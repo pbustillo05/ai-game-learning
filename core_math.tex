@@ -1,0 +1,1068 @@
+\documentclass[12pt, a4paper]{article}
+\input{../preamble/preamble}
+
+\title{Mathematical Notes}
+\author{Pablo, Arka}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+First draft of the research papers to emerge from this project: Rao--Blackwellization, branching and poker case-study.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction}\label{sec:intro}
+
+In the context of end-to-end policy learning, we train a model to learn a parametrized strategy profile $\pi_\theta$.
+All policy-gradient methods to train such  $\theta$ are based on a similar principle.
+They create a sequence $\theta_0, \ldots \theta_k$ of parameters where typically $\theta_0$ is a random seed, and they gradually build the next iterate by:  
+\begin{enumerate}[label =(\roman*)]
+  \item \textbf{Rollout:} Sampling games using the current strategy profiles $(\pi_{\theta_i})_{i\le k}$.
+  \item \textbf{Loss design:} Secretly, unbeknownst to the opponents, some new player with strategy $\pi_\theta$ will randomly replace the acting player.
+  We pick some sort of loss function $\mathcal{L}_{k+1}(\theta)$ which depends on $(\theta_i)_{i\le k}$, and which evaluates how well the new player $\pi_\theta$ is doing.
+  \item \textbf{Gradient Descent}: Using minibatches sampled from the online rollout database, we compute some estimator of the loss $\widehat{\mathcal{L}}_{k+1}(\theta)$ and descend along it.
+\end{enumerate}
+
+Trajectories in games typically only get assigned to a computable reward at the end of the round (terminal trajectories), which forces rollout to \textit{sample full runouts}.
+Typically, each runout is sampled by generating an explicit sequence of full game states (all private and public information is decided).
+
+We introduce here two methods to reduce the variance of the loss estimators $\widehat{\mathcal{L}}_{k+1}(\theta)$:
+\begin{enumerate}[label =(\roman*)]
+  \item \textbf{Rao--Blackwellization of private state:} games have typically a very wide variance coming from the unavailable private information: the exact same strategy can lead to terrible failure or wonderful success depending on the private state of the opponents.
+  We suggest addressing this by integrating away this variance.
+  We replace private-state sampling in the loss estimator by conditional expectations over the posterior distribution of private states.
+
+  \item \textbf{Variance-guided Branching:} a significant amount of variance in the loss estimator typically also comes from the variety of public events (actions and chance events) which can significantly modify the strength of the acting player's private state.
+  We suggest addressing this focusing the sampling around higher variance spots, by seeing rollouts as a tree instead of a set of sequences.
+\end{enumerate}
+
+\section{Game-Theoretical Model}\label{sec:pbg}
+
+To simplify the notations in this exposition, we focus on \textbf{finite Public-action Bayesian Games (PBG)}, although the same ideas can be applied to more general classes of games.
+In a couple words, this means: the game starts with a private chance event (the only source of imperfect-information) but then is played openly with all \textit{players' action} and \textit{chance} events being public.
+This class includes many poker, bidding, and auction models in which all private information is sampled initially and every subsequent action and chance outcome is public.
+
+\begin{definition}[Finite public-action Bayesian game]\label{def:finite-pbg}
+For a finite set $E$, let
+\begin{equation}\label{eq:probability-simplex}
+\Delta(E):=\left\{\lambda:E\to[0,1]\;\middle|\;\sum_{e\in E}\lambda(e)=1\right\}.
+\end{equation}
+
+A finite public-action Bayesian game consists of the following data.
+\begin{enumerate}[label =(\roman*)]
+    \item \textbf{Tree:} A finite prefix-closed set $\mathcal S$ of words, seen as a tree, with empty word $\varnothing\in\mathcal S$.
+    Its elements are called public states, or trajectories.
+    Write $\sigma\preccurlyeq\tau$ if $\sigma$ is a prefix of $\tau$, and $\sigma\prec\tau$ if $\sigma\preccurlyeq\tau$ and $\sigma\neq\tau$.
+    The terminal trajectories are the maximal elements of $\mathcal S$ and are denoted by $\mathcal T$.
+    For every nonterminal trajectory $\sigma\in\mathcal S\setminus\mathcal T$, there is a finite event set $\mathcal E_\sigma$ such that the immediate successors of $\sigma$ are precisely the trajectories $\sigma e$, with $e\in\mathcal E_\sigma$.
+
+    \item \textbf{Owner:} A finite set $\mathcal{P}$ of \textit{players} and an owner map $o:\mathcal S\setminus\mathcal T \to \mathcal{P}\sqcup\{\mathsf c\}$.
+    If $o(\sigma)\in\mathcal P$ (resp. $\{\mathsf c\}$) is a player node (resp. chance node), we typically denote the elements of $\mathcal{E}_\sigma$ by $a$ (resp. $c$).
+    For $\sigma \in \mathcal S$ and $p \in \mathcal P$, we write $|\sigma|_p$ for the number of player nodes in $\sigma$ owned by $p$, and $|\sigma|_{\textnormal{player}}$ for the total number of player nodes in $\sigma$.
+    For $\tau \in \mathcal{T}$, write $\tau^{\mathsf{pre-c}}$ for the largest prefix of $\tau$ which ends in no more than one chance or terminal node (for example $(caccaaaccct)^{\mathsf{pre-c}} = caccaaac$).
+
+    \item \textbf{Initial Private State Profile:} For every player $p\in \mathcal P$, a finite type set $\mathcal X_p$, and a distribution $\mu$ on $\mathcal X:=\prod_{p=1}^P\mathcal X_p$.
+    Elements of $\mathcal X$ are typically written $x= x_{\mathsf c} = (x_p)_{p \in \mathcal P}$, with $x_p\in\mathcal X_p$.
+
+    \item \textbf{Public-Chance Rules:} For every chance node $\sigma$ and every initial profile $x \in \mathcal{X}$, a public-chance rule $\chi(\cdot \mid x, \sigma)\in \Delta(\mathcal E_\sigma)$.
+
+    \item \textbf{Reward:} a function $\mathbf{R} = (R_p)_{p \in \mathcal{P}}: \mathcal{X} \times \mathcal{T}\to\R^{\mathcal{P}}$.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Strategy and Random Trajectories]\label{def:strategy-random-trajectories}
+A strategy profile is the data of $\pi(\cdot \mid x_p, \sigma) \in \Delta(\mathcal E_\sigma)$ for $\sigma \in o^{-1}(\mathcal{P})$ and $x_{o(\sigma)} \in \mathcal{X}_{o(\sigma)}$.
+For $p \in \mathcal{P}$, we write $\pi_p$ for the strategy of player $p$, \textit{i.e.} the subcollection of these distributions for $p = o(\sigma)$, and $\pi_{-p}$ for the strategies of all other players.
+A strategy profile induces a joint probability measure $\mathbb{P}^\pi$ on the set $\mathcal{X} \times \mathcal{T}$.
+
+For a trajectory $\sigma\in\mathcal S$, a player $p$ and a private initial profile $x_p \in \mathcal{X}_p$, define the \textbf{reach} as the probability that player $p$ acted according to $\sigma$ conditional on initial profile $x_p$ and every other event following $\sigma$:
+\begin{equation}\label{eq:player-reach}
+  r_p^\pi(\sigma\mid x)
+  := \mathbb{P}^\pi(p \textnormal{ acts as }\sigma \mid x_p, \textnormal{other events follow }\sigma)
+  = \prod_{\substack{\rho a \preccurlyeq \sigma \\ o(\rho) = p}} \pi(a \mid x_p, \rho),
+\end{equation}
+where the product ranges over the actions of player $p$ in the trajectory $\sigma$.
+Similarly, we define the \textbf{draw odds} of a trajectory $\sigma$ as the probability that the public chance events in $\sigma$ occurred conditional on the initial profile $x$:
+\begin{equation}[rCl]
+  r_{\mathsf c}(\sigma\mid x)
+  &:=& \mathbb{P}^\pi(\textnormal{chance happens as in }\sigma \mid x, \textnormal{players act as } \sigma)
+  \nonumber\\
+  &=& \prod_{\substack{\rho c \preccurlyeq \sigma \\ o(\rho) = \mathsf c}} \chi(c \mid x, \rho),
+  \label{eq:chance-reach}
+\end{equation}
+The expected payoff of player $p$ is
+\begin{equation}\label{eq:expected-payoff}
+  J_p(\pi) :=\mathbb{E}^\pi(R_p) = 
+  \mathbb{E}_{X \sim \mu} 
+  \left(
+    \sum_{\tau\in\mathcal T} R_p(X, \tau) \prod_{q \in \mathcal{P} \cup \{c\}} r_q(\tau \mid X_q)
+  \right)
+\end{equation}
+For $\sigma \in \mathcal{S}$, $p = o(\sigma)$ and $x_p \in \mathcal{X}_p$, we write $V(x, \sigma) = \mathbb{E}^\pi(R_{o(\sigma)}(x, \tau) \mid x_p,\sigma)$.
+For a further choice of $a \in \mathcal{E}_\sigma$, we write $Q(x_p, \sigma a) = \mathbb{E}^\pi(R_{o(\sigma)}(x, \tau) \mid x_p, \sigma a)$ and $A(x_p, \sigma a) = Q(x_p, \sigma a) - V(x_p, \sigma)$.
+\end{definition}
+
+\begin{notation}[Ideal Random Variables]\label{not:random-variables}
+We typically denote $X \sim \mu$ for a random initial profile.
+From it, we can define various other random variables successively.
+Firstly, we define $P^\pi \in \mathcal{P}$ by
+\begin{equation}\label{eq:random-player-law}
+  \mathbb{P}(P^\pi = p \mid X) = \frac{\mathbb{E}^\pi(|\tau|_p \mid X)}{\mathbb{E}^\pi(|\tau|_{\textnormal{player}} \mid X)}
+\end{equation}
+Secondly, we denote $\Sigma^\pi$ for the stationary random $P^\pi$-node of the Markov chain defined by the subtree $o^{-1}(P^\pi)$, conditioned at $X$, where the game is seen to constantly restart at terminal nodes.
+Thirdly, we let $A^\pi \sim \pi(\cdot \mid X_{P^\pi}, \Sigma^\pi)$.
+And finally, we let $\Tau^\pi \sim \frac{|\cdot|_{P^\pi} \mathbb{P}^\pi(\cdot \mid X)}{\mathbb{E}^\pi(|\tau|_{P^\pi} \mid X)}$ be a random terminal trajectory continuing $\Sigma^\pi A^\pi$ defined by
+\begin{equation}\label{eq:terminal-continuation-law}
+  \mathbb{P}(\Tau^\pi = \tau\mid \Sigma^\pi A^\pi) = \mathbb{P}^\pi(\tau \mid \Sigma^\pi A^\pi)
+\end{equation} 
+It's easy to see that the law of $\Sigma^\pi$ is given by
+\begin{equation}\label{eq:stationary-node-law}
+  \mathbb{P}(\Sigma^\pi = \sigma \mid P^\pi) = \one_{o(\sigma) = P^\pi}\frac{\mathbb{P}^\pi(\sigma \preccurlyeq \tau)}{\mathbb{E}^\pi(|\tau|_{P^\pi})}
+\end{equation}
+which is indeed a probability distribution as
+\begin{equation}[rCl]
+  \sum_{o(\sigma) = P^\pi} \mathbb{P}^\pi(\sigma \preccurlyeq \tau)
+  & = &
+  \sum_{o(\sigma) = P^\pi} \sum_{\sigma \preccurlyeq \tau \in \mathcal T} \mathbb{P}^\pi(\tau)
+  \nonumber\\
+  & = &
+  \sum_{\tau \in \mathcal T} \mathbb{P}^\pi(\tau) |\tau|_{P^\pi}
+  \nonumber\\
+  & = &
+  \mathbb{E}^\pi(|\tau|_{P^\pi})
+  \label{eq:stationary-node-normalization}
+\end{equation}
+When $\pi$ is clear from the context, we drop the superscript and write $P$, $\Sigma$, $A$ and $\Tau$.
+Note that $\Tau$ does not follow the law $\mathbb{P}^\pi$.
+\end{notation}
+
+Recall below how the key theorem of policy gradient theory adapts to this setting.
+
+\begin{theorem}[Policy Gradient Theorem for Games]\label{thm:policy-gradient-games}
+  For $p \in \mathcal{P}$, we have
+  \begin{equation}\label{eq:policy-gradient-games}
+    \nabla_{\pi_p} J_p(\pi)
+    = - \mathbb{E}^\pi(|\tau|_{p}) \nabla_{\pi_p} \mathbb{E}\left(\log(\pi(A \mid X_p, \Sigma)) \sg[Q(X_p, \Sigma A)] \mid P = p\right)
+  \end{equation}
+\end{theorem}
+
+\section{Self-Play Policy-Gradient Methods in Synchronous Rollouts}\label{sec:synchronous-pg}
+
+\subsection{Theoretical Model}\label{subsec:pg-theoretical-model}
+
+Assuming a \textit{synchronous rollout}, all main policy-gradient methods to solve games can be modelled by the following choices:
+\begin{enumerate}
+  \item A \textbf{model} is the choice of a parametrized strategy profile $\theta \mapsto \pi^\theta$.
+  Optionally, it also included the choice of a parametrized value functions $\theta \mapsto V^\theta$ meant to approximate $\mathbb{E}^{\pi^\theta}(R_p(x,\tau) \mid x_p, \sigma \preccurlyeq \tau)$ for all $\sigma \in \mathcal{S}$, $p = o(\sigma)$ and $x_p \in \mathcal{X}_p$.
+
+  \item Some \textbf{value} estimators 
+  \[
+    \widehat{Q}(x_p, \sigma a) \simeq \mathbb{E}^\pi(R_{p}(x,\tau) \mid x_p, \sigma a)
+    \\
+    \widehat{V}(x_p, \sigma) \simeq \mathbb{E}^\pi(R_{p}(x,\tau) \mid x_p, \sigma)
+  \]
+  for all $\sigma a \in \mathcal{S}$, $p = o(\sigma)$ and $x_p \in \mathcal{X}_p$. 
+  Optionally, the reward $R_p$ above can be replaced by a modified reward depending on $\pi$ and some reference profile $\rho$ (see R-NaD).
+  
+  \item A \textbf{loss function} $\mathcal{L}$ from which we want to estimate
+  \begin{equation}\label{eq:pg-loss-expectation}
+    l(\theta) = \mathbb{E}\left(
+      \mathcal{L}\left(
+        (\pi^\theta, V^\theta,\pi, V)(X_P, \Sigma),
+        A,
+        \widehat{Q}(X_P, \Sigma A),
+        \widehat{V}(X_P, \Sigma)
+      \right)
+    \right)
+  \end{equation}
+  for $\Sigma, A, P, X$ as in \autoref{not:random-variables} and $V$ all based on a frozen policy $\pi$, called the \textit{rollout profile} (typically an older version of $\pi^\theta$).
+  Optionally, the loss function may also depend on $\alpha(\cdot \mid X_P, \Sigma)$ for reference profile $\alpha$ (see NashPG).
+\end{enumerate}
+
+The \textbf{training} is then an inductive process defining a sequence of weights $(\theta_k)_{k \geq 0}$.
+The first choice $\theta_0$ is a random seed sampled from some initial distribution.
+Assuming we constructed $\theta_0, \ldots, \theta_k$, we define the next iterate $\theta_{k+1}$ by: estimating $l(\theta)$ using the rollout profile $\theta_k$, then performing some number of gradient descent steps on $\theta$ to minimize the estimated loss.
+
+\paragraph{Assumptions.}
+In the model above, we assume a few things that we justify here:
+\begin{enumerate}
+  \item \textbf{No $Q$-head:} In many games of interests, the action space is too large to have a reasonnable $Q$-head as output of the model.
+  \item \textbf{No other-player value head:} With imperfect-information games, the state of the other player is not known.
+  To output a value function for each player, one would need to $\sum_p |\mathcal{X}_p|$ outputs, which is typically too large to be practical.
+  It's also not a quantity that we necessarily want the model to spend effort to learn: the expected returns over other players \textbf{without} conditioning on their private state is a much more relevant quantity to learn (see \autoref{eq:V-vector-head}).
+  \item \textbf{Synchronous rollout:} This is purely a theoretical assumption to simplify the exposition.
+\end{enumerate}
+These assumptions shape the estimators and losses that are relevant for our context.
+
+\paragraph{Primitives.}
+For $0 \leq i \leq k$, we let $\rho^\theta_i = \frac{\pi^\theta(A \mid X_{P},\Sigma)}{\pi^{\theta_i}(A \mid X_{P},\Sigma)}$.
+We define \textbf{centered logits} as
+\begin{equation}\label{eq:centered-logits}
+  z^\theta(a \mid X_{P}, \Sigma) := \log\pi^\theta(a \mid X_{P},\Sigma)
+  -
+  \frac{1}{|\mathcal E_\Sigma|}
+  \sum_{b\in\mathcal E_\Sigma}
+  \log\pi^\theta(b\mid X_{P},\Sigma)
+\end{equation}
+Write $\widehat{A} = \widehat{Q}(X_{P},\Sigma A) - V^{\theta_k}(X_{P},\Sigma)$.
+If we are able to compute one, for $b \in \mathcal{E}_\Sigma$, write $\widehat{Q}(b) = \widehat{Q}(X_{P}, \Sigma b)$ an estimator of an all-action target.
+We also define a clipped value function $V_{\tt clip}^\theta = V^{\theta_k} + \clip(V^\theta - V^{\theta_k}, -\varepsilon_V, \varepsilon_V)$.
+We then have the following classic losses (the notation $\mathcal{L}[\widehat{E}]$ means ``the loss $\mathcal{L}$ depends on a choice of estimator $\widehat{E}$''):
+\begin{equation}[rCl]
+  \mathcal L_{\tt PG}[\widehat{A}]
+  & := &
+  -\rho_k^\theta \widehat{A},
+  \nonumber\\
+  \mathcal L_{\tt clip}[\widehat{A}]
+  & := &
+  -\min\left\{
+    \rho_k^\theta \widehat{A},
+    \clip\left(
+      \rho_k^\theta, 1-\varepsilon,1+\varepsilon
+    \right)
+    \widehat{A}
+  \right\}
+  \nonumber\\
+  \mathcal L_{\tt NeuRD}[\widehat{Q}(-)]
+  & := &
+  - \sum_{b \in \mathcal{E}_\Sigma}
+  z^\theta( b \mid X_{P},\Sigma) \cdot
+  \clip\left(
+    \widehat{Q}(b),
+    -c_{\tt NeuRD},c_{\tt NeuRD}
+  \right)
+  \nonumber\\
+  \mathcal L_{\tt NeuRD}^{\tt sample}[\widehat{Q}]
+  & := &
+  - \frac{z^\theta( A \mid X_{P},\Sigma)}{\pi^{\theta_k}(A \mid X_{P},\Sigma)} \cdot
+  \clip\left(
+    \widehat{Q},
+    -c_{\tt NeuRD},c_{\tt NeuRD}
+  \right)
+  \nonumber\\
+  \mathcal L_{\tt V}[\widehat{V}]
+  & := &
+  c_V\left(V^\theta(X_{P},\Sigma) - \widehat{V}\right)^2,
+  \nonumber\\
+  \mathcal L_{\tt V-clip}[\widehat{V}]
+  & := &
+  c_V \max\left\{\left(V^\theta(X_{P},\Sigma) - \widehat{V}\right)^2, \left(V_{\tt clip}^\theta(X_{P},\Sigma) - \widehat{V}\right)^2\right\},
+  \nonumber\\
+  \mathcal L_{\tt H}
+  & := &
+  -c_H\Ent\!\left(\pi^\theta(\cdot\mid X_{P},\Sigma)\right),
+  \nonumber\\
+  \mathcal L_{\tt KL}
+  & := &
+  c_{\tt KL} \KLop\left(\pi^\theta(\cdot\mid X_{P},\Sigma) \middle\| \pi^{\theta_{\text{ref}(k)}}(\cdot\mid X_{P},\Sigma)\right)
+  \nonumber\\
+  \mathcal L_{\tt KL}^{\tt sample}
+  & := &
+  c_{\tt KL}\left(\rho^\theta_{k} \log(\rho^\theta_{k}) - \rho^\theta_{k} + 1\right)
+  \label{eq:primitive-losses}
+\end{equation}
+
+\paragraph{Relation to \autoref{thm:policy-gradient-games}.}
+The goal of this loss function is that its gradient resembles the gradient of the expected payoff $J_p(\pi^\theta_p, \sg[\pi^\theta_{-p}])$.
+
+\paragraph{Practicality.}
+In practice, it's essentially impossible to sample $\Sigma$ in a non-biased way (one needs to first know the average length of the game).
+It's also impossible to create the estimators $\widehat{Q}$ and $\widehat{V}$ without seeing the sampled $\Sigma$ as part of a full trajectory.
+These two constraints pushes us towards the approximations given in the following subsections.
+
+\subsection{Usual Implementation}\label{subsec:pg-usual-implementation}
+
+We explain here the usual implementation of a training algorithm.
+
+\begin{algorithm}[H]
+\caption{$\mathfrak{T}\gets$~\texttt{SampleTerminal}$(\pi,N)$}
+\label{alg:sample-terminal}
+\DontPrintSemicolon
+\tcc{Terminal trajectory sampling used by ordinary sampled-private-state training.}
+\KwParam{$\pi$, rollout profile; $N$, number of independent terminal rollouts}
+\KwOut{$\mathfrak{T}=((X_i,\Tau_i))_{i=1}^N$}
+\For{$i=1,\ldots,N$}{
+  Sample $X_i\sim\mu$\;
+  Set $\sigma\gets\emptyset$\;
+  \While{$\sigma\notin\mathcal T$}{
+    $p \gets o(\sigma)$\;
+    Sample
+    \[
+      E \sim \begin{cases}[l"l]
+      \pi(\cdot\mid X_{i,p}, \sigma) & \textnormal{if } o(\sigma) \in \mathcal{P}\\
+      \chi(\cdot\mid X_i, \sigma) & \textnormal{otherwise}
+    \end{cases}
+    \]\;
+    Set $\sigma \gets \sigma E$\;
+  }
+  Set $\Tau_i \gets \sigma$\;
+}
+\Return{$\mathfrak{T}$}
+\end{algorithm}
+
+\begin{definition}[Empirical terminal-rollout decision law]\label{def:terminal-rollout-decision-law}
+Fix a terminal rollout batch $\mathfrak{T}=((X_i,\Tau_i))_{i=1}^N$ produced by \cref{alg:sample-terminal}.
+Define an index $I\in\{1,\ldots,N\}$ by
+\begin{equation}\label{eq:terminal-rollout-index-law}
+  \mathbb{P}(I=i\mid\mathfrak{T})
+  =
+  \frac{|\Tau_i|_{\textnormal{player}}}
+       {\sum_{j=1}^N|\Tau_j|_{\textnormal{player}}}.
+\end{equation}
+Then let $\Sigma A \preccurlyeq \Tau_I$ be a uniform choice of a player decision and $P = o(\Sigma)$.
+
+{\color{red}Blank convergence statement: as $N\to\infty$, the law of $\Sigma_N$ should converge to the ideal stationary-node law of \autoref{not:random-variables}.}
+\end{definition}
+
+\paragraph{Primitives.}
+For $\lambda \in [0,1]$, $1 \leq i \leq N$, $\sigma a \preccurlyeq \Tau_i$ and $p = o(\sigma)$, we write
+\begin{equation}\label{eq:sequential-lambda-return}
+  \widehat{Q}^\lambda(X_{i, p}, \sigma a)
+  :=
+  \lambda^{|\Tau \setminus \Sigma|_p} R_{p}(X_{i}, \Tau_i)
+  + (1 - \lambda) \sum_{\substack{\sigma \prec \rho \preccurlyeq \Tau_i \\ o(\rho) = p}}
+  \lambda^{|\rho \setminus \sigma|_p - 1} V^{\theta_k}(X_{i, p},\rho)
+\end{equation}
+and $\widehat{A}^\lambda = \widehat{Q}^\lambda(X_{I,P},\Sigma A) - V^{\theta_k}(X_{I, P},\Sigma)$ and $\widehat{V}^\lambda = \widehat{Q}^\lambda(X_{I,P},\Sigma A)$.
+Note that $\lambda = 1$ recovers the Monte Carlo return estimator (necessary in the absence of a value head).
+For $|\mathcal{P}| = 2$, $\eta > 0$ and $(x,\tau) \in \mathcal{X} \times \mathcal{T}$, we define the \textbf{\texttt{R-NaD} modified return} as
+\begin{equation}\label{eq:rnad-modified-return}
+  R^{\tt NaD}_{p}(x, \tau) :=
+  R_p(x, \tau) +\eta \sum_{\substack{\sigma a\preccurlyeq\Tau \\o(\sigma) \in \mathcal{P}}} (1-2\one_{o(\sigma)=p})
+  \log\left(
+    \frac{\pi^{\theta_k}(a\mid x_{o(\sigma)},\sigma)}
+    {\pi^{\theta_{\refp(k)}}(a\mid x_{o(\sigma)},\sigma)}
+  \right)
+\end{equation}
+Using this instead of $R$ in the formula above, we get $\widehat{Q}_{\tt NaD}^{\eta, \lambda}$, $\widehat{A}_{\tt NaD}^{\eta, \lambda}$ and $\widehat{V}_{\tt NaD}^{\eta, \lambda}$.
+For $b \in \mathcal{E}_\Sigma$, we define the \textbf{\texttt{R-NaD} all-action return} 
+\begin{equation}[rCl]
+  \widehat{Q}_{\tt NaD}^{\eta, \lambda}(b)
+  =
+  V^{\theta_k}(X_{I,P}, \Sigma)
+  &-&
+  \eta\log
+  \left(
+  \frac{
+    \pi^{\theta_k}(b\mid X_{I,P},\Sigma)
+  }{
+    \pi^{\theta_{\refp(k)}}(b\mid X_{I,P},\Sigma)
+  }
+  \right)
+  \nonumber\\
+  &+&
+  \frac{\mathbf{1}_{\{b=A\}}}{\pi^{\theta_k}(b\mid X_{I, P},\Sigma)}
+  \left(
+    \widehat{A}_{\tt NaD}^{\eta, \lambda}
+  \ + \eta\log
+  \left(
+  \frac{
+    \pi^{\theta_k}(b\mid X_{I,P},\Sigma)
+  }{
+    \pi^{\theta_{\refp(k)}}(b\mid X_{I,P},\Sigma)
+  }
+  \right)
+  \right).
+\end{equation}
+
+\paragraph{Choices.} Here are typical choices of losses used in training.
+\begin{center}
+\setlength{\tabcolsep}{3pt}
+\scriptsize
+\begin{tabular}{@{}
+  >{\raggedright\arraybackslash}p{0.17\linewidth}
+  >{\raggedright\arraybackslash}p{0.17\linewidth}
+  >{\raggedright\arraybackslash}p{0.17\linewidth}
+  >{\raggedright\arraybackslash}p{0.43\linewidth}
+@{}}
+\toprule
+\textbf{method}
+& \textbf{\text{ref}(k)}
+& \textbf{$V^\theta$}
+& \textbf{minimized loss}
+\\
+\midrule
+\tt REINFORCE
+& $\varnothing$
+& $\varnothing$ or fixed baseline
+& $\mathcal L_{\tt PG}[\widehat A^1]$
+\\
+\tt Actor--critic
+& $\varnothing$
+& $V^\theta$
+& $\mathcal L_{\tt PG}[\widehat A^\lambda]+\mathcal L_{\tt V}[\widehat V^\lambda]+\mathcal L_{\tt H}$
+\\
+\tt PPO
+& $\varnothing$
+& $V^\theta$
+& $\mathcal L_{\tt clip}[\widehat A^\lambda]+\mathcal L_{\tt V}[\widehat V^\lambda]+\mathcal L_{\tt H}$
+\\
+{\tt MMD}-style {\tt PPO}
+& $\varnothing$
+& $V^\theta$
+& $\mathcal L_{\tt clip}[\widehat A^\lambda]+\mathcal L_{\tt V}[\widehat V^\lambda]+\mathcal L_{\tt H}+\mathcal L_{\tt KL}^{\tt sample}$
+\\
+\tt NashPG-PPO
+& $K\lfloor k/K\rfloor$
+& $V^\theta$
+& $\mathcal L_{\tt clip}[\widehat A^\lambda]+\mathcal L_{\tt V}[\widehat V^\lambda]+\mathcal L_{\tt KL}$
+\\
+\tt RNaD-PPO
+& $\refp(k)$
+& $V^\theta$
+& $\mathcal L_{\tt clip}[\widehat A^{{\tt NaD},\lambda}]+\mathcal L_{\tt V}[\widehat V^{{\tt NaD},\lambda}]$
+\\
+\tt R-NaD / DeepNash
+& $\refp(k)$
+& $V^\theta$
+& $\mathcal L_{\tt NeuRD}[\widehat{Q}_{\tt NaD}^{\eta, \lambda}(-)]+\mathcal L_{\tt V}[\widehat V^{{\tt NaD},\lambda}]$
+\\
+\bottomrule
+\end{tabular}
+\end{center}
+In \texttt{R-NaD}, it's not clear what function $\refp(k)$ to choose as the original implementation is \texttt{IMPALA}-style as opposed to synchronous.
+
+\paragraph{Implementation.} Below is a pseudocode of the usual implementation.
+
+\begin{algorithm}[H]
+\caption{$(\theta_k)_{k\ge0}\gets$~\texttt{SequentialPG}$(\theta_0)$}
+\label{alg:sequential-pg}
+\DontPrintSemicolon
+\tcc{Sequential rollout policy-gradient template corresponding to the procedure above.}
+\KwParam{$\theta_0$, initial weights; $\theta$, working copy of the next iterate}
+\KwHyper{$N$, rollout count; $B$, minibatch size; chosen number of gradient-descent steps per iterate}
+\KwOut{$(\theta_k)_{k\ge0}$}
+\For{$k=0,1,2,\dots$}{
+  Sample $(X_i,\Tau_i)_{i=1}^N \stackrel{\mathsf{iid}}{\sim} (X, \Tau^{\pi^{\theta_k}})$ using $\algcall{alg:sample-terminal}{SampleTerminal}(\pi^{\theta_k},N)$\;
+  \For{$i=1,\ldots,N$}{
+    Compute $R(X_i, \Tau_i)$ (optionally, using \autoref{eq:rnad-modified-return})\;
+    By backward propagation, for $\sigma a \preccurlyeq \Tau_i$ and $p = o(\sigma)$, compute $\widehat{Q}(X_{i, p}, \sigma a)$ using \autoref{eq:sequential-lambda-return}\;
+    Compute $\widehat{V}(X_{i, p}, \sigma)$\;
+  }
+  $\theta\gets\theta_k$\;
+  \For{each gradient-descent step}{
+    Sample $(I_b, \Sigma_b, A_b, P_b)_{b=1}^B \stackrel{\mathsf{iid}}{\sim} (I, \Sigma, A, P)$ as in \autoref{def:terminal-rollout-decision-law}\;
+    Deduce $\widehat{Q}_b = \widehat{Q}(X_{I, P}, \Sigma A)$ and $\widehat{V}_b = \widehat{V}(X_{I, P}, \Sigma)$\;
+    Estimate
+    \begin{equation*}[rCl]
+      \widehat{l}(\theta)
+      &=& \frac{1}{B}\sum_{b=1}^B \mathcal{L}\left(
+        (\pi^\theta, V^\theta,\pi^{\theta_k}, V^{\theta_k})(X_{I_b, P_b}, \Sigma_b),
+        A_b,
+        \widehat{Q}_b,
+        \widehat{V}_b
+        \right)
+    \end{equation*}\;
+    Descend $\theta$ along $\nabla_\theta \widehat{l}(\theta)$\;
+  }
+  store $\theta_{k+1}=\theta$\;
+}
+\Return $(\theta_k)_{k\ge0}$
+\end{algorithm}
+
+Optionally, for some $\refp(k) < k$ reference index, during minibatches, we can evaluate $\pi^{\theta_{\refp(k)}}(\cdot \mid X_{I,P},\Sigma)$ at the sampled $(I, P, \Sigma)$ to modify the loss function (see NashPG).
+
+\subsection{Rao--Blackwellization of the Private State}\label{subsec:rao-blackwell-private-state}
+
+\paragraph{Motivation.}
+Game strategies often involve disguising one's private information.
+In our leading example, poker, good players must ``bluff'' (pretend to have good cards when they don't), ``slowplay'' (pretend to have bad cards when they don't) and more generally, they must ``protect their action ranges'', meaning that $\mathbb{P}(\text{private state of } p\mid \text{public information})$ should not be too revealing.
+When learning poker, players are taught to ``balance their ranges'' and think ``what would I do if I had a different hand?''.
+Motivated by this, it's a natural choice to design models so that it doesn't see his private state $x_p$ but rather decides what to do with any potential private state $x_p$.
+In other words, we do a currying transformation and see the model as
+\begin{equation}\label{eq:rao-blackwell-curried-policy}
+  \theta \longmapsto \left(x_p \in \mathcal{X}_p \mapsto \pi^\theta(\cdot \mid x_p, \sigma) \in \Delta(\mathcal{E}_\sigma)\right)
+\end{equation}
+which means that a single model run now outputs a collection of distributions.
+The goal of Rao--Blackwellization is to exploit this architecture in the training algorithm to reduce the variance of the loss estimator induced by the private state $X$.
+
+\begin{algorithm}[H]
+\caption{$\mathfrak{T}^{\mathsf{pre-c}}\gets$~\texttt{SamplePreTerminal}$(\pi,N)$}
+\label{alg:sample-preterminal}
+\DontPrintSemicolon
+\tcc{Public pre-terminal sampling for Rao--Blackwellized training.}
+\KwParam{$\pi$, rollout profile; $N$, number of independent public rollouts}
+\KwOut{$\mathfrak{T}^{\mathsf{pre-c}}=((\Tau_i^{\mathsf{pre-c}},\mathfrak r_i))_{i=1}^N$}
+\For{$i=1,\ldots,N$}{
+  Sample $X_i\sim\mu$\;
+  Set $\sigma\gets\emptyset$ and $\mathfrak{r}_i\gets 1$\;
+  \While{$\sigma\notin\mathcal{T}^{\mathsf{pre-c}}$}{
+    Sample
+    \[
+      E \sim \begin{cases}[l"l]
+      \pi(\cdot\mid X_{i,p}, \sigma) & \textnormal{if } o(\sigma) \in \mathcal{P}\\
+      \chi(\cdot\mid X_i, \sigma) & \textnormal{otherwise}
+    \end{cases}
+    \]\;
+    Set $\sigma \gets \sigma E$ and
+    \[
+      \mathfrak{r}_{i,o(\sigma)} \gets \mathfrak{r}_{i,o(\sigma)} \odot \begin{cases}[l"l]
+      \pi(E\mid -, \sigma) & \textnormal{if } o(\sigma) \in \mathcal{P}\\
+      \chi(E\mid -, \sigma) & \textnormal{otherwise}
+    \end{cases}
+    \]\;
+    Normalize $\mathfrak{r}_{i,o(\sigma)}$
+  }
+  Set $\Tau_i^{\mathsf{pre-c}} \gets \sigma$\;
+}
+\Return{$\mathfrak{T}^{\mathsf{pre-c}}$}
+\end{algorithm}
+
+\begin{definition}[Empirical pre-terminal Rao--Blackwell decision law]\label{def:preterminal-rao-blackwell-decision-law}
+Fix a pre-terminal rollout batch $\mathfrak{T}^{\mathsf{pre-c}}=((\Tau_i^{\mathsf{pre-c}},\mathfrak r_i))_{i=1}^N$ produced by \cref{alg:sample-preterminal}.
+Define $I\in\{1,\ldots,N\}$ by
+\begin{equation}\label{eq:preterminal-rollout-index-law}
+  \mathbb{P}(I=i\mid\mathfrak{T}^{\mathsf{pre-c}})
+  =
+  \frac{|\Tau_i^{\mathsf{pre-c}}|_{\textnormal{player}}}
+       {\sum_{j=1}^N|\Tau_j^{\mathsf{pre-c}}|_{\textnormal{player}}}.
+\end{equation}
+Then let $\Sigma A \preccurlyeq \Tau_I^{\mathsf{pre-c}}$ be a uniform choice of a player decision and $P = o(\Sigma)$.
+
+{\color{red}Blank convergence statement: as $N\to\infty$, the law of $\Sigma$ should converge to the ideal stationary-node law of \autoref{not:random-variables}, with terminal continuations replaced by their pre-terminal public prefixes.}
+\end{definition}
+
+\paragraph{Theory in the Ideal Setup.}
+Essentially, we modify the expected value computations as
+\begin{equation}[rCl]
+  \widehat{Q}
+  &=&
+  \mathbb{E}^\pi(R_{p}(x, \tau) \mid x_p, \sigma a)
+  \nonumber\\
+  &=&
+  \mathbb{E}^\pi(\mathbb{E}^\pi(R_{p}(x, \tau) \mid x_p, \tau^{\mathsf{pre-c}}) \mid \sigma a)
+  \label{eq:rao-blackwell-q-identity}
+\end{equation}
+\begin{equation}[rCl]
+  \mathbb{E}(\mathcal{L})
+  &=&
+  \mathbb{E}(\mathbb{E}^\pi(\mathcal{L}(x, \Sigma A) \mid \Sigma A))
+  \label{eq:rao-blackwell-loss-identity}
+\end{equation}
+which reduces variance by the Law of Total Variance.
+
+\paragraph{Primitives.}
+For $\lambda \in [0,1]$, $1 \leq i \leq N$, $\sigma a \preccurlyeq \Tau_i$, $p = o(\sigma)$ and $x_p$ compatible with $\Tau_i$, we write
+\begin{equation}\label{eq:rao-blackwell-lambda-return}
+  \widehat{Q}^\lambda(x_p, \sigma a)
+  :=
+  \lambda^{|\Tau \setminus \Sigma|_p} \mathbb{E}^{\pi^{\theta_k}}(R_{p}(x, \tau) \mid x_p, \Tau_i^{\mathsf{pre-c}} \preccurlyeq \tau)
+  + (1 - \lambda) \sum_{\substack{\sigma \prec \rho \preccurlyeq \Tau_i \\ o(\rho) = p}}
+  \lambda^{|\rho \setminus \sigma|_p - 1} V^{\theta_k}(x_p,\rho)
+\end{equation}
+and $\widehat{A}^\lambda(x_p) = \widehat{Q}_f^\lambda(x_p,\Sigma A) - V^{\theta_k}(x_p,\Sigma)$.
+and $\widehat{V}^\lambda(x_p) = \widehat{Q}^\lambda(x_p,\Sigma A)$.
+
+\paragraph{Monte Carlo Methods.}
+After experimentation, we found that a sequential importance sampler (SIS) resulted in the fastest convergence of the Monte Carlo estimates.
+Other methods such as rejection sampling or MCMC were found to be less efficient.
+
+\begin{algorithm}[H]
+\caption{$(\widehat{\mathbb{P}^\mathfrak{r}},\widehat{V})\gets$~\texttt{PreTerminalMC}$(\mathfrak r)$}
+\label{alg:mc-preterminal}
+\DontPrintSemicolon
+\tcc{Black-box Monte Carlo completion from public pre-terminal prefixes.}
+\KwParam{$\mathfrak r$, reach cache}
+\KwHyper{Monte Carlo budget}
+\KwOut{$(\widehat{\mathbb{P}^\mathfrak{r}},\widehat{V})$}
+  Use the a Monte Carlo simulation to sample $(X,\Tau) \sim \mathbb{P}^\mathfrak{r}$ with
+  \[
+    \mathbb{P}^\mathfrak{r}(x,\tau) = \frac{\prod_{q \in [P] \cup \{c\}} r_q(\tau \mid x_q)}{\sum_y \prod_{q \in [P] \cup \{c\}} r_q(\tau \mid y_q)}
+  \]\;
+  Store statistical occurance $(\widehat{\mathbb{P}^\mathfrak{r}}(x_p))_{\substack{p \in \mathcal{P} \\ x_p \in \mathcal{X}_p}}$ and statistical average
+  \[
+    \left(\widehat{V}(x_p) \simeq \mathbb{E}(R_p(X,\Tau) \mid X_p = x_p)\right)_{\substack{p \in \mathcal{P} \\ x_p \in \mathcal{X}_p}}
+  \]
+\Return{$(\widehat{\mathbb{P}^\mathfrak{r}},\widehat{V})$}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$(\theta_k)_{k\ge0}\gets$~\texttt{SequentialRaoBlackwellPG}$(\theta_0)$}
+\label{alg:sequential-rao-blackwell-pg}
+\DontPrintSemicolon
+\tcc{Sequential rollout policy-gradient template corresponding to the procedure above.}
+\KwParam{$\theta_0$, initial weights; $\theta$, working copy of the next iterate}
+\KwHyper{$N$, rollout count; $B$, minibatch size; chosen number of gradient-descent steps per iterate}
+\KwOut{$(\theta_k)_{k\ge0}$}
+\For{$k=0,1,2,\dots$}{
+  Sample $(\Tau_i^{\mathsf{pre-c}}, \mathfrak{r}_i)_{i=1}^N \stackrel{\mathsf{iid}}{\sim} \Tau^{\pi^{\theta_k}}$ using $\algcall{alg:sample-preterminal}{SamplePreTerminal}(\pi^{\theta_k},N)$\;
+	For $1 \leq i \leq N$, $p \in \mathcal{P}$ and $x_p \in \mathcal{X}_p$, estimate 
+  \begin{equation}[rCl]
+        \widehat{\mathbb{P}}(x_p \mid \Tau^{\mathsf{pre-c}}_i)
+         &\simeq& \mathbb{P}^\pi(x_p, \tau \mid \Tau^{\mathsf{pre-c}}_i)
+        \nonumber\\
+        \widehat{V}_p(x_p, \Tau^{\mathsf{pre-c}}_i) &\simeq& \mathbb{E}^\pi(R_{p}(x, \tau) \mid x_p, \Tau^{\mathsf{pre-c}}_i)
+        \label{eq:branched-terminal-estimates}
+    \end{equation} 
+  using $\algcall{alg:mc-preterminal}{PreTerminalMC}(\mathfrak{r_i})$\;
+  \For{$i=1,\ldots,N$}{
+    By backward propagation, for $\sigma a \preccurlyeq \Tau_i$, $p = o(\sigma)$ and $x_p \in \mathcal{X}_p$, compute $\widehat{Q}(x_p, \sigma a)$ using \autoref{eq:rao-blackwell-lambda-return}\;
+    Compute $\widehat{V}(x_p, \sigma)$\;
+  }
+  $\theta\gets\theta_k$\;
+  \For{each gradient-descent step}{
+    Sample $(J_b, \Sigma_b, A_b, P_b)_{b=1}^B \stackrel{\mathsf{iid}}{\sim} (J, \Sigma, A, P)$ as in \autoref{def:preterminal-rao-blackwell-decision-law}\;
+    Deduce $\widehat{Q}_b(-) = \widehat{Q}(-, \Sigma A)$ and $\widehat{V}_b(-) = \widehat{V}(-, \Sigma)$\;
+    Estimate
+    \begin{equation*}
+      \widehat{l}(\theta)
+      =
+      \frac{1}{B}\sum_{b=1}^B \sum_{x_{P_b}}
+        \mathcal{L}\left(
+        (\pi^\theta, V^\theta,\pi^{\theta_k}, V^{\theta_k})(x_{P_b}, \Sigma_b),
+        A_b,
+        \widehat{Q}_b,
+        \widehat{V}_b
+        \right)
+        \cdot
+        \widehat{\mathbb{P}}(x_{P_b} \mid \Tau_{J_b}^{\mathsf{pre-c}})
+    \end{equation*}\;
+    Descend $\theta$ along $\nabla_\theta \widehat{l}(\theta)$\;
+  }
+  store $\theta_{k+1}=\theta$\;
+}
+\Return $(\theta_k)_{k\geq 0}$
+\end{algorithm}
+
+\subsection{Variance-Guided Branching}\label{subsec:variance-guided-branching}
+
+Rao--Blackwellization integrates potential private states knowing a public terminal trajectory.
+It leaves on the table another substantial source of variance: a state $\sigma a$ might end in many different terminal trajectories.
+We suggest here to modify sequential rollout sampling into a Monte Carlo Tree Search (MCTS) style of sampling.
+This approach is particularly useful in games because typically there is only one possible initial public state, or a small space thereof (we build this into the PBG formalism where different initial public states are different games).
+For example, in our leading example of Texas Hold'em cash poker, the initial public state only contains the stack size of each player (and maybe antes, straddles or other house rules): this is a much smaller space than the space of all potential prompts for a coding model.
+
+We further improve MCTS by suggesting a variance-guided branching strategy: we branch more on the nodes with high downstream reward variance.
+
+\paragraph{Branched Rollouts.}
+We enrich the rollout into a branching random walk on the public tree.
+The design constraint, encouraged by the Rao--Blackwellized pipeline, is that the enrichment must be \emph{public}: any stored importance weight depending on a sampled hidden assignment would contaminate every posterior downstream (Warning~\ref{warn:no-private-tilting}).
+
+\begin{algorithm}[H]
+\caption{$(\mathbf{S}^{\beta,\pi},\nu)\gets$~\texttt{SampleTree}$(\pi,\beta)$}
+\label{alg:sample-tree}
+\DontPrintSemicolon
+\tcc{Sampling procedure for the rollout tree of \cref{def:branched-rollout-tree}.}
+\KwParam{$\pi$, rollout profile; $\beta:\mathcal S\setminus\mathcal T\to[1,\infty)$, intensity}
+\KwOut{sampled sub-tree $\mathbf{S}^{\beta,\pi}\subseteq\mathcal S$ and transition laws $\nu$}
+Set $\mathbf{S}^{\beta,\pi}\gets\{\emptyset\}$ and $\mathcal F\gets\{\emptyset\}$\;
+\While{$\mathcal F\neq\emptyset$}{
+  Choose and remove some $\sigma$ from $\mathcal F$\;
+  \eIf{$\sigma$ is pre-terminal}{
+    Set the children of $\sigma$ in $\mathbf{S}^{\beta,\pi}$ to be $\emptyset$\;
+  }{
+    Let $K_\sigma \sim 1 + \operatorname{Poisson}\big(\beta(\sigma) - 1\big)$\;
+    Let
+    \[
+    (E_k)_{1 \leq k \leq K_\sigma} \stackrel{\mathsf{iid}}{\sim} \begin{cases}[l"l]
+      \mathbb{E}^\pi(\pi(\cdot\mid x_p, \sigma) \mid \sigma) & \textnormal{if } o(\sigma) \in \mathcal{P}\\
+      \mathbb{E}^\pi(\chi(\cdot\mid x, \sigma) \mid \sigma) & \textnormal{otherwise}
+    \end{cases}
+    \]\;
+    Set the subset of children of $\sigma$ in $\mathbf{S}^{\beta,\pi}$ to be $\{\sigma E_k : 1 \leq k \leq K_\sigma\}$\;
+    For every $e$ such that $\sigma e\in\mathbf{S}^{\beta,\pi}$, set $\nu(e\mid\sigma)\gets \frac{|\{k:E_k=e\}|}{K_\sigma}$\;
+    Add every child $\sigma e$ to $\mathcal F$\;
+  }
+}
+\Return{$(\mathbf{S}^{\beta,\pi},\nu)$}
+\end{algorithm}
+
+\begin{remark}[Practical Implementation]
+  Note that practically speaking, to sample the $E_k$, we first sample a private state $x$ conditioned on $\sigma$ (for example, in poker, we do this by rejection sampling), then we sample according to the chance rules and player strategies.
+  The deterministic ``$1+$'' is a \emph{spine}: it guarantees survival of every lineage, and at $\beta \equiv 1$ the tree is the set of nodes in a random trajectory $\Tau \sim \mathbb{P}^\pi(\cdot)$.
+\end{remark}
+
+\begin{definition}[Rollout tree]\label{def:branched-rollout-tree}
+Let $\beta : \mathcal S \setminus \mathcal T \to [1, \infty)$ be an intensity function and $(\mathbf{S}^{\beta,\pi},\nu) \gets \algcall{alg:sample-tree}{SampleTree}(\pi, \beta)$ be a random weighted sub-tree, seen as a Markov chain.
+We have a natural probability distribution
+\[
+  \mathbb{P}^{\beta, \pi}(x, \tau \mid \mathbf{S}^{\beta, \pi})
+  = \mathbb{P}^{\beta, \pi}(\tau \mid \mathbf{S}^{\beta, \pi}) \mathbb{P}^\pi(x \mid \tau)
+\]
+on $\mathcal{X} \times \mathcal{T}$ induced from this Markov chain and given by
+\begin{equation}\label{eq:branched-terminal-law}
+    \mathbb{P}^{\beta, \pi}(\tau \mid \mathbf{S}^{\beta, \pi}) = \prod_{\sigma a \preccurlyeq \tau} \nu(a \mid \sigma)
+\end{equation}
+From it, we can firstly define $P^{\beta, \pi} \in \mathcal{P}$ by
+\begin{equation}\label{eq:branched-player-law}
+  \mathbb{P}(P^{\beta, \pi} = p \mid \mathbf{S}^{\beta, \pi})
+  = \frac{\mathbb{E}^{\beta, \pi}(|\tau|_p \mid \mathbf{S}^{\beta, \pi})}
+    {\mathbb{E}^{\beta, \pi}(|\tau|_{\textnormal{player}} \mid \mathbf{S}^{\beta, \pi})}
+\end{equation}
+Secondly, we denote $\Sigma^{\beta, \pi}$ for the stationary random $P^{\beta, \pi}$-node of the Markov chain defined on the further sub-tree $\mathbf{S}^{\beta, \pi} \cap o^{-1}(P^{\beta, \pi})$.
+Thirdly, we let $A^{\beta, \pi} \sim \nu(\cdot \mid \Sigma^{\beta, \pi})$.
+And finally, we let
+\[
+  \Tau^{\beta, \pi, \mathsf{pre-c}} \sim
+  \frac{|\cdot|_{P^\pi} \mathbb{P}^{\beta, \pi}(\cdot \preccurlyeq \tau\mid \mathbf{S}^{\beta, \pi})}
+       {\mathbb{E}^{\beta, \pi}(|\tau|_{P^\pi} \mid \mathbf{S}^{\beta, \pi})}
+\]
+be a random pre-terminal trajectory continuing $\Sigma^{\beta, \pi} A^{\beta, \pi}$ defined by
+\begin{equation}\label{eq:branched-continuation-law}
+  \mathbb{P}(\Tau^{\beta, \pi} = \tau \mid \Sigma^{\beta, \pi} A^{\beta, \pi}, \mathbf{S}^{\beta, \pi})
+  = \mathbb{P}^{\beta, \pi}(\tau \mid \Sigma^{\beta, \pi} A^{\beta, \pi}, \mathbf{S}^{\beta, \pi})
+\end{equation} 
+and $X \sim \mathbb{P}^\pi(\cdot \mid \Tau^{\beta, \pi, \mathsf{pre-c}})$ be a random initial profile.
+It's easy to see that the law of $\Sigma^{\beta, \pi}$ is given by
+\begin{equation}\label{eq:branched-stationary-node-law}
+  \mathbb{P}(\Sigma^\pi = \sigma \mid P^{\beta, \pi}, \mathbf{S}^{\beta, \pi})
+  = \one_{o(\sigma) = P^{\beta, \pi}}
+    \frac{\prod_{\rho e \preccurlyeq \sigma} \nu(e \mid \sigma)}
+         {\mathbb{E}^{\beta, \pi}(|\tau|_{P^{\beta, \pi}} \mid \mathbf{S}^{\beta, \pi})}
+\end{equation}
+which is indeed a probability distribution.
+When $\beta$ and $\pi$ are clear from context, we write $\Bb$ instead of $\Bb^{\beta, \pi}$.
+\end{definition}
+
+\begin{lemma}[Terminal node distribution]\label{lem:branched-terminal-distribution}
+    We have
+    \begin{equation}\label{eq:branched-terminal-distribution}
+        \mathbb{E}(\mathbb{P}^{\beta, \pi}(\cdot \mid \mathbf{S}^{\beta, \pi})) = \mathbb{P}^\pi(\cdot)
+    \end{equation}
+\end{lemma}
+
+\begin{warning}[Don't sample a true hand!]\label{warn:no-private-tilting}
+    One might consider sampling $X$ first and then generating the sub-tree using the knowledge that $X$ is the true private state.
+    While this still satisfies the lemma above, it does \textbf{not} induce the same distribution of sub-trees.
+    The sub-trees sampled by this process would be ``self-correlated'': for $\sigma a, \sigma b\in \mathbf{S}$, the sub-trees $\mathbf{S}_{\sigma a \preccurlyeq}$ and $\mathbf{S}_{\sigma b \preccurlyeq}$ would not be independent.
+    While this allows us to compute Monte Carlo estimators for expected values (such as reward functions), it has much weaker guarantees of convergence due to the lack of locality.
+\end{warning}
+
+\paragraph{Variance-Based Intensities.}
+Using Neyman allocation principles, we target nodes with larger continuation variance.
+\begin{equation}\label{eq:branched-neyman-intensity}
+  \beta(\sigma) \propto \sqrt{\operatorname{tr}\Cov^\pi(\mathbf{R}(x,\tau)\mid\sigma)}.
+\end{equation}
+For player nodes, in order to estimate this variance, we two new heads:
+\begin{equation}\label{eq:V-vector-head}
+  \theta
+  \longmapsto
+  \mathbf V^\theta(\sigma)
+  \simeq
+  \mathbb{E}^\pi(\mathbf{R}(x,\tau)\mid \sigma)
+\end{equation}
+and
+\begin{equation}\label{eq:U-head}
+  \theta
+  \longmapsto
+  U^\theta(\sigma)
+  \simeq
+  \mathbb{E}^\pi(\|\mathbf{R}(x,\tau)\|_2^2\mid\sigma).
+\end{equation}
+We then use the identity
+\[
+  \operatorname{tr}\Cov^\pi(\mathbf{R}(x,\tau)\mid\sigma)
+  =
+  \mathbb{E}^\pi(\|\mathbf{R}(x,\tau)\|_2^2\mid\sigma)
+  -
+  \|\mathbb{E}^\pi(\mathbf{R}(x,\tau)\mid\sigma)\|_2^2.
+\]
+and define
+\[
+  s_k(\sigma)
+  :=
+  \sqrt{\left[U^{\theta_k}(\sigma)-\|\bar{\mathbf V}^{\theta_k}(\sigma)\|_2^2\right]_+}
+\]
+Practically speaking, we can't immidiately use these heads in training before they are somewhat trained.
+So we define on player nodes a function $b(\sigma) \in \mathcal{B}$ partitioning them into buckets.
+Then we define for $b \in \mathcal{B}$, some initial target branching intensity $\beta_{\tt fix}(b)$, and some maximum branching intensity $\beta_{\max}(b)$.
+During a warmup period, we use $\beta(\sigma) = \beta_{\tt fix}(b(\sigma))$.
+After this warmup period, for each bucket $b \in \mathcal{B}$, we define
+\[
+  \bar s_{k-1}(b)
+  :=
+  \frac{\sum_{\rho\in\mathbf S_{k-1}: b(\rho)=b}s_{k-1}(\rho)}
+       {\left|\{\rho\in\mathbf S_{k-1}: b(\rho)=b\}\right|}.
+\]
+and we use
+\[
+  \beta_k(\sigma)
+  :=
+  \clip\!\left(\beta_{\tt avg}(b(\sigma))\frac{s_k(\sigma)}{\bar s_{k-1}(b(\sigma))},1,\beta_{\max}\right)
+\]
+If the denominator is zero, we default to $\beta_{\tt fix}(\sigma)$.
+At chance nodes, keep fixed branching intensities to avoid introducing a new model.
+
+\paragraph{Primitive Functions.}
+Back to a synchronous rollout training, we fix weights $\theta_0,\ldots, \theta_k$.
+We let $\mathbf{S}$, $P$, $\Sigma$, $A$, $\Tau^{\mathsf{pre-c}}$ and $X$ be as above for $\pi = \pi^{\theta_k}$.
+For a player node $\sigma a \in \mathbf{S}$, $p  = o(\sigma)$ and $x_p \in X$, we define the estimators
+\begin{equation}[rCl]
+    \widehat{Q}^\lambda(x_p, \sigma a) &=&
+    \mathbb{E}^{\beta, \pi}\left(
+        \lambda^{|\tau \setminus \sigma|_p} R_p(x, \tau) \middle| x_p, \sigma a
+    \right)\nonumber\\
+    &&\quad+
+    (1 - \lambda) \mathbb{E}^{\beta, \pi}(|\tau \setminus \sigma|_{p} \mid \sigma a)
+    \mathbb{E}\left(
+        \lambda^{|\Sigma \setminus \sigma|_p - 1} V^{\theta_k}(X_p,\Sigma)
+        \middle|
+        \sigma a \preccurlyeq \Sigma, P = p, \mathbf{S}
+    \right)
+    \nonumber\\
+    \widehat{V}^\lambda(x_p, \sigma)
+    &=&
+    \mathbb{E}^{\beta, \pi}\left(
+        \lambda^{|\tau \setminus \sigma|_p} R_p(x, \tau) \middle| x_p, \sigma
+    \right)\nonumber\\
+    &&\quad+
+    (1 - \lambda) \mathbb{E}^{\beta, \pi}(|\tau \setminus \sigma|_{p} \mid \sigma)
+    \mathbb{E}\left(
+        \lambda^{|\Sigma \setminus \sigma|_p - 1} V^{\theta_k}(X_p,\Sigma)
+        \middle|
+        \sigma \prec \Sigma, P = p, \mathbf{S}
+    \right)
+    \nonumber\\
+    \widehat{\mathbf{V}}^\lambda(\sigma)
+    &=&
+    \mathbb{E}^{\beta, \pi}\left(
+        \lambda^{|\tau \setminus \sigma|_{\textnormal{player}}} \mathbf{R}(x, \tau) \middle| \sigma
+    \right)\nonumber\\
+    &&\quad+
+    (1 - \lambda) \mathbb{E}^{\beta, \pi}(|\tau \setminus \sigma|_{\textnormal{player}} \mid \sigma)
+    \mathbb{E}\left(
+        \lambda^{|\Sigma \setminus \sigma|_{\textnormal{player}}}\mathbf{V}^{\theta_k}(\Sigma)
+        \middle|
+        \sigma \prec \Sigma, \mathbf{S}
+    \right)
+    \nonumber\\
+    \widehat{U}^\gamma(\sigma) &=& \mathbb{E}^{\beta, \pi}\left(
+        \lambda^{|\tau \setminus \sigma|_{\textnormal{player}}-1} \|R(x, \tau)\|_2^2 \middle| \sigma
+    \right)\nonumber\\
+    &&\quad+
+    (1 - \lambda) \mathbb{E}^{\beta, \pi}(|\tau \setminus \sigma|_{\textnormal{player}} \mid \sigma)
+    \mathbb{E}\left(
+        \lambda^{|\Sigma \setminus \sigma|_{\textnormal{player}}-1} U^{\theta_k}(\Sigma)
+        \middle|
+        \sigma \prec \Sigma, \mathbf{S}
+    \right)
+    \label{eq:branched-targets}
+\end{equation}
+which are unbiased by \autoref{lem:branched-terminal-distribution} (assuming that the $V$ and $U$ heads are perfect) and can be computed by backward propagation (see algorithm below).
+
+Now say we have a current parameter $\theta$.
+For a sampled $(P, \Sigma)$ and $a \in \mathcal{E}_\Sigma$ in the tree $\mathbf{S}$, and for $x_P \in \mathcal{X}_P$, we then let $\widehat{Q}(x_P, a) = \widehat{Q}^\lambda(x_P, \Sigma a)$, $\widehat{A}^\lambda(x_P, a) = \widehat{Q}(x_P, a) - V^\theta(x_P, \Sigma)$, $\widehat{V}(x_P) = \widehat{V}^\lambda(x_P, \Sigma)$, $\widehat{\mathbf{V}}^\lambda=\widehat{\mathbf{V}}^\lambda(\Sigma)$ and $\widehat{U} = \widehat{U}^\lambda(\Sigma)$.
+We also define new loss function
+\begin{equation}\label{eq:branched-u-loss}
+\begin{aligned}
+    \mathcal L_{\tt U}[\widehat{U}^\lambda]
+    &= c_U\left(U^\theta(\Sigma) - \widehat{U}^\lambda\right)^2,\\
+    \mathcal L_{\mathbf V}[\widehat{\mathbf{V}}^\lambda]
+    &= c_{\mathbf V}\|\mathbf{V}^\theta(\Sigma)-\widehat{\mathbf{V}}^\lambda\|_2^2.
+\end{aligned}
+\end{equation}
+as well as $\mathcal L_{\tt U-clip}$ and $\mathcal L_{\mathbf{V}\tt-clip}$, defined analogously to $\mathcal L_{\tt V-clip}$.
+
+\begin{algorithm}[H]
+\caption{$(\widehat{\mathbb{P}},\widehat{V},\widehat{\mathbf{V}}, \widehat{U})\gets$~\texttt{PreTerminalMomentMC}$(\mathfrak r)$}
+\label{alg:mc-preterminal-moments}
+\DontPrintSemicolon
+\tcc{Black-box Monte Carlo completion from public pre-terminal prefixes, including the squared-norm moment.}
+\KwParam{$\mathfrak r$, reach cache}
+\KwHyper{Monte Carlo budget}
+\KwOut{$(\widehat{\mathbb{P}^{\mathfrak r}},\widehat{V},\widehat{\mathbf{V}}, \widehat{U})$}
+  Use a Monte Carlo simulation to sample $(X,\Tau) \sim \mathbb{P}^{\mathfrak r}$ with
+  \[
+    \mathbb{P}^{\mathfrak r}(x,\tau)
+    =
+    \frac{\prod_{q \in [P] \cup \{c\}} r_q(\tau \mid x_q)}
+         {\sum_y \prod_{q \in [P] \cup \{c\}} r_q(\tau \mid y_q)}
+  \]\;
+  Store statistical occurrence $(\widehat{\mathbb{P}^{\mathfrak r}}(x_p))_{\substack{p \in \mathcal{P} \\ x_p \in \mathcal{X}_p}}$, statistical average
+  \[
+    \left(\widehat{V}(x_p) \simeq \mathbb{E}(R_p(X,\Tau) \mid X_p = x_p)\right)_{\substack{p \in \mathcal{P} \\ x_p \in \mathcal{X}_p}}
+  \]
+  and statistical average
+  \[
+    \widehat{U} \simeq \mathbb{E}(\|\mathbf{R}(X,\Tau)\|_2^2)
+  \]\;
+  Compute $\widehat{\mathbf{V}} \gets \left(\widehat{\mathbb{P}^{\mathfrak r}}(-_p) \cdot \widehat{V}(-_p)\right)_{p \in \mathcal{P}}$\;
+\Return{$(\widehat{\mathbb{P}^{\mathfrak r}},\widehat{V},\widehat{\mathbf{V}}, \widehat{U})$}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$(\widehat{\mathbb{P}}, \widehat{Q}^\lambda, \widehat{V}^\lambda, \widehat{\bar{\mathbf V}}^\lambda, \widehat{U}^\lambda) \gets$~\texttt{BranchedValue}$(\mathbf{S}, V, \mathbf{V}, U, r)$}
+\label{alg:branched-value}
+\DontPrintSemicolon
+\tcc{Backward Propagation of Value Estimators.}
+\KwParam{$\mathbf{S}^{\beta, \pi}$, sampled sub-tree; $V$, $\mathbf{V}$, $U$, value heads; $r$, reach probabilities}
+\KwHyper{$\lambda$, GAE horizon}
+\KwOut{$(\widehat{\mathbb{P}}, \widehat{Q}^\lambda, \widehat{V}^\lambda, \widehat{\bar{\mathbf V}}^\lambda, \widehat{U}^\lambda)$}
+\For{$\tau^{\mathsf{pre-c}} \in \mathbf{S}^{\beta, \pi}$}{
+    Monte Carlo estimation of
+    \begin{equation}[rCl]
+        \widehat{\mathbb{P}}(x_p \mid \tau^{\mathsf{pre-c}}) &\simeq& \mathbb{P}^\pi(x_p \mid \tau^{\mathsf{pre-c}})
+        \nonumber\\
+        \widehat{V}_p(x_p, \tau^{\mathsf{pre-c}}) &\simeq& \mathbb{E}^\pi(R_{p}(x, \tau) \mid \tau^{\mathsf{pre-c}}, x_p)
+        \nonumber\\
+        \widehat{U}(\tau^{\mathsf{pre-c}}) &\simeq& \mathbb{E}^\pi(\|\mathbf{R}(x, \tau)\|_2^2 \mid \tau^{\mathsf{pre-c}})
+        \nonumber\\
+        \widehat{\mathbf V}(\tau^{\mathsf{pre-c}}) &\simeq& \mathbb{E}^\pi(\mathbf{R}(x,\tau)\mid \tau^{\mathsf{pre-c}})
+        \label{eq:branched-moment-terminal-estimates}
+    \end{equation}   
+    for $p \in \mathcal{P}$ and $x_p \in \mathcal{X}_p$ using $\algcall{alg:mc-preterminal-moments}{PreTerminalMomentMC}(\mathfrak{r})$\;
+}
+\For{$\sigma \in \mathbf{S}^{\beta, \pi}$ backward}{
+  Compute
+  \begin{equation}[rCl]
+    \widehat{\mathbb{P}}(x_p \mid \sigma)
+    &\gets&
+    \sum_{\sigma a \in \mathbf{S}^{\beta, \pi}} \nu(a \mid \sigma) \widehat{\mathbb{P}}(x_p \mid \sigma a)
+    \nonumber\\
+    \widehat{V}_p(x_p,\sigma)
+    &\gets&
+    \sum_{\sigma a \in \mathbf{S}^{\beta, \pi}} \nu(a \mid \sigma) \widehat{V}_p(x_p,\sigma a)
+    \nonumber\\
+    \widehat{U}(\sigma)
+    &\gets&
+    \sum_{\sigma a \in \mathbf{S}^{\beta, \pi}} \nu(a \mid \sigma)\widehat{U}(\sigma a)
+    \nonumber\\
+    \widehat{\mathbf V}(\sigma)
+    &\gets&
+    \sum_{\sigma a \in \mathbf{S}^{\beta, \pi}} \nu(a \mid \sigma)\widehat{\mathbf V}(\sigma a)
+    \label{eq:branched-backward-updates}
+  \end{equation}
+  for $p \in \mathcal{P}$ and $x_p \in \mathcal{X}_p$\;
+  \If{$o(\sigma) \in \mathcal{P}$}{
+      $p \gets o(\sigma)$,\;
+      \For{$\sigma a \in \mathbf{S}^{\beta, \pi}$}{
+        $\widehat{Q}(x_p,\rho a) \gets \widehat{V}_p(x_p,\rho a)$
+      }
+      $\widehat{V}(x_p,\sigma) \gets \widehat{V}_p(x_p,\sigma)$\;
+      Store current values $\mathcal{O} \gets \mathcal{O} \sqcup \left((\widehat{\mathbb{P}}(x_p \mid \sigma), (\widehat{Q}(x_p, \sigma a))_{\sigma a \in \mathbf{S}^{\beta, \pi}}, \widehat{V}(x_p, \sigma))_{x_{p} \in \mathcal{X}_{p}}, \widehat{\mathbf V}(\sigma), \widehat{U}(\sigma)\right)$\;
+      Compute
+      \begin{equation}[rCl]
+        \widehat{V}_p(x_p,\sigma) &\gets& \lambda \widehat{V}_p(x_p,\sigma) + (1-\lambda) V(x_p,\sigma)
+        \nonumber\\
+        \widehat{\mathbf V}(\sigma) &\gets& \lambda \widehat{\mathbf V}(\sigma) + (1-\lambda) \mathbf{V}(\sigma)
+        \nonumber\\
+        \widehat{U}(\sigma) &\gets& \lambda \widehat{U}(\sigma) + (1-\lambda) U(\sigma)
+      \end{equation}
+  }
+}
+\Return{$(\widehat{\mathbb{P}}(x_p \mid \sigma), \widehat{Q}(x_{o(\sigma)}, \sigma a), \widehat{V}(x_{o(\sigma)}, \sigma), \widehat{\mathbf V}(\sigma), \widehat{U}(\sigma))_{\substack{\sigma a \in \mathbf{S} \\ x_{o(\sigma)} \in \mathcal{X}_{o(\sigma)}}}$}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$(\theta_k)_{k\ge0}\gets$~\texttt{BranchedRaoBlackwellPG}$(\theta_0)$}
+\label{alg:branched-rao-blackwell-pg}
+\DontPrintSemicolon
+\tcc{Tree-valued generalization of the sequential Rao--Blackwellized template; $\beta\equiv1$ recovers it exactly.}
+\KwParam{$\theta_0$, initial weights; $\theta$, working copy of the next iterate}
+\KwHyper{$N$, tree count; $B$, minibatch size; $M$, node budget; $\lambda$; $\beta_{\max}$; $\delta$, support target}
+\KwHyper{$\beta_{\tt fix}$, $\beta_{\tt avg}$, $k_{\tt warm}$; chosen number of gradient-descent steps per iterate}
+\KwOut{$(\theta_k)_{k\ge0}$}
+\For{$k=0,1,2,\dots$}{
+  Define $\beta_k=\beta_k^{U,\bar V}$ from frozen public moment heads $U^{\theta_k}, \mathbf{V}^{\theta_k}$ and previous-bucket means.\;
+  Sample $\mathbf{S} = \mathbf{S}^{\beta_k, \pi^{\theta_k}}$ using $\algcall{alg:sample-tree}{SampleTree}(\pi^{\theta_k},\beta_k)$\;
+  Compute \algcall{alg:branched-value}{BranchedValue}($\mathbf{S}, V^{\theta_k}, \mathbf{V}^{\theta_k}, U^{\theta_k}, r$)\;
+  \For{each gradient-descent step}{
+    Sample $(P_b, \Sigma_b)_{b=1}^B \stackrel{\mathsf{iid}}{\sim} (P, \Sigma)$\;
+    Deduce $\widehat{Q}_b(x_{P_b}, a)$, $\widehat{V}_b(x_{P_b})$, $\widehat{\mathbf V}_b$ and $\widehat{U}_b$\;
+    Estimate
+    \begin{equation}[rCl]
+      \widehat{l}(\theta)
+      &=& \frac{1}{B}\sum_{b=1}^B\sum_{\substack{x_{P_b} \\ \Sigma a \in \mathbf{S}}}
+        \mathcal{L}^\pi\left(
+        (\pi^\theta, V^\theta,\pi^{\theta_k}, V^{\theta_k})(x_{P_b}, \Sigma_b),
+        a,
+        \widehat{Q}_b(x_{P_b}, a)
+        \right)
+        \widehat{\mathbb{P}}(x_{P_b} \mid \Sigma_b)
+        \nu(a \mid \Sigma_b)
+      \nonumber\\
+      && + \frac{1}{B}\sum_{b=1}^B\sum_{x_{P_b}}
+      \mathcal{L}^{V}\left(
+        (V^\theta, V^{\theta_k})(x_{P_b}, \Sigma_b),
+        \widehat{V}_b(x_{P_b})
+        \right)\widehat{\mathbb{P}}(x_{P_b} \mid \Sigma_b)
+      \nonumber\\
+      && + \frac{1}{B}\sum_{b=1}^B
+      \mathcal{L}^{\mathbf{V}, U}\left(
+        (\mathbf{V}_b^\theta, U^\theta_b, \mathbf{V}_b^{\theta_k}, U^{\theta_k}_b)(\Sigma_b)
+        \widehat{\mathbf V}_b,
+        \widehat{U}_b
+        \right)
+        \label{eq:branched-minibatch-loss}
+    \end{equation}\;
+    Descend $\theta$ along $\nabla_\theta \widehat{l}(\theta)$\;
+  }
+  Store $\theta_{k+1} \gets \theta$\;
+}
+\Return{$(\theta_k)_{k\ge0}$}
+\end{algorithm}
+
+Note that we split the loss function above as there are three different level of dependencies for a sampled $(P, \Sigma)$: $(x_{P}, a)$, $(x_{P})$ and $\varnothing$.
+Also note that sampling the $\Sigma_b$'s might not be trivial: we might want to build an alias table as we construct the tree $\mathbf{S}$.
+
+\section{Poker: a Perfect Example}
+
+We focus on $6$-max Texas Hold'em cash poker, no ante, straddle or rake, with exactly $100$ big blinds per player.
+We don't simplify the game any further: all actions are allowed.
+Below are a few core variables:
+\begin{equation*}[rCl]
+  |\mathcal{P}| &=& 6\\
+  \mathcal{P} &=& \{\texttt{sb, bb, utg, hij, lo, btn}\}\\
+  \mathcal{D} &=& \{0,\ldots, 51\}\\ %deck
+  \mathcal{X}_p &=& \mathcal{H} = \binom{\mathcal{D}}{2}\\
+  \mu &=& \mathsf{Unif}(\{x \in \mathcal{X} \mid \sqcup_p x_p \})\\
+  \mathsf{B} &\in& \binom{\mathcal{D}}{3} \textnormal{ or } \binom{\mathcal{D}}{4} \textnormal{ or } \binom{\mathcal{D}}{5}\\ %board
+  \mathsf{C} &=& \sqcup_p x_p \sqcup \mathsf{B}\\ %used cards
+  \chi(\cdot \mid x, \textnormal{flop}) &=& \mathsf{Unif}\left(\binom{\mathcal{D} \setminus \mathsf{C}}{3}\right)\\
+  \chi(\cdot \mid x, \textnormal{turn}) &=& \mathsf{Unif}\left(\binom{\mathcal{D} \setminus \mathsf{C}}{1}\right)\\
+  \chi(\cdot \mid x, \textnormal{river}) &=& \mathsf{Unif}\left(\binom{\mathcal{D} \setminus \mathsf{C}}{1}\right)
+\end{equation*}
+
+Several specificities impact our implementation:
+\begin{enumerate}
+  \item We feed the model \textbf{redundant} information by feeding it both the public state $\sigma$ and the Bayesian-updated ranges $\mathfrak{r}$.
+  
+  \item The game of poker has a strong \textbf{preflop gauge symmetry}: any suit permutation should leave the strategy invariant.
+  Instead of $1326$ possible private player states, there are $169$.
+  We exploit this by having a separate model for preflop and postflop, making it impossible for the model to not pick actions invariants under this transformation preflop.
+  Optionally, we can also exploit this symmetry in the Monte Carlo estimators (see below) by storing the $4!$ suit permutations of each sampled private state and board into the accumulated statistics (this can be considered if possible with minimal wrap divergence).
+  
+  \item The \textbf{\textbf{preflop gauge symmetry}} is harder to handle as it acts on the board which is an input.
+  Optionally, we can add a loss function term that: samples a random suit permutation, applies it to the model inputs, and penalizes the difference between the re-permutated outputs and the original outputs.
+  This adds one forward pass per sample, which shouldn't be too expensive compared to the cost of a backward pass. 
+  
+  \item In \textbf{postflop} states, to control the size of the input, we actually only feed the ranges of the \textbf{live} players (meaning those who have not folded yet and are thus still eligible to win part of the pot).
+  We feed the model information about folded players by exploiting the very architecture of attention heads (see subsection to come on cluster expansions and Möbius expansions).
+  This adds a computational step which can be seen as the first step of the model (and can be launched in the same batches as the model itself).
+
+  \item The model is a multi-headed attention transformer model, with one token per pair $(p,h)$ (for $p$ only a live player postlfop), one token for each piece of public information, and one taken per \textbf{action mode}.
+  The tokens corresponding to action $a$ and pair $(p_{\textnormal{acting}, h})$ are used to output propensity for $a$ to be played with hand $h$.
+
+  \item As a consequence, we need to either:
+  \begin{enumerate}
+    \item \textbf{Memory Pressure:} during rollout, store the live ranges of each rolled-out state, so they can be fed to the minibatch samples as inputs
+    \item \textbf{Redundant Computations:} during minibatches, recompute the live ranges of each samples state $\Sigma$ by quickly walking back the tree from $\Sigma$ to $\emptyset$, and doing $\odot$-Bayesian updates along the way.
+  \end{enumerate}
+
+  \item Three operations are already implemented in \texttt{CUDA} and \texttt{C++} in a separate repository:
+  \begin{enumerate}
+    \item The \textbf{folded statistics} to be fused with the model as its first step.
+    This is \textbf{only} used: right after a player folded (otherwise can be stored and passed down the trajectory), and postlfop (preflop we can afford feeding the model all ranges). 
+    \item A \textbf{rejection sampler} to be used exclusively for the branching rollout, and to be fused with the model as its last step,
+    \item A \textbf{Monte Carlo estimator} of equity and posteriors, which will be used for both quantum versions after rollouts are completed, and before backpropagation to compute $\widehat{Q}$, $\widehat{V}$, \ldots
+  \end{enumerate} 
+  Folded statistics might be more efficiently computed by the CPU considering that they are only randomly necessary.
+  The other two operations should really be GPU-based.
+
+  \item We implement a synchronous rollout that is heavily computed by GPUs (typically a node of 2-4).
+  We maintain a queue of states to be rolled out, and we roll them out in batches (two types of batches: one for preflop, one for postflop).
+
+  \item \textbf{Loss Function:} we a clipped \texttt{PPO} loss, with an optional \texttt{KL} term to an older reference index $\refp(k)$, an entropy term to encourage exploration (to be faded away throughout training), and loss terms for each of the value heads:
+  \[
+    \mathcal L_{\tt clip}[\widehat A^\lambda]+\mathcal L_{\tt H} + \mathcal L_{\tt KL} + \mathcal L_{\tt V}[\widehat V^\lambda] + \mathcal L_{\tt U}[\widehat U^\lambda]+\mathcal L_{\mathbf V}[\widehat{\mathbf V}^\lambda]
+  \]
+  Ideally, the implementation should allow the user to pick any loss function.
+
+  \item Ideally, the implemtation should be clearly modular: it will be used for poker, but must be easily adaptable to other PBGs.
+\end{enumerate}
+
+\end{document}
