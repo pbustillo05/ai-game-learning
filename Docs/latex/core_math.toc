@@ -1,0 +1,23 @@
+\contentsline {section}{\numberline {1}Introduction}{2}{section*.2}%
+\contentsline {section}{\numberline {2}Game-Theoretical Model}{2}{section*.8}%
+\contentsline {section}{\numberline {3}Self-Play Policy-Gradient Methods in Synchronous Rollouts}{4}{section*.27}%
+\contentsline {subsection}{\numberline {3.1}Theoretical Model}{4}{subsection*.28}%
+\contentsline {paragraph}{Assumptions.}{5}{section*.36}%
+\contentsline {paragraph}{Primitives.}{5}{section*.40}%
+\contentsline {paragraph}{Relation to \autoref {thm:policy-gradient-games}.}{6}{section*.43}%
+\contentsline {paragraph}{Practicality.}{6}{section*.44}%
+\contentsline {subsection}{\numberline {3.2}Usual Implementation}{6}{subsection*.45}%
+\contentsline {paragraph}{Primitives.}{7}{section*.62}%
+\contentsline {paragraph}{Choices.}{7}{section*.66}%
+\contentsline {paragraph}{Implementation.}{7}{section*.67}%
+\contentsline {subsection}{\numberline {3.3}Rao--Blackwellization of the Private State}{8}{subsection*.88}%
+\contentsline {paragraph}{Motivation.}{8}{section*.89}%
+\contentsline {paragraph}{Theory in the Ideal Setup.}{9}{section*.108}%
+\contentsline {paragraph}{Primitives.}{10}{section*.111}%
+\contentsline {paragraph}{Monte Carlo Methods.}{10}{section*.113}%
+\contentsline {subsection}{\numberline {3.4}Variance-Guided Branching}{11}{subsection*.141}%
+\contentsline {paragraph}{Branched Rollouts.}{12}{section*.142}%
+\contentsline {paragraph}{Variance-Based Intensities (naïve version).}{14}{section*.173}%
+\contentsline {paragraph}{Primitive Functions.}{14}{section*.181}%
+\contentsline {paragraph}{Variance-Minimizing Sampling.}{18}{section*.233}%
+\contentsline {section}{\numberline {4}Poker: a Perfect Example}{19}{section*.238}%

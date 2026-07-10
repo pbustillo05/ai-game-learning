@@ -1,0 +1,113 @@
+%%%%% IMPORT IEEE
+\usepackage{IEEEtrantools}
+
+%%%%% IEEE SETTINGS
+\renewcommand{\IEEEproofindentspace}{0em}   %no indent in "IEEEproof"
+\renewcommand{\IEEEQED}{\openbox}   %same QED symbol for "IEEEproof" as for "proof"
+\makeatletter
+    %%point instead of colon after the word "Proof"
+    \def\@IEEEproof[#1]{\@IEEEQEDshowtrue\par\noindent\hspace{\IEEEproofindentspace}{\itshape #1. }}
+    %%create hidden number and label with anchor for "equation"
+    % \bgroup
+    % \def\@currentlabel{\p@equation\theequation}\relax
+    % \def\@currentHref{\@IEEEtheHrefequation}\label{#1}\relax
+    % \Hy@raisedlink{\hyper@anchorstart{\@currentHref}}\relax
+    % \Hy@raisedlink{\hyper@anchorend}\egroup
+    \def\IEEElabelanchoreqn#1{%
+        \def\@currentlabel{\p@equation\theequation}%
+        \def\@currentlabel{\p@equation\theequation}%
+        \@ifundefined{mylabel}{\label{#1}}{\mylabel{#1}}%
+    }
+    %%uses previous commands and activates subnumbering
+    \newcommand{\blocklabel}[1]{\IEEEyesnumber\IEEElabelanchoreqn{#1}\IEEEyessubnumber*}
+    
+    %%allow for customisable tags in "equation" for each line (to put before a label)
+    \newcommand\eqtag[1]{%
+        \def\@currentlabel{#1}%
+        \gdef\tmp{%
+            \addtocounter{equation}{-1}%
+            \def\theequation{#1}}%
+        \aftergroup\aftergroup\aftergroup\aftergroup\aftergroup\aftergroup
+        \aftergroup\aftergroup\aftergroup\aftergroup\aftergroup\aftergroup
+        \aftergroup\aftergroup\aftergroup\aftergroup\aftergroup\aftergroup
+        \aftergroup\aftergroup\aftergroup\aftergroup\aftergroup\aftergroup
+        \aftergroup\aftergroup\aftergroup\aftergroup\aftergroup\aftergroup
+        \aftergroup
+        \tmp}
+\makeatother
+%%faster macro names for basic commands (more can be added)
+\AtBeginDocument{
+    \newcommand\mulitcol\IEEEeqnarraymulticol
+    \newcommand\numspace\IEEEeqnarraynumspace
+    \newcommand\eqbreak{\IEEEnonumber\\}
+    \renewcommand\yesnumber\IEEEyesnumber
+    \newcommand\yessubnumber\IEEEyessubnumber
+    \renewcommand\nonumber\IEEEnonumber
+    \newcommand\nosubnumber\IEEEnosubnumber
+    \let\eqomit\IEEEeqnarrayomit
+    \renewcommand\qedhere\IEEEQEDhere
+}
+
+%%%%% NEW MATH ENVIRONMENTS: equation, equationfit, arraybox, cases and proof (which technically is more a "theorem" environment)
+%%The optional arguments might be "dangerous" as the author could try to use "[" in the beginning of the formula... mathtool has a fix for this that I could try stealing.
+%%begin novalidate
+\RenewDocumentEnvironment{equation}{ s O{c} O{} }
+{%
+    \IfBooleanTF{#1}{\begin{IEEEeqnarray*}[#3]{#2}}{\begin{IEEEeqnarray}[#3]{#2}}
+}{%
+    \IfBooleanTF{#1}{\end{IEEEeqnarray*}}{\end{IEEEeqnarray}}
+}
+\ExplSyntaxOn
+\cs_gset:cpn {equation*} {\equation*}
+\cs_gset_eq:cN {endequation*} \endequation
+\ExplSyntaxOff
+
+\newlength{\mylength}
+\newsavebox{\mybox}
+\NewDocumentEnvironment{equationfit*}{ O{c} O{} O{c} O{\relax} +b } %doesn't allow for tags and numbers unfortunately... but it works so not so bad I'd say
+{%
+    \sbox{\mybox}{%
+        \ensuremath{\displaystyle%
+            \begin{IEEEeqnarraybox}[#2][#3][#4]{#1}%
+                #5%
+            \end{IEEEeqnarraybox}%
+        }%
+    }%
+    \settoboxwidth{\mylength}{\mybox}%
+    \ifdimcomp{\the\linewidth}{>}{\the\mylength}{%
+        \begin{IEEEeqnarray*}{c}%
+            \begin{IEEEeqnarraybox}[#2][#3][#4]{#1}%
+                #5%
+            \end{IEEEeqnarraybox}%
+        \end{IEEEeqnarray*}%
+    }{%
+        \begin{IEEEeqnarray*}{c}%
+            \resizebox{\linewidth}{!}{%
+                \ensuremath{\displaystyle%
+                    \begin{IEEEeqnarraybox}[#2][#3][#4]{#1}%
+                        #5%
+                    \end{IEEEeqnarraybox}%
+                }%
+            }%
+        \end{IEEEeqnarray*}%
+    }%
+}{}
+
+\NewDocumentEnvironment{arraybox}{ O{c} O{} O{c} O{\relax} }
+{\begin{IEEEeqnarraybox}[#2][#3][#4]{#1}}
+{\end{IEEEeqnarraybox}}
+
+\RenewDocumentEnvironment{cases}{ O{c} O{} O{c} O{\relax} }
+{%
+    \setlength{\nulldelimiterspace}{0pt}%
+    \left\{\begin{IEEEeqnarrayboxm}[#2][#3][#4]{#1}%
+        \IEEEstrut%
+}{%
+        \IEEEstrut%
+    \end{IEEEeqnarrayboxm}\right.%
+}
+
+% \RenewDocumentEnvironment{proof}{ o }
+% {\IfNoValueTF{#1}{\begin{IEEEproof}}{\begin{IEEEproof}[Proof of \refNamenumber{#1}]}}
+% {\end{IEEEproof}}
+%%end novalidate

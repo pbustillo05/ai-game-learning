@@ -1,0 +1,48 @@
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{../preamble/project-macros}[2026/07/06 Poker AI shared macros]
+
+%%%%% Probability and analysis
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Pbb}{\mathbb{P}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\one}{\mathbbm{1}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\norminf}[1]{\left\lVert #1 \right\rVert_{\infty}}
+\newcommand{\sg}{\operatorname{sg}}
+\newcommand{\clip}{\operatorname{clip}}
+
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator{\Cov}{Cov}
+\DeclareMathOperator{\supp}{supp}
+\DeclareMathOperator{\ESS}{ESS}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator{\KLop}{KL}
+\newcommand{\KL}[2]{D_{\mathrm{KL}}\!\left(#1\,\middle\|\,#2\right)}
+\DeclareMathOperator{\Ent}{H}
+
+%%%%% Common neural-network operators
+\DeclareMathOperator{\softmax}{softmax}
+\DeclareMathOperator{\sigmoid}{sigmoid}
+\DeclareMathOperator{\softplus}{softplus}
+\DeclareMathOperator{\GELU}{GELU}
+\DeclareMathOperator{\LN}{LN}
+\DeclareMathOperator{\MHA}{MHA}
+\DeclareMathOperator{\FFN}{FFN}
+\DeclareMathOperator{\DLogisticTick}{DLogisticTick}
+
+%%%%% Poker and game-theory notation
+\newcommand{\Hh}{\mathcal{H}}
+\newcommand{\Aa}{\mathcal{A}}
+\newcommand{\Pp}{\mathcal{P}}
+\newcommand{\Cc}{\mathcal{C}}
+\newcommand{\Ff}{\mathcal{F}}
+\newcommand{\Bb}{\mathcal{B}}
+\newcommand{\Tau}{\mathsf{T}}
+\newcommand{\old}{\mathrm{old}}
+\newcommand{\refp}{\mathrm{ref}}
+\newcommand{\Usf}{\mathsf{U}}
+\newcommand{\Vsf}{\mathsf{V}}
+\newcommand{\Rbar}{\overline{R}}
+\newcommand{\leaves}{\partial}
+\newcommand{\reach}{\eta}
+\newcommand{\pub}{\mathrm{pub}}

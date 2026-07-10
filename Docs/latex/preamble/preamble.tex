@@ -1,0 +1,95 @@
+%%%%% 1. CORE CONFIGURATION
+\usepackage{expl3,xparse}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[table,dvipsnames]{xcolor}
+\usepackage{geometry}
+\geometry{a4paper,total={170mm,257mm},left=20mm,top=20mm,marginparwidth=20mm}
+
+%%%%% 2. UTILITIES
+\usepackage{etoolbox}
+\usepackage{settobox}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{float}
+\usepackage{abstract}
+\usepackage{fancyhdr}
+\usepackage[textwidth=16.3mm,textsize=scriptsize]{todonotes}
+    \newcommand*{\newcommentator}[2][red!20]{%
+        \expandafter\newcommand\csname #2\endcsname[1]{\todo[color=#1]{{\bf\makefirstuc{#2}:} ##1}}%
+        \expandafter\newcommand\csname big#2\endcsname[1]{\todo[inline,color=#1]{{\bf\makefirstuc{#2}:} ##1}}}
+    \newcommentator{pablo}
+    \newcommentator[blue!20]{arka}
+
+
+%%%%% 3. GRAPHICS
+\usepackage{graphicx}
+
+%%%%% 4. MATH & FONTS
+\usepackage{amssymb,amsmath}
+\numberwithin{equation}{section}
+\usepackage{mathtools}
+\usepackage{mleftright}
+\mleftright
+\usepackage{stackrel}
+\usepackage{bm}
+\usepackage{bbm}
+
+%%%%% 5. ALGORITHMS
+\usepackage[linesnumbered,ruled]{algorithm2e}
+
+%%%%% 6. PROJECT MATH ENVIRONMENTS AND MACROS
+\usepackage{../preamble/mathenv}
+\usepackage{../preamble/project-macros}
+
+%%%%% 7. BIBLIOGRAPHY AND LINKS
+\usepackage[numbers]{natbib}
+\usepackage[pdfencoding=auto]{hyperref}
+\hypersetup{
+  bookmarksopen = true,
+  bookmarksnumbered = true,
+  linktoc = all,
+  hypertexnames = false,
+  hidelinks,
+  pdftitle = {AI and Poker: From Reinforcement Learning to Nash Equilibrium},
+  pdfauthor = {},
+}
+\def\figureautorefname{Figure}
+
+%%%%% 8. THEOREM ENVIRONMENTS
+\usepackage{../preamble/thmenv}
+\usepackage[nameinlink]{cleveref}
+\crefname{algocf}{algorithm}{algorithms}
+\Crefname{algocf}{Algorithm}{Algorithms}
+
+%%%%% 9. ALGORITHM STYLE
+\SetAlCapSkip{0.8em}
+\SetKwInput{KwIn}{Input}
+\SetKwInput{KwOut}{Output}
+\SetKwInput{KwInit}{Initialise}
+\SetKwInput{KwHyper}{Hyperparameters}
+\SetKwInput{KwParam}{Parameters}
+\SetKwInput{KwCost}{Cost}
+\newcommand{\algcall}[2]{\hyperref[#1]{\texttt{#2}}}
+\newcommand\mycommfont[1]{\footnotesize\ttfamily\textcolor{blue!70!black}{#1}}
+\SetCommentSty{mycommfont}
+
+%%%%% 10. PAGE STYLE
+\setlength{\headheight}{14.5pt}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small AI and Poker}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\title{%
+  \LARGE\bfseries AI and Poker:\\
+  From Reinforcement Learning to Nash Equilibrium\\[0.8em]
+  \large A Mathematical Synthesis
+}
+\author{}
+\date{May 2026}

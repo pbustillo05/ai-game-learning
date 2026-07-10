@@ -5,8 +5,11 @@
 1. **Fresh context per prompt.** Paste, in order: `PREAMBLE.md`, then the
    current repo's `IMPLEMENTATION_NOTES.md` (it stays short — it's the only
    cross-prompt memory), then the prompt file. Nothing else. Do NOT paste
-   `core_math.tex` / `blocker_model.md` / `folder_impact.md` — every needed
-   formula is already restated inside the prompts.
+   `Docs/latex/core_math.tex` / `Docs/MHA_model.md` / `Docs/folder_impact.md` —
+   every needed formula is already restated inside the prompts. The LaTeX file
+   remains authoritative if a transcription discrepancy is found. For P00,
+   P05, P07, and P13
+   also provide `POKER_GPU_EVALUATOR_IO.md`; it is the binding sibling API.
 2. **Order:** P00 → P01 → P02 → P03 → P04 → P05 → P06 → P07 → P08 → P09 →
    P10 → P11 → P12 → P13. Safe parallel tracks if you want to run two
    sessions: {P02→P03→P04→P05→P06→P07} (poker) and {P01→P08→P09→P10→P11}
@@ -45,6 +48,11 @@
   (P09.)
 - **D7.** `branched_value` takes `max_resident_rows` kwarg instead of a new
   config field. (P10.)
+- **D8.** All poker-private combinatorics use `poker_gpu_evaluator.pbg`:
+  completion, exact joint profiles, partition/folded-card summaries, and exact
+  fixed-showdown winner shares per pot stratum. There are no local poker
+  mathematical reference implementations. This repo retains public-tree
+  navigation, policies, pot amounts, and chip-EV assembly. (P00–P13.)
 
 If any delta is unwelcome, say so before its prompt runs; each is localized.
 
@@ -54,17 +62,17 @@ If any delta is unwelcome, say so before its prompt runs; each is localized.
   files, not import side effects.
 - **P01**: Kuhn/Leduc arise from pure configs (grep for "kuhn" in family.py —
   must be absent); exact Kuhn equilibrium test uses the closed form.
-- **P02**: min-raise/no-reopen rule; side-pot fixture with 3 unequal stacks;
-  chip conservation test actually randomizes.
+- **P02**: min-raise/no-reopen rule; pot-stratum fixture with 3 unequal stacks;
+  no hand-rank/category/payoff evaluator symbols.
 - **P03**: fold snapshots taken before masking; no per-hypothesis renorm.
-- **P04**: raw-weight accumulators in the removal algebra (the
-  double-normalization bug is THE risk here); small-deck brute-force test
-  present and not weakened; q_kl ≤ 0 raises.
-- **P05**: fp32 accumulators; SIS weight formula matches the prompt; n_eff.
+- **P04**: partition-summary DTO/adapter maps sibling fields without deriving
+  poker quantities locally; no removal algebra or local oracle.
+- **P05**: thin sibling adapters have no NumPy/device round trip; rejection
+  returns full profiles; fixed showdown returns masks/shares per stratum.
 - **P06**: temperature on content only (find the division site); dlogistic
   normalization exact.
-- **P07**: no [1326,1326] tensors (grep allocations); compact scatter
-  round-trip test; adapter entropy exact over composed events.
+- **P07**: compact scatter round-trip; adapter entropy exact over composed
+  events; sampled actor combo only selects a row; partition inputs are opaque.
 - **P08**: three reach modes agree test; PolicyCache vs recompute test; W1 —
   profiles drawn per event draw and discarded.
 - **P09**: T3 lemma test present with real statistics; sequential
@@ -74,7 +82,8 @@ If any delta is unwelcome, say so before its prompt runs; each is localized.
   capture-before-mix order untouched.
 - **P11**: three weighting levels in rb_ppo (P̂ν / P̂ / bare); T5 variance
   ratio reported; checkpoint resume exactness.
-- **P12**: duplicate deals actually swap seats; CI paired.
+- **P12**: duplicate deals actually swap seats; CI paired; every fixed showdown
+  crosses the evaluator facade.
 - **P13**: only the marked core edit; acceptance checklist numbers pasted.
 
 ## When the codebase is done

@@ -1,0 +1,158 @@
+\ProvidesPackage{../preamble/thmenv}
+
+%%%%% PACKAGES
+\usepackage{amsthm}
+\usepackage{aliascnt}
+\usepackage[framemethod=tikz]{mdframed}    %bars left to def/rem, from Quiangru but has bad break yellow warning problem
+    \mdfdefinestyle{leftbar}{
+      linewidth=1.5pt,
+      linecolor=gray,
+      hidealllines=true,
+      leftline=true,
+      leftmargin=0pt,
+      innerleftmargin=5pt,
+      innerrightmargin=10pt,
+      innertopmargin=-5pt,
+      innerbottommargin=0pt
+    }
+
+%%%%% DEFINITION ENVIRONMENTS
+% Usage: \NewDefinitionAliased{environment_name}{Display Name}
+\newcommand{\NewDefinitionAliased}[2]{%
+    \newaliascnt{#1}{definition}           % Create alias counter
+    \newtheorem{#1}[#1]{#2}             % Define theorem using alias
+    \aliascntresetthe{#1}               % Reset logic
+    \expandafter\def\csname #1autorefname\endcsname{#2} % Set autoref name
+    \surroundwithmdframed[style=leftbar]{#1}    % Apply mdframed style
+}
+
+\theoremstyle{definition}
+    %% Initialization
+    \newtheorem{definition}{Definition}[section]
+        \def\definitionautorefname{Definition}
+        \surroundwithmdframed[style=leftbar]{definition}
+    %% Aliases
+    \NewDefinitionAliased{convention}{Convention}
+    \NewDefinitionAliased{notation}{Notation}
+    \NewDefinitionAliased{conjecture}{Conjecture}
+    \NewDefinitionAliased{assumption}{Assumption}
+
+%%%%% REMARK ENVIRONMENTS
+% Usage: \NewRemarkAliased{environment_name}{Display Name}
+\newcommand{\NewRemarkAliased}[2]{%
+    \newaliascnt{#1}{remark}           % Create alias counter
+    \newtheorem{#1}[#1]{#2}             % Define theorem using alias
+    \aliascntresetthe{#1}               % Reset logic
+    \expandafter\def\csname #1autorefname\endcsname{#2} % Set autoref name
+}
+\theoremstyle{remark}
+    \newtheorem{remark}{Remark}[section]
+        \def\remarkautorefname{Remark}
+    \NewRemarkAliased{construction}{Construction}
+    \NewRemarkAliased{observation}{Observation}
+    \NewRemarkAliased{warning}{Warning}
+
+%%%% THEOREM ENVIRONMENTS
+%% Custom Style for Theorem Environments
+\usepackage{calc}
+\usepackage{thmbox}
+    \thmboxoptions{headstyle={\bfseries#1 #2~},thickness=0.6pt, cut=false}
+\usepackage{boites}
+
+\renewcommand\thmbox@titlestyle[1]{(#1)}
+\newlength{\temp@thmbox@emul}
+\def\thmbox@blankname{blank}
+\def\@gobbleparen(#1)#2\@nil{#1}
+
+\def\thmbox@begin#1#2#3{%
+    \ifhmode\unskip\unskip\par\fi
+    \vskip\topsep
+    \refstepcounter{#2}%
+    \def\thmbox@countername{#2}%
+    \ifx\thmbox@countername\thmbox@blankname
+        % ---- BLANK ENVIRONMENT ----
+        \thmbox{\bfseries #3}%
+    \else
+        % ---- NORMAL ENVIRONMENTS ----
+        \thmbox{\thmbox@headstyle{#1}{\csname the#2\endcsname}#3}%
+    \fi
+    \thmbox@bodystyle\ignorespaces}     %correct top space
+    
+\def\thmbox#1{%
+    \def\breakboxparindent{\parindent}
+    \def\breakboxskip{0pt}
+    \def\bkvz@before@breakbox{\ifhmode\par\fi\vskip\breakboxskip\relax}%allows for page breaks
+    \def\bkvz@set@linewidth{\advance\linewidth-10.4pt
+                        \advance\linewidth-0.4em}%removes space used by left bar (10pt+0.4pt+0.4em) where 0.4pt is the width of the vrule
+    \def\bk@line{\hbox  to \linewidth{\bkvz@left\box\bk@bxa\bkvz@right}}%
+    \def\bkvz@left{\hskip10pt\vrule\color{black}\hskip0.4em}%bar on the left side
+    \def\bkvz@right{}%nothing on the right side
+    \def\bkvz@top{\setlength{\temp@thmbox@emul}{\widthof{#1}}\noindent{#1}\par\nobreak\vskip2pt\hrule width \temp@thmbox@emul\color{black}\par\nobreak}%creates Title underlined in black, breaks lines without breaking pages
+    \def\bkvz@bottom{}%nothing on the bottom => can be changed if desired
+    \breakbox\vskip2pt\noindent\itshape\ignorespaces}%a bit of space before the start of the first line
+    
+\def\endthmbox{\endbreakbox}
+
+\def\thmbox@beginA#1#2[#3]{%
+    \def\thmbox@countername{#2}%
+    \ifx\thmbox@countername\thmbox@blankname
+        % ---- BLANK ENVIRONMENT ----
+        \thmbox@begin{#1}{#2}{#3}%
+    \else
+        % ---- NORMAL ENVIRONMENTS ----
+        \thmbox@begin{#1}{#2}{\thmbox@titlestyle{#3}}%
+    \fi
+}
+
+\def\thmbox@new#1#2#3#4{%
+    \expandafter\def\csname#2\endcsname{%
+        \setkeys{thmbox}{#1}%
+        \@ifnextchar[{\thmbox@beginA{#3}{#4}}{%
+            \thmbox@begin{#3}{#4}{}}%
+    }%
+    \expandafter\def\csname end#2\endcsname{%
+        \endthmbox\vskip\topsep%
+    }%
+}
+%PROBLEMS: systematic "Underfull \hbox (badness 10000) detected" when "enumerate" inside such a theorem environment => doesn't look bad so it's probably fine
+% Usage: \NewTheoremAliased{environment_name}{Display Name}
+\newcommand{\NewTheoremAliased}[2]{%
+    \newaliascnt{#1}{theorem}           % Create alias counter
+    \newtheorem{#1}[#1]{\noindent #2}             % Define theorem using alias
+    \aliascntresetthe{#1}               % Reset logic
+    \expandafter\def\csname #1autorefname\endcsname{#2} % Set autoref name
+}
+
+%% Initialization
+\newtheorem{theorem}{\noindent Theorem}[section]
+    \def\theoremautorefname{Theorem}
+%% Aliases
+\NewTheoremAliased{lemma}{Lemma}
+\NewTheoremAliased{proposition}{Proposition}
+\NewTheoremAliased{corollary}{Corollary}
+%% Blank Theorem Environment
+\NewTheoremAliased{blank}{}
+
+%%%%% EXERCISE ENVIRONMENTS
+\def\exercise{}
+\@ifundefined{exercisename}{\def\exercisename{Exercise}}{}
+\renewenvironment{exercise}[1][\exercisename]{%
+  \par\smallbreak\small%
+  \list{\hspace\labelsep\textbf{#1\,:}}{%
+    \leftmargin=\parindent%
+    \labelwidth=\parindent}%
+  \item\relax}{%
+  \endlist}
+\def\openquestion{}
+\@ifundefined{openquestionname}{\def\openquestionname{Open Question}}{}
+\renewenvironment{openquestion}[1][\openquestionname]{%
+  \par\smallbreak\small%
+  \list{\hspace\labelsep\textbf{#1\,:}}{%
+    \leftmargin=\parindent%
+    \labelwidth=\parindent}%
+  \item\relax}{%
+  \endlist}
+
+%%% Hyperref Anchor Names
+\def\exerciseautorefname{Exercise}
+\def\openquestionautorefname{Open Question}

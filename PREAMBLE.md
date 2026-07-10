@@ -2,8 +2,10 @@
 
 You are implementing one module of a research codebase for policy-gradient
 self-play in Public-action Bayesian Games (PBGs), with no-limit hold'em poker as
-the first instance. The full design is owned by two frozen documents,
-`CONTRACTS.md` and `NOTATION.md`, checked into the repo root. This preamble
+the first instance. The mathematical source of truth is
+`Docs/latex/core_math.tex`; its implementation mapping is `NOTATION.md`.
+Interfaces and evaluator ownership are frozen by `CONTRACTS.md` and
+`POKER_GPU_EVALUATOR_IO.md`. This preamble
 reproduces the parts you need in every prompt; the prompt that follows it
 reproduces the module-specific parts. **You never need information beyond what
 is pasted; if something seems missing, it is a signal to re-read, not invent.**
@@ -19,10 +21,17 @@ is pasted; if something seems missing, it is a signal to re-read, not invent.**
   earlier prompts must still pass. Write the new tests named in the prompt.
 - **R4.** No abstractions beyond spec: no metaclasses, no plugin frameworks, no
   clever indirection. Plain functions, dataclasses, `nn.Module`s, Protocols.
-- **R5.** Math semantics come from the quoted NOTATION excerpts, not from your
-  memory of standard RL conventions. Where they differ, the excerpt wins.
+- **R5.** Math semantics come from `Docs/latex/core_math.tex` as transcribed in
+  the quoted NOTATION excerpts, not from memory of standard RL conventions. If
+  a quoted excerpt appears to conflict with the source, report it; the source wins.
 - **R6.** Every public function/class gets a docstring with tensor shapes.
   Every tensor-returning line of nontrivial shape gets a `# [dims]` comment.
+- **R7.** All poker-private combinatorics are owned by the sibling
+  `poker-gpu-evaluator` repository: collision-conditioned private laws and
+  samples, partition/folded-card summaries, completion/equity coefficients,
+  hand ranking, ties, and per-pot-stratum winner shares. Follow
+  `POKER_GPU_EVALUATOR_IO.md`; never implement a local CPU "reference", copy a
+  kernel, compare hand ranks/categories, or import sibling internals.
 
 ## Global conventions
 
@@ -30,8 +39,8 @@ is pasted; if something seems missing, it is a signal to re-read, not invent.**
   hints everywhere; `from __future__ import annotations`.
 - Naming: snake_case functions, CamelCase classes. Symbol map: `sigma → node`,
   `tau → traj`, `x_p → xtype` (int type index), `pi → policy`, `nu → nu`,
-  branching intensity `beta → beta`, folded pairwise kernel `beta_B →
-  beta_b_kernel` (never bare `beta` for the kernel).
+  branching intensity `beta → beta`. Poker partition-kernel field names are
+  owned and versioned by the evaluator facade.
 - Shape letters: `N` nodes, `C` child edges (CSR), `G` trees, `P` players
   (padded `P_max`), `X` private types (padded `X_max`), `E` events (padded
   `E_max`), `B` minibatch, `T` action types, `M` raise-mixture comps,
@@ -55,9 +64,10 @@ pbg/core/        config.py game.py tree.py rollout.py branching.py values.py
                  training.py logging_util.py
 pbg/games/synthetic/   family.py presets.py exact.py model.py
 pbg/games/poker/       engine.py cards.py ranges.py folded.py mc.py adapter.py
+                        # public navigation + DTO/adapters; no private poker math
 pbg/games/poker/model/ primitives.py preflop.py postflop.py incidence.py heads.py
 pbg/eval/        exploitability.py arena.py
-configs/  tests/  CONTRACTS.md  NOTATION.md
+configs/  tests/  CONTRACTS.md  NOTATION.md  POKER_GPU_EVALUATOR_IO.md
 ```
 
 Import direction (enforced by `tests/test_p0_imports.py`): `pbg.core` imports
@@ -80,7 +90,7 @@ class PBGGame(Protocol):
     def chance_probs(self, state_refs, xprofile) -> Tensor: ...   # [B,E_max]
     def step(self, state_refs, event_ids) -> Tensor: ...          # int32 [B]
     def is_terminal(self, state_refs) -> Tensor: ...
-    def is_pre_terminal(self, state_refs) -> Tensor: ...    # NOTATION §1 definition
+    def is_pre_terminal(self, state_refs) -> Tensor: ...    # core_math tau^{pre-c}; NOTATION §1
     def reward(self, xprofile, terminal_state_refs) -> Tensor:    # float32 [B,P]
     def reach_update(self, log_r_rows, state_refs, event_ids, policy_rows) -> Tensor: ...
     def sample_profiles(self, state_refs, reach_rows, n, gen) -> Tensor:  # int32 [B,n,P] joint posterior draws
@@ -107,7 +117,7 @@ class TreeBatch:
 class CompletionStats:    # all float32
     p_hat: Tensor         # [P_max, X_max] normalized posterior (0 on invalid types)
     v_hat: Tensor         # [P_max, X_max] E[R_p | X_p=x]; 0 where p_hat==0
-    vvec_hat: Tensor      # [P_max] E[R_p]; 0 for non-live players
+    vvec_hat: Tensor      # [P_max] E[R_p]; folded deterministic payoff retained, padded seats 0
     u_hat: Tensor         # [] E[||R||^2]
     n_eff: Tensor         # [] effective sample size
 
@@ -131,7 +141,7 @@ class NodeTargets:        # one row per stored player-decision node
 class PolicyOutput:
     raw: Any              # game-owned payload
     v: Tensor             # [B, X_max]
-    vvec: Tensor | None   # [B, P_max]
+    vvec: Tensor | None   # [B, P_max], all seated players; padded seats 0
     u: Tensor | None      # [B]
 
 class PolicyAdapter(Protocol):
@@ -148,7 +158,7 @@ error. Field names you may rely on: `rollout.n_trees, rollout.beta_mode
 ("sequential"|"fixed"|"neyman"), rollout.beta_fix/beta_avg/beta_max (per-bucket
 dicts), rollout.warmup_iters, rollout.node_budget, rollout.reach_storage
 ("full"|"decisions_only"|"recompute")`; `completion.n_samples,
-completion.backend`; `loss.name, loss.lam, loss.clip_eps, loss.clip_eps_v,
+completion.backend` (`"poker_gpu"` for poker; sibling backend chooses CPU/CUDA); `loss.name, loss.lam, loss.clip_eps, loss.clip_eps_v,
 loss.c_v, loss.c_h, loss.c_kl, loss.c_u, loss.c_vvec, loss.ref_period,
 loss.entropy_schedule, loss.use_moment_heads, loss.use_suit_consistency`;
 `train.iters, train.gd_steps_per_iter, train.minibatch_size, train.lr,
