@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pbg"
+version = "0.1.0"
+description = "Policy-gradient self-play for public-action Bayesian games"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["numpy", "pyyaml", "pytest", "torch>=2.2"]
+
+# Development prerequisite for poker boundaries (kept out of package deps):
+# pip install -e ../poker-gpu-evaluator
+
+[tool.setuptools.packages.find]
+include = ["pbg*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

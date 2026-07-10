@@ -1,0 +1,56 @@
+game:
+  name: synthetic
+  synthetic:
+    n_players: 2
+    deck_size: 3
+    n_suits: 1
+    hand_size: 1
+    n_rounds: 1
+    board_per_round: [0]
+    max_raises: 1
+    bet_size: [1]
+    ante: 1
+  poker: null
+rollout:
+  n_trees: 16
+  beta_mode: sequential
+  beta_fix: {default: 1.0}
+  beta_avg: {default: 1.0}
+  beta_max: {default: 1.0}
+  warmup_iters: 0
+  node_budget: 128
+  reach_storage: full
+completion:
+  n_samples: 32
+  backend: synthetic
+model:
+  n_buckets: 128
+  hidden_dim: 32
+  e_max: 3
+loss:
+  name: rb_ppo
+  lam: 0.95
+  clip_eps: 0.2
+  clip_eps_v: 0.2
+  c_v: 0.5
+  c_h: 0.01
+  c_kl: 0.0
+  c_u: 0.0
+  c_vvec: 0.0
+  ref_period: null
+  entropy_schedule: const
+  use_moment_heads: false
+  use_suit_consistency: false
+train:
+  iters: 2
+  gd_steps_per_iter: 1
+  minibatch_size: 16
+  lr: 0.001
+  adam_betas: [0.9, 0.999]
+  grad_clip: 1.0
+  amp: false
+  seed: 7
+  checkpoint_every: 1
+  out_dir: runs/kuhn_smoke
+debug_asserts: true
+
