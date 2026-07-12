@@ -1,8 +1,0 @@
-\BOOKMARK [1][]{section*.2}{1\040Introduction}{}% 1
-\BOOKMARK [1][]{section*.8}{2\040Game-Theoretical\040Model}{}% 2
-\BOOKMARK [1][]{section*.27}{3\040Self-Play\040Policy-Gradient\040Methods\040in\040Synchronous\040Rollouts}{}% 3
-\BOOKMARK [2][]{subsection*.28}{3.1\040Theoretical\040Model}{section*.27}% 4
-\BOOKMARK [2][]{subsection*.45}{3.2\040Usual\040Implementation}{section*.27}% 5
-\BOOKMARK [2][]{subsection*.88}{3.3\040Rao\205Blackwellization\040of\040the\040Private\040State}{section*.27}% 6
-\BOOKMARK [2][]{subsection*.141}{3.4\040Variance-Guided\040Branching}{section*.27}% 7
-\BOOKMARK [1][]{section*.238}{4\040Poker:\040a\040Perfect\040Example}{}% 8

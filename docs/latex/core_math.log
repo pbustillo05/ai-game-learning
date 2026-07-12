@@ -1,10 +1,10 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026) (preloaded format=pdflatex 2026.7.10)  10 JUL 2026 13:00
+This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026) (preloaded format=pdflatex 2026.7.10)  12 JUL 2026 16:30
 entering extended mode
  restricted \write18 enabled.
  file:line:error style messages enabled.
  %&-line parsing enabled.
-**/home/pablob/ai-game-learning/Docs/latex/core_math.tex
-(/home/pablob/ai-game-learning/Docs/latex/core_math.tex
+**/home/pablob/ai-game-learning/docs/latex/core_math.tex
+(/home/pablob/ai-game-learning/docs/latex/core_math.tex
 LaTeX2e <2026-06-01>
 L3 programming layer <2026-06-18>
 (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/base/article.cls
@@ -23,7 +23,7 @@ File: size12.clo 2025/01/22 v1.4n Standard LaTeX file (size option)
 \abovecaptionskip=\skip49
 \belowcaptionskip=\skip50
 \bibindent=\dimen150
-) (../preamble/preamble.tex (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/l3kernel/expl3.sty
+) (./preamble/preamble.tex (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/l3kernel/expl3.sty
 Package: expl3 2026-06-18 L3 programming layer (loader) 
  (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/l3backend/l3backend-pdftex.def
 File: l3backend-pdftex.def 2026-02-18 L3 backend support: PDF output (pdfTeX)
@@ -621,7 +621,7 @@ Package: relsize 2013/03/29 ver 4.1
 \c@algocf=\count347
 \algocf@algoframe=\box84
 \algocf@algobox=\box85
-) (../preamble/mathenv.sty (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/ieeetran/IEEEtrantools.sty
+) (./preamble/mathenv.sty (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/ieeetran/IEEEtrantools.sty
 Package: IEEEtrantools 2015/08/26 V1.5 by Michael Shell
 
 -- See the "IEEEtrantools_doc.txt" manual for usage information.
@@ -654,7 +654,11 @@ Package: IEEEtrantools 2015/08/26 V1.5 by Michael Shell
 )
 \mylength=\skip106
 \mybox=\box86
-) (../preamble/project-macros.sty
+) (./preamble/project-macros.sty
+
+LaTeX Warning: You have requested package `preamble/project-macros',
+               but the package provides `../preamble/project-macros'.
+
 Package: ../preamble/project-macros 2026/07/06 Poker AI shared macros
 ) (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/natbib/natbib.sty
 Package: natbib 2010/09/13 8.31b (PWD, AO)
@@ -754,9 +758,13 @@ Package hyperref Info: Option `bookmarksnumbered' set `true' on input line 60.
 Package hyperref Info: Option `hypertexnames' set `false' on input line 60.
  (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/generic/stringenc/se-pdfdoc.def
 File: se-pdfdoc.def 2019/11/29 v1.12 stringenc: PDFDocEncoding
-) (../preamble/thmenv.sty
+) (./preamble/thmenv.sty
+
+LaTeX Warning: You have requested package `preamble/thmenv',
+               but the package provides `../preamble/thmenv'.
+
 Package: ../preamble/thmenv 
- (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/amscls/amsthm.sty
+(/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/amscls/amsthm.sty
 Package: amsthm 2020/05/29 v2.20.6
 \thm@style=\toks51
 \thm@bodyfont=\toks52
@@ -1070,43 +1078,40 @@ Package microtype Info: Loading generic protrusion settings for font family
 (microtype)             See the microtype manual for details.
 Package mdframed Info: Box was splittet wrong
  starting loop to iterate the splitting point
-(mdframed)              on input line 75.
+(mdframed)              on input line 76.
  [2{/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/enc/dvips/lm/lm-mathit.enc}{/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/enc/dvips/lm/lm-rm.enc}{/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/enc/dvips/lm/lm-mathsy.enc}{/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/enc/dvips/lm/lm-mathex.enc}]
 Package mdframed Info: mdframed detected package amsthm 
  changed the theorem header of amsthm
-(mdframed)              on input line 77.
+(mdframed)              on input line 78.
+ [3]
 Package mdframed Info: mdframed detected package amsthm 
  changed the theorem header of amsthm
-(mdframed)              on input line 109.
-LaTeX Font Info:    Trying to load font information for U+bbm on input line 124.
+(mdframed)              on input line 153.
+LaTeX Font Info:    Trying to load font information for U+bbm on input line 157.
  (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/bbm-macros/ubbm.fd
 File: ubbm.fd 1999/03/15 V 1.2 Font definition for bbm font - TH
-)
-Package mdframed Info: Not enough space on this page on input line 141.
- [3]
-Package mdframed Info: Not enough space on this page on input line 141.
- [4]
-LaTeX Font Info:    Trying to load font information for OT1+lmtt on input line 216.
+) [4] [5
+pdfTeX warning (ext4): destination with the same identifier (name{equation*.37}) has been already used, duplicate ignored
+<argument> ...shipout:D \box_use:N \l_shipout_box 
+                                                  \__shipout_drop_firstpage_...
+l.248 \end{enumerate}
+                     
+pdfTeX warning (ext4): destination with the same identifier (name{equation*.38}) has been already used, duplicate ignored
+<argument> ...shipout:D \box_use:N \l_shipout_box 
+                                                  \__shipout_drop_firstpage_...
+l.248 \end{enumerate}
+                     ]
+LaTeX Font Info:    Trying to load font information for OT1+lmtt on input line 263.
  (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/lm/ot1lmtt.fd
 File: ot1lmtt.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
-) [5
-pdfTeX warning (ext4): destination with the same identifier (name{equation*.32}) has been already used, duplicate ignored
-<argument> ...shipout:D \box_use:N \l_shipout_box 
-                                                  \__shipout_drop_firstpage_...
-l.270 \end{equation}
-                    
-pdfTeX warning (ext4): destination with the same identifier (name{equation*.33}) has been already used, duplicate ignored
-<argument> ...shipout:D \box_use:N \l_shipout_box 
-                                                  \__shipout_drop_firstpage_...
-l.270 \end{equation}
-                    {/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/enc/dvips/lm/lm-rmtt.enc}]
-LaTeX Font Info:    Trying to load font information for U+euf on input line 285.
+)
+LaTeX Font Info:    Trying to load font information for U+euf on input line 332.
  (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/amsfonts/ueuf.fd
 File: ueuf.fd 2013/01/14 v3.01 Euler Fraktur
 ) (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/microtype/mt-euf.cfg
 File: mt-euf.cfg 2006/07/03 v1.1 microtype config. file: AMS Euler Fraktur (RS)
 )
-LaTeX Font Info:    Trying to load font information for T1+lmtt on input line 285.
+LaTeX Font Info:    Trying to load font information for T1+lmtt on input line 332.
  (/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/tex/latex/lm/t1lmtt.fd
 File: t1lmtt.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
@@ -1114,72 +1119,82 @@ Package microtype Info: Loading generic protrusion settings for font family
 (microtype)             `lmtt' (encoding: T1).
 (microtype)             For optimal results, create family-specific settings.
 (microtype)             See the microtype manual for details.
+ [6{/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/enc/dvips/lm/lm-rmtt.enc}]
 Package mdframed Info: mdframed detected package amsthm 
  changed the theorem header of amsthm
-(mdframed)              on input line 310.
- [6]
-Package mdframed Info: Not enough space on this page on input line 322.
+(mdframed)              on input line 357.
 LaTeX Font Info:    Font shape `T1/lmtt/bx/n' in size <12> not available
-(Font)              Font shape `T1/lmtt/b/n' tried instead on input line 335.
+(Font)              Font shape `T1/lmtt/b/n' tried instead on input line 398.
+ [7]
 LaTeX Font Info:    External font `lmex10' loaded for size
-(Font)              <5> on input line 384.
- [7] [8]
+(Font)              <5> on input line 447.
+ [8] [9]
 Package mdframed Info: mdframed detected package amsthm 
  changed the theorem header of amsthm
-(mdframed)              on input line 518.
- [9] [10] [11]
+(mdframed)              on input line 583.
+ [10]
+Overfull \hbox (53.07903pt too wide) in alignment at lines 716--716
+ [] [][]
+ []
+
+[11] [12]
 Package mdframed Info: mdframed detected package amsthm 
  changed the theorem header of amsthm
-(mdframed)              on input line 682.
+(mdframed)              on input line 767.
 Package mdframed Info: Box was splittet wrong
  starting loop to iterate the splitting point
-(mdframed)              on input line 724.
- [12] [13]
-Overfull \hbox (201.10916pt too wide) in alignment at lines 811--895
+(mdframed)              on input line 806.
+ [13] [14]
+Overfull \hbox (201.10916pt too wide) in alignment at lines 917--1001
  [] [] [] [][]
  []
 
-[14] [15]
-Overfull \hbox (26.39351pt too wide) in alignment at lines 1042--1042
+[15] [16]
+Overfull \hbox (35.4282pt too wide) in alignment at lines 1170--1170
  [] [] [] [][]
  []
 
 
-Overfull \hbox (60.74452pt too wide) in alignment at lines 1042--1042
+Overfull \hbox (27.89467pt too wide) in paragraph at lines 1170--1170
+[][]$ 
+ []
+
+
+Overfull \hbox (126.50592pt too wide) in alignment at lines 1170--1170
  [] [] [] [][]
  []
 
-[16]
+[17]
 LaTeX Font Info:    External font `lmex10' loaded for size
-(Font)              <10> on input line 1052.
+(Font)              <10> on input line 1180.
 LaTeX Font Info:    External font `lmex10' loaded for size
-(Font)              <7> on input line 1052.
+(Font)              <7> on input line 1180.
 
-Overfull \hbox (52.79707pt too wide) in alignment at lines 1095--1095
+Overfull \hbox (58.42207pt too wide) in alignment at lines 1223--1223
  [] [] [] [][]
  []
 
-[17] [18] [19] [20] (./core_math.aux)
+[18] [19] [20] [21] (./core_math.aux)
  ***********
 LaTeX2e <2026-06-01>
 L3 programming layer <2026-06-18>
  ***********
 Package rerunfilecheck Info: File `core_math.out' has not changed.
-(rerunfilecheck)             Checksum: 110A04374EFC1D484C77133F44E16DBB;661.
+(rerunfilecheck)             Checksum: A879BBDC3DDF1D442A664D0C19AC5C33;661.
  ) 
 Here is how much of TeX's memory you used:
- 31515 strings out of 469158
- 591628 string characters out of 5460257
- 1074880 words of memory out of 5000000
- 59322 multiletter control sequences out of 15000+600000
- 756167 words of font info for 276 fonts, out of 8000000 for 9000
+ 31551 strings out of 469158
+ 592282 string characters out of 5460257
+ 1074841 words of memory out of 5000000
+ 59334 multiletter control sequences out of 15000+600000
+ 762408 words of font info for 279 fonts, out of 8000000 for 9000
  14 hyphenation exceptions out of 8191
  122i,26n,124p,1047b,1045s stack positions out of 10000i,1000n,20000p,200000b,200000s
  </home/pablob/.TinyTeX/.TinyTeX/texmf-var/fonts/pk/ljfour/public/bbm/bbm12.600pk></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/amsfonts/euler/eufm10.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmbx10.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmbx12.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmbx8.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmex10.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmmi10.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmmi12.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmmi6.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmmi8.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmr10.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmr12.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmr17.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmr6.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmr8.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmri12.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmro12.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmss12.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmss8.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmsy10.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmsy6.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmsy8.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmtk10.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmtt10.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmtt12.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/lm/lmtt8.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/amsfonts/symbols/msam10.pfb></home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb>
-Output written on core_math.pdf (20 pages, 583211 bytes).
+Output written on core_math.pdf (21 pages, 597523 bytes).
 PDF statistics:
- 690 PDF objects out of 1000 (max. 8388607)
- 600 compressed objects within 6 object streams
- 313 named destinations out of 1000 (max. 500000)
- 73293 words of extra memory for PDF output out of 74296 (max. 10000000)
+ 724 PDF objects out of 1000 (max. 8388607)
+ 632 compressed objects within 7 object streams
+ 334 named destinations out of 1000 (max. 500000)
+ 77389 words of extra memory for PDF output out of 89155 (max. 10000000)
 
