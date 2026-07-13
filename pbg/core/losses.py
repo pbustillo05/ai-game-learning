@@ -1,8 +1,9 @@
-"""Policy-gradient, value, entropy, KL, and moment losses."""
+"""Minimal posterior-weighted policy, value, and entropy losses."""
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import torch
 from torch import Tensor
@@ -13,67 +14,82 @@ def _cfg(cfg: Any, name: str, default: Any = None) -> Any:
     return getattr(source, name, default)
 
 
-def _sample(old: Any, targets: Any) -> tuple[Any, Tensor, Tensor, Tensor]:
+def _parts(old: Any, targets: Any) -> tuple[Any, Tensor, Tensor]:
     target = getattr(targets, "targets", targets)
     source = targets if hasattr(targets, "old_logp_child") else old
-    logp = getattr(source, "old_logp_child", getattr(source, "logp_child", None))
-    value = getattr(source, "old_v", getattr(source, "v", None))
+    logp = getattr(source, "old_logp_child", None)
+    value = getattr(source, "old_v", None)
     if logp is None or value is None:
         raise TypeError("old rollout log-probabilities and values are required")
-    return target, logp, value, getattr(targets, "child_mask", target.nu_row != 0)
+    return target, logp, value
 
 
-def _ratio(new: Any, old: Any, targets: Any, adapter: Any) -> tuple[Tensor, Tensor, Any]:
-    target, old_logp, old_v, child_mask = _sample(old, targets)
-    logp = adapter.log_prob(new, target.child_event_row.to(new.v.device).long())
-    if logp.shape != target.q_hat.shape:
-        raise ValueError("adapter log probabilities are not aligned with q_hat")
-    cached = old_logp.to(logp.device, logp.dtype)
-    # Avoid inf/nan even before masking: padded cache columns conventionally
-    # contain -inf, and IEEE arithmetic would turn finite - (-inf) into inf.
-    active = child_mask.to(logp.device)[:, :, None]
-    safe_logp = torch.where(active, logp, torch.zeros_like(logp))
-    safe_cached = torch.where(active, cached, torch.zeros_like(cached))
-    difference = safe_logp - safe_cached
-    ratio = torch.exp(difference)
-    advantage = target.q_hat.to(new.v.device, new.v.dtype) - old_v.to(
-        new.v.device, new.v.dtype
-    )[:, None, :]
-    return ratio, advantage, target
+def _selected_logp(new: Any, targets: Any, adapter: Any) -> Tensor:
+    target = getattr(targets, "targets", targets)
+    selected = target.child_event_row.to(new.v.device)
+    child_mask = target.child_mask.to(new.v.device)
+    legal_ids = targets.legal_event_ids.to(new.v.device)
+    legal_mask = targets.legal_event_mask.to(new.v.device)
+    if legal_ids.ndim != 2 or not bool(legal_mask.any(1).all()):
+        raise ValueError("every minibatch row must contain a legal event")
+    safe = torch.where(child_mask, selected, legal_ids[:, :1].expand_as(selected))
+    result = adapter.log_prob(new, safe, legal_ids, legal_mask)
+    if result.shape != target.a_hat.shape:
+        raise ValueError("adapter log probabilities are not aligned with a_hat")
+    return result
+
+
+def _ratio(new: Any, old: Any, targets: Any, adapter: Any) -> tuple[Tensor, Tensor]:
+    target, cached, _ = _parts(old, targets)
+    logp = _selected_logp(new, targets, adapter)
+    active = target.child_mask.to(logp.device)[:, :, None]
+    difference = torch.where(active, logp, torch.zeros_like(logp)) - torch.where(
+        active, cached.to(logp), torch.zeros_like(logp)
+    )
+    return torch.exp(difference), target.a_hat.to(new.v)
 
 
 def l_pg(new: Any, old: Any, targets: Any, adapter: Any, cfg: Any) -> tuple[Tensor, dict]:
+    """Return direct-advantage policy loss elements ``[B,E,X]``."""
+
     del cfg
-    ratio, advantage, _ = _ratio(new, old, targets, adapter)
+    ratio, advantage = _ratio(new, old, targets, adapter)
     return -ratio * advantage, {"ratio": ratio}
 
 
 def l_clip(new: Any, old: Any, targets: Any, adapter: Any, cfg: Any) -> tuple[Tensor, dict]:
-    ratio, advantage, _ = _ratio(new, old, targets, adapter)
+    """Return PPO-clipped direct-advantage elements ``[B,E,X]``."""
+
+    ratio, advantage = _ratio(new, old, targets, adapter)
     eps = float(_cfg(cfg, "clip_eps"))
     clipped = ratio.clamp(1.0 - eps, 1.0 + eps)
-    loss = -torch.minimum(ratio * advantage, clipped * advantage)
-    return loss, {"ratio": ratio, "clipped": (ratio != clipped)}
+    return -torch.minimum(ratio * advantage, clipped * advantage), {
+        "ratio": ratio,
+        "clipped": ratio != clipped,
+    }
 
 
 def l_v(new: Any, old: Any, targets: Any, adapter: Any, cfg: Any) -> tuple[Tensor, dict]:
-    del adapter
+    """Return actor-type squared value loss elements ``[B,X]``."""
+
+    del old, adapter
     target = getattr(targets, "targets", targets)
-    loss = float(_cfg(cfg, "c_v")) * (new.v - target.v_hat.to(new.v)) ** 2
-    return loss, {}
+    return float(_cfg(cfg, "c_v")) * (new.v - target.v_hat.to(new.v)) ** 2, {}
 
 
 def l_v_clip(new: Any, old: Any, targets: Any, adapter: Any, cfg: Any) -> tuple[Tensor, dict]:
+    """Return clipped actor-type value loss elements ``[B,X]``."""
+
     del adapter
-    target, _, old_v, _ = _sample(old, targets)
-    old_v = old_v.to(new.v)
-    eps = float(_cfg(cfg, "clip_eps_v"))
-    clipped = old_v + (new.v - old_v).clamp(-eps, eps)
-    wanted = target.v_hat.to(new.v)
-    loss = float(_cfg(cfg, "c_v")) * torch.maximum(
-        (new.v - wanted) ** 2, (clipped - wanted) ** 2
+    target, _, old_v = _parts(old, targets)
+    old_value = old_v.to(new.v)
+    clipped = old_value + (new.v - old_value).clamp(
+        -float(_cfg(cfg, "clip_eps_v")), float(_cfg(cfg, "clip_eps_v"))
     )
-    return loss, {}
+    wanted = target.v_hat.to(new.v)
+    return float(_cfg(cfg, "c_v")) * torch.maximum(
+        (new.v - wanted) ** 2, (clipped - wanted) ** 2
+    ), {}
 
 
 def _entropy_coefficient(cfg: Any, iteration: int) -> float:
@@ -84,44 +100,27 @@ def _entropy_coefficient(cfg: Any, iteration: int) -> float:
     return value
 
 
-def l_h(new: Any, old: Any, targets: Any, adapter: Any, cfg: Any, *, iteration: int = 0) -> tuple[Tensor, dict]:
-    del old, targets
-    entropy = adapter.entropy(new)
+def l_h(
+    new: Any,
+    old: Any,
+    targets: Any,
+    adapter: Any,
+    cfg: Any,
+    *,
+    iteration: int = 0,
+) -> tuple[Tensor, dict]:
+    """Return entropy-regularization elements ``[B,X]``."""
+
+    del old
+    entropy = adapter.entropy(
+        new,
+        targets.legal_event_ids.to(new.v.device),
+        targets.legal_event_mask.to(new.v.device),
+    )
     return -_entropy_coefficient(cfg, iteration) * entropy, {"entropy": entropy}
 
 
-def l_kl(new: Any, old: Any, targets: Any, adapter: Any, cfg: Any) -> tuple[Tensor, dict]:
-    del targets
-    reference = getattr(old, "ref_out", getattr(old, "out_ref", old))
-    value = adapter.kl(new, reference)
-    return float(_cfg(cfg, "c_kl")) * value, {"kl": value}
-
-
-def l_kl_sample(new: Any, old: Any, targets: Any, adapter: Any, cfg: Any) -> tuple[Tensor, dict]:
-    ratio, _, _ = _ratio(new, old, targets, adapter)
-    value = ratio * torch.log(ratio) - ratio + 1.0
-    return float(_cfg(cfg, "c_kl")) * value, {"ratio": ratio}
-
-
-def l_u(new: Any, old: Any, targets: Any, adapter: Any, cfg: Any) -> tuple[Tensor, dict]:
-    del old, adapter
-    target = getattr(targets, "targets", targets)
-    if new.u is None:
-        raise ValueError("moment loss requires the u head")
-    return float(_cfg(cfg, "c_u")) * (new.u - target.u_hat.to(new.u)) ** 2, {}
-
-
-def l_vvec(new: Any, old: Any, targets: Any, adapter: Any, cfg: Any) -> tuple[Tensor, dict]:
-    del old, adapter
-    target = getattr(targets, "targets", targets)
-    if new.vvec is None:
-        raise ValueError("moment loss requires the vvec head")
-    seat_mask = getattr(targets, "seat_mask", torch.ones_like(target.vvec_hat, dtype=torch.bool))
-    squared = (new.vvec - target.vvec_hat.to(new.vvec)) ** 2
-    return float(_cfg(cfg, "c_vvec")) * (squared * seat_mask.to(squared)).sum(-1), {}
-
-
-def _masked_sum(value: Tensor, mask: Tensor, dims: tuple[int, ...]) -> Tensor:
+def _sum(value: Tensor, mask: Tensor, dims: tuple[int, ...]) -> Tensor:
     return (value * mask.to(value)).sum(dim=dims)
 
 
@@ -133,61 +132,61 @@ def rb_ppo(
     cfg: Any,
     *,
     iteration: int = 0,
-    out_ref: Any | None = None,
 ) -> tuple[Tensor, dict[str, float]]:
-    """Return the three-level posterior-weighted rb_ppo objective."""
+    """Return ``L_clip[A_hat] + L_H + L_V[V_hat]`` averaged over rows."""
 
-    target, _, _, default_child = _sample(old, targets)
-    valid = getattr(targets, "valid_type_mask", target.p_hat != 0).to(new.v.device)
-    child = getattr(targets, "child_mask", default_child).to(new.v.device)
-    p = target.p_hat.to(new.v)
-    nu = target.nu_row.to(new.v)
+    target, _, _ = _parts(old, targets)
+    valid = targets.valid_type_mask.to(new.v.device)
+    child = target.child_mask.to(new.v.device)
+    child_valid = child[:, :, None] & valid[:, None, :]
+    child_p = target.child_p_hat.to(new.v)
+    parent_p = target.parent_p_hat.to(new.v)
+    count = target.child_count.to(new.v).clamp_min(1.0)[:, None, None]
+
     policy, policy_metrics = l_clip(new, old, targets, adapter, cfg)
-    policy_mask = child[:, :, None] & valid[:, None, :]
-    per_row = _masked_sum(policy * p[:, None, :] * nu[:, :, None], policy_mask, (1, 2))
+    policy_weight = child_p / count * child_valid.to(child_p)
+    per_row = (policy * policy_weight).sum((1, 2))
 
-    value, _ = l_v_clip(new, old, targets, adapter, cfg)
+    value, _ = l_v(new, old, targets, adapter, cfg)
     entropy, entropy_metrics = l_h(new, old, targets, adapter, cfg, iteration=iteration)
-    per_type = value + entropy
-    if out_ref is not None and _cfg(cfg, "ref_period") is not None:
-        kl = adapter.kl(new, out_ref)
-        per_type = per_type + float(_cfg(cfg, "c_kl")) * kl
-    else:
-        kl = torch.zeros_like(new.v)
-    per_row = per_row + _masked_sum(per_type * p, valid, (1,))
-    if bool(_cfg(cfg, "use_moment_heads", False)):
-        moment_u, _ = l_u(new, old, targets, adapter, cfg)
-        moment_v, _ = l_vvec(new, old, targets, adapter, cfg)
-        per_row = per_row + moment_u + moment_v
+    type_weight = parent_p * valid.to(parent_p)
+    per_row = per_row + ((value + entropy) * type_weight).sum(1)
 
+    denominator = policy_weight.sum().clamp_min(torch.finfo(policy_weight.dtype).eps)
     ratio = policy_metrics["ratio"]
-    weight = p[:, None, :] * nu[:, :, None] * policy_mask.to(p)
-    denominator = weight.sum().clamp_min(torch.finfo(weight.dtype).eps)
     log_ratio = torch.log(ratio)
-    approx_kl = (weight * (ratio - 1.0 - log_ratio)).sum() / denominator
-    clip_frac = (weight * policy_metrics["clipped"].to(weight)).sum() / denominator
-    entropy_mean = (p * valid.to(p) * entropy_metrics["entropy"]).sum() / (
-        (p * valid.to(p)).sum().clamp_min(torch.finfo(p.dtype).eps)
-    )
+    approx_kl = (policy_weight * (ratio - 1.0 - log_ratio)).sum() / denominator
+    clip_frac = (policy_weight * policy_metrics["clipped"].to(policy_weight)).sum() / denominator
+    entropy_denominator = type_weight.sum().clamp_min(torch.finfo(type_weight.dtype).eps)
     wanted = target.v_hat.to(new.v)
-    value_weight = p * valid.to(p)
-    mean_wanted = (value_weight * wanted).sum() / value_weight.sum().clamp_min(1e-12)
-    variance = (value_weight * (wanted - mean_wanted) ** 2).sum()
-    residual = (value_weight * (wanted - new.v) ** 2).sum()
+    mean_wanted = (type_weight * wanted).sum() / entropy_denominator
+    variance = (type_weight * (wanted - mean_wanted).square()).sum()
+    residual = (type_weight * (wanted - new.v).square()).sum()
     explained = 1.0 - residual / variance.clamp_min(1e-12)
     metrics = {
         "loss": float(per_row.mean().detach()),
-        "policy": float(_masked_sum(policy * weight, policy_mask, (1, 2)).mean().detach()),
-        "value": float(_masked_sum(value * p, valid, (1,)).mean().detach()),
-        "entropy_loss": float(_masked_sum(entropy * p, valid, (1,)).mean().detach()),
-        "kl": float((kl * p * valid).sum().detach() / p.sum().clamp_min(1e-12)),
+        "policy": float((policy * policy_weight).sum(1).sum(1).mean().detach()),
+        "value": float((value * type_weight).sum(1).mean().detach()),
+        "entropy_loss": float((entropy * type_weight).sum(1).mean().detach()),
         "approx_kl": float(approx_kl.detach()),
         "clip_frac": float(clip_frac.detach()),
-        "entropy": float(entropy_mean.detach()),
+        "entropy": float((entropy_metrics["entropy"] * type_weight).sum().detach() / entropy_denominator),
         "explained_variance": float(explained.detach()),
-        "ratio_max": float(torch.where(policy_mask, ratio, torch.zeros_like(ratio)).max().detach()),
+        "ratio_max": float(torch.where(child_valid, ratio, torch.zeros_like(ratio)).max().detach()),
     }
     return per_row.mean(), metrics
 
 
-COMPOSITES = {"rb_ppo": rb_ppo}
+@dataclass(frozen=True)
+class LossSpec:
+    """Composite loss and the target fields it requires."""
+
+    fn: Callable[..., tuple[Tensor, dict[str, float]]]
+    required_targets: frozenset[str]
+
+
+COMPOSITES: dict[str, LossSpec] = {
+    "rb_ppo": LossSpec(
+        rb_ppo, frozenset({"parent_p_hat", "child_p_hat", "a_hat", "v_hat"})
+    )
+}

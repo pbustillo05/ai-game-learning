@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from pbg.core.branching import sample_branched_labeled
 from pbg.core.game import GameBundle, PRETERM, TERMINAL
+from pbg.core.rollout import sample_trees
 from pbg.games.synthetic.exact import enumerate_public_tree
 from pbg.games.synthetic.family import SyntheticPBG, SyntheticRolloutBackend
 from pbg.games.synthetic.model import (
@@ -37,7 +37,7 @@ def _bundle(game: SyntheticPBG, net: SyntheticNet, beta: float) -> GameBundle:
 
 
 def _sample(game: SyntheticPBG, net: SyntheticNet, cfg: SimpleNamespace, seed: int):
-    return sample_branched_labeled(
+    return sample_trees(
         _bundle(game, net, float(cfg.beta_fix["default"])),
         cfg,
         torch.Generator().manual_seed(seed),

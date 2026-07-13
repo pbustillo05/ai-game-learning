@@ -90,28 +90,63 @@ class SyntheticNet(nn.Module):
 class SyntheticPolicyAdapter:
     """Exact categorical policy operations over synthetic event logits."""
 
-    def log_prob(self, out: PolicyOutput, event_ids: Tensor) -> Tensor:
+    def log_prob(
+        self,
+        out: PolicyOutput,
+        event_ids: Tensor,
+        legal_event_ids: Tensor,
+        legal_event_mask: Tensor,
+    ) -> Tensor:
         """Map int64 event ids ``[B, E_sel]`` to log-probs ``[B, E_sel, X]``."""
 
+        if legal_event_ids.ndim != 2 or legal_event_mask.shape != legal_event_ids.shape:
+            raise ValueError("legal events and mask must have shape [B,E_legal]")
+        if legal_event_ids.shape[0] != out.raw.shape[0]:
+            raise ValueError("legal event rows must align with policy rows")
+        full_legal_count = torch.zeros_like(out.raw, dtype=torch.int32)
+        ids = legal_event_ids.to(out.raw.device).long()[:, None, :].expand(
+            out.raw.shape[0], out.raw.shape[1], -1
+        )
+        full_legal_count.scatter_add_(
+            2,
+            ids,
+            legal_event_mask.to(device=out.raw.device, dtype=torch.int32)[:, None, :].expand_as(ids),
+        )
+        full_legal = full_legal_count > 0
+        logits = out.raw.masked_fill(~full_legal, -torch.inf)
         if event_ids.ndim == 1:
             event_ids = event_ids[:, None]
         if event_ids.ndim != 2 or event_ids.shape[0] != out.raw.shape[0]:
             raise ValueError("event_ids must have shape [B, E_sel]")
         if ((event_ids < 0) | (event_ids >= out.raw.shape[-1])).any():
             raise ValueError("event id is outside the categorical head")
-        log_policy = torch.log_softmax(out.raw, dim=-1)  # [B, X, E]
+        log_policy = torch.log_softmax(logits, dim=-1)  # [B, X, E]
         gather_ids = event_ids[:, None, :].expand(
             out.raw.shape[0], out.raw.shape[1], event_ids.shape[1]
         )
         selected = torch.gather(log_policy, 2, gather_ids)  # [B, X, E_sel]
         return selected.transpose(1, 2)  # [B, E_sel, X]
 
-    def entropy(self, out: PolicyOutput) -> Tensor:
+    def entropy(
+        self,
+        out: PolicyOutput,
+        legal_event_ids: Tensor,
+        legal_event_mask: Tensor,
+    ) -> Tensor:
         """Return exact categorical entropy ``[B, X]``."""
 
         # Avoid differentiating through ``0 * -inf`` at masked events.  This is
         # algebraically log_softmax on the finite (legal) subset.
-        legal = torch.isfinite(out.raw)
+        legal_count = torch.zeros_like(out.raw, dtype=torch.int32)
+        ids = legal_event_ids.to(out.raw.device).long()[:, None, :].expand(
+            out.raw.shape[0], out.raw.shape[1], -1
+        )
+        legal_count.scatter_add_(
+            2,
+            ids,
+            legal_event_mask.to(device=out.raw.device, dtype=torch.int32)[:, None, :].expand_as(ids),
+        )
+        legal = legal_count > 0
         finite_logits = torch.where(legal, out.raw, torch.zeros_like(out.raw))
         maximum = torch.where(legal, out.raw, torch.full_like(out.raw, -torch.inf)).amax(
             dim=-1, keepdim=True

@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from pbg.core.game import PRETERM, TERMINAL
+from pbg.core.game import GameBundle, PRETERM, TERMINAL
 from pbg.core.rollout import sample_trees
-from pbg.games.synthetic.family import SyntheticPBG
+from pbg.games.synthetic.family import SyntheticPBG, SyntheticRolloutBackend
 from pbg.games.synthetic.exact import enumerate_public_tree
 from pbg.games.synthetic.model import (
     SyntheticNet,
@@ -27,15 +27,11 @@ def _cfg(mode: str, n_trees: int = 256):
 
 
 def _rollout(game, net, mode: str, seed: int = 811, n_trees: int = 256):
+    bundle = GameBundle(
+        net, SyntheticRolloutBackend(game), SyntheticPolicyAdapter(), None
+    )
     return sample_trees(
-        game,
-        net,
-        SyntheticPolicyAdapter(),
-        _cfg(mode, n_trees),
-        None,
-        None,
-        torch.Generator().manual_seed(seed),
-        np.random.default_rng(seed),
+        bundle, _cfg(mode, n_trees), torch.Generator().manual_seed(seed)
     )
 
 
@@ -69,7 +65,7 @@ def test_reach_modes_agree_exactly_and_policy_cache_matches_adapter() -> None:
     for mode in ("full", "decisions_only", "recompute"):
         tree, reach, policy = _rollout(game, net, mode)
         leaves = _leaf_ids(tree)
-        results.append((tree, reach.rows_for(tree, leaves, game, policy), policy))
+        results.append((tree, reach.rows_for(tree, leaves, SyntheticRolloutBackend(game), policy), policy))
     reference_tree, reference_rows, _ = results[0]
     for tree, rows, _ in results[1:]:
         assert torch.equal(tree.state_ref, reference_tree.state_ref)
@@ -77,7 +73,7 @@ def test_reach_modes_agree_exactly_and_policy_cache_matches_adapter() -> None:
         assert torch.equal(rows, reference_rows)
 
     tree, _, policy = results[0]
-    node_ids = policy.node_index.long()
+    node_ids = policy.node_ids.long()
     refs = tree.state_ref[node_ids]
     legal_ids, legal_mask = game.legal_events(refs)
     head_mask = torch.zeros((len(refs), game.n_player_events), dtype=torch.bool)
@@ -87,9 +83,11 @@ def test_reach_modes_agree_exactly_and_policy_cache_matches_adapter() -> None:
         output = net(game.encode_public(refs), head_mask)
         edge = tree.child_ptr[node_ids]
         events = tree.child_event[edge.long()]
-        recomputed = SyntheticPolicyAdapter().log_prob(output, events[:, None])[:, 0]
-    assert torch.allclose(policy.logp_child[:, 0], recomputed, atol=1e-6, rtol=0.0)
-    assert torch.allclose(policy.v_old, output.v, atol=1e-6, rtol=0.0)
+        recomputed = SyntheticPolicyAdapter().log_prob(
+            output, events[:, None], legal_ids, legal_mask
+        )[:, 0]
+    assert torch.allclose(policy.old_logp_child[:, 0], recomputed, atol=1e-6, rtol=0.0)
+    assert torch.allclose(policy.old_v, output.v, atol=1e-6, rtol=0.0)
 
 
 def test_50k_sequential_terminal_history_law_matches_exact_policy() -> None:
@@ -127,40 +125,25 @@ def test_50k_sequential_terminal_history_law_matches_exact_policy() -> None:
     assert statistic < 18.467
 
 
-def test_sequential_rejects_intensity_and_enforces_node_budget() -> None:
+def test_sequential_rejects_invalid_mode_and_enforces_node_budget() -> None:
     torch.manual_seed(814)
     game = SyntheticPBG(kuhn())
     net = SyntheticNet(game.n_types, game.n_player_events)
+    invalid = _cfg("full", 1)
+    invalid.beta_mode = "neyman"
+    bundle = GameBundle(net, SyntheticRolloutBackend(game), SyntheticPolicyAdapter(), None)
     try:
-        sample_trees(
-            game,
-            net,
-            SyntheticPolicyAdapter(),
-            _cfg("full", 1),
-            None,
-            object(),
-            torch.Generator().manual_seed(815),
-            np.random.default_rng(815),
-        )
-    except AssertionError as exc:
-        assert "intensity" in str(exc)
+        sample_trees(bundle, invalid, torch.Generator().manual_seed(815))
+    except ValueError as exc:
+        assert "sequential" in str(exc) and "fixed" in str(exc)
     else:
-        raise AssertionError("sequential rollout accepted an intensity controller")
+        raise AssertionError("rollout accepted an invalid beta mode")
 
     tiny = _cfg("full", 1)
     tiny.node_budget = 1
     try:
-        sample_trees(
-            game,
-            net,
-            SyntheticPolicyAdapter(),
-            tiny,
-            None,
-            None,
-            torch.Generator().manual_seed(816),
-            np.random.default_rng(816),
-        )
+        sample_trees(bundle, tiny, torch.Generator().manual_seed(816))
     except RuntimeError as exc:
-        assert "node_budget=1" in str(exc)
+        assert "capacity nodes" in str(exc)
     else:
         raise AssertionError("rollout ignored its hard node budget")

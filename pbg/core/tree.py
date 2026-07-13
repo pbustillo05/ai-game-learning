@@ -425,6 +425,7 @@ class AliasTable:
 
     @classmethod
     def build(cls, weights: Tensor | np.ndarray | Iterable[float]) -> "AliasTable":
+        source_device = weights.device if isinstance(weights, Tensor) else torch.device("cpu")
         values = torch.as_tensor(weights, dtype=torch.float64).flatten().cpu()
         if values.numel() == 0:
             raise ValueError("alias weights cannot be empty")
@@ -450,9 +451,9 @@ class AliasTable:
             probability[index] = 1.0
             alias[index] = index
         return cls(
-            probability=torch.tensor(probability, dtype=torch.float64),
-            alias=torch.tensor(alias, dtype=torch.int64),
-            outcomes=torch.arange(count, dtype=torch.int32),
+            probability=torch.tensor(probability, dtype=torch.float64, device=source_device),
+            alias=torch.tensor(alias, dtype=torch.int64, device=source_device),
+            outcomes=torch.arange(count, dtype=torch.int32, device=source_device),
         )
 
     @property
@@ -470,11 +471,17 @@ class AliasTable:
             raise ValueError("n must be nonnegative")
         size = int(self.probability.numel())
         if isinstance(gen, np.random.Generator):
+            if self.probability.device.type != "cpu":
+                raise ValueError("NumPy generators can only sample CPU alias tables")
             columns = torch.from_numpy(gen.integers(size, size=n, dtype=np.int64))
             uniforms = torch.from_numpy(gen.random(n))
         else:
-            columns = torch.randint(size, (n,), generator=gen, dtype=torch.int64)
-            uniforms = torch.rand(n, generator=gen, dtype=torch.float64)
+            columns = torch.randint(
+                size, (n,), generator=gen, dtype=torch.int64, device=self.probability.device
+            )
+            uniforms = torch.rand(
+                n, generator=gen, dtype=torch.float64, device=self.probability.device
+            )
         picked = torch.where(
             uniforms < self.probability[columns], columns, self.alias[columns]
         )
@@ -482,42 +489,32 @@ class AliasTable:
 
 
 def build_decision_alias(tree: TreeBatch) -> AliasTable:
-    """Build the length-biased decision law over player-owned node ids."""
+    """Build the length-biased decision law over decision-row indices."""
 
     p_max = tree.depth_p.shape[1]
     node_ids = ((tree.owner >= 0) & (tree.owner < p_max)).nonzero(as_tuple=False).squeeze(1)
     if node_ids.numel() == 0:
         raise ValueError("tree batch contains no player decision nodes")
-    table = AliasTable.build(tree.path_weight[node_ids])
-    table.outcomes = node_ids.to(torch.int32).cpu()
-    return table
-
-
-# Compatibility with the older plural spelling in CONTRACTS.md.
-build_alias_tables = build_decision_alias
+    return AliasTable.build(tree.path_weight[node_ids])
 
 
 @dataclass
 class PolicyCache:
     """Frozen rollout outputs for the stored children of player nodes."""
 
-    logp_child: Tensor
-    v_old: Tensor
-    node_index: Tensor
+    node_ids: Tensor  # int32 [Nd]
+    old_logp_child: Tensor  # float32 [Nd,E,X]
+    old_v: Tensor  # float32 [Nd,X]
 
-    def rows_for(self, node_ids: Tensor) -> tuple[Tensor, Tensor]:
-        """Gather cached log-probability/value rows for decision node ids."""
-
-        lookup = {int(node): row for row, node in enumerate(self.node_index.tolist())}
-        try:
-            rows = torch.tensor(
-                [lookup[int(node)] for node in node_ids.detach().cpu().tolist()],
-                dtype=torch.long,
-                device=self.logp_child.device,
-            )
-        except KeyError as exc:
-            raise KeyError(f"node {int(exc.args[0])} is not in PolicyCache") from exc
-        return self.logp_child[rows], self.v_old[rows]
+    def __post_init__(self) -> None:
+        if self.node_ids.ndim != 1 or self.node_ids.dtype != torch.int32:
+            raise ValueError("PolicyCache.node_ids must be int32 [Nd]")
+        if self.old_logp_child.ndim != 3 or self.old_logp_child.shape[0] != self.node_ids.numel():
+            raise ValueError("PolicyCache.old_logp_child must have shape [Nd,E,X]")
+        if self.old_v.ndim != 2 or self.old_v.shape[0] != self.node_ids.numel():
+            raise ValueError("PolicyCache.old_v must have shape [Nd,X]")
+        if self.old_logp_child.dtype != torch.float32 or self.old_v.dtype != torch.float32:
+            raise ValueError("PolicyCache floating tensors must be fp32")
 
 
 def _replay_reach_update(
@@ -528,7 +525,7 @@ def _replay_reach_update(
     owner: int,
     taken_logp: Tensor | None,
 ) -> Tensor:
-    """Replay one public edge using the game protocol's legacy policy shapes."""
+    """Replay one public edge from cached selected-action likelihoods."""
 
     if owner >= 0:
         if taken_logp is None:
@@ -573,24 +570,26 @@ class ReachCache:
 
         if self.mode not in {"full", "decisions_only", "recompute"}:
             raise ValueError(f"unknown reach-cache mode {self.mode!r}")
-        requested = [int(node) for node in node_ids.detach().cpu().tolist()]
-        stored = {int(node): row for row, node in enumerate(self.node_index.tolist())}
+        requested = node_ids.to(device=self.node_index.device, dtype=torch.int64)
+        stored_ids = self.node_index.to(torch.int64)
+        positions = torch.searchsorted(stored_ids, requested)
+        present = positions < stored_ids.numel()
+        if stored_ids.numel():
+            present &= stored_ids[positions.clamp_max(stored_ids.numel() - 1)] == requested
         if self.mode != "recompute":
-            missing = [node for node in requested if node not in stored]
-            if missing:
-                raise KeyError(f"reach rows are not stored for nodes {missing}")
-            indices = torch.tensor(
-                [stored[node] for node in requested], dtype=torch.long, device=self.log_r.device
-            )
-            return self.log_r[indices]
+            if not bool(present.all()):
+                raise KeyError("one or more requested reach rows are not stored")
+            return self.log_r[positions.to(self.log_r.device)]
 
-        policy_rows = {
-            int(node): row for row, node in enumerate(policy_cache.node_index.tolist())
-        }
-        memo = {node: self.log_r[row].clone() for node, row in stored.items()}
+        n = int(tree.parent.numel())
+        memo = torch.empty((n, *self.log_r.shape[1:]), dtype=self.log_r.dtype, device=self.log_r.device)
+        known = torch.zeros(n, dtype=torch.bool, device=self.log_r.device)
+        memo[stored_ids.to(self.log_r.device)] = self.log_r
+        known[stored_ids.to(self.log_r.device)] = True
+        policy_ids = policy_cache.node_ids.to(torch.int64)
 
         def compute(node: int) -> Tensor:
-            if node in memo:
+            if bool(known[node]):
                 return memo[node]
             parent = int(tree.parent[node])
             if parent < 0:
@@ -605,13 +604,13 @@ class ReachCache:
             taken = None
             owner = int(tree.owner[parent])
             if owner >= 0:
-                cache_row = policy_rows.get(parent)
-                if cache_row is None:
+                cache_row = int(torch.searchsorted(policy_ids, torch.tensor(parent, device=policy_ids.device)))
+                if cache_row >= policy_ids.numel() or int(policy_ids[cache_row]) != parent:
                     raise KeyError(f"player node {parent} is absent from PolicyCache")
                 child_slot = edge - edge_start
-                taken = policy_cache.logp_child[cache_row, child_slot]
+                taken = policy_cache.old_logp_child[cache_row, child_slot]
             value = _replay_reach_update(
-                game,
+                getattr(game, "game", game),
                 compute(parent),
                 tree.state_ref[parent : parent + 1],
                 tree.child_event[edge : edge + 1],
@@ -619,6 +618,7 @@ class ReachCache:
                 taken,
             )
             memo[node] = value
+            known[node] = True
             return value
 
-        return torch.stack([compute(node) for node in requested], dim=0)
+        return torch.stack([compute(int(node)) for node in requested.tolist()], dim=0)

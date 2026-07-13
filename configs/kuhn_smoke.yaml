@@ -15,9 +15,6 @@ rollout:
   n_trees: 16
   beta_mode: sequential
   beta_fix: {default: 1.0}
-  beta_avg: {default: 1.0}
-  beta_max: {default: 1.0}
-  warmup_iters: 0
   node_budget: 128
   reach_storage: full
 completion:
@@ -34,12 +31,7 @@ loss:
   clip_eps_v: 0.2
   c_v: 0.5
   c_h: 0.01
-  c_kl: 0.0
-  c_u: 0.0
-  c_vvec: 0.0
-  ref_period: null
   entropy_schedule: const
-  use_moment_heads: false
   use_suit_consistency: false
 train:
   iters: 2
@@ -53,4 +45,3 @@ train:
   checkpoint_every: 1
   out_dir: runs/kuhn_smoke
 debug_asserts: true
-

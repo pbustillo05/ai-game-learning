@@ -120,9 +120,14 @@ class PokerPolicyAdapter:
     compose = probabilities
 
     def log_prob(
-        self, raw: PolicyOutput | Mapping[str, Tensor], legal_event_ids: Tensor,
-        legal_mask: Tensor, event_ids: Tensor | None = None,
+        self,
+        raw: PolicyOutput | Mapping[str, Tensor],
+        selected_event_ids: Tensor,
+        legal_event_ids: Tensor,
+        legal_mask: Tensor,
     ) -> Tensor:
+        """Return selected legal-event log probabilities ``[B,E_selected,X]``."""
+
         probability = self.probabilities(raw, legal_event_ids, legal_mask)
         event_shape = (probability.shape[0],) + (1,) * (probability.ndim - 2) + (probability.shape[-1],)
         mask = legal_mask.to(probability.device).reshape(event_shape).expand_as(probability)
@@ -130,15 +135,21 @@ class PokerPolicyAdapter:
             mask, torch.log(probability.clamp_min(self.eps)),
             torch.full_like(probability, -torch.inf),
         )
-        if event_ids is None:
-            return log_rows
-        columns = (legal_event_ids.to(event_ids.device) == event_ids[:, None]).to(torch.int64).argmax(1)
-        present = ((legal_event_ids.to(event_ids.device) == event_ids[:, None]) & legal_mask.to(event_ids.device)).any(1)
-        if not bool(present.all()):
-            raise ValueError("event_ids must select supplied legal events")
-        column_shape = (log_rows.shape[0],) + (1,) * (log_rows.ndim - 2) + (1,)
-        columns = columns.to(log_rows.device).reshape(column_shape).expand(log_rows.shape[:-1] + (1,))
-        return log_rows.gather(-1, columns).squeeze(-1)
+        if selected_event_ids.ndim == 1:
+            selected_event_ids = selected_event_ids[:, None]
+        matches = (
+            legal_event_ids[:, None, :].to(selected_event_ids.device)
+            == selected_event_ids[:, :, None]
+        ) & legal_mask[:, None, :].to(selected_event_ids.device)
+        if not bool(matches.any(-1).all()):
+            raise ValueError("selected_event_ids must select supplied legal events")
+        columns = matches.to(torch.int64).argmax(-1).to(log_rows.device)  # [B,E_selected]
+        if log_rows.ndim != 3:
+            raise ValueError("poker policy log rows must have shape [B,X,E_legal]")
+        gathered = log_rows.gather(
+            -1, columns[:, None, :].expand(log_rows.shape[0], log_rows.shape[1], -1)
+        )  # [B,X,E_selected]
+        return gathered.transpose(1, 2)  # [B,E_selected,X]
 
     def entropy(self, raw: PolicyOutput | Mapping[str, Tensor], legal_event_ids: Tensor, legal_mask: Tensor) -> Tensor:
         probability = self.probabilities(raw, legal_event_ids, legal_mask)

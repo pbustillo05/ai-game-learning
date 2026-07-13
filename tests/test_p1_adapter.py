@@ -19,7 +19,8 @@ def test_adapter_log_prob_normalizes_and_entropy_is_exact() -> None:
     output = net(keys, legal)
     adapter = SyntheticPolicyAdapter()
     selected = torch.tensor([[1, 2], [0, 1]], dtype=torch.int64)
-    log_prob = adapter.log_prob(output, selected)
+    ids = torch.arange(3, dtype=torch.int32).expand(2, -1)
+    log_prob = adapter.log_prob(output, selected, ids, legal)
     assert log_prob.shape == (2, 2, 3)
     assert torch.allclose(
         torch.logsumexp(log_prob, dim=1), torch.zeros((2, 3)), atol=1e-6
@@ -30,7 +31,7 @@ def test_adapter_log_prob_normalizes_and_entropy_is_exact() -> None:
     numerical = -torch.where(
         probability > 0.0, probability * log_policy, torch.zeros_like(probability)
     ).sum(dim=-1)
-    assert torch.allclose(adapter.entropy(output), numerical)
+    assert torch.allclose(adapter.entropy(output, ids, legal), numerical)
     assert torch.allclose(adapter.kl(output, output), torch.zeros((2, 3)), atol=1e-7)
 
 

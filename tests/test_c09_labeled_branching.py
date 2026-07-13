@@ -12,7 +12,7 @@ import torch
 import yaml
 from torch import Tensor, nn
 
-from pbg.core.branching import _offspring_counts, sample_branched_labeled
+from pbg.core.branching import _offspring_counts, _sample_branched_labeled
 from pbg.core.config import ConfigError, load_config
 from pbg.core.game import EventBatch, GameBundle, TERMINAL
 from pbg.core.rollout import _selected_policy_logp
@@ -126,7 +126,7 @@ def _cfg(n_trees: int, beta: float, budget: int = 32) -> SimpleNamespace:
 
 def _sample(backend: _LabeledBackend, cfg: SimpleNamespace, seed: int = 1):
     bundle = GameBundle(_Model(), backend, _Adapter(), None)
-    return sample_branched_labeled(bundle, cfg, torch.Generator().manual_seed(seed))
+    return _sample_branched_labeled(bundle, cfg, torch.Generator().manual_seed(seed))
 
 
 def test_integer_and_fractional_randomized_rounding() -> None:
@@ -149,7 +149,7 @@ def test_equal_labeled_siblings_remain_distinct_with_uniform_weights() -> None:
     assert torch.equal(tree.child_event, torch.zeros_like(tree.child_event))
     assert torch.allclose(tree.nu, torch.full_like(tree.nu, 0.25), atol=0, rtol=0)
     assert torch.allclose(tree.path_weight[tree.child_node], tree.nu, atol=0, rtol=0)
-    assert policy.logp_child.shape == (8, 4, 1)
+    assert policy.old_logp_child.shape == (8, 4, 1)
 
 
 def test_duplicate_siblings_expand_independently_without_label_sorting() -> None:
@@ -191,7 +191,7 @@ def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> 
 def test_labeled_hot_path_has_no_explicit_host_transfers_or_label_sort() -> None:
     banned = {"cpu", "numpy", "tolist", "item", "sort", "argsort"}
     for function in (
-        sample_branched_labeled,
+        _sample_branched_labeled,
         DeviceTreeBuffer.append_children,
         DeviceTreeBuffer.finalize,
         _selected_policy_logp,

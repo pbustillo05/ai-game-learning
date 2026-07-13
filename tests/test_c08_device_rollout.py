@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, GameBundle
-from pbg.core.rollout import sample_trees, sample_trees_device
+from pbg.core.rollout import _sample_trees_sequential, sample_trees
 from pbg.core.tree import DeviceTreeBuffer
 from pbg.games.synthetic.family import SyntheticPBG, SyntheticRolloutBackend
 from pbg.games.synthetic.model import SyntheticNet, SyntheticPolicyAdapter
@@ -47,7 +47,7 @@ def _step(game: SyntheticPBG, state: int, event: int) -> int:
 def test_device_sampler_stays_resident_and_builds_one_path_per_tree() -> None:
     torch.manual_seed(80)
     game = SyntheticPBG(leduc())
-    tree, reach, policy = sample_trees_device(
+    tree, reach, policy = _sample_trees_sequential(
         _bundle(game), _cfg(), torch.Generator().manual_seed(81)
     )
     tree.validate()
@@ -59,7 +59,7 @@ def test_device_sampler_stays_resident_and_builds_one_path_per_tree() -> None:
     assert torch.all(tree.child_ptr[1:] - tree.child_ptr[:-1] <= 1)
     assert int(((tree.owner == PRETERM) | (tree.owner == TERMINAL)).sum()) == 32
     assert reach.log_r.device == tree.parent.device
-    assert policy.logp_child.device == tree.parent.device
+    assert policy.old_logp_child.device == tree.parent.device
 
 
 def test_corrected_leduc_completion_cut_rolls_through_board_and_final_betting() -> None:
@@ -80,28 +80,23 @@ def test_corrected_leduc_completion_cut_rolls_through_board_and_final_betting() 
 def test_buffer_overflow_is_loud_and_returns_no_partial_tree() -> None:
     game = SyntheticPBG(kuhn())
     with pytest.raises(RuntimeError, match=r"requested nodes=.*capacity nodes="):
-        sample_trees_device(
+        _sample_trees_sequential(
             _bundle(game), _cfg(n_trees=2, node_budget=1),
             torch.Generator().manual_seed(82),
         )
 
 
-def test_legacy_warning_is_debug_gated() -> None:
+def test_sample_trees_is_the_sole_dispatch_entry() -> None:
     game = SyntheticPBG(kuhn())
-    model = SyntheticNet(game.n_types, game.n_player_events, {"hidden_dim": 8})
     cfg = _cfg(n_trees=1)
-    cfg.debug_asserts = True
-    with pytest.warns(DeprecationWarning):
-        sample_trees(
-            game, model, SyntheticPolicyAdapter(), cfg, None, None,
-            torch.Generator().manual_seed(83), None,
-        )
+    tree, _, _ = sample_trees(_bundle(game), cfg, torch.Generator().manual_seed(83))
+    assert tree.parent.numel() > 0
 
 
 def test_production_hot_functions_contain_no_explicit_host_transfers() -> None:
     banned = {"cpu", "numpy", "tolist", "item"}
     for function in (
-        sample_trees_device,
+        _sample_trees_sequential,
         DeviceTreeBuffer.append_children,
         DeviceTreeBuffer.finalize,
     ):

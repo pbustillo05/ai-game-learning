@@ -33,9 +33,6 @@ class RolloutConfig:
     n_trees: int
     beta_mode: str
     beta_fix: dict[str, float]
-    beta_avg: dict[str, float]
-    beta_max: dict[str, float]
-    warmup_iters: int
     node_budget: int
     reach_storage: str
 
@@ -50,7 +47,7 @@ class CompletionConfig:
 
 @dataclass
 class LossConfig:
-    """Configure the policy, value, entropy, KL, and moment losses."""
+    """Configure the minimal clipped-policy, value, and entropy losses."""
 
     name: str
     lam: float
@@ -58,12 +55,7 @@ class LossConfig:
     clip_eps_v: float
     c_v: float
     c_h: float
-    c_kl: float
-    c_u: float
-    c_vvec: float
-    ref_period: int | None
     entropy_schedule: str
-    use_moment_heads: bool = False
     use_suit_consistency: bool = False
 
 

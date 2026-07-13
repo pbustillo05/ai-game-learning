@@ -129,3 +129,14 @@
 - Streamed whole trees in fixed configured-budget chunks and rejected unsafe row-cap configurations.
 - Added generic dense auxiliary channels with optional capture and every-player-node bootstrapping.
 - Verified focused CPU behavior, historical P10 compatibility, and small CPU/CUDA parity.
+
+## C11 — minimal RB-PPO training correction
+
+- Made corrected posterior targets the sole public value API and removed default Q allocation.
+- Unified sequential and fixed labeled rollout behind `sample_trees(bundle, cfg, gen)`.
+- Aligned alias outcomes, targets, frozen policy caches, reach rows, and minibatches by decision row.
+- Normalized synthetic and poker policy adapters over complete legal-event rows with duplicate gathers.
+- Reduced the active composite to clipped direct-advantage policy, actor-value, and entropy terms.
+- Added loss target-field declarations and fail-fast target availability checks before optimization.
+- Replaced controller/reference/moment checkpoint state with explicit model, optimizer, scaler, config, and RNG state.
+- Migrated the strict config and Kuhn smoke preset away from deferred Neyman, KL, and moment fields.

@@ -7,7 +7,7 @@ import torch
 
 from pbg.core.completion import BatchedCompletionStats
 from pbg.core.game import TERMINAL
-from pbg.core.posterior_values import (
+from pbg.core.values import (
     AuxiliaryChannelSpec,
     HeadEvals,
     branched_value,
