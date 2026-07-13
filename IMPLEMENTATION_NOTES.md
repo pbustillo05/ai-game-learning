@@ -161,3 +161,15 @@
 - Pair-level aggregate A payoff drives bb/100 means, Student-t intervals, and per-seat reports.
 - Fold rewards remain local; every fixed showdown crosses the stable evaluator facade.
 - Arena reconstruction uses the P07 poker model bundle and policy adapter directly.
+
+## P13A — GPU-native poker rollout backend
+
+- Added a preallocated device SoA state store with tensor-cursor prefix allocation and full action histories.
+- Implemented one Torch transition path for CPU and CUDA, including blinds, button rotation, affine raises, short all-ins, reopening, folds, chance deals and completion cuts.
+- Kept fold settlement and public pot-stratum construction local while exposing device tensors for sibling completion.
+- Added deterministic colex chance labels with street-disjoint offsets and padded dealt-card payloads.
+- Routed one preflop queue and shared postflop queues by live-player count, lifting preflop classes to combo rows at the boundary.
+- Partition and exact-profile inputs stay on the owning device and use the evaluator 0.3.0+ public adapters without removed arguments.
+- Removed the policy adapter's device-scalar tick-width synchronization from the rollout event path.
+- Random CPU trajectories match the independent `NLHEEngine`; focused CUDA residency passed on an idle RTX 2080 Ti.
+- Batch histograms are retained as `preflop` and `postflop_<n_live>` dispatch records without CI throughput thresholds.

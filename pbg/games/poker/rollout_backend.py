@@ -1,0 +1,741 @@
+"""Device-native batched no-limit hold'em rollout backend."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping
+from typing import Any
+
+import torch
+from torch import Tensor, nn
+
+from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
+from pbg.games.poker.cards import N_CLASSES, N_HANDS
+from pbg.games.poker.engine import (
+    ALL_IN,
+    CHECK_CALL,
+    FOLD,
+    FOLDED,
+    LIVE,
+    RAISE_OFFSET,
+    RIVER,
+    PokerConfig,
+    PotStrata,
+)
+from pbg.games.poker.folded import (
+    FoldSnapshotBatch,
+    PokerGPUPartitionAdapter,
+)
+from pbg.games.poker.mc import PokerGPURejectionSampler
+from pbg.games.poker.model.postflop import PostflopMasks
+from pbg.games.poker.model.preflop import (
+    PokerPublicBatch,
+    PolicyOutput,
+    PreflopMasks,
+)
+from pbg.games.poker.tensor_state import PokerTensorStateStore
+
+
+_PLAYER = 0
+_CHANCE = 1
+_TERMINAL = 2
+_PRETERM = 3
+_EPS = 1e-6
+_CHANCE_OFFSETS = (100_000, 200_000, 300_000)
+
+
+class PokerRolloutBackend:
+    """Batched Torch implementation of public NLHE navigation.
+
+    Args:
+        cfg: Public table configuration.
+        capacity: Maximum number of state rows resident in this pipeline.
+        device: Owning CPU or CUDA device.
+        max_rollout_steps: Maximum public transitions in one sampled path.
+        beta_fix: Fixed branching intensities by public-stage bucket.
+        profile_sampler: Exact sibling-facade joint-profile adapter.
+        partition_adapter: Sibling-facade neutral-partition adapter.
+        evaluator_backend: ``"auto"``, ``"cpu"``, or ``"cuda"``.
+
+    Every returned tensor remains on ``device``.  The CPU and CUDA paths run
+    the same state-transition code; :class:`NLHEEngine` remains the separate
+    list-based correctness oracle used only by tests and evaluation.
+    """
+
+    def __init__(
+        self,
+        cfg: PokerConfig,
+        capacity: int,
+        device: torch.device | str,
+        *,
+        max_rollout_steps: int | None = None,
+        beta_fix: Mapping[str, float] | Any | None = None,
+        profile_sampler: PokerGPURejectionSampler | Any | None = None,
+        partition_adapter: PokerGPUPartitionAdapter | Any | None = None,
+        evaluator_backend: str = "auto",
+    ) -> None:
+        self.cfg = cfg
+        self.device = torch.device(device)
+        self.n_players = cfg.n_players
+        self.x_sizes = (N_HANDS,) * cfg.n_players
+        self.n_ticks = cfg.n_ticks
+        self.e_max = RAISE_OFFSET + cfg.n_ticks
+        if evaluator_backend not in {"auto", "cpu", "cuda"}:
+            raise ValueError("evaluator_backend must be 'auto', 'cpu', or 'cuda'")
+        if max_rollout_steps is None:
+            raises_per_street = math.ceil(cfg.stack_bb / cfg.bb) + 1
+            max_rollout_steps = 4 * cfg.n_players * (raises_per_street + 1) + 3
+        self.max_rollout_steps = int(max_rollout_steps)
+        self.states = PokerTensorStateStore(
+            capacity, self.max_rollout_steps, self.device, cfg.n_players
+        )
+        self.state_store = self.states
+        table = getattr(beta_fix, "beta_fix", beta_fix)
+        self.beta_fix = dict(table or {"default": 1.0})
+        if "default" not in self.beta_fix:
+            raise ValueError("beta_fix requires a 'default' entry")
+        if any(not math.isfinite(float(value)) or float(value) < 1.0 for value in self.beta_fix.values()):
+            raise ValueError("rollout beta values must be finite and at least one")
+        self.profile_sampler = profile_sampler or PokerGPURejectionSampler(
+            backend=evaluator_backend
+        )
+        self.partition_adapter = partition_adapter or PokerGPUPartitionAdapter()
+        combo_cards = torch.triu_indices(52, 52, offset=1, device=self.device).T
+        self.combo_cards = combo_cards.to(torch.int16)  # [H,2]
+        a, b = combo_cards[:, 0], combo_cards[:, 1]
+        rank_a, rank_b = a // 4, b // 4
+        high_pos = 12 - torch.maximum(rank_a, rank_b)
+        low_pos = 12 - torch.minimum(rank_a, rank_b)
+        self.combo_class = torch.where(
+            (rank_a == rank_b) | ((a % 4) == (b % 4)),
+            high_pos * 13 + low_pos,
+            low_pos * 13 + high_pos,
+        ).to(torch.int64)  # [H]
+        self.batch_size_histograms: dict[str, list[int]] = {
+            "preflop": [],
+            **{f"postflop_{live}": [] for live in range(2, cfg.n_players + 1)},
+        }
+        self.game = self
+
+    def root_states(self, n: int) -> Tensor:
+        """Reset storage, post blinds, and return int32 root handles ``[B]``."""
+
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            raise ValueError("n must be a nonnegative integer")
+        buttons = torch.remainder(
+            torch.arange(n, dtype=torch.int32, device=self.device), self.n_players
+        )  # [B]
+        return self._root_states_with_buttons(buttons)
+
+    def _root_states_with_buttons(self, buttons: Tensor) -> Tensor:
+        """Reset storage and initialize roots for explicit buttons ``[B]``."""
+
+        n = buttons.shape[0]
+        self.states.reset()
+        handles = self.states.allocate_all(n)  # [B]
+        rows = handles.to(torch.int64)
+        if self.n_players == 2:
+            sb_seat = buttons
+            bb_seat = torch.remainder(buttons + 1, 2)
+        else:
+            sb_seat = torch.remainder(buttons + 1, self.n_players)
+            bb_seat = torch.remainder(buttons + 2, self.n_players)
+        stacks = torch.full(
+            (n, self.n_players), float(self.cfg.stack_bb),
+            dtype=torch.float32, device=self.device,
+        )  # [B,P]
+        committed = torch.zeros_like(stacks)  # [B,P]
+        batch = torch.arange(n, device=self.device)
+        sb_post = torch.minimum(stacks[batch, sb_seat.long()], torch.full((n,), float(self.cfg.sb), device=self.device))
+        bb_post = torch.minimum(stacks[batch, bb_seat.long()], torch.full((n,), float(self.cfg.bb), device=self.device))
+        committed[batch, sb_seat.long()] += sb_post
+        committed[batch, bb_seat.long()] += bb_post
+        stacks -= committed
+        status = torch.where(stacks <= _EPS, ALL_IN, LIVE).to(torch.int8)  # [B,P]
+        first = torch.remainder(bb_seat + 1, self.n_players)
+        offsets = torch.arange(self.n_players, device=self.device)[None, :]  # [1,P]
+        candidates = torch.remainder(first[:, None] + offsets, self.n_players)
+        candidate_live = status.gather(1, candidates.long()) == LIVE
+        actor = candidates.gather(1, candidate_live.to(torch.int64).argmax(1, keepdim=True)).squeeze(1)
+        has_actor = candidate_live.any(1)
+        self.states.stacks[rows] = stacks
+        self.states.committed_street[rows] = committed
+        self.states.committed_total[rows] = committed
+        self.states.status[rows] = status
+        self.states.acted[rows] = False
+        self.states.reopen_mask[rows] = status == LIVE
+        self.states.actor[rows] = torch.where(has_actor, actor, -torch.ones_like(actor)).to(torch.int32)
+        self.states.street[rows] = 0
+        self.states.button[rows] = buttons
+        self.states.n_raises[rows] = 0
+        self.states.phase[rows] = torch.where(has_actor, _PLAYER, _PRETERM).to(torch.int32)
+        self.states.board[rows] = -1
+        self.states.last_full_raise[rows] = float(self.cfg.bb)
+        self.states.current_bet[rows] = committed.max(1).values
+        self.states.action_history[rows] = -1
+        self.states.history_length[rows] = 0
+        self.states.fold_payoff[rows] = 0.0
+        return handles
+
+    def rotate_button(self, states: Tensor) -> Tensor:
+        """Return fresh roots ``[B]`` with each supplied button advanced once."""
+
+        self._validate_handles(states)
+        buttons = torch.remainder(
+            self.states.button[states.to(torch.int64)].clone() + 1, self.n_players
+        )
+        return self._root_states_with_buttons(buttons)
+
+    def _validate_handles(self, states: Tensor) -> None:
+        if states.ndim != 1 or states.dtype != torch.int32:
+            raise TypeError("states must be int32 [B]")
+        if states.device != self.device:
+            raise ValueError("states must be on the backend device")
+
+    def classify(self, states: Tensor) -> Tensor:
+        """Return int32 owner or leaf codes ``[B]``."""
+
+        self._validate_handles(states)
+        rows = states.to(torch.int64)
+        phase = self.states.phase[rows]
+        actor = self.states.actor[rows]
+        return torch.where(
+            phase == _CHANCE,
+            torch.full_like(actor, CHANCE),
+            torch.where(
+                phase == _TERMINAL,
+                torch.full_like(actor, TERMINAL),
+                torch.where(phase == _PRETERM, torch.full_like(actor, PRETERM), actor),
+            ),
+        ).to(torch.int32)  # [B]
+
+    owner_of = classify
+
+    def is_terminal(self, states: Tensor) -> Tensor:
+        """Return fold-terminal flags ``[B]``."""
+
+        return self.classify(states) == TERMINAL
+
+    def is_pre_terminal(self, states: Tensor) -> Tensor:
+        """Return completion-cut flags ``[B]``."""
+
+        return self.classify(states) == PRETERM
+
+    def raise_targets(self, states: Tensor) -> Tensor:
+        """Return affine raise-to ticks as float32 ``[B,n_ticks]``."""
+
+        self._validate_handles(states)
+        rows = states.to(torch.int64)
+        actor = self.states.actor[rows].to(torch.int64)
+        committed = self.states.committed_street[rows, actor]
+        maximum = committed + self.states.stacks[rows, actor]
+        minimum = self.states.current_bet[rows] + self.states.last_full_raise[rows]
+        if self.n_ticks == 1:
+            targets = maximum[:, None]
+        else:
+            fraction = torch.arange(self.n_ticks, dtype=torch.float32, device=self.device)
+            fraction = fraction / float(self.n_ticks - 1)
+            targets = minimum[:, None] + (maximum - minimum)[:, None] * fraction[None, :]
+            targets[:, -1] = maximum
+        short = maximum + _EPS < minimum
+        targets = torch.where(short[:, None], torch.zeros_like(targets), targets)
+        targets[:, -1] = maximum
+        allowed = (
+            (self.states.phase[rows] == _PLAYER)
+            & self.states.reopen_mask[rows, actor]
+            & (maximum > self.states.current_bet[rows] + _EPS)
+        )
+        return torch.where(allowed[:, None], targets, torch.zeros_like(targets))  # [B,T]
+
+    legal_raise_targets = raise_targets
+
+    def legal_events(self, states: Tensor) -> tuple[Tensor, Tensor]:
+        """Return player event ids and legal masks ``[B,E_max]``."""
+
+        self._validate_handles(states)
+        rows = states.to(torch.int64)
+        actor = self.states.actor[rows].to(torch.int64)
+        ids = torch.arange(self.e_max, dtype=torch.int32, device=self.device)[None, :]
+        ids = ids.expand(states.shape[0], -1).clone()  # [B,E]
+        mask = torch.zeros_like(ids, dtype=torch.bool)  # [B,E]
+        player = self.states.phase[rows] == _PLAYER
+        to_call = self.states.current_bet[rows] - self.states.committed_street[rows, actor]
+        mask[:, FOLD] = player & (to_call > _EPS)
+        mask[:, CHECK_CALL] = player
+        maximum = self.states.committed_street[rows, actor] + self.states.stacks[rows, actor]
+        can_raise = player & self.states.reopen_mask[rows, actor] & (
+            maximum > self.states.current_bet[rows] + _EPS
+        )
+        minimum = self.states.current_bet[rows] + self.states.last_full_raise[rows]
+        short = maximum + _EPS < minimum
+        mask[:, RAISE_OFFSET:] = can_raise[:, None] & (~short[:, None])
+        mask[:, -1] |= can_raise & short
+        return ids, mask
+
+    def step(self, states: Tensor, events: EventBatch) -> Tensor:
+        """Apply player or chance events and return successor handles ``[B]``."""
+
+        self._validate_handles(states)
+        if events.public_id.shape != states.shape:
+            raise ValueError("events and states must have matching shape [B]")
+        phase = self.states.phase[states.to(torch.int64)]
+        if "cards" in events.payload:
+            torch._assert((phase == _CHANCE).all(), "card payload requires chance states")
+            return self._step_chance(states, events.payload["cards"])
+        torch._assert((phase == _PLAYER).all(), "player event requires player states")
+        return self._step_player(states, events.public_id)
+
+    def _step_player(self, states: Tensor, event_ids: Tensor) -> Tensor:
+        """Apply batched legal player actions ``[B]``."""
+
+        legal_ids, legal_mask = self.legal_events(states)
+        selected = legal_ids == event_ids[:, None]
+        torch._assert((selected & legal_mask).any(1).all(), "illegal poker event")
+        successors = self.states.append_copies(states)  # [B]
+        rows = successors.to(torch.int64)
+        actor = self.states.actor[rows].to(torch.int64)
+        batch = torch.arange(states.shape[0], device=self.device)
+        fold = event_ids == FOLD
+        call = event_ids == CHECK_CALL
+        raise_event = event_ids >= RAISE_OFFSET
+        self.states.status[rows[fold], actor[fold]] = FOLDED
+        self.states.acted[rows[fold], actor[fold]] = True
+        to_call = (self.states.current_bet[rows] - self.states.committed_street[rows, actor]).clamp_min(0.0)
+        addition_call = torch.minimum(self.states.stacks[rows, actor], to_call)
+        selected_call = torch.where(call, addition_call, torch.zeros_like(addition_call))
+        self.states.stacks[rows, actor] -= selected_call
+        self.states.committed_street[rows, actor] += selected_call
+        self.states.committed_total[rows, actor] += selected_call
+        self.states.acted[rows[call], actor[call]] = True
+        targets = self.raise_targets(states)
+        tick = (event_ids - RAISE_OFFSET).clamp(0, self.n_ticks - 1).to(torch.int64)
+        target = targets[batch, tick]
+        old_bet = self.states.current_bet[rows]
+        old_committed = self.states.committed_street[rows, actor]
+        addition_raise = torch.where(raise_event, target - old_committed, torch.zeros_like(target))
+        self.states.stacks[rows, actor] -= addition_raise
+        self.states.committed_street[rows, actor] += addition_raise
+        self.states.committed_total[rows, actor] += addition_raise
+        increment = target - old_bet
+        full_raise = raise_event & (increment + _EPS >= self.states.last_full_raise[rows])
+        self.states.current_bet[rows] = torch.where(raise_event, target, old_bet)
+        self.states.last_full_raise[rows] = torch.where(
+            full_raise, increment, self.states.last_full_raise[rows]
+        )
+        self.states.n_raises[rows] += full_raise.to(torch.int32)
+        self.states.acted[rows[full_raise]] = False
+        self.states.acted[rows[raise_event], actor[raise_event]] = True
+        all_in = self.states.stacks[rows, actor] <= _EPS
+        self.states.stacks[rows, actor] = torch.where(
+            all_in, torch.zeros_like(self.states.stacks[rows, actor]), self.states.stacks[rows, actor]
+        )
+        self.states.status[rows, actor] = torch.where(
+            all_in, torch.full_like(self.states.status[rows, actor], ALL_IN), self.states.status[rows, actor]
+        )
+        length = self.states.history_length[rows].to(torch.int64)
+        torch._assert((length < self.max_rollout_steps).all(), "poker action history capacity exceeded")
+        self.states.action_history[rows, length] = event_ids
+        self.states.history_length[rows] += 1
+        self.states.reopen_mask[rows] = (~self.states.acted[rows]) & (self.states.status[rows] == LIVE)
+
+        contesting = self.states.status[rows] != FOLDED
+        contest_count = contesting.sum(1)
+        fold_terminal = contest_count == 1
+        winner = contesting.to(torch.int64).argmax(1)
+        baseline = -self.states.committed_total[rows]
+        pot = self.states.committed_total[rows].sum(1)
+        payoff = baseline.clone()
+        payoff[batch, winner] += pot
+        self.states.fold_payoff[rows] = torch.where(
+            fold_terminal[:, None], payoff, self.states.fold_payoff[rows]
+        )
+
+        offsets = torch.arange(1, self.n_players + 1, device=self.device)[None, :]
+        candidates = torch.remainder(actor[:, None] + offsets, self.n_players)
+        candidate_live = self.states.status[rows].gather(1, candidates) == LIVE
+        candidate_committed = self.states.committed_street[rows].gather(1, candidates)
+        candidate_acted = self.states.acted[rows].gather(1, candidates)
+        needs_action = candidate_live & (
+            (~candidate_acted) | (candidate_committed + _EPS < self.states.current_bet[rows, None])
+        )
+        has_next = needs_action.any(1)
+        next_actor = candidates.gather(1, needs_action.to(torch.int64).argmax(1, keepdim=True)).squeeze(1)
+        actionable = (self.states.status[rows] == LIVE).sum(1)
+        finish_round = (~fold_terminal) & (~has_next)
+        completion = finish_round & ((self.states.street[rows] == RIVER) | (actionable <= 1))
+        chance = finish_round & (~completion)
+        self.states.actor[rows] = torch.where(has_next, next_actor, -torch.ones_like(next_actor)).to(torch.int32)
+        self.states.phase[rows] = torch.where(
+            fold_terminal,
+            torch.full_like(self.states.phase[rows], _TERMINAL),
+            torch.where(
+                completion,
+                torch.full_like(self.states.phase[rows], _PRETERM),
+                torch.where(chance, torch.full_like(self.states.phase[rows], _CHANCE), self.states.phase[rows]),
+            ),
+        )
+        return successors
+
+    def _step_chance(self, states: Tensor, cards: Tensor) -> Tensor:
+        """Deal padded chance cards ``[B,3]`` and begin the next street."""
+
+        if cards.ndim != 2 or cards.shape != (states.shape[0], 3):
+            raise ValueError("chance cards must have shape [B,3]")
+        successors = self.states.append_copies(states)  # [B]
+        rows = successors.to(torch.int64)
+        old_street = self.states.street[states.to(torch.int64)]
+        flop = old_street == 0
+        expected = torch.where(flop, 3, 1)
+        real = cards >= 0
+        torch._assert((real.sum(1) == expected).all(), "wrong number of chance cards")
+        torch._assert(((cards < 52) | (~real)).all(), "chance card outside deck")
+        sorted_cards = torch.sort(cards.masked_fill(~real, 127), dim=1).values.to(torch.int16)
+        sorted_cards = sorted_cards.masked_fill(~real, -1)
+        self.states.board[rows[flop], :3] = sorted_cards[flop, :3]
+        later = ~flop
+        destination = old_street[later] + 2
+        self.states.board[rows[later], destination.to(torch.int64)] = cards[later, 0]
+        self.states.street[rows] = old_street + 1
+        self.states.committed_street[rows] = 0.0
+        self.states.acted[rows] = False
+        self.states.reopen_mask[rows] = self.states.status[rows] == LIVE
+        self.states.last_full_raise[rows] = float(self.cfg.bb)
+        self.states.current_bet[rows] = 0.0
+        self.states.n_raises[rows] = 0
+        start = torch.remainder(self.states.button[rows] + 1, self.n_players)
+        offsets = torch.arange(self.n_players, device=self.device)[None, :]
+        candidates = torch.remainder(start[:, None] + offsets, self.n_players)
+        live = self.states.status[rows].gather(1, candidates.long()) == LIVE
+        torch._assert(live.any(1).all(), "chance state has no actionable seat")
+        actor = candidates.gather(1, live.to(torch.int64).argmax(1, keepdim=True)).squeeze(1)
+        self.states.actor[rows] = actor.to(torch.int32)
+        self.states.phase[rows] = _PLAYER
+        return successors
+
+    def sample_profiles(self, states: Tensor, reach: Tensor, gen: torch.Generator) -> Tensor:
+        """Draw one exact collision-conditioned profile as int32 ``[B,P]``."""
+
+        self._validate_handles(states)
+        rows = states.to(torch.int64)
+        dealt = torch.ones(
+            (states.shape[0], self.n_players), dtype=torch.bool, device=self.device
+        )  # [B,P]
+        profiles = self.profile_sampler.sample(
+            reach, self.states.board[rows], dealt, 1, gen
+        )
+        return profiles[:, 0].to(torch.int32)  # [B,P]
+
+    def sample_events(
+        self,
+        states: Tensor,
+        profiles: Tensor,
+        policy_out: PolicyOutput | None,
+        adapter: Any,
+        gen: torch.Generator,
+    ) -> EventBatch:
+        """Draw player actions or profile-complement chance cards ``[B]``."""
+
+        owners = self.classify(states)
+        if policy_out is not None:
+            legal_ids, legal_mask = self.legal_events(states)
+            public_id = adapter.draw(
+                policy_out, profiles, owners.to(torch.int64), legal_ids, legal_mask, gen
+            )
+            return EventBatch(public_id=public_id.to(torch.int32))
+        rows = states.to(torch.int64)
+        board = self.states.board[rows]
+        private = self.combo_cards[profiles.to(torch.int64)].reshape(states.shape[0], -1)
+        unavailable = torch.cat((board, private), dim=1)  # [B,5+2P]
+        valid = unavailable >= 0
+        blocked = torch.zeros((states.shape[0], 52), dtype=torch.bool, device=self.device)
+        batch_rows = torch.arange(states.shape[0], device=self.device)[:, None].expand_as(valid)
+        blocked[batch_rows[valid], unavailable[valid].to(torch.int64)] = True
+        keys = torch.rand((states.shape[0], 52), generator=gen, device=self.device)
+        keys.masked_fill_(blocked, torch.inf)
+        draw = torch.argsort(keys, dim=1)[:, :3].to(torch.int16)  # [B,3]
+        count = torch.where(self.states.street[rows] == 0, 3, 1)
+        keep = torch.arange(3, device=self.device)[None, :] < count[:, None]
+        cards = draw.masked_fill(~keep, -1)  # [B,3]
+        sorted_cards = torch.sort(cards.masked_fill(cards < 0, 127), dim=1).values
+        c0, c1, c2 = sorted_cards[:, 0].to(torch.int32), sorted_cards[:, 1].to(torch.int32), sorted_cards[:, 2].to(torch.int32)
+        flop_label = c0 + c1 * (c1 - 1) // 2 + c2 * (c2 - 1) * (c2 - 2) // 6
+        one_label = cards[:, 0].to(torch.int32)
+        street = self.states.street[rows]
+        label = torch.where(street == 0, flop_label + _CHANCE_OFFSETS[0], one_label + _CHANCE_OFFSETS[1])
+        label = torch.where(street == 2, one_label + _CHANCE_OFFSETS[2], label)
+        return EventBatch(public_id=label.to(torch.int32), payload={"cards": cards})
+
+    def reach_update(
+        self,
+        reach: Tensor,
+        states: Tensor,
+        events: EventBatch,
+        policy_out: PolicyOutput | None,
+    ) -> Tensor:
+        """Update action likelihoods or board compatibility ``[B,P,H]``."""
+
+        result = reach.clone()  # [B,P,H]
+        if policy_out is not None:
+            legal_ids, legal_mask = self.legal_events(states)
+            from pbg.games.poker.adapter import PokerPolicyAdapter
+
+            adapter = PokerPolicyAdapter(self.n_ticks)
+            selected = adapter.log_prob(
+                policy_out, events.public_id[:, None], legal_ids, legal_mask
+            )[:, 0]  # [B,H]
+            actor = self.classify(states).to(torch.int64)
+            batch = torch.arange(states.shape[0], device=self.device)
+            result[batch, actor] += selected.detach().float()
+            return result
+        cards = events.payload["cards"]
+        real = cards >= 0
+        conflict = (
+            (self.combo_cards[None, :, :, None] == cards[:, None, None, :])
+            & real[:, None, None, :]
+        ).any(3).any(2)  # [B,H]
+        return result.masked_fill(conflict[:, None, :], -torch.inf)
+
+    def encode_public(self, states: Tensor) -> PokerPublicBatch:
+        """Construct model public inputs from handles ``[B]``."""
+
+        rows = states.to(torch.int64)
+        legal_ids, legal = self.legal_events(states)
+        targets = self.raise_targets(states)
+        fold_legal = legal[:, FOLD].to(torch.float32)
+        raise_fraction = legal[:, RAISE_OFFSET:].to(torch.float32).mean(1)
+        legality = torch.stack((fold_legal, legal[:, CHECK_CALL].float(), raise_fraction), dim=1)
+        bounds = torch.stack((targets[:, 0], targets[:, -1]), dim=1)
+        del legal_ids
+        return PokerPublicBatch(
+            street=self.states.street[rows].to(torch.int64),
+            board=self.states.board[rows].to(torch.int64),
+            pot=self.states.committed_total[rows].sum(1),
+            stacks=self.states.stacks[rows],
+            committed=self.states.committed_total[rows],
+            to_act=self.states.actor[rows].to(torch.int64),
+            legality_summary=legality,
+            n_ticks=torch.full((states.shape[0],), self.n_ticks, dtype=torch.int64, device=self.device),
+            raise_grid_bounds=bounds,
+            status=self.states.status[rows].to(torch.int64),
+            seat_mask=torch.ones((states.shape[0], self.n_players), dtype=torch.bool, device=self.device),
+            button=self.states.button[rows].to(torch.int64),
+        )
+
+    @staticmethod
+    def _slice_public(pub: PokerPublicBatch, positions: Tensor) -> PokerPublicBatch:
+        values = {
+            name: None if getattr(pub, name) is None else getattr(pub, name)[positions]
+            for name in pub.__dataclass_fields__
+        }
+        return PokerPublicBatch(**values)
+
+    @staticmethod
+    def _combine_outputs(parts: list[tuple[Tensor, PolicyOutput]], batch: int) -> PolicyOutput:
+        if not parts:
+            raise ValueError("cannot combine an empty policy batch")
+        sample = parts[0][1]
+        raw = {
+            name: torch.empty((batch, *value.shape[1:]), dtype=value.dtype, device=value.device)
+            for name, value in sample.raw.items()
+        }
+        value = torch.empty((batch, *sample.v.shape[1:]), dtype=sample.v.dtype, device=sample.v.device)
+        vvec = None if sample.vvec is None else torch.empty(
+            (batch, *sample.vvec.shape[1:]), dtype=sample.vvec.dtype, device=sample.vvec.device
+        )
+        u = None if sample.u is None else torch.empty(
+            (batch, *sample.u.shape[1:]), dtype=sample.u.dtype, device=sample.u.device
+        )
+        for positions, output in parts:
+            for name in raw:
+                raw[name][positions] = output.raw[name]
+            value[positions] = output.v
+            if vvec is not None and output.vvec is not None:
+                vvec[positions] = output.vvec
+            if u is not None and output.u is not None:
+                u[positions] = output.u
+        return PolicyOutput(raw=raw, v=value, vvec=vvec, u=u)
+
+    def policy_forward(self, frozen_model: nn.Module, states: Tensor, reach: Tensor) -> PolicyOutput:
+        """Route queued street-family model calls and return combo rows ``[B,H]``."""
+
+        self._validate_handles(states)
+        if reach.shape != (states.shape[0], self.n_players, N_HANDS):
+            raise ValueError("reach must have shape [B,P,1326]")
+        finite = torch.isfinite(reach)
+        gauge = reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
+        weights = torch.exp(reach - gauge).masked_fill(~finite, 0.0)  # [B,P,H]
+        pub = self.encode_public(states)
+        rows = states.to(torch.int64)
+        parts: list[tuple[Tensor, PolicyOutput]] = []
+        preflop = (self.states.street[rows] == 0).nonzero().squeeze(1)
+        if preflop.numel():
+            selected = weights[preflop]
+            class_ranges = torch.zeros(
+                (preflop.shape[0], self.n_players, N_CLASSES),
+                dtype=torch.float32, device=self.device,
+            )  # [Bp,P,K]
+            class_ids = self.combo_class[None, None, :].expand_as(selected)
+            class_ranges.scatter_add_(2, class_ids, selected)
+            pre_pub = self._slice_public(pub, preflop)
+            masks = PreflopMasks(
+                seat_mask=pre_pub.seat_mask,
+                status=pre_pub.status,
+            )
+            output = frozen_model.forward_preflop(
+                pre_pub, class_ranges, pre_pub.to_act, masks
+            )
+            if output.v.shape[1] == N_CLASSES:
+                output = PolicyOutput(
+                    raw={name: value[:, self.combo_class] for name, value in output.raw.items()},
+                    v=output.v[:, self.combo_class], vvec=output.vvec, u=output.u,
+                )
+            parts.append((preflop, output))
+            self.batch_size_histograms["preflop"].append(preflop.shape[0])
+
+        post = (self.states.street[rows] != 0).nonzero().squeeze(1)
+        if post.numel():
+            n_live = (self.states.status[rows[post]] != FOLDED).sum(1)
+            queue_order = torch.argsort(
+                torch.stack([(n_live == live).sum() for live in range(2, self.n_players + 1)]),
+                descending=True,
+            )
+            for queue_index in queue_order:
+                live = queue_index + 2
+                positions = post[n_live == live]
+                if positions.numel() == 0:
+                    continue
+                post_pub = self._slice_public(pub, positions)
+                compatibility = self._compatibility(post_pub.board)
+                partition = self._partition_summary(
+                    post_pub.board, weights[positions], post_pub.status, int(live)
+                )
+                evaluator_dim = getattr(getattr(frozen_model, "postflop", None), "cfg", None)
+                use_summary = evaluator_dim is not None and evaluator_dim.evaluator_summary_dim > 0
+                masks = PostflopMasks(
+                    compatibility=compatibility,
+                    seat_mask=post_pub.seat_mask,
+                    combo_mask=(weights[positions] > 0),
+                    status=post_pub.status,
+                    evaluator_summary=partition if use_summary else None,
+                )
+                output = frozen_model.forward_postflop(
+                    post_pub, weights[positions], post_pub.to_act, masks
+                )
+                parts.append((positions, output))
+                self.batch_size_histograms[f"postflop_{live}"].append(positions.shape[0])
+        return self._combine_outputs(parts, states.shape[0])
+
+    def _compatibility(self, board: Tensor) -> Tensor:
+        """Return board-compatible combo mask ``[B,H]``."""
+
+        real = board >= 0
+        conflict = (
+            (self.combo_cards[None, :, :, None] == board[:, None, None, :])
+            & real[:, None, None, :]
+        ).any(3).any(2)
+        return ~conflict
+
+    def _partition_summary(
+        self, board: Tensor, weights: Tensor, status: Tensor, n_live: int
+    ) -> Any:
+        """Call the sibling facade with live/folded rows ``[B,L/F,H]``."""
+
+        batch = board.shape[0]
+        folded_mask = status == FOLDED
+        order = torch.argsort(folded_mask.to(torch.int32), dim=1)
+        ordered = weights.gather(
+            1, order[:, :, None].expand(-1, -1, N_HANDS)
+        )  # [B,P,H]
+        live_weights = ordered[:, :n_live].contiguous()  # [B,L,H]
+        folded_weights = ordered[:, n_live:].contiguous()  # [B,F,H]
+        folders = self.n_players - n_live
+        boundary_board = torch.where(
+            board < 0, torch.full_like(board, 255), board
+        ).to(torch.uint8)
+        folded = FoldSnapshotBatch(
+            reach_weights=folded_weights,
+            board_at_fold=boundary_board[:, None, :].expand(-1, folders, -1).contiguous(),
+            line_meta=torch.zeros((batch, folders, 8), dtype=torch.float32, device=self.device),
+            folder_mask=torch.ones((batch, folders), dtype=torch.bool, device=self.device),
+        )
+        return self.partition_adapter.summarize(
+            board_cards=board, live_range_weights=live_weights, folded=folded
+        )
+
+    def beta_fn(self, states: Tensor) -> Tensor:
+        """Return configured stage-fixed branching intensities as fp32 ``[B]``."""
+
+        self._validate_handles(states)
+        rows = states.to(torch.int64)
+        street = self.states.street[rows]
+        phase = self.states.phase[rows]
+        result = torch.full(
+            (states.shape[0],), float(self.beta_fix["default"]),
+            dtype=torch.float32, device=self.device,
+        )  # [B]
+        player_names = ("preflop", "flop", "turn", "river")
+        chance_names = ("chance_to_flop", "chance_to_turn", "chance_to_river")
+        for index, name in enumerate(player_names):
+            if name in self.beta_fix:
+                result[(phase == _PLAYER) & (street == index)] = float(self.beta_fix[name])
+        for index, name in enumerate(chance_names):
+            if name in self.beta_fix:
+                result[(phase == _CHANCE) & (street == index)] = float(self.beta_fix[name])
+        return result
+
+    def pot_strata(self, states: Tensor) -> PotStrata:
+        """Construct padded public pot strata ``[B,P,P]`` and amounts ``[B,P]``."""
+
+        rows = states.to(torch.int64)
+        committed = self.states.committed_total[rows]
+        levels = torch.sort(committed, dim=1).values
+        previous = torch.cat((torch.zeros_like(levels[:, :1]), levels[:, :-1]), dim=1)
+        contributors = (committed[:, None, :] + _EPS >= levels[:, :, None]).sum(2)
+        amount = (levels - previous) * contributors.to(torch.float32)
+        eligible = (
+            (self.states.status[rows, None, :] != FOLDED)
+            & (committed[:, None, :] + _EPS >= levels[:, :, None])
+            & (amount[:, :, None] > _EPS)
+        )
+        return PotStrata(eligible, amount, -committed)
+
+    def completion_inputs(self, states: Tensor, reach: Tensor) -> dict[str, Tensor]:
+        """Build device-local tensors for the public sibling completion facade.
+
+        ``states`` is int32 ``[B]`` and ``reach`` is log reach
+        float32 ``[B,P,1326]``.  Returned fields match the tensor arguments of
+        ``poker_gpu_evaluator.pbg.complete`` except for caller-owned seed and
+        completion configuration.
+        """
+
+        self._validate_handles(states)
+        if reach.shape != (states.shape[0], self.n_players, N_HANDS):
+            raise ValueError("reach must have shape [B,P,1326]")
+        rows = states.to(torch.int64)
+        dealt = torch.ones(
+            (states.shape[0], self.n_players), dtype=torch.bool, device=self.device
+        )  # [B,P]
+        finite = torch.isfinite(reach)
+        row_max = reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
+        weights = torch.exp(reach - row_max).masked_fill(~finite, 0.0).contiguous()
+        strata = self.pot_strata(states)
+        board = torch.where(
+            self.states.board[rows] < 0,
+            torch.full_like(self.states.board[rows], 255),
+            self.states.board[rows],
+        ).to(torch.uint8).contiguous()
+        return {
+            "board_cards": board,
+            "range_weights": weights,
+            "dealt_mask": dealt,
+            "contender_mask": (self.states.status[rows] != FOLDED).contiguous(),
+            "stratum_players": strata.stratum_players.contiguous(),
+            "payoff_baseline": strata.payoff_baseline.contiguous(),
+            "stratum_amount": strata.stratum_amount.contiguous(),
+        }
+
+    def reward(self, profiles: Tensor, terminal_states: Tensor) -> Tensor:
+        """Return locally known fold payoff rows ``[B,P]``."""
+
+        del profiles
+        return self.states.fold_payoff[terminal_states.to(torch.int64)]

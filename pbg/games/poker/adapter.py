@@ -86,10 +86,10 @@ class PokerPolicyAdapter:
             raise ValueError("legal event ids and masks must have shape [B,E]")
         if legal_event_ids.shape[0] != batch or legal_mask.dtype != torch.bool:
             raise TypeError("legal mask must be bool and batch-aligned")
-        inferred = max(
-            legal_event_ids.shape[1] - RAISE_OFFSET,
-            int(legal_event_ids.max().item()) - RAISE_OFFSET + 1 if legal_event_ids.numel() else 0,
-        )
+        # Poker backends expose the complete contiguous
+        # fold/check-call/raise-tick row, so its static width determines the
+        # number of raise ticks without synchronizing a device scalar.
+        inferred = legal_event_ids.shape[1] - RAISE_OFFSET
         n_ticks = self.n_ticks if self.n_ticks is not None else inferred
         if n_ticks <= 0:
             raise ValueError("the legal event set has no raise-tick width")
