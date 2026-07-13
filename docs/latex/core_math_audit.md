@@ -12,6 +12,8 @@ No unresolved item below challenges the overall PBG, Rao--Blackwellization, or p
 
 The former finite-sample unbiasedness claim for conditional bucket values has been corrected. The terminal-distribution lemma supplies unbiased linear estimators of bucket probability mass and posterior-weighted target mass; dividing the latter by the former is a generally biased self-normalized ratio. The ratio is consistent for positive-mass buckets and asymptotically unbiased under bounded rewards. Likewise, sibling independence makes the leave-one-branch baseline an action-independent control variate, not an unbiased finite-sample value estimate.
 
+The completion cut is now defined after the final player action: only public chance and reward resolution may follow, so a pre-board Leduc state is excluded when another betting round remains. Sampled rollout trees are labeled trees: repeated event labels remain distinct children with uniform edge mass and independent descendants, random draws, and completion samples.
+
 Severity below means:
 
 - **Critical:** invalidates a definition, theorem, probability law, or central estimator.

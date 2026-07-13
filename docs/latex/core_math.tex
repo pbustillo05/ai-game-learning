@@ -764,6 +764,8 @@ Set $\mathfrak{S}^{\beta,\pi}\gets\{\varnothing\}$, $\ell^{\beta,\pi}(\varnothin
 \begin{remark}[Practical Implementation]
   Note that practically speaking, to sample each outgoing event $E_{\mathsf{a}}$, we first sample a temporary private state $x$ conditioned on $\sigma$ (for example, in poker, we do this by rejection sampling), then we sample according to the chance rules and player strategies.
   Since $\beta\geq1$, randomized rounding always gives at least one child; this guaranteed child is a \emph{spine} which preserves every lineage.
+  Every abstract sampled child is retained as a distinct tree node, even when two event labels $E_{\mathsf a}$ agree.
+  Such nodes may share immutable public-state payloads, but never topology, descendants, random draws, or Monte Carlo completion samples; each outgoing edge has transition probability $1/N^{\beta,\pi}(\mathsf s)$.
   At $\beta \equiv 1$ the tree is the set of nodes in a random trajectory $\Tau \sim \mathbb{P}^\pi(\cdot)$.
 \end{remark}
 
@@ -1180,14 +1182,15 @@ Initialize target table $\mathcal O\gets\varnothing$\;
 \Return{target table $\mathcal O$}
 \end{algorithm}
 
-Note that returning $\widehat{Q}$ is only necessary if we are using a \texttt{NeuRD} update rule.
-Otherwise $\widehat{A}$ suffices.
+Note that returning $\widehat{Q}$ is only necessary for the deferred \texttt{NeuRD} research extension.
+The fixed-intensity PPO v1 returns $\widehat{A}$ and does not store $\widehat Q$ by default.
 
 \begin{algorithm}[H]
 \caption{$(\theta_k)_{k\ge0}\gets$~\texttt{BranchedRaoBlackwellPG}$(\theta_0)$}
 \label{alg:branched-rao-blackwell-pg}
 \DontPrintSemicolon
 \tcc{Tree-valued generalization of the sequential Rao--Blackwellized template; $\beta\equiv1$ recovers it exactly.}
+\tcc{Research template: the implementation companion freezes v1 to fixed intensities, actor-type $V$ heads, and PPO advantage targets.}
 \KwParam{$\theta_0$, initial weights; $\theta$, working copy of the next iterate}
 \KwHyper{$N$, tree count; $B$, minibatch size; $\lambda$; $\beta_{\max}$}
 \KwHyper{$\beta_{\tt fix}$, $\beta_{\tt avg}$, $k_{\tt warm}$; chosen number of gradient-descent steps per iterate}
@@ -1303,11 +1306,11 @@ Several specificities impact our implementation:
   \item We implement a synchronous rollout that is heavily computed by GPUs (typically a node of 2-4).
   We maintain a queue of states to be rolled out, and we roll them out in batches (two types of batches: one for preflop, one for postflop).
 
-  \item \textbf{Loss Function:} we use a clipped \texttt{PPO} loss, with an optional \texttt{KL} term to an older reference index $\operatorname{ref}(k)$, an entropy term to encourage exploration (to be faded away throughout training), and loss terms for each of the value heads:
+  \item \textbf{Research loss design:} the full design combines clipped \texttt{PPO} with an optional \texttt{KL} term to an older reference index $\operatorname{ref}(k)$, an entropy term, and losses for each proposed value head:
   \[
     \mathcal L_{\tt clip}[\widehat A^\lambda]+\mathcal L_{\tt H} + \mathcal L_{\tt KL} + \mathcal L_{\tt V}[\widehat V^\lambda] + \mathcal L_{\tt U}[\widehat U^\lambda]+\mathcal L_{\mathbf V}[\widehat{\mathbf V}^\lambda]
   \]
-  Ideally, the implementation should allow the user to pick any loss function.
+  The implementation companion's fixed-intensity PPO v1 uses only the clipped policy, actor-type value, and entropy terms. Reference-policy KL and the public $U/\mathbf V$ heads and losses are deferred research extensions, as are \texttt{NeuRD} and stored all-action $Q$ targets.
 
   \item Ideally, the implemtation should be clearly modular: it will be used for poker, but must be easily adaptable to other PBGs.
 \end{enumerate}

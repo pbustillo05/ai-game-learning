@@ -2,6 +2,10 @@
 
 **Status: FROZEN once signed off. Version 0.2 (draft for Arka/Pablo review).**
 
+The P09--P11 branching, value-target, and loss portions are superseded by the
+C00 alignment recorded here and in `NOTATION.md`. The active v1 contract is
+fixed-intensity PPO; explicitly marked research extensions are not requirements.
+
 The cross-repository tensor contract for poker completion and rejection is
 `POKER_GPU_EVALUATOR_IO.md`. It is normative and wins over older "user kernel
 slot" wording in this file.

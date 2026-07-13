@@ -5,6 +5,8 @@
 and algorithms to implementation objects; it does not supersede or silently
 change the source. §12 records the few typographical normalizations needed to
 make the source's displayed equations and pseudocode refer to the same objects.
+The branching, value-target, and loss rules below supersede the corresponding
+P09--P11 companion text: v1 is the fixed-intensity PPO path identified here.
 
 Notation: symbols as in `core_math.tex`; code names per CONTRACTS §2.
 
