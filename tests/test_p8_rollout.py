@@ -122,7 +122,7 @@ def test_50k_sequential_terminal_history_law_matches_exact_policy() -> None:
     keys = game.encode_public(tree.state_ref[leaves]).cpu().numpy()
     observed = np.asarray([(keys == key).sum() for key in expected], dtype=np.float64)
     target = 50_000 * np.asarray(list(expected.values()), dtype=np.float64)
-    statistic = float(np.square(observed - target).div(target).sum())
+    statistic = float((np.square(observed - target) / target).sum())
     # df=4: chi-square survival probability exceeds 1e-3 below 18.467.
     assert statistic < 18.467
 

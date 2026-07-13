@@ -64,7 +64,9 @@ A finite public-action Bayesian game consists of the following data.
     If $o(\sigma)\in\mathcal P$ (resp. $\{\mathsf c\}$) is a player node (resp. chance node), we typically denote the elements of $\mathcal{E}_\sigma$ by $a$ (resp. $c$).
     For $\sigma \in \mathcal S$ and $p \in \mathcal P$, we write $|\sigma|_p$ for the number of player nodes in $\sigma$ owned by $p$, and $|\sigma|_{\textnormal{player}}$ for the total number of player nodes in $\sigma$.
     For $\rho\preccurlyeq\sigma$, we write $|\sigma\setminus\rho|_p:=|\sigma|_p-|\rho|_p$ and $|\sigma\setminus\rho|_{\textnormal{player}}:=|\sigma|_{\textnormal{player}}-|\rho|_{\textnormal{player}}$.
-    For $\tau \in \mathcal{T}$, write $\tau^{\mathsf{pre-c}}$ for the largest prefix of $\tau$ which ends in no more than one chance or terminal node (for example $(caccaaaccct)^{\mathsf{pre-c}} = caccaaac$).
+    For $\tau \in \mathcal{T}$, write $\tau^{\mathsf{pre-c}}$ for the largest prefix ending in no more than one node in $\mathcal{T} \sqcup o^{-1}(\mathsf{c})$.
+    In other words, we have $\tau^{\mathsf{pre-c}} = \sigma a$ for $\sigma a \preccurlyeq \tau$ the last player node $o(\sigma) \in \mathcal{P}$ and decision $a$: if $\sigma a \prec \tau$, we must have $o(\rho) = \mathsf{c}$ for every $\sigma a \preccurlyeq \rho \prec \tau$.
+    Informally, a pre-terminal state is when all players have acted, and before any final chance events are revealed which may impact rewards (\textit{e.g.} when players are all-in in poker before the board is complete, the pre-terminal state is right after the last ``\textit{call}'' and before seeing any more board cards).
 
     \item \textbf{Initial Private State Profile:} For every player $p\in \mathcal P$, a finite type set $\mathcal X_p$, and a distribution $\mu$ on $\mathcal X:=\prod_{p\in\mathcal P}\mathcal X_p$.
     Elements of $\mathcal X$ are typically written $x= x_{\mathsf c} = (x_p)_{p \in \mathcal P}$, with $x_p\in\mathcal X_p$.
@@ -761,7 +763,8 @@ Set $\mathfrak{S}^{\beta,\pi}\gets\{\varnothing\}$, $\ell^{\beta,\pi}(\varnothin
 
 \begin{remark}[Practical Implementation]
   Note that practically speaking, to sample each outgoing event $E_{\mathsf{a}}$, we first sample a temporary private state $x$ conditioned on $\sigma$ (for example, in poker, we do this by rejection sampling), then we sample according to the chance rules and player strategies.
-  The deterministic ``$1+$'' is a \emph{spine}: it guarantees survival of every lineage, and at $\beta \equiv 1$ the tree is the set of nodes in a random trajectory $\Tau \sim \mathbb{P}^\pi(\cdot)$.
+  Since $\beta\geq1$, randomized rounding always gives at least one child; this guaranteed child is a \emph{spine} which preserves every lineage.
+  At $\beta \equiv 1$ the tree is the set of nodes in a random trajectory $\Tau \sim \mathbb{P}^\pi(\cdot)$.
 \end{remark}
 
 \begin{definition}[Rollout tree]\label{def:branched-rollout-tree}
@@ -854,6 +857,8 @@ Moreover, there are game-dependent constants $c,C>0$ such that, for every $0<\va
 
 \paragraph{Variance-Based Intensities (naïve version).}
 Using Neyman allocation principles, we target nodes with larger continuation variance.
+This paragraph records a research direction rather than the first implementation contract.
+The initial implementation uses only fixed public-stage-dependent intensities and defers the $\mathbf V$ and $U$ heads, their estimators and their losses until the allocation objective is better understood.
 \begin{equation}\label{eq:branched-neyman-intensity}
   \beta(\sigma) \propto \sqrt{\operatorname{tr}\Cov^\pi(\mathbf{R}(x,\tau)\mid\sigma)}.
 \end{equation}
@@ -999,8 +1004,13 @@ For a player node $\mathsf{s}\in \mathfrak{S}$ with $\ell(\mathsf{s})=\sigma$, a
     \right)
     \label{eq:branched-targets}
 \end{equation}
-The $\widehat{Q}^\lambda$, $\widehat{V}^\lambda$, $\widehat{\mathbf V}^\lambda$ and $\widehat{U}^\lambda$ targets are unbiased by \autoref{lem:branched-terminal-distribution} (assuming that the $V$ and $U$ heads are perfect).
-For $N(\mathsf{s})>1$, \autoref{lem:branched-branch-independence} makes the sibling average entering $\widehat{V}^{\lambda,\neg\mathsf{a}}$ independent of the target branch after conditioning on the target action label, so $\widehat{A}^\lambda$ is an unbiased leave-one-branch advantage estimator.
+\begin{lemma}[Unnormalised bucket moments]\label{lem:branched-bucket-moments}
+For every private-state bucket, the backward estimators $\widehat{\mathbb P}(x_p)$ and $\widehat M_p(x_p)=\widehat{\mathbb P}(x_p)\widehat V_p(x_p)$ are unbiased for the corresponding probability mass and posterior-weighted target moment, assuming unbiased leaf bucket statistics and perfect heads for bootstrapped terms.
+The conditional ratio $\operatorname{Cond}(\widehat M_p,\widehat{\mathbb P})$ is generally biased at finite sample size: one can estimate without bias how much target mass lies in a bucket, but not its conditional average by dividing by a random bucket size.
+If the true bucket mass is positive, the ratio is consistent as the effective descendant and completion sample size tends to infinity; for bounded rewards it is therefore asymptotically unbiased.
+\end{lemma}
+For $N(\mathsf{s})>1$, \autoref{lem:branched-branch-independence} makes the sibling average entering $\widehat{V}^{\lambda,\neg\mathsf{a}}$ independent of the target branch after conditioning on the target action label.
+It is thus a leave-one-branch, action-independent control variate for the target branch, rather than a finite-sample unbiased estimator of $V$ or $A$.
 All of these targets can be computed by backward propagation (see algorithm below).
 
 Now say we have a current parameter $\theta$.

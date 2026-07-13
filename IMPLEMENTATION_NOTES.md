@@ -71,3 +71,28 @@
 - Added the public poker facade for exact-profile delegation, complement chance draws, public encoding/reach updates, owned range slots, and evaluator-mediated fixed-showdown settlement.
 - P07 focused tests: 9 passed (`tests/test_p7_postflop.py`, `tests/test_p7_adapter.py`, seed values 70/73 where stochastic).
 - Full suite after P07: 60 passed, 3 skipped in 10.20s on CPU; skipped tests are optional sibling-boundary/device cases.
+
+## P09 — branched rollout and variance-guided intensities
+
+- Preserved the sequential sampler path and its random-number consumption; non-sequential modes dispatch to the P09 implementation.
+- Added spine-Poisson child counts, one fresh joint posterior profile per event draw, stable event deduplication, and empirical multiplicity weights.
+- Branched policy caches store one all-type log-probability row per unique child; reach updates remain per-edge and copy-on-branch.
+- Node-budget pressure permanently clamps the affected tree frontier to spine-only continuation and records `budget_clamped` rollout metrics.
+- Added a bucketed warmup/Neyman controller with padded-seat masking, chance-node fixed intensities, iteration updates, and checkpoint state round-tripping.
+- P09 focused tests include the 50k fixed-beta-one law and 20k beta-three ν-induced terminal-law checks, multiplicity statistics, budget degradation, and controller formulas.
+
+## P10 — backward value propagation
+
+- Added the capture-before-mix branched lambda-return pass with owner-only type-value bootstrapping and optional all-player moment bootstrapping.
+- Completion posteriors remain unmixed; invalid private-type and padded-seat entries are explicitly zero-masked from game dimensions.
+- Complete trees are greedily streamed under the resident-row cap without splitting dependency chains.
+- Added an independent recursive fp64 oracle plus focused branching, sequential-boundary, lambda-endpoint, moment-gating, padding, and chunk-consistency tests.
+
+## Corrected implementation plan (C00/C08–C11, P12, P13A/P13B)
+
+- Froze randomized-rounding offspring and duplicate-preserving labeled sampled trees; historical P09 quotient-tree behavior is superseded by C09.
+- Corrected the mathematical contract to propagate unbiased bucket mass and posterior-weighted target mass, treating conditional values as self-normalized finite-sample ratios.
+- Added correction prompts for the device-resident rollout boundary, fixed branching, posterior-moment backpropagation, and the minimal RB-PPO objective.
+- Deferred Neyman allocation, public moment heads/losses, stored Q targets by default, and reference-policy KL.
+- Rewrote P12 against the typed bundle and split poker work into P13A GPU rollout plus P13B integration/presets.
+- Made every active prompt independently launchable in a cleared context: each now names its workspace bootstrap, binding interfaces, staged compatibility obligations, owned test migrations, exact validation commands, and handoff requirements. P08–P11 are visibly marked historical.

@@ -141,29 +141,30 @@ class NodeTargets:        # one row per stored player-decision node
 class PolicyOutput:
     raw: Any              # game-owned payload
     v: Tensor             # [B, X_max]
-    vvec: Tensor | None   # [B, P_max], all seated players; padded seats 0
-    u: Tensor | None      # [B]
+    # Future extensions may add public moment outputs; v1 does not require them.
 
 class PolicyAdapter(Protocol):
-    def log_prob(self, out, event_ids) -> Tensor: ...        # [B,E_sel] -> [B,E_sel,X_max]
-    def entropy(self, out) -> Tensor: ...                    # [B, X_max]
-    def kl(self, out_new, out_ref) -> Tensor: ...            # [B, X_max]
+    def log_prob(self, out, selected_event_ids, legal_event_ids,
+                 legal_event_mask) -> Tensor: ...  # [B,E_sel,X_max]
+    def entropy(self, out, legal_event_ids,
+                legal_event_mask) -> Tensor: ...   # [B,X_max]
+    def kl(self, out_new, out_ref, legal_event_ids,
+           legal_event_mask) -> Tensor: ...        # deferred [B,X_max]
 ```
 
 ## Config (pbg/core/config.py, built in P0)
 
 Nested dataclasses `RootConfig(game, rollout, completion, model, loss, train,
 debug_asserts)` loaded by `load_config(path)`; unknown YAML keys are a hard
-error. Field names you may rely on: `rollout.n_trees, rollout.beta_mode
-("sequential"|"fixed"|"neyman"), rollout.beta_fix/beta_avg/beta_max (per-bucket
-dicts), rollout.warmup_iters, rollout.node_budget, rollout.reach_storage
-("full"|"decisions_only"|"recompute")`; `completion.n_samples,
-completion.backend` (`"poker_gpu"` for poker; sibling backend chooses CPU/CUDA); `loss.name, loss.lam, loss.clip_eps, loss.clip_eps_v,
-loss.c_v, loss.c_h, loss.c_kl, loss.c_u, loss.c_vvec, loss.ref_period,
-loss.entropy_schedule, loss.use_moment_heads, loss.use_suit_consistency`;
-`train.iters, train.gd_steps_per_iter, train.minibatch_size, train.lr,
-train.adam_betas, train.grad_clip, train.amp, train.seed,
-train.checkpoint_every, train.out_dir`.
+error. Field names you may rely on are `rollout.n_trees`, `rollout.beta_mode`
+(`"sequential"|"fixed"`), `rollout.beta_fix` (a public-stage mapping),
+`rollout.node_budget`, `rollout.reach_storage`
+(`"full"|"decisions_only"|"recompute"`), `completion.n_samples`, and
+`completion.backend` (`"auto"|"cpu"|"cuda"` through the sibling facade).
+The active loss fields are `name`, `lam`, `clip_eps`, `clip_eps_v`, `c_v`,
+`c_h`, `entropy_schedule`, and `use_suit_consistency`. Training fields are
+`iters`, `gd_steps_per_iter`, `minibatch_size`, `lr`, `adam_betas`,
+`grad_clip`, `amp`, `seed`, `checkpoint_every`, and `out_dir`.
 
 ## Testing conventions
 

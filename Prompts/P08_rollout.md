@@ -1,5 +1,8 @@
 # P08 — TreeBatch, ReachCache plumbing, sequential rollout (`tree.py`, `rollout.py`)
 
+> **Historical prompt — do not launch on the current repository.** C08 is the
+> self-contained replacement contract for the rollout boundary and device model.
+
 **Depends on:** P00, P01 (test bed), P05 (Protocols).
 **Files:** `pbg/core/tree.py`, `pbg/core/rollout.py`; `tests/test_p8_tree.py`,
 `test_p8_rollout.py`.

@@ -1,6 +1,6 @@
 # NOTATION.md — Mathematical Specification for Implementation
 
-**Status: implementation companion to `Docs/latex/core_math.tex`.**
+**Status: implementation companion to `docs/latex/core_math.tex`.**
 `core_math.tex` is the mathematical source of truth. This file maps its symbols
 and algorithms to implementation objects; it does not supersede or silently
 change the source. §12 records the few typographical normalizations needed to
@@ -28,15 +28,12 @@ p = o(σ). It induces ℙ^π on 𝒳 × 𝒯. Player reach r_p^π(σ | x_p) = �
 over p-owned edges ρa ≼ σ; chance reach r_c(σ | x) analogous with χ.
 
 **Pre-terminal trajectories.** For a terminal trajectory τ, τ^pre-c is the
-public prefix at the final chance node: all player actions have occurred, but
-the final public chance outcome has not yet been drawn. Thus the prefix ends
-immediately before that chance event (equivalently, immediately after the last
-player action when no intervening public event exists). In the source example
-`(caccaaaccct)^pre-c = caccaaac`, the trailing `c` identifies that chance
-node; it does not mean its outgoing chance outcome has already been sampled.
-In poker, once betting
-has closed for the final time, rollout stops before drawing the remaining
-runout/chance outcome; completion integrates that chance outcome and showdown.
+largest public prefix after which no player-owned node remains. All player
+actions are complete; continuation consists only of zero or more public-chance
+draws and terminal reward resolution. In poker, closed betting with an
+incomplete board is pre-terminal and completion owns the runout and showdown.
+In Leduc, the state before the public card is not pre-terminal because another
+betting round follows; the state after final betting is a completion leaf.
 
 ---
 
@@ -71,14 +68,14 @@ pre-terminal trajectory:
 - Loss: 𝔼(ℒ) = 𝔼( Σ_{x_P} ℒ(x_P, Σ, ·) · ℙ^π(x_P | conditioning) ), variance-reduced
   by the law of total variance.
 
-**Posterior route (signed-off decision).** In the branched pipeline, the posterior
-weights P̂(x_p | Σ) used in the loss are the **backward-MC** ones: ν-weighted mixtures,
-over the sampled tree below Σ, of the leaf posteriors ℙ^π(x_p | τ^pre-c) estimated by
-the completion sampler. All of (P̂, Q̂, V̂, V̂vec, Û) are expectations under the same
-tree-conditional measure ℙ^{β,π}(· | 𝐒); unbiasedness of each is supplied jointly by
-the terminal-distribution lemma (§5). No forward/cluster-expansion posterior appears
-anywhere in production code. Forward-exact posteriors exist only in
-`games/synthetic/exact.py` as test oracles (T6).
+**Posterior route (signed-off decision).** The branched pipeline propagates
+backward-MC bucket mass P̂ and posterior-weighted target mass M̂=P̂V̂. These
+unnormalized quantities are linear expectations under the tree-conditional
+measure and are unbiased when the leaf bucket statistics are unbiased. The
+conditional ratio `Cond(M̂,P̂)` is generally biased at finite sample size, but is
+consistent for positive-mass buckets and asymptotically unbiased for bounded
+rewards. No forward/cluster-expansion posterior appears in production code;
+forward-exact posteriors exist only as test oracles.
 
 ---
 
@@ -112,10 +109,11 @@ within-trajectory uniform choice. Needed only for analysis/tests, not implementa
 
 ## 5. Branched rollout
 
-**SampleTree(π, β).** Frontier-driven construction of a public tree:
+**SampleTree(π, β).** Frontier-driven construction of a labeled sampled tree:
 
-- At non-pre-terminal σ: K_σ ∼ 1 + Poisson(β(σ) − 1), β(σ) ∈ [1, ∞). The
-  deterministic “1+” is the spine: every lineage survives; β ≡ 1 gives a single path.
+- At non-pre-terminal σ,
+  `K_σ = floor(β(σ)) + Bernoulli(β(σ) − floor(β(σ)))`.
+  Since β ≥ 1, every lineage has a spine; β ≡ 1 gives a single path.
 - Children events (E_k)_{k ≤ K_σ} i.i.d. from the **public mixture**:
   𝔼^π(π(·|x_p,σ) | σ) at player nodes, 𝔼^π(χ(·|x,σ) | σ) at chance nodes. In practice:
   draw a fresh private profile x from the posterior at σ (poker: rejection sampler),
@@ -123,17 +121,18 @@ within-trajectory uniform choice. Needed only for analysis/tests, not implementa
   one “true” profile per tree and condition the whole tree on it: that correlates
   sibling subtrees and voids the locality/convergence guarantees. Every node's event
   draws use fresh, node-local posterior draws.
-- Empirical transition weights ν(e | σ) = #{k : E_k = e} / K_σ; children stored
-  deduplicated with their multiplicities in ν.
+- Every abstract child is stored separately, even when two children have the
+  same public event label. Each outgoing sampled-tree edge has probability
+  `1/K_σ`. Equal-labeled nodes may share immutable public-state payloads but
+  their descendants and completion samples remain independent.
 - Pre-terminal σ: stop; leaf of the stored tree (owner = PRETERM). Completion (§6)
   integrates the remaining chance + showdown.
 
-**Induced measure.** ℙ^{β,π}(τ | 𝐒) = ∏_{σa ≼ τ} ν(a|σ) over stored leaves, extended
+**Induced measure.** ℙ^{β,π}(τ | 𝐒) follows uniformly selected abstract
+children, hence uses the product of `1/K` along a sampled-tree path, and is extended
 to 𝒳 by ℙ^π(x | τ). **Terminal-distribution lemma:**
-𝔼_𝐒[ ℙ^{β,π}(· | 𝐒) ] = ℙ^π(·). All target estimators of §7 are conditional
-expectations under ℙ^{β,π}(·|𝐒) and are therefore unbiased for their ℙ^π
-counterparts (given unbiased leaf statistics and perfect value heads for the
-bootstrapped parts).
+𝔼_𝐒[ ℙ^{β,π}(· | 𝐒) ] = ℙ^π(·). This gives unbiasedness for linear
+bucket masses and posterior-weighted moments, not for ratios of their estimators.
 
 ---
 
@@ -168,49 +167,46 @@ V̂vec=**R**, and Û=‖**R**‖₂² exactly once P̂ has been obtained.
 
 ## 7. BranchedValue — backward propagation
 
-Inputs: stored tree 𝐒 with ν; leaf `CompletionStats`; frozen value heads
-V^{θ_k}(x_p, σ) (actor-type value, defined only for p = o(σ)), and, if moment heads
-are enabled, **V**^{θ_k}(σ), U^{θ_k}(σ); horizon λ ∈ [0,1].
+Inputs: labeled stored tree 𝐒; leaf `CompletionStats`; frozen actor-type
+value heads V^{θ_k}(x_p,σ); horizon λ ∈ [0,1]. The initial implementation
+defers public moment heads.
 
-Per-node state during the pass: `p̂(x_p | σ)` [P,X], `v̂_p(x_p, σ)` [P,X],
-`v̂vec(σ)` [P], `û(σ)` scalar.
+Per-node working state is posterior mass `P̂ [P,X]` and posterior-weighted
+return mass `M̂ [P,X]`. Conditional values are formed only when emitted.
 
 ```
 initialize at every PRETERM leaf from CompletionStats
+    P̂_p(x,t) = leaf posterior mass
+    M̂_p(x,t) = P̂_p(x,t) * leaf conditional reward estimate
 for σ in reverse topological order (children before parents), σ not a leaf:
-    # (1) ν-weighted aggregation from children (all four statistics):
-    p̂(·|σ)    = Σ_a ν(a|σ) p̂(·|σa)
-    v̂_·(·,σ)  = Σ_a ν(a|σ) v̂_·(·,σa)
-    v̂vec(σ)   = Σ_a ν(a|σ) v̂vec(σa)
-    û(σ)      = Σ_a ν(a|σ) û(σa)
-    if o(σ) is a player p:                        # decision node: emit targets
-        # (2) capture targets BEFORE any mixing at σ:
-        Q̂(x_p, σa) = v̂_p(x_p, σa)   for every stored child σa
-        V̂(x_p, σ)  = v̂_p(x_p, σ)                                   # = ν-avg of children
-        emit NodeTargets row: (p̂(x_p|σ), Q̂, V̂, v̂vec(σ), û(σ), ν(·|σ))
-        # (3) λ-mix in place, so ancestors see bootstrapped statistics:
-        v̂_p(x_p, σ)  ← λ v̂_p(x_p, σ) + (1−λ) V^{θ_k}(x_p, σ)        # owner component only
-        v̂vec(σ)      ← λ v̂vec(σ) + (1−λ) **V**^{θ_k}(σ)             # if moment heads enabled
-        û(σ)         ← λ û(σ)    + (1−λ) U^{θ_k}(σ)                 # if moment heads enabled
+    P̂(·|σ) = (1/K_σ) Σ_a P̂(·|σa)
+    M̂(·,σ) = (1/K_σ) Σ_a M̂(·,σa)
+    if o(σ) is player p:
+        V̂(x,σ) = Cond(M̂_p(x,σ), P̂_p(x|σ))
+        for each abstract child a:
+            Q̂_a(x) = Cond(M̂_p(x,σa), P̂_p(x|σa))
+            if K_σ > 1:
+                sibling = Cond(Σ_b M̂_p(x,σb) - M̂_p(x,σa),
+                               Σ_b P̂_p(x|σb) - P̂_p(x|σa))
+                B̂_a(x) = λ sibling + (1−λ) V^{θ_k}(x,σ)
+            else:
+                B̂_a(x) = V^{θ_k}(x,σ)
+            Â_a(x) = Q̂_a(x) - B̂_a(x)
+        emit parent P̂, child P̂, Â, V̂, child labels and masks
+        M̂_p(x,σ) ← λ M̂_p(x,σ) + (1−λ)P̂_p(x|σ)V^{θ_k}(x,σ)
     # chance nodes: aggregation only, no mixing, no targets
 ```
 
-Source-to-code details:
+- Leave-one-out totals are computed as total-minus-child, hence linear in the
+  number of edges rather than quadratic.
+- Q̂ is transient and is stored only when an optional `emit_q=True` consumer asks
+  for it. The shipped PPO objective consumes Â directly.
+- Branch independence makes the sibling baseline action-independent for the
+  target branch. It does not make the conditional ratio finite-sample unbiased.
+- Additional estimator channels may reuse the same aggregate/conditionalize/
+  bootstrap/emit kernels, but no unused moment tensors are part of v1.
 
-- The child-loop assignment reads `Q̂(x_p, ρa) ← V̂_p(x_p, ρa)` in the source
-  with ρ undefined in that scope; ρ is the loop's current σ. Ordering “capture, then mix” is
-  explicit; the child values entering step (1)/(2) are the children's **post-mix**
-  values, which is exactly what reproduces the sequential λ-return along any path.
-- Only the owner's component v̂_p is λ-mixed at a player node σ (there is no
-  value head for x_q at a node q doesn't own). Non-owner components v̂_q propagate as
-  pure ν-mixtures of leaf MC values. v̂vec and û mix at **every** player node
-  (their exponent in the source counts |·|_player). Consequence worth stating: for a
-  fixed player p, the target Q̂(x_p, ·) bootstraps at every downstream p-decision,
-  matching the sequential λ-return exponent |·|_p.
-- Consistency check (T4): at β ≡ 1 and along a single path, the emitted Q̂(x_p, σa)
-  equals the sequential λ-return of §8 exactly.
-
-Complexity: one O(|𝐒| · P_max · X_max) pass; poker X_max = 1326 → keep v̂ in fp32 on
+Complexity: one O(|𝐒| · P_max · X_max) pass; poker X_max = 1326 → keep P̂/M̂ in fp32 on
 GPU, stream by tree if memory-bound.
 
 ---
@@ -239,25 +235,17 @@ later defining recursion.
 
 ---
 
-## 9. Variance-guided intensities (Neyman)
+## 9. Fixed intensities (v1)
 
-Per-node standard-deviation proxy from the (frozen) public moment heads:
+The active implementation accepts only `beta_mode="sequential"` and
+`beta_mode="fixed"`. A game-owned batched `beta_fn(states) -> float32[B]`
+returns public-stage-dependent values in [1,∞): poker uses preflop/flop/turn/
+river (and optional chance-transition buckets), while synthetic games use
+betting round/chance phase. There is no learned controller state.
 
-s_k(σ) = sqrt( [ U^{θ_k}(σ) − ‖**V**^{θ_k}(σ)‖₂² ]₊ )
-
-Player nodes are partitioned into buckets b(σ) ∈ ℬ (poker default: street ×
-players-live × pot-size bin; synthetic default: depth bin). Controller:
-
-- Warmup (k < k_warm, or moment heads disabled): β_k(σ) = β_fix(b(σ)).
-- After warmup: with s̄_{k−1}(b) the mean of s_{k−1} over player nodes of bucket b in
-  the previous iteration's trees,
-  β_k(σ) = clip( β_avg(b(σ)) · s_k(σ) / s̄_{k−1}(b(σ)), 1, β_max(b(σ)) ),
-  falling back to β_fix(b(σ)) when s̄_{k−1}(b(σ)) is 0/undefined.
-- Chance nodes: always β_fix(b_chance) (no model, fixed intensity).
-
-Here β_avg is the per-bucket target average intensity (distinct from β_fix),
-the declared β_max is applied per bucket, and the zero-denominator fallback is
-β_fix(b(σ)). If s is constant on a bucket, every node receives β_avg(b).
+The Neyman proxy based on public **V** and U heads remains a deliberately
+naïve research direction in `core_math.tex`. Its heads, estimators, losses and
+bucket updates are deferred until the correct variance/cost objective is known.
 
 ---
 
@@ -265,19 +253,14 @@ the declared β_max is applied per bucket, and the zero-denominator fallback is
 
 ### 10.1 Primitives (per node row; ratios w.r.t. the cached rollout policy θ_k)
 
-ρ^θ(a, x_p) = π^θ(a|x_p,Σ) / π^{θ_k}(a|x_p,Σ);  Â(x_p, a) = Q̂(x_p, Σa) − V^{θ_k}(x_p, Σ).
+ρ^θ(a, x_p) = π^θ(a|x_p,Σ) / π^{θ_k}(a|x_p,Σ); Â is emitted directly by §7.
 
 - ℒ_PG = −ρ Â
 - ℒ_clip = −min( ρ Â, clip(ρ, 1−ε, 1+ε) Â )
 - ℒ_V = c_V (V^θ − V̂)²;  ℒ_V-clip with V_clip^θ = V^{θ_k} + clip(V^θ − V^{θ_k}, ±ε_V)
 - ℒ_H = −c_H · Ent(π^θ(·|x_p,Σ))  (exact over the factored head, per adapter)
-- ℒ_KL = c_KL · KL(π^θ ‖ π^{θ_ref(k)});  ref(k) = K_ref ⌊k/K_ref⌋, disabled if None
-- ℒ_KL^sample = c_KL · (ρ log ρ − ρ + 1)
-- ℒ_U = c_U (U^θ − Û)²;  ℒ_Vvec = c_Vvec ‖**V**^θ − V̂vec‖₂² over the full
-  player reward vector (including folded players; excluding padded seats)
-  (+ clip variants)
-- NeuRD / R-NaD primitives: **out of scope for v1** (registry slot reserved; adapter
-  method `centered_logits` may raise NotImplementedError).
+- Adapter KL and centered-logit operations may remain reusable primitives, but
+  reference snapshots, KL loss, moment losses and NeuRD/R-NaD are deferred.
 
 ### 10.2 What the gradient targets
 
@@ -289,13 +272,12 @@ gradient theorem for games (source Thm; constant 𝔼|τ|_p absorbed into learni
 For a minibatch of sampled decision nodes {Σ_b} with targets from §7:
 
 L(θ) = (1/B) Σ_b [
-   Σ_{x} Σ_{a ∈ children(Σ_b)}  P̂_b(x) ν(a|Σ_b) · ℒ_clip(x, a)
- + Σ_{x} P̂_b(x) · ( ℒ_V(x) + ℒ_H(x) + ℒ_KL(x) )
- + 1[moment heads] · ( ℒ_U + ℒ_Vvec )                            ]
+   Σ_{a ∈ children(Σ_b)} (1/K_b) Σ_x P̂_b(x | child_a) · ℒ_clip(Â_b(x,a))
+ + Σ_x P̂_b(x | parent) · ( ℒ_V(x) + ℒ_H(x) ) ]
 
-Three weighting levels, matching dependency structure: (x, a) terms weighted
-P̂·ν; (x) terms weighted P̂; public terms unweighted. Entropy coefficient follows
-`entropy_schedule`. All sums over x are masked to valid/board-compatible types.
+Policy terms use child-branch posteriors; value and entropy terms use the parent
+posterior. Duplicate public action labels remain separate abstract children.
+Entropy follows `entropy_schedule`; all type sums are explicitly masked.
 
 ---
 
@@ -313,8 +295,9 @@ P̂·ν; (x) terms weighted P̂; public terms unweighted. Entropy coefficient fo
 - **Model.** Two nets (169-class preflop / combo-row postflop), pre-LN trunk,
   key-side reach prior added un-tempered, learned transforms of evaluator-supplied
   partition fields, factored type × DLogisticTick raise head,
-  actor-row V head, flag-gated full-player public moment heads. Compact H_B tokenization is the
-  default (CONTRACTS §5-P7). Suit-consistency loss flag-gated, default off.
+  actor-row V head. Public moment heads are deferred. Compact H_B tokenization
+  is the default (CONTRACTS §5-P7). Suit-consistency loss is flag-gated and off
+  by default.
 - **Preflop gauge symmetry.** Preflop net is class-native (169); deterministic
   combo-to-class aggregation may live in `cards.py`/`ranges.py` because it is a
   representation map, not a private-state law.

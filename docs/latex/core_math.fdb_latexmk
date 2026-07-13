@@ -1,5 +1,5 @@
 # Fdb version 4
-["pdflatex"] 1783891824.29632 "/home/pablob/ai-game-learning/docs/latex/core_math.tex" "core_math.pdf" "core_math" 1783891825.52827 0
+["pdflatex"] 1783898612.24383 "/home/pablob/ai-game-learning/docs/latex/core_math.tex" "core_math.pdf" "core_math" 1783898613.63586 0
   "/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/enc/dvips/lm/lm-ec.enc" 1254269338 2375 baa924870cfb487815765f9094cf3728 ""
   "/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/enc/dvips/lm/lm-mathex.enc" 1202520719 3486 c7eadf5dcc57b3b2d11736679f6636ba ""
   "/home/pablob/.TinyTeX/.TinyTeX/texmf-dist/fonts/enc/dvips/lm/lm-mathit.enc" 1202520719 2405 5dcf2c1b967ee25cc46c58cd52244aed ""
@@ -284,11 +284,11 @@
   "/home/pablob/.TinyTeX/.TinyTeX/texmf-var/fonts/pk/ljfour/public/bbm/bbm12.600pk" 1783705724.51307 8424 e3a2ed4f6d1f03961a5d4332e28f1c22 ""
   "/home/pablob/.TinyTeX/.TinyTeX/texmf-var/web2c/pdftex/pdflatex.fmt" 1783657715 2250913 6ab9ad8eaf9c82e3e3b0e860333b57d0 ""
   "/home/pablob/.TinyTeX/.TinyTeX/texmf.cnf" 1783657698 637 edd806fb06a89761a6034e1968af9017 ""
-  "/home/pablob/ai-game-learning/docs/latex/core_math.tex" 1783891804.11067 73948 288a5fd2c4fdb1bca0898b3f45f838a5 ""
-  "core_math.aux" 1783891825.36963 16478 6b08690e5fd11b189ee50291f2b0f573 "pdflatex"
-  "core_math.out" 1783891825.37063 661 a879bbdc3ddf1d442a664d0c19ac5c33 "pdflatex"
-  "core_math.tex" 1783891804.11067 73948 288a5fd2c4fdb1bca0898b3f45f838a5 ""
-  "core_math.toc" 1783891825.37163 1704 867d618cbaaab96e06c57b5318c4563f "pdflatex"
+  "/home/pablob/ai-game-learning/docs/latex/core_math.tex" 1783898610.59295 75569 c05f8c157c3b1c864fc9f661cf0c5b75 ""
+  "core_math.aux" 1783898613.48194 16732 dce0808f3a3aafd50de2f7a9c0df9d24 "pdflatex"
+  "core_math.out" 1783898613.48394 661 1d3fbeb72c454ee9e3adba853f959ff2 "pdflatex"
+  "core_math.tex" 1783898610.59295 75569 c05f8c157c3b1c864fc9f661cf0c5b75 ""
+  "core_math.toc" 1783898613.48394 1704 96653bb38f636786db9649aa7508609d "pdflatex"
   "preamble/mathenv.sty" 1783695854.19826 4306 685c91aefa0860972329565e682f5a1f ""
   "preamble/preamble.tex" 1783891822.66063 2570 18d1e504b6713a4115a6af73557d538f ""
   "preamble/project-macros.sty" 1783695877.06121 1583 50e7ce86cce534216a42aba2b09b3b4b ""

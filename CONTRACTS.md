@@ -35,7 +35,7 @@ pbg/
     game.py                # PBG Protocols, event/owner constants
     tree.py                # TreeBatch (SoA rollout tree), alias tables
     rollout.py             # SamplePreTerminal (sequential = branching with beta==1)
-    branching.py           # SampleTree, IntensityController
+    branching.py           # labeled SampleTree, fixed beta_fn
     values.py              # BranchedValue backward propagation
     completion.py          # CompletionStats, MCCompletion Protocol
     policy_adapter.py      # PolicyAdapter Protocol (game-specific action factorization)
@@ -129,28 +129,23 @@ class GameConfig:
 @dataclass
 class RolloutConfig:
     n_trees: int                 # G per iteration (per rank: G // world_size)
-    beta_mode: str               # "sequential" (beta==1) | "fixed" | "neyman"
+    beta_mode: str               # "sequential" (beta==1) | "fixed"
     beta_fix: dict[str, float]   # per-bucket fixed intensity
-    beta_avg: dict[str, float]   # per-bucket target average intensity (neyman)
-    beta_max: dict[str, float]   # per-bucket clip ceiling
-    warmup_iters: int
     node_budget: int             # hard cap on nodes per tree; sampler raises past it
     reach_storage: str           # "full" | "decisions_only" | "recompute"
 
 @dataclass
 class CompletionConfig:
     n_samples: int               # MC budget per pre-terminal node
-    backend: str                 # poker uses "poker_gpu"; sibling selects auto/cpu/cuda
+    backend: str                 # sibling execution backend: "auto" | "cpu" | "cuda"
 
 @dataclass
 class LossConfig:
     name: str                    # key into losses.COMPOSITES, default "rb_ppo"
     lam: float                   # lambda, GAE horizon (general; default 0.95)
     clip_eps: float; clip_eps_v: float
-    c_v: float; c_h: float; c_kl: float; c_u: float; c_vvec: float
-    ref_period: int | None       # ref(k) = K*floor(k/K); None disables KL term
+    c_v: float; c_h: float
     entropy_schedule: str        # "const" | "linear_decay"
-    use_moment_heads: bool       # default False (flag-gated per plan)
     use_suit_consistency: bool   # default False
 
 @dataclass
@@ -256,17 +251,18 @@ class CompletionStats:
 @dataclass
 class NodeTargets:            # aligned with player-node ids
     node_ids: Tensor          # int32 [Nd]
-    p_hat:    Tensor          # [Nd, X_max]        posterior over ACTOR types at node
-    q_hat:    Tensor          # [Nd, E_max, X_max] per-child lambda-return, mask via child count
+    parent_p_hat: Tensor      # [Nd, X_max] posterior over actor types at parent
+    child_p_hat: Tensor       # [Nd, E_max, X_max] branch-conditioned posterior
+    a_hat: Tensor             # [Nd, E_max, X_max] leave-one-branch advantage
     v_hat:    Tensor          # [Nd, X_max]
-    vvec_hat: Tensor          # [Nd, P_max]
-    u_hat:    Tensor          # [Nd]
-    nu_row:   Tensor          # [Nd, E_max]        nu weights per child, zero-padded
     child_event_row: Tensor   # int32 [Nd, E_max]
+    child_mask: Tensor        # bool [Nd, E_max]
+    child_count: Tensor       # int32 [Nd]
+    q_hat: Tensor | None      # optional, present only when emit_q=True
 
 @dataclass
 class MinibatchSample:        # produced by minibatch.sample(...)
-    node_ids: Tensor          # int32 [B]
+    decision_rows: Tensor     # int32 [B], sampled directly by alias table
     targets:  NodeTargets     # gathered rows, [B, ...]
     old_out:  PolicyOutput    # frozen rollout-policy outputs at these nodes (cached at rollout time)
 ```
@@ -280,17 +276,17 @@ The generic core never sees poker's action factorization. Games expose:
 class PolicyOutput:           # everything the model emits at a batch of nodes
     raw: Any                  # game-owned payload (poker: type logits, raise mixture, etc.)
     v: Tensor                 # [B, X_max] per-type value
-    vvec: Tensor | None       # [B, P_max], all seated players; padded seats 0
-    u: Tensor | None          # [B]
 
 class PolicyAdapter(Protocol):
-    def log_prob(self, out: PolicyOutput, event_ids: Tensor) -> Tensor:
-        """[B, E_sel] -> [B, E_sel, X_max]: log pi(event | xtype, node)."""
-    def entropy(self, out: PolicyOutput) -> Tensor:
+    def log_prob(self, out, selected_event_ids, legal_event_ids,
+                 legal_event_mask) -> Tensor:
+        """[B,E_sel,X_max]: log pi(selected event | xtype,node)."""
+    def entropy(self, out, legal_event_ids, legal_event_mask) -> Tensor:
         """[B, X_max]. Exact where tractable; poker: exact over the factored head."""
-    def kl(self, out_new, out_ref) -> Tensor:
-        """[B, X_max]."""
-    def centered_logits(self, out, event_ids) -> Tensor:
+    def kl(self, out_new, out_ref, legal_event_ids, legal_event_mask) -> Tensor:
+        """Deferred extension, [B,X_max]."""
+    def centered_logits(self, out, selected_event_ids,
+                        legal_event_ids, legal_event_mask) -> Tensor:
         """NeuRD support; may raise NotImplementedError in v1."""
 ```
 
@@ -429,8 +425,9 @@ class PostflopNet(nn.Module):
     # (1176/1128/1081); carries compact_to_combo/combo_to_compact int32 maps and
     # scatters outputs back to [B, 1326] before returning. Fixed-shape-per-street batching.
 ```
-`heads.py`: `TypeHead`, `RaiseMixtureHead` (`DLogisticTick` per `Docs/MHA_model.md`,
-binomial ticks behind a flag as ablation), `ValueHead`, `MomentHeads` (flag-gated).
+`heads.py`: `TypeHead`, `RaiseMixtureHead` (`DLogisticTick` per `docs/MHA_model.md`,
+binomial ticks behind a flag as ablation), and `ValueHead`. Existing
+`MomentHeads` code is a dormant research extension and is not wired into v1.
 Poker-private collision and partition features are evaluator-produced. Learned
 tensor transformations over supplied fields may live in the model, but
 `incidence.py` must not enumerate or derive legal/conflicting private
@@ -441,45 +438,78 @@ assignments.
 ### P8/P9 — `core/rollout.py`, `core/branching.py`
 
 ```python
-def sample_trees(game, policy_fn, cfg: RolloutConfig, intensity, gen) -> tuple[TreeBatch, ReachCache, OldOutCache]
-# policy_fn: state batch -> PolicyOutput (queued/batched inference; poker adapter splits
-# preflop/postflop queues internally). Spine-Poisson children per NOTATION §5:
-# K = 1 + Poisson(beta(node) - 1); events drawn from the PUBLIC mixture (NOTATION §5,
-# Warning W1: never condition on a sampled true profile).
-# beta_mode="sequential" hard-sets beta==1; test T2 asserts equality of path law.
-class IntensityController:      # buckets, warmup, Neyman update; NOTATION §9
-    def beta(self, nodes) -> Tensor
-    def update_bucket_means(self, tree, s_values) -> None
+StateBatch = Tensor  # int32 [B] opaque handles into a backend-owned state store
+
+@dataclass
+class EventBatch:
+    public_id: Tensor
+    payload: dict[str, Tensor]
+
+class RolloutBackend(Protocol):
+    device: torch.device
+    n_players: int
+    x_sizes: tuple[int, ...]
+    max_rollout_steps: int
+    def root_states(self, n) -> StateBatch: ...
+    def classify(self, states) -> Tensor: ...
+    def legal_events(self, states) -> tuple[Tensor, Tensor]: ...
+    def policy_forward(self, frozen_model, states, reaches) -> PolicyOutput: ...
+    def sample_profiles(self, states, reaches, gen) -> Tensor: ...
+    def sample_events(self, states, profiles, policy_out, adapter, gen) -> EventBatch: ...
+    def step(self, states, events: EventBatch) -> StateBatch: ...
+    def reach_update(self, reaches, states, events, policy_out) -> Tensor: ...
+    def beta_fn(self, states) -> Tensor: ...       # fp32 [B], fixed public-stage values
+
+def sample_trees(bundle, cfg: RolloutConfig, gen) -> tuple[TreeBatch, ReachCache, OldOutCache]
+# K = floor(beta) + Bernoulli(beta-floor(beta)). Every abstract child is stored,
+# including repeated public labels, with edge probability exactly 1/K.
+# beta_mode="sequential" hard-sets beta==1; "fixed" calls backend.beta_fn.
 ```
 `OldOutCache` stores rollout-policy `PolicyOutput` rows at player nodes (for
-ratio/KL terms) so minibatching never re-runs the frozen policy.
+policy ratios) so minibatching never re-runs the frozen policy. Production
+rollout tensors remain on their owning GPU; host transfers are forbidden in the
+hot path. Buffer overflow raises rather than changing the sampled law.
 
 ### P10 — `core/values.py`
 
 ```python
-def branched_value(tree, reach, completion: MCCompletion, value_heads, lam, cfg) -> NodeTargets
+def branched_value(tree, leaf_stats, reach, value_heads, lam, game, *,
+                   configured_node_budget,
+                   emit_q=False, auxiliary_reducers=()) -> NodeTargets
 # The core_math BranchedValue algorithm, transcribed in NOTATION §7:
 #   1. MC completion at PRETERM leaves -> CompletionStats
-#   2. Backward pass: nu-weighted mixing of (p_hat, v_hat, vvec_hat, u_hat)
-#   3. At player nodes: capture q_hat from (already lambda-mixed) children,
-#      capture v_hat/vvec/u targets, THEN lambda-mix owner v_hat (and vvec/u at
-#      every player node) before the parent consumes.
+#   2. Backward pass: uniform-child aggregation of posterior mass P and
+#      posterior-weighted return mass M.
+#   3. At player nodes: conditionalize M/P, compute O(C) total-minus-child
+#      baselines, emit A and V, then lambda-mix owner M before parent consumption.
+# Q is transient unless emit_q=True. Public moment channels are deferred.
 # Backward-MC posterior is the ONLY production path (signed-off decision).
 ```
 
 ### P11 — `core/losses.py`, `core/training.py`
 
 ```python
-# primitives (NOTATION §10 formulas): l_pg, l_clip, l_v, l_v_clip, l_h, l_kl,
-# l_kl_sample, l_u, l_vvec — each:
+# active primitives (NOTATION §10 formulas): l_pg, l_clip, l_v, l_v_clip, l_h:
 # (new_out, old_out, targets, adapter, cfg) -> ([B] or [B,X], metrics).
-# NeuRD/R-NaD source formulas have reserved registry names but are out of v1 scope.
+# Adapter KL/centered-logit methods remain extension points; KL snapshots,
+# moment losses and NeuRD/R-NaD are out of v1 scope.
 COMPOSITES: dict[str, LossFn] = {"rb_ppo": ...}
-# rb_ppo per NOTATION §10.3: posterior-weighted sum over (xtype, child event) with
-# p_hat * nu weights; moment losses gated by cfg.loss.use_moment_heads.
+# Policy terms consume a_hat and child_p_hat with uniform abstract-child weights;
+# value/entropy terms consume parent_p_hat.
 def train(cfg: RootConfig) -> None       # torchrun entry; DDP; phase-alternating:
 # each rank samples n_trees/world locally -> branched_value locally -> gd_steps with
 # DDP-allreduced grads; GradScaler; checkpoint {model, opt, scaler, iter, cfg, rng}.
+```
+
+Game construction returns a typed bundle rather than a positional tuple:
+
+```python
+@dataclass
+class GameBundle:
+    model: nn.Module
+    rollout_backend: RolloutBackend
+    policy_adapter: PolicyAdapter
+    completion_backend: MCCompletion
 ```
 
 ### P12/P13 — `eval/`, integration
@@ -553,9 +583,9 @@ approx-KL, ratio clip fraction, value-head explained variance, tree stats
 
 ## 10. Mathematical authority
 
-`Docs/latex/core_math.tex` is authoritative. `NOTATION.md` §12 records only
+`docs/latex/core_math.tex` is authoritative. `NOTATION.md` §12 records only
 symbol-level normalizations needed to transcribe internally cross-referenced
 source equations and pseudocode; it does not define alternative mathematics.
-In particular, `is_pre_terminal` identifies the final chance node before its
-chance outcome is drawn, and the public moment heads represent the full player
-reward vector (including folded-player payoff components).
+In particular, `is_pre_terminal` identifies a completion cut after which no
+player node remains; zero or more chance draws may remain. Public moment heads
+and their allocation rule are deferred research extensions.

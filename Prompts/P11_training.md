@@ -1,5 +1,8 @@
 # P11 — Losses, minibatching, training loop (`losses.py`, `minibatch.py`, `training.py`)
 
+> **Historical prompt — do not launch on the current repository.** C11 replaces
+> its target, weighting, bundle, Neyman, moment, and reference-KL contracts.
+
 **Depends on:** P08–P10 (+P01 for tests; poker wired in P13).
 **Files:** `pbg/core/losses.py`, `pbg/core/minibatch.py`, `pbg/core/training.py`;
 `tests/test_p11_losses.py`, `test_p11_training.py`.

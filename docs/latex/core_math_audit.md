@@ -4,9 +4,13 @@
 
 This is now a living audit of `core_math.tex`, restricted to issues deliberately left for later and local inconsistencies that remain after the review pass. It does not audit implementation files, cited papers, or claims against the literature.
 
-The main mathematical spine is now coherent: the ideal decision law matches pooled rollout occupancy; the policy-gradient sampling law is frozen correctly; sequential and branched empirical laws have explicit convergence statements; pre-terminal completion is typed through a fixed public prefix; and branched private-state values propagate posterior-weighted moments.
+The main mathematical spine is now coherent: the ideal decision law matches pooled rollout occupancy; the policy-gradient sampling law is frozen correctly; sequential and branched empirical laws have explicit convergence statements; pre-terminal completion is a cut after all player actions; and branched private-state values propagate posterior mass together with posterior-weighted moments.
+
+The implementation contract deliberately starts with fixed public-stage branching intensities, actor-type value heads, and PPO advantage targets. The naïve Neyman rule, public moment heads, NeuRD/Q targets, and reference-policy KL remain research extensions rather than v1 requirements.
 
 No unresolved item below challenges the overall PBG, Rao--Blackwellization, or public-branching research program. Items 21--25 are deferred questions about method identification, support assumptions, and exposition. The later checklist contains local notation and algorithm-interface work that should be handled before treating the pseudocode as executable specification.
+
+The former finite-sample unbiasedness claim for conditional bucket values has been corrected. The terminal-distribution lemma supplies unbiased linear estimators of bucket probability mass and posterior-weighted target mass; dividing the latter by the former is a generally biased self-normalized ratio. The ratio is consistent for positive-mass buckets and asymptotically unbiased under bounded rewards. Likewise, sibling independence makes the leave-one-branch baseline an action-independent control variate, not an unbiased finite-sample value estimate.
 
 Severity below means:
 

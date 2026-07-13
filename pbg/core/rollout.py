@@ -157,9 +157,23 @@ def sample_trees(
 ) -> tuple[TreeBatch, ReachCache, PolicyCache]:
     """Sample sequential public trajectories in one shared frontier loop."""
 
-    del np_gen  # Reserved for P09 Poisson child counts.
     if cfg_rollout.beta_mode != "sequential":
-        raise NotImplementedError("P08 implements only beta_mode='sequential'")
+        # Keep the P08 path below unchanged: its random-number consumption is a
+        # reproducibility contract.  The import is local to avoid a module
+        # cycle while allowing branching.py to reuse the rollout helpers.
+        from pbg.core.branching import sample_branched_trees
+
+        return sample_branched_trees(
+            game,
+            policy_fn,
+            adapter,
+            cfg_rollout,
+            completion_reach_hook,
+            intensity,
+            torch_gen,
+            np_gen,
+        )
+    del np_gen  # Reserved for P09 Poisson child counts.
     if intensity is not None:
         raise AssertionError("intensity must be None in sequential rollout mode")
     if cfg_rollout.reach_storage not in {"full", "decisions_only", "recompute"}:

@@ -2,18 +2,18 @@
 
 ## Protocol
 
-1. **Fresh context per prompt.** Paste, in order: `PREAMBLE.md`, then the
-   current repo's `IMPLEMENTATION_NOTES.md` (it stays short — it's the only
-   cross-prompt memory), then the prompt file. Nothing else. Do NOT paste
-   `Docs/latex/core_math.tex` / `Docs/MHA_model.md` / `Docs/folder_impact.md` —
-   every needed formula is already restated inside the prompts. The LaTeX file
-   remains authoritative if a transcription discrepancy is found. For P00,
-   P05, P07, and P13
-   also provide `POKER_GPU_EVALUATOR_IO.md`; it is the binding sibling API.
-2. **Order:** P00 → P01 → P02 → P03 → P04 → P05 → P06 → P07 → P08 → P09 →
-   P10 → P11 → P12 → P13. Safe parallel tracks if you want to run two
-   sessions: {P02→P03→P04→P05→P06→P07} (poker) and {P01→P08→P09→P10→P11}
-   (generic core, tested on synthetic) after P00; they only meet at P12/P13.
+1. **Fresh context per prompt.** Start a new workspace-aware context and submit
+   exactly one active prompt file. Each active prompt contains a
+   `Fresh-context bootstrap` section telling the agent which repository files
+   to inspect; no prior prompt text or chat transcript is required. The agent
+   must read those files from the workspace rather than asking you to paste
+   them. `docs/latex/core_math.tex` remains authoritative if a transcription
+   discrepancy is found, and `POKER_GPU_EVALUATOR_IO.md` is binding whenever a
+   prompt names the sibling facade.
+2. **Correction order for the current repository:** C00 → C08 → C09 →
+   C10 → C11 → P12 → P13A → P13B. P09–P11 remain as historical
+   implementation prompts; C09–C11 explicitly supersede their obsolete
+   Poisson/dedup/value/loss contracts.
 3. **After each prompt:** run `pytest -q` yourself; skim the diff against the
    review checklist below; resolve any `CONTRACT-QUESTION` comments (edit
    CONTRACTS/NOTATION if the question is right, tell the next session via
@@ -22,6 +22,17 @@
 4. **If a session goes off the rails** (renamed interfaces, invented
    abstractions): discard the diff and re-run the prompt; do not repair
    drifted code by hand — repaired drift compounds.
+
+## Active versus historical files
+
+- Launch now, in order: `C00_math_contract.md`, `C08_device_rollout.md`,
+  `C09_labeled_branching.md`, `C10_posterior_moments.md`,
+  `C11_minimal_training.md`, `P12_eval.md`, `P13A_gpu_poker_rollout.md`, and
+  `P13B_integration.md`.
+- `P00`–`P11` document the already-built foundation. They are retained for
+  provenance and tests, but are not part of the current launch sequence.
+- In particular, never run P08–P11 after their C08–C11 corrections; the C
+  prompt is the complete replacement contract.
 
 ## Contract deltas vs the signed-off CONTRACTS v0.1 (flagging per our rule)
 
@@ -32,20 +43,16 @@
   the Protocol: branching needs joint posterior profile draws generically;
   poker routes it to the rejection backend, synthetic implements it exactly.
   (P01/P09.)
-- **D3.** `OldOutCache` concretized as `PolicyCache` living in `core/tree.py`,
-  storing per-stored-child per-type log-probs + old V only (not full
-  PolicyOutput — full raw payloads at 1326 rows would be prohibitive). KL
-  reference terms re-forward a frozen ref checkpoint at minibatch time
-  instead of caching ref outputs. (P08/P11.)
+- **D3.** `OldOutCache` is a compact policy cache aligned to one stable
+  decision-row order. Reference-policy KL is deferred. (P08/C11.)
 - **D4.** `ReachCache` lives in `core/tree.py` (not `completion.py`) to keep
   file ownership clean; `completion.py` keeps only `ReachView` ferrying.
   (P08.)
 - **D5.** Engine deals chance cards via a `deal(state_refs, cards)` side
   channel rather than enumerating chance outcomes as engine events (the
   outcome space is huge); the adapter samples the cards. (P02/P07.)
-- **D6.** Node-budget overflow in branched mode degrades to spine-only
-  continuation with a metrics flag (deterministic), rather than erroring.
-  (P09.)
+- **D6.** Node-budget overflow is a loud capacity error; it never changes the
+  sampled offspring law. (C08/C09.)
 - **D7.** `branched_value` takes `max_resident_rows` kwarg instead of a new
   config field. (P10.)
 - **D8.** All poker-private combinatorics use `poker_gpu_evaluator.pbg`:
@@ -75,16 +82,16 @@ If any delta is unwelcome, say so before its prompt runs; each is localized.
   events; sampled actor combo only selects a row; partition inputs are opaque.
 - **P08**: three reach modes agree test; PolicyCache vs recompute test; W1 —
   profiles drawn per event draw and discarded.
-- **P09**: T3 lemma test present with real statistics; sequential
-  byte-identity guard; controller state in checkpoint.
-- **P10**: reference implementation is genuinely independent (path
-  enumeration, not the same recursion copy-pasted); lam sweep in T4;
-  capture-before-mix order untouched.
-- **P11**: three weighting levels in rb_ppo (P̂ν / P̂ / bare); T5 variance
-  ratio reported; checkpoint resume exactness.
+- **C09**: randomized rounding, duplicate-labeled abstract children retained,
+  uniform `1/K` edges, and terminal-distribution test.
+- **C10**: P/M rather than direct conditional-value averaging; O(K)
+  leave-one-out oracle; Q absent unless explicitly requested.
+- **C11**: policy uses child posterior and emitted A; value/entropy use parent
+  posterior; stable decision-row indexing; checkpoint resume exactness.
 - **P12**: duplicate deals actually swap seats; CI paired; every fixed showdown
   crosses the evaluator facade.
-- **P13**: only the marked core edit; acceptance checklist numbers pasted.
+- **P13A**: CPU-engine parity plus no host transfers in the GPU rollout path.
+- **P13B**: typed GameBundle, fixed-beta presets, device-residency acceptance.
 
 ## When the codebase is done
 

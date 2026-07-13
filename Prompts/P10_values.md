@@ -1,5 +1,8 @@
 # P10 — Backward value propagation (`values.py`)
 
+> **Historical prompt — do not launch on the current repository.** C10 replaces
+> direct conditional-value averaging with posterior mass/moment propagation.
+
 **Depends on:** P05, P08, P09 (+P01 test bed).
 **Files:** `pbg/core/values.py`; `tests/test_p10_values.py`.
 **May touch:** append `IMPLEMENTATION_NOTES.md`.

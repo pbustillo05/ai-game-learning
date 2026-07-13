@@ -1,5 +1,8 @@
 # P09 — Branched rollout & variance-guided intensities (`branching.py`)
 
+> **Historical prompt — do not launch on the current repository.** C09 replaces
+> its Poisson, deduplicated-tree, budget-clamp, and Neyman contracts.
+
 **Depends on:** P08 (+P01 test bed, P05 samplers).
 **Files:** `pbg/core/branching.py`; `tests/test_p9_branching.py`.
 **May touch:** `pbg/core/rollout.py` ONLY at the `_draw_children` hook and the

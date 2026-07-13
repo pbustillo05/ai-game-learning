@@ -109,9 +109,22 @@ class SyntheticPolicyAdapter:
     def entropy(self, out: PolicyOutput) -> Tensor:
         """Return exact categorical entropy ``[B, X]``."""
 
-        log_policy = torch.log_softmax(out.raw, dim=-1)  # [B, X, E]
-        policy = torch.softmax(out.raw, dim=-1)  # [B, X, E]
-        terms = torch.where(policy > 0.0, policy * log_policy, torch.zeros_like(policy))
+        # Avoid differentiating through ``0 * -inf`` at masked events.  This is
+        # algebraically log_softmax on the finite (legal) subset.
+        legal = torch.isfinite(out.raw)
+        finite_logits = torch.where(legal, out.raw, torch.zeros_like(out.raw))
+        maximum = torch.where(legal, out.raw, torch.full_like(out.raw, -torch.inf)).amax(
+            dim=-1, keepdim=True
+        )
+        unnormalized = torch.where(
+            legal, torch.exp(finite_logits - maximum), torch.zeros_like(out.raw)
+        )
+        normalizer = unnormalized.sum(dim=-1, keepdim=True)
+        policy = unnormalized / normalizer
+        log_policy = torch.where(
+            legal, finite_logits - maximum - torch.log(normalizer), torch.zeros_like(out.raw)
+        )
+        terms = policy * log_policy
         return -terms.sum(dim=-1)  # [B, X]
 
     def kl(self, out_new: PolicyOutput, out_ref: PolicyOutput) -> Tensor:
@@ -183,4 +196,3 @@ def export_policy_tables(
         int(tree_index.node_keys[index]): probabilities[row]
         for row, index in enumerate(decision_indices)
     }
-
