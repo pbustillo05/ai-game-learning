@@ -1,116 +1,153 @@
-# Prompt Suite README — how to run GPT 5.6 through this build
+# Public-action Bayesian game learning
 
-## Protocol
+`pbg` is a GPU-oriented research framework for learning strategies in
+imperfect-information games. It implements policy-gradient self-play for finite
+public-action Bayesian games, with exact synthetic card games for validation
+and no-limit Texas hold'em as the main large-scale domain.
 
-1. **Fresh context per prompt.** Start a new workspace-aware context and submit
-   exactly one active prompt file. Each active prompt contains a
-   `Fresh-context bootstrap` section telling the agent which repository files
-   to inspect; no prior prompt text or chat transcript is required. The agent
-   must read those files from the workspace rather than asking you to paste
-   them. `docs/latex/core_math.tex` remains authoritative if a transcription
-   discrepancy is found, and `POKER_GPU_EVALUATOR_IO.md` is binding whenever a
-   prompt names the sibling facade.
-2. **Correction order for the current repository:** C00 → C08 → C09 →
-   C10 → C11 → P12 → P13A → P13B. P09–P11 remain as historical
-   implementation prompts; C09–C11 explicitly supersede their obsolete
-   Poisson/dedup/value/loss contracts.
-3. **After each prompt:** run `pytest -q` yourself; skim the diff against the
-   review checklist below; resolve any `CONTRACT-QUESTION` comments (edit
-   CONTRACTS/NOTATION if the question is right, tell the next session via
-   IMPLEMENTATION_NOTES if it's wrong); commit. Never start the next prompt
-   with a red suite.
-4. **If a session goes off the rails** (renamed interfaces, invented
-   abstractions): discard the diff and re-run the prompt; do not repair
-   drifted code by hand — repaired drift compounds.
+The implementation plan in `Prompts/` is complete. Those files remain as
+development history; this README describes the repository as a normal,
+implemented project.
 
-## Active versus historical files
+## What is implemented
 
-- Launch now, in order: `C00_math_contract.md`, `C08_device_rollout.md`,
-  `C09_labeled_branching.md`, `C10_posterior_moments.md`,
-  `C11_minimal_training.md`, `P12_eval.md`, `P13A_gpu_poker_rollout.md`, and
-  `P13B_integration.md`.
-- `P00`–`P11` document the already-built foundation. They are retained for
-  provenance and tests, but are not part of the current launch sequence.
-- In particular, never run P08–P11 after their C08–C11 corrections; the C
-  prompt is the complete replacement contract.
+- Strict configuration, explicit RNGs, deterministic checkpointing, AMP, and
+  gradient-only DDP.
+- Device-resident sequential and fixed-intensity public-tree rollout.
+- Duplicate-preserving labeled branching with randomized-rounded offspring.
+- Monte Carlo leaf completion and posterior-moment backward propagation.
+- Rao–Blackwellized PPO over all actor private types.
+- Configurable synthetic games, Kuhn and Leduc presets, exact posteriors, best
+  responses, and exploitability.
+- A public NLHE engine with correct betting, short-all-in reopening, chance
+  transitions, side pots, and affine chip-payoff assembly.
+- Preflop 169-class and compact postflop 1326-combo transformer models.
+- CPU/CUDA tensor-native poker rollout and paired duplicate-deal evaluation.
+- A strict adapter boundary to `poker-gpu-evaluator` for all private poker
+  combinatorics and showdown evaluation.
 
-## Contract deltas vs the signed-off CONTRACTS v0.1 (flagging per our rule)
+## Architecture
 
-- **D1.** `games/synthetic/model.py` added (SyntheticNet + adapter + policy
-  table exporter): the generic loop needs *some* model for synthetic games;
-  the poker model is poker-owned. (P01.)
-- **D2.** `PBGGame.sample_profiles(state_refs, reach_rows, n, gen)` added to
-  the Protocol: branching needs joint posterior profile draws generically;
-  poker routes it to the rejection backend, synthetic implements it exactly.
-  (P01/P09.)
-- **D3.** `OldOutCache` is a compact policy cache aligned to one stable
-  decision-row order. Reference-policy KL is deferred. (P08/C11.)
-- **D4.** `ReachCache` lives in `core/tree.py` (not `completion.py`) to keep
-  file ownership clean; `completion.py` keeps only `ReachView` ferrying.
-  (P08.)
-- **D5.** Engine deals chance cards via a `deal(state_refs, cards)` side
-  channel rather than enumerating chance outcomes as engine events (the
-  outcome space is huge); the adapter samples the cards. (P02/P07.)
-- **D6.** Node-budget overflow is a loud capacity error; it never changes the
-  sampled offspring law. (C08/C09.)
-- **D7.** `branched_value` takes `max_resident_rows` kwarg instead of a new
-  config field. (P10.)
-- **D8.** All poker-private combinatorics use `poker_gpu_evaluator.pbg`:
-  completion, exact joint profiles, partition/folded-card summaries, and exact
-  fixed-showdown winner shares per pot stratum. There are no local poker
-  mathematical reference implementations. The shipped 0.3.0+ boundary exports
-  a defensive `COMBO_CARDS` table and its deterministic partition call has no
-  query or seed arguments. This repo retains public-tree navigation, policies,
-  pot amounts, and chip-EV assembly. (P00–P13.)
+The generic package under `pbg/core/` operates on opaque state handles and
+game-neutral tensor protocols. A game factory returns one typed `GameBundle`
+containing its model, rollout backend, policy adapter, and completion backend.
+Synthetic and poker implementations live under `pbg/games/`; evaluation is
+read-only under `pbg/eval/`.
 
-If any delta is unwelcome, say so before its prompt runs; each is localized.
+The active training pipeline is:
 
-## Per-prompt review checklist (what to eyeball in the diff)
+```text
+frozen model -> sampled public trees -> leaf completion
+             -> posterior P/M backward pass -> aligned decision minibatches
+             -> posterior-weighted clipped policy + value + entropy update
+```
 
-- **P00**: config strictness actually rejects unknown keys; import test walks
-  files, not import side effects.
-- **P01**: Kuhn/Leduc arise from pure configs (grep for "kuhn" in family.py —
-  must be absent); exact Kuhn equilibrium test uses the closed form.
-- **P02**: min-raise/no-reopen rule; pot-stratum fixture with 3 unequal stacks;
-  no hand-rank/category/payoff evaluator symbols.
-- **P03**: fold snapshots taken before masking; no per-hypothesis renorm.
-- **P04**: partition-summary DTO/adapter maps sibling fields without deriving
-  poker quantities locally; no removal algebra or local oracle.
-- **P05**: thin sibling adapters have no NumPy/device round trip; rejection
-  returns full profiles; fixed showdown returns masks/shares per stratum.
-- **P06**: temperature on content only (find the division site); dlogistic
-  normalization exact.
-- **P07**: compact scatter round-trip; adapter entropy exact over composed
-  events; sampled actor combo only selects a row; partition inputs are opaque.
-- **P08**: three reach modes agree test; PolicyCache vs recompute test; W1 —
-  profiles drawn per event draw and discarded.
-- **C09**: randomized rounding, duplicate-labeled abstract children retained,
-  uniform `1/K` edges, and terminal-distribution test.
-- **C10**: P/M rather than direct conditional-value averaging; O(K)
-  leave-one-out oracle; Q absent unless explicitly requested.
-- **C11**: policy uses child posterior and emitted A; value/entropy use parent
-  posterior; stable decision-row indexing; checkpoint resume exactness.
-- **P12**: duplicate deals actually swap seats; CI paired; every fixed showdown
-  crosses the evaluator facade.
-- **P13A**: CPU-engine parity plus no host transfers in the GPU rollout path.
-- **P13B**: typed GameBundle, fixed-beta presets, device-residency acceptance.
+Poker ownership is intentionally split. This repository owns public game
+navigation, policies, ranges, pots, and chip-EV assembly.
+`poker_gpu_evaluator.pbg` owns collision-conditioned private profiles,
+folded-card partition summaries, completion/equity, hand comparison, ties, and
+per-pot winner shares. See
+[`POKER_GPU_EVALUATOR_IO.md`](POKER_GPU_EVALUATOR_IO.md).
 
-## When the codebase is done
+## Requirements and installation
 
-Bring the final `IMPLEMENTATION_NOTES.md`, the T5/T3/T4 outputs, and the
-Leduc exploitability curve back to Claude for the review pass (step 5 of the
-original plan), together with any CONTRACT-QUESTIONs that were deferred.
+- Python 3.11+
+- PyTorch 2.2+
+- NumPy, PyYAML, and pytest
+- The sibling `poker-gpu-evaluator` repository for poker completion and
+  integration paths
 
-## Shared server hygiene
+On the shared GPU server, use the persistent poker virtual environment and do
+not install into system Python:
 
-This repo is often used on a shared GPU server, and we must used these GPUs for testing, before doing any serious runs.
-Do use the GPUs but be conservative:
-- Use a virtualenv for Python work. Do not install packages into the server's system Python. Prefer one persistent user-level venv shared by the poker repos (there should be one available at `/home/pablob/.venvs/poker` and if unavailable, ask the user to create it), so dependencies are not reinstalled every session.
-- Check GPU state before CUDA work with `nvidia-smi`. If sandboxed access fails, request explicit approval rather than guessing.
-- Do not touch other users' GPU jobs. After checking GPU state, make sure to only launch tasks in idle available GPUs.
-- After a GPU task is done, make sure the GPU has returned to a clean idle state, without any strange lingering workload or memory usage.
-- Avoid OOM at all cost. Stage CUDA tests from tiny smoke runs to larger benchmarks, watch memory between runs, precompute estimated memory usage before anything sizable, and keep batch sizes/partials modest until usage is known. An OOM can require someone to physically reset the server, which is remote and difficult to access.
-- Prefer commands that make resource targeting explicit.
+```bash
+/home/pablob/.venvs/poker/bin/python -m pip install -e .
+/home/pablob/.venvs/poker/bin/python -m pip install -e ../poker-gpu-evaluator
+```
 
-You are by default approved and encouraged by the user to use the GPUs, as long you respect these rules. Escalate approval requests if the sandbox prevents you from using them.
----
+The sibling install is optional for synthetic-only work and required for real
+poker evaluator calls.
+
+## Configuration
+
+Complete presets are provided in `configs/`:
+
+- `kuhn_smoke.yaml` — small sequential Kuhn run.
+- `leduc.yaml` — fixed-intensity Leduc branching.
+- `synthetic_dial_example.yaml` — scalable three-player synthetic example.
+- `nlhe6_h100.yaml` — conservative first-profile six-player CUDA NLHE run.
+
+Configuration loading rejects unknown or missing fields. Game-owned mappings
+are validated when their bundle is constructed. See
+[`docs/training_and_evaluation.md`](docs/training_and_evaluation.md) for the
+schema and preset details.
+
+## Training
+
+There is no console-script wrapper yet. Run a preset through the Python API:
+
+```bash
+/home/pablob/.venvs/poker/bin/python - <<'PY'
+from pbg.core.config import load_config
+from pbg.core.training import train
+
+train(load_config("configs/kuhn_smoke.yaml"))
+PY
+```
+
+Training writes append-only `metrics.jsonl` rows and atomic checkpoints to the
+configured output directory. Checkpoints contain model, optimizer, gradient
+scaler, configuration, iteration, and explicit Torch/NumPy RNG state.
+
+For DDP, launch the same code with `torchrun`. Tree and minibatch sizes are per
+rank. Before CUDA work on a shared server, inspect `nvidia-smi`, use only an
+idle explicitly selected GPU, stage small smoke runs first, and verify the GPU
+returns to idle afterward.
+
+## Evaluation
+
+`pbg.eval.exploitability` performs exact read-only evaluation of feasible
+synthetic checkpoints and writes iteration-sorted exploitability curves.
+
+`pbg.eval.arena` compares poker checkpoints using paired duplicate deals,
+complement runouts, seat rotation, and paired Student-t confidence intervals.
+Every showdown crosses the evaluator facade.
+
+## Tests
+
+Run the full suite from the repository root:
+
+```bash
+/home/pablob/.venvs/poker/bin/python -m pytest -q
+```
+
+The tests cover strict contracts, exact synthetic oracles, sampled terminal
+laws, posterior targets, loss weighting, public poker rules, model behavior,
+CPU/tensor parity, evaluator boundaries, device residency, DDP, checkpointing,
+and short integration runs. CUDA- and sibling-dependent tests skip when their
+prerequisites are unavailable.
+
+## Documentation
+
+The implementation documentation starts at [`docs/README.md`](docs/README.md):
+
+- [`docs/architecture.md`](docs/architecture.md)
+- [`docs/core_algorithms.md`](docs/core_algorithms.md)
+- [`docs/synthetic_games.md`](docs/synthetic_games.md)
+- [`docs/poker.md`](docs/poker.md)
+- [`docs/training_and_evaluation.md`](docs/training_and_evaluation.md)
+- [`docs/file_reference.md`](docs/file_reference.md), covering every tracked
+  file
+
+Authoritative technical sources are
+[`CONTRACTS.md`](CONTRACTS.md), [`NOTATION.md`](NOTATION.md), and
+[`docs/latex/core_math.tex`](docs/latex/core_math.tex). Historical implementation
+status and decisions are recorded in
+[`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md).
+
+## Project status
+
+All implementation and correction prompts through P13B are implemented. The
+current default is the corrected fixed-intensity RB-PPO path. Learned Neyman
+allocation, reference-policy KL, NeuRD/R-NaD objectives, and public moment
+losses remain explicit research extensions rather than unfinished requirements.

@@ -19,9 +19,10 @@ corrected compressed per-folder summaries, and (6) defines the computation
 budget, the Monte Carlo validation oracle, and teacher targets for learned
 components.
 
-The companion [`blocker_model.md`](blocker_model.md) specifies the network that consumes the
-objects defined here. This file contains no architecture; `blocker_model.md` contains
-no derivations.
+The companion `blocker_model.md` in the sibling evaluator repository specifies
+the network that consumes the objects defined here. It is intentionally not a
+local file: this document contains no architecture, and the sibling model
+document contains no derivations.
 
 ---
 
