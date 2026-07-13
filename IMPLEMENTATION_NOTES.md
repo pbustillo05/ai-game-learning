@@ -118,3 +118,14 @@
 - Fixed intensities are backend bucket lookups validated as finite fp32 values at least one.
 - Capacity exhaustion raises from the preallocated buffer without clamping or partial output.
 - Isolated the P09 quotient sampler under `_legacy_sample_branched_trees` for migration only.
+
+## C10 — posterior-moment backward propagation
+
+- Added the corrected engine alongside the untouched historical P10 value module.
+- Propagated posterior mass and posterior-weighted return mass with uniform abstract-child averages.
+- Conditionalized only at emission, with explicit zero-mass handling and fp32 working storage.
+- Added O(K) total-minus-child sibling baselines and capture-before-bootstrap advantages.
+- Kept Q allocation opt-in and emitted explicit child masks, counts, labels, and posterior rows.
+- Streamed whole trees in fixed configured-budget chunks and rejected unsafe row-cap configurations.
+- Added generic dense auxiliary channels with optional capture and every-player-node bootstrapping.
+- Verified focused CPU behavior, historical P10 compatibility, and small CPU/CUDA parity.
