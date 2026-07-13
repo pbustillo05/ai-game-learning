@@ -151,3 +151,13 @@
 - Added loss target-field declarations and fail-fast target availability checks before optimization.
 - Replaced controller/reference/moment checkpoint state with explicit model, optimizer, scaler, config, and RNG state.
 - Migrated the strict config and Kuhn smoke preset away from deferred Neyman, KL, and moment fields.
+
+## P12 — read-only checkpoint evaluation
+
+- Added exact synthetic checkpoint evaluation through the C11 bundle and P01 policy-table tools.
+- Curves are sorted by stored iteration and return rows identical to their JSONL representation.
+- Added CPU-engine poker arenas with exact sibling joint profiles and paired complement runouts.
+- Duplicate replays rotate the singled-out button-relative seat and share seat/history uniforms.
+- Pair-level aggregate A payoff drives bb/100 means, Student-t intervals, and per-seat reports.
+- Fold rewards remain local; every fixed showdown crosses the stable evaluator facade.
+- Arena reconstruction uses the P07 poker model bundle and policy adapter directly.
