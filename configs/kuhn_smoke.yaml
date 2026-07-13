@@ -12,14 +12,14 @@ game:
     ante: 1
   poker: null
 rollout:
-  n_trees: 16
+  n_trees: 512
   beta_mode: sequential
   beta_fix: {default: 1.0}
   node_budget: 128
   reach_storage: full
 completion:
-  n_samples: 32
-  backend: synthetic
+  n_samples: 256
+  backend: exact
 model:
   n_buckets: 128
   hidden_dim: 32
@@ -34,14 +34,14 @@ loss:
   entropy_schedule: const
   use_suit_consistency: false
 train:
-  iters: 2
+  iters: 300
   gd_steps_per_iter: 1
-  minibatch_size: 16
+  minibatch_size: 256
   lr: 0.001
   adam_betas: [0.9, 0.999]
   grad_clip: 1.0
   amp: false
   seed: 7
-  checkpoint_every: 1
+  checkpoint_every: 25
   out_dir: runs/kuhn_smoke
 debug_asserts: true

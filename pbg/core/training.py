@@ -26,6 +26,7 @@ from pbg.core.values import HeadEvals, branched_value
 
 GAME_FACTORIES = {
     "synthetic": "pbg.games.synthetic.bundle:build_bundle",
+    "poker": "pbg.games.poker.bundle:build_bundle",
 }
 
 
@@ -211,9 +212,14 @@ def train(cfg: RootConfig) -> None:
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    if cfg.rollout.n_trees % world:
-        raise ValueError("rollout.n_trees must be divisible by WORLD_SIZE")
-    requested = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if cfg.game.name == "poker" and cfg.completion.backend == "cpu":
+        requested = torch.device("cpu")
+    elif cfg.game.name == "poker" and cfg.completion.backend == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("poker completion backend 'cuda' requires an available CUDA device")
+        requested = torch.device(f"cuda:{local_rank}")
+    else:
+        requested = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     bundle = build_game_bundle(cfg, requested)
     device = torch.device(bundle.rollout_backend.device)
     torch.use_deterministic_algorithms(True)
@@ -231,7 +237,6 @@ def train(cfg: RootConfig) -> None:
             device_ids=[device.index] if device.type == "cuda" else None,
         )
     local_cfg = copy.deepcopy(cfg)
-    local_cfg.rollout.n_trees //= world
     optimizer = torch.optim.Adam(
         bundle.model.parameters(), lr=cfg.train.lr, betas=cfg.train.adam_betas
     )

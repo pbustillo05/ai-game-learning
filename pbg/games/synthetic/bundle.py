@@ -70,8 +70,10 @@ class SyntheticCompletion:
 def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     """Build the synthetic family, model, adapter, rollout, and completion bundle."""
 
-    if cfg.completion.backend not in {"synthetic", "cpu", "auto"}:
-        raise ValueError("synthetic completion backend must be 'synthetic', 'cpu', or 'auto'")
+    if cfg.completion.backend not in {"exact", "synthetic", "cpu", "auto", "mc"}:
+        raise ValueError(
+            "synthetic completion backend must be 'exact', 'mc', 'synthetic', 'cpu', or 'auto'"
+        )
     values = dict(cfg.game.synthetic or {})
     values["board_per_round"] = tuple(values["board_per_round"])
     values["bet_size"] = tuple(values["bet_size"])

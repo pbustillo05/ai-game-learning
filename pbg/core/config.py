@@ -193,8 +193,10 @@ def _validate_config(cfg: RootConfig) -> None:
     if cfg.game.name == "poker":
         if cfg.game.poker is None:
             raise ConfigError("root.game.poker: required when game.name is 'poker'")
-        if cfg.completion.backend != "poker_gpu":
-            raise ConfigError("root.completion.backend: poker requires 'poker_gpu'")
+        if cfg.completion.backend not in {"auto", "cpu", "cuda"}:
+            raise ConfigError(
+                "root.completion.backend: poker requires 'auto', 'cpu', or 'cuda'"
+            )
     if cfg.rollout.beta_mode not in {"sequential", "fixed"}:
         raise ConfigError("root.rollout.beta_mode: expected 'sequential' or 'fixed'")
     if "default" not in cfg.rollout.beta_fix:

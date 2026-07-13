@@ -1,0 +1,52 @@
+game:
+  name: synthetic
+  synthetic:
+    n_players: 3
+    deck_size: 10
+    n_suits: 2
+    hand_size: 1
+    n_rounds: 2
+    board_per_round: [0, 1]
+    max_raises: 2
+    bet_size: [1, 2]
+    ante: 1
+  poker: null
+rollout:
+  n_trees: 128
+  beta_mode: fixed
+  beta_fix:
+    default: 1.0
+    round_0: 1.25
+    chance_round_1: 1.5
+    round_1: 2.0
+  node_budget: 1024
+  reach_storage: decisions_only
+completion:
+  n_samples: 1024
+  backend: mc
+# Exact exploitability is disabled when P01's 2M feasibility guard is exceeded.
+model:
+  n_buckets: 1024
+  hidden_dim: 96
+  e_max: 3
+loss:
+  name: rb_ppo
+  lam: 0.95
+  clip_eps: 0.2
+  clip_eps_v: 0.2
+  c_v: 0.5
+  c_h: 0.01
+  entropy_schedule: const
+  use_suit_consistency: false
+train:
+  iters: 1000
+  gd_steps_per_iter: 4
+  minibatch_size: 256
+  lr: 0.0003
+  adam_betas: [0.9, 0.999]
+  grad_clip: 1.0
+  amp: false
+  seed: 17
+  checkpoint_every: 50
+  out_dir: runs/synthetic_dial
+debug_asserts: false

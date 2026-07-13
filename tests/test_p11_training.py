@@ -11,6 +11,11 @@ from pbg.core.training import build_game_bundle, load_checkpoint, save_checkpoin
 
 def test_kuhn_smoke_and_checkpoint_restores_rng(tmp_path) -> None:
     cfg = load_config("configs/kuhn_smoke.yaml")
+    cfg.rollout.n_trees = 16
+    cfg.completion.n_samples = 32
+    cfg.train.iters = 2
+    cfg.train.minibatch_size = 16
+    cfg.train.checkpoint_every = 1
     cfg.train.out_dir = str(tmp_path / "run")
     train(cfg)
     lines = (tmp_path / "run" / "metrics.jsonl").read_text().splitlines()

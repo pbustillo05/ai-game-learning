@@ -173,3 +173,18 @@
 - Removed the policy adapter's device-scalar tick-width synchronization from the rollout event path.
 - Random CPU trajectories match the independent `NLHEEngine`; focused CUDA residency passed on an idle RTX 2080 Ti.
 - Batch histograms are retained as `preflop` and `postflop_<n_live>` dispatch records without CI throughput thresholds.
+
+## P13B — corrected integration and first-run presets
+
+- Registered synthetic and poker factories through the explicit importlib boundary.
+- Added the poker-owned model/adapter/rollout/completion bundle with one owning model.
+- Tensor-native completion calls the sibling facade directly for showdowns and uses
+  sibling exact-profile sampling for collision-conditioned fold posteriors.
+- Added strict Kuhn, Leduc, synthetic-dial, and six-player H100 presets with only
+  fixed-intensity RB-PPO settings; DDP retains tree and batch values per rank.
+- Poker `cpu`, `cuda`, and `auto` select matching rollout/completion residency.
+- CPU sibling integration passed three train iterations and checkpoint roundtrip.
+- CUDA tensor-residency passed on an idle RTX 2080 Ti; the real sibling CUDA smoke
+  cannot JIT on this host because no CUDA toolkit/nvcc is installed (`CUDA_HOME` absent).
+- H100 profiling uses the backend `preflop`/`postflop_<n_live>` histograms alongside
+  `nvidia-smi dmon`; no fixed throughput threshold is imposed by CI.

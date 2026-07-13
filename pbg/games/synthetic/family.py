@@ -785,9 +785,17 @@ class SyntheticRolloutBackend:
         refs, _ = self.game._refs(states)
         values: list[float] = []
         for ref in refs:
-            phase = "chance" if self.game.states.phase[ref] == 1 else "player"
-            bucket = f"round{self.game.states.round[ref]}_{phase}"
-            values.append(float(self.beta_fix.get(bucket, self.beta_fix["default"])))
+            round_index = self.game.states.round[ref]
+            if self.game.states.phase[ref] == 1:
+                bucket = f"chance_round_{round_index}"
+            else:
+                bucket = f"round_{round_index}"
+            # Retain historical spellings for programmatic callers while the
+            # shipped presets use the P13B public-stage names above.
+            legacy = f"round{round_index}_{'chance' if self.game.states.phase[ref] == 1 else 'player'}"
+            values.append(
+                float(self.beta_fix.get(bucket, self.beta_fix.get(legacy, self.beta_fix["default"])))
+            )
         result = torch.tensor(values, dtype=torch.float32, device=self.device)  # [B]
         if not bool(torch.isfinite(result).all()) or bool((result < 1.0).any()):
             raise ValueError("rollout beta must be finite and at least one")

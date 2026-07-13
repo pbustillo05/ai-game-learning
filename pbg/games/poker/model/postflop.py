@@ -342,6 +342,16 @@ class PostflopNet(nn.Module):
             "s": compact_scatter(scale, mapping, dim=1),
             "iota": compact_scatter(iota, mapping, dim=1),
         }
+        # Padded/impossible private rows are excluded by posterior masks in the
+        # loss, but the factorized adapter still evaluates a complete fixed-width
+        # row. Give those rows a harmless valid distribution rather than the
+        # scatter fill value (notably, a zero logistic scale).
+        full_actor_mask = compact_scatter(actor_mask, mapping, dim=1)
+        invalid = ~full_actor_mask
+        raw["omega"] = raw["omega"].masked_fill(invalid[..., None], 1.0 / c.m_raise)
+        raw["mu"] = raw["mu"].masked_fill(invalid[..., None], 0.5)
+        raw["s"] = raw["s"].masked_fill(invalid[..., None], 1.0)
+        raw["iota"] = raw["iota"].masked_fill(invalid, 0.5)
         full_value = compact_scatter(value, mapping, dim=1)
         vvec: Tensor | None = None
         u: Tensor | None = None

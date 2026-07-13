@@ -20,7 +20,8 @@ def test_kuhn_smoke_loads_every_config_field() -> None:
     assert cfg.game.name == "synthetic"
     assert cfg.game.synthetic is not None
     assert cfg.rollout.beta_fix == {"default": 1.0}
-    assert cfg.completion.n_samples == 32
+    assert cfg.completion.n_samples == 256
+    assert cfg.completion.backend == "exact"
     assert cfg.model["n_buckets"] == 128
     assert cfg.loss.lam == pytest.approx(0.95)
     assert cfg.train.adam_betas == (0.9, 0.999)
@@ -63,4 +64,3 @@ def test_metrics_logger_appends_json_lines(tmp_path: Path) -> None:
         {"step": 4, "loss": 1.5},
         {"step": 5, "loss": 1.0, "entropy": 0.25},
     ]
-
