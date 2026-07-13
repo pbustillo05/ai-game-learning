@@ -61,6 +61,17 @@
 - Fixed showdown validation checks only shape, eligibility, tie shares, and mask consistency; poker winner selection remains entirely evaluator-owned.
 - All three operations lazily import and require the stable `pbg-v2` public facade, with no local evaluator or CUDA fallback.
 
+## Evaluator 0.3.0 contract reconciliation
+
+- Reconciled the consumer boundary with the shipped
+  `poker_gpu_evaluator.pbg` API documented in the sibling repository.
+- Removed the ignored-and-now-deleted `query_combo_ids` argument from the
+  partition adapter; it now calls the deterministic 0.3.0+ signature exactly.
+- Validate the sibling's defensive uint8 `[1326,2]` `COMBO_CARDS` export against
+  the frozen local lexicographic representation before any evaluator operation.
+- Updated the binding IO document, corrected CONTRACTS P4 signature, and
+  carried the shipped API constraints into the unimplemented P12/P13 prompts.
+
 ## P07 — postflop model and poker public-tree adapter
 
 - Added generic padded compact-row maps with differentiable gather/scatter and representation-row permutation helpers.

@@ -13,9 +13,13 @@ This prompt is self-contained; prior prompt text is not required. Before
 editing: run `git status --short`; preserve unrelated changes; read
 `PREAMBLE.md`, `IMPLEMENTATION_NOTES.md`, `NOTATION.md`, `CONTRACTS.md`, and
 `POKER_GPU_EVALUATOR_IO.md`; inspect the completed C11, P12 and P13A public
-interfaces plus current configs and checkpoint code. Dependencies describe the
-expected repository state only. Run focused baselines, then complete wiring,
-presets, tests, acceptance commands, and notes in this session.
+interfaces plus current configs and checkpoint code, and compare the evaluator
+boundary with `../poker-gpu-evaluator/docs/api_pbg.md`. The local contract
+reflects evaluator package 0.3.0: validate its defensive `COMBO_CARDS` export
+and do not reintroduce removed partition query/seed arguments. Dependencies
+describe the expected repository state only. Run focused baselines, then
+complete wiring, presets, tests, acceptance commands, and notes in this
+session.
 
 ## Goal
 
@@ -56,8 +60,10 @@ one owning model instance; the backend receives it only through
 
 The completion backend is the sibling facade execution choice
 `"auto" | "cpu" | "cuda"`; `cpu` is the sibling mathematical oracle, not a
-local fallback. Missing/incompatible sibling packages fail with exact install
-and API-version guidance.
+local fallback. Missing/incompatible sibling packages fail with exact install,
+API-version, and combo-map guidance. `API_VERSION == "pbg-v2"` does not imply
+that removed partition arguments remain accepted; use the exact shipped
+0.3.0+ signature recorded in `POKER_GPU_EVALUATOR_IO.md`.
 
 ## Presets
 
@@ -101,6 +107,8 @@ Do not retain `beta_avg`, `beta_max`, `warmup_iters`, `use_moment_heads`,
 - Policy-cache rows normalize for every valid private row; target masks respect
   board/type masks.
 - All presets load under strict schema and contain no deferred settings.
+- The real sibling's `COMBO_CARDS` matches all 1326 local combo rows, and fake
+  boundary tests prove partition calls contain no removed query/seed keywords.
 - One-rank versus two-rank Kuhn curves both improve and have comparable final
   exploitability after sample-count scaling.
 - Profiling command records preflop/postflop batch histograms and GPU utilization

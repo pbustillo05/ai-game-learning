@@ -51,6 +51,7 @@ def _install_fake(
     package.__path__ = []  # type: ignore[attr-defined]
     facade = ModuleType("poker_gpu_evaluator.pbg")
     facade.API_VERSION = version  # type: ignore[attr-defined]
+    facade.COMBO_CARDS = torch.triu_indices(52, 52, offset=1).T.to(torch.uint8)  # type: ignore[attr-defined]
 
     def complete(**kwargs: Any) -> _CompletionResult:
         calls["complete"] = kwargs
@@ -316,3 +317,5 @@ def test_real_sibling_facade_version_when_installed() -> None:
         reason="poker_gpu_evaluator pbg-v2 facade is not installed",
     )
     assert facade.API_VERSION == "pbg-v2"
+    expected = torch.triu_indices(52, 52, offset=1).T.to(torch.uint8)
+    assert torch.equal(facade.COMBO_CARDS, expected)

@@ -11,10 +11,14 @@ This prompt is self-contained; prior prompt text is not required. Before
 editing: run `git status --short`; preserve unrelated changes; read
 `PREAMBLE.md`, `IMPLEMENTATION_NOTES.md`, `NOTATION.md`, `CONTRACTS.md`,
 `POKER_GPU_EVALUATOR_IO.md`, and the poker implementation notes at the end of
-`docs/latex/core_math.tex`; inspect the completed C08/C09 interfaces and all
-P02–P07 poker sources/tests. Run the CPU oracle and focused poker baselines
-first. Implement the backend, parity/device tests, and notes in this session,
-then run focused and full suites.
+`docs/latex/core_math.tex`; compare the binding contract with the shipped API
+in `../poker-gpu-evaluator/docs/api_pbg.md`; inspect the completed C08/C09
+interfaces and all P02–P07 poker sources/tests. The implemented 0.3.0+
+partition call has only `board_cards`, `range_weights`, `row_mask`,
+`field_order`, and `backend`; never pass the removed query or seed arguments.
+Run the CPU oracle and focused poker baselines first. Implement the backend,
+parity/device tests, and notes in this session, then run focused and full
+suites.
 
 ## Goal
 
@@ -91,7 +95,9 @@ and returns combo-indexed policy/value rows aligned to the input handles.
   model call per tree or node.
 - Preflop outputs are lifted to 1326 combo rows at this boundary.
 - Folded summaries, joint profiles and completion use only public sibling
-  facade tensors and preserve device/stream.
+  facade tensors and preserve device/stream. Use the existing facade adapter's
+  `COMBO_CARDS` compatibility check and exact evaluator 0.3.0+ partition
+  signature; do not duplicate either boundary in the rollout backend.
 
 Equal public labels may share immutable tensor payload indices, but their C09
 sampled-tree nodes and descendant RNG streams remain distinct.
@@ -111,6 +117,8 @@ sampled-tree nodes and descendant RNG streams remain distinct.
   street transition.
 - CUDA tests assert all outputs remain on device and sibling calls receive the
   original device tensors.
+- Fake-facade partition instrumentation rejects any obsolete
+  `query_card_sets`, `query_combo_ids`, or `seed` keyword.
 - AST/static scan rejects `.cpu()`, `.numpy()`, `.tolist()` and hot-path `.item()`.
 - Instrumented model records large preflop/postflop batch calls and no per-node
   forwards.

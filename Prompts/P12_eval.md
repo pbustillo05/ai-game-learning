@@ -11,10 +11,13 @@ This prompt is self-contained; prior prompt text is not required. Before
 editing: run `git status --short`; preserve unrelated changes; read
 `PREAMBLE.md`, `IMPLEMENTATION_NOTES.md`, `NOTATION.md`, and `CONTRACTS.md`;
 inspect the completed C11 bundle/checkpoint API, P01 exact tools, P07 poker
-adapter, evaluator facade contract, and existing evaluation stubs. Dependencies
-describe code already present, not prompt text to paste. Run focused baseline
-tests, then implement both evaluators, tests, and notes before focused and full
-suites.
+adapter, evaluator facade contract, the shipped sibling API documented in
+`../poker-gpu-evaluator/docs/api_pbg.md`, and existing evaluation stubs. The
+local contract already reflects evaluator package 0.3.0: `COMBO_CARDS` is
+public and the removed partition query/seed arguments must not be used.
+Dependencies describe code already present, not prompt text to paste. Run
+focused baseline tests, then implement both evaluators, tests, and notes before
+focused and full suites.
 
 ## Goal
 
@@ -61,7 +64,8 @@ not exist yet.
   GPU rollout backend or MC completion to play a hand.
 - Obtain private profiles through the sibling joint-profile API. Sample one
   full public runout uniformly from its complement and reuse it for the paired
-  replay.
+  replay. Rely on the existing adapter's all-1326-row `COMBO_CARDS` compatibility
+  check; do not construct an alternate evaluator combo map in arena code.
 - Rotate the singled-out seat `s` through every button-relative position. In
   replay AB, A occupies `s` and B every other seat; record A's payoff at `s`.
   In replay BA, B occupies `s` and A every other seat; record B's payoff at
@@ -89,6 +93,8 @@ not exist yet.
 - Chip conservation, seat rotation and per-seat report shapes hold.
 - Fake sibling facade proves every showdown crossed the public boundary and
   its stipulated stratum shares determined rewards.
+- Real-sibling boundary coverage confirms the defensive `COMBO_CARDS` export
+  agrees with local `hand_index`/`hand_cards` for all 1326 rows.
 
 Required commands:
 

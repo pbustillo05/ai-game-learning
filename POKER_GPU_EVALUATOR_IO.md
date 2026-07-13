@@ -1,8 +1,9 @@
 # `ai-game-learning` ↔ `poker-gpu-evaluator` IO contract
 
-**Status:** desired v2 integration contract. This document is the handoff to the
-maintainer of `../poker-gpu-evaluator`. It supersedes that repository's current
-API wherever current support APIs disagree with the four operations below.
+**Status:** implemented `pbg-v2` integration contract. This document mirrors the
+shipped facade documented by `../poker-gpu-evaluator/docs/api_pbg.md`. The
+evaluator document is authoritative for its implementation; this copy records
+the consumer-side ownership rules and adapter obligations.
 
 ## 1. Scope and ownership
 
@@ -37,6 +38,7 @@ installation is sufficient during development), exposing:
 ```python
 from poker_gpu_evaluator.pbg import (
     API_VERSION,
+    COMBO_CARDS,
     CompletionConfig,
     CompletionResult,
     JointProfileResult,
@@ -51,7 +53,9 @@ from poker_gpu_evaluator.pbg import (
 
 `API_VERSION` is the literal string `"pbg-v2"`. The local adapter checks it
 before its first production call and raises an actionable incompatibility
-error rather than attempting a legacy fallback.
+error rather than attempting a legacy fallback. It also compares the exported
+`COMBO_CARDS` against the local representation map before making a production
+call.
 
 Importing the package must not initialize CUDA or compile an extension. CUDA
 loading/JIT may happen on the first call with `backend="cuda"`.
@@ -81,9 +85,10 @@ for a in range(52):
         combo_id += 1
 ```
 
-This is the enumeration already used by `poker-gpu-evaluator`. The local
-`hand_index`/`hand_cards` implementation must be tested against the exported
-evaluator combo table for all 1326 rows.
+This is the enumeration used by `poker-gpu-evaluator`. `COMBO_CARDS` is a
+defensive copy of its frozen uint8 `[1326,2]` table. The local
+`hand_index`/`hand_cards` implementation is checked against that exported table
+for all 1326 rows.
 
 All tensors are `torch.Tensor`. Inputs must be contiguous. All tensor inputs in
 one call must be on one device, except `seed`, which may be CPU or on that same
@@ -260,10 +265,7 @@ def partition_many(
     board_cards: torch.Tensor,       # uint8 [B,5], 255 padded
     range_weights: torch.Tensor,     # float32 [B,S,1326]
     row_mask: torch.Tensor,          # bool [B,S]
-    query_card_sets: torch.Tensor | None = None,
-    query_combo_ids: torch.Tensor | None = None,
     field_order: int = 2,
-    seed: torch.Tensor | None = None,
     backend: str = "auto",
 ) -> PartitionSummaryResult: ...
 ```
@@ -279,8 +281,12 @@ may change `base_log_z` but not the ratio fields.
 This repository may cache, reshape, scatter, decompose, or learn projections of
 these returned tensors. It may not compute them from private-card collision
 rules, enumerate disjoint assignments, or provide a local mathematical oracle.
-Validation, device, seed, metadata, and CPU/CUDA conventions match the other
-facade operations.
+Validation, device, metadata, and CPU/CUDA conventions match the other facade
+operations. Partition summaries are deterministic and take no seed.
+
+The initial implementation accepted `query_card_sets`, `query_combo_ids`, and
+`seed` but ignored them. Those arguments are not part of the shipped signature
+and were removed in evaluator package 0.3.0. Consumers must not pass them.
 
 ## 5. Exact fixed-showdown API
 
@@ -400,23 +406,24 @@ It must:
 
 1. convert `-1` local board padding to evaluator `255` padding without changing
    real card ids;
-2. preserve or stably pack every dealt seat, including folded blocker rows, and
+2. verify `COMBO_CARDS` matches the local lexicographic combo representation;
+3. preserve or stably pack every dealt seat, including folded blocker rows, and
    scatter every dealt-seat output back to `P_max`;
-3. construct nested `stratum_players`, `payoff_baseline`, and
+4. construct nested `stratum_players`, `payoff_baseline`, and
    `stratum_amount` from `NLHEEngine` commitments/status;
-4. exponentiate local log-reach rows after subtracting each row maximum, pass
+5. exponentiate local log-reach rows after subtracting each row maximum, pass
    float32 unnormalized weights, and never normalize hypothesis-by-hypothesis;
-5. allocate one int64 seed per spot by consuming the supplied local
+6. allocate one int64 seed per spot by consuming the supplied local
    `torch.Generator`; no global RNG is used;
-6. map `CompletionResult` field-for-field into `BatchedCompletionStats`;
-7. map `JointProfileResult.combo_ids` into the PBG profile tensor, retaining
+7. map `CompletionResult` field-for-field into `BatchedCompletionStats`;
+8. map `JointProfileResult.combo_ids` into the PBG profile tensor, retaining
    sampled combos for folded dealt seats and keeping `-1` only for
    undealt/padded seats;
-8. carry `PartitionSummaryResult` fields into model DTOs without recomputing
+9. carry `PartitionSummaryResult` fields into model DTOs without recomputing
    poker quantities;
-9. pass all fixed-showdown eligibility strata in one facade call and map
+10. pass all fixed-showdown eligibility strata in one facade call and map
    `ShowdownResult` shares into affine local payoff assembly; and
-10. turn evaluator validation/degeneracy/failure into the local typed errors
+11. turn evaluator validation/degeneracy/failure into the local typed errors
    with batch indices and diagnostic context.
 
 The adapter must not import private modules such as
@@ -452,26 +459,15 @@ Before `poker_gpu` may be the shipped poker backend, CI must cover:
 - an end-to-end poker rollout/completion smoke in this repository using only
   the public `poker_gpu_evaluator.pbg` import.
 
-## 9. Differences from the sibling repository's current API
+## 9. Implemented facade notes
 
-As of the documents reviewed for this handoff, `range_equity_simulation`
-returns NumPy equity surfaces and reach marginals, while
-`sample_true_target(sample_mode="acting_hand")` returns only the actor's combo.
-Those APIs may remain for other consumers, but they are not sufficient here:
+The installable `poker_gpu_evaluator.pbg` facade now provides the four
+operations and result types above on CPU and CUDA. Legacy evaluator APIs are
+not integration surfaces for this repository. In particular, local code must
+not import private evaluator modules, use NumPy-returning range-equity helpers,
+or recover only an acting-hand marginal when a full joint profile is required.
 
-- completion needs device-native torch IO and all-player posterior/value
-  moments, especially `u_hat`;
-- payoff coefficients must be explicit so side-pot equity becomes the exact
-  chip payoff used by training;
-- branching needs the entire accepted joint profile, not one actor marginal;
-- rejection success and attempt counts are needed per requested profile; and
-- the existing `partition_many` operation needs the stable torch facade and
-  frozen result fields above;
-- the existing `batch_eval` fixed-hand implementations need one unified facade
-  that accepts eligibility strata and returns original-seat winner masks and
-  tie shares after ranking each hand once; and
-- this consumer needs a stable installable import surface, not `sys.path`
-  insertion of the sibling's `evaluator/` directory.
-
-The new `poker_gpu_evaluator.pbg` facade may reuse the existing CUDA kernels,
-but its public behavior is governed by this document.
+Evaluator package 0.3.0 removed the three formerly ignored partition arguments
+listed in §4 and added the defensive public `COMBO_CARDS` export. `API_VERSION`
+remains `"pbg-v2"`; therefore consumers must follow the exact shipped signature
+rather than infer optional arguments from the API-version string alone.

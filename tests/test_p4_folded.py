@@ -25,6 +25,7 @@ def _install_fake(monkeypatch: pytest.MonkeyPatch, *, version: str = "pbg-v2") -
     package.__path__ = []  # type: ignore[attr-defined]
     facade = ModuleType("poker_gpu_evaluator.pbg")
     facade.API_VERSION = version  # type: ignore[attr-defined]
+    facade.COMBO_CARDS = torch.triu_indices(52, 52, offset=1).T.to(torch.uint8)  # type: ignore[attr-defined]
     facade.PartitionSummaryResult = _FakeResult  # type: ignore[attr-defined]
 
     def partition_many(**kwargs: Any) -> _FakeResult:
@@ -53,7 +54,7 @@ def _install_fake(monkeypatch: pytest.MonkeyPatch, *, version: str = "pbg-v2") -
     return calls, _FakeResult
 
 
-def _inputs(device: torch.device | str = "cpu") -> tuple[torch.Tensor, torch.Tensor, Any, torch.Tensor]:
+def _inputs(device: torch.device | str = "cpu") -> tuple[torch.Tensor, torch.Tensor, Any]:
     from pbg.games.poker.folded import FoldSnapshotBatch
 
     board = torch.tensor(
@@ -79,8 +80,7 @@ def _inputs(device: torch.device | str = "cpu") -> tuple[torch.Tensor, torch.Ten
             [[True, False, True], [False, True, False]], dtype=torch.bool, device=device
         ),
     )
-    queries = torch.tensor([[1, 7], [10, -1]], dtype=torch.int32, device=device)
-    return board, live, folded, queries
+    return board, live, folded
 
 
 def test_import_is_lazy_and_exact_facade_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -90,13 +90,12 @@ def test_import_is_lazy_and_exact_facade_mapping(monkeypatch: pytest.MonkeyPatch
     assert "poker_gpu_evaluator" not in sys.modules
 
     calls, result_type = _install_fake(monkeypatch)
-    board, live, folded, queries = _inputs()
+    board, live, folded = _inputs()
     adapter = folded_module.PokerGPUPartitionAdapter()
     output = adapter.summarize(
         board_cards=board,
         live_range_weights=live,
         folded=folded,
-        query_combo_ids=queries.t().contiguous().t(),
     )
 
     sibling_result = calls.pop("_result")
@@ -104,7 +103,6 @@ def test_import_is_lazy_and_exact_facade_mapping(monkeypatch: pytest.MonkeyPatch
         "board_cards",
         "range_weights",
         "row_mask",
-        "query_combo_ids",
     }
     assert calls["board_cards"].dtype == torch.uint8
     assert calls["board_cards"].tolist() == [[0, 5, 9, 255, 255], [4, 8, 12, 16, 20]]
@@ -118,8 +116,6 @@ def test_import_is_lazy_and_exact_facade_mapping(monkeypatch: pytest.MonkeyPatch
         [True, True, False, True, False],
     ]
     assert calls["row_mask"].is_contiguous()
-    assert calls["query_combo_ids"].is_contiguous()
-
     assert isinstance(result_type(**{
         "base_log_z": output.fields["base_log_z"],
         "single_card_log_ratio": output.fields["single_card_log_ratio"],
@@ -148,13 +144,12 @@ def test_version_and_result_contract_errors(monkeypatch: pytest.MonkeyPatch) -> 
     _install_fake(monkeypatch, version="pbg-v1")
     from pbg.games.poker.folded import PokerGPUPartitionAdapter
 
-    board, live, folded, queries = _inputs()
+    board, live, folded = _inputs()
     with pytest.raises(RuntimeError, match="expected API_VERSION 'pbg-v2'"):
         PokerGPUPartitionAdapter().summarize(
             board_cards=board,
             live_range_weights=live,
             folded=folded,
-            query_combo_ids=queries,
         )
 
     calls, _ = _install_fake(monkeypatch)
@@ -176,7 +171,6 @@ def test_version_and_result_contract_errors(monkeypatch: pytest.MonkeyPatch) -> 
             board_cards=board,
             live_range_weights=live,
             folded=folded,
-            query_combo_ids=queries,
         )
 
 
@@ -184,11 +178,11 @@ def test_input_shape_dtype_device_contract(monkeypatch: pytest.MonkeyPatch) -> N
     _install_fake(monkeypatch)
     from pbg.games.poker.folded import FoldSnapshotBatch, PokerGPUPartitionAdapter
 
-    board, live, folded, queries = _inputs()
+    board, live, folded = _inputs()
     adapter = PokerGPUPartitionAdapter()
     with pytest.raises(ValueError, match=r"\[B,5\]"):
         adapter.summarize(
-            board_cards=board[:, :4], live_range_weights=live, folded=folded, query_combo_ids=queries
+            board_cards=board[:, :4], live_range_weights=live, folded=folded
         )
     wrong = FoldSnapshotBatch(
         folded.reach_weights,
@@ -198,14 +192,7 @@ def test_input_shape_dtype_device_contract(monkeypatch: pytest.MonkeyPatch) -> N
     )
     with pytest.raises(TypeError, match="board_at_fold"):
         adapter.summarize(
-            board_cards=board, live_range_weights=live, folded=wrong, query_combo_ids=queries
-        )
-    with pytest.raises(TypeError, match="query_combo_ids"):
-        adapter.summarize(
-            board_cards=board,
-            live_range_weights=live,
-            folded=folded,
-            query_combo_ids=queries.to(torch.int64),
+            board_cards=board, live_range_weights=live, folded=wrong
         )
 
 
@@ -214,7 +201,7 @@ def test_cuda_mapping_has_no_cpu_or_numpy_round_trip(monkeypatch: pytest.MonkeyP
     _install_fake(monkeypatch)
     from pbg.games.poker.folded import PokerGPUPartitionAdapter
 
-    board, live, folded, queries = _inputs("cuda")
+    board, live, folded = _inputs("cuda")
 
     def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("adapter attempted a host round trip")
@@ -225,7 +212,6 @@ def test_cuda_mapping_has_no_cpu_or_numpy_round_trip(monkeypatch: pytest.MonkeyP
         board_cards=board,
         live_range_weights=live,
         folded=folded,
-        query_combo_ids=queries,
     )
     assert all(value.device.type == "cuda" for value in output.fields.values())
 
@@ -254,3 +240,33 @@ def test_real_sibling_smoke() -> None:
     if facade.API_VERSION != "pbg-v2":
         pytest.skip("installed sibling does not expose the pbg-v2 facade")
     assert callable(facade.partition_many)
+    expected = torch.triu_indices(52, 52, offset=1).T.to(torch.uint8)
+    assert torch.equal(facade.COMBO_CARDS, expected)
+
+    from pbg.games.poker.folded import FoldSnapshotBatch, PokerGPUPartitionAdapter
+
+    folded = FoldSnapshotBatch(
+        reach_weights=torch.empty((1, 0, 1326), dtype=torch.float32),
+        board_at_fold=torch.empty((1, 0, 5), dtype=torch.uint8),
+        line_meta=torch.empty((1, 0, 0), dtype=torch.float32),
+        folder_mask=torch.empty((1, 0), dtype=torch.bool),
+    )
+    output = PokerGPUPartitionAdapter().summarize(
+        board_cards=torch.full((1, 5), -1, dtype=torch.int16),
+        live_range_weights=torch.ones((1, 1, 1326), dtype=torch.float32),
+        folded=folded,
+    )
+    assert output.fields["output_valid"].tolist() == [True]
+
+
+def test_incompatible_combo_table_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake(monkeypatch)
+    facade = sys.modules["poker_gpu_evaluator.pbg"]
+    facade.COMBO_CARDS[0] = torch.tensor([0, 2], dtype=torch.uint8)
+    from pbg.games.poker.folded import PokerGPUPartitionAdapter
+
+    board, live, folded = _inputs()
+    with pytest.raises(RuntimeError, match="COMBO_CARDS is incompatible"):
+        PokerGPUPartitionAdapter().summarize(
+            board_cards=board, live_range_weights=live, folded=folded
+        )

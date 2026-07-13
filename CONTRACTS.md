@@ -382,10 +382,12 @@ class PartitionSummaryBatch:
     fields: Mapping[str, Tensor]
     metadata: Mapping[str, object]
 class PokerGPUPartitionAdapter:
-    def summarize(self, board, reach_rows, folded_snapshots, queries) -> PartitionSummaryBatch: ...
+    def summarize(self, board, reach_rows, folded_snapshots) -> PartitionSummaryBatch: ...
 ```
 Acceptance: fake-facade field mapping, version/device/shape checks, and sibling
-integration tests. No local Φ/α/β/Λ implementation or Monte Carlo oracle is
+integration tests. The adapter verifies the facade's defensive `COMBO_CARDS`
+copy and calls the evaluator 0.3.0+ partition signature without the removed
+query/seed arguments. No local Φ/α/β/Λ implementation or Monte Carlo oracle is
 permitted.
 
 ### P5 — `games/poker/mc.py`

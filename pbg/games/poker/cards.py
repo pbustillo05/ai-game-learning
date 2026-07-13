@@ -47,6 +47,23 @@ def hand_cards(h: int) -> tuple[int, int]:
     return _HAND_CARDS[h]
 
 
+def validate_evaluator_combo_cards(combo_cards: Tensor) -> None:
+    """Require the sibling facade to use this repository's frozen combo map."""
+
+    if not isinstance(combo_cards, Tensor):
+        raise RuntimeError("poker_gpu_evaluator.pbg.COMBO_CARDS must be a torch.Tensor")
+    if combo_cards.shape != (N_HANDS, 2) or combo_cards.dtype != torch.uint8:
+        raise RuntimeError(
+            "poker_gpu_evaluator.pbg.COMBO_CARDS must be uint8 [1326,2]"
+        )
+    expected = torch.tensor(_HAND_CARDS, dtype=torch.uint8, device=combo_cards.device)
+    if not torch.equal(combo_cards, expected):
+        raise RuntimeError(
+            "poker_gpu_evaluator.pbg.COMBO_CARDS is incompatible with the local "
+            "lexicographic hand_index/hand_cards mapping"
+        )
+
+
 def _class_id(a: int, b: int) -> int:
     rank_a, suit_a = divmod(a, 4)
     rank_b, suit_b = divmod(b, 4)

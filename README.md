@@ -58,8 +58,10 @@
 - **D8.** All poker-private combinatorics use `poker_gpu_evaluator.pbg`:
   completion, exact joint profiles, partition/folded-card summaries, and exact
   fixed-showdown winner shares per pot stratum. There are no local poker
-  mathematical reference implementations. This repo retains public-tree
-  navigation, policies, pot amounts, and chip-EV assembly. (P00–P13.)
+  mathematical reference implementations. The shipped 0.3.0+ boundary exports
+  a defensive `COMBO_CARDS` table and its deterministic partition call has no
+  query or seed arguments. This repo retains public-tree navigation, policies,
+  pot amounts, and chip-EV assembly. (P00–P13.)
 
 If any delta is unwelcome, say so before its prompt runs; each is localized.
 

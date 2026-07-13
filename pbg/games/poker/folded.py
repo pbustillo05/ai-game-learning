@@ -13,6 +13,8 @@ from typing import Any, Callable
 import torch
 from torch import Tensor
 
+from pbg.games.poker.cards import validate_evaluator_combo_cards
+
 
 N_CARDS = 52
 N_COMBOS = 1326
@@ -63,6 +65,7 @@ class PokerGPUPartitionAdapter:
         try:
             from poker_gpu_evaluator.pbg import (
                 API_VERSION,
+                COMBO_CARDS,
                 PartitionSummaryResult,
                 partition_many,
             )
@@ -76,6 +79,7 @@ class PokerGPUPartitionAdapter:
                 "incompatible poker_gpu_evaluator facade: expected API_VERSION "
                 f"{EXPECTED_API_VERSION!r}, got {API_VERSION!r}; update the sibling package"
             )
+        validate_evaluator_combo_cards(COMBO_CARDS)
         self._partition_many = partition_many
         self._result_type = PartitionSummaryResult
         return partition_many, PartitionSummaryResult
@@ -112,7 +116,6 @@ class PokerGPUPartitionAdapter:
         board_cards: Tensor,
         live_range_weights: Tensor,
         folded: FoldSnapshotBatch,
-        query_combo_ids: Tensor | None,
     ) -> None:
         if not isinstance(live_range_weights, Tensor):
             raise TypeError("live_range_weights must be a torch.Tensor")
@@ -158,18 +161,6 @@ class PokerGPUPartitionAdapter:
         if any(tensor.device != board_cards.device for tensor in tensors):
             raise ValueError("all input tensors must be on the same device")
 
-        if query_combo_ids is not None:
-            if not isinstance(query_combo_ids, Tensor):
-                raise TypeError("query_combo_ids must be a torch.Tensor or None")
-            if query_combo_ids.dtype != torch.int32:
-                raise TypeError("query_combo_ids must have dtype torch.int32")
-            if query_combo_ids.ndim not in (1, 2):
-                raise ValueError("query_combo_ids must have shape [Q] or [B,Q]")
-            if query_combo_ids.ndim == 2 and query_combo_ids.shape[0] != batch_size:
-                raise ValueError("query_combo_ids must have shape [Q] or [B,Q]")
-            if query_combo_ids.device != board_cards.device:
-                raise ValueError("query_combo_ids and other inputs must share a device")
-
     @staticmethod
     def _validate_result(result: Any, result_type: type[Any], batch_size: int, device: torch.device) -> None:
         if not isinstance(result, result_type):
@@ -214,21 +205,17 @@ class PokerGPUPartitionAdapter:
         board_cards: Tensor,
         live_range_weights: Tensor,
         folded: FoldSnapshotBatch,
-        query_combo_ids: Tensor | None,
     ) -> PartitionSummaryBatch:
         """Return evaluator summaries for a batch of public spots.
 
         ``board_cards`` is integer ``[B,5]`` with local -1 or boundary 255
         padding. ``live_range_weights`` is float32 ``[B,L,1326]``. Fold inputs
-        have the shapes documented by :class:`FoldSnapshotBatch`, and optional
-        ``query_combo_ids`` is int32 ``[B,Q]`` or broadcastable ``[Q]``.
+        have the shapes documented by :class:`FoldSnapshotBatch`.
         Returned fields have shapes documented by :class:`PartitionSummaryBatch`.
         """
 
         boundary_board = self._normalize_board(board_cards)  # [B,5]
-        self._validate_inputs(
-            boundary_board, live_range_weights, folded, query_combo_ids
-        )
+        self._validate_inputs(boundary_board, live_range_weights, folded)
         partition_many, result_type = self._load_facade()
 
         range_weights = torch.cat(
@@ -240,12 +227,10 @@ class PokerGPUPartitionAdapter:
         row_mask = torch.cat(
             (live_mask, folded.folder_mask), dim=1
         ).contiguous()  # [B,S]
-        queries = query_combo_ids.contiguous() if query_combo_ids is not None else None
         result = partition_many(
             board_cards=boundary_board,
             range_weights=range_weights,
             row_mask=row_mask,
-            query_combo_ids=queries,
         )
         batch_size = boundary_board.shape[0]
         self._validate_result(result, result_type, batch_size, boundary_board.device)

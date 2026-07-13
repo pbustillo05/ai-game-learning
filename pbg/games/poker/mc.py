@@ -15,6 +15,7 @@ import torch
 from torch import Tensor
 
 from pbg.core.completion import BatchedCompletionStats, ReachView
+from pbg.games.poker.cards import validate_evaluator_combo_cards
 from pbg.games.poker.engine import FOLDED, NLHEEngine
 
 N_COMBOS = 1326
@@ -72,6 +73,7 @@ def _load_operation(name: str) -> Callable[..., Any]:
     try:
         facade = importlib.import_module("poker_gpu_evaluator.pbg")
         api_version = facade.API_VERSION
+        combo_cards = facade.COMBO_CARDS
         operation = getattr(facade, name)
     except (ImportError, ModuleNotFoundError, AttributeError) as exc:
         raise RuntimeError(
@@ -83,6 +85,7 @@ def _load_operation(name: str) -> Callable[..., Any]:
             "incompatible poker_gpu_evaluator facade: expected API_VERSION "
             f"{EXPECTED_API_VERSION!r}, got {api_version!r}; update the sibling package"
         )
+    validate_evaluator_combo_cards(combo_cards)
     return operation
 
 
