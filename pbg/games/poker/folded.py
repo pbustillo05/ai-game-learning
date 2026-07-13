@@ -36,6 +36,7 @@ class FoldSnapshotBatch:
     board_at_fold: Tensor
     line_meta: Tensor
     folder_mask: Tensor
+    seat_ids: Tensor | None = None
 
 
 @dataclass
@@ -123,13 +124,17 @@ class PokerGPUPartitionAdapter:
             raise ValueError("live_range_weights must have shape [B,L,1326]")
         if live_range_weights.dtype != torch.float32:
             raise TypeError("live_range_weights must have dtype torch.float32")
-        if not isinstance(folded, FoldSnapshotBatch):
-            raise TypeError("folded must be a FoldSnapshotBatch")
+        if not all(
+            hasattr(folded, name)
+            for name in ("reach_weights", "board_at_fold", "line_meta", "folder_mask")
+        ):
+            raise TypeError("folded must provide the FoldSnapshotBatch fields")
 
         reach = folded.reach_weights
         fold_board = folded.board_at_fold
         line_meta = folded.line_meta
         mask = folded.folder_mask
+        seat_ids = folded.seat_ids
         if reach.ndim != 3 or reach.shape[2] != N_COMBOS:
             raise ValueError("folded.reach_weights must have shape [B,F,1326]")
         batch_size, n_folders = reach.shape[:2]
@@ -154,12 +159,19 @@ class PokerGPUPartitionAdapter:
             raise ValueError("folded.folder_mask must have shape [B,F]")
         if mask.dtype != torch.bool:
             raise TypeError("folded.folder_mask must have dtype torch.bool")
+        if seat_ids is not None:
+            if seat_ids.shape != (batch_size, n_folders) or seat_ids.dtype not in (
+                torch.int32, torch.int64
+            ):
+                raise TypeError("folded.seat_ids must be integer [B,F]")
 
         if board_cards.shape[0] != batch_size or live_range_weights.shape[0] != batch_size:
             raise ValueError("all inputs must have the same B dimension")
         tensors = (live_range_weights, reach, fold_board, line_meta, mask)
         if any(tensor.device != board_cards.device for tensor in tensors):
             raise ValueError("all input tensors must be on the same device")
+        if seat_ids is not None and seat_ids.device != board_cards.device:
+            raise ValueError("folded.seat_ids is on the wrong device")
 
     @staticmethod
     def _validate_result(result: Any, result_type: type[Any], batch_size: int, device: torch.device) -> None:
@@ -216,29 +228,102 @@ class PokerGPUPartitionAdapter:
 
         boundary_board = self._normalize_board(board_cards)  # [B,5]
         self._validate_inputs(boundary_board, live_range_weights, folded)
-        partition_many, result_type = self._load_facade()
+        batch_size = boundary_board.shape[0]
+        # The correction is the folded subsystem integrated out. Live ranges are accepted
+        # only because they remain part of the versioned call-site contract;
+        # including them in the neutral partition law would double-count live
+        # collision geometry and produce a non-neutral correction with K=0.
+        if folded.reach_weights.shape[1] == 0 or not bool(folded.folder_mask.any()):
+            zeros = torch.zeros(
+                (batch_size,), dtype=torch.float32, device=boundary_board.device
+            )
+            return PartitionSummaryBatch(
+                fields={
+                    "base_log_z": zeros,
+                    "single_card_log_ratio": torch.zeros(
+                        (batch_size, N_CARDS),
+                        dtype=torch.float32,
+                        device=boundary_board.device,
+                    ),
+                    "pair_card_log_ratio": torch.zeros(
+                        (batch_size, N_CARDS, N_CARDS),
+                        dtype=torch.float32,
+                        device=boundary_board.device,
+                    ),
+                    "output_valid": torch.ones(
+                        (batch_size,), dtype=torch.bool, device=boundary_board.device
+                    ),
+                },
+                metadata={"api_version": EXPECTED_API_VERSION, "neutral_no_folders": True},
+            )
 
-        range_weights = torch.cat(
-            (live_range_weights, folded.reach_weights), dim=1
-        ).contiguous()  # [B,S,1326]
-        live_mask = torch.ones(
-            live_range_weights.shape[:2], dtype=torch.bool, device=boundary_board.device
-        )  # [B,L]
-        row_mask = torch.cat(
-            (live_mask, folded.folder_mask), dim=1
-        ).contiguous()  # [B,S]
+        partition_many, result_type = self._load_facade()
+        range_weights = folded.reach_weights.contiguous()  # [B,F,1326]
+        row_mask = folded.folder_mask.contiguous()  # [B,F]
         result = partition_many(
             board_cards=boundary_board,
             range_weights=range_weights,
             row_mask=row_mask,
         )
-        batch_size = boundary_board.shape[0]
         self._validate_result(result, result_type, batch_size, boundary_board.device)
+
+        n_folders = folded.reach_weights.shape[1]
+        folder_base = torch.zeros(
+            (batch_size, n_folders), dtype=torch.float32, device=boundary_board.device
+        )
+        folder_single = torch.zeros(
+            (batch_size, n_folders, N_CARDS),
+            dtype=torch.float32,
+            device=boundary_board.device,
+        )
+        folder_pair = torch.zeros(
+            (batch_size, n_folders, N_CARDS, N_CARDS),
+            dtype=torch.float32,
+            device=boundary_board.device,
+        )
+        folder_valid = torch.zeros(
+            (batch_size, n_folders), dtype=torch.bool, device=boundary_board.device
+        )
+        active = folded.folder_mask.nonzero(as_tuple=False)
+        if active.numel():
+            active_board = boundary_board[active[:, 0]].contiguous()
+            active_range = folded.reach_weights[
+                active[:, 0], active[:, 1]
+            ][:, None, :].contiguous()
+            active_mask = torch.ones(
+                (active.shape[0], 1), dtype=torch.bool, device=boundary_board.device
+            )
+            per_folder = partition_many(
+                board_cards=active_board,
+                range_weights=active_range,
+                row_mask=active_mask,
+            )
+            self._validate_result(
+                per_folder, result_type, active.shape[0], boundary_board.device
+            )
+            folder_base[active[:, 0], active[:, 1]] = per_folder.base_log_z
+            folder_single[active[:, 0], active[:, 1]] = per_folder.single_card_log_ratio
+            folder_valid[active[:, 0], active[:, 1]] = per_folder.output_valid
+            if per_folder.pair_card_log_ratio is not None:
+                folder_pair[active[:, 0], active[:, 1]] = per_folder.pair_card_log_ratio
 
         fields = {
             "base_log_z": result.base_log_z,
             "single_card_log_ratio": result.single_card_log_ratio,
             "output_valid": result.output_valid,
+            "folder_log_mass": folder_base,
+            "folder_single_card_log_ratio": folder_single,
+            "folder_pair_card_log_ratio": folder_pair,
+            "folder_output_valid": folder_valid,
+            "folder_mask": folded.folder_mask,
+            "folder_line_meta": folded.line_meta,
+            "folder_seat": (
+                folded.seat_ids
+                if folded.seat_ids is not None
+                else torch.arange(n_folders, device=boundary_board.device)[None].expand(
+                    batch_size, -1
+                )
+            ),
         }
         if result.pair_card_log_ratio is not None:
             fields["pair_card_log_ratio"] = result.pair_card_log_ratio

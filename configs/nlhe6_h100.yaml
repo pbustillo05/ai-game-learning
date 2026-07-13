@@ -8,9 +8,8 @@ game:
     bb: 1.0
     n_ticks: 32
 rollout:
-  n_trees: 256  # TUNE: per rank for one H100
-  beta_mode: fixed
-  beta_fix:
+  n_trees: 8  # Safe bootstrap per rank; increase only after measured memory profiling.
+  beta:
     default: 1.0
     preflop: 1.0
     flop: 1.05
@@ -19,10 +18,10 @@ rollout:
     chance_to_flop: 1.5
     chance_to_turn: 1.5
     chance_to_river: 1.5
-  node_budget: 8192
+  node_budget: 512
   reach_storage: recompute
 completion:
-  n_samples: 2048  # TUNE: one H100
+  n_samples: 256  # Safe bootstrap; tune after evaluator-memory measurement.
   backend: cuda
 model:
   d_model: 192  # TUNE: one H100
@@ -32,10 +31,11 @@ model:
   m_raise: 4
   k_act: 7
   max_players: 6
-train:
+training:
+  mode: branched_rao_blackwell
   iters: 10000
   gd_steps_per_iter: 32
-  minibatch_size: 128  # TUNE: one H100
+  minibatch_size: 2  # Legacy combined preset; use configs/train/nlhe6.yaml + hardware profile.
   lr: 0.0003
   adam_betas: [0.9, 0.999]
   grad_clip: 1.0

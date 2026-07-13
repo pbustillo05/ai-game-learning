@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -11,6 +12,7 @@ from pbg.core.completion import BatchedCompletionStats
 from pbg.core.config import RootConfig
 from pbg.core.game import PRETERM, GameBundle
 from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
+from pbg.games.poker.cards import N_HANDS
 from pbg.games.poker.engine import PokerConfig
 from pbg.games.poker.folded import PokerGPUPartitionAdapter
 from pbg.games.poker.mc import (
@@ -21,7 +23,84 @@ from pbg.games.poker.mc import (
 )
 from pbg.games.poker.model.postflop import PostflopNet
 from pbg.games.poker.model.preflop import PokerModelConfig, PreflopNet
+from pbg.games.poker.model.primitives import MHA
 from pbg.games.poker.rollout_backend import PokerRolloutBackend
+from pbg.games.poker.tensor_state import PokerTensorStateStore
+
+
+@dataclass(frozen=True)
+class PokerRolloutMemoryPlan:
+    """Conservative byte plan for persistent and peak rollout allocations."""
+
+    capacity: int
+    state_bytes: int
+    tree_bytes: int
+    reach_cache_bytes: int
+    frontier_reach_bytes: int
+    policy_cache_bytes: int
+
+    @property
+    def peak_bytes(self) -> int:
+        return sum(
+            (
+                self.state_bytes,
+                self.tree_bytes,
+                self.reach_cache_bytes,
+                self.frontier_reach_bytes,
+                self.policy_cache_bytes,
+            )
+        )
+
+
+def estimate_rollout_memory(
+    *, n_trees: int, node_budget: int, n_players: int, reach_storage: str
+) -> PokerRolloutMemoryPlan:
+    """Estimate worst-case rollout bytes before allocating a poker backend.
+
+    The estimate intentionally counts two capacity-sized reach frontiers: a
+    branched wave can retain the active rows while constructing its successors.
+    It excludes model, completion, optimizer, and autograd allocations, so the
+    CUDA preflight leaves half of currently free device memory for those phases.
+    """
+
+    if reach_storage not in {"full", "decisions_only", "recompute"}:
+        raise ValueError("unknown reach storage mode")
+    if n_trees < 0 or node_budget <= 0 or n_players <= 0:
+        raise ValueError("invalid rollout memory-plan dimensions")
+    capacity = n_trees * node_budget
+    edge_capacity = capacity - n_trees
+    node_bytes = capacity * (6 * 4 + n_players * 4)
+    edge_bytes = edge_capacity * 4 * 4
+    reach_row_bytes = n_players * N_HANDS * 4
+    reach_cache = (
+        n_trees if reach_storage == "recompute" else capacity
+    ) * reach_row_bytes
+    return PokerRolloutMemoryPlan(
+        capacity=capacity,
+        state_bytes=PokerTensorStateStore.storage_nbytes(capacity, n_players),
+        tree_bytes=node_bytes + edge_bytes,
+        reach_cache_bytes=reach_cache,
+        frontier_reach_bytes=2 * capacity * reach_row_bytes,
+        # Selected policy likelihoods and values are retained only for realized
+        # player edges/nodes, but this remains a safe capacity bound.
+        policy_cache_bytes=(edge_capacity + capacity) * N_HANDS * 4,
+    )
+
+
+def _preflight_cuda_rollout(plan: PokerRolloutMemoryPlan, device: torch.device) -> None:
+    """Reject a rollout plan that would crowd out model/optimizer allocations."""
+
+    if device.type != "cuda":
+        return
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    if plan.peak_bytes > free_bytes // 2:
+        gib = 1024**3
+        raise MemoryError(
+            "poker rollout plan requires "
+            f"{plan.peak_bytes / gib:.2f} GiB, exceeding half of the currently free "
+            f"{free_bytes / gib:.2f} GiB on {device} (total {total_bytes / gib:.2f} GiB); "
+            "reduce rollout.n_trees/node_budget or use a smaller storage plan"
+        )
 
 
 def _reach_rows(reach: Any) -> Tensor:
@@ -152,20 +231,38 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     if model_cfg.max_players < engine_cfg.n_players:
         raise ValueError("model.max_players must cover every configured poker seat")
     model = PokerModelBundle(PreflopNet(model_cfg), PostflopNet(model_cfg)).to(device)
+    if cfg.hardware is not None:
+        for module in model.modules():
+            if isinstance(module, MHA):
+                module.configure_execution(
+                    cfg.hardware.attention_backend, cfg.hardware.query_chunk_size
+                )
     adapter = PokerPolicyAdapter(engine_cfg.n_ticks)
     profiles = PokerGPURejectionSampler(backend=cfg.completion.backend)
     partition = PokerGPUPartitionAdapter()
-    capacity = cfg.rollout.n_trees * cfg.rollout.node_budget
+    plan = estimate_rollout_memory(
+        n_trees=cfg.rollout.n_trees,
+        node_budget=cfg.rollout.node_budget,
+        n_players=engine_cfg.n_players,
+        reach_storage=cfg.rollout.reach_storage,
+    )
+    _preflight_cuda_rollout(plan, device)
     backend = PokerRolloutBackend(
         engine_cfg,
-        capacity,
+        plan.capacity,
         device,
         beta_fix=cfg.rollout.beta_fix,
         profile_sampler=profiles,
         partition_adapter=partition,
         evaluator_backend=cfg.completion.backend,
     )
-    completion = _TensorPokerGPUCompletion(backend=cfg.completion.backend)
+    backend.execution_profile = cfg.hardware
+    backend.rollout_memory_plan = plan
+    completion = (
+        None
+        if cfg.training.mode == "normal"
+        else _TensorPokerGPUCompletion(backend=cfg.completion.backend)
+    )
     return GameBundle(
         model=model,
         rollout_backend=backend,

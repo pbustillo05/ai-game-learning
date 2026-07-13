@@ -8,8 +8,9 @@ from typing import Any, Mapping
 import torch
 from torch import Tensor, nn
 
-from pbg.games.poker.cards import N_CLASSES, class_size
+from pbg.games.poker.cards import N_CLASSES, class_of_hand, class_size
 from pbg.games.poker.model.heads import MomentHeads, RaiseMixtureHead, TypeHead, ValueHead
+from pbg.games.poker.model.incidence import IncidenceResidual
 from pbg.games.poker.model.primitives import FFN, LN, MHA
 
 
@@ -30,6 +31,9 @@ class PokerModelConfig:
     evaluator_summary_dim: int = 0
     ffn_hidden: int | None = None
     use_moment_heads: bool = False
+    max_history_tokens: int = 256
+    folder_beta_rank: int = 16
+    folder_line_dim: int = 8
     eps: float = 1e-8
 
     def __post_init__(self) -> None:
@@ -47,6 +51,12 @@ class PokerModelConfig:
             raise ValueError("embedding dimensions are invalid")
         if self.ffn_hidden is not None and self.ffn_hidden <= 0:
             raise ValueError("ffn_hidden must be positive when supplied")
+        if self.max_history_tokens <= 0:
+            raise ValueError("max_history_tokens must be positive")
+        if not 0 <= self.folder_beta_rank <= 52:
+            raise ValueError("folder_beta_rank must be in [0,52]")
+        if self.folder_line_dim <= 0:
+            raise ValueError("folder_line_dim must be positive")
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any] | None) -> PokerModelConfig:
@@ -62,6 +72,28 @@ class PokerModelConfig:
         if unknown:
             raise ValueError(f"unknown poker model configuration key: {unknown[0]}")
         return cls(**data)
+
+
+@dataclass
+class PackedPublicHistory:
+    """Lossless padded public trajectory consumed by both poker networks.
+
+    Every field has shape ``[B,T]``. ``action`` uses ``0=fold``,
+    ``1=check/call``, ``2=raise``, and ``3=street separator``. ``amount`` is
+    the chips called for check/call and the exact raise-to amount for raises.
+    The remaining floating-point fields record the pre-action arithmetic.
+    """
+
+    actor: Tensor
+    street: Tensor
+    action: Tensor
+    amount: Tensor
+    pot_before: Tensor
+    call_amount: Tensor
+    current_bet: Tensor
+    min_raise_to: Tensor
+    max_raise_to: Tensor
+    mask: Tensor
 
 
 @dataclass
@@ -89,6 +121,15 @@ class PokerPublicBatch:
     status: Tensor | None = None
     seat_mask: Tensor | None = None
     button: Tensor | None = None
+    committed_street: Tensor | None = None
+    call_amount: Tensor | None = None
+    current_bet: Tensor | None = None
+    min_raise_to: Tensor | None = None
+    max_raise_to: Tensor | None = None
+    last_full_raise: Tensor | None = None
+    legal_action_mask: Tensor | None = None
+    raise_ticks: Tensor | None = None
+    history: PackedPublicHistory | None = None
 
 
 @dataclass
@@ -134,12 +175,17 @@ class PreflopNet(nn.Module):
         dc = c.class_embedding_dim
 
         self.class_embedding = nn.Embedding(N_CLASSES, dc)
-        self.class_row_affine = nn.Linear(dc + 4, d)
+        class_geometry_dim = 54
+        self.class_row_affine = nn.Linear(dc + 4 + class_geometry_dim, d)
         self.seat_embedding = nn.Embedding(c.max_players, d)
         self.status_embedding = nn.Embedding(3, d)
         self.actor_embedding = nn.Embedding(2, d)
         self.public_scalar_affine = nn.Linear(1, d)
-        self.public_type_embedding = nn.Embedding(6, d)
+        self.public_type_embedding = nn.Embedding(10, d)
+        self.history_numeric_affine = nn.Linear(6, d)
+        self.history_action_embedding = nn.Embedding(4, d)
+        self.history_street_embedding = nn.Embedding(4, d)
+        self.history_position_embedding = nn.Embedding(c.max_history_tokens, d)
         self.state_token = nn.Parameter(torch.zeros(d))
         self.anchor_tokens = nn.Parameter(torch.empty(c.k_act, d))
         self.anchor_seat_embedding = nn.Embedding(c.max_players, d)
@@ -148,9 +194,13 @@ class PreflopNet(nn.Module):
         self.summary_projection = (
             nn.Linear(c.evaluator_summary_dim, dc) if c.evaluator_summary_dim else None
         )
-        side_dim = dc + 2 + (dc if c.evaluator_summary_dim else 0)
+        static_side_dim = dc + 2 + class_geometry_dim + (dc if c.evaluator_summary_dim else 0)
+        side_dim = static_side_dim + 3 * d
         self.layer_norms = nn.ModuleList(LN(d) for _ in range(c.n_layers_pre))
         self.attentions = nn.ModuleList(MHA(d, c.n_heads) for _ in range(c.n_layers_pre))
+        self.incidence_residuals = nn.ModuleList(
+            IncidenceResidual(d) for _ in range(c.n_layers_pre)
+        )
         self.layer_ffns = nn.ModuleList(
             FFN(d + side_dim, d, c.ffn_hidden) for _ in range(c.n_layers_pre)
         )
@@ -169,6 +219,24 @@ class PreflopNet(nn.Module):
 
         sizes = torch.tensor([class_size(k) for k in range(N_CLASSES)], dtype=torch.float32)
         self.register_buffer("class_sizes", sizes, persistent=True)
+        combo_cards = torch.triu_indices(52, 52, offset=1).T
+        combo_class = torch.tensor(
+            [class_of_hand(hand) for hand in range(combo_cards.shape[0])], dtype=torch.long
+        )
+        orbit = torch.zeros((N_CLASSES, 52), dtype=torch.float32)
+        orbit.index_put_(
+            (combo_class[:, None].expand(-1, 2).reshape(-1), combo_cards.reshape(-1)),
+            torch.ones(combo_cards.numel(), dtype=torch.float32),
+            accumulate=True,
+        )
+        orbit = orbit / sizes[:, None]
+        overlap = orbit @ orbit.T
+        within = overlap.diagonal()
+        cross = (overlap.sum(1) - within) / (N_CLASSES - 1)
+        self.register_buffer("class_card_geometry", orbit, persistent=True)
+        self.register_buffer(
+            "class_overlap_scalars", torch.stack((within, cross), dim=1), persistent=True
+        )
 
     def _validate_public(self, pub: PokerPublicBatch, class_ranges: Tensor) -> tuple[int, int]:
         if class_ranges.ndim != 3 or class_ranges.shape[-1] != N_CLASSES:
@@ -190,6 +258,33 @@ class PreflopNet(nn.Module):
             raise ValueError("pub.board must have shape [B,5]")
         if pub.legality_summary.ndim != 2 or pub.legality_summary.shape[0] != batch:
             raise ValueError("pub.legality_summary must have shape [B,L]")
+        optional_shapes = {
+            "committed_street": (batch, players),
+            "call_amount": (batch,),
+            "current_bet": (batch,),
+            "min_raise_to": (batch,),
+            "max_raise_to": (batch,),
+            "last_full_raise": (batch,),
+        }
+        for name, shape in optional_shapes.items():
+            value = getattr(pub, name)
+            if value is not None and value.shape != shape:
+                raise ValueError(f"pub.{name} must have shape {shape}")
+        if pub.legal_action_mask is not None:
+            if pub.legal_action_mask.ndim != 2 or pub.legal_action_mask.shape[0] != batch:
+                raise ValueError("pub.legal_action_mask must have shape [B,E]")
+        if pub.raise_ticks is not None:
+            if pub.raise_ticks.ndim != 2 or pub.raise_ticks.shape[0] != batch:
+                raise ValueError("pub.raise_ticks must have shape [B,N]")
+        if pub.history is not None:
+            history_shape = pub.history.mask.shape
+            for name in pub.history.__dataclass_fields__:
+                if getattr(pub.history, name).shape != history_shape:
+                    raise ValueError("every public-history field must have shape [B,T]")
+            if history_shape[0] != batch or pub.history.mask.dtype != torch.bool:
+                raise TypeError("public history mask must be bool [B,T]")
+            if history_shape[1] > self.cfg.max_history_tokens:
+                raise ValueError("public history exceeds max_history_tokens")
         tensors = (
             pub.street, pub.board, pub.pot, pub.stacks, pub.committed, pub.to_act,
             pub.legality_summary, pub.n_ticks, pub.raise_grid_bounds, class_ranges,
@@ -284,32 +379,72 @@ class PreflopNet(nn.Module):
         batch, players = seat_mask.shape
         dtype = pub.pot.dtype
         device = pub.pot.device
-        scalar_groups = (
+        scalar_groups = [
             pub.pot[:, None], pub.stacks, pub.committed,
             pub.street.to(dtype)[:, None], pub.legality_summary.to(dtype),
             torch.cat((pub.n_ticks.to(dtype)[:, None], pub.raise_grid_bounds.to(dtype)), dim=1),
-        )
-        scalars = torch.cat(scalar_groups, dim=1)
-        type_ids = torch.cat(
-            (
-                torch.zeros(1, dtype=torch.long, device=device),
-                torch.ones(players, dtype=torch.long, device=device),
-                torch.full((players,), 2, dtype=torch.long, device=device),
-                torch.full((1,), 3, dtype=torch.long, device=device),
-                torch.full((pub.legality_summary.shape[1],), 4, dtype=torch.long, device=device),
-                torch.full((3,), 5, dtype=torch.long, device=device),
+        ]
+        type_groups = [
+            (1, 0), (players, 1), (players, 2), (1, 3),
+            (pub.legality_summary.shape[1], 4), (3, 5),
+        ]
+        if pub.committed_street is not None:
+            scalar_groups.append(pub.committed_street.to(dtype))
+            type_groups.append((players, 6))
+        exact = [
+            value.to(dtype)[:, None]
+            for value in (
+                pub.call_amount, pub.current_bet, pub.min_raise_to,
+                pub.max_raise_to, pub.last_full_raise,
             )
-        )
+            if value is not None
+        ]
+        if exact:
+            scalar_groups.append(torch.cat(exact, dim=1))
+            type_groups.append((len(exact), 7))
+        if pub.legal_action_mask is not None:
+            scalar_groups.append(pub.legal_action_mask.to(dtype))
+            type_groups.append((pub.legal_action_mask.shape[1], 8))
+        if pub.raise_ticks is not None:
+            scalar_groups.append(pub.raise_ticks.to(dtype))
+            type_groups.append((pub.raise_ticks.shape[1], 9))
+        scalars = torch.cat(scalar_groups, dim=1)
+        type_ids = torch.cat([
+            torch.full((count,), kind, dtype=torch.long, device=device)
+            for count, kind in type_groups
+        ])
         token = self.public_scalar_affine(scalars[..., None]) + self.public_type_embedding(type_ids)[None, :, :]
         seat_position = self.seat_embedding(relative_seats)
         token[:, 1 : 1 + players] = token[:, 1 : 1 + players] + seat_position
         token[:, 1 + players : 1 + 2 * players] = token[:, 1 + players : 1 + 2 * players] + seat_position
-        valid = torch.cat(
-            (
-                torch.ones((batch, 1), dtype=torch.bool, device=device), seat_mask, seat_mask,
-                torch.ones((batch, 1 + pub.legality_summary.shape[1] + 3), dtype=torch.bool, device=device),
-            ), dim=1,
-        )
+        valid = torch.ones(scalars.shape, dtype=torch.bool, device=device)
+        valid[:, 1 : 1 + players] = seat_mask
+        valid[:, 1 + players : 1 + 2 * players] = seat_mask
+        if pub.history is not None and pub.history.mask.shape[1]:
+            history = pub.history
+            numeric = torch.stack(
+                (
+                    history.amount, history.pot_before, history.call_amount,
+                    history.current_bet, history.min_raise_to, history.max_raise_to,
+                ),
+                dim=-1,
+            ).to(dtype)
+            history_token = self.history_numeric_affine(numeric)
+            history_token = history_token + self.history_action_embedding(
+                history.action.clamp(0, 3).long()
+            )
+            history_token = history_token + self.history_street_embedding(
+                history.street.clamp(0, 3).long()
+            )
+            history_token = history_token + self.history_position_embedding(
+                torch.arange(history.mask.shape[1], device=device)
+            )[None]
+            safe_actor = history.actor.clamp(0, players - 1).long()
+            history_token = history_token + self.seat_embedding(
+                relative_seats.gather(1, safe_actor)
+            ) * (history.actor >= 0)[..., None]
+            token = torch.cat((token, history_token), dim=1)
+            valid = torch.cat((valid, history.mask), dim=1)
         public_mean = (token * valid[..., None]).sum(dim=1) / valid.sum(dim=1, keepdim=True)
         state = self.state_token[None, :] + public_mean
         return torch.cat((token, state[:, None, :]), dim=1), torch.cat(
@@ -348,10 +483,21 @@ class PreflopNet(nn.Module):
         expanded_emb = class_emb[:, None, :, :].expand(-1, players, -1, -1)
         sizes = self.class_sizes[class_ids].to(class_ranges.dtype) / 12.0
         size_feature = sizes[:, None, :].expand(-1, players, -1)
+        geometry = torch.cat(
+            (
+                self.class_card_geometry[class_ids],
+                self.class_overlap_scalars[class_ids],
+            ),
+            dim=-1,
+        ).to(class_ranges.dtype)
+        expanded_geometry = geometry[:, None].expand(-1, players, -1, -1)
         log_range = torch.log(class_ranges.clamp_min(c.eps))
         constant = torch.ones_like(class_ranges)
         row_feature = torch.cat(
-            (class_ranges[..., None], log_range[..., None], size_feature[..., None], expanded_emb, constant[..., None]),
+            (
+                class_ranges[..., None], log_range[..., None], size_feature[..., None],
+                expanded_emb, expanded_geometry, constant[..., None],
+            ),
             dim=-1,
         )
         row = self.class_row_affine(row_feature)
@@ -377,21 +523,43 @@ class PreflopNet(nn.Module):
             batch, players * N_CLASSES
         ).float()
 
-        side_class = torch.cat((expanded_emb, class_ranges[..., None], log_range[..., None]), dim=-1)
+        side_class = torch.cat(
+            (expanded_emb, class_ranges[..., None], log_range[..., None], expanded_geometry),
+            dim=-1,
+        )
         if self.summary_projection is not None:
             assert summary is not None
             side_class = torch.cat((side_class, self.summary_projection(summary)), dim=-1)
-        side = torch.zeros(
-            token.shape[:2] + (side_class.shape[-1],), dtype=side_class.dtype, device=token.device
-        )
-        side[:, : players * N_CLASSES] = side_class.reshape(batch, players * N_CLASSES, -1)
-
         x = token
-        for layer_norm, attention, layer_ffn in zip(
-            self.layer_norms, self.attentions, self.layer_ffns, strict=True
+        incidence_mass = normalized
+        identical_scale = (1.0 / self.class_sizes[class_ids]).to(class_ranges.dtype)
+        for layer_norm, attention, incidence, layer_ffn in zip(
+            self.layer_norms, self.attentions, self.incidence_residuals,
+            self.layer_ffns, strict=True
         ):
+            row_state = x[:, : players * N_CLASSES].reshape(
+                batch, players, N_CLASSES, d
+            )
+            j, overlap_card, overlap_equal, _ = incidence(
+                row_state,
+                incidence_mass,
+                self.class_card_geometry[class_ids].to(class_ranges.dtype),
+                identical_scale,
+            )
             normalized_x = layer_norm(x)
             x_hat = x + attention(normalized_x, normalized_x, key_bias, key_mask)
+            dynamic = torch.cat(
+                (j, overlap_card * overlap_card, overlap_card * overlap_equal), dim=-1
+            )
+            side_rows = torch.cat((side_class, dynamic), dim=-1)
+            side = torch.zeros(
+                token.shape[:2] + (side_rows.shape[-1],),
+                dtype=side_rows.dtype,
+                device=token.device,
+            )
+            side[:, : players * N_CLASSES] = side_rows.reshape(
+                batch, players * N_CLASSES, -1
+            )
             x = x_hat + layer_ffn(torch.cat((layer_norm(x_hat), side), dim=-1))
 
         final = self.final_norm(x)

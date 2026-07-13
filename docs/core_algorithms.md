@@ -6,19 +6,25 @@ formal statements are defined in [`../NOTATION.md`](../NOTATION.md) and
 
 ## Sequential and fixed-intensity rollout
 
-`sample_trees` is the public entry point. `beta_mode: sequential` dispatches to
-the one-child sampler. `beta_mode: fixed` dispatches to labeled branching.
+`training.mode` is the public pipeline selector. `normal` uses a one-path
+terminal sampler and compact scalar decision rows; `rao_blackwell` dispatches
+to the one-child pre-terminal sampler; `branched_rao_blackwell` dispatches to
+labeled branching using `rollout.beta`.
 
-At each frontier wave, the backend classifies states into player, chance, and
-leaf rows. For player rows it evaluates the frozen model, draws a fresh joint
-private profile from the public posterior, draws a public event conditional on
-that profile, updates reach likelihoods, and caches the selected action's
-all-type log probability. Chance rows similarly draw a fresh posterior profile
-before sampling their public event. The child public states and owner codes are
-then appended to the device tree buffer.
+The sequential sampler draws one joint private profile from the root prior for
+each tree and carries that fixed profile along its sole lineage. At each
+frontier wave, the backend classifies states into player, chance, and leaf rows.
+For player rows it evaluates the frozen model, draws a public event conditional
+on the tree's profile, updates reach likelihoods, and caches the selected
+action's all-type log probability. Chance rows draw their public event
+conditional on that same profile. This is the direct `SamplePreTerminal`
+construction and avoids posterior-profile rejection sampling inside the
+sequential hot loop.
 
-Fresh profile draws are local to event draws. Sampling one private profile for
-an entire tree would correlate branches and violate the intended public-event
+Fixed branching instead draws a fresh posterior profile for every abstract
+child event. Those node-local draws are necessary to keep sibling subtrees
+conditionally independent; sampling one private profile for an entire branched
+tree would correlate its branches and violate the intended public-event
 mixture.
 
 For fixed intensity `beta >= 1`, the number of abstract children is randomized
@@ -164,4 +170,3 @@ scaling are used only when CUDA AMP is enabled. Gradients are norm-clipped.
 Under DDP, each rank retains the configured number of trees and minibatch rows,
 uses a rank-specific seed, constructs targets locally, and participates only in
 gradient synchronization. Rank zero writes metrics and checkpoints.
-

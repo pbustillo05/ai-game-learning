@@ -62,6 +62,27 @@ def test_device_sampler_stays_resident_and_builds_one_path_per_tree() -> None:
     assert policy.old_logp_child.device == tree.parent.device
 
 
+def test_sequential_sampler_draws_one_private_profile_batch_at_roots() -> None:
+    torch.manual_seed(84)
+    game = SyntheticPBG(leduc())
+    bundle = _bundle(game)
+    backend = bundle.rollout_backend
+    original = backend.sample_profiles
+    sampled_states: list[torch.Tensor] = []
+
+    def counted_sample_profiles(states, reach, gen):
+        sampled_states.append(states.clone())
+        return original(states, reach, gen)
+
+    backend.sample_profiles = counted_sample_profiles
+    _sample_trees_sequential(
+        bundle, _cfg(n_trees=32), torch.Generator().manual_seed(85)
+    )
+
+    assert len(sampled_states) == 1
+    assert torch.equal(sampled_states[0], game.root_states(32))
+
+
 def test_corrected_leduc_completion_cut_rolls_through_board_and_final_betting() -> None:
     game = SyntheticPBG(leduc())
     backend = SyntheticRolloutBackend(game)

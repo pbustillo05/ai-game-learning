@@ -176,13 +176,13 @@ def test_overflow_raises_instead_of_clamping_or_returning_partial_tree() -> None
 
 def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> None:
     raw = yaml.safe_load((ROOT / "configs" / "kuhn_smoke.yaml").read_text())
-    raw["rollout"]["beta_mode"] = "neyman"
+    raw["training"]["mode"] = "neyman"
     path = tmp_path / "neyman.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match="sequential.*fixed"):
+    with pytest.raises(ConfigError, match="training.mode"):
         load_config(path)
-    raw["rollout"]["beta_mode"] = "fixed"
-    raw["rollout"]["beta_fix"] = {"default": float("nan")}
+    raw["training"]["mode"] = "branched_rao_blackwell"
+    raw["rollout"]["beta"] = {"default": float("nan")}
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ConfigError, match="finite value at least one"):
         load_config(path)

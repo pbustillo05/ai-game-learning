@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from pbg.games.poker.model.preflop import (
+    PackedPublicHistory,
     PokerModelConfig,
     PokerPublicBatch,
     PreflopMasks,
@@ -40,6 +41,26 @@ def _inputs(batch: int = 2, players: int = 3) -> tuple[PokerPublicBatch, torch.T
         status=torch.zeros(batch, players, dtype=torch.int64),
         seat_mask=torch.ones(batch, players, dtype=torch.bool),
         button=torch.arange(batch, dtype=torch.int64) % players,
+        committed_street=torch.rand(batch, players),
+        call_amount=torch.rand(batch),
+        current_bet=torch.rand(batch) + 1.0,
+        min_raise_to=torch.rand(batch) + 2.0,
+        max_raise_to=torch.full((batch,), 100.0),
+        last_full_raise=torch.ones(batch),
+        legal_action_mask=torch.ones(batch, 18, dtype=torch.bool),
+        raise_ticks=torch.linspace(2.0, 100.0, 16)[None].expand(batch, -1).clone(),
+        history=PackedPublicHistory(
+            actor=torch.tensor([[0, 1], [1, -1]])[:batch],
+            street=torch.tensor([[0, 0], [0, 1]])[:batch],
+            action=torch.tensor([[1, 2], [0, 3]])[:batch],
+            amount=torch.tensor([[0.5, 3.0], [0.0, 0.0]])[:batch],
+            pot_before=torch.tensor([[1.5, 2.0], [1.5, 4.0]])[:batch],
+            call_amount=torch.tensor([[0.5, 1.0], [1.0, 0.0]])[:batch],
+            current_bet=torch.tensor([[1.0, 2.0], [1.0, 0.0]])[:batch],
+            min_raise_to=torch.tensor([[2.0, 3.0], [2.0, 0.0]])[:batch],
+            max_raise_to=torch.full((batch, 2), 100.0),
+            mask=torch.ones(batch, 2, dtype=torch.bool),
+        ),
     )
     return pub, ranges
 
@@ -120,3 +141,39 @@ def test_gradient_reaches_every_parameter() -> None:
 def test_model_config_is_strict() -> None:
     with pytest.raises(ValueError, match="unknown poker model"):
         PokerModelConfig.from_dict({"d_modle": 16})
+
+
+def test_preflop_orbit_geometry_is_exact_and_history_changes_output() -> None:
+    model = PreflopNet(_config()).eval()
+    torch.testing.assert_close(model.class_card_geometry.sum(1), torch.full((169,), 2.0))
+    expected_overlap = model.class_card_geometry @ model.class_card_geometry.T
+    torch.testing.assert_close(
+        model.class_overlap_scalars[:, 0], expected_overlap.diagonal()
+    )
+    pub, ranges = _inputs(batch=1)
+    first = model(pub, ranges)
+    pub.history.action[0, 0] = 2
+    pub.history.amount[0, 0] = 37.5
+    second = model(pub, ranges)
+    assert not torch.allclose(first.v, second.v)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_preflop_conformance_paths_run_forward_backward_on_cuda() -> None:
+    pub, ranges = _inputs(batch=1)
+    values = {}
+    for name in pub.__dataclass_fields__:
+        value = getattr(pub, name)
+        if isinstance(value, PackedPublicHistory):
+            values[name] = PackedPublicHistory(
+                **{
+                    field: getattr(value, field).cuda()
+                    for field in value.__dataclass_fields__
+                }
+            )
+        else:
+            values[name] = None if value is None else value.cuda()
+    model = PreflopNet(_config()).cuda()
+    output = model(PokerPublicBatch(**values), ranges.cuda())
+    (output.v.square().mean() + output.raw["type_logits"].square().mean()).backward()
+    assert torch.isfinite(output.v).all()

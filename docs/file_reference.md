@@ -11,7 +11,7 @@ provenance or compatibility, not part of the current execution sequence.
   coding agents.
 - `README.md` is the project entry point: scope, architecture, setup, presets,
   training, evaluation, tests, and documentation links.
-- `pyproject.toml` defines the `pbg` 0.1.0 setuptools package, Python 3.11+
+- `pyproject.toml` defines the `pbg` 0.1.0 setuptools package, Python 3.10+
   requirement, runtime/test dependencies, package discovery, and pytest root.
 - `CONTRACTS.md` freezes package layout, tensor interfaces, invariants,
   evaluator ownership, precision/DDP rules, and acceptance gates. Corrections
@@ -19,15 +19,9 @@ provenance or compatibility, not part of the current execution sequence.
 - `NOTATION.md` maps the authoritative mathematics to concrete data structures
   and algorithms, including the corrected labeled branching, posterior-moment
   recurrence, and RB-PPO weighting.
-- `POKER_GPU_EVALUATOR_IO.md` is the binding cross-repository API contract for
-  combo representation, completion, partition summaries, exact profiles, and
-  fixed showdowns.
-- `IMPLEMENTATION_NOTES.md` is the chronological implementation ledger from
-  P00 through P13B, including contract reconciliations, validation outcomes,
-  and deliberately deferred work.
-- `PREAMBLE.md` is the historical common instruction block used while applying
-  implementation prompts. Its older DTO excerpt is provenance, not the current
-  API; use `CONTRACTS.md` and code for current interfaces.
+- `IMPLEMENTATION_NOTES.md` is a historical chronological implementation
+  ledger from P00 through P13B. For current readiness, use
+  `docs/audit/findings.md` and `docs/audit/resolved_findings.md`.
 
 ## Configuration presets
 
@@ -36,8 +30,10 @@ provenance or compatibility, not part of the current execution sequence.
 - `configs/leduc.yaml` trains Leduc with fixed stage-dependent branching.
 - `configs/synthetic_dial_example.yaml` demonstrates a larger three-player
   synthetic game and decision-only reach caching.
-- `configs/nlhe6_h100.yaml` is the first-profile six-player 100bb CUDA/H100
-  configuration with AMP, recomputed reach, and conservative tuning markers.
+- `configs/train/nlhe6.yaml` is the hardware-independent six-player 100bb
+  configuration. `configs/hardware/` contains local and Quest execution
+  ceilings. Quest access is available, but execution remains explicitly
+  deferred until local readiness review and staged H100 measurement.
 
 ## Implementation documentation
 
@@ -55,24 +51,39 @@ provenance or compatibility, not part of the current execution sequence.
 - `docs/file_reference.md` is this per-file inventory.
 - `docs/MHA_model.md` is the detailed mathematical specification of the poker
   transformer, tokenization, reach-biased attention, policy heads, and values.
-- `docs/folder_impact.md` derives folded-range card-removal mathematics. It is
+- `docs/audit/README.md` indexes the repository-readiness audit, traceability,
+  validation probes, storage/compute requirements, active findings, and
+  resolved findings.
+- `docs/theory/folder_impact.md` derives folded-range card-removal mathematics. It is
   evaluator-owned background, not code to implement locally in this repo.
 
 ## Mathematical LaTeX sources
 
-- `docs/latex/core_math.tex` is the mathematical source of truth for PBG
+- `docs/theory/core_math.tex` is the mathematical source of truth for PBG
   decision laws, Rao–Blackwellization, sampled branching, completion, targets,
   losses, and research extensions.
-- `docs/latex/core_math_audit.md` records the review of that source, resolved
-  corrections, and deferred theoretical questions.
-- `docs/latex/preamble/preamble.tex` loads document packages and global LaTeX
+- `docs/theory/core_math_audit.md` records the review of that source, resolved
+  corrections, and deferred theoretical questions. It is not an implementation
+  readiness audit.
+- `docs/theory/preamble/preamble.tex` loads document packages and global LaTeX
   formatting.
-- `docs/latex/preamble/project-macros.sty` defines project probability,
+- `docs/theory/preamble/project-macros.sty` defines project probability,
   analysis, neural-network, and poker notation.
-- `docs/latex/preamble/mathenv.sty` defines custom IEEE-style equation/proof
+- `docs/theory/preamble/mathenv.sty` defines custom IEEE-style equation/proof
   environments and helpers.
-- `docs/latex/preamble/thmenv.sty` defines theorem, definition, remark, and
+- `docs/theory/preamble/thmenv.sty` defines theorem, definition, remark, and
   framed-environment styles.
+
+## Archive
+
+- `archive/POKER_GPU_EVALUATOR_IO.md` is the binding cross-repository API
+  contract for combo representation, completion, partition summaries, exact
+  profiles, and fixed showdowns.
+- `archive/PREAMBLE.md` is the historical common instruction block used while
+  applying implementation prompts. Its older DTO excerpt is provenance, not the
+  current API; use `CONTRACTS.md` and code for current interfaces.
+- `archive/prompts/` preserves the historical implementation and correction
+  prompts. It is not a current execution queue.
 
 ## Generic core package
 
@@ -187,44 +198,44 @@ provenance or compatibility, not part of the current execution sequence.
 
 ## Historical implementation prompts
 
-- `Prompts/P00_skeleton.md` specified package skeleton, strict config, logging,
+- `archive/prompts/P00_skeleton.md` specified package skeleton, strict config, logging,
   seeding, and import-direction tests.
-- `Prompts/P01_synthetic.md` specified the synthetic family, presets, exact
+- `archive/prompts/P01_synthetic.md` specified the synthetic family, presets, exact
   analysis, model, and adapter.
-- `Prompts/P02_engine.md` specified card representations and the public NLHE
+- `archive/prompts/P02_engine.md` specified card representations and the public NLHE
   engine.
-- `Prompts/P03_ranges.md` specified poker reach and fold-snapshot bookkeeping.
-- `Prompts/P04_folded.md` specified the evaluator-owned partition-summary
+- `archive/prompts/P03_ranges.md` specified poker reach and fold-snapshot bookkeeping.
+- `archive/prompts/P04_folded.md` specified the evaluator-owned partition-summary
   boundary.
-- `Prompts/P05_completion.md` specified generic completion DTOs and the three
+- `archive/prompts/P05_completion.md` specified generic completion DTOs and the three
   poker evaluator operations.
-- `Prompts/P06_preflop.md` specified attention primitives, poker output heads,
+- `archive/prompts/P06_preflop.md` specified attention primitives, poker output heads,
   and the preflop network.
-- `Prompts/P07_postflop.md` specified compact postflop modeling and the poker
+- `archive/prompts/P07_postflop.md` specified compact postflop modeling and the poker
   public-tree adapter.
-- `Prompts/P08_rollout.md` specified the first sequential rollout/cache design;
+- `archive/prompts/P08_rollout.md` specified the first sequential rollout/cache design;
   C08 supersedes its production boundary.
-- `Prompts/P09_branching.md` specified the old quotient-tree Poisson/Neyman
+- `archive/prompts/P09_branching.md` specified the old quotient-tree Poisson/Neyman
   design; C09 supersedes its production algorithm.
-- `Prompts/P10_values.md` specified the old direct conditional-value backward
+- `archive/prompts/P10_values.md` specified the old direct conditional-value backward
   pass; C10 supersedes it.
-- `Prompts/P11_training.md` specified the broader old loss/training plan; C11
+- `archive/prompts/P11_training.md` specified the broader old loss/training plan; C11
   supersedes it.
-- `Prompts/P12_eval.md` specified the current read-only synthetic and poker
+- `archive/prompts/P12_eval.md` specified the current read-only synthetic and poker
   evaluation layer.
-- `Prompts/P13A_gpu_poker_rollout.md` specified the current tensor-native poker
+- `archive/prompts/P13A_gpu_poker_rollout.md` specified the current tensor-native poker
   state and rollout backend.
-- `Prompts/P13B_integration.md` specified current factories, presets,
+- `archive/prompts/P13B_integration.md` specified current factories, presets,
   residency, sibling integration, and acceptance tests.
-- `Prompts/C00_math_contract.md` aligned the mathematical contract before the
+- `archive/prompts/C00_math_contract.md` aligned the mathematical contract before the
   corrected implementation.
-- `Prompts/C08_device_rollout.md` corrected rollout to the typed,
+- `archive/prompts/C08_device_rollout.md` corrected rollout to the typed,
   device-resident backend and pre-terminal semantics.
-- `Prompts/C09_labeled_branching.md` corrected branching to randomized-rounded
+- `archive/prompts/C09_labeled_branching.md` corrected branching to randomized-rounded
   fixed intensities and duplicate-preserving labeled children.
-- `Prompts/C10_posterior_moments.md` corrected values to propagate posterior
+- `archive/prompts/C10_posterior_moments.md` corrected values to propagate posterior
   and weighted-return mass with leave-one-branch baselines.
-- `Prompts/C11_minimal_training.md` corrected row alignment, configuration,
+- `archive/prompts/C11_minimal_training.md` corrected row alignment, configuration,
   checkpointing, and the minimal posterior-weighted RB-PPO objective.
 
 ## Tests
@@ -296,4 +307,3 @@ provenance or compatibility, not part of the current execution sequence.
   real sibling signatures, and a short checkpointed CPU poker training smoke.
 - `tests/test_p13b_ddp.py` checks per-rank sizing and comparable one-/two-rank
   Kuhn learning curves.
-

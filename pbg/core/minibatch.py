@@ -28,6 +28,23 @@ class MinibatchSample:
     legal_event_mask: Tensor  # bool [B,E_legal]
 
 
+def index_minibatch(sample: MinibatchSample, rows: Tensor) -> MinibatchSample:
+    """Select physical rows without changing their sampled semantics."""
+
+    rows = rows.to(device=sample.state_refs.device, dtype=torch.int64)
+    return MinibatchSample(
+        decision_rows=sample.decision_rows[rows],
+        state_refs=sample.state_refs[rows],
+        reach=sample.reach[rows],
+        targets=_gather_targets(sample.targets, rows),
+        old_logp_child=sample.old_logp_child[rows],
+        old_v=sample.old_v[rows],
+        valid_type_mask=sample.valid_type_mask[rows],
+        legal_event_ids=sample.legal_event_ids[rows],
+        legal_event_mask=sample.legal_event_mask[rows],
+    )
+
+
 def _gather_targets(targets: NodeTargets, rows: Tensor) -> NodeTargets:
     """Gather target rows exclusively with tensor indexing."""
 

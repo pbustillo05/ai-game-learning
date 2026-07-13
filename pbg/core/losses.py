@@ -132,7 +132,8 @@ def rb_ppo(
     cfg: Any,
     *,
     iteration: int = 0,
-) -> tuple[Tensor, dict[str, float]]:
+    reduction: str = "mean",
+) -> tuple[Tensor, dict[str, Any]]:
     """Return ``L_clip[A_hat] + L_H + L_V[V_hat]`` averaged over rows."""
 
     target, _, _ = _parts(old, targets)
@@ -152,41 +153,155 @@ def rb_ppo(
     type_weight = parent_p * valid.to(parent_p)
     per_row = per_row + ((value + entropy) * type_weight).sum(1)
 
-    denominator = policy_weight.sum().clamp_min(torch.finfo(policy_weight.dtype).eps)
+    policy_denominator = policy_weight.sum()
+    denominator = policy_denominator.clamp_min(torch.finfo(policy_weight.dtype).eps)
     ratio = policy_metrics["ratio"]
     log_ratio = torch.log(ratio)
-    approx_kl = (policy_weight * (ratio - 1.0 - log_ratio)).sum() / denominator
-    clip_frac = (policy_weight * policy_metrics["clipped"].to(policy_weight)).sum() / denominator
-    entropy_denominator = type_weight.sum().clamp_min(torch.finfo(type_weight.dtype).eps)
+    raw_entropy_denominator = type_weight.sum()
+    entropy_denominator = raw_entropy_denominator.clamp_min(
+        torch.finfo(type_weight.dtype).eps
+    )
     wanted = target.v_hat.to(new.v)
-    mean_wanted = (type_weight * wanted).sum() / entropy_denominator
-    variance = (type_weight * (wanted - mean_wanted).square()).sum()
     residual = (type_weight * (wanted - new.v).square()).sum()
-    explained = 1.0 - residual / variance.clamp_min(1e-12)
-    metrics = {
-        "loss": float(per_row.mean().detach()),
-        "policy": float((policy * policy_weight).sum(1).sum(1).mean().detach()),
-        "value": float((value * type_weight).sum(1).mean().detach()),
-        "entropy_loss": float((entropy * type_weight).sum(1).mean().detach()),
-        "approx_kl": float(approx_kl.detach()),
-        "clip_frac": float(clip_frac.detach()),
-        "entropy": float((entropy_metrics["entropy"] * type_weight).sum().detach() / entropy_denominator),
-        "explained_variance": float(explained.detach()),
-        "ratio_max": float(torch.where(child_valid, ratio, torch.zeros_like(ratio)).max().detach()),
+    stats = {
+        "rows": per_row.new_tensor(per_row.shape[0]),
+        "loss_sum": per_row.sum().detach(),
+        "policy_sum": (policy * policy_weight).sum().detach(),
+        "value_sum": (value * type_weight).sum().detach(),
+        "entropy_loss_sum": (entropy * type_weight).sum().detach(),
+        "kl_num": (policy_weight * (ratio - 1.0 - log_ratio)).sum().detach(),
+        "kl_den": policy_denominator.detach(),
+        "clip_num": (
+            policy_weight * policy_metrics["clipped"].to(policy_weight)
+        ).sum().detach(),
+        "entropy_num": (entropy_metrics["entropy"] * type_weight).sum().detach(),
+        "entropy_den": raw_entropy_denominator.detach(),
+        "wanted_sum": (type_weight * wanted).sum().detach(),
+        "wanted_sq_sum": (type_weight * wanted.square()).sum().detach(),
+        "residual_sum": residual.detach(),
+        "ratio_max": torch.where(
+            child_valid, ratio, torch.zeros_like(ratio)
+        ).max().detach(),
     }
-    return per_row.mean(), metrics
+    if reduction == "sum":
+        return per_row.sum(), stats
+    if reduction != "mean":
+        raise ValueError("reduction must be 'mean' or 'sum'")
+    return per_row.mean(), finalize_metric_stats([stats])
+
+
+def ppo(
+    new: Any,
+    old: Any,
+    targets: Any,
+    adapter: Any,
+    cfg: Any,
+    *,
+    iteration: int = 0,
+    reduction: str = "mean",
+) -> tuple[Tensor, dict[str, Any]]:
+    """Ordinary PPO on one sampled private type and scalar target per row."""
+
+    del old
+    actor_type = targets.actor_type.to(new.v.device, dtype=torch.int64)
+    rows = torch.arange(actor_type.numel(), device=new.v.device)
+    logp_all = adapter.log_prob(
+        new,
+        targets.event.to(new.v.device)[:, None],
+        targets.legal_event_ids.to(new.v.device),
+        targets.legal_event_mask.to(new.v.device),
+    )[:, 0]
+    logp = logp_all[rows, actor_type]
+    ratio = torch.exp(logp - targets.old_logp.to(logp))
+    advantage = targets.advantage.to(logp)
+    eps = float(_cfg(cfg, "clip_eps"))
+    clipped = ratio.clamp(1.0 - eps, 1.0 + eps)
+    policy = -torch.minimum(ratio * advantage, clipped * advantage)
+
+    value = new.v[rows, actor_type]
+    wanted = targets.v_target.to(value)
+    value_loss = float(_cfg(cfg, "c_v")) * (value - wanted).square()
+    entropy_all = adapter.entropy(
+        new,
+        targets.legal_event_ids.to(new.v.device),
+        targets.legal_event_mask.to(new.v.device),
+    )
+    entropy = entropy_all[rows, actor_type]
+    entropy_loss = -_entropy_coefficient(cfg, iteration) * entropy
+    per_row = policy + value_loss + entropy_loss
+
+    residual = (wanted - value).square().sum()
+    rows_count = per_row.new_tensor(per_row.shape[0])
+    stats = {
+        "rows": rows_count,
+        "loss_sum": per_row.sum().detach(),
+        "policy_sum": policy.sum().detach(),
+        "value_sum": value_loss.sum().detach(),
+        "entropy_loss_sum": entropy_loss.sum().detach(),
+        "kl_num": (ratio - 1.0 - torch.log(ratio)).sum().detach(),
+        "kl_den": rows_count,
+        "clip_num": (ratio != clipped).to(ratio).sum().detach(),
+        "entropy_num": entropy.sum().detach(),
+        "entropy_den": rows_count,
+        "wanted_sum": wanted.sum().detach(),
+        "wanted_sq_sum": wanted.square().sum().detach(),
+        "residual_sum": residual.detach(),
+        "ratio_max": ratio.max().detach(),
+    }
+    if reduction == "sum":
+        return per_row.sum(), stats
+    if reduction != "mean":
+        raise ValueError("reduction must be 'mean' or 'sum'")
+    return per_row.mean(), finalize_metric_stats([stats])
+
+
+def finalize_metric_stats(parts: list[dict[str, Tensor]]) -> dict[str, float]:
+    """Finalize additive loss diagnostics from one or more physical batches."""
+
+    if not parts:
+        return {}
+    summed = {
+        key: torch.stack([part[key].float() for part in parts]).sum()
+        for key in parts[0]
+        if key != "ratio_max"
+    }
+    ratio_max = torch.stack([part["ratio_max"].float() for part in parts]).max()
+    rows = summed["rows"].clamp_min(1.0)
+    kl_den = summed["kl_den"].clamp_min(1e-12)
+    entropy_den = summed["entropy_den"].clamp_min(1e-12)
+    variance = summed["wanted_sq_sum"] - summed["wanted_sum"].square() / entropy_den
+    explained = 1.0 - summed["residual_sum"] / variance.clamp_min(1e-12)
+    return {
+        "loss": float(summed["loss_sum"] / rows),
+        "policy": float(summed["policy_sum"] / rows),
+        "value": float(summed["value_sum"] / rows),
+        "entropy_loss": float(summed["entropy_loss_sum"] / rows),
+        "approx_kl": float(summed["kl_num"] / kl_den),
+        "clip_frac": float(summed["clip_num"] / kl_den),
+        "entropy": float(summed["entropy_num"] / entropy_den),
+        "explained_variance": float(explained),
+        "ratio_max": float(ratio_max),
+    }
 
 
 @dataclass(frozen=True)
 class LossSpec:
     """Composite loss and the target fields it requires."""
 
-    fn: Callable[..., tuple[Tensor, dict[str, float]]]
+    fn: Callable[..., tuple[Tensor, dict[str, Any]]]
     required_targets: frozenset[str]
+    modes: frozenset[str] = frozenset(
+        {"normal", "rao_blackwell", "branched_rao_blackwell"}
+    )
 
 
 COMPOSITES: dict[str, LossSpec] = {
+    "ppo": LossSpec(
+        ppo, frozenset({"advantage", "v_target"}), frozenset({"normal"})
+    ),
     "rb_ppo": LossSpec(
-        rb_ppo, frozenset({"parent_p_hat", "child_p_hat", "a_hat", "v_hat"})
+        rb_ppo,
+        frozenset({"parent_p_hat", "child_p_hat", "a_hat", "v_hat"}),
+        frozenset({"rao_blackwell", "branched_rao_blackwell"}),
     )
 }

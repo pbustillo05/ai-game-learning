@@ -9,7 +9,71 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
+
+from pbg.games.poker.model.primitives import LN
+
+
+class IncidenceResidual(nn.Module):
+    """Exact unnormalized card/identical-row mass residual for one layer."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.norm = LN(d_model)
+        self.source = nn.Linear(d_model, d_model, bias=False)
+        self.query = nn.Linear(d_model, d_model)
+        self.identical = nn.Linear(d_model, d_model, bias=False)
+        self.own = nn.Linear(d_model, d_model, bias=False)
+        self.output = nn.Linear(d_model, d_model)
+
+    def forward(
+        self,
+        rows: Tensor,
+        mass: Tensor,
+        card_incidence: Tensor,
+        identical_scale: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Return ``j, O_card, O_equal, O_own`` with shape ``[B,P,R,D]``.
+
+        ``card_incidence`` is the two-hot postflop map or orbit-averaged
+        preflop map ``[B,R,52]``/``[R,52]``. ``identical_scale`` is one for
+        combo rows and ``1/n_k`` for class-orbit rows.
+        """
+
+        if rows.ndim != 4 or mass.shape != rows.shape[:3]:
+            raise ValueError("incidence rows/mass must have shapes [B,P,R,D]/[B,P,R]")
+        batch, _, row_count, _ = rows.shape
+        if card_incidence.ndim == 2:
+            card_incidence = card_incidence[None].expand(batch, -1, -1)
+        if card_incidence.shape != (batch, row_count, 52):
+            raise ValueError("card_incidence must have shape [R,52] or [B,R,52]")
+        if identical_scale.ndim == 1:
+            identical_scale = identical_scale[None].expand(batch, -1)
+        if identical_scale.shape != (batch, row_count):
+            raise ValueError("identical_scale must have shape [R] or [B,R]")
+        normalized = self.norm(rows)
+        source = self.source(normalized) * mass[..., None]
+        card_accumulator = torch.einsum(
+            "brc,bprd->bpcd", card_incidence.to(source.dtype), source
+        )
+        card_overlap = torch.einsum(
+            "brc,bpcd->bprd", card_incidence.to(source.dtype), card_accumulator
+        )
+        same = source * identical_scale[:, None, :, None].to(source.dtype)
+        total_card = card_overlap.sum(1, keepdim=True)
+        total_same = same.sum(1, keepdim=True)
+        other_equal = total_same - same
+        other_card = total_card - card_overlap - 2.0 * other_equal
+        own_card = card_overlap - 2.0 * same
+        residual = self.output(
+            torch.nn.functional.gelu(
+                self.query(normalized)
+                + other_card
+                + self.identical(other_equal)
+                + self.own(own_card)
+            )
+        )
+        return residual, other_card, other_equal, own_card
 
 
 @dataclass(frozen=True)

@@ -697,12 +697,30 @@ class SyntheticRolloutBackend:
         head_mask[rows[legal_mask], legal_ids[legal_mask].to(torch.int64)] = True
         return frozen_model(self.game.encode_public(states), head_mask)
 
+    def plan_policy_batches(
+        self, model: Any, states: Tensor, phase: str
+    ) -> list[Tensor]:
+        """Synthetic models fit in one physical CPU batch."""
+
+        del model
+        if phase not in {"training", "inference"}:
+            raise ValueError("phase must be 'training' or 'inference'")
+        return [torch.arange(states.numel(), device=states.device)] if states.numel() else []
+
     def sample_profiles(
         self, states: Tensor, reach: Tensor, gen: torch.Generator
     ) -> Tensor:
         """Draw one posterior profile per state as int32 ``[B,P]``."""
 
         return self.game.sample_profiles(states, reach, 1, gen)[:, 0]  # [B,P]
+
+    def sampled_terminal_reward(
+        self, states: Tensor, profiles: Tensor, gen: torch.Generator
+    ) -> Tensor:
+        """Settle one sampled private profile at each synthetic leaf."""
+
+        del gen
+        return self.game.reward(profiles, states).float()
 
     @staticmethod
     def _log_prob(

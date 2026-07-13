@@ -1,0 +1,28 @@
+name: quest_slurm
+scheduler: slurm
+attention_backend: auto
+query_chunk_size: 256
+# Quest access is available, but this profile is deliberately opt-in and
+# execution-deferred until the local readiness gate in HARDWARE.md passes.
+# It inherits the validated local-safe ceilings until intentionally staged
+# H100 profiling establishes separate 40/80 GiB tiers.
+training_max_tokens: 8192
+training_max_token_pairs: 67108864
+inference_max_tokens: 16384
+inference_max_token_pairs: 134217728
+reserve_vram_gib: 4.0
+max_memory_fraction: 0.80
+max_devices: 4
+expected_compute_capability: [9, 0]
+min_vram_gib: 39.0
+max_vram_gib: 82.0
+precision: bf16
+worker_count: 0
+checkpoint_every: null
+slurm:
+  partition: gengpu
+  # Supply the authorized account/allocation at launch; do not commit it.
+  account: null
+  gres: "gpu:1"
+  constraint: null
+  time_limit: "48:00:00"

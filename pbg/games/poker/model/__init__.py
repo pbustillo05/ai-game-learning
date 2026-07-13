@@ -2,6 +2,7 @@
 
 __all__ = [
     "PokerModelConfig",
+    "PackedPublicHistory",
     "PokerPublicBatch",
     "PolicyOutput",
     "PostflopMasks",
@@ -15,7 +16,10 @@ def __getattr__(name: str):
         from pbg.games.poker.model import postflop
 
         return getattr(postflop, name)
-    if name in {"PokerModelConfig", "PokerPublicBatch", "PolicyOutput", "PreflopNet"}:
+    if name in {
+        "PackedPublicHistory", "PokerModelConfig", "PokerPublicBatch",
+        "PolicyOutput", "PreflopNet",
+    }:
         from pbg.games.poker.model import preflop
 
         return getattr(preflop, name)

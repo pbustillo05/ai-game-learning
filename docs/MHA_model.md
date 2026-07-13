@@ -4,12 +4,13 @@
 > model inputs, not permission to compute poker-private combinatorics locally.
 > Collision-conditioned posteriors, partition/folded-card summaries,
 > completion, sampling, and showdown winners are produced by
-> `poker-gpu-evaluator` under `POKER_GPU_EVALUATOR_IO.md`. This repository only
-> learns transformations of supplied fields and navigates the public tree.
-> Any later wording that says the model computes collision incidence,
-> folded-card kernels, or partition corrections is descriptive of desired input
-> semantics and is superseded by this boundary; those fields must arrive from
-> the sibling facade.
+> `poker-gpu-evaluator` under `archive/POKER_GPU_EVALUATOR_IO.md`. This repository only
+> learns transformations of supplied fields, applies the fixed card/class
+> representation incidence operator inside neural layers, and navigates the
+> public tree. Any later wording that says the model computes folded-card
+> kernels, partition corrections, collision-conditioned laws, or private
+> assignments is descriptive of desired input semantics and is superseded by
+> this boundary; those private-law fields must arrive from the sibling facade.
 
 The deployed object is one weight-only policy object with two networks:
 
@@ -27,7 +28,8 @@ architecture follows:
 - transformer sequence layers over player hand/class rows, public tokens, and
   action-anchor tokens;
 - an exact incidence residual carrying unnormalized masses and identical-combo
-  overlap, as defined by the incidence identities in `folder_impact.md`;
+  overlap, as defined by the incidence identities in
+  `docs/theory/folder_impact.md`;
 - postflop folded-player effects injected through folded statistics rather than
   folded-player hand rows.
 
@@ -107,7 +109,8 @@ Normalized ranges mask board-impossible hands and normalize over each player's
 available hands; raw ranges remain row features.
 
 **Postflop folded statistics** $\mathcal F_\sigma$, supplied by the evaluator
-partition-summary facade using the semantics in `folder_impact.md` and refreshed
+partition-summary facade using the semantics in
+`docs/theory/folder_impact.md` and refreshed
 by the caller only on street or fold events:
 
 - per-hand corrections $\Lambda_B(g)$, consumed as the **folder-corrected
@@ -243,7 +246,8 @@ the learned bilinear $Q/K$ span includes, per head:
 - **type biases** $\propto\mathbf 1[p=q]$ and position/status interactions;
 - **postflop folded pairwise potential**
   $\Delta_F(h,g)=\mathbf 1_h^\top\beta_B\,\mathbf 1_g$ exactly, via the signed
-  factor coordinates from the card-Möbius expansion in `folder_impact.md`;
+  factor coordinates from the card-Möbius expansion in
+  `docs/theory/folder_impact.md`;
 - arbitrary learned low-rank card-pair kernels (learned projections of
   $\mathbf 1_h$).
 
@@ -253,7 +257,7 @@ overlap coefficients, blocker-conflict heads with positive ones, same-player
 range-shape heads — are **learned roles on shared features, not assigned
 head types**. The exact identical-combo channel is routed to the incidence
 residual because $\mathbf 1[g=h]$ is nonlinear in overlap
-(see the incidence identities in `folder_impact.md`).
+(see the incidence identities in `docs/theory/folder_impact.md`).
 
 ## Trunk
 
@@ -276,14 +280,15 @@ O^{\rm card}_i\odot O^{=}_i,\
 $$
 
 which expose the optional third-order folded-stat products from
-`folder_impact.md`.
+`docs/theory/folder_impact.md`.
 Preflop uses analogous class-level overlap side inputs and omits folded-stat
 terms.
 
 ## Incidence Residual
 
 The exact mass path carries unnormalized disjointness-restricted sums and the
-identical-combo channel from the incidence identities in `folder_impact.md`, at
+identical-combo channel from the incidence identities in
+`docs/theory/folder_impact.md`, at
 $O(52)$ per query via card accumulators. Per layer, it runs over tokenized range
 players: all seated players preflop and live players postflop.
 Below, $h,g$ denote postflop hands; preflop uses the orbit-averaged class-row
@@ -308,7 +313,7 @@ $$
 
 fed into the row FFN as part of $\psi^\ell$.
 For postflop hand rows these are exact by the inclusion–exclusion identities of
-`folder_impact.md`; $O^{=}$ is the only exact identical-combo channel in the
+`docs/theory/folder_impact.md`; $O^{=}$ is the only exact identical-combo channel in the
 model. Cost $O(L|\mathcal H|d)$ postflop per layer, or $O(LH_Bd)$ under optional
 compact tokenization.
 

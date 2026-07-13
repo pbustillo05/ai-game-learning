@@ -1239,7 +1239,10 @@ The fixed-intensity PPO v1 returns $\widehat{A}$ and does not store $\widehat Q$
 \paragraph{Variance-Minimizing Sampling.} The goal of this paragraph is to formalize and solve the problem of minimizing sampling variance.
 Typically, we want to pick the $\beta$ intensities so to:
 \begin{enumerate}
-  \item \textbf{Minimize:} the average variance $\mathbb{E}(\Var(\widehat{V}^1 \mid \Sigma))$ of the $\lambda = 1$ Monte Carlo value estimator,
+  \item \textbf{Minimize:} the average variance 
+  \[
+    \mathbb{E}(\Var(\widehat{V}^1 \mid \Sigma)) = \sum_\sigma 
+  \]of the $\lambda = 1$ Monte Carlo value estimator,
   \item \textbf{Subject to constraint:} $\mathbb{E}(|\mathfrak{S}|)\le M$ for some expected sampled-node budget $M$.
 \end{enumerate}
 This is obviously not the true variance of the loss estimator, but it is probably the best proxy we can get for it.

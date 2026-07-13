@@ -8,15 +8,15 @@ the main domains.
 
 ## Where to find things
 
-- `CONTRACTS.md`, `NOTATION.md`, and `docs/latex/core_math.tex`: authoritative
+- `CONTRACTS.md`, `NOTATION.md`, and `docs/theory/core_math.tex`: authoritative
   contracts, notation, and mathematics.
-- `Prompts/`: implementation and correction prompts; see `README.md` for the
-  current execution order.
+- `archive/prompts/`: historical implementation and correction prompts.
 - `pbg/core/`: generic rollout, branching, value, loss, and training code.
 - `pbg/games/`: synthetic-game and poker-specific implementations.
 - `tests/`: behavior and contract tests.
-- `POKER_GPU_EVALUATOR_IO.md`: binding interface to the sibling poker evaluator.
-- `IMPLEMENTATION_NOTES.md`: implementation status, decisions, and open issues.
+- `archive/POKER_GPU_EVALUATOR_IO.md`: binding interface to the sibling poker evaluator.
+- `IMPLEMENTATION_NOTES.md`: historical implementation ledger; use
+  `docs/audit/` for current readiness and open issues.
 
 ## Shared server hygiene
 

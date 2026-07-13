@@ -65,6 +65,12 @@ class RolloutBackend(Protocol):
         """Return game-owned policy output for states/reach ``[B]``/``[B,P,X]``."""
         ...
 
+    def plan_policy_batches(
+        self, model: nn.Module, states: StateBatch, phase: str
+    ) -> list[Tensor]:
+        """Partition sampled rows into bounded physical policy batches."""
+        ...
+
     def sample_profiles(
         self, states: StateBatch, reach: Tensor, gen: torch.Generator
     ) -> Tensor:
@@ -100,6 +106,12 @@ class RolloutBackend(Protocol):
         """Return fixed branching intensities as fp32 ``[B]``."""
         ...
 
+    def sampled_terminal_reward(
+        self, states: StateBatch, profiles: Tensor, gen: torch.Generator
+    ) -> Tensor:
+        """Settle sampled terminal/pre-terminal rows as fp32 ``[B,P]``."""
+        ...
+
 
 @dataclass
 class GameBundle:
@@ -108,7 +120,7 @@ class GameBundle:
     model: nn.Module
     rollout_backend: RolloutBackend
     policy_adapter: Any
-    completion_backend: MCCompletion
+    completion_backend: MCCompletion | None
 
 
 @runtime_checkable

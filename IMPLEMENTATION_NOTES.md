@@ -1,5 +1,12 @@
 # Implementation notes
 
+**Status:** historical chronological ledger. Entries below preserve the
+implementation narrative from P00 through P13B and may describe behavior or
+readiness claims later superseded by correction prompts or the repository audit.
+For current status, open issues, and resolved audit items, use
+`docs/audit/findings.md`, `docs/audit/resolved_findings.md`, and
+`docs/audit/validation_matrix.md`.
+
 ## P00 — repository skeleton and configuration
 
 - Added the complete package, config, test, and evaluation directory skeleton.
@@ -112,7 +119,7 @@
 
 - Added the typed `GameBundle`, `RolloutBackend`, and opaque `EventBatch` boundary.
 - Added a preallocated device tree buffer with contiguous parent-major appends and CSR finalization.
-- The new sequential sampler runs a fixed number of frontier waves and keeps topology, reach, policy caches, and RNG draws device-local.
+- The sequential sampler draws one prior private profile per root, carries it along the sole lineage, and keeps topology, profiles, reach, policy caches, and RNG draws device-local; posterior resampling remains exclusive to branching.
 - Player and chance frontier partitions use backend-owned policy routing, event sampling, stepping, classification, and reach updates.
 - Synthetic rollout remains the CPU oracle and now applies the completion cut only after final betting; folds remain terminal.
 - Buffer exhaustion raises requested/capacity diagnostics and cannot return a truncated tree.

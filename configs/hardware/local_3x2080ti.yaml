@@ -1,0 +1,18 @@
+name: local_3x2080ti
+scheduler: none
+attention_backend: auto
+query_chunk_size: 128
+training_max_tokens: 8192
+training_max_token_pairs: 67108864
+inference_max_tokens: 16384
+inference_max_token_pairs: 134217728
+reserve_vram_gib: 2.0
+max_memory_fraction: 0.82
+max_devices: 3
+expected_compute_capability: [7, 5]
+min_vram_gib: 10.0
+max_vram_gib: 12.0
+precision: fp16
+worker_count: 0
+checkpoint_every: null
+slurm: null

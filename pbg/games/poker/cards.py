@@ -2,7 +2,7 @@
 
 This module deliberately contains no hand evaluation.  A card id is
 ``4 * rank + suit`` and a hand id follows the lexicographic enumeration in
-``POKER_GPU_EVALUATOR_IO.md``.
+``archive/POKER_GPU_EVALUATOR_IO.md``.
 """
 
 from __future__ import annotations

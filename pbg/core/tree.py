@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from pbg.core.game import CHANCE, PRETERM, TERMINAL
+from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
 
 
 @dataclass
@@ -521,6 +521,7 @@ def _replay_reach_update(
     game: Any,
     row: Tensor,
     state_ref: Tensor,
+    child_state_ref: Tensor,
     event: Tensor,
     owner: int,
     taken_logp: Tensor | None,
@@ -535,19 +536,20 @@ def _replay_reach_update(
         result[owner, :width] += taken_logp[:width].to(result.device, result.dtype)
         return result
 
-    # Chance reach updates are game-owned (e.g. public-card compatibility).
-    p_max, x_max = row.shape
-    event_value = int(event.item())
-    event_width = max(1, event_value + 1)
-    dummy = torch.ones(
-        (1, p_max, x_max, event_width), dtype=row.dtype, device=row.device
+    # A game may reconstruct chance information from its successor state.  Poker
+    # uses this to recover dealt board cards without retaining poker-specific
+    # edge payloads in TreeBatch.
+    replay_chance = getattr(game, "replay_chance_reach", None)
+    if callable(replay_chance):
+        updated = replay_chance(row[None], state_ref, child_state_ref)
+        return updated[0]
+
+    # Generic rollout backends already expose the typed EventBatch boundary.
+    # In particular, do not manufacture a policy tensor indexed by public_id:
+    # chance labels need not be compact action indices.
+    updated = game.reach_update(
+        row[None], state_ref, EventBatch(public_id=event), None
     )
-    try:
-        updated = game.reach_update(row[None], state_ref, event, dummy)
-    except (ValueError, IndexError, RuntimeError):
-        # Poker's adapter consumes [B,X,E] log rows and chance updates are a no-op.
-        dummy_log = torch.zeros((1, x_max, event_width), dtype=row.dtype, device=row.device)
-        updated = game.reach_update(row[None], state_ref, event, dummy_log)
     return updated[0]
 
 
@@ -610,9 +612,10 @@ class ReachCache:
                 child_slot = edge - edge_start
                 taken = policy_cache.old_logp_child[cache_row, child_slot]
             value = _replay_reach_update(
-                getattr(game, "game", game),
+                game,
                 compute(parent),
                 tree.state_ref[parent : parent + 1],
+                tree.state_ref[node : node + 1],
                 tree.child_event[edge : edge + 1],
                 owner,
                 taken,

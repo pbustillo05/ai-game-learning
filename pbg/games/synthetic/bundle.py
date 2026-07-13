@@ -86,5 +86,7 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         model=model,
         rollout_backend=SyntheticRolloutBackend(family, cfg.rollout.beta_fix, backend_device),
         policy_adapter=SyntheticPolicyAdapter(),
-        completion_backend=SyntheticCompletion(family),
+        completion_backend=(
+            None if cfg.training.mode == "normal" else SyntheticCompletion(family)
+        ),
     )

@@ -7,8 +7,11 @@ name = "pbg"
 version = "0.1.0"
 description = "Policy-gradient self-play for public-action Bayesian games"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = ["numpy", "pyyaml", "pytest", "torch>=2.2"]
+
+[project.scripts]
+pbg-train = "pbg.cli.train:main"
 
 # Development prerequisite for poker boundaries (kept out of package deps):
 # pip install -e ../poker-gpu-evaluator

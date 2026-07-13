@@ -7,8 +7,8 @@ C00 alignment recorded here and in `NOTATION.md`. The active v1 contract is
 fixed-intensity PPO; explicitly marked research extensions are not requirements.
 
 The cross-repository tensor contract for poker completion and rejection is
-`POKER_GPU_EVALUATOR_IO.md`. It is normative and wins over older "user kernel
-slot" wording in this file.
+`archive/POKER_GPU_EVALUATOR_IO.md`. It is normative and wins over older "user
+kernel slot" wording in this file.
 
 This document is the single source of truth for repository layout, naming, tensor
 conventions, and every public interface. Implementation prompts receive excerpts of
@@ -22,7 +22,7 @@ this file verbatim. Rules for the implementer (GPT 5.6):
   including tests from earlier prompts.
 - **R4.** No abstractions beyond spec. No metaclasses, no dynamic dispatch beyond the
   Protocols defined here, no clever registry magic beyond `losses.py`'s explicit dict.
-- **R5.** Mathematical semantics come from `Docs/latex/core_math.tex` through
+- **R5.** Mathematical semantics come from `docs/theory/core_math.tex` through
   its implementation transcription in `NOTATION.md`, not from memory of RL
   conventions. If the two documents appear to conflict, `core_math.tex` wins
   and the discrepancy must be reported rather than silently implemented.
@@ -38,7 +38,7 @@ pbg/
     config.py              # dataclass configs + YAML loading
     game.py                # PBG Protocols, event/owner constants
     tree.py                # TreeBatch (SoA rollout tree), alias tables
-    rollout.py             # SamplePreTerminal (sequential = branching with beta==1)
+    rollout.py             # optimized SamplePreTerminal (one profile per root)
     branching.py           # labeled SampleTree, fixed beta_fn
     values.py              # BranchedValue backward propagation
     completion.py          # CompletionStats, MCCompletion Protocol
@@ -77,7 +77,7 @@ pbg/
     test_p1_*.py ... test_p13_*.py   # one file prefix per prompt
   CONTRACTS.md
   NOTATION.md
-  POKER_GPU_EVALUATOR_IO.md
+  archive/POKER_GPU_EVALUATOR_IO.md
 ```
 
 **Import direction (enforced by a test):** `core` imports nothing from `games` or
@@ -90,7 +90,7 @@ and reach DTOs. `eval` may import both.
 
 ## 2. Global conventions
 
-- **Python 3.11, torch ≥ 2.2.** No other DL frameworks. numpy allowed for CPU-side
+- **Python 3.10+, torch ≥ 2.2.** No other DL frameworks. numpy allowed for CPU-side
   sampling and exact solvers. Type hints everywhere; `from __future__ import annotations`.
 - **Naming.** snake_case functions/modules, CamelCase classes. Mathematical symbols
   map to code as: `sigma → node`, `tau → traj`, `x_p → xtype` (integer type index),
@@ -133,14 +133,13 @@ class GameConfig:
 @dataclass
 class RolloutConfig:
     n_trees: int                 # G per iteration (per rank: G // world_size)
-    beta_mode: str               # "sequential" (beta==1) | "fixed"
-    beta_fix: dict[str, float]   # per-bucket fixed intensity
+    beta: dict[str, float] | None # per-bucket intensity; branched RB only
     node_budget: int             # hard cap on nodes per tree; sampler raises past it
     reach_storage: str           # "full" | "decisions_only" | "recompute"
 
 @dataclass
 class CompletionConfig:
-    n_samples: int               # MC budget per pre-terminal node
+    n_samples: int | None        # null for normal; MC budget for RB modes
     backend: str                 # sibling execution backend: "auto" | "cpu" | "cuda"
 
 @dataclass
@@ -153,7 +152,8 @@ class LossConfig:
     use_suit_consistency: bool   # default False
 
 @dataclass
-class TrainConfig:
+class TrainingConfig:
+    mode: str                    # normal | rao_blackwell | branched_rao_blackwell
     iters: int; gd_steps_per_iter: int; minibatch_size: int
     lr: float; adam_betas: tuple; grad_clip: float
     amp: bool; seed: int; checkpoint_every: int; out_dir: str
@@ -162,7 +162,7 @@ class TrainConfig:
 class RootConfig:
     game: GameConfig; rollout: RolloutConfig; completion: CompletionConfig
     model: dict                  # game-owned; poker model config parsed in games/poker
-    loss: LossConfig; train: TrainConfig
+    loss: LossConfig; training: TrainingConfig
     debug_asserts: bool = False
 ```
 
@@ -341,7 +341,7 @@ class NLHEEngine:
     def __init__(self, cfg: PokerConfig): ...          # n_players, stacks in bb, blinds, tick grid
     # StateTable: SoA of packed states; all methods vectorized over int32 state_refs
     # fields: street, board(5 x int8, -1 pad), pot, stacks[P], committed[P], status[P] (live/folded/allin),
-    #         to_act, last_raise, n_raises, action_history (fixed-cap int16 ring)
+    #         to_act, last_raise, n_raises, parent-linked lossless public-history event
 ```
 Engine exposes the `PBGGame` public-tree surface except private-state semantics,
 which live behind `adapter.py`/`mc.py`. `cards.py` exposes
@@ -402,14 +402,15 @@ class PokerGPURejectionSampler: ...        # thin adapter to sample_joint_profil
 class PokerGPUShowdownEvaluator: ...       # thin adapter to evaluate_showdowns
 ```
 `backend="poker_gpu"` resolves only to the public
-`poker_gpu_evaluator.pbg` facade specified in `POKER_GPU_EVALUATOR_IO.md`.
+`poker_gpu_evaluator.pbg` facade specified in
+`archive/POKER_GPU_EVALUATOR_IO.md`.
 The sibling CPU backend is the acceptance oracle. There is no local poker
 reference implementation, generic user-kernel registry, or locally implemented
 CUDA path.
 
 ### P6/P7 — `games/poker/model/*`
 
-`primitives.py` (frozen signatures; semantics in `Docs/MHA_model.md` "Definitions of
+`primitives.py` (frozen signatures; semantics in `docs/MHA_model.md` "Definitions of
 Layer Primitives"):
 
 ```python
@@ -469,7 +470,8 @@ class RolloutBackend(Protocol):
 def sample_trees(bundle, cfg: RolloutConfig, gen) -> tuple[TreeBatch, ReachCache, OldOutCache]
 # K = floor(beta) + Bernoulli(beta-floor(beta)). Every abstract child is stored,
 # including repeated public labels, with edge probability exactly 1/K.
-# beta_mode="sequential" hard-sets beta==1; "fixed" calls backend.beta_fn.
+# training.mode="rao_blackwell" uses the profile-carrying one-child sampler;
+# "fixed" calls backend.beta_fn and draws child-local posterior profiles.
 ```
 `OldOutCache` stores rollout-policy `PolicyOutput` rows at player nodes (for
 policy ratios) so minibatching never re-runs the frozen policy. Production
@@ -589,7 +591,7 @@ approx-KL, ratio clip fraction, value-head explained variance, tree stats
 
 ## 10. Mathematical authority
 
-`docs/latex/core_math.tex` is authoritative. `NOTATION.md` §12 records only
+`docs/theory/core_math.tex` is authoritative. `NOTATION.md` §12 records only
 symbol-level normalizations needed to transcribe internally cross-referenced
 source equations and pseudocode; it does not define alternative mathematics.
 In particular, `is_pre_terminal` identifies a completion cut after which no

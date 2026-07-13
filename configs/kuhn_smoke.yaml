@@ -13,8 +13,7 @@ game:
   poker: null
 rollout:
   n_trees: 512
-  beta_mode: sequential
-  beta_fix: {default: 1.0}
+  beta: null
   node_budget: 128
   reach_storage: full
 completion:
@@ -33,7 +32,8 @@ loss:
   c_h: 0.01
   entropy_schedule: const
   use_suit_consistency: false
-train:
+training:
+  mode: rao_blackwell
   iters: 300
   gd_steps_per_iter: 1
   minibatch_size: 256

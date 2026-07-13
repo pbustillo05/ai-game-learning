@@ -29,7 +29,7 @@ def _install_fake(monkeypatch: pytest.MonkeyPatch, *, version: str = "pbg-v2") -
     facade.PartitionSummaryResult = _FakeResult  # type: ignore[attr-defined]
 
     def partition_many(**kwargs: Any) -> _FakeResult:
-        calls.update(kwargs)
+        calls.setdefault("all", []).append(kwargs)
         board = kwargs["board_cards"]
         batch_size = board.shape[0]
         device = board.device
@@ -44,7 +44,7 @@ def _install_fake(monkeypatch: pytest.MonkeyPatch, *, version: str = "pbg-v2") -
             output_valid=torch.ones(batch_size, dtype=torch.bool, device=device),
             metadata={"backend": "fake", "api_version": "pbg-v2"},
         )
-        calls["_result"] = result
+        calls.setdefault("_results", []).append(result)
         return result
 
     facade.partition_many = partition_many  # type: ignore[attr-defined]
@@ -98,24 +98,19 @@ def test_import_is_lazy_and_exact_facade_mapping(monkeypatch: pytest.MonkeyPatch
         folded=folded,
     )
 
-    sibling_result = calls.pop("_result")
-    assert set(calls) == {
-        "board_cards",
-        "range_weights",
-        "row_mask",
-    }
-    assert calls["board_cards"].dtype == torch.uint8
-    assert calls["board_cards"].tolist() == [[0, 5, 9, 255, 255], [4, 8, 12, 16, 20]]
-    assert calls["board_cards"].is_contiguous()
-    assert calls["range_weights"].shape == (2, 5, 1326)
-    assert torch.equal(calls["range_weights"][:, :2], live)
-    assert torch.equal(calls["range_weights"][:, 2:], folded.reach_weights)
-    assert calls["range_weights"].is_contiguous()
-    assert calls["row_mask"].tolist() == [
-        [True, True, True, False, True],
-        [True, True, False, True, False],
-    ]
-    assert calls["row_mask"].is_contiguous()
+    sibling_result = calls["_results"][0]
+    combined, per_folder = calls["all"]
+    assert set(combined) == {"board_cards", "range_weights", "row_mask"}
+    assert combined["board_cards"].dtype == torch.uint8
+    assert combined["board_cards"].tolist() == [[0, 5, 9, 255, 255], [4, 8, 12, 16, 20]]
+    assert combined["board_cards"].is_contiguous()
+    assert combined["range_weights"].shape == (2, 3, 1326)
+    assert torch.equal(combined["range_weights"], folded.reach_weights)
+    assert combined["range_weights"].is_contiguous()
+    assert combined["row_mask"].tolist() == folded.folder_mask.tolist()
+    assert combined["row_mask"].is_contiguous()
+    assert per_folder["range_weights"].shape == (3, 1, 1326)
+    assert per_folder["row_mask"].all()
     assert isinstance(result_type(**{
         "base_log_z": output.fields["base_log_z"],
         "single_card_log_ratio": output.fields["single_card_log_ratio"],
@@ -128,6 +123,13 @@ def test_import_is_lazy_and_exact_facade_mapping(monkeypatch: pytest.MonkeyPatch
         "single_card_log_ratio",
         "pair_card_log_ratio",
         "output_valid",
+        "folder_log_mass",
+        "folder_single_card_log_ratio",
+        "folder_pair_card_log_ratio",
+        "folder_output_valid",
+        "folder_mask",
+        "folder_line_meta",
+        "folder_seat",
     }
     assert output.fields["base_log_z"].shape == (2,)
     assert output.fields["single_card_log_ratio"].shape == (2, 52)
@@ -138,6 +140,30 @@ def test_import_is_lazy_and_exact_facade_mapping(monkeypatch: pytest.MonkeyPatch
     assert output.fields["pair_card_log_ratio"] is sibling_result.pair_card_log_ratio
     assert output.fields["output_valid"] is sibling_result.output_valid
     assert output.metadata is sibling_result.metadata
+
+
+def test_no_folder_summary_is_exactly_neutral_and_skips_facade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, _ = _install_fake(monkeypatch)
+    from pbg.games.poker.folded import FoldSnapshotBatch, PokerGPUPartitionAdapter
+
+    board = torch.full((2, 5), -1, dtype=torch.int16)
+    folded = FoldSnapshotBatch(
+        reach_weights=torch.empty((2, 0, 1326), dtype=torch.float32),
+        board_at_fold=torch.empty((2, 0, 5), dtype=torch.uint8),
+        line_meta=torch.empty((2, 0, 8), dtype=torch.float32),
+        folder_mask=torch.empty((2, 0), dtype=torch.bool),
+    )
+    output = PokerGPUPartitionAdapter().summarize(
+        board_cards=board,
+        live_range_weights=torch.rand(2, 3, 1326),
+        folded=folded,
+    )
+    assert "all" not in calls
+    assert torch.count_nonzero(output.fields["single_card_log_ratio"]) == 0
+    assert torch.count_nonzero(output.fields["pair_card_log_ratio"]) == 0
+    assert output.fields["output_valid"].all()
 
 
 def test_version_and_result_contract_errors(monkeypatch: pytest.MonkeyPatch) -> None:

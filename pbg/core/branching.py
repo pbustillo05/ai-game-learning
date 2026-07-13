@@ -81,9 +81,9 @@ def _sample_branched_labeled(
     device = torch.device(backend.device)
     if torch.device(gen.device) != device:
         raise ValueError("rollout generator must be created on the backend device")
-    beta_mode = getattr(rollout_cfg, "beta_mode", None)
+    beta_mode = getattr(rollout_cfg, "beta_mode", "fixed")
     if beta_mode not in {"sequential", "fixed"}:
-        raise ValueError("beta_mode must be 'sequential' or 'fixed'")
+        raise ValueError("legacy beta_mode must be 'sequential' or 'fixed'")
     if rollout_cfg.reach_storage not in {"full", "decisions_only", "recompute"}:
         raise ValueError("unknown reach_storage mode")
     n_trees = int(rollout_cfg.n_trees)
@@ -106,16 +106,16 @@ def _sample_branched_labeled(
     )  # [G,P,X]
     for player, size in enumerate(x_sizes):
         root_reach[:, player, size:] = -torch.inf
-    reach_rows = torch.empty(
-        (buffer.node_capacity, p_max, x_max), dtype=torch.float32, device=device
-    )  # [capacity,P,X]
-    reach_rows[:n_trees] = root_reach
-    edge_logp = torch.full(
-        (buffer.edge_capacity, x_max), -torch.inf, dtype=torch.float32, device=device
-    )  # [edge_capacity,X]
-    node_value = torch.zeros(
-        (buffer.node_capacity, x_max), dtype=torch.float32, device=device
-    )  # [node_capacity,X]
+    reach_rows: Tensor | None = None
+    if rollout_cfg.reach_storage != "recompute":
+        reach_rows = torch.empty(
+            (buffer.node_capacity, p_max, x_max), dtype=torch.float32, device=device
+        )  # [capacity,P,X]
+        reach_rows[:n_trees] = root_reach
+    policy_edge_ids: list[Tensor] = []
+    policy_edge_logp: list[Tensor] = []
+    policy_node_ids: list[Tensor] = []
+    policy_node_values: list[Tensor] = []
 
     frontier_nodes = root_nodes
     frontier_states = roots
@@ -206,14 +206,16 @@ def _sample_branched_labeled(
         child_nodes = buffer.append_children(
             parents, next_states, next_owner, events.public_id, weights
         )  # [C_new]
-        reach_rows[child_nodes.to(torch.int64)] = next_reach
+        if reach_rows is not None:
+            reach_rows[child_nodes.to(torch.int64)] = next_reach
 
         if player_positions.numel() != 0:
             assert player_logp is not None and player_output is not None
             edge_rows = torch.arange(
                 first_edge, first_edge + child_count, dtype=torch.int64, device=device
             )  # [C_new]
-            edge_logp[edge_rows[player_positions]] = player_logp
+            policy_edge_ids.append(edge_rows[player_positions])
+            policy_edge_logp.append(player_logp)
             decision_parent_positions = (
                 (active_owner >= 0) & (active_owner < p_max)
             ).nonzero().squeeze(1)
@@ -224,9 +226,8 @@ def _sample_branched_labeled(
                     torch.cumsum(player_counts, dim=0)[:-1],
                 )
             )  # [Nd_wave]
-            node_value[active_nodes[decision_parent_positions].to(torch.int64)] = (
-                player_output.v[value_rows].detach().float()
-            )
+            policy_node_ids.append(active_nodes[decision_parent_positions].to(torch.int32))
+            policy_node_values.append(player_output.v[value_rows].detach().float())
 
         frontier_nodes = child_nodes
         frontier_states = next_states
@@ -252,8 +253,8 @@ def _sample_branched_labeled(
         reach_nodes = root_nodes
     reach_cache = ReachCache(
         mode=rollout_cfg.reach_storage,
-        log_r=reach_rows[reach_nodes.to(torch.int64)],
-        node_index=reach_nodes,
+        log_r=root_reach if reach_rows is None else reach_rows[reach_nodes.to(torch.int64)],
+        node_index=root_nodes if reach_rows is None else reach_nodes,
     )
 
     decision_nodes = ((tree.owner >= 0) & (tree.owner < p_max)).nonzero().squeeze(1)
@@ -266,17 +267,21 @@ def _sample_branched_labeled(
             dtype=torch.float32,
             device=device,
         )  # [Nd,K_max,X]
-        edge_parent = buffer.edge_parent[: buffer.edge_count].to(torch.int64)  # [C]
-        player_edge = (tree.owner[edge_parent] >= 0) & (tree.owner[edge_parent] < p_max)
-        edge_ids = torch.arange(buffer.edge_count, device=device)[player_edge]  # [Cd]
-        parent_ids = edge_parent[player_edge]  # [Cd]
+        edge_ids = torch.cat(policy_edge_ids).to(torch.int64)  # [Cd]
+        edge_logp = torch.cat(policy_edge_logp).to(torch.float32)  # [Cd,X]
+        edge_parent = buffer.edge_parent[edge_ids].to(torch.int64)  # [Cd]
+        parent_ids = edge_parent
         node_to_row = torch.full(
             (buffer.node_count,), -1, dtype=torch.int64, device=device
         )  # [N]
         node_to_row[decision_nodes] = torch.arange(decision_nodes.numel(), device=device)
         columns = edge_ids - tree.child_ptr[parent_ids].to(torch.int64)  # [Cd]
-        logp_child[node_to_row[parent_ids], columns] = edge_logp[edge_ids]
-        v_old = node_value[decision_nodes]  # [Nd,X]
+        logp_child[node_to_row[parent_ids], columns] = edge_logp
+        cached_nodes = torch.cat(policy_node_ids).to(torch.int32)
+        cached_values = torch.cat(policy_node_values).to(torch.float32)
+        if not torch.equal(cached_nodes, decision_nodes):
+            raise RuntimeError("branched rollout omitted a player decision cache row")
+        v_old = cached_values  # [Nd,X]
     else:
         logp_child = torch.empty((0, 0, x_max), dtype=torch.float32, device=device)
         v_old = torch.empty((0, x_max), dtype=torch.float32, device=device)

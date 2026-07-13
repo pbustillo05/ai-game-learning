@@ -1,6 +1,6 @@
 # NOTATION.md — Mathematical Specification for Implementation
 
-**Status: implementation companion to `docs/latex/core_math.tex`.**
+**Status: implementation companion to `docs/theory/core_math.tex`.**
 `core_math.tex` is the mathematical source of truth. This file maps its symbols
 and algorithms to implementation objects; it does not supersede or silently
 change the source. §12 records the few typographical normalizations needed to
@@ -123,6 +123,11 @@ within-trajectory uniform choice. Needed only for analysis/tests, not implementa
   one “true” profile per tree and condition the whole tree on it: that correlates
   sibling subtrees and voids the locality/convergence guarantees. Every node's event
   draws use fresh, node-local posterior draws.
+- The optimized `training.mode="rao_blackwell"` implementation does not invoke this
+  branching construction with `K_σ=1` mechanically. It samples one profile from
+  μ at each root and carries it along the single path, exactly as
+  `SamplePreTerminal`. The resulting public-trajectory law is the same, without
+  repeated posterior sampling.
 - Every abstract child is stored separately, even when two children have the
   same public event label. Each outgoing sampled-tree edge has probability
   `1/K_σ`. Equal-labeled nodes may share immutable public-state payloads but
@@ -239,11 +244,12 @@ later defining recursion.
 
 ## 9. Fixed intensities (v1)
 
-The active implementation accepts only `beta_mode="sequential"` and
-`beta_mode="fixed"`. A game-owned batched `beta_fn(states) -> float32[B]`
-returns public-stage-dependent values in [1,∞): poker uses preflop/flop/turn/
-river (and optional chance-transition buckets), while synthetic games use
-betting round/chance phase. There is no learned controller state.
+The active implementation exposes `training.mode` as `normal`,
+`rao_blackwell`, or `branched_rao_blackwell`. Only the branched mode accepts a
+`rollout.beta` map. A game-owned batched `beta_fn(states) -> float32[B]` returns
+public-stage-dependent values in [1,∞): poker uses preflop/flop/turn/river (and
+optional chance-transition buckets), while synthetic games use betting
+round/chance phase. There is no learned controller state.
 
 The Neyman proxy based on public **V** and U heads remains a deliberately
 naïve research direction in `core_math.tex`. Its heads, estimators, losses and
@@ -305,7 +311,7 @@ Entropy follows `entropy_schedule`; all type sums are explicitly masked.
   representation map, not a private-state law.
 - **Private poker math.** Completion/equity coefficients, exact joint profiles,
   partition summaries, and fixed-showdown per-stratum winner shares use
-  `poker_gpu_evaluator.pbg` under `POKER_GPU_EVALUATOR_IO.md`. The sibling CPU
+  `poker_gpu_evaluator.pbg` under `archive/POKER_GPU_EVALUATOR_IO.md`. The sibling CPU
   backend is the reference oracle. Locally, a sampled actor combo merely selects
   one action-head row; a supplied unavailable-card set merely defines the
   complement from which the next board card(s) are sampled uniformly.

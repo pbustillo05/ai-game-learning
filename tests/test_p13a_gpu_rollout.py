@@ -12,13 +12,15 @@ import pytest
 import torch
 from torch import Tensor
 
+from pbg.core.config import load_config
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
 from pbg.core.game import GameBundle
 from pbg.core.rollout import sample_trees
-from pbg.games.poker.adapter import PokerPolicyAdapter
+from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
 from pbg.games.poker.engine import (
     ALL_IN,
     CHECK_CALL,
+    FOLD,
     FOLDED,
     LIVE,
     RAISE_OFFSET,
@@ -27,7 +29,8 @@ from pbg.games.poker.engine import (
     _State,
 )
 from pbg.games.poker.folded import PartitionSummaryBatch
-from pbg.games.poker.model.preflop import PolicyOutput
+from pbg.games.poker.model.postflop import PostflopNet
+from pbg.games.poker.model.preflop import PokerModelConfig, PolicyOutput, PreflopNet
 from pbg.games.poker.rollout_backend import PokerRolloutBackend
 from pbg.games.poker.tensor_state import PokerTensorStateStore
 
@@ -99,6 +102,48 @@ class _RecordingModel:
         return self._output(ranges.shape[0], 1326, ranges.device)
 
 
+class _AlwaysCheckModel(_RecordingModel):
+    """Deterministic legal check/call policy used to reach every board street."""
+
+    @staticmethod
+    def _output(batch: int, rows: int, device: torch.device) -> PolicyOutput:
+        output = _RecordingModel._output(batch, rows, device)
+        output.raw["type_logits"][..., 0] = 20.0
+        output.raw["type_logits"][..., 1:] = -20.0
+        return output
+
+    @staticmethod
+    def _prefer_check_call(output: PolicyOutput, pub: Any) -> PolicyOutput:
+        facing = pub.legality_summary[:, 0].bool()
+        logits = output.raw["type_logits"]
+        logits[facing, :, 0] = -20.0
+        logits[facing, :, 1] = 20.0
+        return output
+
+    def forward_preflop(
+        self, pub: Any, ranges: Tensor, actor: Tensor, masks: Any
+    ) -> PolicyOutput:
+        del actor, masks
+        return self._prefer_check_call(self._output(ranges.shape[0], 169, ranges.device), pub)
+
+    def forward_postflop(
+        self, pub: Any, ranges: Tensor, actor: Tensor, masks: Any
+    ) -> PolicyOutput:
+        del actor, masks
+        return self._prefer_check_call(self._output(ranges.shape[0], 1326, ranges.device), pub)
+
+
+class _AlwaysFoldModel(_RecordingModel):
+    """Deterministic fold policy for a player-edge replay check."""
+
+    @staticmethod
+    def _output(batch: int, rows: int, device: torch.device) -> PolicyOutput:
+        output = _RecordingModel._output(batch, rows, device)
+        output.raw["type_logits"][..., 0] = 20.0
+        output.raw["type_logits"][..., 1:] = -20.0
+        return output
+
+
 def _backend(
     cfg: PokerConfig,
     capacity: int = 4096,
@@ -143,11 +188,13 @@ def test_tensor_store_has_required_device_soa_and_prefix_allocation() -> None:
     assert torch.equal(handles, torch.tensor([0, -1, 1, 2], dtype=torch.int32))
     required = {
         "stacks", "committed_street", "committed_total", "status", "acted",
-        "reopen_mask", "actor", "street", "button", "n_raises", "phase",
-        "board", "last_full_raise", "current_bet", "action_history",
-        "history_length", "fold_payoff",
-    }
+            "reopen_mask", "actor", "street", "button", "n_raises", "phase",
+            "board", "last_full_raise", "current_bet", "history_parent", "history_event",
+            "history_length", "fold_payoff",
+        }
     assert required.issubset(vars(store))
+    assert "action_history" not in vars(store)
+    assert store.history_parent.shape == store.history_event.shape == (16,)
     assert all(value.device.type == "cpu" for value in vars(store).values() if isinstance(value, Tensor))
 
 
@@ -164,6 +211,7 @@ def test_random_legal_trajectories_match_cpu_engine_step_for_step() -> None:
             assert int(backend.classify(ref)[0]) == cpu_owner
             if cpu_owner in {PRETERM, TERMINAL}:
                 break
+            parent_ref = ref.clone()
             if cpu_owner == CHANCE:
                 street = cpu.states.street[cpu_ref]
                 used = {card for card in cpu.states.board[cpu_ref] if card >= 0}
@@ -173,6 +221,7 @@ def test_random_legal_trajectories_match_cpu_engine_step_for_step() -> None:
                 cards = torch.tensor([padded], dtype=torch.int16)
                 cpu_ref = int(cpu.deal(torch.tensor([cpu_ref]), cards)[0])
                 ref = backend.step(ref, EventBatch(torch.zeros(1, dtype=torch.int32), {"cards": cards}))
+                expected_history_event = -1
             else:
                 cpu_ids, cpu_mask = cpu.legal_events(torch.tensor([cpu_ref], dtype=torch.int32))
                 ids, mask = backend.legal_events(ref)
@@ -185,9 +234,42 @@ def test_random_legal_trajectories_match_cpu_engine_step_for_step() -> None:
                 event = rng.choice(legal)
                 cpu_ref = int(cpu.step(torch.tensor([cpu_ref]), torch.tensor([event]))[0])
                 ref = backend.step(ref, EventBatch(torch.tensor([event], dtype=torch.int32)))
+                expected_history_event = event
+            row = ref.long()
+            assert torch.equal(backend.states.history_parent[row], parent_ref)
+            assert int(backend.states.history_event[row][0]) == expected_history_event
             _compare_state(cpu, cpu_ref, backend, ref)
         else:
             raise AssertionError("legal poker trajectory exceeded test horizon")
+
+
+def test_parent_linked_history_reconstructs_exact_actions_arithmetic_and_streets() -> None:
+    cfg = PokerConfig(n_players=2, stack_bb=20.0, n_ticks=5)
+    backend = _backend(cfg)
+    root = backend.root_states(1)
+    raised = backend.step(
+        root, EventBatch(torch.tensor([RAISE_OFFSET], dtype=torch.int32))
+    )
+    called = backend.step(
+        raised, EventBatch(torch.tensor([CHECK_CALL], dtype=torch.int32))
+    )
+    flop = backend.step(
+        called,
+        EventBatch(
+            torch.zeros(1, dtype=torch.int32),
+            {"cards": torch.tensor([[3, 8, 11]], dtype=torch.int16)},
+        ),
+    )
+    history = backend.encode_public(flop).history
+    assert history is not None
+    assert history.mask.tolist() == [[True, True, True]]
+    assert history.actor.tolist() == [[0, 1, -1]]
+    assert history.street.tolist() == [[0, 0, 1]]
+    assert history.action.tolist() == [[2, 1, 3]]
+    torch.testing.assert_close(history.amount, torch.tensor([[2.0, 1.0, 0.0]]))
+    torch.testing.assert_close(history.pot_before, torch.tensor([[1.5, 3.0, 4.0]]))
+    torch.testing.assert_close(history.call_amount, torch.tensor([[0.5, 1.0, 0.0]]))
+    assert backend.states.history_parent.numel() == backend.states.capacity
 
 
 def _install_state(backend: PokerRolloutBackend, state: _State) -> Tensor:
@@ -288,9 +370,35 @@ def test_policy_routes_one_large_preflop_and_one_shared_postflop_queue() -> None
     assert backend.batch_size_histograms == {"preflop": [32], "postflop_2": [32]}
 
 
+def test_policy_planner_mixes_postflop_streets_and_splits_live_counts() -> None:
+    cfg = PokerConfig(n_players=3, n_ticks=3)
+    backend = _backend(cfg)
+    backend.execution_profile = load_config(
+        "configs/train/nlhe6.yaml", hardware_profile="local_3x2080ti"
+    ).hardware
+    states = backend.root_states(4)
+    rows = states.long()
+    backend.states.street[rows] = torch.tensor(
+        [1, 2, 3, 1], dtype=backend.states.street.dtype
+    )
+    backend.states.status[rows] = torch.tensor(
+        [[0, 0, 1], [0, 0, 1], [0, 0, 1], [0, 0, 0]],
+        dtype=backend.states.status.dtype,
+    )
+    model = PokerModelBundle(
+        PreflopNet(PokerModelConfig(max_players=3)),
+        PostflopNet(PokerModelConfig(max_players=3)),
+    )
+    plans = backend.plan_policy_batches(model, states, "training")
+    assert len(plans) == 2
+    mixed = next(plan for plan in plans if plan.numel() == 3)
+    assert set(backend.states.street[rows[mixed]].tolist()) == {1, 2, 3}
+
+
 def test_core_sampler_accumulates_many_trees_before_model_forward() -> None:
     cfg = PokerConfig(n_players=2, stack_bb=4.0, n_ticks=3)
-    backend = _backend(cfg, capacity=2048)
+    profiles = _Profiles()
+    backend = _backend(cfg, capacity=2048, profile_sampler=profiles)
     model = _RecordingModel()
     rollout = SimpleNamespace(
         n_trees=16, node_budget=64, beta_mode="sequential", reach_storage="full"
@@ -305,6 +413,78 @@ def test_core_sampler_accumulates_many_trees_before_model_forward() -> None:
     assert reach.log_r.device == backend.device
     assert policy.old_v.shape[0] > len(model.calls) and policy.old_v.shape[1] == 1326
     assert all(batch > 1 for _, batch, _ in model.calls)
+    assert profiles.devices == [backend.device]
+
+
+@pytest.mark.parametrize(
+    ("beta_mode", "beta_fix"),
+    (("sequential", {"default": 1.0}), ("fixed", {"default": 1.0, "preflop": 2.0})),
+)
+def test_poker_recompute_replays_postflop_reach_exactly(
+    beta_mode: str, beta_fix: dict[str, float]
+) -> None:
+    """Full and replayed poker reaches agree through flop, turn, and river."""
+
+    cfg = PokerConfig(n_players=2, stack_bb=2.0, n_ticks=2)
+    model = _AlwaysCheckModel()
+    common = dict(n_trees=2, node_budget=64, beta_mode=beta_mode, beta_fix=beta_fix)
+    full_backend = _backend(cfg, capacity=256, beta_fix=beta_fix)
+    replay_backend = _backend(cfg, capacity=256, beta_fix=beta_fix)
+    full_tree, full_reach, full_policy = sample_trees(
+        GameBundle(model, full_backend, PokerPolicyAdapter(2), None),
+        SimpleNamespace(**common, reach_storage="full"),
+        torch.Generator().manual_seed(731),
+    )
+    replay_tree, replay_reach, replay_policy = sample_trees(
+        GameBundle(model, replay_backend, PokerPolicyAdapter(2), None),
+        SimpleNamespace(**common, reach_storage="recompute"),
+        torch.Generator().manual_seed(731),
+    )
+    for field in ("parent", "child_ptr", "child_node", "child_event", "owner", "state_ref"):
+        assert torch.equal(getattr(replay_tree, field), getattr(full_tree, field))
+    node_ids = torch.arange(full_tree.parent.numel(), dtype=torch.int32)
+    expected = full_reach.rows_for(full_tree, node_ids, full_backend, full_policy)
+    actual = replay_reach.rows_for(replay_tree, node_ids, replay_backend, replay_policy)
+    assert torch.equal(actual, expected)
+
+    streets = replay_backend.states.street[replay_tree.state_ref.long()]
+    assert bool(((replay_tree.owner >= 0) & (streets > 0)).any())
+    events = replay_tree.child_event
+    assert bool(((events >= 100_000) & (events < 200_000)).any())
+    assert bool(((events >= 200_000) & (events < 300_000)).any())
+    assert bool(((events >= 300_000) & (events < 400_000)).any())
+    if beta_mode == "fixed":
+        has_duplicate_label = False
+        for parent in range(replay_tree.parent.numel()):
+            start, stop = int(replay_tree.child_ptr[parent]), int(replay_tree.child_ptr[parent + 1])
+            labels = replay_tree.child_event[start:stop]
+            has_duplicate_label |= labels.numel() > labels.unique().numel()
+        assert has_duplicate_label
+
+
+def test_poker_recompute_replays_fold_reach_exactly() -> None:
+    cfg = PokerConfig(n_players=2, stack_bb=2.0, n_ticks=2)
+    rollout = SimpleNamespace(
+        n_trees=2, node_budget=8, beta_mode="sequential", reach_storage="full"
+    )
+    full_backend = _backend(cfg, capacity=32)
+    replay_backend = _backend(cfg, capacity=32)
+    model = _AlwaysFoldModel()
+    full_tree, full_reach, full_policy = sample_trees(
+        GameBundle(model, full_backend, PokerPolicyAdapter(2), None),
+        rollout,
+        torch.Generator().manual_seed(732),
+    )
+    replay_tree, replay_reach, replay_policy = sample_trees(
+        GameBundle(model, replay_backend, PokerPolicyAdapter(2), None),
+        SimpleNamespace(**dict(vars(rollout), reach_storage="recompute")),
+        torch.Generator().manual_seed(732),
+    )
+    node_ids = torch.arange(full_tree.parent.numel(), dtype=torch.int32)
+    expected = full_reach.rows_for(full_tree, node_ids, full_backend, full_policy)
+    actual = replay_reach.rows_for(replay_tree, node_ids, replay_backend, replay_policy)
+    assert torch.equal(actual, expected)
+    assert bool((replay_tree.child_event == FOLD).any())
 
 
 def test_completion_inputs_are_device_facade_tensors_and_conserve_pots() -> None:

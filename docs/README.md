@@ -1,8 +1,8 @@
 # Implementation documentation
 
 This directory documents the repository as it exists now. The implementation
-prompts in `Prompts/` are retained as development history; they are not a setup
-or execution sequence.
+prompts in `../archive/prompts/` are retained as development history; they are
+not a setup or execution sequence.
 
 Start here:
 
@@ -21,21 +21,22 @@ Start here:
   the shipped presets.
 - [File reference](file_reference.md) gives a purpose and status for every
   tracked file in the repository, including tests and historical prompts.
+- [Audit](audit/README.md) records repository-readiness findings, validation
+  probes, and resolved items.
 
 The mathematical and interface authorities remain:
 
-- [`../docs/latex/core_math.tex`](latex/core_math.tex) — mathematical source of
+- [`theory/core_math.tex`](theory/core_math.tex) — mathematical source of
   truth.
 - [`../NOTATION.md`](../NOTATION.md) — mapping from the mathematics to code.
 - [`../CONTRACTS.md`](../CONTRACTS.md) — frozen interfaces and invariants.
-- [`../POKER_GPU_EVALUATOR_IO.md`](../POKER_GPU_EVALUATOR_IO.md) — binding
+- [`../archive/POKER_GPU_EVALUATOR_IO.md`](../archive/POKER_GPU_EVALUATOR_IO.md) — binding
   contract with the sibling poker evaluator.
 
 Two existing research documents have narrower scopes:
 
 - [Poker Player Model](MHA_model.md) specifies the poker network in more
   mathematical detail.
-- [Card Removal from Folded Ranges](folder_impact.md) is background mathematics
+- [Card Removal from Folded Ranges](theory/folder_impact.md) is background mathematics
   owned by the evaluator side of the repository boundary. It is not a local
   implementation specification.
-

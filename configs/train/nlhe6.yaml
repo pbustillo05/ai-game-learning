@@ -1,0 +1,55 @@
+game:
+  name: poker
+  synthetic: null
+  poker:
+    n_players: 6
+    stack_bb: 100.0
+    sb: 0.5
+    bb: 1.0
+    n_ticks: 32
+rollout:
+  n_trees: 8
+  beta:
+    default: 1.0
+    preflop: 1.0
+    flop: 1.05
+    turn: 1.10
+    river: 1.25
+    chance_to_flop: 1.5
+    chance_to_turn: 1.5
+    chance_to_river: 1.5
+  node_budget: 512
+  reach_storage: recompute
+completion:
+  n_samples: 256
+  backend: cuda
+model:
+  d_model: 192
+  n_heads: 6
+  n_layers_pre: 3
+  n_layers_post: 4
+  m_raise: 4
+  k_act: 7
+  max_players: 6
+training:
+  mode: branched_rao_blackwell
+  iters: 10000
+  gd_steps_per_iter: 32
+  minibatch_size: 128
+  lr: 0.0003
+  adam_betas: [0.9, 0.999]
+  grad_clip: 1.0
+  amp: true
+  seed: 23
+  checkpoint_every: 100
+  out_dir: runs/nlhe6
+loss:
+  name: rb_ppo
+  lam: 0.95
+  clip_eps: 0.2
+  clip_eps_v: 0.2
+  c_v: 0.5
+  c_h: 0.01
+  entropy_schedule: const
+  use_suit_consistency: false
+debug_asserts: false

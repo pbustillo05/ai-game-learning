@@ -22,7 +22,13 @@ from pbg.games.poker.folded import PokerGPUPartitionAdapter
 from pbg.games.poker.mc import PokerGPURejectionSampler, PokerGPUShowdownEvaluator
 from pbg.games.poker.model.heads import raise_tick_probs
 from pbg.games.poker.model.postflop import PostflopMasks, PostflopNet
-from pbg.games.poker.model.preflop import PokerPublicBatch, PolicyOutput, PreflopMasks, PreflopNet
+from pbg.games.poker.model.preflop import (
+    PackedPublicHistory,
+    PokerPublicBatch,
+    PolicyOutput,
+    PreflopMasks,
+    PreflopNet,
+)
 from pbg.games.poker.ranges import RangeState
 
 
@@ -204,7 +210,15 @@ class PokerModelBundle(nn.Module):
         values = {}
         for name in pub.__dataclass_fields__:
             value = getattr(pub, name)
-            values[name] = None if value is None else value[rows]
+            if isinstance(value, PackedPublicHistory):
+                values[name] = PackedPublicHistory(
+                    **{
+                        field: getattr(value, field)[rows]
+                        for field in value.__dataclass_fields__
+                    }
+                )
+            else:
+                values[name] = None if value is None else value[rows]
         return PokerPublicBatch(**values)
 
     @staticmethod
@@ -428,11 +442,69 @@ class PokerGame:
         legality = torch.stack((fold_legal, legal[:, CHECK_CALL].float(), raise_fraction), dim=1)
         targets = self.engine.raise_targets(state_refs)
         bounds = torch.stack((targets[:, 0], targets[:, -1]), dim=1)
+        committed_street = torch.tensor(
+            [self.engine.states.committed_street[ref] for ref in refs],
+            dtype=torch.float32,
+            device=device,
+        )
+        current_bet = torch.tensor(
+            [self.engine.states.current_bet[ref] for ref in refs],
+            dtype=torch.float32,
+            device=device,
+        )
+        last_full_raise = torch.tensor(
+            [self.engine.states.last_full_raise[ref] for ref in refs],
+            dtype=torch.float32,
+            device=device,
+        )
+        call_amount = (
+            current_bet - committed_street.gather(1, actor[:, None]).squeeze(1)
+        ).clamp_min(0.0)
+        histories = [self.engine.states.public_history[ref] for ref in refs]
+        width = max((len(row) for row in histories), default=0)
+        history_shape = (len(refs), width)
+        history_actor = torch.full(history_shape, -1, dtype=torch.long, device=device)
+        history_street = torch.full(history_shape, -1, dtype=torch.long, device=device)
+        history_action = torch.full(history_shape, -1, dtype=torch.long, device=device)
+        history_mask = torch.zeros(history_shape, dtype=torch.bool, device=device)
+        history_float = {
+            name: torch.zeros(history_shape, dtype=torch.float32, device=device)
+            for name in (
+                "amount", "pot_before", "call_amount", "current_bet",
+                "min_raise_to", "max_raise_to",
+            )
+        }
+        for row_index, row in enumerate(histories):
+            for column, event in enumerate(row):
+                history_actor[row_index, column] = event.actor
+                history_street[row_index, column] = event.street
+                history_action[row_index, column] = event.action
+                history_mask[row_index, column] = True
+                for name in history_float:
+                    history_float[name][row_index, column] = getattr(event, name)
         return PokerPublicBatch(
             street=street, board=board.long(), pot=pot, stacks=stacks, committed=committed,
             to_act=actor, legality_summary=legality,
             n_ticks=torch.full((len(refs),), self.engine.n_ticks, dtype=torch.long, device=device),
-            raise_grid_bounds=bounds, status=status, seat_mask=torch.ones_like(status, dtype=torch.bool), button=button,
+            raise_grid_bounds=bounds,
+            status=status,
+            seat_mask=torch.ones_like(status, dtype=torch.bool),
+            button=button,
+            committed_street=committed_street,
+            call_amount=call_amount,
+            current_bet=current_bet,
+            min_raise_to=targets[:, 0],
+            max_raise_to=targets[:, -1],
+            last_full_raise=last_full_raise,
+            legal_action_mask=legal,
+            raise_ticks=targets,
+            history=PackedPublicHistory(
+                actor=history_actor,
+                street=history_street,
+                action=history_action,
+                mask=history_mask,
+                **history_float,
+            ),
         )
 
     def reach_update(self, log_r_rows: Tensor, state_refs: Tensor, event_ids: Tensor, policy_rows: Tensor) -> Tensor:

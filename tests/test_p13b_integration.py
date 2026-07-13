@@ -15,6 +15,7 @@ from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
 from pbg.games.poker.cards import validate_evaluator_combo_cards
 from pbg.games.poker.folded import PokerGPUPartitionAdapter
 from pbg.games.poker.mc import PokerGPUCompletion
+from pbg.games.poker.bundle import estimate_rollout_memory
 from pbg.games.poker.rollout_backend import PokerRolloutBackend
 
 
@@ -44,8 +45,8 @@ def _small_poker_cfg(tmp_path: Path):
     }
     cfg.rollout.n_trees = 2
     cfg.rollout.node_budget = 64
-    cfg.rollout.beta_mode = "sequential"
-    cfg.rollout.beta_fix = {"default": 1.0}
+    cfg.training.mode = "rao_blackwell"
+    cfg.rollout.beta = None
     cfg.rollout.reach_storage = "full"
     cfg.completion.n_samples = 8
     cfg.completion.backend = "cpu"
@@ -92,8 +93,36 @@ def test_all_first_run_presets_load_strictly_without_deferred_settings() -> None
     }
     nlhe = loaded["nlhe6_h100.yaml"]
     assert nlhe.game.poker["n_players"] == 6
+    assert nlhe.rollout.n_trees == 8 and nlhe.rollout.node_budget == 512
+    assert nlhe.train.minibatch_size == 2
     assert nlhe.completion.backend == "cuda"
     assert nlhe.train.iters == 10_000 and nlhe.train.checkpoint_every == 100
+
+
+def test_poker_rollout_memory_plan_bounds_recompute_and_full_storage() -> None:
+    safe = estimate_rollout_memory(
+        n_trees=8, node_budget=512, n_players=6, reach_storage="recompute"
+    )
+    legacy = estimate_rollout_memory(
+        n_trees=256, node_budget=8192, n_players=6, reach_storage="recompute"
+    )
+    full = estimate_rollout_memory(
+        n_trees=256, node_budget=8192, n_players=6, reach_storage="full"
+    )
+    gib = 1024**3
+    assert safe.capacity == 4096
+    assert safe.peak_bytes < gib
+    assert legacy.frontier_reach_bytes > 100 * gib
+    assert full.reach_cache_bytes > 60 * gib
+
+
+def test_h100_bootstrap_bundle_constructs_without_capacity_sized_history() -> None:
+    cfg = load_config(ROOT / "configs" / "nlhe6_h100.yaml")
+    bundle = build_game_bundle(cfg, torch.device("cpu"))
+    backend = bundle.rollout_backend
+    assert backend.rollout_memory_plan.peak_bytes == 306_318_404
+    assert "action_history" not in vars(backend.states)
+    assert backend.states.history_parent.shape == (4_096,)
 
 
 def test_explicit_registry_builds_one_owning_poker_model(tmp_path: Path) -> None:
@@ -150,3 +179,20 @@ def test_three_iteration_cpu_sibling_smoke_is_finite_and_checkpoints(tmp_path: P
         torch.zeros(2),
         atol=1e-6,
     )
+
+
+def test_normal_poker_settles_sampled_showdown_without_completion(tmp_path: Path) -> None:
+    pytest.importorskip("poker_gpu_evaluator.pbg")
+    cfg = _small_poker_cfg(tmp_path)
+    cfg.training.mode = "normal"
+    cfg.completion.n_samples = None
+    cfg.loss.name = "ppo"
+    cfg.train.iters = 1
+    cfg.train.out_dir = str(tmp_path / "poker_normal")
+    bundle = build_game_bundle(cfg, torch.device("cpu"))
+    assert bundle.completion_backend is None
+    train(cfg)
+    record = json.loads(
+        (Path(cfg.train.out_dir) / "metrics.jsonl").read_text().splitlines()[0]
+    )
+    assert torch.isfinite(torch.tensor(record["loss"]))

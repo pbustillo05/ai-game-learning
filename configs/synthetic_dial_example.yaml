@@ -13,8 +13,7 @@ game:
   poker: null
 rollout:
   n_trees: 128
-  beta_mode: fixed
-  beta_fix:
+  beta:
     default: 1.0
     round_0: 1.25
     chance_round_1: 1.5
@@ -38,7 +37,8 @@ loss:
   c_h: 0.01
   entropy_schedule: const
   use_suit_consistency: false
-train:
+training:
+  mode: branched_rao_blackwell
   iters: 1000
   gd_steps_per_iter: 4
   minibatch_size: 256

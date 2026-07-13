@@ -5,7 +5,7 @@
 > repository. `ai-game-learning` may consume versioned partition/folded-card
 > summaries from the sibling facade, but must not implement the partition,
 > removal-set, collision, or Monte Carlo machinery described below. Binding
-> implementation ownership is defined by `POKER_GPU_EVALUATOR_IO.md`.
+> implementation ownership is defined by `archive/POKER_GPU_EVALUATOR_IO.md`.
 
 **Scope.** This document is self-contained mathematics. It (1) states the problem
 of how folded players' ranges bias the joint distribution of live hands and

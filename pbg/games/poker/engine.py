@@ -56,6 +56,21 @@ class PokerConfig:
 
 
 @dataclass(frozen=True)
+class PublicHistoryEvent:
+    """One lossless public action or street-separator record."""
+
+    actor: int
+    street: int
+    action: int
+    amount: float
+    pot_before: float
+    call_amount: float
+    current_bet: float
+    min_raise_to: float
+    max_raise_to: float
+
+
+@dataclass(frozen=True)
 class _State:
     street: int
     board: tuple[int, ...]
@@ -73,6 +88,7 @@ class _State:
     n_raises: int
     action_history: tuple[int, ...]
     fold_payoff: tuple[float, ...] | None = None
+    public_history: tuple[PublicHistoryEvent, ...] = ()
 
 
 class StateTable:
@@ -103,6 +119,7 @@ class StateTable:
         self.n_raises: list[int] = []
         self.action_history: list[tuple[int, ...]] = []
         self.fold_payoff: list[tuple[float, ...] | None] = []
+        self.public_history: list[tuple[PublicHistoryEvent, ...]] = []
 
     def append(self, state: _State) -> int:
         ref = len(self.street)
@@ -127,6 +144,7 @@ class StateTable:
         self.n_raises.append(state.n_raises)
         self.action_history.append(state.action_history)
         self.fold_payoff.append(state.fold_payoff)
+        self.public_history.append(state.public_history)
         return ref
 
     def state(self, ref: int) -> _State:
@@ -148,6 +166,7 @@ class StateTable:
             n_raises=self.n_raises[ref],
             action_history=self.action_history[ref],
             fold_payoff=self.fold_payoff[ref],
+            public_history=self.public_history[ref],
         )
 
     def __len__(self) -> int:
@@ -447,6 +466,29 @@ class NLHEEngine:
         current_bet = state.current_bet
         last_full_raise = state.last_full_raise
         n_raises = state.n_raises
+        targets, _ = self._raise_grid(state)
+        call_amount = max(0.0, current_bet - street_commit[actor])
+        maximum = street_commit[actor] + stacks[actor]
+        minimum = min(maximum, current_bet + last_full_raise)
+        action = 0 if event == FOLD else 1 if event == CHECK_CALL else 2
+        amount = (
+            min(stacks[actor], call_amount)
+            if event == CHECK_CALL
+            else targets[event - RAISE_OFFSET]
+            if event >= RAISE_OFFSET
+            else 0.0
+        )
+        history_event = PublicHistoryEvent(
+            actor=actor,
+            street=state.street,
+            action=action,
+            amount=float(amount),
+            pot_before=float(sum(state.committed_total)),
+            call_amount=float(call_amount),
+            current_bet=float(current_bet),
+            min_raise_to=float(minimum),
+            max_raise_to=float(maximum),
+        )
 
         if event == FOLD:
             status[actor] = FOLDED
@@ -461,7 +503,6 @@ class NLHEEngine:
                 stacks[actor] = 0.0
                 status[actor] = ALL_IN
         else:
-            targets, _ = self._raise_grid(state)
             target = targets[event - RAISE_OFFSET]
             addition = target - street_commit[actor]
             old_bet = current_bet
@@ -496,6 +537,7 @@ class NLHEEngine:
             betting_closed=False,
             n_raises=n_raises,
             action_history=state.action_history + (event,),
+            public_history=state.public_history + (history_event,),
         )
         if len(self._still_contesting(updated.status)) == 1:
             return self._finish_fold(updated)
@@ -580,6 +622,19 @@ class NLHEEngine:
                 betting_closed=False,
                 n_raises=0,
                 action_history=state.action_history,
+                public_history=state.public_history + (
+                    PublicHistoryEvent(
+                        actor=-1,
+                        street=street,
+                        action=3,
+                        amount=0.0,
+                        pot_before=float(sum(state.committed_total)),
+                        call_amount=0.0,
+                        current_bet=0.0,
+                        min_raise_to=0.0,
+                        max_raise_to=0.0,
+                    ),
+                ),
             )
             successors.append(self.states.append(next_state))
         return torch.tensor(successors, dtype=torch.int32, device=device)

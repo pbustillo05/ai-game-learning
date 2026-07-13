@@ -5,7 +5,7 @@ imperfect-information games. It implements policy-gradient self-play for finite
 public-action Bayesian games, with exact synthetic card games for validation
 and no-limit Texas hold'em as the main large-scale domain.
 
-The implementation plan in `Prompts/` is complete. Those files remain as
+The implementation plan in `archive/prompts/` is complete. Those files remain as
 development history; this README describes the repository as a normal,
 implemented project.
 
@@ -47,11 +47,11 @@ navigation, policies, ranges, pots, and chip-EV assembly.
 `poker_gpu_evaluator.pbg` owns collision-conditioned private profiles,
 folded-card partition summaries, completion/equity, hand comparison, ties, and
 per-pot winner shares. See
-[`POKER_GPU_EVALUATOR_IO.md`](POKER_GPU_EVALUATOR_IO.md).
+[`archive/POKER_GPU_EVALUATOR_IO.md`](archive/POKER_GPU_EVALUATOR_IO.md).
 
 ## Requirements and installation
 
-- Python 3.11+
+- Python 3.10+
 - PyTorch 2.2+
 - NumPy, PyYAML, and pytest
 - The sibling `poker-gpu-evaluator` repository for poker completion and
@@ -75,7 +75,8 @@ Complete presets are provided in `configs/`:
 - `kuhn_smoke.yaml` — small sequential Kuhn run.
 - `leduc.yaml` — fixed-intensity Leduc branching.
 - `synthetic_dial_example.yaml` — scalable three-player synthetic example.
-- `nlhe6_h100.yaml` — conservative first-profile six-player CUDA NLHE run.
+- `train/nlhe6.yaml` — hardware-independent six-player NLHE settings; combine
+  with a profile under `configs/hardware/`.
 
 Configuration loading rejects unknown or missing fields. Game-owned mappings
 are validated when their bundle is constructed. See
@@ -84,16 +85,24 @@ schema and preset details.
 
 ## Training
 
-There is no console-script wrapper yet. Run a preset through the Python API:
+Long-running training accepts a scientific config and a separate hardware
+profile:
 
 ```bash
-/home/pablob/.venvs/poker/bin/python - <<'PY'
-from pbg.core.config import load_config
-from pbg.core.training import train
-
-train(load_config("configs/kuhn_smoke.yaml"))
-PY
+pbg-train \
+  --config configs/train/nlhe6.yaml \
+  --hardware-profile local_3x2080ti
 ```
+
+The equivalent Python API is
+`load_config(path, hardware_profile="local_3x2080ti")`. Hardware profiles
+control execution ceilings and launch metadata only; they do not alter the
+game, model, estimator, loss, or checkpoint parameter schema.
+
+The console entry point defaults to `local_3x2080ti` when the hardware flag is
+omitted. Quest access is available, but the cluster profile is intentionally
+deferred pending the local readiness gate in [`HARDWARE.md`](HARDWARE.md) and
+must always be selected explicitly with `--hardware-profile quest_slurm`.
 
 Training writes append-only `metrics.jsonl` rows and atomic checkpoints to the
 configured output directory. Checkpoints contain model, optimizer, gradient
@@ -141,13 +150,18 @@ The implementation documentation starts at [`docs/README.md`](docs/README.md):
 
 Authoritative technical sources are
 [`CONTRACTS.md`](CONTRACTS.md), [`NOTATION.md`](NOTATION.md), and
-[`docs/latex/core_math.tex`](docs/latex/core_math.tex). Historical implementation
-status and decisions are recorded in
+[`docs/theory/core_math.tex`](docs/theory/core_math.tex). The current audit and
+status matrix start at [`docs/audit/README.md`](docs/audit/README.md).
+Historical implementation status and decisions are recorded in
 [`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md).
 
 ## Project status
 
-All implementation and correction prompts through P13B are implemented. The
-current default is the corrected fixed-intensity RB-PPO path. Learned Neyman
-allocation, reference-policy KL, NeuRD/R-NaD objectives, and public moment
-losses remain explicit research extensions rather than unfinished requirements.
+All implementation and correction prompts through P13B are historical. The
+current default is the corrected fixed-intensity RB-PPO path, with active
+readiness gaps tracked in [`docs/audit/findings.md`](docs/audit/findings.md)
+and completed audit work tracked in
+[`docs/audit/resolved_findings.md`](docs/audit/resolved_findings.md). Learned
+Neyman allocation, reference-policy KL, NeuRD/R-NaD objectives, and public
+moment losses remain explicit research extensions rather than unfinished
+requirements.

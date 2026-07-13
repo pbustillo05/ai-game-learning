@@ -85,7 +85,7 @@ the caller's explicit generator. There is no NumPy conversion, local poker-math
 fallback, or hidden device transfer.
 
 The complete binding contract is
-[`../POKER_GPU_EVALUATOR_IO.md`](../POKER_GPU_EVALUATOR_IO.md).
+[`../archive/POKER_GPU_EVALUATOR_IO.md`](../archive/POKER_GPU_EVALUATOR_IO.md).
 
 ## Policy and value model
 
@@ -144,4 +144,3 @@ showdown cases, and calls the sibling facade on the same device.
 
 The CPU `PokerGame` facade remains useful for independent navigation, range,
 arena, and adapter tests. Production training uses the tensor backend.
-

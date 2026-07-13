@@ -2,7 +2,7 @@
 
 ## Installation
 
-The project requires Python 3.11+, NumPy, PyYAML, pytest, and PyTorch 2.2 or
+The project requires Python 3.10+, NumPy, PyYAML, pytest, and PyTorch 2.2 or
 newer. Poker development also requires the sibling evaluator, installed
 separately in editable mode. On the shared server, use
 `/home/pablob/.venvs/poker`; do not install into system Python.
@@ -26,18 +26,20 @@ their factories.
 Top-level sections are:
 
 - `game`: selects `synthetic` or `poker` and supplies its owned mapping.
-- `rollout`: tree count per rank, `sequential`/`fixed` beta mode, public-stage
-  beta map, per-tree node budget, and reach storage mode.
-- `completion`: samples per leaf and backend selection.
+- `rollout`: tree count per rank, optional branched-only public-stage `beta`
+  map, per-tree node budget, and reach storage mode.
+- `completion`: samples per leaf (`null` in normal mode) and evaluator backend.
 - `model`: game-owned network dimensions.
-- `loss`: `rb_ppo`, lambda, PPO/value clipping, value/entropy coefficients,
-  entropy schedule, and optional suit-consistency flag.
-- `train`: iterations, gradient steps, minibatch size, Adam settings, AMP,
-  seed, checkpoint cadence, and output directory.
+- `loss`: a registered mode-compatible objective (`ppo` for normal and
+  `rb_ppo` for the current RB paths), lambda, clipping, and regularization.
+- `training`: `normal`, `rao_blackwell`, or `branched_rao_blackwell`, plus
+  iterations, gradient steps, minibatch size, Adam settings, AMP, seed,
+  checkpoint cadence, and output directory.
 - `debug_asserts`: enables expensive validation where supported.
 
-Every `beta_fix` map requires `default`, and every intensity must be finite and
-at least one. `reach_storage` is `full`, `decisions_only`, or `recompute`.
+Every branched `rollout.beta` map requires `default`, and every intensity must
+be finite and at least one. Non-branched modes require `beta: null`.
+`reach_storage` is `full`, `decisions_only`, or `recompute`.
 
 ## Shipped presets
 
@@ -47,23 +49,23 @@ at least one. `reach_storage` is `full`, `decisions_only`, or `recompute`.
   public chance.
 - `configs/synthetic_dial_example.yaml`: three-player configurable game using
   decision-only reach storage.
-- `configs/nlhe6_h100.yaml`: six-player 100bb NLHE CUDA preset sized as a
-  conservative first H100 profile, with recomputed reaches and AMP. Its marked
-  values are tuning starting points, not throughput guarantees.
+- `configs/train/nlhe6.yaml`: hardware-independent six-player 100bb NLHE
+  settings, combined with `configs/hardware/local_3x2080ti.yaml` or the
+  conservative, explicitly selected `quest_slurm.yaml` execution profile.
 
 ## Running training
 
-There is currently no console-script wrapper. Load a preset and call the public
-training function:
+Long-running training uses separate scientific and hardware inputs:
 
 ```bash
-/home/pablob/.venvs/poker/bin/python - <<'PY'
-from pbg.core.config import load_config
-from pbg.core.training import train
-
-train(load_config("configs/kuhn_smoke.yaml"))
-PY
+pbg-train --config configs/train/nlhe6.yaml \
+  --hardware-profile local_3x2080ti
 ```
+
+Omitting `--hardware-profile` defaults to `local_3x2080ti`. Quest access is
+available, but cluster execution is deliberately deferred until the local
+readiness gate in `HARDWARE.md` passes and always requires an explicit
+`--hardware-profile quest_slurm` selection.
 
 For multiple ranks, launch the same entry code with `torchrun`. Tree counts and
 minibatch sizes remain per rank; they are not divided by world size.

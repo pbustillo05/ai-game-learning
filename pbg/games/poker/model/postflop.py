@@ -13,6 +13,7 @@ from pbg.games.poker.folded import PartitionSummaryBatch
 from pbg.games.poker.model.heads import MomentHeads, RaiseMixtureHead, TypeHead, ValueHead
 from pbg.games.poker.model.incidence import (
     CompactMap,
+    IncidenceResidual,
     build_compact_map,
     compact_gather,
     compact_scatter,
@@ -39,6 +40,7 @@ class PostflopMasks:
     combo_embeddings: Tensor | None = None
     evaluator_summary: Tensor | Mapping[str, Tensor] | PartitionSummaryBatch | None = None
     fold_line_features: Tensor | None = None
+    live_seat_ids: Tensor | None = None
 
 
 def _summary_fields(
@@ -51,9 +53,20 @@ def _summary_fields(
 
     if summary is None:
         return None
-    if isinstance(summary, PartitionSummaryBatch):
+    if isinstance(summary, PartitionSummaryBatch) or hasattr(summary, "fields"):
         summary = summary.fields
-    values = [summary] if isinstance(summary, Tensor) else [summary[key] for key in sorted(summary)]
+    semantic = {
+        "base_log_z", "single_card_log_ratio", "pair_card_log_ratio", "output_valid"
+    }
+    values = (
+        [summary]
+        if isinstance(summary, Tensor)
+        else [
+            summary[key]
+            for key in sorted(summary)
+            if key not in semantic and not key.startswith("folder_")
+        ]
+    )
     result: list[Tensor] = []
     batch, compact = mapping.batch_size, mapping.compact_size
     for value in values:
@@ -129,29 +142,47 @@ class PostflopNet(nn.Module):
         self.cfg = cfg if isinstance(cfg, PokerModelConfig) else PokerModelConfig.from_dict(cfg)
         c = self.cfg
         d, dc = c.d_model, c.class_embedding_dim
+        geo_dim = 52 + 2 * c.folder_beta_rank
         self.rank_embedding = nn.Embedding(13, dc)
         self.suit_embedding = nn.Embedding(4, dc)
         self.combo_features = FFN(3 * dc, dc, c.ffn_hidden)
         self.summary_projection = nn.Linear(c.evaluator_summary_dim, dc) if c.evaluator_summary_dim else None
-        self.row_affine = nn.Linear(2 + dc + 1 + (dc if self.summary_projection else 0), d)
+        self.row_affine = nn.Linear(
+            3 + dc + geo_dim + d + 1 + (dc if self.summary_projection else 0), d
+        )
+        self.folder_context = FFN(1 + c.folder_line_dim, d, c.ffn_hidden)
+        self.tight_delta_projection = nn.Linear(52, d, bias=False)
         self.seat_embedding = nn.Embedding(c.max_players, d)
         self.status_embedding = nn.Embedding(3, d)
         self.actor_embedding = nn.Embedding(2, d)
         self.public_scalar_affine = nn.Linear(1, d)
-        self.public_type_embedding = nn.Embedding(6, d)
+        self.public_type_embedding = nn.Embedding(12, d)
+        self.history_numeric_affine = nn.Linear(6, d)
+        self.history_action_embedding = nn.Embedding(4, d)
+        self.history_street_embedding = nn.Embedding(4, d)
+        self.history_position_embedding = nn.Embedding(c.max_history_tokens, d)
         self.board_projection = nn.Linear(dc, d)
         self.state_token = nn.Parameter(torch.zeros(d))
         self.anchor_tokens = nn.Parameter(torch.empty(c.k_act, d))
         self.anchor_seat_embedding = nn.Embedding(c.max_players, d)
         nn.init.normal_(self.anchor_tokens, std=d**-0.5)
 
-        side_dim = dc + 2 + (dc if self.summary_projection else 0)
+        static_side_dim = (
+            dc + 3 + geo_dim + 2 * c.folder_beta_rank + 2 * d
+            + (dc if self.summary_projection else 0)
+        )
+        side_dim = static_side_dim + 3 * d
         self.layer_norms = nn.ModuleList(LN(d) for _ in range(c.n_layers_post))
         self.attentions = nn.ModuleList(MHA(d, c.n_heads) for _ in range(c.n_layers_post))
+        self.incidence_residuals = nn.ModuleList(
+            IncidenceResidual(d) for _ in range(c.n_layers_post)
+        )
         self.layer_ffns = nn.ModuleList(FFN(d + side_dim, d, c.ffn_hidden) for _ in range(c.n_layers_post))
         self.final_norm = LN(d)
-        self.global_features = FFN(3 * d, d, c.ffn_hidden)
+        self.actor_seat_features = FFN(4 * d, d, c.ffn_hidden)
+        self.global_features = FFN((2 + c.max_players) * d, d, c.ffn_hidden)
         self.seat_features = FFN(d + 3, d, c.ffn_hidden)
+        self.fold_features = FFN(d + 3, d, c.ffn_hidden)
         readout_dim = d + c.k_act * d + dc + d
         self.type_features = FFN(readout_dim, d, c.ffn_hidden)
         self.raise_features = FFN(readout_dim, d, c.ffn_hidden)
@@ -160,6 +191,161 @@ class PostflopNet(nn.Module):
         self.value_head = ValueHead(readout_dim, feature_dim=d, hidden=c.ffn_hidden)
         self.moment_heads = MomentHeads(2 * d, d, c.ffn_hidden) if c.use_moment_heads else None
         self.register_buffer("combo_cards", torch.triu_indices(52, 52, offset=1).T, persistent=True)
+        two_hot = torch.zeros((N_HANDS, 52), dtype=torch.float32)
+        two_hot.scatter_(1, self.combo_cards.cpu(), 1.0)
+        self.register_buffer("combo_two_hot", two_hot, persistent=True)
+
+    def _folded_geometry(
+        self,
+        summary: Tensor | Mapping[str, Tensor] | PartitionSummaryBatch | None,
+        mapping: CompactMap,
+        dtype: torch.dtype,
+    ) -> tuple[Tensor, Tensor]:
+        """Return evaluator-derived Lambda and signed beta coordinates."""
+
+        batch, compact = mapping.batch_size, mapping.compact_size
+        device = mapping.compact_to_full.device
+        combo_ids = mapping.compact_to_full
+        cards = self.combo_cards[combo_ids]
+        geometry = self.combo_two_hot[combo_ids].to(dtype)
+        fields: Mapping[str, Tensor] | None
+        if isinstance(summary, PartitionSummaryBatch) or hasattr(summary, "fields"):
+            fields = summary.fields
+        elif isinstance(summary, Mapping):
+            fields = summary
+        else:
+            fields = None
+        alpha = None if fields is None else fields.get("single_card_log_ratio")
+        beta = None if fields is None else fields.get("pair_card_log_ratio")
+        valid = None if fields is None else fields.get("output_valid")
+        if alpha is None:
+            lambda_hand = torch.zeros((batch, compact), dtype=dtype, device=device)
+        else:
+            if alpha.shape != (batch, 52):
+                raise ValueError("single_card_log_ratio must have shape [B,52]")
+            alpha = alpha.to(device=device, dtype=dtype)
+            lambda_hand = alpha.gather(1, cards[..., 0]) + alpha.gather(1, cards[..., 1])
+        if beta is not None:
+            if beta.shape != (batch, 52, 52):
+                raise ValueError("pair_card_log_ratio must have shape [B,52,52]")
+            beta = beta.to(device=device, dtype=torch.float32)
+            batch_ids = torch.arange(batch, device=device)[:, None]
+            lambda_hand = lambda_hand + beta[
+                batch_ids, cards[..., 0], cards[..., 1]
+            ].to(dtype)
+        rank = self.cfg.folder_beta_rank
+        if rank:
+            signed = torch.zeros((batch, compact, 2 * rank), dtype=dtype, device=device)
+            if beta is not None:
+                symmetric = 0.5 * (beta + beta.transpose(1, 2))
+                eigenvalue, eigenvector = torch.linalg.eigh(symmetric)
+                indices = torch.topk(eigenvalue.abs(), k=rank, dim=1).indices
+                selected_value = eigenvalue.gather(1, indices)
+                selected_vector = eigenvector.gather(
+                    2, indices[:, None, :].expand(-1, 52, -1)
+                )
+                first = selected_vector.gather(
+                    1, cards[..., 0, None].expand(-1, -1, rank)
+                )
+                second = selected_vector.gather(
+                    1, cards[..., 1, None].expand(-1, -1, rank)
+                )
+                coordinate = (first + second) * selected_value.abs().sqrt()[:, None, :]
+                positive = coordinate.masked_fill(selected_value[:, None, :] < 0, 0.0)
+                negative = coordinate.masked_fill(selected_value[:, None, :] >= 0, 0.0)
+                signed = torch.cat((positive, negative), dim=-1).to(dtype)
+            geometry = torch.cat((geometry, signed), dim=-1)
+        if valid is not None:
+            if valid.shape != (batch,) or valid.dtype != torch.bool:
+                raise TypeError("output_valid must be bool [B]")
+            lambda_hand = lambda_hand.masked_fill(~valid[:, None], 0.0)
+            geometry = torch.cat(
+                (geometry[..., :52], geometry[..., 52:].masked_fill(~valid[:, None, None], 0.0)),
+                dim=-1,
+            )
+        lambda_hand = lambda_hand.masked_fill(~mapping.valid, 0.0)
+        geometry = geometry.masked_fill(~mapping.valid[..., None], 0.0)
+        return lambda_hand, geometry
+
+    def _folder_context(
+        self,
+        summary: Tensor | Mapping[str, Tensor] | PartitionSummaryBatch | None,
+        mapping: CompactMap,
+        players: int,
+        dtype: torch.dtype,
+        board: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Build per-card pressure, per-folder seat context, and products."""
+
+        if isinstance(summary, PartitionSummaryBatch) or hasattr(summary, "fields"):
+            fields: Mapping[str, Tensor] | None = summary.fields
+        elif isinstance(summary, Mapping):
+            fields = summary
+        else:
+            fields = None
+        batch, compact = mapping.batch_size, mapping.compact_size
+        device = mapping.compact_to_full.device
+        empty_pressure = torch.zeros((batch, compact, self.cfg.d_model), dtype=dtype, device=device)
+        empty_seats = torch.zeros((batch, players, self.cfg.d_model), dtype=dtype, device=device)
+        if fields is None or "folder_log_mass" not in fields:
+            return empty_pressure, empty_seats, empty_pressure
+        log_mass = fields["folder_log_mass"].to(device=device, dtype=dtype)
+        folder_count = log_mass.shape[1]
+        single = fields.get("folder_single_card_log_ratio")
+        line = fields.get("folder_line_meta")
+        mask = fields.get("folder_mask")
+        seat = fields.get("folder_seat")
+        valid = fields.get("folder_output_valid")
+        if single is None or single.shape != (batch, folder_count, 52):
+            raise ValueError("folder_single_card_log_ratio must have shape [B,F,52]")
+        if line is None or line.shape != (batch, folder_count, self.cfg.folder_line_dim):
+            raise ValueError("folder_line_meta has the wrong shape")
+        if mask is None or mask.shape != (batch, folder_count) or mask.dtype != torch.bool:
+            raise TypeError("folder_mask must be bool [B,F]")
+        if valid is not None:
+            if valid.shape != mask.shape or valid.dtype != torch.bool:
+                raise TypeError("folder_output_valid must be bool [B,F]")
+            mask = mask & valid
+        marginal = (1.0 - single.to(device=device, dtype=dtype).exp()).clamp(0.0, 1.0)
+        context = self.folder_context(
+            torch.cat((log_mass[..., None], line.to(device=device, dtype=dtype)), dim=-1)
+        )
+        context = context * mask[..., None]
+        unnormalized = log_mass.exp()[..., None] * marginal * mask[..., None]
+        card_pressure = torch.einsum("bfc,bfd->bcd", unnormalized, context)
+        cards = self.combo_cards[mapping.compact_to_full]
+        pressure = card_pressure.gather(
+            1, cards[..., 0, None].expand(-1, -1, self.cfg.d_model)
+        ) + card_pressure.gather(
+            1, cards[..., 1, None].expand(-1, -1, self.cfg.d_model)
+        )
+        folder_pool = context * unnormalized.sum(2, keepdim=True)
+        seat_context = empty_seats.clone()
+        if seat is not None:
+            if seat.shape != (batch, folder_count):
+                raise ValueError("folder_seat must have shape [B,F]")
+            safe_seat = seat.to(device=device, dtype=torch.long).clamp(0, players - 1)
+            seat_context.scatter_add_(
+                1,
+                safe_seat[..., None].expand(-1, -1, self.cfg.d_model),
+                context + folder_pool,
+            )
+        board_indicator = torch.nn.functional.one_hot(
+            board.clamp(0, 51).long(), 52
+        ).bool() & (board >= 0)[..., None]
+        available = ~board_indicator.any(1)
+        real_count = (board >= 0).sum(1)
+        uniform = available.to(dtype) * (2.0 / (52 - real_count).to(dtype))[:, None]
+        delta = (marginal - uniform[:, None, :]) * mask[..., None]
+        projected_delta = self.tight_delta_projection(delta)
+        total_delta = projected_delta.sum(1)
+        pair_products = 0.5 * (
+            total_delta.square() - projected_delta.square().sum(1)
+        )
+        pressure = pressure.masked_fill(~mapping.valid[..., None], 0.0)
+        tight = pair_products[:, None, :].expand(-1, compact, -1)
+        tight = tight.masked_fill(~mapping.valid[..., None], 0.0)
+        return pressure, seat_context, tight
 
     def _card_embedding(self, cards: Tensor) -> Tensor:
         safe = cards.clamp(0, 51).long()
@@ -182,7 +368,7 @@ class PostflopNet(nn.Module):
 
     def _validate(
         self, pub: PokerPublicBatch, ranges: Tensor, actor_seat: Tensor | None, masks: PostflopMasks
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, CompactMap]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, CompactMap]:
         if ranges.ndim != 3 or ranges.shape[-1] != N_HANDS or not ranges.is_floating_point():
             raise ValueError("combo_ranges must be floating point [B,P,1326]")
         batch, players = ranges.shape[:2]
@@ -218,22 +404,80 @@ class PostflopNet(nn.Module):
         combo_mask = combo_mask & masks.compatibility[:, None, :] & seat_mask[:, :, None]
         if not bool(combo_mask[torch.arange(batch, device=ranges.device), actor].any(dim=1).all()):
             raise ValueError("each actor must have at least one compatible combo row")
-        return actor, seat_mask, status, combo_mask, build_compact_map(masks.compatibility)
+        live_ids = masks.live_seat_ids
+        if live_ids is None:
+            seats = torch.arange(players, device=ranges.device)[None].expand(batch, -1)
+            ordered = torch.where(seat_mask, seats, players).sort(dim=1).values
+            live_count = int(seat_mask.sum(1).max().item())
+            selected = ordered[:, :live_count]
+            live_valid = selected < players
+            live_ids = selected.clamp_max(players - 1)
+        else:
+            if live_ids.ndim != 2 or live_ids.shape[0] != batch:
+                raise ValueError("live_seat_ids must have shape [B,L]")
+            live_ids = live_ids.to(device=ranges.device, dtype=torch.long)
+            if bool(((live_ids < 0) | (live_ids >= players)).any()):
+                raise ValueError("live_seat_ids contains an invalid table seat")
+            live_valid = seat_mask.gather(1, live_ids)
+        if not bool(((live_ids == actor[:, None]) & live_valid).any(1).all()):
+            raise ValueError("live_seat_ids must contain each actor")
+        return (
+            actor, seat_mask, live_ids, live_valid, status, combo_mask,
+            build_compact_map(masks.compatibility),
+        )
 
-    def _public_tokens(self, pub: PokerPublicBatch, fold: Tensor | None, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+    def _public_tokens(
+        self,
+        pub: PokerPublicBatch,
+        fold: Tensor | None,
+        dtype: torch.dtype,
+        relative: Tensor,
+    ) -> tuple[Tensor, Tensor]:
         batch, players = pub.stacks.shape
-        groups = [pub.pot[:, None], pub.stacks, pub.committed, pub.street.to(dtype)[:, None],
-                  pub.legality_summary.to(dtype), pub.n_ticks.to(dtype)[:, None], pub.raise_grid_bounds.to(dtype)]
+        groups = [
+            pub.pot[:, None], pub.stacks, pub.committed, pub.street.to(dtype)[:, None],
+            pub.legality_summary.to(dtype), pub.n_ticks.to(dtype)[:, None],
+            pub.raise_grid_bounds.to(dtype),
+        ]
+        type_groups = [
+            (1, 0), (players, 1), (players, 2), (1, 3),
+            (pub.legality_summary.shape[1], 4), (1, 5), (2, 6),
+        ]
+        if pub.committed_street is not None:
+            groups.append(pub.committed_street.to(dtype))
+            type_groups.append((players, 7))
+        exact = [
+            value.to(dtype)[:, None]
+            for value in (
+                pub.call_amount, pub.current_bet, pub.min_raise_to,
+                pub.max_raise_to, pub.last_full_raise,
+            )
+            if value is not None
+        ]
+        if exact:
+            groups.append(torch.cat(exact, dim=1))
+            type_groups.append((len(exact), 8))
+        if pub.legal_action_mask is not None:
+            groups.append(pub.legal_action_mask.to(dtype))
+            type_groups.append((pub.legal_action_mask.shape[1], 9))
+        if pub.raise_ticks is not None:
+            groups.append(pub.raise_ticks.to(dtype))
+            type_groups.append((pub.raise_ticks.shape[1], 10))
         if fold is not None:
             if fold.shape[0] != batch or not fold.is_floating_point():
                 raise ValueError("fold_line_features must be floating point with leading B")
             flat = fold.flatten(start_dim=1).to(dtype)
             groups.extend((flat.mean(dim=1, keepdim=True), flat.square().mean(dim=1, keepdim=True)))
+            type_groups.append((2, 11))
         scalar = torch.cat([value.to(dtype) for value in groups], dim=1)
         scalar_tokens = self.public_scalar_affine(scalar[..., None])
-        scalar_tokens = scalar_tokens + self.public_type_embedding(
-            torch.zeros(scalar.shape, dtype=torch.long, device=scalar.device)
-        )
+        scalar_type = torch.cat([
+            torch.full((count,), kind, dtype=torch.long, device=scalar.device)
+            for count, kind in type_groups
+        ])
+        scalar_tokens = scalar_tokens + self.public_type_embedding(scalar_type)[None]
+        scalar_tokens[:, 1 : 1 + players] += self.seat_embedding(relative)
+        scalar_tokens[:, 1 + players : 1 + 2 * players] += self.seat_embedding(relative)
         board_mask = pub.board >= 0
         board_tokens = self.board_projection(self._card_embedding(pub.board).to(dtype))
         board_tokens = board_tokens + self.public_type_embedding(
@@ -241,7 +485,41 @@ class PostflopNet(nn.Module):
         )
         state = self.state_token.to(dtype)[None, None, :].expand(batch, 1, -1)
         token = torch.cat((state, scalar_tokens, board_tokens), dim=1)
-        valid = torch.cat((torch.ones((batch, 1 + scalar.shape[1]), dtype=torch.bool, device=scalar.device), board_mask), dim=1)
+        scalar_valid = torch.ones(scalar.shape, dtype=torch.bool, device=scalar.device)
+        if pub.seat_mask is not None:
+            scalar_valid[:, 1 : 1 + players] = pub.seat_mask
+            scalar_valid[:, 1 + players : 1 + 2 * players] = pub.seat_mask
+        valid = torch.cat(
+            (
+                torch.ones((batch, 1), dtype=torch.bool, device=scalar.device),
+                scalar_valid,
+                board_mask,
+            ),
+            dim=1,
+        )
+        if pub.history is not None and pub.history.mask.shape[1]:
+            history = pub.history
+            if history.mask.shape[1] > self.cfg.max_history_tokens:
+                raise ValueError("public history exceeds max_history_tokens")
+            numeric = torch.stack(
+                (
+                    history.amount, history.pot_before, history.call_amount,
+                    history.current_bet, history.min_raise_to, history.max_raise_to,
+                ),
+                dim=-1,
+            ).to(dtype)
+            history_token = self.history_numeric_affine(numeric)
+            history_token += self.history_action_embedding(history.action.clamp(0, 3).long())
+            history_token += self.history_street_embedding(history.street.clamp(0, 3).long())
+            history_token += self.history_position_embedding(
+                torch.arange(history.mask.shape[1], device=scalar.device)
+            )[None]
+            safe_actor = history.actor.clamp(0, players - 1).long()
+            history_token += self.seat_embedding(relative.gather(1, safe_actor)) * (
+                history.actor >= 0
+            )[..., None]
+            token = torch.cat((token, history_token), dim=1)
+            valid = torch.cat((valid, history.mask), dim=1)
         return token, valid
 
     def forward(
@@ -255,13 +533,32 @@ class PostflopNet(nn.Module):
 
         if masks is None:
             raise ValueError("postflop forward requires supplied compatibility")
-        actor, seat_mask, status, combo_mask, mapping = self._validate(pub, combo_ranges, actor_seat, masks)
+        (
+            actor, seat_mask, live_ids, live_valid, status, combo_mask, mapping
+        ) = self._validate(pub, combo_ranges, actor_seat, masks)
         batch, players = combo_ranges.shape[:2]
+        live_players = live_ids.shape[1]
         c, d = self.cfg, self.cfg.d_model
-        compact_ranges = compact_gather(combo_ranges, mapping, dim=2)
-        compact_mask = compact_gather(combo_mask, mapping, dim=2).bool()
+        all_compact_ranges = compact_gather(combo_ranges, mapping, dim=2)
+        all_compact_mask = compact_gather(combo_mask, mapping, dim=2).bool()
+        live_row_index = live_ids[..., None].expand(-1, -1, mapping.compact_size)
+        compact_ranges = all_compact_ranges.gather(1, live_row_index)
+        compact_mask = all_compact_mask.gather(1, live_row_index) & live_valid[..., None]
         combo_emb = self._combo_embedding(mapping.compact_to_full, masks.combo_embeddings, combo_ranges.dtype)
+        lambda_hand, folded_geometry = self._folded_geometry(
+            masks.evaluator_summary, mapping, combo_ranges.dtype
+        )
+        folder_pressure, folder_seat_context, tight_products = self._folder_context(
+            masks.evaluator_summary, mapping, players, combo_ranges.dtype, pub.board
+        )
         summary = _summary_fields(masks.evaluator_summary, mapping, players, combo_ranges.dtype)
+        if summary is not None:
+            summary = summary.gather(
+                1,
+                live_ids[..., None, None].expand(
+                    -1, -1, mapping.compact_size, summary.shape[-1]
+                ),
+            )
         if self.summary_projection is None:
             if summary is not None:
                 raise ValueError("evaluator_summary_dim must be configured to supply summaries")
@@ -269,16 +566,33 @@ class PostflopNet(nn.Module):
         else:
             if summary is None:
                 summary = torch.zeros(
-                    (batch, players, mapping.compact_size, c.evaluator_summary_dim),
+                    (batch, live_players, mapping.compact_size, c.evaluator_summary_dim),
                     dtype=combo_ranges.dtype, device=combo_ranges.device,
                 )
             if summary.shape[-1] != c.evaluator_summary_dim:
                 raise ValueError("concatenated evaluator summary width does not match evaluator_summary_dim")
             summary_projected = self.summary_projection(summary)
         log_range = torch.log(compact_ranges.clamp_min(c.eps))
-        expanded_combo = combo_emb[:, None].expand(-1, players, -1, -1)
-        features = [compact_ranges[..., None], log_range[..., None], expanded_combo,
-                    torch.ones_like(compact_ranges)[..., None]]
+        base_reach = compact_ranges.masked_fill(~compact_mask, 0.0)
+        base_reach = base_reach / base_reach.sum(dim=2, keepdim=True).clamp_min(c.eps)
+        corrected_log_reach = torch.log(base_reach.clamp_min(c.eps)) + lambda_hand[:, None, :]
+        corrected_log_reach = corrected_log_reach.masked_fill(~compact_mask, -torch.inf)
+        log_normalizer = torch.logsumexp(corrected_log_reach, dim=2, keepdim=True)
+        corrected_log_reach = torch.where(
+            compact_mask,
+            corrected_log_reach - log_normalizer.masked_fill(~torch.isfinite(log_normalizer), 0.0),
+            torch.zeros_like(corrected_log_reach),
+        )
+        expanded_combo = combo_emb[:, None].expand(-1, live_players, -1, -1)
+        expanded_geometry = folded_geometry[:, None].expand(-1, live_players, -1, -1)
+        expanded_pressure = folder_pressure[:, None].expand(-1, live_players, -1, -1)
+        expanded_tight = tight_products[:, None].expand(-1, live_players, -1, -1)
+        features = [
+            compact_ranges[..., None], log_range[..., None],
+            corrected_log_reach[..., None], expanded_combo, expanded_geometry,
+            expanded_pressure,
+            torch.ones_like(compact_ranges)[..., None],
+        ]
         if summary_projected is not None:
             features.append(summary_projected)
         row = self.row_affine(torch.cat(features, dim=-1))
@@ -287,44 +601,133 @@ class PostflopNet(nn.Module):
             relative = torch.remainder(seats - pub.button[:, None].long(), players)
         else:
             relative = seats
-        row = row + self.seat_embedding(relative)[:, :, None]
-        row = row + self.status_embedding(status)[:, :, None]
-        actor_flag = seats == actor[:, None]
+        live_relative = relative.gather(1, live_ids)
+        live_status = status.gather(1, live_ids)
+        row = row + self.seat_embedding(live_relative)[:, :, None]
+        row = row + self.status_embedding(live_status)[:, :, None]
+        actor_flag = live_ids == actor[:, None]
         row = row + self.actor_embedding(actor_flag.long())[:, :, None]
-        row_flat = row.reshape(batch, players * mapping.compact_size, d)
-        public, public_mask = self._public_tokens(pub, masks.fold_line_features, combo_ranges.dtype)
+        row_flat = row.reshape(batch, live_players * mapping.compact_size, d)
+        public, public_mask = self._public_tokens(
+            pub, masks.fold_line_features, combo_ranges.dtype, relative
+        )
         actor_relative = relative.gather(1, actor[:, None]).squeeze(1)
         anchors = self.anchor_tokens.to(combo_ranges.dtype)[None] + self.anchor_seat_embedding(actor_relative)[:, None]
         token = torch.cat((row_flat, public, anchors), dim=1)
         row_mask = compact_mask.reshape(batch, -1)
         key_mask = torch.cat((row_mask, public_mask, torch.ones((batch, c.k_act), dtype=torch.bool, device=row.device)), dim=1)
-        normalized_reach = compact_ranges.masked_fill(~compact_mask, 0)
-        normalized_reach = normalized_reach / normalized_reach.sum(dim=2, keepdim=True).clamp_min(c.eps)
         key_bias = torch.zeros(token.shape[:2], dtype=torch.float32, device=token.device)
-        key_bias[:, :row_flat.shape[1]] = torch.log(normalized_reach.clamp_min(c.eps)).reshape(batch, -1).float()
-        side_parts = [expanded_combo, compact_ranges[..., None], log_range[..., None]]
+        key_bias[:, :row_flat.shape[1]] = corrected_log_reach.reshape(batch, -1).float()
+        beta_square = expanded_geometry[..., 52:].square()
+        side_parts = [
+            expanded_combo, compact_ranges[..., None], log_range[..., None],
+            corrected_log_reach[..., None], expanded_geometry, beta_square,
+            expanded_pressure, expanded_tight,
+        ]
         if summary_projected is not None:
             side_parts.append(summary_projected)
         side_rows = torch.cat(side_parts, dim=-1)
-        side = torch.zeros(token.shape[:2] + (side_rows.shape[-1],), dtype=side_rows.dtype, device=token.device)
-        side[:, :row_flat.shape[1]] = side_rows.reshape(batch, row_flat.shape[1], -1)
         x = token
-        for norm, attention, ffn in zip(self.layer_norms, self.attentions, self.layer_ffns, strict=True):
+        incidence_mass = corrected_log_reach.exp() * compact_mask
+        identical_scale = torch.ones(
+            (batch, mapping.compact_size), dtype=combo_ranges.dtype, device=combo_ranges.device
+        )
+        for norm, attention, incidence, ffn in zip(
+            self.layer_norms, self.attentions, self.incidence_residuals,
+            self.layer_ffns, strict=True
+        ):
+            row_state = x[:, :row_flat.shape[1]].reshape(
+                batch, live_players, mapping.compact_size, d
+            )
+            j, overlap_card, overlap_equal, _ = incidence(
+                row_state,
+                incidence_mass,
+                folded_geometry[..., :52],
+                identical_scale,
+            )
             normalized_x = norm(x)
             residual = x + attention(normalized_x, normalized_x, key_bias, key_mask)
+            dynamic = torch.cat(
+                (j, overlap_card * overlap_card, overlap_card * overlap_equal), dim=-1
+            )
+            complete_side = torch.cat((side_rows, dynamic), dim=-1)
+            side = torch.zeros(
+                token.shape[:2] + (complete_side.shape[-1],),
+                dtype=complete_side.dtype,
+                device=token.device,
+            )
+            side[:, :row_flat.shape[1]] = complete_side.reshape(
+                batch, row_flat.shape[1], -1
+            )
             x = residual + ffn(torch.cat((norm(residual), side), dim=-1))
         final = self.final_norm(x)
-        final_rows = final[:, :row_flat.shape[1]].reshape(batch, players, mapping.compact_size, d)
+        final_rows = final[:, :row_flat.shape[1]].reshape(
+            batch, live_players, mapping.compact_size, d
+        )
         final_public = final[:, row_flat.shape[1]:-c.k_act]
         final_anchors = final[:, -c.k_act:]
         public_float = public_mask.to(final_public.dtype)
         public_mean = (final_public * public_float[..., None]).sum(1) / public_float.sum(1, keepdim=True)
-        actor_rows = final_rows[torch.arange(batch, device=actor.device), actor]
-        actor_mask = compact_mask[torch.arange(batch, device=actor.device), actor]
-        actor_mass = compact_ranges[torch.arange(batch, device=actor.device), actor] * actor_mask
-        actor_pool = (actor_rows * actor_mass[..., None]).sum(1) / actor_mass.sum(1, keepdim=True).clamp_min(c.eps)
-        anchor_pool = final_anchors.mean(1)
-        global_feature = self.global_features(torch.cat((public_mean, actor_pool, anchor_pool), dim=-1))
+        actor_live = ((live_ids == actor[:, None]) & live_valid).to(torch.int64).argmax(1)
+        actor_rows = final_rows[torch.arange(batch, device=actor.device), actor_live]
+        actor_mask = compact_mask[torch.arange(batch, device=actor.device), actor_live]
+        actor_anchor_input = torch.cat(
+            (
+                final_anchors[:, 0], final_anchors[:, 1], final_anchors[:, 2],
+                final_anchors[:, 3:].mean(1),
+            ),
+            dim=-1,
+        )
+        actor_summary = self.actor_seat_features(actor_anchor_input)
+        mass = incidence_mass.sum(2)
+        pooled = (final_rows * incidence_mass[..., None]).sum(2) / mass[..., None].clamp_min(c.eps)
+        live_seat_meta = torch.stack(
+            (
+                mass,
+                live_status.to(mass.dtype) / 2.0,
+                live_relative.to(mass.dtype) / max(c.max_players - 1, 1),
+            ),
+            dim=-1,
+        )
+        live_summary = self.seat_features(
+            torch.cat((pooled, live_seat_meta), dim=-1)
+        )
+        full_mass = torch.zeros(
+            (batch, players), dtype=mass.dtype, device=mass.device
+        ).scatter_add(1, live_ids, mass * live_valid.to(mass.dtype))
+        seat_meta = torch.stack(
+            (
+                full_mass,
+                status.to(mass.dtype) / 2.0,
+                relative.to(mass.dtype) / max(c.max_players - 1, 1),
+            ),
+            dim=-1,
+        )
+        folded_summary = self.fold_features(
+            torch.cat((folder_seat_context, seat_meta), dim=-1)
+        )
+        scattered_live = torch.zeros_like(folded_summary).scatter_add(
+            1,
+            live_ids[..., None].expand(-1, -1, d),
+            live_summary * live_valid[..., None],
+        )
+        seat_summary = torch.where(
+            seat_mask[..., None], scattered_live, folded_summary
+        )
+        actor_selector = torch.nn.functional.one_hot(actor, players).to(torch.bool)
+        seat_summary = torch.where(actor_selector[..., None], actor_summary[:, None], seat_summary)
+        seat_summary = seat_summary.masked_fill(~(pub.seat_mask if pub.seat_mask is not None else torch.ones_like(seat_mask))[..., None], 0.0)
+        relative_index = relative[..., None].expand(-1, -1, d)
+        ordered_seats = torch.zeros_like(seat_summary).scatter(1, relative_index, seat_summary)
+        padded_seats = torch.zeros(
+            (batch, c.max_players, d), dtype=seat_summary.dtype, device=seat_summary.device
+        )
+        padded_seats[:, :players] = ordered_seats
+        global_feature = self.global_features(
+            torch.cat(
+                (public_mean, actor_summary, padded_seats.reshape(batch, -1)), dim=-1
+            )
+        )
         readout = torch.cat((actor_rows, final_anchors.reshape(batch, 1, -1).expand(-1, mapping.compact_size, -1),
                              combo_emb, global_feature[:, None].expand(-1, mapping.compact_size, -1)), dim=-1)
         z_type, z_raise = self.type_features(readout), self.raise_features(readout)
@@ -356,9 +759,5 @@ class PostflopNet(nn.Module):
         vvec: Tensor | None = None
         u: Tensor | None = None
         if self.moment_heads is not None:
-            mass = (compact_ranges * compact_mask).sum(2)
-            pooled = (final_rows * (compact_ranges * compact_mask)[..., None]).sum(2) / mass[..., None].clamp_min(c.eps)
-            seat_meta = torch.stack((mass, status.to(mass.dtype) / 2, relative.to(mass.dtype) / max(players - 1, 1)), dim=-1)
-            seat_summary = self.seat_features(torch.cat((pooled, seat_meta), dim=-1))
             vvec, u = self.moment_heads(torch.cat((global_feature, public_mean), dim=-1), seat_summary, seat_mask)
         return PolicyOutput(raw=raw, v=full_value, vvec=vvec, u=u)
