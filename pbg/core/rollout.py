@@ -324,7 +324,12 @@ def _draw_children(
     normalizer = probability.sum(dim=1, keepdim=True)
     if bool((normalizer <= 0).any()):
         raise RuntimeError("a rollout event distribution has zero mass")
-    columns = torch.multinomial(probability / normalizer, 1, generator=torch_gen)
+    # The positional P08/P09 compatibility path may pair a CUDA policy with its
+    # historical CPU generator.  Keep that generator's exact stream; the C08/C09
+    # production entry points instead require a device-matched generator.
+    sample_device = torch.device(torch_gen.device)
+    sample_probability = (probability / normalizer).to(sample_device)
+    columns = torch.multinomial(sample_probability, 1, generator=torch_gen)
     return legal_event_ids.gather(1, columns.to(legal_event_ids.device)).squeeze(1).to(torch.int32)
 
 
@@ -378,9 +383,9 @@ def sample_trees(
         # Keep the P08 path below unchanged: its random-number consumption is a
         # reproducibility contract.  The import is local to avoid a module
         # cycle while allowing branching.py to reuse the rollout helpers.
-        from pbg.core.branching import sample_branched_trees
+        from pbg.core.branching import _legacy_sample_branched_trees
 
-        return sample_branched_trees(
+        return _legacy_sample_branched_trees(
             game,
             policy_fn,
             adapter,

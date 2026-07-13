@@ -1,0 +1,205 @@
+from __future__ import annotations
+
+import ast
+import inspect
+import textwrap
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+import yaml
+from torch import Tensor, nn
+
+from pbg.core.branching import _offspring_counts, sample_branched_labeled
+from pbg.core.config import ConfigError, load_config
+from pbg.core.game import EventBatch, GameBundle, TERMINAL
+from pbg.core.rollout import _selected_policy_logp
+from pbg.core.tree import DeviceTreeBuffer
+
+
+ROOT = Path(__file__).parents[1]
+
+
+@dataclass
+class _Output:
+    raw: Tensor
+    v: Tensor
+
+
+class _Model(nn.Module):
+    def forward(self, states: Tensor) -> _Output:
+        batch = states.shape[0]
+        return _Output(
+            raw=torch.zeros((batch, 1, 2), device=states.device),
+            v=torch.zeros((batch, 1), device=states.device),
+        )
+
+
+class _Adapter:
+    def log_prob(
+        self,
+        output: _Output,
+        selected: Tensor,
+        legal_ids: Tensor,
+        legal_mask: Tensor,
+    ) -> Tensor:
+        del legal_ids, legal_mask
+        return torch.zeros(
+            (*selected.shape, 1), dtype=torch.float32, device=selected.device
+        )
+
+
+class _LabeledBackend:
+    device = torch.device("cpu")
+    n_players = 2
+    x_sizes = (1, 1)
+    max_rollout_steps = 2
+
+    def __init__(self, beta: float, two_levels: bool = False) -> None:
+        self.beta = beta
+        self.two_levels = two_levels
+
+    def root_states(self, n: int) -> Tensor:
+        return torch.zeros(n, dtype=torch.int32)
+
+    def classify(self, states: Tensor) -> Tensor:
+        terminal_at = 2 if self.two_levels else 1
+        return torch.where(states >= terminal_at, torch.full_like(states, TERMINAL), 0)
+
+    def legal_events(self, states: Tensor) -> tuple[Tensor, Tensor]:
+        ids = torch.tensor([[0, 1]], dtype=torch.int32).expand(states.shape[0], -1)
+        mask = torch.ones_like(ids, dtype=torch.bool)
+        if not self.two_levels:
+            mask[:, 1] = False
+        return ids, mask
+
+    def policy_forward(self, model: nn.Module, states: Tensor, reach: Tensor) -> _Output:
+        del reach
+        return model(states)
+
+    def sample_profiles(
+        self, states: Tensor, reach: Tensor, gen: torch.Generator
+    ) -> Tensor:
+        del reach
+        draw = torch.randint(2, (states.shape[0],), generator=gen, device=states.device)
+        return torch.stack((draw, torch.zeros_like(draw)), dim=1).to(torch.int32)
+
+    def sample_events(
+        self,
+        states: Tensor,
+        profiles: Tensor,
+        policy_out: _Output | None,
+        adapter: _Adapter,
+        gen: torch.Generator,
+    ) -> EventBatch:
+        del adapter, gen
+        if policy_out is None:
+            raise AssertionError("this rigged game has no chance nodes")
+        public_id = torch.where(states == 0, torch.zeros_like(states), profiles[:, 0])
+        return EventBatch(public_id=public_id.to(torch.int32))
+
+    def step(self, states: Tensor, events: EventBatch) -> Tensor:
+        del events
+        return states + 1
+
+    def reach_update(
+        self, reach: Tensor, states: Tensor, events: EventBatch, policy_out: _Output | None
+    ) -> Tensor:
+        del states, events, policy_out
+        return reach.clone()
+
+    def beta_fn(self, states: Tensor) -> Tensor:
+        return torch.full(states.shape, self.beta, dtype=torch.float32)
+
+
+def _cfg(n_trees: int, beta: float, budget: int = 32) -> SimpleNamespace:
+    return SimpleNamespace(
+        n_trees=n_trees,
+        beta_mode="fixed",
+        beta_fix={"default": beta},
+        node_budget=budget,
+        reach_storage="full",
+    )
+
+
+def _sample(backend: _LabeledBackend, cfg: SimpleNamespace, seed: int = 1):
+    bundle = GameBundle(_Model(), backend, _Adapter(), None)
+    return sample_branched_labeled(bundle, cfg, torch.Generator().manual_seed(seed))
+
+
+def test_integer_and_fractional_randomized_rounding() -> None:
+    integer = _offspring_counts(torch.full((4096,), 3.0), torch.Generator().manual_seed(1))
+    assert torch.equal(integer, torch.full_like(integer, 3))
+    fractional = _offspring_counts(
+        torch.full((20_000,), 2.25), torch.Generator().manual_seed(2)
+    )
+    assert set(fractional.tolist()) == {2, 3}
+    # Binomial sd is 61.2; tolerance is >4.8 sd (H0 failure probability < 2e-6).
+    assert abs(int((fractional == 3).sum()) - 5_000) < 300
+
+
+def test_equal_labeled_siblings_remain_distinct_with_uniform_weights() -> None:
+    tree, _, policy = _sample(_LabeledBackend(4.0), _cfg(8, 4.0))
+    tree.validate()
+    roots = (tree.parent == -1).nonzero().squeeze(1)
+    counts = tree.child_ptr[roots + 1] - tree.child_ptr[roots]
+    assert torch.equal(counts, torch.full_like(counts, 4))
+    assert torch.equal(tree.child_event, torch.zeros_like(tree.child_event))
+    assert torch.allclose(tree.nu, torch.full_like(tree.nu, 0.25), atol=0, rtol=0)
+    assert torch.allclose(tree.path_weight[tree.child_node], tree.nu, atol=0, rtol=0)
+    assert policy.logp_child.shape == (8, 4, 1)
+
+
+def test_duplicate_siblings_expand_independently_without_label_sorting() -> None:
+    tree, _, _ = _sample(_LabeledBackend(2.0, two_levels=True), _cfg(128, 2.0), 7)
+    roots = (tree.parent == -1).nonzero().squeeze(1)
+    mixed = 0
+    for root in roots:
+        first = tree.child_node[tree.child_ptr[root] : tree.child_ptr[root + 1]]
+        assert torch.equal(
+            tree.child_event[tree.child_ptr[root] : tree.child_ptr[root + 1]],
+            torch.zeros(2, dtype=torch.int32),
+        )
+        descendant_events = torch.cat(
+            [tree.child_event[tree.child_ptr[node] : tree.child_ptr[node + 1]] for node in first]
+        )
+        mixed += int(descendant_events.unique().numel() == 2)
+    assert mixed > 60
+
+
+def test_overflow_raises_instead_of_clamping_or_returning_partial_tree() -> None:
+    with pytest.raises(RuntimeError, match=r"requested nodes=.*capacity nodes="):
+        _sample(_LabeledBackend(4.0), _cfg(2, 4.0, budget=1))
+
+
+def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> None:
+    raw = yaml.safe_load((ROOT / "configs" / "kuhn_smoke.yaml").read_text())
+    raw["rollout"]["beta_mode"] = "neyman"
+    path = tmp_path / "neyman.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="sequential.*fixed"):
+        load_config(path)
+    raw["rollout"]["beta_mode"] = "fixed"
+    raw["rollout"]["beta_fix"] = {"default": float("nan")}
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="finite value at least one"):
+        load_config(path)
+
+
+def test_labeled_hot_path_has_no_explicit_host_transfers_or_label_sort() -> None:
+    banned = {"cpu", "numpy", "tolist", "item", "sort", "argsort"}
+    for function in (
+        sample_branched_labeled,
+        DeviceTreeBuffer.append_children,
+        DeviceTreeBuffer.finalize,
+        _selected_policy_logp,
+    ):
+        syntax = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        used = {
+            node.attr
+            for node in ast.walk(syntax)
+            if isinstance(node, ast.Attribute) and node.attr in banned
+        }
+        assert not used

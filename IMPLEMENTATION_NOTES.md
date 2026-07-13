@@ -107,3 +107,14 @@
 - Buffer exhaustion raises requested/capacity diagnostics and cannot return a truncated tree.
 - The positional P08 sampler remains behaviorally intact and warns only under debug assertions.
 - Explicit Torch generators can now be constructed directly on the rank device.
+
+## C09 — fixed-intensity labeled branching
+
+- Added the typed `sample_branched_labeled` entry point on the C08 device path.
+- Randomized rounding produces `floor(beta)` plus one Bernoulli fractional child.
+- Abstract children remain parent-major and duplicate public labels remain distinct.
+- Profiles, events, steps, reach updates, classification, and appends are batched.
+- Every edge stores exactly reciprocal offspring mass and propagates path occupancy.
+- Fixed intensities are backend bucket lookups validated as finite fp32 values at least one.
+- Capacity exhaustion raises from the preallocated buffer without clamping or partial output.
+- Isolated the P09 quotient sampler under `_legacy_sample_branched_trees` for migration only.

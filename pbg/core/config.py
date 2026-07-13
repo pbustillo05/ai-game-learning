@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import MISSING, dataclass, fields, is_dataclass
+import math
 from pathlib import Path
 from types import UnionType
 from typing import Any, TypeVar, Union, get_args, get_origin, get_type_hints
@@ -202,8 +203,15 @@ def _validate_config(cfg: RootConfig) -> None:
             raise ConfigError("root.game.poker: required when game.name is 'poker'")
         if cfg.completion.backend != "poker_gpu":
             raise ConfigError("root.completion.backend: poker requires 'poker_gpu'")
-    if cfg.rollout.beta_mode not in {"sequential", "fixed", "neyman"}:
-        raise ConfigError("root.rollout.beta_mode: expected 'sequential', 'fixed', or 'neyman'")
+    if cfg.rollout.beta_mode not in {"sequential", "fixed"}:
+        raise ConfigError("root.rollout.beta_mode: expected 'sequential' or 'fixed'")
+    if "default" not in cfg.rollout.beta_fix:
+        raise ConfigError("root.rollout.beta_fix.default: required")
+    for bucket, beta in cfg.rollout.beta_fix.items():
+        if not math.isfinite(beta) or beta < 1.0:
+            raise ConfigError(
+                f"root.rollout.beta_fix.{bucket}: expected a finite value at least one"
+            )
     if cfg.rollout.reach_storage not in {"full", "decisions_only", "recompute"}:
         raise ConfigError(
             "root.rollout.reach_storage: expected 'full', 'decisions_only', or 'recompute'"
