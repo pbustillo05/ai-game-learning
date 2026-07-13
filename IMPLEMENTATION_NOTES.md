@@ -96,3 +96,14 @@
 - Deferred Neyman allocation, public moment heads/losses, stored Q targets by default, and reference-policy KL.
 - Rewrote P12 against the typed bundle and split poker work into P13A GPU rollout plus P13B integration/presets.
 - Made every active prompt independently launchable in a cleared context: each now names its workspace bootstrap, binding interfaces, staged compatibility obligations, owned test migrations, exact validation commands, and handoff requirements. P08–P11 are visibly marked historical.
+
+## C08 — device-resident rollout foundation
+
+- Added the typed `GameBundle`, `RolloutBackend`, and opaque `EventBatch` boundary.
+- Added a preallocated device tree buffer with contiguous parent-major appends and CSR finalization.
+- The new sequential sampler runs a fixed number of frontier waves and keeps topology, reach, policy caches, and RNG draws device-local.
+- Player and chance frontier partitions use backend-owned policy routing, event sampling, stepping, classification, and reach updates.
+- Synthetic rollout remains the CPU oracle and now applies the completion cut only after final betting; folds remain terminal.
+- Buffer exhaustion raises requested/capacity diagnostics and cannot return a truncated tree.
+- The positional P08 sampler remains behaviorally intact and warns only under debug assertions.
+- Explicit Torch generators can now be constructed directly on the rank device.

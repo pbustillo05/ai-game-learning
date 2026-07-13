@@ -98,3 +98,17 @@ If any delta is unwelcome, say so before its prompt runs; each is localized.
 Bring the final `IMPLEMENTATION_NOTES.md`, the T5/T3/T4 outputs, and the
 Leduc exploitability curve back to Claude for the review pass (step 5 of the
 original plan), together with any CONTRACT-QUESTIONs that were deferred.
+
+## Shared server hygiene
+
+This repo is often used on a shared GPU server, and we must used these GPUs for testing, before doing any serious runs.
+Do use the GPUs but be conservative:
+- Use a virtualenv for Python work. Do not install packages into the server's system Python. Prefer one persistent user-level venv shared by the poker repos (there should be one available at `/home/pablob/.venvs/poker` and if unavailable, ask the user to create it), so dependencies are not reinstalled every session.
+- Check GPU state before CUDA work with `nvidia-smi`. If sandboxed access fails, request explicit approval rather than guessing.
+- Do not touch other users' GPU jobs. After checking GPU state, make sure to only launch tasks in idle available GPUs.
+- After a GPU task is done, make sure the GPU has returned to a clean idle state, without any strange lingering workload or memory usage.
+- Avoid OOM at all cost. Stage CUDA tests from tiny smoke runs to larger benchmarks, watch memory between runs, precompute estimated memory usage before anything sizable, and keep batch sizes/partials modest until usage is known. An OOM can require someone to physically reset the server, which is remote and difficult to access.
+- Prefer commands that make resource targeting explicit.
+
+You are by default approved and encouraged by the user to use the GPUs, as long you respect these rules. Escalate approval requests if the sandbox prevents you from using them.
+---

@@ -232,7 +232,11 @@ def load_config(path: str | Path) -> RootConfig:
     return cfg
 
 
-def seed_all(seed: int, rank: int = 0) -> tuple[torch.Generator, np.random.Generator]:
+def seed_all(
+    seed: int,
+    rank: int = 0,
+    device: torch.device | str | None = None,
+) -> tuple[torch.Generator, np.random.Generator]:
     """Return explicit Torch and NumPy generators seeded for one rank.
 
     The rank-local seed is ``seed * 1000 + rank``. Torch's process generators
@@ -243,8 +247,7 @@ def seed_all(seed: int, rank: int = 0) -> tuple[torch.Generator, np.random.Gener
     torch.manual_seed(rank_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(rank_seed)
-    torch_gen = torch.Generator()
+    torch_gen = torch.Generator(device=torch.device(device or "cpu"))
     torch_gen.manual_seed(rank_seed)
     np_gen = np.random.default_rng(rank_seed)
     return torch_gen, np_gen
-

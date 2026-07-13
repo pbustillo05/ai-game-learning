@@ -247,6 +247,174 @@ class TreeBuilder:
         return result
 
 
+class DeviceTreeBuffer:
+    """Preallocated device-resident storage for a batch of rollout trees.
+
+    Node capacity is ``n_trees * node_budget`` and edge capacity is that value
+    minus ``n_trees``.  Roots always occupy the first ``n_trees`` rows.
+    """
+
+    def __init__(
+        self,
+        n_trees: int,
+        node_budget: int,
+        n_players: int,
+        device: torch.device | str,
+    ) -> None:
+        if n_trees < 0 or node_budget <= 0 or n_players <= 0:
+            raise ValueError("n_trees must be nonnegative and budgets must be positive")
+        self.n_trees = int(n_trees)
+        self.node_budget = int(node_budget)
+        self.n_players = int(n_players)
+        self.device = torch.device(device)
+        self.node_capacity = self.n_trees * self.node_budget
+        self.edge_capacity = self.node_capacity - self.n_trees
+        self.node_count = 0
+        self.edge_count = 0
+
+        self.parent = torch.full(
+            (self.node_capacity,), -1, dtype=torch.int32, device=self.device
+        )
+        self.tree_id = torch.empty(
+            self.node_capacity, dtype=torch.int32, device=self.device
+        )
+        self.owner = torch.empty(
+            self.node_capacity, dtype=torch.int32, device=self.device
+        )
+        self.state_ref = torch.empty(
+            self.node_capacity, dtype=torch.int32, device=self.device
+        )
+        self.depth_p = torch.zeros(
+            (self.node_capacity, self.n_players), dtype=torch.int32, device=self.device
+        )
+        self.depth_player = torch.zeros(
+            self.node_capacity, dtype=torch.int32, device=self.device
+        )
+        self.path_weight = torch.empty(
+            self.node_capacity, dtype=torch.float32, device=self.device
+        )
+        self.edge_parent = torch.empty(
+            self.edge_capacity, dtype=torch.int32, device=self.device
+        )
+        self.child_node = torch.empty(
+            self.edge_capacity, dtype=torch.int32, device=self.device
+        )
+        self.child_event = torch.empty(
+            self.edge_capacity, dtype=torch.int32, device=self.device
+        )
+        self.edge_weight = torch.empty(
+            self.edge_capacity, dtype=torch.float32, device=self.device
+        )
+
+    def add_roots(self, states: Tensor, owners: Tensor) -> Tensor:
+        """Store int32 root ``states``/``owners`` ``[G]`` and return node ids."""
+
+        if states.shape != (self.n_trees,) or owners.shape != (self.n_trees,):
+            raise ValueError("root tensors must have shape [n_trees]")
+        if states.device != self.device or owners.device != self.device:
+            raise ValueError("root tensors must be on the buffer device")
+        ids = torch.arange(self.n_trees, dtype=torch.int32, device=self.device)  # [G]
+        self.state_ref[: self.n_trees] = states.to(torch.int32)
+        self.owner[: self.n_trees] = owners.to(torch.int32)
+        self.tree_id[: self.n_trees] = ids
+        self.path_weight[: self.n_trees] = 1.0
+        self.node_count = self.n_trees
+        return ids
+
+    append_roots = add_roots
+
+    def append_children(
+        self,
+        parents: Tensor,
+        states: Tensor,
+        owners: Tensor,
+        events: Tensor,
+        weights: Tensor,
+    ) -> Tensor:
+        """Append flattened parent-major child rows and return int32 node ids.
+
+        All arguments are one-dimensional ``[C_new]`` tensors.  Device prefix
+        sums assign contiguous child and edge rows without per-node mutation.
+        """
+
+        count = parents.numel()
+        if any(value.shape != (count,) for value in (states, owners, events, weights)):
+            raise ValueError("child append tensors must all have shape [C_new]")
+        if any(value.device != self.device for value in (parents, states, owners, events, weights)):
+            raise ValueError("child append tensors must be on the buffer device")
+        requested_nodes = self.node_count + count
+        requested_edges = self.edge_count + count
+        if requested_nodes > self.node_capacity or requested_edges > self.edge_capacity:
+            raise RuntimeError(
+                "DeviceTreeBuffer overflow: "
+                f"requested nodes={requested_nodes}, edges={requested_edges}; "
+                f"capacity nodes={self.node_capacity}, edges={self.edge_capacity}"
+            )
+        if count == 0:
+            return torch.empty(0, dtype=torch.int32, device=self.device)
+
+        offsets = torch.cumsum(
+            torch.ones(count, dtype=torch.int32, device=self.device), dim=0
+        ).to(torch.int32) - 1  # [C_new]
+        nodes = offsets + self.node_count  # [C_new]
+        edges = offsets.to(torch.int64) + self.edge_count  # [C_new]
+        node_rows = nodes.to(torch.int64)
+        parent_rows = parents.to(torch.int64)
+        parent_owner = self.owner[parent_rows]  # [C_new]
+
+        self.parent[node_rows] = parents.to(torch.int32)
+        self.state_ref[node_rows] = states.to(torch.int32)
+        self.owner[node_rows] = owners.to(torch.int32)
+        self.tree_id[node_rows] = self.tree_id[parent_rows]
+        self.depth_p[node_rows] = self.depth_p[parent_rows]
+        player_mask = (parent_owner >= 0) & (parent_owner < self.n_players)  # [C_new]
+        increments = torch.zeros(
+            (count, self.n_players), dtype=torch.int32, device=self.device
+        )  # [C_new,P]
+        safe_owner = parent_owner.clamp(0, self.n_players - 1).to(torch.int64)
+        increments.scatter_(1, safe_owner[:, None], player_mask.to(torch.int32)[:, None])
+        self.depth_p[node_rows] += increments
+        self.depth_player[node_rows] = (
+            self.depth_player[parent_rows] + player_mask.to(torch.int32)
+        )
+        self.path_weight[node_rows] = self.path_weight[parent_rows] * weights.float()
+
+        self.edge_parent[edges] = parents.to(torch.int32)
+        self.child_node[edges] = nodes
+        self.child_event[edges] = events.to(torch.int32)
+        self.edge_weight[edges] = weights.float()
+        self.node_count = requested_nodes
+        self.edge_count = requested_edges
+        return nodes
+
+    def finalize(self) -> TreeBatch:
+        """Return device views truncated to the realized node/edge counts."""
+
+        n = self.node_count
+        c = self.edge_count
+        edge_parent = self.edge_parent[:c].to(torch.int64)  # [C]
+        counts = torch.bincount(edge_parent, minlength=n).to(torch.int32)  # [N]
+        child_ptr = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=self.device),
+                torch.cumsum(counts, dim=0).to(torch.int32),
+            )
+        )  # [N+1]
+        return TreeBatch(
+            parent=self.parent[:n],
+            child_ptr=child_ptr,
+            child_node=self.child_node[:c],
+            child_event=self.child_event[:c],
+            nu=self.edge_weight[:c],
+            tree_id=self.tree_id[:n],
+            owner=self.owner[:n],
+            depth_p=self.depth_p[:n],
+            depth_player=self.depth_player[:n],
+            state_ref=self.state_ref[:n],
+            path_weight=self.path_weight[:n],
+        )
+
+
 @dataclass
 class AliasTable:
     """Walker alias table with optional external outcomes."""

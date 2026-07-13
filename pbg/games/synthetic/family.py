@@ -5,13 +5,13 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from pbg.core.game import CHANCE, TERMINAL
+from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
 
 FOLD = 0
 CHECK_CALL = 1
@@ -633,3 +633,162 @@ class SyntheticPBG:
         return torch.tensor(
             [self.states.history_hash[ref] for ref in refs], dtype=torch.int64, device=device
         )  # [B]
+
+
+class SyntheticRolloutBackend:
+    """CPU mathematical-oracle implementation of the batched rollout boundary."""
+
+    def __init__(
+        self,
+        game: SyntheticPBG,
+        beta_fix: Mapping[str, float] | Any | None = None,
+        device: torch.device | str = "cpu",
+    ) -> None:
+        self.game = game
+        self.device = torch.device(device)
+        if self.device.type != "cpu":
+            raise ValueError("the synthetic state-table oracle is CPU-only")
+        self.n_players = game.n_players
+        self.x_sizes = game.x_sizes
+        self.max_rollout_steps = (
+            game.cfg.n_rounds * game.n_players * (game.cfg.max_raises + 1)
+            + sum(count > 0 for count in game.cfg.board_per_round)
+        )
+        table = getattr(beta_fix, "beta_fix", beta_fix)
+        self.beta_fix = dict(table or {"default": 1.0})
+        if "default" not in self.beta_fix:
+            raise ValueError("beta_fix requires a 'default' entry")
+
+    def root_states(self, n: int) -> Tensor:
+        """Return opaque int32 root handles ``[B]`` on the backend device."""
+
+        return self.game.root_states(n).to(self.device)
+
+    def classify(self, states: Tensor) -> Tensor:
+        """Return owner codes ``[B]`` using the corrected completion cut."""
+
+        refs, _ = self.game._refs(states)
+        result: list[int] = []
+        for ref in refs:
+            state = self.game.states.state(ref)
+            if state.phase == 2:
+                result.append(TERMINAL if sum(state.live) == 1 else PRETERM)
+            elif state.phase == 1:
+                result.append(CHANCE)
+            else:
+                result.append(state.to_act)
+        return torch.tensor(result, dtype=torch.int32, device=self.device)  # [B]
+
+    def legal_events(self, states: Tensor) -> tuple[Tensor, Tensor]:
+        """Return public event ids/masks ``[B,E_max]``."""
+
+        return self.game.legal_events(states)
+
+    def policy_forward(self, frozen_model: Any, states: Tensor, reach: Tensor) -> Any:
+        """Evaluate all private types at player states ``[B]``."""
+
+        del reach
+        legal_ids, legal_mask = self.legal_events(states)
+        width = int(getattr(frozen_model, "e_max", self.game.n_player_events))
+        head_mask = torch.zeros(
+            (states.shape[0], width), dtype=torch.bool, device=self.device
+        )  # [B,E]
+        rows = torch.arange(states.shape[0], device=self.device)[:, None].expand_as(legal_ids)
+        head_mask[rows[legal_mask], legal_ids[legal_mask].to(torch.int64)] = True
+        return frozen_model(self.game.encode_public(states), head_mask)
+
+    def sample_profiles(
+        self, states: Tensor, reach: Tensor, gen: torch.Generator
+    ) -> Tensor:
+        """Draw one posterior profile per state as int32 ``[B,P]``."""
+
+        return self.game.sample_profiles(states, reach, 1, gen)[:, 0]  # [B,P]
+
+    @staticmethod
+    def _log_prob(
+        adapter: Any, policy_out: Any, legal_ids: Tensor, legal_mask: Tensor
+    ) -> Tensor:
+        try:
+            value = adapter.log_prob(policy_out, legal_ids, legal_ids, legal_mask)
+        except TypeError:
+            try:
+                value = adapter.log_prob(policy_out, legal_ids, legal_mask)
+            except TypeError:
+                value = adapter.log_prob(policy_out, legal_ids)
+        if value.shape[1] != legal_ids.shape[1] and value.shape[2] == legal_ids.shape[1]:
+            value = value.transpose(1, 2)
+        return value.float().masked_fill(~legal_mask[..., None], -torch.inf)  # [B,E,X]
+
+    def sample_events(
+        self,
+        states: Tensor,
+        profiles: Tensor,
+        policy_out: Any | None,
+        adapter: Any,
+        gen: torch.Generator,
+    ) -> EventBatch:
+        """Draw one public event per row and return an opaque event batch."""
+
+        legal_ids, legal_mask = self.legal_events(states)
+        owners = self.classify(states)
+        if policy_out is None:
+            probability = self.game.chance_probs(states, profiles)
+        else:
+            all_logp = self._log_prob(adapter, policy_out, legal_ids, legal_mask)
+            actor_type = profiles.gather(1, owners.to(torch.int64)[:, None]).squeeze(1)
+            rows = torch.arange(states.shape[0], device=self.device)
+            probability = torch.exp(all_logp[rows, :, actor_type])
+        probability = probability.masked_fill(~legal_mask, 0.0)
+        normalizer = probability.sum(dim=1, keepdim=True)
+        if bool((normalizer <= 0).any()):
+            raise RuntimeError("a rollout event distribution has zero mass")
+        columns = torch.multinomial(probability / normalizer, 1, generator=gen)
+        public_id = legal_ids.gather(1, columns).squeeze(1).to(torch.int32)  # [B]
+        return EventBatch(public_id=public_id)
+
+    def step(self, states: Tensor, events: EventBatch) -> Tensor:
+        """Apply ``events`` and return successor handles ``[B]``."""
+
+        return self.game.step(states, events.public_id)
+
+    def reach_update(
+        self,
+        reach: Tensor,
+        states: Tensor,
+        events: EventBatch,
+        policy_out: Any | None,
+    ) -> Tensor:
+        """Apply selected action/chance likelihoods to log reach ``[B,P,X]``."""
+
+        result = reach.clone()  # [B,P,X]
+        refs, _ = self.game._refs(states)
+        event_ids = events.public_id.detach().cpu().tolist()
+        if policy_out is not None:
+            log_policy = torch.log_softmax(policy_out.raw, dim=-1)  # [B,X,E]
+        for row, (ref, event) in enumerate(zip(refs, event_ids, strict=True)):
+            state = self.game.states.state(ref)
+            if state.phase == 0:
+                result[row, state.to_act] += log_policy[row, :, int(event)]
+            else:
+                revealed = set(self.game._event_cards(ref, int(event)))
+                conflict = torch.tensor(
+                    [not revealed.isdisjoint(hand) for hand in self.game._hand_sets],
+                    dtype=torch.bool,
+                    device=self.device,
+                )  # [X]
+                result[row, :, conflict] = -torch.inf
+        return result
+
+    def beta_fn(self, states: Tensor) -> Tensor:
+        """Return configured fixed intensity for synthetic stage buckets ``[B]``."""
+
+        refs, _ = self.game._refs(states)
+        values: list[float] = []
+        for ref in refs:
+            phase = "chance" if self.game.states.phase[ref] == 1 else "player"
+            bucket = f"round{self.game.states.round[ref]}_{phase}"
+            values.append(float(self.beta_fix.get(bucket, self.beta_fix["default"])))
+        result = torch.tensor(values, dtype=torch.float32, device=self.device)  # [B]
+        if not bool(torch.isfinite(result).all()) or bool((result < 1.0).any()):
+            raise ValueError("rollout beta must be finite and at least one")
+        return result
