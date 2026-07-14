@@ -14,7 +14,12 @@ from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
 
 @dataclass
 class TreeBatch:
-    """CSR rollout topology: trajectories or one sampled branching tree."""
+    """CSR rollout topology: trajectories or one sampled branching tree.
+
+    ``depth_p[node, p]`` counts the ``p``-owned nodes on the path through
+    ``node``, including ``node`` itself when ``owner[node] == p``.
+    ``depth_player`` is the corresponding count over all players.
+    """
 
     parent: Tensor
     child_ptr: Tensor
@@ -46,6 +51,8 @@ class TreeBatch:
                 raise ValueError(f"{name} must have shape [N]")
         if self.depth_p.ndim != 2 or self.depth_p.shape[0] != n:
             raise ValueError("depth_p must have shape [N,P_max]")
+        if p_max <= 0:
+            raise ValueError("depth_p must have a positive player dimension")
         if self.child_ptr.ndim != 1 or self.child_ptr.numel() != n + 1:
             raise ValueError("child_ptr must have shape [N+1]")
         c = int(self.child_node.numel())
@@ -95,13 +102,14 @@ class TreeBatch:
                     raise ValueError("child and parent arrays disagree")
                 if int(self.tree_id[child]) != int(self.tree_id[node]):
                     raise ValueError("an edge cannot cross tree ids")
+                child_owner = int(self.owner[child])
                 expected_depth = self.depth_p[node].clone()
-                if 0 <= node_owner < p_max:
-                    expected_depth[node_owner] += 1
+                if 0 <= child_owner < p_max:
+                    expected_depth[child_owner] += 1
                 if not torch.equal(self.depth_p[child], expected_depth):
                     raise ValueError("depth_p is inconsistent with the parent chain")
                 expected_player_depth = int(self.depth_player[node]) + int(
-                    0 <= node_owner < p_max
+                    0 <= child_owner < p_max
                 )
                 if int(self.depth_player[child]) != expected_player_depth:
                     raise ValueError("depth_player is inconsistent with the parent chain")
@@ -116,12 +124,21 @@ class TreeBatch:
             raise ValueError("parents must be -1 only at roots")
         if bool((incoming[roots] != 0).any()) or bool((incoming[~roots] != 1).any()):
             raise ValueError("every non-root must have exactly one incoming edge")
-        if not torch.equal(self.depth_p[roots], torch.zeros_like(self.depth_p[roots])):
-            raise ValueError("root depth_p must be zero")
+        root_rows = roots.nonzero(as_tuple=False).squeeze(1)
+        expected_root_depth = torch.zeros_like(self.depth_p[root_rows])
+        root_owner = self.owner[root_rows].to(torch.int64)
+        root_player = (root_owner >= 0) & (root_owner < p_max)
+        safe_root_owner = root_owner.clamp(0, p_max - 1)
+        expected_root_depth.scatter_(
+            1, safe_root_owner[:, None], root_player.to(torch.int32)[:, None]
+        )
+        if not torch.equal(self.depth_p[root_rows], expected_root_depth):
+            raise ValueError("root depth_p must count the root owner")
+        expected_root_player_depth = root_player.to(self.depth_player.dtype)
         if not torch.equal(
-            self.depth_player[roots], torch.zeros_like(self.depth_player[roots])
+            self.depth_player[root_rows], expected_root_player_depth
         ):
-            raise ValueError("root depth_player must be zero")
+            raise ValueError("root depth_player must count a player-owned root")
         if not torch.allclose(
             self.path_weight[roots], torch.ones_like(self.path_weight[roots]), atol=0, rtol=0
         ):
@@ -219,16 +236,14 @@ class TreeBuilder:
         path_weight = torch.ones(n, dtype=torch.float32)
         incoming_nu = {child: weight for edges in self.children for child, _, weight in edges}
         for node, parent in enumerate(self.parents):
-            if parent < 0:
-                continue
-            depth_p[node] = depth_p[parent]
-            parent_owner = self.owners[parent]
-            if 0 <= parent_owner < self.n_players:
-                depth_p[node, parent_owner] += 1
-                depth_player[node] = depth_player[parent] + 1
-            else:
+            if parent >= 0:
+                depth_p[node] = depth_p[parent]
                 depth_player[node] = depth_player[parent]
-            path_weight[node] = path_weight[parent] * incoming_nu[node]
+                path_weight[node] = path_weight[parent] * incoming_nu[node]
+            owner = self.owners[node]
+            if 0 <= owner < self.n_players:
+                depth_p[node, owner] += 1
+                depth_player[node] += 1
 
         result = TreeBatch(
             parent=torch.tensor(self.parents, dtype=torch.int32),
@@ -317,6 +332,12 @@ class DeviceTreeBuffer:
         self.state_ref[: self.n_trees] = states.to(torch.int32)
         self.owner[: self.n_trees] = owners.to(torch.int32)
         self.tree_id[: self.n_trees] = ids
+        root_owners = owners.to(torch.int64)
+        player_mask = (root_owners >= 0) & (root_owners < self.n_players)
+        self.depth_p[: self.n_trees].zero_()
+        safe_owner = root_owners.clamp(0, self.n_players - 1)
+        self.depth_p[ids.to(torch.int64), safe_owner] = player_mask.to(torch.int32)
+        self.depth_player[: self.n_trees] = player_mask.to(torch.int32)
         self.path_weight[: self.n_trees] = 1.0
         self.node_count = self.n_trees
         return ids
@@ -360,18 +381,17 @@ class DeviceTreeBuffer:
         edges = offsets.to(torch.int64) + self.edge_count  # [C_new]
         node_rows = nodes.to(torch.int64)
         parent_rows = parents.to(torch.int64)
-        parent_owner = self.owner[parent_rows]  # [C_new]
-
         self.parent[node_rows] = parents.to(torch.int32)
         self.state_ref[node_rows] = states.to(torch.int32)
         self.owner[node_rows] = owners.to(torch.int32)
         self.tree_id[node_rows] = self.tree_id[parent_rows]
         self.depth_p[node_rows] = self.depth_p[parent_rows]
-        player_mask = (parent_owner >= 0) & (parent_owner < self.n_players)  # [C_new]
+        child_owner = owners.to(torch.int64)
+        player_mask = (child_owner >= 0) & (child_owner < self.n_players)  # [C_new]
         increments = torch.zeros(
             (count, self.n_players), dtype=torch.int32, device=self.device
         )  # [C_new,P]
-        safe_owner = parent_owner.clamp(0, self.n_players - 1).to(torch.int64)
+        safe_owner = child_owner.clamp(0, self.n_players - 1)
         increments.scatter_(1, safe_owner[:, None], player_mask.to(torch.int32)[:, None])
         self.depth_p[node_rows] += increments
         self.depth_player[node_rows] = (

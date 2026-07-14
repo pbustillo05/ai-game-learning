@@ -2,10 +2,16 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
 import torch
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL
-from pbg.core.tree import AliasTable, TreeBuilder, build_decision_alias
+from pbg.core.tree import (
+    AliasTable,
+    DeviceTreeBuffer,
+    TreeBuilder,
+    build_decision_alias,
+)
 
 
 def _hand_tree():
@@ -26,10 +32,73 @@ def test_builder_finalize_computes_csr_depth_and_path_weight() -> None:
     assert tree.child_event.tolist() == [4, 5, 8]
     assert torch.equal(
         tree.depth_p,
-        torch.tensor([[0, 0], [1, 0], [1, 0], [1, 0]], dtype=torch.int32),
+        torch.tensor([[1, 0], [1, 0], [1, 0], [1, 0]], dtype=torch.int32),
     )
-    assert tree.depth_player.tolist() == [0, 1, 1, 1]
+    assert tree.depth_player.tolist() == [1, 1, 1, 1]
     assert torch.equal(tree.path_weight, torch.tensor([1.0, 0.25, 0.75, 0.25]))
+
+
+def test_depth_counts_owned_nodes_including_the_current_state() -> None:
+    builder = TreeBuilder(2)
+    root = builder.add_root(0, 0)
+    chance = builder.add_child(root, 1, 10, 1.0, CHANCE)
+    player_one = builder.add_child(chance, 2, 11, 1.0, 1)
+    player_zero = builder.add_child(player_one, 3, 12, 1.0, 0)
+    builder.add_child(player_zero, 4, 13, 1.0, TERMINAL)
+
+    tree = builder.finalize()
+
+    assert torch.equal(
+        tree.depth_p,
+        torch.tensor(
+            [[1, 0], [1, 0], [1, 1], [2, 1], [2, 1]], dtype=torch.int32
+        ),
+    )
+    assert tree.depth_player.tolist() == [1, 1, 2, 3, 3]
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda:0",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ],
+)
+def test_device_tree_depth_uses_the_same_inclusive_convention(device: str) -> None:
+    buffer = DeviceTreeBuffer(1, 3, 2, device)
+    root = buffer.add_roots(
+        torch.tensor([0], dtype=torch.int32, device=device),
+        torch.tensor([0], dtype=torch.int32, device=device),
+    )
+    child = buffer.append_children(
+        root,
+        torch.tensor([1], dtype=torch.int32, device=device),
+        torch.tensor([1], dtype=torch.int32, device=device),
+        torch.tensor([10], dtype=torch.int32, device=device),
+        torch.tensor([1.0], device=device),
+    )
+    buffer.append_children(
+        child,
+        torch.tensor([2], dtype=torch.int32, device=device),
+        torch.tensor([TERMINAL], dtype=torch.int32, device=device),
+        torch.tensor([11], dtype=torch.int32, device=device),
+        torch.tensor([1.0], device=device),
+    )
+
+    tree = buffer.finalize()
+    tree.validate()
+    assert torch.equal(
+        tree.depth_p,
+        torch.tensor(
+            [[1, 0], [1, 1], [1, 1]], dtype=torch.int32, device=device
+        ),
+    )
+    assert tree.depth_player.tolist() == [1, 2, 2]
 
 
 def test_validate_rejects_bad_nu_and_path_weight() -> None:

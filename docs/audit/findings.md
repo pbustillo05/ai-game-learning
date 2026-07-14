@@ -28,23 +28,6 @@ intensity is `low`, `medium`, or `high`.
 
 ## B. Game-family, theory, operations, and validation findings
 
-### AUD-021 — `core_math.tex` lambda-return displays are off by one relative to code
-
-**Severity:** Major specification defect, implementation currently follows the corrected companion  
-**Modes:** Normal, sequential RB  
-**Evidence:** Equations `sequential-lambda-return` and `rao-blackwell-lambda-return` use terminal exponent `|Tau ∖ sigma|_p`, which includes the current decision under the document's depth convention. The correct player-clock exponent is the number of downstream decisions by the same player, `|Tau|_p - |sigma|_p - 1`. `NOTATION.md` explicitly normalizes this typo, and the backward implementation applies one lambda mix at each downstream owner decision, which is the corrected behavior.
-
-**Consequence:** A future direct transcription of the authoritative TeX would disagree with the current code and standard player-clock GAE, especially visible at the last decision where the terminal reward should have exponent zero.
-
-**Recommendation:** Correct the equations in `core_math.tex` rather than relying on a companion normalization. Add closed-form trajectory tests for zero, one, and multiple downstream same-player decisions at lambda 0, intermediate lambda, and 1.
-
-**Model recommendation:** `5.6 Sol` with `high` thinking — an authoritative mathematical correction should be derived against code and closed-form edge cases, not patched mechanically.
-
-**Response:** Ignore for now; core_math is changing a lot anyways
-
-
----
-
 ### AUD-022 — Global policy-support assumptions remain unresolved
 
 **Severity:** Major theoretical/robustness issue  

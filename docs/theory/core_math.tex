@@ -62,7 +62,9 @@ A finite public-action Bayesian game consists of the following data.
 
     \item \textbf{Owner:} A finite set $\mathcal{P}$ of \textit{players} and an owner map $o:\mathcal S\setminus\mathcal T \to \mathcal{P}\sqcup\{\mathsf c\}$.
     If $o(\sigma)\in\mathcal P$ (resp. $\{\mathsf c\}$) is a player node (resp. chance node), we typically denote the elements of $\mathcal{E}_\sigma$ by $a$ (resp. $c$).
-    For $\sigma \in \mathcal S$ and $p \in \mathcal P$, we write $|\sigma|_p$ for the number of player nodes in $\sigma$ owned by $p$, and $|\sigma|_{\textnormal{player}}$ for the total number of player nodes in $\sigma$.
+    For $\sigma \in \mathcal S$ and $p \in \mathcal P$, we write
+    $|\sigma|_p:=\#\{\rho\preccurlyeq\sigma\mid o(\rho)=p\}$ for the number of player nodes in $\sigma$ owned by $p$, and $|\sigma|_{\textnormal{player}}:=\sum_{p\in\mathcal P}|\sigma|_p$ for the total number of player nodes in $\sigma$.
+    Thus, when $o(\sigma)=p$, the state $\sigma$ is counted in $|\sigma|_p$: it is the state immediately before $p$ chooses an outgoing action $a\in\mathcal E_\sigma$; that action is the edge from $\sigma$ to the next state $\sigma a$.
     For $\rho\preccurlyeq\sigma$, we write $|\sigma\setminus\rho|_p:=|\sigma|_p-|\rho|_p$ and $|\sigma\setminus\rho|_{\textnormal{player}}:=|\sigma|_{\textnormal{player}}-|\rho|_{\textnormal{player}}$.
     For $\tau \in \mathcal{T}$, write $\tau^{\mathsf{pre-c}}$ for the largest prefix ending in no more than one node in $\mathcal{T} \sqcup o^{-1}(\mathsf{c})$.
     In other words, we have $\tau^{\mathsf{pre-c}} = \sigma a$ for $\sigma a \preccurlyeq \tau$ the last player node $o(\sigma) \in \mathcal{P}$ and decision $a$: if $\sigma a \prec \tau$, we must have $o(\rho) = \mathsf{c}$ for every $\sigma a \preccurlyeq \rho \prec \tau$.
@@ -151,6 +153,15 @@ larger class of games to which the same techniques apply.  We keep the
 formalism below closer to poker, where private states are sampled initially,
 to simplify the notation.
 \end{remark}
+
+\begin{notation}[Stationary Distributions in Tree-Shaped Markov Chains]\label{not:stationary-distribution}
+  Whenever we have a tree-shaped Markov chain with a collection of terminal states, we call \textit{stationary distribution} the unique probability distribution that is stable under:
+  \begin{enumerate}[label = (\roman*)]
+    \item at any non-terminal state, randomly moving down the tree according to the transition probabilities, and
+    \item at any terminal state, jumping back to the root of the tree.
+  \end{enumerate}
+  From a game persepective, we see games as endlessly restarting whenever someone won.
+\end{notation}
 
 \begin{notation}[Ideal Random Variables]\label{not:random-variables}
 We first sample an ideal player-decision node $\Sigma^\pi$ according to
@@ -317,6 +328,7 @@ We then have the following classic losses (the notation $\mathcal{L}[\widehat{E}
   c_{\tt KL}\left(\rho^\theta_{k} \log(\rho^\theta_{k}) - \rho^\theta_{k} + 1\right)
   \label{eq:primitive-losses}
 \end{equation}
+The displayed NeuRD losses clip raw $Q$-values and are therefore not invariant to additive reward shifts; they should be understood as deliberate non-invariant surrogates.
 
 \paragraph{Relation to \autoref{thm:policy-gradient-games}.}
 The goal of this loss function is that its gradient resembles the gradient of the expected payoff $J_p(\pi^\theta_p, \sg[\pi^\theta_{-p}])$.
@@ -367,6 +379,8 @@ Define an index $I\in\{1,\ldots,N\}$ by
 \end{equation}
 Then let $\Sigma A \preccurlyeq \Tau_I$ be a uniform choice of a player decision and $P = o(\Sigma)$.
 \end{definition}
+
+Do note that all convergence statements are restricted to the fixed finite game, fixed rollout profile, and the sampling schemes stated in their lemmas.
 
 \begin{lemma}[Convergence of the empirical terminal-rollout decision law]\label{lem:terminal-rollout-decision-law-convergence}
 Let $\widehat{\mathbb P}_N$ be the conditional law of $(X_I,P,\Sigma,A)$ given $\mathfrak T$, and let $\mathbb P_\star$ be the ideal law of \autoref{not:random-variables}. Then
@@ -492,6 +506,7 @@ For $b \in \mathcal{E}_\Sigma$, we define the \textbf{\texttt{R-NaD} all-action 
 \bottomrule
 \end{tabular}
 \end{center}
+The method names in this table denote synchronous loss surrogates, not exact reproductions or convergence claims.
 In \texttt{R-NaD}, it is not clear what function $\operatorname{ref}(k)$ to choose, as the original implementation is \texttt{IMPALA}-style rather than synchronous.
 
 \paragraph{Implementation.} Below is a pseudocode of the usual implementation.
@@ -618,7 +633,7 @@ Essentially, we modify the expected value computations as
   \mathbb{E}^\pi(R_{p}(x, \tau) \mid x_p, \sigma a)
   \nonumber\\
   &=&
-  \mathbb{E}^\pi(\mathbb{E}^\pi(R_{p}(x, \tau) \mid x_p, \tau^{\mathsf{pre-c}}) \mid \sigma a)
+  \mathbb{E}^\pi(\mathbb{E}^\pi(R_{p}(x, \tau) \mid x_p, \tau^{\mathsf{pre-c}}) \mid x_p, \sigma a)
   \label{eq:rao-blackwell-q-identity}
 \end{equation}
 \begin{equation}[rCl]
@@ -682,7 +697,7 @@ Other methods such as rejection sampling or MCMC were found to be less efficient
 	For $1 \leq i \leq N$, $p \in \mathcal{P}$ and $x_p \in \mathcal{X}_p$, estimate 
   \begin{equation}[rCl]
         \widehat{\mathbb{P}}(x_p \mid \Tau^{\mathsf{pre-c}}_i)
-         &\simeq& \mathbb{P}^\pi(x_p, \tau \mid \Tau^{\mathsf{pre-c}}_i)
+         &\simeq& \mathbb{P}^\pi(x_p \mid \Tau^{\mathsf{pre-c}}_i)
         \nonumber\\
         \widehat{V}_p(x_p, \Tau^{\mathsf{pre-c}}_i) &\simeq& \mathbb{E}^\pi(R_{p}(x, \tau) \mid x_p, \Tau^{\mathsf{pre-c}}_i)
         \label{eq:sequential-preterminal-estimates}
@@ -733,32 +748,53 @@ We enrich the rollout into a branching random walk on the public tree.
 The design constraint, encouraged by the Rao--Blackwellized pipeline, is that the enrichment must be \emph{public}: any stored importance weight depending on a sampled hidden assignment would contaminate every posterior downstream (Warning~\ref{warn:no-private-tilting}).
 
 \begin{algorithm}[H]
-\caption{$(\mathfrak S^{\beta,\pi},\ell^{\beta,\pi},N^{\beta,\pi})\gets$~\texttt{SampleTree}$(\pi,\beta)$}
+\caption{$(\mathfrak S^{\beta,\pi},\ell^{\beta,\pi},N^{\beta,\pi},\mathfrak r)\gets$~\texttt{SampleTree}$(\pi,\beta)$}
 \label{alg:sample-tree}
 \DontPrintSemicolon
 \tcc{Sampling procedure for the rollout tree of \cref{def:branched-rollout-tree}.}
 \KwParam{$\pi$, rollout profile; $\beta:\mathcal S\setminus\mathcal T\to[1,\infty)$, intensity}
-\KwOut{sampled tree $\mathfrak{S}^{\beta,\pi}$, label map $\ell^{\beta,\pi}:\mathfrak{S}^{\beta,\pi}\to \mathcal S$, and child counts $N$}
-Set $\mathfrak{S}^{\beta,\pi}\gets\{\varnothing\}$, $\ell^{\beta,\pi}(\varnothing)\gets\varnothing$, and $\mathcal F\gets\{\varnothing\}$\;
+\KwOut{sampled tree $\mathfrak{S}^{\beta,\pi}$, label map $\ell^{\beta,\pi}:\mathfrak{S}^{\beta,\pi}\to \mathcal S$, child counts $N$, and node-specific reach caches $\mathfrak r$}
+Set $\mathfrak{S}^{\beta,\pi}\gets\{\varnothing\}$, $\ell^{\beta,\pi}(\varnothing)\gets\varnothing$, $\mathfrak r_{\varnothing}\gets(1)_{q\in\mathcal P\cup\{\mathsf c\}}$, and $\mathcal F\gets\{\varnothing\}$\;
 \While{$\mathcal F\neq\varnothing$}{
   Choose and remove some node $\mathsf{s}\in\mathcal F$ and set $\sigma\gets\ell^{\beta,\pi}(\mathsf{s})$\;
   \eIf{$\sigma$ is pre-terminal}{
-    Set $\mathfrak{E}_{\mathsf{s}}\gets\varnothing$\;
+    Set $\mathfrak{E}_{\mathsf{s}}\gets\varnothing$ and $N^{\beta,\pi}(\mathsf s)\gets0$\;
   }{
+    Set $q\gets o(\sigma)$\;
     Let $N^{\beta,\pi}(\mathsf{s}) \sim \lfloor\beta(\sigma)\rfloor + \operatorname{Bernoulli}\big(\beta(\sigma) - \lfloor\beta(\sigma)\rfloor\big)$\;
     Set $\mathfrak{E}_{\mathsf{s}}\gets\{\mathsf{a}_1,\ldots,\mathsf{a}_{N^{\beta,\pi}(\mathsf{s})}\}$ to be the set of children of $\mathsf{s}$\;
-    Let
-    \[
-    (E_{\mathsf{a}})_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}} \stackrel{\mathsf{iid}}{\sim} \begin{cases}[l"l]
-      \mathbb{E}^\pi(\pi(\cdot\mid x_p, \sigma) \mid \sigma) & \textnormal{if } o(\sigma) \in \mathcal{P}\\
-      \mathbb{E}^\pi(\chi(\cdot\mid x, \sigma) \mid \sigma) & \textnormal{otherwise}
-    \end{cases}
-    \]\;
-    For $\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}$, let $\ell^{\beta,\pi}(\mathsf{s}\mathsf{a})=\sigma E_{\mathsf{a}}$\;
+    \For{$\mathsf a\in\mathfrak E_{\mathsf s}$, independently}{
+      Sample $X_{\mathsf s,\mathsf a}$ from the posterior represented by the current reach cache,
+      \[
+        \mathbb P^{\mathfrak r_{\mathsf s}}(x\mid\sigma)
+        =
+        \frac{\mu(x)\prod_{u\in\mathcal P\cup\{\mathsf c\}}r_{\mathsf s,u}(\sigma\mid x_u)}
+             {\sum_{y\in\mathcal X}\mu(y)\prod_{u\in\mathcal P\cup\{\mathsf c\}}r_{\mathsf s,u}(\sigma\mid y_u)}
+      \]\;
+      Sample
+      \[
+        E_{\mathsf a}\sim
+        \begin{cases}[l"l]
+          \pi(\cdot\mid X_{\mathsf s,\mathsf a,q},\sigma) & \textnormal{if }q\in\mathcal P,\\
+          \chi(\cdot\mid X_{\mathsf s,\mathsf a},\sigma) & \textnormal{otherwise}
+        \end{cases}
+      \]\;
+      Set $\ell^{\beta,\pi}(\mathsf s\mathsf a)\gets\sigma E_{\mathsf a}$ and $\mathfrak r_{\mathsf s\mathsf a}\gets\mathfrak r_{\mathsf s}$\;
+      Set
+      \[
+        \mathfrak r_{\mathsf s\mathsf a,q}\gets
+        \mathfrak r_{\mathsf s\mathsf a,q}\odot
+        \begin{cases}[l"l]
+          \pi(E_{\mathsf a}\mid-,\sigma) & \textnormal{if }q\in\mathcal P,\\
+          \chi(E_{\mathsf a}\mid-,\sigma) & \textnormal{otherwise}
+        \end{cases}
+      \]\;
+      Normalize $\mathfrak r_{\mathsf s\mathsf a,q}$\;
+    }
     $\mathcal F \gets \mathcal F \sqcup \{\mathsf{s}\mathsf{a}:\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}\}$\;
   }
 }
-\Return{$(\mathfrak{S}^{\beta,\pi}, \ell^{\beta,\pi}:\mathfrak{S}^{\beta,\pi}\to\mathcal S, N^{\beta,\pi}:\mathfrak{S}^{\beta,\pi}\to\mathbb N)$}
+\Return{$(\mathfrak{S}^{\beta,\pi}, \ell^{\beta,\pi}:\mathfrak{S}^{\beta,\pi}\to\mathcal S, N^{\beta,\pi}:\mathfrak{S}^{\beta,\pi}\to\{0,1,\ldots\},\mathfrak r)$}
 \end{algorithm}
 
 \begin{remark}[Practical Implementation]
@@ -770,9 +806,7 @@ Set $\mathfrak{S}^{\beta,\pi}\gets\{\varnothing\}$, $\ell^{\beta,\pi}(\varnothin
 \end{remark}
 
 \begin{definition}[Rollout tree]\label{def:branched-rollout-tree}
-Let $\beta : \mathcal S \setminus \mathcal T \to [1, \infty)$ be an intensity function and $(\mathfrak{S}^{\beta,\pi}, \ell^{\beta,\pi}:\mathfrak{S}^{\beta,\pi}\to\mathcal S, N^{\beta,\pi}:\mathfrak{S}^{\beta,\pi}\to\mathbb N) \gets \algcall{alg:sample-tree}{SampleTree}(\pi, \beta)$ be a random labeled tree, seen as a Markov chain (with uniform transition probabilities).
-When $\beta$ and $\pi$ are clear, write $\ell$ for $\ell^{\beta,\pi}$.
-Conditioning on $\mathfrak{S}^{\beta,\pi}$ below means conditioning on the sampled labeled tree, including $\ell$ and $N^{\beta,\pi}$.
+Let $\beta : \mathcal S \setminus \mathcal T \to [1, \infty)$ be an intensity function and $(\mathfrak{S}^{\beta,\pi}, \ell^{\beta,\pi}:\mathfrak{S}^{\beta,\pi}\to\mathcal S, N^{\beta,\pi}:\mathfrak{S}^{\beta,\pi}\to\{0,1,\ldots\},\mathfrak r) \gets \algcall{alg:sample-tree}{SampleTree}(\pi, \beta)$ be a random labeled tree, seen as a Markov chain (with uniform transition probabilities), together with its auxiliary node-specific reach caches.
 We have a natural probability distribution on $\mathcal{X} \times \mathcal{T}$ induced by first sampling a leaf of this Markov chain and then completing its pre-terminal public label:
 \begin{equation}\label{eq:branched-terminal-law}
   \mathbb{P}^{\beta, \pi}(x,\tau \mid \mathfrak{S}^{\beta, \pi})
@@ -780,7 +814,6 @@ We have a natural probability distribution on $\mathcal{X} \times \mathcal{T}$ i
     \left(\prod_{\mathsf{s} \prec \mathsf{t}} \frac{1}{N^{\beta,\pi}(\mathsf{s})}\right)
     \mathbb P^\pi(x,\tau\mid\tau^{\mathsf{pre-c}}).
 \end{equation}
-Equivalently, let $\mathsf{T}^{\beta,\pi}$ be the sampled leaf of this Markov chain, set $\Tau^{\beta,\pi,\mathsf{pre-c}}:=\ell(\mathsf{T}^{\beta,\pi})$, and then sample $(X,\Tau^{\beta,\pi})\sim\mathbb P^\pi(\cdot\mid\Tau^{\beta,\pi,\mathsf{pre-c}})$.
 From it, we can firstly define $P^{\beta, \pi} \in \mathcal{P}$ by
 \begin{equation}\label{eq:branched-player-law}
   \mathbb{P}(P^{\beta, \pi} = p \mid \mathfrak{S}^{\beta, \pi})
@@ -789,18 +822,6 @@ From it, we can firstly define $P^{\beta, \pi} \in \mathcal{P}$ by
 \end{equation}
 Secondly, we denote $\mathsf{S}^{\beta, \pi}$ for a random node sampled from the stationary distribution of the Markov chain defined on the sub-tree of $\mathfrak{S}^{\beta, \pi}$ on these nodes labeled by a game node owned by $P^{\beta, \pi}$, and we let $\Sigma^{\beta, \pi} = \ell(\mathsf{S}^{\beta, \pi})$ be its label.
 Thirdly, we let $\mathsf{A}^{\beta, \pi}$ be a uniform choice in $\mathfrak{E}_{\mathsf{S}^{\beta,\pi}}$ and let $A^{\beta, \pi}$ be its public event label, so $\ell(\mathsf{S}^{\beta,\pi}\mathsf{A}^{\beta,\pi})=\Sigma^{\beta,\pi}A^{\beta,\pi}$.
-And finally, we let
-\[
-  \Tau^{\beta, \pi, \mathsf{pre-c}} \sim
-  \frac{|\cdot|_{P^{\beta,\pi}} \mathbb{P}^{\beta, \pi}(\cdot \preccurlyeq \tau\mid \mathfrak{S}^{\beta, \pi})}
-       {\mathbb{E}^{\beta, \pi}(|\tau|_{P^{\beta,\pi}} \mid \mathfrak{S}^{\beta, \pi})}
-\]
-be a random pre-terminal trajectory continuing $\Sigma^{\beta, \pi} A^{\beta, \pi}$ defined by
-\begin{equation}\label{eq:branched-continuation-law}
-  \mathbb{P}(\Tau^{\beta, \pi,\mathsf{pre-c}} = \tau^{\mathsf{pre-c}} \mid \Sigma^{\beta, \pi} A^{\beta, \pi}, \mathfrak{S}^{\beta, \pi})
-  = \mathbb{P}^{\beta, \pi}(\tau^{\mathsf{pre-c}} \mid \Sigma^{\beta, \pi} A^{\beta, \pi}, \mathfrak{S}^{\beta, \pi})
-\end{equation} 
-and conditionally on it we sample $(X,\Tau^{\beta,\pi})\sim\mathbb{P}^\pi(\cdot \mid \Tau^{\beta, \pi, \mathsf{pre-c}})$.
 It's easy to see that the law of $\mathsf{S}^{\beta, \pi}$ is given by
 \begin{equation}\label{eq:branched-stationary-node-law}
   \mathbb{P}(\mathsf{S}^{\beta,\pi} = \mathsf{s} \mid P^{\beta, \pi}, \mathfrak{S}^{\beta, \pi})
@@ -810,26 +831,24 @@ It's easy to see that the law of $\mathsf{S}^{\beta, \pi}$ is given by
 which is indeed a probability distribution.
 \end{definition}
 
-\begin{lemma}[Convergence of the empirical branched decision law]\label{lem:branched-decision-law-convergence}
-Let $(\mathfrak S_m^{\beta,\pi})_{m=1}^M$ be independent rollout trees, let $\mathbb P_m^{\beta,\pi}$ be the conditional law of $(X,P,\Sigma,A)$ given $\mathfrak S_m^{\beta,\pi}$ from \cref{def:branched-rollout-tree}, and set
+\begin{lemma}[Single-tree convergence of the branched decision law]\label{lem:branched-decision-law-convergence}
+Fix an intensity profile $\bar\beta:\mathcal S\setminus\mathcal T\to[1,\infty)$ and assume that every terminal trajectory contains at least one player node.
+For $K\in\mathbb N$, set $\beta_K:=K\bar\beta$, sample a single rollout tree $\mathfrak S_K:=\mathfrak S^{\beta_K,\pi}$ as in \cref{def:branched-rollout-tree}, and let
 \[
-  Z_m:=\mathbb E^{\beta,\pi}(|\tau|_{\textnormal{player}}\mid\mathfrak S_m^{\beta,\pi}),
-  \qquad
-  \widehat{\mathbb P}^{\beta,\pi}_M
-  :=\frac{\sum_{m=1}^M Z_m\mathbb P_m^{\beta,\pi}}{\sum_{m=1}^M Z_m}.
+  \widehat{\mathbb P}_K
+  :=
+  \mathcal L\!\left(
+    P^{\beta_K,\pi},\Sigma^{\beta_K,\pi},A^{\beta_K,\pi}
+    \middle|
+    \mathfrak S_K
+  \right).
 \]
-Then, for the ideal law $\mathbb P_\star$ of \autoref{not:random-variables},
+Let $\mathbb P_\star^{\mathrm{dec}}:=\mathcal L(P^\pi,\Sigma^\pi,A^\pi)$ be the corresponding marginal of the ideal law in \autoref{not:random-variables}.
+Then $|\mathfrak S_K|\to\infty$ and
 \[
-  \|\widehat{\mathbb P}^{\beta,\pi}_M-\mathbb P_\star\|_{\rm TV}\longrightarrow0
-  \quad\textnormal{almost surely},
-  \qquad
-  \sqrt M(\widehat{\mathbb P}^{\beta,\pi}_M-\mathbb P_\star)
-  \Longrightarrow\mathcal N(0,\Gamma_{\beta,\pi}).
-\]
-Moreover, there are game-dependent constants $c,C>0$ such that, for every $0<\varepsilon<1$,
-\[
-  \mathbb P\!\left(\|\widehat{\mathbb P}^{\beta,\pi}_M-\mathbb P_\star\|_{\rm TV}>\varepsilon\right)
-  \leq Ce^{-cM\varepsilon^2}.
+  \bigl\|\widehat{\mathbb P}_K-\mathbb P_\star^{\mathrm{dec}}\bigr\|_{\mathrm{TV}}
+  \xrightarrow[K\to\infty]{\mathbb P}
+  0.
 \]
 \end{lemma}
 
@@ -891,7 +910,7 @@ For a player node $\mathsf{s}\in \mathfrak{S}$ with $\ell(\mathsf{s})=\sigma$, a
     \widehat{V}^{\lambda,\neg\mathsf{a}}(x_p, \mathsf{s})
     &=&
     \mathbb{E}^{\beta, \pi}\left(
-        \lambda^{|\tau \setminus \sigma|_p} R_p(x, \tau)
+        \lambda^{|\tau \setminus \sigma|_p+1} R_p(x, \tau)
         \middle|
         x_p,\mathsf{s} ,\neg \mathsf{s}\mathsf{a}, \mathfrak{S}
     \right)\nonumber\\
@@ -903,7 +922,7 @@ For a player node $\mathsf{s}\in \mathfrak{S}$ with $\ell(\mathsf{s})=\sigma$, a
         x_p, \mathsf{s}, \neg \mathsf{s}\mathsf{a},\mathfrak{S}
     \right)
     \mathbb{E}\left(
-        \lambda^{|\Sigma \setminus \sigma|_p - 1} V^{\theta_k}(x_p,\Sigma)
+        \lambda^{|\Sigma \setminus \sigma|_p} V^{\theta_k}(x_p,\Sigma)
         \middle|
         \mathsf{s} \preccurlyeq \mathsf{S},\mathsf{s}\mathsf{a}\not\preccurlyeq \mathsf{S},P = p,\mathfrak{S}
     \right)
@@ -924,10 +943,8 @@ For a player node $\mathsf{s}\in \mathfrak{S}$ with $\ell(\mathsf{s})=\sigma$, a
 \begin{lemma}[Unnormalised bucket moments]\label{lem:branched-bucket-moments}
   All of the above estimators are unbiased when multiplied by $\one_{x_p}$.
 \end{lemma}
-For $N(\mathsf{s})>1$, \autoref{lem:branched-branch-independence} makes the sibling average entering $\widehat{V}^{\lambda,\neg\mathsf{a}}$ independent of the target branch after conditioning on the target action label.
-It is thus a leave-one-branch, action-independent control variate for the target branch, rather than a finite-sample unbiased estimator of $V$ or $A$.
+For $N(\mathsf{s})>1$, \autoref{lem:branched-branch-independence} makes the sibling average entering $\widehat{V}^{\lambda,\neg\mathsf{a}}$ independent of the target branch after conditioning on the target action label, which is needed for the lemma above.
 All of these targets can be computed by backward propagation (see algorithm below).
-
 
 For a sampled $(P, \mathsf{S}, \Sigma)$, a sampled action $\mathsf{a}\in\mathfrak{E}_{\mathsf{S}}$ labeled by $\Sigma a_{\mathsf{a}}$, and a private state $x_P \in \mathcal{X}_P$, we use the local aliases $\widehat{Q}(x_P, \mathsf{a}) := \widehat{Q}^\lambda(x_P, \mathsf{S}\mathsf{a})$, $\widehat{A}(x_P, \mathsf{a}) := \widehat{A}^\lambda(x_P, \mathsf{S}\mathsf{a})$ and $\widehat{V}(x_P) := \widehat{V}^\lambda(x_P, \mathsf{S})$.
 
@@ -976,6 +993,9 @@ for a budget $M$.
 We see this as a \texttt{KKT} fixed point problem in the player-node variables
 $(N(\sigma))_{o(\sigma)\in\mathcal P}$, keeping chance-node intensities fixed,
 with rescaled inverse Lagrange multiplier $\kappa$.
+Throughout this calculation, $N(\sigma)>0$ is a deterministic continuous
+mean-field approximation to the randomized offspring count, and its solution
+is used as the intensity $\beta(\sigma)$ before randomized rounding.
 We compute the derivatives
 \begin{equation*}[rCl]
   \frac{\partial}{\partial (1/N(\sigma))}
@@ -1015,11 +1035,21 @@ We compute the derivatives
   \mathbb{E}(|\mathfrak{S}_{\mathsf{s}\preccurlyeq}|-1
   \mid \ell(\mathsf{s})=\sigma,N(\mathsf{s})=1)
 \end{equation*}
-This motivates us to define two new heads:
+This motivates us to define two new log-scale proxy heads whose regression
+estimands are the conditional means of the log targets defined below:
 \begin{enumerate}
-  \item \textbf{Log-Variance Head:} $W(\sigma) \simeq  \log\operatorname*{trCov}(\widehat{\mathbf V} \mid \sigma, N(\sigma) = 1)$,
-  \item \textbf{Log-Size Head:} $S(\sigma) \simeq \log \mathbb{E}(|\mathfrak{S}_{\mathsf{s}\preccurlyeq}|-1 \mid \ell(\mathsf{s})=\sigma,N(\mathsf{s})=1)$.
+  \item \textbf{Log-Variance Head:}
+    $W(\sigma) \simeq
+    \mathbb E(\widehat W(\mathsf s)\mid
+    \ell(\mathsf s)=\sigma,N(\mathsf s)\geq2)$,
+  \item \textbf{Log-Size Head:}
+    $S(\sigma) \simeq
+    \mathbb E(\widehat S^1(\mathsf s)\mid
+    \ell(\mathsf s)=\sigma)$.
 \end{enumerate}
+Thus $e^{W(\sigma)}$ and $e^{S(\sigma)}$ are geometric-scale proxies for
+the variance and descendant size appearing in the continuous KKT
+approximation, rather than arithmetic conditional means.
 Then we can define the iterative process as
 \begin{equation}[rCl]
   \kappa_k &\gets& \kappa_{k-1} \frac{M}{|\mathfrak{S}_{k-1}|}
@@ -1038,18 +1068,20 @@ $\sigma$ with $N(\mathsf{s})\geq 2$, we use the trace sample covariance
 \begin{equation}
   \widehat{W}(\mathsf{s})
   =
-  \log\left( \varepsilon_W + 
+  \log\left( \max\left\{\varepsilon_W,
     \frac{1}{N(\mathsf{s})-1}
   \sum_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}}
   \left\|
     \widehat{\mathbf V}(\mathsf{s}\mathsf{a})
     -\widehat{\mathbf V}(\mathsf{s})
   \right\|_2^2
-  \right)
+  \right\}\right)
   \label{eq:branched-log-variance-target}
 \end{equation}
-Sibling independence makes $\widehat{W}(\mathsf{s})$ unbiased for
-$\operatorname*{trCov}(\widehat{\mathbf V}\mid\sigma,N(\sigma)=1)$.
+Sibling independence makes the unlogged sample covariance inside the maximum
+the usual unbiased trace-covariance estimator.  The logarithm and positive
+floor deliberately turn it into the log-scale target whose conditional mean
+defines $W$; no unbiasedness claim is made after this transformation.
 Using the same GAE horizon $\lambda\in[0,1]$ as above, we define a raw size target $\widehat{S}^\lambda(\mathsf s)$, such that $\exp(\widehat{S}^1(\mathsf s)) = (|\mathfrak S_{\mathsf s\preccurlyeq}|-1)/N(\mathsf s)$ (see \autoref{alg:branched-value} for details).
 For a given sample, we let $\widehat W = \widehat W (\Sigma)$ and $\widehat{S}^\lambda = \widehat{S}^\lambda(\Sigma)$ and introduce losses
 \begin{equation}[rCl]
@@ -1133,11 +1165,11 @@ For posterior mass $w$ and posterior-weighted moment $m$, write
 In numerical implementations the denominator may be clamped to a small positive constant.
 
 \begin{algorithm}[H]
-\caption{$\mathcal O \gets$~\texttt{BranchedValue}$(\mathfrak{S}, V, S, r)$}
+\caption{$\mathcal O \gets$~\texttt{BranchedValue}$(\mathfrak{S}, V, S, \mathfrak r)$}
 \label{alg:branched-value}
 \DontPrintSemicolon
 \tcc{Backward Propagation of Value Estimators.}
-\KwParam{$\mathfrak{S}^{\beta, \pi}$, sampled labeled tree with child counts $N$; $V$, value head; $S$, log-size head; $r$, reach probabilities}
+\KwParam{$\mathfrak{S}^{\beta, \pi}$, sampled labeled tree with child counts $N$; $V$, value head; $S$, log-size head; $\mathfrak r$, node-specific reach caches}
 \KwHyper{$\lambda$, GAE horizon}
 \KwOut{target table $\mathcal O$}
 Initialize target table $\mathcal O\gets\varnothing$\;
@@ -1155,6 +1187,8 @@ Initialize target table $\mathcal O\gets\varnothing$\;
     Set $\widehat{M}_p(-_p,\mathsf t)\gets
     \widehat{\mathbb P}(-_p\mid\mathsf t)\widehat V_p(-_p,\mathsf t)$ for every $p\in\mathcal P$\;
     Set $\widehat C(\mathsf t)\gets 0$\;
+    Store $\mathcal O[\mathsf t].\mathrm{posterior}\gets
+    (\widehat{\mathbb P}(-_p\mid\mathsf t))_{p\in\mathcal P}$\;
 }
 \For{node $\mathsf{s} \in \mathfrak{S}^{\beta, \pi}$ non-terminal, backward}{
   $\sigma \gets \ell(\mathsf{s})$\;
@@ -1163,30 +1197,36 @@ Initialize target table $\mathcal O\gets\varnothing$\;
     \left(
       \left(\widehat{\mathbb{P}}(-_p \mid \mathsf{s}),\widehat{M}_p(-_p,\mathsf{s})\right)_{p\in\mathcal P},
       \widehat{\mathbf V}(\mathsf{s}),
-      \widehat{C}
+      \widehat{C}(\mathsf s)
     \right)
     &\gets&
     \operatorname{Avg}_{\mathsf{s}}\left[
       \left(
         \left(\widehat{\mathbb{P}}(-_p \mid \bullet),\widehat{M}_p(-_p,\bullet)\right)_{p\in\mathcal P},
         \widehat{\mathbf V}(\bullet),
-        1 + N(\sigma \bullet)\widehat C^\lambda(\bullet)
+        1 + N(\mathsf s\bullet)\widehat C(\bullet)
       \right)
     \right]
     \nonumber\\
     \label{eq:branched-backward-updates}
   \end{equation}
+  Store $\mathcal O[\mathsf s].\mathrm{posterior}\gets
+  (\widehat{\mathbb P}(-_p\mid\mathsf s))_{p\in\mathcal P}$\;
   \If{$o(\sigma) \in \mathcal{P}$}{
+      Set $\widehat W(\mathsf s)\gets\bot$\;
       \If{$N(\mathsf s)\geq2$}{
       Set
       $\widehat W(\mathsf s)
         \gets
         \log\left(
-          \varepsilon_W
-          +
-          \frac{N(\mathsf s)}{N(\mathsf s)-1}
-          \left(\widehat{\mathcal V}_2(\mathsf s)
-          -\|\widehat{\mathbf V}(\mathsf s)\|_2^2\right)
+          \max\left\{\varepsilon_W,
+          \frac{1}{N(\mathsf s)-1}
+          \sum_{\mathsf a\in\mathfrak E_{\mathsf s}}
+          \left\|
+            \widehat{\mathbf V}(\mathsf s\mathsf a)
+            -\widehat{\mathbf V}(\mathsf s)
+          \right\|_2^2
+          \right\}
         \right);
       $
       }
@@ -1215,7 +1255,7 @@ Initialize target table $\mathcal O\gets\varnothing$\;
       $\widehat V_{o(\sigma)}(-_{o(\sigma)},\mathsf s)
       \gets\operatorname{Cond}(\widehat M_{o(\sigma)}(-_{o(\sigma)},\mathsf s),\widehat{\mathbb P}(-_{o(\sigma)}\mid\mathsf s))$\;
       $\widehat S^\lambda(\mathsf s) \gets \log(\widehat{C}(\mathsf{s}))$\;
-      Store current targets $\mathcal O[\mathsf s] \gets \left(s\widehat{\mathbb{P}}(-_{o(\sigma)} \mid \mathsf{s}),(\widehat{A}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a}),\widehat{Q}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a}))_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}},\widehat V_{o(\sigma)}(-_{o(\sigma)},\mathsf s),\widehat W(\mathsf s),\widehat S^\lambda(\mathsf s)\right)$\;
+      Store current targets $\mathcal O[\mathsf s].\mathrm{targets} \gets \left((\widehat{A}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a}),\widehat{Q}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a}))_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}},\widehat V_{o(\sigma)}(-_{o(\sigma)},\mathsf s),\widehat W(\mathsf s),\widehat S^\lambda(\mathsf s)\right)$\;
       Overwrite with the bootstrapped private-state moment propagated to ancestors:
       \begin{equation}[rCl]
         \widehat M_{o(\sigma)}(-_{o(\sigma)},\mathsf s)
@@ -1228,7 +1268,7 @@ Initialize target table $\mathcal O\gets\varnothing$\;
         \widehat C(\mathsf s)
         &\gets&
         \operatorname{Mix}_{\lambda}\left(
-          C(\mathsf s),
+          \widehat C(\mathsf s),
           \exp(S(\sigma))
         \right)
       \end{equation}
@@ -1247,17 +1287,17 @@ The fixed-intensity PPO v1 returns $\widehat{A}$ and does not store $\widehat Q$
 \tcc{Tree-valued generalization of the sequential Rao--Blackwellized template; $\beta\equiv1$ recovers it exactly.}
 \tcc{Research template: the implementation companion freezes v1 to fixed intensities, actor-type $V$ heads, and PPO advantage targets.}
 \KwParam{$\theta_0$, initial weights; $\theta$, working copy of the next iterate}
-\KwHyper{$N$, tree count; $B$, minibatch size; $\lambda$; $\beta_{\max}$}
+\KwHyper{$B$, minibatch size; $\lambda$; $\beta_{\max}$}
 \KwHyper{$\beta_{\tt fix}$, $k_{\tt warm}$, $M$, $\kappa_0$; chosen number of gradient-descent steps per iterate}
 \KwOut{$(\theta_k)_{k\ge0}$}
 \For{$k=0,1,2,\dots$}{
   Define $\beta_k$ from the frozen public heads $W^{\theta_k}$ and $S^{\theta_k}$, the current inverse multiplier $\kappa_k$, and the KKT rule above\;
-  Sample $((\mathfrak{S}, \ell:\mathfrak{S}\to\mathcal S, N:\mathfrak{S}\to\mathbb N)$ using $\algcall{alg:sample-tree}{SampleTree}(\pi^{\theta_k},\beta_k)$\;
+  Sample $(\mathfrak{S}, \ell:\mathfrak{S}\to\mathcal S, N:\mathfrak{S}\to\{0,1,\ldots\},\mathfrak r)$ using $\algcall{alg:sample-tree}{SampleTree}(\pi^{\theta_k},\beta_k)$\;
   Set $\kappa_{k+1}\gets\kappa_k M/|\mathfrak S|$\;
-  Compute target table $\mathcal O\gets \algcall{alg:branched-value}{BranchedValue}(\mathfrak{S}, V^{\theta_k}, S^{\theta_k}, r)$\;
+  Compute target table $\mathcal O\gets \algcall{alg:branched-value}{BranchedValue}(\mathfrak{S}, V^{\theta_k}, S^{\theta_k},\mathfrak r)$\;
   \For{each gradient-descent step}{
     Sample $(P_b, \mathsf{S}_b)_{b=1}^B \stackrel{\mathsf{iid}}{\sim} (P, \mathsf{S})$ and set $\Sigma_b=\ell(\mathsf{S}_b)$\;
-    Deduce $\widehat{\mathbb P}(x_{P_b}\mid\mathsf S_b\mathsf a)$, $\widehat{A}_b^\lambda(x_{P_b}, \mathsf{a})$, $\widehat{Q}_b^\lambda(x_{P_b}, \mathsf{a})$, $\widehat{V}_b(x_{P_b})$, $\widehat W_b$ and $\widehat S_b^\lambda$ from $\mathcal O$ at $\mathsf{S}_b$\;
+    Deduce $\widehat{A}_b^\lambda(x_{P_b}, \mathsf{a})$, $\widehat{Q}_b^\lambda(x_{P_b}, \mathsf{a})$, $\widehat{V}_b(x_{P_b})$, $\widehat W_b$ and $\widehat S_b^\lambda$ from $\mathcal O[\mathsf S_b].\mathrm{targets}$, and deduce $\widehat{\mathbb P}(x_{P_b}\mid\mathsf S_b)$ and $\widehat{\mathbb P}(x_{P_b}\mid\mathsf S_b\mathsf a)$ from the corresponding $\mathrm{posterior}$ fields\;
     Estimate
     \begin{equation}[rCl]
       \widehat{l}(\theta)

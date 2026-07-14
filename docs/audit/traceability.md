@@ -6,7 +6,7 @@
 |---|---|---|---|
 | `SampleTerminal` | Sample one private profile and all public events through terminal reward | `pbg/core/normal.py`, shared sequential sampler, game-owned sampled terminal settlement | Implemented; resolved `AUD-001` |
 | Terminal empirical decision law | Pool player decisions with trajectory-length bias | `build_decision_alias` on trajectories | Weight law would be correct, but no normal targets/loss |
-| Sequential player-clock lambda return | Bootstrap only at later decisions of the same player | owner-only moment bootstrap in `branched_value` | Correct relative to `NOTATION.md`; TeX display needs correction (`AUD-021`) |
+| Sequential player-clock lambda return | Bootstrap only at later decisions of the same player | owner-only moment bootstrap in `branched_value`; inclusive `depth_p` metadata | Aligned with `core_math.tex`; the contrary `AUD-021` premise was retracted |
 | `SamplePreTerminal` | One private profile per root, carried along one public path; update all-type reaches | `_sample_trees_sequential` | Aligned in the current worktree |
 | `PreTerminalMC` | Collision-conditioned profile/runout completion; posterior and actor-type values | synthetic and poker completion backends | Semantically present; active training validates quality and retains only `p_hat`/`v_hat` |
 | `SequentialRaoBlackwellPG` | Integrate actor types using leaf posterior; pre-terminal one-path targets | sequential sampler + completion + `branched_value` + `rb_ppo` | Present; decision reaches compact after completion, while target layout remains shared with branching |

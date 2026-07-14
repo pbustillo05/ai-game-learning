@@ -128,6 +128,8 @@ def build_normal_dataset_from_sampled(
     event = tree.child_event[edge].to(torch.int32)
     q_target = torch.empty_like(old_v)
     carry = reward_by_tree.clone()
+    # Inclusive depth numbers each owner's decision nodes 1, 2, ... along a
+    # trajectory; descending order therefore propagates later returns first.
     owner_depth = tree.depth_p[decisions, owners].to(torch.int64)
     for depth in range(int(bundle.rollout_backend.max_rollout_steps), -1, -1):
         selected = (owner_depth == depth).nonzero(as_tuple=False).squeeze(1)

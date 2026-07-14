@@ -197,8 +197,8 @@ class TreeBatch:
     # node metadata
     tree_id:     Tensor  # int32 [N]
     owner:       Tensor  # int32 [N]   in [0,P) or CHANCE/TERMINAL/PRETERM
-    depth_p:     Tensor  # int32 [N, P_max]  |sigma|_p  (player-decision counts along path)
-    depth_player:Tensor  # int32 [N]         |sigma|_player
+    depth_p:     Tensor  # int32 [N, P_max]  |sigma|_p; includes node sigma when owner(sigma)=p
+    depth_player:Tensor  # int32 [N]         |sigma|_player; includes player-owned node sigma
     # game payload
     state_ref:   Tensor  # int32 [N] index into the game's StateTable (opaque to core)
     # decision-law support (player nodes only; see NOTATION §4)
@@ -207,7 +207,9 @@ class TreeBatch:
 
 Invariants (asserted in `TreeBatch.validate()`):
 `nu[child_ptr[i]:child_ptr[i+1]].sum() == 1` for every non-leaf `i`; leaves have
-`owner ∈ {TERMINAL, PRETERM}`; `depth_*` consistent with parent chain.
+`owner ∈ {TERMINAL, PRETERM}`; and for every node `sigma`,
+`depth_p[sigma,p] == #{rho <= sigma : owner[rho] == p}` and
+`depth_player[sigma] == sum_p depth_p[sigma,p]`.
 
 `build_alias_tables(tree: TreeBatch) -> AliasTable` — one categorical table over all
 player-decision nodes, weights `path_weight[i] * 1[owner[i] ∈ players]`, used by

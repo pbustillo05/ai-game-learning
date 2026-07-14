@@ -432,6 +432,41 @@ discarded after the wave has produced its public event/reach update.
 
 ## B. Game-family, theory, operations, and validation findings
 
+### AUD-021 — RETRACTED: `core_math.tex` lambda-return displays are off by one relative to code
+
+**Severity:** Major specification defect, implementation currently follows the corrected companion
+**Modes:** Normal, sequential RB
+**Original evidence (incorrect):** Equations `sequential-lambda-return` and `rao-blackwell-lambda-return` use terminal exponent `|Tau ∖ sigma|_p`, which includes the current decision under the document's depth convention. The correct player-clock exponent is the number of downstream decisions by the same player, `|Tau|_p - |sigma|_p - 1`. `NOTATION.md` explicitly normalizes this typo, and the backward implementation applies one lambda mix at each downstream owner decision, which is the corrected behavior.
+
+**Consequence:** A future direct transcription of the authoritative TeX would disagree with the current code and standard player-clock GAE, especially visible at the last decision where the terminal reward should have exponent zero.
+
+**Recommendation:** Correct the equations in `core_math.tex` rather than relying on a companion normalization. Add closed-form trajectory tests for zero, one, and multiple downstream same-player decisions at lambda 0, intermediate lambda, and 1.
+
+**Model recommendation:** `5.6 Sol` with `high` thinking — an authoritative mathematical correction should be derived against code and closed-form edge cases, not patched mechanically.
+
+**Response:** Ignore for now; core_math is changing a lot anyways
+
+**Correction:** The finding inverted the authoritative convention. In
+`core_math.tex`, `|sigma|_p` counts `p`-owned nodes `rho <= sigma`, including
+`sigma` when `o(sigma)=p`. Consequently `|Tau ∖ sigma|_p` already is the number
+of later decisions by `p`; the sequential and Rao--Blackwellized displays are
+correct. The actual divergence was that `NOTATION.md` and `TreeBatch.depth_p`
+had silently adopted a strict-prefix, decisions-already-taken convention.
+
+**Implementation:** `NOTATION.md`, `CONTRACTS.md`, and `TreeBatch` now use the
+inclusive-node definition from `core_math.tex`. Both CPU and device tree
+builders count the current node's owner, including player-owned roots, and
+validation enforces the same invariant. The audit now limits its lambda-clock
+finding to the genuinely inconsistent leave-one-branch analytic baseline.
+
+**Verification:** Focused tests pin inclusive depths across player, chance, and
+terminal nodes for both tree builders. Normal target construction retains the
+same reverse ordering of each player's decisions under the shifted ordinal.
+The complete CPU suite passes (`198 passed, 8 skipped`), and the focused CPU/CUDA
+depth-parity test passes on an explicitly selected idle GPU (`2 passed`).
+
+---
+
 ### AUD-019 — Kuhn/Leduc/dial do not use the required MHA poker design
 
 **Severity:** Major if “each version of poker” includes these games; otherwise Moderate clarification  

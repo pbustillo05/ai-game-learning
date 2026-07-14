@@ -18,8 +18,10 @@ A finite PBG is:
 
 - A finite prefix-closed tree 𝒮 of public trajectories with root ∅; terminal set 𝒯
   (maximal elements); each non-terminal σ has finite event set ℰ_σ, children σe.
-- Players 𝒫 with owner map o: 𝒮∖𝒯 → 𝒫 ⊔ {c}. |σ|_p = number of p-owned decision
-  nodes that are **strict prefixes** of σ (i.e., decisions already taken along σ);
+- Players 𝒫 with owner map o: 𝒮∖𝒯 → 𝒫 ⊔ {c}. A player-owned state σ is
+  the state immediately before its owner chooses an outgoing action; that action
+  is the edge σ→σa. Consistently with `core_math.tex`,
+  |σ|_p = #{ρ ≼ σ : o(ρ)=p}, including σ itself when o(σ)=p, and
   |σ|_player = Σ_p |σ|_p.
 - Private types: finite 𝒳_p per player, joint prior μ on 𝒳 = ∏_p 𝒳_p.
 - Chance rules χ(· | x, σ) ∈ Δ(ℰ_σ) at chance nodes (may depend on the full profile x).
@@ -221,8 +223,8 @@ GPU, stream by tree if memory-bound.
 ## 8. λ-returns, sequential form (reference semantics)
 
 For a single trajectory Τ, node σa with p = o(σ), and n = number of p-owned decision
-nodes ρ with σ ≺ ρ ≼ Τ (equivalently |Τ|_p − |σ|_p − 1 counting conventions per §1;
-define via depth_p arrays, not string ops):
+nodes ρ with σ ≺ ρ ≼ Τ (equivalently |Τ|_p − |σ|_p under the convention in §1;
+define via `depth_p` arrays, not string operations):
 
 Q̂^λ(x_p, σa) = λⁿ · (terminal target) + (1−λ) Σ_{j=1..n} λ^{j−1} V^{θ_k}(x_p, ρ_j)
 
