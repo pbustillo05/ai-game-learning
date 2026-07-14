@@ -20,7 +20,7 @@ from pbg.games.poker.engine import (
 )
 from pbg.games.poker.folded import PokerGPUPartitionAdapter
 from pbg.games.poker.mc import PokerGPURejectionSampler, PokerGPUShowdownEvaluator
-from pbg.games.poker.model.heads import raise_tick_probs
+from pbg.games.poker.model.heads import dlogistic_tick
 from pbg.games.poker.model.postflop import PostflopMasks, PostflopNet
 from pbg.games.poker.model.preflop import (
     PackedPublicHistory,
@@ -34,6 +34,15 @@ from pbg.games.poker.ranges import RangeState
 
 def _raw_mapping(output: PolicyOutput | Mapping[str, Tensor]) -> Mapping[str, Tensor]:
     return output.raw if isinstance(output, PolicyOutput) else output
+
+
+def _require_device(condition: Tensor, message: str) -> None:
+    """Validate a scalar condition without synchronizing CUDA to the host."""
+
+    if condition.device.type == "cuda":
+        torch._assert_async(condition, message)
+    elif not bool(condition):
+        raise ValueError(message)
 
 
 class PokerPolicyAdapter:
@@ -62,8 +71,10 @@ class PokerPolicyAdapter:
             raise ValueError("profiles and actor must have shapes [B,P] and [B]")
         actor = actor.to(device=profiles.device, dtype=torch.long)
         combo = profiles.gather(1, actor[:, None]).squeeze(1).long()
-        if bool(((combo < 0) | (combo >= N_HANDS)).any()):
-            raise ValueError("the stipulated actor combo is invalid")
+        _require_device(
+            ((combo >= 0) & (combo < N_HANDS)).all(),
+            "the stipulated actor combo is invalid",
+        )
         batch_ids = torch.arange(profiles.shape[0], device=profiles.device)
         selected: dict[str, Tensor] = {}
         for name, value in raw.items():
@@ -100,11 +111,34 @@ class PokerPolicyAdapter:
         if n_ticks <= 0:
             raise ValueError("the legal event set has no raise-tick width")
         type_probability = torch.softmax(type_logits.float(), dim=-1)
-        ticks = raise_tick_probs(
-            fields["omega"].float(), fields["mu"].float(), fields["s"].float(),
-            fields["iota"].float(), n_ticks,
-        )
         prefix = type_logits.shape[:-1]
+        omega = fields["omega"].float()
+        mu = fields["mu"].float()
+        scale = fields["s"].float()
+        iota = fields["iota"].float()
+        logistic = dlogistic_tick(n_ticks, mu, scale)
+        mixture = (omega[..., None] * logistic).sum(dim=-2)
+        raise_mask = legal_mask[:, RAISE_OFFSET:].to(type_logits.device)
+        mask_shape = (batch,) + (1,) * (mixture.ndim - 2) + (n_ticks,)
+        expanded_raise_mask = raise_mask.reshape(mask_shape).expand_as(mixture)
+        mixture = mixture.masked_fill(~expanded_raise_mask, 0.0)
+        mixture = mixture / mixture.sum(-1, keepdim=True).clamp_min(self.eps)
+        tick_index = torch.arange(n_ticks, device=type_logits.device)[None]
+        allin_index = torch.where(
+            raise_mask,
+            tick_index,
+            torch.full_like(tick_index, -1),
+        ).max(1).values
+        allin = torch.zeros((batch, n_ticks), dtype=torch.float32, device=type_logits.device)
+        has_raise = allin_index >= 0
+        allin.scatter_(
+            1,
+            allin_index.clamp_min(0)[:, None],
+            has_raise.to(torch.float32)[:, None],
+        )
+        allin = allin.reshape(mask_shape).expand_as(mixture)
+        ticks = (1.0 - iota[..., None]) * mixture + iota[..., None] * allin
+        ticks = ticks.masked_fill(~expanded_raise_mask, 0.0)
         full = torch.zeros(prefix + (RAISE_OFFSET + n_ticks,), dtype=torch.float32, device=type_logits.device)
         facing_bet = ((legal_event_ids == FOLD) & legal_mask).any(dim=1)
         facing = facing_bet.reshape((batch,) + (1,) * (type_logits.ndim - 2))
@@ -112,15 +146,19 @@ class PokerPolicyAdapter:
         full[..., CHECK_CALL] = torch.where(facing, type_probability[..., 1], type_probability[..., 0])
         full[..., RAISE_OFFSET:] = type_probability[..., 2, None] * ticks
         ids = legal_event_ids.to(device=full.device, dtype=torch.long)
-        if bool(((ids < 0) | (ids >= full.shape[-1])).any()):
-            raise ValueError("legal event id is outside the factorized event space")
+        _require_device(
+            ((ids >= 0) & (ids < full.shape[-1])).all(),
+            "legal event id is outside the factorized event space",
+        )
         event_shape = (batch,) + (1,) * (type_logits.ndim - 2) + (ids.shape[1],)
         ids = ids.reshape(event_shape).expand(prefix + (ids.shape[1],))
         mask = legal_mask.to(full.device).reshape(event_shape).expand_as(ids)
         probability = full.gather(-1, ids).masked_fill(~mask, 0.0)
         normalizer = probability.sum(dim=-1, keepdim=True)
-        if bool((normalizer <= 0).any()):
-            raise ValueError("supplied legal events have zero policy mass")
+        _require_device(
+            (normalizer > 0).all(),
+            "supplied legal events have zero policy mass",
+        )
         return probability / normalizer
 
     compose = probabilities
@@ -147,8 +185,10 @@ class PokerPolicyAdapter:
             legal_event_ids[:, None, :].to(selected_event_ids.device)
             == selected_event_ids[:, :, None]
         ) & legal_mask[:, None, :].to(selected_event_ids.device)
-        if not bool(matches.any(-1).all()):
-            raise ValueError("selected_event_ids must select supplied legal events")
+        _require_device(
+            matches.any(-1).all(),
+            "selected_event_ids must select supplied legal events",
+        )
         columns = matches.to(torch.int64).argmax(-1).to(log_rows.device)  # [B,E_selected]
         if log_rows.ndim != 3:
             raise ValueError("poker policy log rows must have shape [B,X,E_legal]")
@@ -441,7 +481,13 @@ class PokerGame:
         raise_fraction = legal[:, RAISE_OFFSET:].float().mean(1)
         legality = torch.stack((fold_legal, legal[:, CHECK_CALL].float(), raise_fraction), dim=1)
         targets = self.engine.raise_targets(state_refs)
-        bounds = torch.stack((targets[:, 0], targets[:, -1]), dim=1)
+        raise_legal = legal[:, RAISE_OFFSET:]
+        lower = targets.masked_fill(~raise_legal, torch.inf).min(1).values
+        upper = targets.masked_fill(~raise_legal, -torch.inf).max(1).values
+        has_raise = raise_legal.any(1)
+        lower = torch.where(has_raise, lower, torch.zeros_like(lower))
+        upper = torch.where(has_raise, upper, torch.zeros_like(upper))
+        bounds = torch.stack((lower, upper), dim=1)
         committed_street = torch.tensor(
             [self.engine.states.committed_street[ref] for ref in refs],
             dtype=torch.float32,
@@ -493,8 +539,8 @@ class PokerGame:
             committed_street=committed_street,
             call_amount=call_amount,
             current_bet=current_bet,
-            min_raise_to=targets[:, 0],
-            max_raise_to=targets[:, -1],
+            min_raise_to=lower,
+            max_raise_to=upper,
             last_full_raise=last_full_raise,
             legal_action_mask=legal,
             raise_ticks=targets,

@@ -126,7 +126,7 @@ def _poker_cfg():
         "stack_bb": 10.0,
         "sb": 0.5,
         "bb": 1.0,
-        "n_ticks": 1,
+        "chip_unit_bb": 0.5,
     }
     cfg.model = {
         "d_model": 8,

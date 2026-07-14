@@ -12,21 +12,20 @@ game:
     ante: 1
   poker: null
 rollout:
-  n_trees: 256
+  n_trees: 1
   beta:
     default: 1.0
     round_0: 1.0
     chance_round_1: 2.0
     round_1: 2.0
-  node_budget: 512
+  node_budget: 131072  # One sampled branching tree per rank.
   reach_storage: full
 completion:
   n_samples: 512
   backend: exact
 model:
-  n_buckets: 512
+  architecture: mha
   hidden_dim: 64
-  e_max: 3
 loss:
   name: rb_ppo
   lam: 0.95
@@ -35,7 +34,7 @@ loss:
   c_v: 0.5
   c_h: 0.01
   entropy_schedule: const
-  use_suit_consistency: false
+  value_loss: clipped
 training:
   mode: branched_rao_blackwell
   iters: 300
@@ -48,4 +47,4 @@ training:
   seed: 11
   checkpoint_every: 25
   out_dir: runs/leduc
-debug_asserts: true
+  reproducibility: strict

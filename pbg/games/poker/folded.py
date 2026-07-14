@@ -20,6 +20,7 @@ N_CARDS = 52
 N_COMBOS = 1326
 PAD_CARD = 255
 EXPECTED_API_VERSION = "pbg-v2"
+EXPECTED_FOLDER_API_VERSION = "pbg-folder-v1"
 
 
 @dataclass
@@ -43,10 +44,10 @@ class FoldSnapshotBatch:
 class PartitionSummaryBatch:
     """Opaque evaluator summary tensors and host metadata.
 
-    Standard fields are ``base_log_z`` float32 ``[B]``,
-    ``single_card_log_ratio`` float32 ``[B,52]``, optional
-    ``pair_card_log_ratio`` float32 ``[B,52,52]``, and ``output_valid`` bool
-    ``[B]``.  The tensors are the evaluator result tensors themselves.
+    The compact model-ready fields include combined unary/pair corrections,
+    signed beta factors, per-folder mass/card pressure/delta, tight contraction,
+    fold-line/seat metadata, and validity. Bulky evaluator-owned per-folder
+    pair/covariance tensors are validated at the boundary but not retained.
     """
 
     fields: dict[str, Tensor]
@@ -54,21 +55,25 @@ class PartitionSummaryBatch:
 
 
 class PokerGPUPartitionAdapter:
-    """Thin, lazy adapter for ``poker_gpu_evaluator.pbg.partition_many``."""
+    """Thin, lazy adapter for evaluator-owned model-ready folder summaries."""
 
-    def __init__(self) -> None:
-        self._partition_many: Callable[..., Any] | None = None
+    def __init__(self, beta_rank: int = 16) -> None:
+        if isinstance(beta_rank, bool) or not isinstance(beta_rank, int) or not 0 <= beta_rank <= 52:
+            raise ValueError("beta_rank must be an integer in [0,52]")
+        self.beta_rank = beta_rank
+        self._partition_folders: Callable[..., Any] | None = None
         self._result_type: type[Any] | None = None
 
     def _load_facade(self) -> tuple[Callable[..., Any], type[Any]]:
-        if self._partition_many is not None and self._result_type is not None:
-            return self._partition_many, self._result_type
+        if self._partition_folders is not None and self._result_type is not None:
+            return self._partition_folders, self._result_type
         try:
             from poker_gpu_evaluator.pbg import (
                 API_VERSION,
                 COMBO_CARDS,
-                PartitionSummaryResult,
-                partition_many,
+                FOLDER_API_VERSION,
+                FolderSummaryResult,
+                partition_folders,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             raise RuntimeError(
@@ -80,10 +85,15 @@ class PokerGPUPartitionAdapter:
                 "incompatible poker_gpu_evaluator facade: expected API_VERSION "
                 f"{EXPECTED_API_VERSION!r}, got {API_VERSION!r}; update the sibling package"
             )
+        if FOLDER_API_VERSION != EXPECTED_FOLDER_API_VERSION:
+            raise RuntimeError(
+                "incompatible evaluator folder facade: expected FOLDER_API_VERSION "
+                f"{EXPECTED_FOLDER_API_VERSION!r}, got {FOLDER_API_VERSION!r}"
+            )
         validate_evaluator_combo_cards(COMBO_CARDS)
-        self._partition_many = partition_many
-        self._result_type = PartitionSummaryResult
-        return partition_many, PartitionSummaryResult
+        self._partition_folders = partition_folders
+        self._result_type = FolderSummaryResult
+        return partition_folders, FolderSummaryResult
 
     @staticmethod
     def _normalize_board(board_cards: Tensor) -> Tensor:
@@ -174,12 +184,31 @@ class PokerGPUPartitionAdapter:
             raise ValueError("folded.seat_ids is on the wrong device")
 
     @staticmethod
-    def _validate_result(result: Any, result_type: type[Any], batch_size: int, device: torch.device) -> None:
+    def _validate_result(
+        result: Any,
+        result_type: type[Any],
+        batch_size: int,
+        n_folders: int,
+        beta_rank: int,
+        device: torch.device,
+    ) -> None:
         if not isinstance(result, result_type):
-            raise TypeError("partition_many returned an unexpected result type")
+            raise TypeError("partition_folders returned an unexpected result type")
         expected = (
             ("base_log_z", (batch_size,), torch.float32),
             ("single_card_log_ratio", (batch_size, N_CARDS), torch.float32),
+            ("pair_card_log_ratio", (batch_size, N_CARDS, N_CARDS), torch.float32),
+            ("beta_eigenvalue", (batch_size, beta_rank), torch.float32),
+            ("beta_eigenvector", (batch_size, N_CARDS, beta_rank), torch.float32),
+            ("folder_log_mass", (batch_size, n_folders), torch.float32),
+            ("folder_single_card_log_ratio", (batch_size, n_folders, N_CARDS), torch.float32),
+            ("folder_pair_card_log_ratio", (batch_size, n_folders, N_CARDS, N_CARDS), torch.float32),
+            ("folder_card_marginal", (batch_size, n_folders, N_CARDS), torch.float32),
+            ("folder_delta", (batch_size, n_folders, N_CARDS), torch.float32),
+            ("folder_sigma", (batch_size, n_folders, N_CARDS, N_CARDS), torch.float32),
+            ("sigma_total", (batch_size, N_CARDS, N_CARDS), torch.float32),
+            ("tight_cluster_scalar", (batch_size,), torch.float32),
+            ("folder_output_valid", (batch_size, n_folders), torch.bool),
             ("output_valid", (batch_size,), torch.bool),
         )
         for name, shape, dtype in expected:
@@ -194,18 +223,6 @@ class PokerGPUPartitionAdapter:
                 raise ValueError(f"partition result {name} is on the wrong device")
             if not value.is_contiguous():
                 raise ValueError(f"partition result {name} must be contiguous")
-        pair = getattr(result, "pair_card_log_ratio", None)
-        if pair is not None:
-            if not isinstance(pair, Tensor):
-                raise TypeError("partition result pair_card_log_ratio must be a Tensor or None")
-            if pair.shape != (batch_size, N_CARDS, N_CARDS):
-                raise ValueError("partition result pair_card_log_ratio must have shape [B,52,52]")
-            if pair.dtype != torch.float32:
-                raise TypeError("partition result pair_card_log_ratio has the wrong dtype")
-            if pair.device != device:
-                raise ValueError("partition result pair_card_log_ratio is on the wrong device")
-            if not pair.is_contiguous():
-                raise ValueError("partition result pair_card_log_ratio must be contiguous")
         if not isinstance(getattr(result, "metadata", None), dict):
             raise TypeError("partition result metadata must be a dict")
         if any(isinstance(value, Tensor) for value in result.metadata.values()):
@@ -237,84 +254,55 @@ class PokerGPUPartitionAdapter:
             zeros = torch.zeros(
                 (batch_size,), dtype=torch.float32, device=boundary_board.device
             )
+            n_folders = folded.reach_weights.shape[1]
+            fields = {
+                "base_log_z": zeros,
+                "single_card_log_ratio": torch.zeros((batch_size, N_CARDS), dtype=torch.float32, device=boundary_board.device),
+                "pair_card_log_ratio": torch.zeros((batch_size, N_CARDS, N_CARDS), dtype=torch.float32, device=boundary_board.device),
+                "beta_eigenvalue": torch.zeros((batch_size, self.beta_rank), dtype=torch.float32, device=boundary_board.device),
+                "beta_eigenvector": torch.zeros((batch_size, N_CARDS, self.beta_rank), dtype=torch.float32, device=boundary_board.device),
+                "folder_log_mass": torch.zeros((batch_size, n_folders), dtype=torch.float32, device=boundary_board.device),
+                "folder_single_card_log_ratio": torch.zeros((batch_size, n_folders, N_CARDS), dtype=torch.float32, device=boundary_board.device),
+                "folder_card_marginal": torch.zeros((batch_size, n_folders, N_CARDS), dtype=torch.float32, device=boundary_board.device),
+                "folder_delta": torch.zeros((batch_size, n_folders, N_CARDS), dtype=torch.float32, device=boundary_board.device),
+                "tight_cluster_scalar": zeros,
+                "folder_output_valid": folded.folder_mask.clone(),
+                "output_valid": torch.ones((batch_size,), dtype=torch.bool, device=boundary_board.device),
+                "folder_mask": folded.folder_mask,
+                "folder_line_meta": folded.line_meta,
+                "folder_seat": folded.seat_ids if folded.seat_ids is not None else torch.arange(
+                    n_folders, dtype=torch.int64, device=boundary_board.device
+                )[None].expand(batch_size, -1),
+            }
             return PartitionSummaryBatch(
-                fields={
-                    "base_log_z": zeros,
-                    "single_card_log_ratio": torch.zeros(
-                        (batch_size, N_CARDS),
-                        dtype=torch.float32,
-                        device=boundary_board.device,
-                    ),
-                    "pair_card_log_ratio": torch.zeros(
-                        (batch_size, N_CARDS, N_CARDS),
-                        dtype=torch.float32,
-                        device=boundary_board.device,
-                    ),
-                    "output_valid": torch.ones(
-                        (batch_size,), dtype=torch.bool, device=boundary_board.device
-                    ),
-                },
+                fields=fields,
                 metadata={"api_version": EXPECTED_API_VERSION, "neutral_no_folders": True},
             )
 
-        partition_many, result_type = self._load_facade()
+        partition_folders, result_type = self._load_facade()
         range_weights = folded.reach_weights.contiguous()  # [B,F,1326]
         row_mask = folded.folder_mask.contiguous()  # [B,F]
-        result = partition_many(
+        result = partition_folders(
             board_cards=boundary_board,
             range_weights=range_weights,
             row_mask=row_mask,
+            beta_rank=self.beta_rank,
         )
-        self._validate_result(result, result_type, batch_size, boundary_board.device)
-
         n_folders = folded.reach_weights.shape[1]
-        folder_base = torch.zeros(
-            (batch_size, n_folders), dtype=torch.float32, device=boundary_board.device
+        self._validate_result(
+            result, result_type, batch_size, n_folders, self.beta_rank, boundary_board.device
         )
-        folder_single = torch.zeros(
-            (batch_size, n_folders, N_CARDS),
-            dtype=torch.float32,
-            device=boundary_board.device,
-        )
-        folder_pair = torch.zeros(
-            (batch_size, n_folders, N_CARDS, N_CARDS),
-            dtype=torch.float32,
-            device=boundary_board.device,
-        )
-        folder_valid = torch.zeros(
-            (batch_size, n_folders), dtype=torch.bool, device=boundary_board.device
-        )
-        active = folded.folder_mask.nonzero(as_tuple=False)
-        if active.numel():
-            active_board = boundary_board[active[:, 0]].contiguous()
-            active_range = folded.reach_weights[
-                active[:, 0], active[:, 1]
-            ][:, None, :].contiguous()
-            active_mask = torch.ones(
-                (active.shape[0], 1), dtype=torch.bool, device=boundary_board.device
-            )
-            per_folder = partition_many(
-                board_cards=active_board,
-                range_weights=active_range,
-                row_mask=active_mask,
-            )
-            self._validate_result(
-                per_folder, result_type, active.shape[0], boundary_board.device
-            )
-            folder_base[active[:, 0], active[:, 1]] = per_folder.base_log_z
-            folder_single[active[:, 0], active[:, 1]] = per_folder.single_card_log_ratio
-            folder_valid[active[:, 0], active[:, 1]] = per_folder.output_valid
-            if per_folder.pair_card_log_ratio is not None:
-                folder_pair[active[:, 0], active[:, 1]] = per_folder.pair_card_log_ratio
-
         fields = {
-            "base_log_z": result.base_log_z,
-            "single_card_log_ratio": result.single_card_log_ratio,
-            "output_valid": result.output_valid,
-            "folder_log_mass": folder_base,
-            "folder_single_card_log_ratio": folder_single,
-            "folder_pair_card_log_ratio": folder_pair,
-            "folder_output_valid": folder_valid,
+            name: getattr(result, name)
+            for name in (
+                "base_log_z", "single_card_log_ratio", "pair_card_log_ratio",
+                "beta_eigenvalue", "beta_eigenvector", "folder_log_mass",
+                "folder_single_card_log_ratio", "folder_card_marginal",
+                "folder_delta", "tight_cluster_scalar", "folder_output_valid",
+                "output_valid",
+            )
+        }
+        fields.update({
             "folder_mask": folded.folder_mask,
             "folder_line_meta": folded.line_meta,
             "folder_seat": (
@@ -324,7 +312,10 @@ class PokerGPUPartitionAdapter:
                     batch_size, -1
                 )
             ),
-        }
-        if result.pair_card_log_ratio is not None:
-            fields["pair_card_log_ratio"] = result.pair_card_log_ratio
+        })
+        if result.metadata.get("folder_api_version") != EXPECTED_FOLDER_API_VERSION:
+            raise RuntimeError(
+                "incompatible evaluator folder summary: expected folder_api_version "
+                f"{EXPECTED_FOLDER_API_VERSION!r}"
+            )
         return PartitionSummaryBatch(fields=fields, metadata=result.metadata)

@@ -38,14 +38,17 @@ installation is sufficient during development), exposing:
 ```python
 from poker_gpu_evaluator.pbg import (
     API_VERSION,
+    FOLDER_API_VERSION,
     COMBO_CARDS,
     CompletionConfig,
     CompletionResult,
+    FolderSummaryResult,
     JointProfileResult,
     PartitionSummaryResult,
     ShowdownResult,
     complete,
     evaluate_showdowns,
+    partition_folders,
     partition_many,
     sample_joint_profiles,
 )
@@ -56,6 +59,8 @@ before its first production call and raises an actionable incompatibility
 error rather than attempting a legacy fallback. It also compares the exported
 `COMBO_CARDS` against the local representation map before making a production
 call.
+`FOLDER_API_VERSION` is the literal string `"pbg-folder-v1"` and gates the
+model-ready folded-summary extension independently of the base facade version.
 
 Importing the package must not initialize CUDA or compile an extension. CUDA
 loading/JIT may happen on the first call with `backend="cuda"`.
@@ -260,6 +265,25 @@ class PartitionSummaryResult:
     output_valid: torch.Tensor                  # bool [B]
     metadata: dict[str, object]
 
+@dataclass
+class FolderSummaryResult:
+    base_log_z: torch.Tensor                    # float32 [B]
+    single_card_log_ratio: torch.Tensor         # float32 [B,52]
+    pair_card_log_ratio: torch.Tensor           # float32 [B,52,52]
+    beta_eigenvalue: torch.Tensor               # float32 [B,R]
+    beta_eigenvector: torch.Tensor              # float32 [B,52,R]
+    folder_log_mass: torch.Tensor               # float32 [B,F]
+    folder_single_card_log_ratio: torch.Tensor  # float32 [B,F,52]
+    folder_pair_card_log_ratio: torch.Tensor    # float32 [B,F,52,52]
+    folder_card_marginal: torch.Tensor          # float32 [B,F,52]
+    folder_delta: torch.Tensor                  # float32 [B,F,52]
+    folder_sigma: torch.Tensor                  # float32 [B,F,52,52]
+    sigma_total: torch.Tensor                   # float32 [B,52,52]
+    tight_cluster_scalar: torch.Tensor          # float32 [B]
+    folder_output_valid: torch.Tensor           # bool [B,F]
+    output_valid: torch.Tensor                  # bool [B]
+    metadata: dict[str, object]
+
 def partition_many(
     *,
     board_cards: torch.Tensor,       # uint8 [B,5], 255 padded
@@ -268,6 +292,15 @@ def partition_many(
     field_order: int = 2,
     backend: str = "auto",
 ) -> PartitionSummaryResult: ...
+
+def partition_folders(
+    *,
+    board_cards: torch.Tensor,       # uint8 [B,5], 255 padded
+    range_weights: torch.Tensor,     # float32 [B,F,1326]
+    row_mask: torch.Tensor,          # bool [B,F]
+    beta_rank: int = 16,
+    backend: str = "auto",
+) -> FolderSummaryResult: ...
 ```
 
 It computes collision-conditioned assignment mass and finite-difference blocker
@@ -278,8 +311,12 @@ supplied as rows; their public status affects local model metadata, not the
 partition law. Scaling each active range row independently by a positive scalar
 may change `base_log_z` but not the ratio fields.
 
-This repository may cache, reshape, scatter, decompose, or learn projections of
-these returned tensors. It may not compute them from private-card collision
+`partition_folders` is the model-ready `pbg-folder-v1` extension. In one public
+call it returns the combined fields, per-folder log masses and finite
+differences, unnormalized card marginals, centered deltas/covariances, the
+summed/tight contraction, and signed beta factors. This repository may cache,
+reshape, scatter, or learn projections of these returned tensors. It may not
+compute or decompose them from private-card collision
 rules, enumerate disjoint assignments, or provide a local mathematical oracle.
 Validation, device, metadata, and CPU/CUDA conventions match the other facade
 operations. Partition summaries are deterministic and take no seed.
@@ -419,8 +456,8 @@ It must:
 8. map `JointProfileResult.combo_ids` into the PBG profile tensor, retaining
    sampled combos for folded dealt seats and keeping `-1` only for
    undealt/padded seats;
-9. carry `PartitionSummaryResult` fields into model DTOs without recomputing
-   poker quantities;
+9. carry the compact model-ready subset of `FolderSummaryResult` into model
+   DTOs and cache it exactly until a street or fold event;
 10. pass all fixed-showdown eligibility strata in one facade call and map
    `ShowdownResult` shares into affine local payoff assembly; and
 11. turn evaluator validation/degeneracy/failure into the local typed errors

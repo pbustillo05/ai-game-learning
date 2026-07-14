@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -26,6 +27,7 @@ from pbg.games.poker.engine import (
 )
 from pbg.games.poker.folded import (
     FoldSnapshotBatch,
+    PartitionSummaryBatch,
     PokerGPUPartitionAdapter,
 )
 from pbg.games.poker.mc import PokerGPURejectionSampler, PokerGPUShowdownEvaluator
@@ -45,6 +47,16 @@ _TERMINAL = 2
 _PRETERM = 3
 _EPS = 1e-6
 _CHANCE_OFFSETS = (100_000, 200_000, 300_000)
+
+
+@dataclass
+class CompactPokerDecisionReach:
+    """Ragged live-seat reach rows retained for optimization."""
+
+    row_ptr: Tensor  # int64 [D+1]
+    seat_ids: Tensor  # int64 [T]
+    log_r: Tensor  # float32 [T,1326]
+    n_rows: int
 
 
 class PokerRolloutBackend:
@@ -83,6 +95,10 @@ class PokerRolloutBackend:
         self.x_sizes = (N_HANDS,) * cfg.n_players
         self.n_ticks = cfg.n_ticks
         self.e_max = RAISE_OFFSET + cfg.n_ticks
+        self.raise_unit_values = (
+            torch.arange(1, cfg.n_ticks + 1, dtype=torch.float32, device=self.device)
+            * float(cfg.chip_unit_bb)
+        )
         if evaluator_backend not in {"auto", "cpu", "cuda"}:
             raise ValueError("evaluator_backend must be 'auto', 'cpu', or 'cuda'")
         if max_rollout_steps is None:
@@ -121,6 +137,7 @@ class PokerRolloutBackend:
         }
         self.execution_profile = None
         self.policy_batch_metrics: deque[dict[str, int | str]] = deque(maxlen=4096)
+        self._partition_cache: dict[int, PartitionSummaryBatch] = {}
         self.game = self
 
     def root_states(self, n: int) -> Tensor:
@@ -138,6 +155,7 @@ class PokerRolloutBackend:
 
         n = buttons.shape[0]
         self.states.reset()
+        self._partition_cache.clear()
         handles = self.states.allocate_all(n)  # [B]
         rows = handles.to(torch.int64)
         if self.n_players == 2:
@@ -187,6 +205,7 @@ class PokerRolloutBackend:
         self.states.fold_payoff[rows] = 0.0
         self.states.board_at_fold[rows] = 255
         self.states.fold_line_meta[rows] = 0.0
+        self.states.partition_cache_key[rows] = -1
         return handles
 
     def rotate_button(self, states: Tensor) -> Tensor:
@@ -234,30 +253,10 @@ class PokerRolloutBackend:
         return self.classify(states) == PRETERM
 
     def raise_targets(self, states: Tensor) -> Tensor:
-        """Return affine raise-to ticks as float32 ``[B,n_ticks]``."""
+        """Return every fixed-denomination raise-to amount ``[B,n_ticks]``."""
 
         self._validate_handles(states)
-        rows = states.to(torch.int64)
-        actor = self.states.actor[rows].to(torch.int64)
-        committed = self.states.committed_street[rows, actor]
-        maximum = committed + self.states.stacks[rows, actor]
-        minimum = self.states.current_bet[rows] + self.states.last_full_raise[rows]
-        if self.n_ticks == 1:
-            targets = maximum[:, None]
-        else:
-            fraction = torch.arange(self.n_ticks, dtype=torch.float32, device=self.device)
-            fraction = fraction / float(self.n_ticks - 1)
-            targets = minimum[:, None] + (maximum - minimum)[:, None] * fraction[None, :]
-            targets[:, -1] = maximum
-        short = maximum + _EPS < minimum
-        targets = torch.where(short[:, None], torch.zeros_like(targets), targets)
-        targets[:, -1] = maximum
-        allowed = (
-            (self.states.phase[rows] == _PLAYER)
-            & self.states.reopen_mask[rows, actor]
-            & (maximum > self.states.current_bet[rows] + _EPS)
-        )
-        return torch.where(allowed[:, None], targets, torch.zeros_like(targets))  # [B,T]
+        return self.raise_unit_values[None].expand(states.shape[0], -1)
 
     legal_raise_targets = raise_targets
 
@@ -280,8 +279,16 @@ class PokerRolloutBackend:
         )
         minimum = self.states.current_bet[rows] + self.states.last_full_raise[rows]
         short = maximum + _EPS < minimum
-        mask[:, RAISE_OFFSET:] = can_raise[:, None] & (~short[:, None])
-        mask[:, -1] |= can_raise & short
+        targets = self.raise_unit_values[None]
+        full_raises = (targets + _EPS >= minimum[:, None]) & (
+            targets <= maximum[:, None] + _EPS
+        )
+        short_allin = torch.isclose(
+            targets, maximum[:, None], rtol=0.0, atol=_EPS
+        )
+        mask[:, RAISE_OFFSET:] = can_raise[:, None] & torch.where(
+            short[:, None], short_allin, full_raises
+        )
         return ids, mask
 
     def step(self, states: Tensor, events: EventBatch) -> Tensor:
@@ -406,6 +413,7 @@ class PokerRolloutBackend:
                 ),
                 dim=1,
             )
+            self.states.partition_cache_key[fold_rows] = successors[fold]
         self.states.reopen_mask[rows] = (~self.states.acted[rows]) & (self.states.status[rows] == LIVE)
 
         contesting = self.states.status[rows] != FOLDED
@@ -488,6 +496,7 @@ class PokerRolloutBackend:
         self.states.history_pot_before[rows] = self.states.committed_total[parent_rows].sum(1)
         self.states.history_current_bet[rows] = self.states.current_bet[parent_rows]
         self.states.history_length[rows] += 1
+        self.states.partition_cache_key[rows] = successors
         return successors
 
     def _packed_history(self, states: Tensor) -> PackedPublicHistory:
@@ -725,7 +734,13 @@ class PokerRolloutBackend:
         fold_legal = legal[:, FOLD].to(torch.float32)
         raise_fraction = legal[:, RAISE_OFFSET:].to(torch.float32).mean(1)
         legality = torch.stack((fold_legal, legal[:, CHECK_CALL].float(), raise_fraction), dim=1)
-        bounds = torch.stack((targets[:, 0], targets[:, -1]), dim=1)
+        raise_legal = legal[:, RAISE_OFFSET:]
+        lower = targets.masked_fill(~raise_legal, torch.inf).min(1).values
+        upper = targets.masked_fill(~raise_legal, -torch.inf).max(1).values
+        has_raise = raise_legal.any(1)
+        lower = torch.where(has_raise, lower, torch.zeros_like(lower))
+        upper = torch.where(has_raise, upper, torch.zeros_like(upper))
+        bounds = torch.stack((lower, upper), dim=1)
         actor = self.states.actor[rows].to(torch.int64)
         call_amount = (
             self.states.current_bet[rows]
@@ -748,8 +763,8 @@ class PokerRolloutBackend:
             committed_street=self.states.committed_street[rows],
             call_amount=call_amount,
             current_bet=self.states.current_bet[rows],
-            min_raise_to=targets[:, 0],
-            max_raise_to=targets[:, -1],
+            min_raise_to=lower,
+            max_raise_to=upper,
             last_full_raise=self.states.last_full_raise[rows],
             legal_action_mask=legal,
             raise_ticks=targets,
@@ -904,6 +919,63 @@ class PokerRolloutBackend:
                 return self._combine_outputs(parts, states.shape[0])
         return self._policy_forward_direct(frozen_model, states, reach)
 
+    def compact_decision_reach(
+        self, states: Tensor, reach: Tensor
+    ) -> CompactPokerDecisionReach:
+        """Discard folded full ranges after their final rollout/completion use."""
+
+        self._validate_handles(states)
+        if reach.shape != (states.numel(), self.n_players, N_HANDS):
+            raise ValueError("reach must have shape [D,P,1326]")
+        rows = states.to(device=self.device, dtype=torch.int64)
+        live = self.states.status[rows] != FOLDED  # [D,P]
+        counts = live.sum(1, dtype=torch.int64)
+        row_ptr = torch.cat(
+            (torch.zeros(1, dtype=torch.int64, device=self.device), counts.cumsum(0))
+        )
+        seats = torch.arange(self.n_players, device=self.device)[None].expand_as(live)
+        return CompactPokerDecisionReach(
+            row_ptr=row_ptr,
+            seat_ids=seats[live].to(torch.int64),
+            log_r=reach[live].contiguous(),
+            n_rows=int(states.numel()),
+        )
+
+    def expand_decision_reach(
+        self, compact: CompactPokerDecisionReach, rows: Tensor
+    ) -> Tensor:
+        """Materialize dense policy rows only for the sampled minibatch."""
+
+        if not isinstance(compact, CompactPokerDecisionReach):
+            raise TypeError("expected CompactPokerDecisionReach")
+        rows = rows.to(device=self.device, dtype=torch.int64)
+        if rows.ndim != 1:
+            raise ValueError("decision reach rows are out of range")
+        valid_rows = ((rows >= 0) & (rows < compact.n_rows)).all()
+        if rows.device.type == "cuda":
+            torch._assert_async(valid_rows, "decision reach rows are out of range")
+        elif not bool(valid_rows):
+            raise ValueError("decision reach rows are out of range")
+        starts = compact.row_ptr[rows]
+        counts = compact.row_ptr[rows + 1] - starts
+        batch_rows = torch.repeat_interleave(
+            torch.arange(rows.numel(), device=self.device), counts
+        )
+        repeated_starts = torch.repeat_interleave(starts, counts)
+        output_starts = torch.repeat_interleave(
+            counts.cumsum(0) - counts, counts
+        )
+        offsets = torch.arange(batch_rows.numel(), device=self.device) - output_starts
+        source = repeated_starts + offsets
+        result = torch.full(
+            (rows.numel(), self.n_players, N_HANDS),
+            -torch.inf,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        result[batch_rows, compact.seat_ids[source]] = compact.log_r[source]
+        return result
+
     def _policy_forward_direct(
         self, frozen_model: nn.Module, states: Tensor, reach: Tensor
     ) -> PolicyOutput:
@@ -945,38 +1017,51 @@ class PokerRolloutBackend:
 
         post = (self.states.street[rows] != 0).nonzero().squeeze(1)
         if post.numel():
-            n_live = (self.states.status[rows[post]] != FOLDED).sum(1)
-            queue_order = torch.argsort(
-                torch.stack([(n_live == live).sum() for live in range(2, self.n_players + 1)]),
-                descending=True,
+            source_model = frozen_model.module if hasattr(frozen_model, "module") else frozen_model
+            post_model = getattr(source_model, "postflop", None)
+            consumes_partition = bool(
+                getattr(
+                    post_model,
+                    "requires_partition_summary",
+                    getattr(getattr(post_model, "cfg", None), "evaluator_summary_dim", 0) > 0,
+                )
             )
-            for queue_index in queue_order:
-                live = queue_index + 2
-                positions = post[n_live == live]
-                if positions.numel() == 0:
-                    continue
-                post_pub = self._slice_public(pub, positions)
-                compatibility = self._compatibility(post_pub.board)
-                partition = self._partition_summary(
-                    post_pub.board, weights[positions], post_pub.status, int(live)
-                )
-                masks = PostflopMasks(
-                    compatibility=compatibility,
-                    seat_mask=post_pub.seat_mask,
-                    combo_mask=(weights[positions] > 0),
-                    status=post_pub.status,
-                    evaluator_summary=partition,
-                    live_seat_ids=torch.where(
-                        post_pub.status != FOLDED,
-                        torch.arange(self.n_players, device=self.device)[None],
-                        self.n_players,
-                    ).sort(1).values[:, : int(live)],
-                )
-                output = frozen_model.forward_postflop(
-                    post_pub, weights[positions], post_pub.to_act, masks
-                )
-                parts.append((positions, output))
-                self.batch_size_histograms[f"postflop_{live}"].append(positions.shape[0])
+            post_street = self.states.street[rows[post]]
+            n_live = (self.states.status[rows[post]] != FOLDED).sum(1)
+            for street in range(1, RIVER + 1):
+                compact_size = math.comb(52 - (street + 2), 2)
+                for live in range(2, self.n_players + 1):
+                    positions = post[(post_street == street) & (n_live == live)]
+                    if positions.numel() == 0:
+                        continue
+                    post_pub = self._slice_public(pub, positions)
+                    compatibility = self._compatibility(post_pub.board)
+                    partition = None
+                    if consumes_partition:
+                        partition = self._partition_summary(
+                            states[positions], post_pub.board, weights[positions],
+                            post_pub.status, live
+                        )
+                    masks = PostflopMasks(
+                        compatibility=compatibility,
+                        seat_mask=post_pub.seat_mask,
+                        combo_mask=(weights[positions] > 0),
+                        status=post_pub.status,
+                        evaluator_summary=partition,
+                        live_seat_ids=torch.where(
+                            post_pub.status != FOLDED,
+                            torch.arange(self.n_players, device=self.device)[None],
+                            self.n_players,
+                        ).sort(1).values[:, :live],
+                        compact_size=compact_size,
+                    )
+                    output = frozen_model.forward_postflop(
+                        post_pub, weights[positions], post_pub.to_act, masks
+                    )
+                    parts.append((positions, output))
+                    self.batch_size_histograms[
+                        f"postflop_{live}"
+                    ].append(positions.shape[0])
         return self._combine_outputs(parts, states.shape[0])
 
     def _compatibility(self, board: Tensor) -> Tensor:
@@ -990,9 +1075,53 @@ class PokerRolloutBackend:
         return ~conflict
 
     def _partition_summary(
-        self, board: Tensor, weights: Tensor, status: Tensor, n_live: int
-    ) -> Any:
-        """Call the sibling facade with live/folded rows ``[B,L/F,H]``."""
+        self, states: Tensor, board: Tensor, weights: Tensor, status: Tensor, n_live: int
+    ) -> PartitionSummaryBatch:
+        """Reuse summaries until their street/fold dependency anchor changes."""
+
+        rows = states.to(torch.int64)
+        keys = self.states.partition_cache_key[rows].clone()
+        missing_anchor = keys < 0
+        if bool(missing_anchor.any()):
+            keys[missing_anchor] = states[missing_anchor]
+            self.states.partition_cache_key[rows[missing_anchor]] = states[missing_anchor]
+        key_values = [int(value) for value in keys.detach().cpu().tolist()]
+        representatives: dict[int, int] = {}
+        for position, key in enumerate(key_values):
+            if key not in self._partition_cache and key not in representatives:
+                representatives[key] = position
+        if representatives:
+            selected = torch.tensor(
+                list(representatives.values()), dtype=torch.long, device=self.device
+            )
+            computed = self._partition_summary_uncached(
+                states[selected], board[selected], weights[selected], status[selected], n_live
+            )
+            for offset, key in enumerate(representatives):
+                self._partition_cache[key] = PartitionSummaryBatch(
+                    fields={name: value[offset : offset + 1] for name, value in computed.fields.items()},
+                    metadata=dict(computed.metadata),
+                )
+        cached = [self._partition_cache[key] for key in key_values]
+        field_names = tuple(cached[0].fields)
+        return PartitionSummaryBatch(
+            fields={
+                name: torch.cat([summary.fields[name] for summary in cached], dim=0)
+                for name in field_names
+            },
+            metadata={
+                "cache": "street_or_fold",
+                "cache_hits": len(key_values) - len(representatives),
+                "cache_misses": len(representatives),
+                "folder_api_version": computed.metadata.get("folder_api_version")
+                if representatives else cached[0].metadata.get("folder_api_version"),
+            },
+        )
+
+    def _partition_summary_uncached(
+        self, states: Tensor, board: Tensor, weights: Tensor, status: Tensor, n_live: int
+    ) -> PartitionSummaryBatch:
+        """Call the sibling folder facade for dependency-distinct rows."""
 
         batch = board.shape[0]
         folded_mask = status == FOLDED
@@ -1003,16 +1132,15 @@ class PokerRolloutBackend:
         live_weights = ordered[:, :n_live].contiguous()  # [B,L,H]
         folded_weights = ordered[:, n_live:].contiguous()  # [B,F,H]
         folders = self.n_players - n_live
-        boundary_board = torch.where(
-            board < 0, torch.full_like(board, 255), board
-        ).to(torch.uint8)
+        state_rows = states.to(torch.int64)
+        batch_rows = state_rows[:, None].expand(-1, folders)
         folded = FoldSnapshotBatch(
             reach_weights=folded_weights,
             board_at_fold=self.states.board_at_fold[
-                torch.arange(batch, device=self.device)[:, None], order[:, n_live:]
+                batch_rows, order[:, n_live:]
             ].contiguous(),
             line_meta=self.states.fold_line_meta[
-                torch.arange(batch, device=self.device)[:, None], order[:, n_live:]
+                batch_rows, order[:, n_live:]
             ].contiguous(),
             folder_mask=torch.ones((batch, folders), dtype=torch.bool, device=self.device),
             seat_ids=order[:, n_live:].to(torch.int64).contiguous(),

@@ -7,7 +7,8 @@ evaluator boundary and are assembled by :func:`assemble_showdown_payoff`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor
@@ -36,13 +37,14 @@ _EPS = 1e-6
 
 @dataclass(frozen=True)
 class PokerConfig:
-    """Configuration for one cash-game table, with chip units in big blinds."""
+    """Configuration for one cash-game table in an exact fixed denomination."""
 
     n_players: int = 6
     stack_bb: float = 100.0
     sb: float = 0.5
     bb: float = 1.0
-    n_ticks: int = 64
+    chip_unit_bb: float = 0.5
+    n_ticks: int = field(init=False)
 
     def __post_init__(self) -> None:
         if not 2 <= self.n_players <= 9:
@@ -51,8 +53,17 @@ class PokerConfig:
             raise ValueError("stack_bb must be positive")
         if self.sb <= 0.0 or self.bb <= 0.0 or self.sb > self.bb:
             raise ValueError("blinds must satisfy 0 < sb <= bb")
-        if self.n_ticks <= 0:
-            raise ValueError("n_ticks must be positive")
+        if not math.isfinite(self.chip_unit_bb) or self.chip_unit_bb <= 0.0:
+            raise ValueError("chip_unit_bb must be finite and positive")
+        units = []
+        for name, value in (("stack_bb", self.stack_bb), ("sb", self.sb), ("bb", self.bb)):
+            count = round(value / self.chip_unit_bb)
+            if count <= 0 or not math.isclose(
+                value, count * self.chip_unit_bb, rel_tol=0.0, abs_tol=1e-9
+            ):
+                raise ValueError(f"{name} must be an integer multiple of chip_unit_bb")
+            units.append(count)
+        object.__setattr__(self, "n_ticks", units[0])
 
 
 @dataclass(frozen=True)
@@ -356,7 +367,8 @@ class NLHEEngine:
 
     def _raise_grid(self, state: _State) -> tuple[list[float], list[bool]]:
         actor = state.actor
-        targets = [0.0] * self.n_ticks
+        unit = self.cfg.chip_unit_bb
+        targets = [unit * (tick + 1) for tick in range(self.n_ticks)]
         legal = [False] * self.n_ticks
         if actor < 0 or state.phase != _PLAYER or state.acted[actor]:
             return targets, legal
@@ -364,24 +376,17 @@ class NLHEEngine:
         if maximum <= state.current_bet + _EPS:
             return targets, legal
         minimum = state.current_bet + state.last_full_raise
+        maximum_tick = round(maximum / unit) - 1
         if maximum + _EPS < minimum:
-            targets[-1] = maximum
-            legal[-1] = True
+            legal[maximum_tick] = True
             return targets, legal
-        if self.n_ticks == 1:
-            targets[0] = maximum
-        else:
-            span = maximum - minimum
-            targets = [
-                minimum + span * tick / (self.n_ticks - 1)
-                for tick in range(self.n_ticks)
-            ]
-            targets[-1] = maximum
-        legal = [True] * self.n_ticks
+        minimum_tick = max(0, math.ceil((minimum - _EPS) / unit) - 1)
+        for tick in range(minimum_tick, maximum_tick + 1):
+            legal[tick] = True
         return targets, legal
 
     def raise_targets(self, state_refs: Tensor) -> Tensor:
-        """Return the affine raise-to grid as float32 ``[B,n_ticks]``."""
+        """Return every fixed-denomination raise-to amount ``[B,n_ticks]``."""
 
         refs, device = self._refs(state_refs)
         rows = [self._raise_grid(self.states.state(ref))[0] for ref in refs]

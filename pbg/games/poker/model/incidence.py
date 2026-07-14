@@ -101,8 +101,17 @@ class CompactMap:
         return self.full_to_compact.shape[1]
 
 
-def build_compact_map(compatibility: Tensor) -> CompactMap:
-    """Build a stable, padded map from supplied bool rows ``[B,H]``."""
+def build_compact_map(
+    compatibility: Tensor,
+    compact_size: int | None = None,
+) -> CompactMap:
+    """Build a stable, padded map from supplied bool rows ``[B,H]``.
+
+    Production CUDA callers provide the fixed compatible-combo count for the
+    street. This keeps the output shape static and avoids reading a device
+    reduction on the host. Generic CPU callers retain minimal ragged padding;
+    generic CUDA callers conservatively use the full width.
+    """
 
     if not isinstance(compatibility, Tensor) or compatibility.ndim != 2:
         raise ValueError("compatibility must have shape [B,H]")
@@ -110,21 +119,35 @@ def build_compact_map(compatibility: Tensor) -> CompactMap:
         raise TypeError("compatibility must have dtype torch.bool")
     batch, full_size = compatibility.shape
     counts = compatibility.sum(dim=1)
-    compact_size = int(counts.max().item()) if batch else 0
+    if compact_size is None:
+        compact_size = (
+            int(counts.max().item())
+            if batch and compatibility.device.type == "cpu"
+            else full_size
+        )
+    if isinstance(compact_size, bool) or not 0 <= compact_size <= full_size:
+        raise ValueError("compact_size must be in [0,H]")
+    enough_space = (counts <= compact_size).all()
+    if compatibility.device.type == "cuda":
+        torch._assert_async(enough_space, "compact_size omits compatible rows")
+    elif not bool(enough_space):
+        raise ValueError("compact_size omits compatible rows")
     compact_to_full = torch.zeros(
         (batch, compact_size), dtype=torch.long, device=compatibility.device
     )
-    valid = torch.zeros_like(compact_to_full, dtype=torch.bool)
-    full_to_compact = torch.full(
-        (batch, full_size), -1, dtype=torch.long, device=compatibility.device
+    rank = compatibility.long().cumsum(dim=1) - 1
+    full_to_compact = torch.where(compatibility, rank, -torch.ones_like(rank))
+    if compact_size:
+        full_ids = torch.arange(full_size, device=compatibility.device)[None].expand(batch, -1)
+        compact_to_full.scatter_add_(
+            1,
+            rank.clamp(0, compact_size - 1),
+            torch.where(compatibility, full_ids, torch.zeros_like(full_ids)),
+        )
+    valid = (
+        torch.arange(compact_size, device=compatibility.device)[None]
+        < counts[:, None]
     )
-    full_ids = torch.arange(full_size, device=compatibility.device)
-    for row in range(batch):
-        selected = full_ids[compatibility[row]]
-        count = selected.numel()
-        compact_to_full[row, :count] = selected
-        valid[row, :count] = True
-        full_to_compact[row, selected] = torch.arange(count, device=compatibility.device)
     return CompactMap(compact_to_full, full_to_compact, valid)
 
 
@@ -176,17 +199,22 @@ def compact_scatter(
     inverse = [order.index(axis) for axis in range(values.ndim)]
     moved = values.permute(order)
     suffix = moved.shape[2:]
-    output = torch.full(
-        (mapping.batch_size, mapping.full_size, *suffix),
-        fill_value,
-        dtype=values.dtype,
-        device=values.device,
-    )
-    if mapping.compact_size and bool(mapping.valid.any()):
-        batch_ids = torch.arange(mapping.batch_size, device=values.device)[:, None]
-        batch_ids = batch_ids.expand_as(mapping.valid)[mapping.valid]
-        full_ids = mapping.compact_to_full.to(values.device)[mapping.valid]
-        output[batch_ids, full_ids] = moved[mapping.valid]
+    if mapping.compact_size:
+        index = mapping.full_to_compact.clamp_min(0).reshape(
+            mapping.batch_size, mapping.full_size, *([1] * len(suffix))
+        ).expand(mapping.batch_size, mapping.full_size, *suffix)
+        output = moved.gather(1, index)
+        selected = (mapping.full_to_compact >= 0).reshape(
+            mapping.batch_size, mapping.full_size, *([1] * len(suffix))
+        )
+        output = output.masked_fill(~selected, fill_value)
+    else:
+        output = torch.full(
+            (mapping.batch_size, mapping.full_size, *suffix),
+            fill_value,
+            dtype=values.dtype,
+            device=values.device,
+        )
     return output.permute(inverse)
 
 

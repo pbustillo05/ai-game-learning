@@ -6,9 +6,9 @@ game:
     stack_bb: 100.0
     sb: 0.5
     bb: 1.0
-    n_ticks: 32
+    chip_unit_bb: 0.5
 rollout:
-  n_trees: 8  # Safe bootstrap per rank; increase only after measured memory profiling.
+  n_trees: 1  # Exactly one sampled branching tree per rank.
   beta:
     default: 1.0
     preflop: 1.0
@@ -18,7 +18,7 @@ rollout:
     chance_to_flop: 1.5
     chance_to_turn: 1.5
     chance_to_river: 1.5
-  node_budget: 512
+  node_budget: 4096  # Preserves the former total per-rank node ceiling.
   reach_storage: recompute
 completion:
   n_samples: 256  # Safe bootstrap; tune after evaluator-memory measurement.
@@ -43,6 +43,7 @@ training:
   seed: 23
   checkpoint_every: 100
   out_dir: runs/nlhe6_h100
+  reproducibility: throughput
 loss:
   name: rb_ppo
   lam: 0.95
@@ -51,5 +52,4 @@ loss:
   c_v: 0.5
   c_h: 0.01
   entropy_schedule: const
-  use_suit_consistency: false
-debug_asserts: false
+  value_loss: clipped

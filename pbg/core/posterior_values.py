@@ -8,7 +8,7 @@ It propagates posterior bucket mass ``P`` and posterior-weighted return mass
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Sequence
+from typing import Any, Iterable, Literal, Sequence
 
 import torch
 from torch import Tensor
@@ -84,6 +84,34 @@ class _AuxiliaryChannel:
     spec: AuxiliaryChannelSpec
     leaf: Tensor  # [L,...]
     head: Tensor | None  # [Nd,...]
+
+
+@dataclass(frozen=True)
+class BackwardFrontierMemoryPlan:
+    """Conservative bytes resident while reducing completed tree regions.
+
+    ``frontier_bytes`` counts the persistent ``P/M`` boundary.  ``scratch_bytes``
+    conservatively allows three additional copies of that boundary while a set
+    of ready siblings is gathered, reduced, and compacted.  Unlike the former
+    abstract row cap, every term includes private-type width and dtype size.
+    """
+
+    leaf_input_bytes: int
+    target_bytes: int
+    frontier_bytes: int
+    scratch_bytes: int
+    structure_bytes: int
+    max_frontier_rows: int
+
+    @property
+    def peak_bytes(self) -> int:
+        return (
+            self.leaf_input_bytes
+            + self.target_bytes
+            + self.frontier_bytes
+            + self.scratch_bytes
+            + self.structure_bytes
+        )
 
 
 def conditionalize(moment: Tensor, mass: Tensor) -> Tensor:
@@ -190,9 +218,7 @@ def _layout(
 ) -> _Layout:
     if not 0.0 <= float(lam) <= 1.0:
         raise ValueError("lam must be in [0,1]")
-    tree.validate()
     device = leaf_stats.p_hat.device
-    n = int(tree.parent.numel())
     if leaf_stats.p_hat.ndim != 3:
         raise ValueError("leaf p_hat must have shape [L,P_max,X_max]")
     leaves, p_max, x_max = map(int, leaf_stats.p_hat.shape)
@@ -204,6 +230,48 @@ def _layout(
         raise ValueError("leaf posterior mass must be finite and nonnegative")
     if not bool(torch.isfinite(leaf_stats.v_hat).all()):
         raise ValueError("leaf values must be finite")
+
+    leaf_nodes = _leaf_node_ids(tree, leaf_stats)
+    return _layout_from_shape(
+        tree,
+        leaf_nodes,
+        p_max,
+        x_max,
+        device,
+        reach,
+        heads,
+        lam,
+        game,
+    )
+
+
+def _layout_from_shape(
+    tree: TreeBatch,
+    leaf_nodes: Tensor,
+    p_max: int,
+    x_max: int,
+    device: torch.device,
+    reach: Any,
+    heads: HeadEvals,
+    lam: float,
+    game: Any,
+) -> _Layout:
+    """Validate topology and construct layout without allocating leaf values."""
+
+    if not 0.0 <= float(lam) <= 1.0:
+        raise ValueError("lam must be in [0,1]")
+    tree.validate()
+    n = int(tree.parent.numel())
+    leaf_nodes = leaf_nodes.to(device=device, dtype=torch.int64)
+    counts = tree.child_ptr[1:].to(torch.int64) - tree.child_ptr[:-1].to(torch.int64)
+    default_leaves = (counts == 0).nonzero(as_tuple=False).squeeze(1)
+    if (
+        leaf_nodes.ndim != 1
+        or leaf_nodes.numel() != default_leaves.numel()
+        or leaf_nodes.unique().numel() != leaf_nodes.numel()
+        or not torch.equal(leaf_nodes.sort().values, default_leaves.sort().values)
+    ):
+        raise ValueError("leaf node ids must uniquely cover every stored leaf")
 
     n_players = int(game.n_players)
     x_sizes = tuple(int(size) for size in game.x_sizes)
@@ -241,10 +309,8 @@ def _layout(
     decision_row = torch.full((n,), -1, dtype=torch.int64, device=device)
     decision_row[decision_nodes] = torch.arange(nd, device=device)
 
-    leaf_nodes = _leaf_node_ids(tree, leaf_stats)
     leaf_row = torch.full((n,), -1, dtype=torch.int64, device=device)
-    leaf_row[leaf_nodes] = torch.arange(leaves, device=device)
-    counts = tree.child_ptr[1:].to(torch.int64) - tree.child_ptr[:-1].to(torch.int64)
+    leaf_row[leaf_nodes] = torch.arange(leaf_nodes.numel(), device=device)
     e_max = int(counts[decision_nodes].max()) if nd else 0
     type_mask = torch.zeros((p_max, x_max), dtype=torch.bool, device=device)
     for player, size in enumerate(x_sizes):
@@ -342,7 +408,94 @@ def _edge_metadata(result: NodeTargets, tree: TreeBatch, layout: _Layout) -> Non
     result.child_mask[rows, slots] = True
 
 
-def _process_chunk(
+def _compact_single_child_posterior(result: NodeTargets) -> None:
+    """Share the identical parent/child posterior storage on trajectories."""
+
+    if (
+        result.child_p_hat.shape[1] == 1
+        and result.child_count.numel()
+        and bool((result.child_count == 1).all())
+    ):
+        if not torch.equal(result.child_p_hat[:, 0], result.parent_p_hat):
+            raise RuntimeError("single-child posterior targets must be identical")
+        result.child_p_hat = result.parent_p_hat[:, None]
+
+
+def _tensor_bytes(value: Tensor) -> int:
+    return int(value.numel()) * int(value.element_size())
+
+
+def _frontier_memory_plan(
+    tree: TreeBatch,
+    leaf_stats: BatchedCompletionStats,
+    layout: _Layout,
+    channels: Sequence[_AuxiliaryChannel],
+    emit_q: bool,
+) -> BackwardFrontierMemoryPlan:
+    """Plan the value phase in bytes before allocating its dense frontier."""
+
+    return _frontier_memory_plan_from_shape(
+        tree,
+        layout,
+        channels,
+        emit_q,
+        _tensor_bytes(leaf_stats.p_hat) + _tensor_bytes(leaf_stats.v_hat),
+    )
+
+
+def _frontier_memory_plan_from_shape(
+    tree: TreeBatch,
+    layout: _Layout,
+    channels: Sequence[_AuxiliaryChannel],
+    emit_q: bool,
+    leaf_input_bytes: int,
+) -> BackwardFrontierMemoryPlan:
+    """Plan a full or incrementally supplied completion/value phase."""
+
+    leaves = int(layout.leaf_nodes.numel())
+    moment_row_bytes = layout.p_max * layout.x_max * torch.tensor([], dtype=torch.float32).element_size()
+    frontier_bytes = 2 * leaves * moment_row_bytes
+    auxiliary_frontier = 0
+    auxiliary_targets = 0
+    for channel in channels:
+        trailing = 1
+        for size in channel.leaf.shape[1:]:
+            trailing *= int(size)
+        auxiliary_frontier += leaves * trailing * 4
+        if channel.spec.emit_field is not None:
+            auxiliary_targets += int(layout.decision_nodes.numel()) * trailing * 4
+    frontier_bytes += auxiliary_frontier
+    nd, e_max, x_max = (
+        int(layout.decision_nodes.numel()),
+        layout.e_max,
+        layout.x_max,
+    )
+    target_float_values = nd * x_max * (2 + 2 * e_max)
+    if emit_q:
+        target_float_values += nd * e_max * x_max
+    target_bytes = (
+        target_float_values * 4
+        + nd * 4  # node ids
+        + nd * e_max * 4  # child event ids
+        + nd * e_max  # child mask
+        + nd * 4  # child counts
+        + auxiliary_targets
+    )
+    # Parent/child gathers, newly reduced rows, and the compacted next frontier
+    # can overlap with the old frontier in PyTorch's caching allocator.
+    scratch_bytes = 3 * frontier_bytes
+    structure_bytes = layout.n * (8 * 5 + 1) + int(tree.child_node.numel()) * 8
+    return BackwardFrontierMemoryPlan(
+        leaf_input_bytes=leaf_input_bytes,
+        target_bytes=target_bytes,
+        frontier_bytes=frontier_bytes,
+        scratch_bytes=scratch_bytes,
+        structure_bytes=structure_bytes,
+        max_frontier_rows=leaves,
+    )
+
+
+def _reduce_frontier(
     tree: TreeBatch,
     leaf_stats: BatchedCompletionStats,
     heads: HeadEvals,
@@ -350,104 +503,371 @@ def _process_chunk(
     layout: _Layout,
     result: NodeTargets,
     channels: Sequence[_AuxiliaryChannel],
-    nodes: Tensor,
-) -> None:
-    size = int(nodes.numel())
-    local_of = torch.full((layout.n,), -1, dtype=torch.int64, device=layout.device)
-    local_of[nodes] = torch.arange(size, device=layout.device)
-    parent = tree.parent[nodes].to(torch.int64)
-    counts = layout.child_count_all[nodes]
-    p_mass = torch.zeros((size, layout.p_max, layout.x_max), dtype=torch.float32, device=layout.device)
-    m_mass = torch.zeros_like(p_mass)
-    aux_values = [
-        torch.zeros(
-            (size, *channel.leaf.shape[1:]),
-            dtype=torch.float32,
-            device=layout.device,
-        )
-        for channel in channels
-    ]
+) -> int:
+    """Contract completed siblings into parent ``P/M`` boundary summaries.
 
-    leaf_rows = layout.leaf_row[nodes]
-    leaf_local = (leaf_rows >= 0).nonzero(as_tuple=False).squeeze(1)
-    source_rows = leaf_rows[leaf_local]
-    leaf_p = (
-        leaf_stats.p_hat[source_rows]
-        .detach()
-        .to(torch.float32)
+    The frontier starts at the pre-terminal leaves.  Whenever all children of
+    a parent are present, their targets are emitted and those child rows are
+    replaced by one parent row.  Consequently no ``[N,P,X]`` moment arena is
+    allocated; the persistent moment state never exceeds the initial leaf cut.
+    """
+
+    frontier_nodes = layout.leaf_nodes
+    frontier_p = (
+        leaf_stats.p_hat.detach().to(torch.float32)
         .masked_fill(~layout.type_mask[None], 0.0)
     )
     leaf_v = (
-        leaf_stats.v_hat[source_rows]
-        .detach()
-        .to(torch.float32)
+        leaf_stats.v_hat.detach().to(torch.float32)
         .masked_fill(~layout.type_mask[None], 0.0)
     )
-    leaf_v = torch.where(leaf_p > 0, leaf_v, torch.zeros_like(leaf_v))
-    p_mass[leaf_local] = leaf_p
-    m_mass[leaf_local] = leaf_p * leaf_v
-    for values, channel in zip(aux_values, channels):
-        values[leaf_local] = channel.leaf[source_rows]
+    leaf_v = torch.where(frontier_p > 0, leaf_v, torch.zeros_like(leaf_v))
+    frontier_m = frontier_p * leaf_v
+    frontier_aux = [channel.leaf.detach().to(torch.float32) for channel in channels]
+    peak_rows = int(frontier_nodes.numel())
 
-    processed = torch.zeros(size, dtype=torch.int64, device=layout.device)
-    current = leaf_local
-    while current.numel():
-        global_parent = parent[current]
-        has_parent = global_parent >= 0
-        child_local = current[has_parent]
+    while frontier_nodes.numel():
+        frontier_parent = tree.parent[frontier_nodes].to(torch.int64)
+        has_parent = frontier_parent >= 0
         if not bool(has_parent.any()):
             break
-        parent_local = local_of[global_parent[has_parent]]
-        if bool((parent_local < 0).any()):
-            raise ValueError("a memory chunk split a tree dependency chain")
+        boundary_count = torch.bincount(
+            frontier_parent[has_parent], minlength=layout.n
+        ).to(torch.int64)
+        ready = (
+            (layout.child_count_all > 0)
+            & (boundary_count == layout.child_count_all)
+        ).nonzero(as_tuple=False).squeeze(1)
+        if ready.numel() == 0:
+            raise RuntimeError("backward frontier stalled before reaching every root")
 
-        # Accumulate completed child rows; division happens exactly once when
-        # all abstract children of a parent have arrived.
-        p_mass.index_add_(0, parent_local, p_mass[child_local])
-        m_mass.index_add_(0, parent_local, m_mass[child_local])
-        for values in aux_values:
-            values.index_add_(0, parent_local, values[child_local])
-        processed.index_add_(0, parent_local, torch.ones_like(parent_local))
-        candidates = parent_local.unique()
-        ready = candidates[processed[candidates] == counts[candidates]]
-        divisor = counts[ready].to(torch.float32)
-        p_mass[ready] /= divisor[:, None, None]
-        m_mass[ready] /= divisor[:, None, None]
-        for values in aux_values:
-            values[ready] /= divisor.reshape((ready.numel(),) + (1,) * (values.ndim - 1))
+        counts = layout.child_count_all[ready].to(torch.int64)
+        starts = tree.child_ptr[ready].to(torch.int64)
+        cumulative = torch.cumsum(counts, 0) - counts
+        slots = torch.arange(
+            int(counts.sum()), device=layout.device
+        ) - torch.repeat_interleave(cumulative, counts)
+        edges = torch.repeat_interleave(starts, counts) + slots
+        child_nodes = tree.child_node[edges].to(torch.int64)
+        frontier_row = torch.full(
+            (layout.n,), -1, dtype=torch.int64, device=layout.device
+        )
+        frontier_row[frontier_nodes] = torch.arange(
+            frontier_nodes.numel(), device=layout.device
+        )
+        child_rows = frontier_row[child_nodes]
+        if bool((child_rows < 0).any()):
+            raise RuntimeError("a ready parent is missing a child boundary summary")
 
-        global_ready = nodes[ready]
-        decision = layout.decision_row[global_ready] >= 0
+        parent_rows = torch.repeat_interleave(
+            torch.arange(ready.numel(), device=layout.device), counts
+        )
+        parent_p = torch.zeros(
+            (ready.numel(), layout.p_max, layout.x_max),
+            dtype=torch.float32,
+            device=layout.device,
+        )
+        parent_m = torch.zeros_like(parent_p)
+        parent_p.index_add_(0, parent_rows, frontier_p[child_rows])
+        parent_m.index_add_(0, parent_rows, frontier_m[child_rows])
+        divisor = counts.to(torch.float32)[:, None, None]
+        parent_p /= divisor
+        parent_m /= divisor
+
+        parent_aux: list[Tensor] = []
+        for values in frontier_aux:
+            reduced = torch.zeros(
+                (ready.numel(), *values.shape[1:]),
+                dtype=torch.float32,
+                device=layout.device,
+            )
+            reduced.index_add_(0, parent_rows, values[child_rows])
+            reduced /= counts.to(torch.float32).reshape(
+                (ready.numel(),) + (1,) * (values.ndim - 1)
+            )
+            parent_aux.append(reduced)
+
+        decision = layout.decision_row[ready] >= 0
         if bool(decision.any()):
-            dec_local = ready[decision]
-            dec_nodes = global_ready[decision]
+            dec_local = decision.nonzero(as_tuple=False).squeeze(1)
+            dec_nodes = ready[dec_local]
             rows = layout.decision_row[dec_nodes]
             players = tree.owner[dec_nodes].to(torch.int64)
             hrows = layout.head_row[dec_nodes]
             dec_counts = counts[dec_local]
-            starts = tree.child_ptr[dec_nodes].to(torch.int64)
-            cumulative = torch.cumsum(dec_counts, 0) - dec_counts
-            slots = torch.arange(
-                int(dec_counts.sum()), device=layout.device
-            ) - torch.repeat_interleave(cumulative, dec_counts)
-            edges = torch.repeat_interleave(starts, dec_counts) + slots
-            child_nodes = tree.child_node[edges].to(torch.int64)
-            child_rows = local_of[child_nodes]
+            dec_edge_mask = torch.repeat_interleave(decision, counts)
             emit(
-                result, rows, players, p_mass[dec_local], m_mass[dec_local],
-                p_mass[child_rows], m_mass[child_rows], slots,
-                heads.v[hrows].detach().to(torch.float32), lam,
+                result,
+                rows,
+                players,
+                parent_p[dec_local],
+                parent_m[dec_local],
+                frontier_p[child_rows[dec_edge_mask]],
+                frontier_m[child_rows[dec_edge_mask]],
+                slots[dec_edge_mask],
+                heads.v[hrows].detach().to(torch.float32),
+                lam,
             )
-            for values, channel in zip(aux_values, channels):
+            for values, channel in zip(parent_aux, channels):
                 if channel.spec.emit_field is not None:
                     result.aux[channel.spec.emit_field][rows] = values[dec_local]
                 if channel.spec.bootstrap == "every_player_node":
-                    values[dec_local] = float(lam) * values[dec_local] + (1.0 - float(lam)) * channel.head[hrows]
-            owner_m = m_mass[dec_local, players]
-            owner_p = p_mass[dec_local, players]
-            old_v = heads.v[hrows].detach().to(torch.float32).masked_fill(~layout.type_mask[players], 0.0)
-            m_mass[dec_local, players] = bootstrap(owner_m, owner_p, old_v, lam)
-        current = ready
+                    values[dec_local] = (
+                        float(lam) * values[dec_local]
+                        + (1.0 - float(lam)) * channel.head[hrows]
+                    )
+            owner_m = parent_m[dec_local, players]
+            owner_p = parent_p[dec_local, players]
+            old_v = (
+                heads.v[hrows].detach().to(torch.float32)
+                .masked_fill(~layout.type_mask[players], 0.0)
+            )
+            parent_m[dec_local, players] = bootstrap(owner_m, owner_p, old_v, lam)
+
+        consumed = torch.zeros(
+            frontier_nodes.numel(), dtype=torch.bool, device=layout.device
+        )
+        consumed[child_rows] = True
+        frontier_nodes = torch.cat((frontier_nodes[~consumed], ready))
+        frontier_p = torch.cat((frontier_p[~consumed], parent_p))
+        frontier_m = torch.cat((frontier_m[~consumed], parent_m))
+        frontier_aux = [
+            torch.cat((old[~consumed], new))
+            for old, new in zip(frontier_aux, parent_aux)
+        ]
+        peak_rows = max(peak_rows, int(frontier_nodes.numel()))
+
+    roots = (tree.parent < 0).nonzero(as_tuple=False).squeeze(1).to(torch.int64)
+    if frontier_nodes.numel() != roots.numel() or not torch.equal(
+        frontier_nodes.sort().values, roots.sort().values
+    ):
+        raise RuntimeError("backward frontier did not reduce to exactly the tree roots")
+    return peak_rows
+
+
+def _reduce_streamed_leaf_batches(
+    tree: TreeBatch,
+    batches: Iterable[tuple[Tensor, BatchedCompletionStats]],
+    heads: HeadEvals,
+    lam: float,
+    layout: _Layout,
+    result: NodeTargets,
+) -> int:
+    """Incrementally complete leaves and reduce every newly ready subtree."""
+
+    frontier_nodes = torch.empty(0, dtype=torch.int64, device=layout.device)
+    frontier_p = torch.empty(
+        (0, layout.p_max, layout.x_max), dtype=torch.float32, device=layout.device
+    )
+    frontier_m = torch.empty_like(frontier_p)
+    seen = torch.zeros(layout.n, dtype=torch.bool, device=layout.device)
+    peak_rows = 0
+
+    for node_ids, stats in batches:
+        node_ids = node_ids.to(device=layout.device, dtype=torch.int64)
+        if node_ids.numel() == 0:
+            raise ValueError("streamed completion batches cannot be empty")
+        if stats.p_hat.shape != (node_ids.numel(), layout.p_max, layout.x_max):
+            raise ValueError("streamed leaf p_hat has the wrong shape")
+        if stats.v_hat.shape != stats.p_hat.shape:
+            raise ValueError("streamed leaf v_hat must match p_hat")
+        _reject_low_precision("streamed leaf p_hat", stats.p_hat)
+        _reject_low_precision("streamed leaf v_hat", stats.v_hat)
+        if node_ids.unique().numel() != node_ids.numel():
+            raise ValueError("a streamed completion batch contains duplicate leaves")
+        valid = (node_ids >= 0) & (node_ids < layout.n)
+        if bool(valid.all()):
+            valid &= layout.leaf_row[node_ids] >= 0
+            valid &= ~seen[node_ids]
+        if not bool(valid.all()):
+            raise ValueError("streamed completion leaves must be unique unconsumed leaves")
+        if not bool(torch.isfinite(stats.p_hat).all()) or bool((stats.p_hat < 0).any()):
+            raise ValueError("streamed posterior mass must be finite and nonnegative")
+        if not bool(torch.isfinite(stats.v_hat).all()):
+            raise ValueError("streamed leaf values must be finite")
+        seen[node_ids] = True
+
+        added_p = (
+            stats.p_hat.detach().to(torch.float32)
+            .masked_fill(~layout.type_mask[None], 0.0)
+        )
+        added_v = (
+            stats.v_hat.detach().to(torch.float32)
+            .masked_fill(~layout.type_mask[None], 0.0)
+        )
+        added_v = torch.where(added_p > 0, added_v, torch.zeros_like(added_v))
+        frontier_nodes = torch.cat((frontier_nodes, node_ids))
+        frontier_p = torch.cat((frontier_p, added_p))
+        frontier_m = torch.cat((frontier_m, added_p * added_v))
+        peak_rows = max(peak_rows, int(frontier_nodes.numel()))
+
+        contracted = False
+        while frontier_nodes.numel():
+            frontier_parent = tree.parent[frontier_nodes].to(torch.int64)
+            has_parent = frontier_parent >= 0
+            if not bool(has_parent.any()):
+                break
+            boundary_count = torch.bincount(
+                frontier_parent[has_parent], minlength=layout.n
+            ).to(torch.int64)
+            ready = (
+                (layout.child_count_all > 0)
+                & (boundary_count == layout.child_count_all)
+            ).nonzero(as_tuple=False).squeeze(1)
+            if ready.numel() == 0:
+                break
+            contracted = True
+
+            counts = layout.child_count_all[ready].to(torch.int64)
+            starts = tree.child_ptr[ready].to(torch.int64)
+            cumulative = torch.cumsum(counts, 0) - counts
+            slots = torch.arange(
+                int(counts.sum()), device=layout.device
+            ) - torch.repeat_interleave(cumulative, counts)
+            edges = torch.repeat_interleave(starts, counts) + slots
+            child_nodes = tree.child_node[edges].to(torch.int64)
+            frontier_row = torch.full(
+                (layout.n,), -1, dtype=torch.int64, device=layout.device
+            )
+            frontier_row[frontier_nodes] = torch.arange(
+                frontier_nodes.numel(), device=layout.device
+            )
+            child_rows = frontier_row[child_nodes]
+            if bool((child_rows < 0).any()):
+                raise RuntimeError("a ready parent is missing a child boundary summary")
+
+            parent_rows = torch.repeat_interleave(
+                torch.arange(ready.numel(), device=layout.device), counts
+            )
+            parent_p = torch.zeros(
+                (ready.numel(), layout.p_max, layout.x_max),
+                dtype=torch.float32,
+                device=layout.device,
+            )
+            parent_m = torch.zeros_like(parent_p)
+            parent_p.index_add_(0, parent_rows, frontier_p[child_rows])
+            parent_m.index_add_(0, parent_rows, frontier_m[child_rows])
+            divisor = counts.to(torch.float32)[:, None, None]
+            parent_p /= divisor
+            parent_m /= divisor
+
+            decision = layout.decision_row[ready] >= 0
+            if bool(decision.any()):
+                dec_local = decision.nonzero(as_tuple=False).squeeze(1)
+                dec_nodes = ready[dec_local]
+                rows = layout.decision_row[dec_nodes]
+                players = tree.owner[dec_nodes].to(torch.int64)
+                hrows = layout.head_row[dec_nodes]
+                dec_edge_mask = torch.repeat_interleave(decision, counts)
+                emit(
+                    result,
+                    rows,
+                    players,
+                    parent_p[dec_local],
+                    parent_m[dec_local],
+                    frontier_p[child_rows[dec_edge_mask]],
+                    frontier_m[child_rows[dec_edge_mask]],
+                    slots[dec_edge_mask],
+                    heads.v[hrows].detach().to(torch.float32),
+                    lam,
+                )
+                owner_m = parent_m[dec_local, players]
+                owner_p = parent_p[dec_local, players]
+                old_v = (
+                    heads.v[hrows].detach().to(torch.float32)
+                    .masked_fill(~layout.type_mask[players], 0.0)
+                )
+                parent_m[dec_local, players] = bootstrap(
+                    owner_m, owner_p, old_v, lam
+                )
+
+            consumed = torch.zeros(
+                frontier_nodes.numel(), dtype=torch.bool, device=layout.device
+            )
+            consumed[child_rows] = True
+            frontier_nodes = torch.cat((frontier_nodes[~consumed], ready))
+            frontier_p = torch.cat((frontier_p[~consumed], parent_p))
+            frontier_m = torch.cat((frontier_m[~consumed], parent_m))
+            peak_rows = max(peak_rows, int(frontier_nodes.numel()))
+
+        del stats, added_p, added_v, frontier_parent, has_parent
+        if contracted:
+            del parent_p, parent_m, child_rows, parent_rows, divisor, consumed
+
+    if not bool(seen[layout.leaf_nodes].all()):
+        raise ValueError("streamed completion did not cover every stored leaf")
+    roots = (tree.parent < 0).nonzero(as_tuple=False).squeeze(1).to(torch.int64)
+    if frontier_nodes.numel() != roots.numel() or not torch.equal(
+        frontier_nodes.sort().values, roots.sort().values
+    ):
+        raise RuntimeError("streamed backward frontier did not reduce to every root")
+    return peak_rows
+
+
+def streamed_branched_value(
+    tree: TreeBatch,
+    leaf_nodes: Tensor,
+    completion_batches: Iterable[tuple[Tensor, BatchedCompletionStats]],
+    reach: Any,
+    heads: HeadEvals,
+    lam: float,
+    game: Any,
+    *,
+    configured_node_budget: int,
+    completion_batch_rows: int,
+    emit_q: bool = False,
+    max_workspace_bytes: int = 1 << 30,
+) -> NodeTargets:
+    """Construct targets while completion batches feed a ``P/M`` frontier."""
+
+    if configured_node_budget <= 0:
+        raise ValueError("configured_node_budget must be positive")
+    if completion_batch_rows <= 0:
+        raise ValueError("completion_batch_rows must be positive")
+    if isinstance(max_workspace_bytes, bool) or max_workspace_bytes <= 0:
+        raise ValueError("max_workspace_bytes must be a positive byte count")
+    device = tree.parent.device
+    layout = _layout_from_shape(
+        tree,
+        leaf_nodes,
+        int(game.n_players),
+        max(int(size) for size in game.x_sizes),
+        device,
+        reach,
+        heads,
+        lam,
+        game,
+    )
+    if layout.n:
+        _, actual_counts = tree.tree_id.to(torch.int64).unique(return_counts=True)
+        if bool((actual_counts > configured_node_budget).any()):
+            raise ValueError("stored tree exceeds configured_node_budget")
+    # p_hat, v_hat, estimator_stddev and output_valid conservatively represent
+    # the dense learning/quality fields returned by active completion backends.
+    completion_bytes = (
+        min(completion_batch_rows, int(leaf_nodes.numel()))
+        * layout.p_max
+        * layout.x_max
+        * (3 * 4 + 1)
+    )
+    plan = _frontier_memory_plan_from_shape(
+        tree, layout, (), bool(emit_q), completion_bytes
+    )
+    if plan.peak_bytes > max_workspace_bytes:
+        gib = 1024**3
+        raise MemoryError(
+            "streamed completion/backward plan requires "
+            f"{plan.peak_bytes / gib:.3f} GiB, exceeding the configured "
+            f"{max_workspace_bytes / gib:.3f} GiB byte budget"
+        )
+    result = _empty_targets(layout, bool(emit_q), ())
+    _edge_metadata(result, tree, layout)
+    if layout.n:
+        _reduce_streamed_leaf_batches(
+            tree, completion_batches, heads, lam, layout, result
+        )
+    _compact_single_child_posterior(result)
+    return result
 
 
 def branched_value(
@@ -461,23 +881,22 @@ def branched_value(
     configured_node_budget: int,
     emit_q: bool = False,
     auxiliary_reducers: Sequence[AuxiliaryChannelSpec] = (),
-    max_resident_rows: int = 2_000_000,
+    max_workspace_bytes: int = 1 << 30,
 ) -> NodeTargets:
     """Propagate posterior moments and emit decision targets.
 
     Leaf tensors are ``[L,P,X]`` and head rows are ``[Nd,X]``.  Returned
     parent fields are ``[Nd,X]`` and child fields are padded ``[Nd,E,X]``.
-    Complete trees are selected in fixed contiguous tree-id ranges and a
-    dependency chain is never split across chunks.
+    Completed siblings are reduced through a ``P/M`` boundary frontier.  The
+    persistent moment workspace is therefore bounded by the number of leaves,
+    not the total number of stored nodes.
     """
 
     if configured_node_budget <= 0:
         raise ValueError("configured_node_budget must be positive")
-    if max_resident_rows <= 0:
-        raise ValueError("max_resident_rows must be positive")
+    if isinstance(max_workspace_bytes, bool) or max_workspace_bytes <= 0:
+        raise ValueError("max_workspace_bytes must be a positive byte count")
     layout = _layout(tree, leaf_stats, reach, heads, lam, game)
-    if configured_node_budget * layout.p_max > max_resident_rows:
-        raise ValueError("configured tree can exceed max_resident_rows")
     if layout.n:
         _, actual_counts = tree.tree_id.to(torch.int64).unique(return_counts=True)
         if bool((actual_counts > configured_node_budget).any()):
@@ -486,16 +905,20 @@ def branched_value(
             raise ValueError("tree ids must be nonnegative")
 
     channels = _channels(tuple(auxiliary_reducers), leaf_stats, heads, layout)
+    plan = _frontier_memory_plan(
+        tree, leaf_stats, layout, channels, bool(emit_q)
+    )
+    if plan.peak_bytes > max_workspace_bytes:
+        gib = 1024**3
+        raise MemoryError(
+            "backward frontier plan requires "
+            f"{plan.peak_bytes / gib:.3f} GiB, exceeding the configured "
+            f"{max_workspace_bytes / gib:.3f} GiB byte budget"
+        )
     result = _empty_targets(layout, bool(emit_q), channels)
     _edge_metadata(result, tree, layout)
     if layout.n == 0:
         return result
-
-    trees_per_chunk = max(1, max_resident_rows // (configured_node_budget * layout.p_max))
-    tree_ids = tree.tree_id.to(torch.int64)
-    max_tree_id = int(tree_ids.max())
-    for first in range(0, max_tree_id + 1, trees_per_chunk):
-        selected = ((tree_ids >= first) & (tree_ids < first + trees_per_chunk)).nonzero(as_tuple=False).squeeze(1)
-        if selected.numel():
-            _process_chunk(tree, leaf_stats, heads, lam, layout, result, channels, selected)
+    _reduce_frontier(tree, leaf_stats, heads, lam, layout, result, channels)
+    _compact_single_child_posterior(result)
     return result

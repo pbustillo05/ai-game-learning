@@ -303,9 +303,8 @@ Entropy follows `entropy_schedule`; all type sums are explicitly masked.
 - **Model.** Two nets (169-class preflop / combo-row postflop), pre-LN trunk,
   key-side reach prior added un-tempered, learned transforms of evaluator-supplied
   partition fields, factored type × DLogisticTick raise head,
-  actor-row V head. Public moment heads are deferred. Compact H_B tokenization
-  is the default (CONTRACTS §5-P7). Suit-consistency loss is flag-gated and off
-  by default.
+  actor-row V head. Public moment heads and the suit-consistency loss are
+  deferred. Compact H_B tokenization is the default (CONTRACTS §5-P7).
 - **Preflop gauge symmetry.** Preflop net is class-native (169); deterministic
   combo-to-class aggregation may live in `cards.py`/`ranges.py` because it is a
   representation map, not a private-state law.

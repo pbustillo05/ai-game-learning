@@ -60,12 +60,14 @@ also accumulates only realized policy-edge and policy-node cache rows instead
 of reserving capacity-sized likelihood/value tables. `PokerTensorStateStore`
 now represents public player history as one parent handle plus one event per
 successor, eliminating the copied `action_history[capacity,max_steps]` tensor.
-The shipped preset is a conservative 8-tree, 512-node bootstrap configuration.
+The shipped preset is one sampled branching tree per rank with a 4,096-node
+hard ceiling, preserving the former total per-rank capacity without root
+replicas.
 
 `estimate_rollout_memory` provides a conservative byte plan (two full reach
 frontiers plus state/tree/cache bounds), and CUDA bundle construction rejects a
 plan exceeding half of currently free device memory before allocating the
-backend. The revised preset's rollout plan is 306,318,404 bytes (about
+backend. The revised preset's rollout plan is 306,149,260 bytes (about
 291 MiB) on CPU construction.
 
 **Verification:** Static tests bound the legacy 2,097,152-node recompute
@@ -74,8 +76,27 @@ preset plan is below 1 GiB. Parent/event links are checked against random
 legal engine trajectories. CPU construction of the preset succeeds, the full
 suite passes (`133 passed, 4 skipped`), and a tiny explicitly targeted CUDA
 smoke passed on idle GPU 1; GPU 1 returned to 9 MiB and 0% utilization.
-`AUD-005`, `AUD-013`, and later model/completion allocations remain separate
-limits; this does not claim the preset is a production-scale H100 run.
+`AUD-005` and later model allocations remain separate limits; `AUD-013` now
+owns the completion/backward byte plan. This does not claim that the preset is
+a production-scale H100 run.
+
+---
+
+### AUD-005 — H100 ceilings for exact fused MHA remain unmeasured
+
+**Severity:** Major  
+**Modes:** All poker modes  
+**Evidence:** The former implementation routed nonzero reach priors through explicit fp32 `[B,H,N,N]` logits/probabilities and retained folded-seat query rows. It now uses mathematically exact compiled FlexAttention when supported, exact checkpointed query-chunk attention otherwise, live-seat postflop compaction, and hardware-profile token budgets. On an idle 2080 Ti, production-width four-layer full-flop forward/backward peaks measured 0.291/0.380/0.642 GiB for 2/3/6 live-player singleton states. Target H100 40/80 GiB batch ceilings have not yet been measured.
+
+**Consequence:** Effective minibatch 128 is supported through accumulated physical batches on the local profile, but H100 throughput and safe per-rank ceilings cannot yet be advertised as production-validated.
+
+**Recommendation:** Retain the exact MHA design. Quest access is available but intentionally deferred until the local readiness gate passes. On the first scheduled Quest validation job, validate one H100 before two/four-GPU jobs, measure 40/80 GiB tiers without trial-by-OOM, and write the resulting per-rank token ceilings into `configs/hardware/quest_slurm.yaml`.
+
+**Model recommendation:** `5.6 Sol` with `high` thinking — selecting an exact scalable attention formulation requires architecture, kernel, autograd, and memory expertise.
+
+**Response:** Implemented without changing the architecture or attention law. Postflop execution now scales with live players, while rare early-training six-way states remain supported as budgeted singletons. Flop/turn/river share postflop queues and may batch together; live-player count and actual padded token cost drive packing.
+
+**Implementation:** Local profile complete and CUDA-validated on the active 2080 Ti server. Quest access is established, but the H100 profile remains deliberately conservative and opt-in; this finding remains open only for readiness-gated Quest measurement/tuning.
 
 ---
 
@@ -151,8 +172,8 @@ are the same as recorded under `AUD-006`.
 
 ### AUD-008 — Folded-summary semantics do not match `folder_impact.md`
 
-**Severity:** Major  
-**Modes:** All postflop poker modes  
+**Severity:** Major
+**Modes:** All postflop poker modes
 **Evidence:** `_partition_summary` sorts live and folded ranges and `PokerGPUPartitionAdapter.summarize` concatenates both before calling neutral `partition_many`. `folder_impact.md` defines `Phi` as the folded subsystem integrated out; with no folders, its correction should be zero. The current call with no folders still partitions all live-player ranges and returns nonzero collision finite differences. When model summaries are enabled, those fields are projected generically rather than converted into per-hand `Lambda_B`, signed beta factors, or folder pressure.
 
 **Consequence:** The enabled feature would represent a different partition law from the claimed folded-player effective potential. It may double-count live-player collision geometry already intended for attention/incidence.
@@ -231,6 +252,159 @@ code.
 
 ---
 
+### AUD-009 — Partition summaries are recomputed and discarded on every postflop forward
+
+**Severity:** Major
+**Modes:** All postflop poker modes
+**Evidence:** `PokerRolloutBackend.policy_forward` called `_partition_summary` for every postflop queue before checking whether the model consumed it, and there was no cache keyed by street/fold state.
+
+**Consequence:** An evaluator call and large pair-summary allocation were paid even when unusable, and deterministic work repeated across unchanged siblings/minibatches.
+
+**Recommendation:** Skip the evaluator for models with no summary consumer. Otherwise compute and cache a compact model-ready summary at fold/street transitions and reuse it while its dependency key is unchanged.
+
+**Model recommendation:** `5.6 Terra` with `medium` thinking — the caching rule is clear, but dependency keys and branch-safe lifetimes span several modules.
+
+**Response:** Yes. Folded stats only need to be computed postflop and only when:
+
+- flop/turn/river was just drawn,
+- or a new player just folded.
+
+Most spots don't require re-computing it (the coefficients would be identical as the previous node).
+
+**Implementation:** Completed. State rows now carry a four-byte partition-cache
+anchor. Ordinary actions inherit it; chance deals and folds replace it with the
+successor row. The backend batches dependency-distinct misses, stores a compact
+model-ready `PartitionSummaryBatch`, and reuses it across siblings and later
+forwards. `PostflopNet` explicitly declares its consumer contract; models
+without a consumer bypass the evaluator. Regression tests cover reuse, fold
+invalidation, and the no-consumer fast path.
+
+---
+
+### AUD-010 — The evaluator/model boundary cannot currently supply the full MHA folder contract
+
+**Severity:** Major
+**Modes:** All postflop poker modes
+**Evidence:** `pbg-v2 partition_many` returned only combined base/unary/pair fields, while the MHA contract also required per-folder mass/pressure, signed beta factors, tight contractions, and real fold-line metadata.
+
+**Consequence:** Full MHA conformance could not be achieved by changing only the local projection width; some required data were absent or locally fabricated.
+
+**Recommendation:** Add a versioned evaluator extension returning model-ready folder sufficient statistics while keeping private poker math in the sibling, and preserve public fold-time metadata locally.
+
+**Model recommendation:** `5.6 Sol` with `high` thinking — this changes a versioned cross-repository API and partitions ownership of mathematically sensitive data.
+
+**Response:** Yes.
+
+**Implementation:** Completed across both repositories. The sibling evaluator
+now exposes `partition_folders` with capability version `pbg-folder-v1`,
+returning combined and per-folder finite differences, unnormalized card
+marginals, deltas/covariances, tight-cluster contraction, and signed beta
+factors in one public call. Local code validates the rich DTO, retains only the
+compact model-facing fields, and attaches the locally preserved fold board,
+line, and seat metadata. The postflop model consumes evaluator-owned beta,
+pressure, delta, and tight-contraction fields without recomputing poker math.
+
+---
+
+### AUD-011 — The engine does not expose the full fixed-denomination NLHE action set
+
+**Severity:** Major
+**Modes:** All poker modes
+**Evidence:** The engine used an affine `n_ticks` grid; the 100bb preset exposed only 32 raise sizes and configured no chip denomination.
+
+**Consequence:** Training used a discretized sizing abstraction rather than full fixed-denomination NLHE.
+
+**Recommendation:** Add an integer chip unit and enumerate every legal raise-to amount, using the factored continuous head on the dynamic legal ticks.
+
+**Model recommendation:** `5.6 Sol` with `high` thinking — continuous sizing touches game semantics, sampling distributions, policy heads, likelihoods, and training correctness.
+
+**Response:** I want continuous bet sizing, meaning NO abstraction. The model should be able to pick any bet sizes, using a parametrized distribution with a few "modes" each having a center, width and height. And we need to sample from this distribution. Ideally we use 100bb with 0.5bb as the smallest units. But I'm also ok using as default 64bb with 0.5bb as the smallest unit so it becomes exactly 128 possible bet sizes (if you think a power of 2 would be better).
+
+**Implementation:** Completed with the preferred 100bb/0.5bb default. Both
+public engines enumerate all 200 global raise-to denominations and mask the
+exact state-legal interval, including short all-ins; configuration rejects
+stacks or blinds outside the denomination. The logistic-mixture head is
+renormalized over legal denominations, the all-in atom targets the current
+maximum, and rollout samples from that exact law. Production configs no longer
+contain `n_ticks: 32`. Tests cover complete enumeration, engine parity, dynamic
+all-in placement, sampling probabilities, and invalid denominations.
+
+---
+
+### AUD-012 — Fixed branching repeats identical model forwards per child
+
+**Severity:** Major
+**Modes:** Branched RB
+**Evidence:** `_sample_branched_labeled` repeats parent states/reaches by offspring count, then calls `policy_forward` on those repeated rows. Every sibling from one player parent therefore recomputes the same policy and value output. The code later selects the first duplicate value for the parent, confirming the duplication is recognized after the expensive call.
+
+**Consequence:** Model compute and activation/workspace scale with child count even though only posterior samples/events/reach updates need to be child-local. This is particularly harmful for the already expensive poker MHA.
+
+**Recommendation:** Evaluate each unique active player parent once; sample child-local profiles; gather actor rows/events from the parent output; compute selected-action log probabilities for all sampled labels; expand only the lightweight reach/event operations. Add a call-count and numerical-parity test.
+
+**Model recommendation:** `5.6 Terra` with `medium` thinking — this is a bounded vectorization refactor with a crisp numerical-parity oracle.
+
+**Response:** Yes.
+
+**Implementation:** Completed. Each rollout wave now calls `policy_forward`
+once per unique active player parent. A tensor-structured row gather expands
+the parent outputs for child-local profile sampling, event selection, reach
+updates, and selected-action likelihoods; value rows remain parent-local.
+Tests verify the exact unique-parent call sizes across two branching levels and
+numerical parity between gathered and explicitly repeated policy outputs.
+
+---
+
+### AUD-014 — Completion retains unused large diagnostics and ignores quality signals
+
+**Severity:** Major
+**Modes:** Sequential RB, branched RB
+**Evidence:** Poker completion retains `equity_share[B,P,1326,K]`, `output_valid`, `estimator_stddev`, `sample_count`, `vvec_hat`, `u_hat`, and `n_eff`. The active `branched_value/rb_ppo` path consumes only `p_hat` and `v_hat`. For six players, `equity_share` alone is about 191 kB (186.5 KiB) per leaf. Conversely, `n_eff`, validity, and estimator error are not used to reject or adapt noisy targets.
+
+**Consequence:** Memory is spent on dead fields while target quality is not governed. Many leaves can turn this into gigabytes.
+
+**Recommendation:** Add a minimal completion-return mode for active consumers, or immediately detach only required learning fields and release the sibling result. If quality fields are retained, define thresholds, logging, invalid-row policy, and optional adaptive sampling rather than silently ignoring them.
+
+**Model recommendation:** `5.6 Terra` with `medium` thinking — DTO minimization is contained, while quality-policy choices require careful evaluator integration.
+
+**Response:** Yes.
+
+**Implementation:** Completed. Completion results are converted immediately
+to a learning-only `p_hat`/`v_hat` view. The conversion rejects non-finite or
+negative posterior mass, non-finite values, invalid outputs carrying posterior
+mass, nonpositive effective/sample counts, and inconsistent effective counts.
+It logs scalar effective-sample, invalid-mass, estimator-error, and error-
+coverage summaries, then releases `equity_share`, elementwise validity/error
+tensors, auxiliary moments, leaf reaches, and the original completion DTO
+before target construction/optimization.
+
+---
+
+### AUD-015 — Folded and live reach lifetimes are not mode-specific
+
+**Severity:** Major
+**Modes:** All, especially normal
+**Evidence:** Both samplers maintain a dense `[node,P,H]` reach arena and `ReachCache` exposes whole rows. Folded seats stay in the same full-width representation. There is no transition from a full fold-time range to the compact statistics required by the model, nor any release after normal terminal rollout or RB leaf completion.
+
+**Consequence:** The optimization explicitly requested by the user—discarding folded ranges after their last consumer—is absent. Normal mode would inherit RB memory unless a specialized lifecycle is designed.
+
+**Recommendation:** Implement the lifetimes in `mode_storage_compute.md`: retain folded full ranges only through future summary refreshes and, for RB, leaf completion; persist model-ready folded summaries per decision; then free full folded rows. Treat normal, one-path RB, and tree RB as different compact target layouts.
+
+**Model recommendation:** `5.6 Sol` with `high` thinking — mode-specific reach ownership and release points interact with completion, replay, summaries, and branching independence.
+
+**Response:** We do need full folded ranges to be fed to the "completion" equity/posterior API (which isn't used in normal mode). But otherwise, they are only used through the folded stats. Make sure this is efficiently handled.
+
+**Implementation:** Completed. Normal mode converts decision reaches to a
+game-owned cache as soon as sampled terminal targets are built. RB modes retain
+full folded ranges through leaf completion and target construction, then
+replace the tree `ReachCache` with the same decision cache. Poker implements
+that cache as ragged live-seat `[T,1326]` rows plus seat ids and row pointers;
+dense `[B,P,1326]` rows exist only for sampled physical minibatches. Folded
+model-ready summaries remain in the street/fold-keyed partition cache, and a
+regression test verifies that full folded rows are absent while cached folder
+summaries still serve later training forwards.
+
+---
+
 ### AUD-016 — Player-node branching samples more hidden state than the event law needs
 
 **Severity:** Moderate  
@@ -257,6 +431,79 @@ discarded after the wave has produced its public event/reach update.
 ---
 
 ## B. Game-family, theory, operations, and validation findings
+
+### AUD-019 — Kuhn/Leduc/dial do not use the required MHA poker design
+
+**Severity:** Major if “each version of poker” includes these games; otherwise Moderate clarification  
+**Modes:** Synthetic poker variants  
+**Evidence:** All synthetic games used `SyntheticNet`, a small public/type embedding MLP. None used the MHA hand/class rows, reach priors, action anchors, incidence residual, factored continuous raise head, or folded-summary design.
+
+**Consequence:** Model comparisons across small poker and full poker confounded game complexity with a completely different architecture. The user's requirement that `docs/MHA_model.md` be used “for each versions of poker” was not met under the natural reading.
+
+**Recommendation:** Decide scope. If binding, create scaled MHA adapters for Kuhn/Leduc/dial with the same architectural concepts and game-appropriate row/action heads. Retain `SyntheticNet` only as an explicit baseline.
+
+**Response:** Yes
+
+**Implementation:** Synthetic poker now defaults to `SyntheticMHANet`. It runs
+player/type rows with public-history and discrete action-anchor tokens, adds
+normalized log reach as an untempered key prior, and applies exact card,
+identical-type, and own-range incidence channels in every layer. Folded rows are
+excluded from attention and integrated through finite-game card pressure. The
+discrete raise menu uses event anchors, the appropriate counterpart of NLHE's
+factored tick head. `SyntheticNet` remains available only through explicit
+`model.architecture: mlp_baseline`. Exact policy export propagates the model's
+own reach factors down the public tree.
+
+**Verification:** Tests assert MHA is the default, validate card incidence,
+show reach-prior and folded-summary effects, verify exact duplicate-state
+expansion, and cover explicit MLP selection. Existing adapter, rollout, exact
+export, and all-mode training tests pass; the full CPU suite reports `196
+passed, 7 skipped`.
+
+---
+
+### AUD-032 — There are no comparative performance gates for the three modes
+
+**Severity:** Major relative to the “all modes optimally” requirement  
+**Modes:** All  
+**Evidence:** No benchmark recorded normalized throughput, phase time, retained
+target bytes, or device peak memory by mode.
+
+**Consequence:** Mode-specific performance regressions had no enforceable
+efficiency contract.
+
+**Recommendation:** Add stable microbenchmarks and end-to-end profiles with
+per-mode/device tolerances and clean GPU setup/teardown.
+
+**Response:** Use judgment about optimality and improve against our own measured
+times with a benchmark-then-optimize pass.
+
+**Implementation:** `pbg-benchmark` now runs any scientific config through all
+three modes, records median phase times, topology/offspring, decisions and
+terminal/completion samples per second, effective completion samples, compact
+target bytes per decision, and CUDA allocated/reserved peaks. Baselines are
+matched by device, compute capability, thread count, and workload; throughput,
+time, storage, and CUDA-memory regressions have configurable tolerances. The
+runner requires clean CUDA allocator state before and after a job. The committed
+matrix covers Kuhn, Leduc, a third dial point, tiny/medium local NLHE, and the
+readiness-gated production chunk.
+
+The optimization pass deduplicates identical synthetic public states before
+model evaluation and expands the output exactly. On the local 14-thread CPU,
+the controlled 512-tree Kuhn normal profile improved median rollout from
+0.2233 s to 0.1968 s (11.8%), optimization from 0.0287 s to 0.0163 s (43.2%),
+and total throughput from 4,355 to 5,136 decisions/s (17.9%).
+
+**Verification:** Gate-unit tests cover within-tolerance acceptance,
+multi-metric regression failures, and cross-environment refusal. Final
+three-mode Kuhn and Leduc profiles emitted `pbg-performance-v1` records. A tiny
+heads-up 5bb normal-mode CUDA smoke completed on idle GPU 1 with a 46 MiB peak
+reserved footprint; after process exit GPU 1 returned to 9 MiB and 0%
+utilization. Larger CUDA/NLHE baselines remain machine-local operations and
+follow the shared-server workload matrix rather than being encoded as portable
+absolute timings.
+
+---
 
 ### AUD-030 — CUDA verification is presently blocked in the prescribed venv
 
@@ -294,3 +541,364 @@ and folder-impact references were corrected; `docs/audit/README.md` is linked
 from the documentation index; `IMPLEMENTATION_NOTES.md` is explicitly marked as
 a historical ledger; and H100/preset language points readers to the active
 audit findings rather than claiming readiness.
+
+---
+
+### AUD-018 — The shipped dial example aliases distinct public histories in the model
+
+**Severity:** Major  
+**Modes:** Synthetic  
+**Evidence:** `SyntheticNet` embedded `public_key % n_buckets`. The shipped dial
+had 10,826 enumerated public states but only 1,024 buckets, so distinct
+perfect-recall public histories necessarily shared embeddings.
+
+**Consequence:** The dial policy could not represent an arbitrary behavioral
+strategy on its own public tree and could conflate different legal/history
+contexts.
+
+**Recommendation:** Use collision-free state embeddings for enumerated
+synthetic games, dynamically size the table after tree enumeration, or reject
+insufficient capacity.
+
+**Model recommendation:** `5.6 Luna` with `medium` thinking.
+
+**Response:**
+
+**Implementation:** `SyntheticNet` now indexes public keys directly and rejects
+negative/out-of-capacity keys. The synthetic bundle enumerates the complete
+public tree before model construction, verifies key uniqueness, derives the
+embedding capacity from the maximum reachable key, and rejects a smaller
+user-supplied capacity. Shipped synthetic presets no longer guess a bucket
+count.
+
+**Verification:** A regression builds the shipped dial and proves that every
+enumerated history has a unique key and an in-capacity embedding row; a model
+unit test proves that an out-of-capacity key is rejected instead of wrapped.
+
+---
+
+### AUD-023 — Configuration exposes dead or misleading controls
+
+**Severity:** Moderate  
+**Modes:** All  
+**Evidence:** `use_suit_consistency` and `debug_asserts` had no production
+consumers, `clip_eps_v` was not selected by the composites, synthetic
+`model.e_max` was ignored, and game-owned mappings admitted obsolete keys.
+
+**Consequence:** Users could believe a behavior was enabled when it was not,
+and misspelled settings could survive configuration loading.
+
+**Recommendation:** Remove deferred fields until wired or make them functional;
+give each game factory a strict schema and test accepted toggles.
+
+**Model recommendation:** `5.6 Luna` with `medium` thinking.
+
+**Response:**
+
+**Implementation:** The two no-op flags and synthetic `e_max` were removed from
+the accepted schema and presets. Synthetic game/model and poker game/model
+mappings are validated during top-level load and reject unknown fields.
+`loss.value_loss: mse | clipped` now explicitly selects `l_v` or `l_v_clip` in
+both normal and RB composites, so `clip_eps_v` has a real consumer.
+
+**Verification:** Configuration regressions reject both removed flags,
+synthetic `e_max`, and misspelled game keys. Loss tests demonstrate that the
+two accepted value-loss settings select observably different objectives.
+
+---
+
+### AUD-027 — Global deterministic mode conflicts with maximum throughput
+
+**Severity:** Moderate  
+**Modes:** All GPU modes  
+**Evidence:** Training unconditionally enabled deterministic algorithms and
+deterministic cuDNN behavior, with no reproducibility/performance choice.
+
+**Consequence:** Optimized kernels and autotuning were unavailable even for
+performance runs.
+
+**Recommendation:** Add `strict | seeded | throughput` profiles while keeping
+seeds and checkpoint RNG state in every profile.
+
+**Model recommendation:** `5.6 Luna` with `medium` thinking.
+
+**Response:**
+
+**Implementation:** `training.reproducibility` is a strict enum. `strict`
+enables deterministic algorithms and disables benchmarking/TF32; `seeded`
+keeps explicit seeds while allowing nondeterministic kernels without cuDNN
+autotuning; `throughput` enables cuDNN benchmarking and TF32. Hardware metadata
+records the selected profile and effective backend flags. The production NLHE
+presets select `throughput`; small correctness presets remain strict or seeded.
+
+**Verification:** Profile tests assert each backend-control transition, and all
+profiles retain explicit rank-local generators and checkpointed process RNG.
+
+---
+
+### AUD-028 — Training cannot resume as an end-to-end workflow
+
+**Severity:** Moderate  
+**Modes:** All  
+**Evidence:** Checkpoint primitives existed, but `train` always created a new
+optimizer, began at zero, and appended metrics without run identity checks.
+
+**Consequence:** Long training could not reliably restart through the public API.
+
+**Recommendation:** Add a validated resume entry point restoring all state and
+preserving iteration schedules; test bitwise strict continuation.
+
+**Model recommendation:** `5.6 Luna` with `medium` thinking.
+
+**Response:**
+
+**Implementation:** `train(cfg, resume_from=...)` and CLI `--resume` restore the
+model, optimizer, scaler, completed iteration, explicit generators, and process
+RNG. Checkpoints store per-rank RNG for DDP. Resume requires the original output
+directory, scientific configuration, run identity, DDP world size, schedule,
+and exact gap-free metrics prefix. New runs refuse accidental append over
+existing artifacts, and every metric/checkpoint carries a stable run identity.
+
+**Verification:** The end-to-end test simulates an interruption after a real
+checkpoint, resumes through the public API, and compares its final model tensors
+and metrics with an uninterrupted strict-mode run; they are bitwise identical.
+
+---
+
+### AUD-020 — Synthetic `exact` completion is actually sampled MC
+
+**Severity:** Moderate
+**Modes:** Sequential RB, branched RB synthetic
+**Evidence:** `SyntheticCompletion.complete` always sampled `n_samples`
+posterior profiles. `completion.backend: exact` selected the same implementation.
+
+**Consequence:** Preset names overstated exactness and small-game estimator tests
+mixed completion noise with rollout/branching variance.
+
+**Recommendation:** Implement feasibility-guarded exact completion and retain MC
+as a separate backend; use exact Kuhn/Leduc completion as a training-mode oracle.
+
+**Model recommendation:** `5.6 Terra` with `medium` thinking.
+
+**Response:**
+
+**Implementation:** `SyntheticExactCompletion` now enumerates every
+collision-free private profile compatible with the public board, weights it by
+the product of the stored per-player reaches, and returns exact posterior mass
+and conditional values. It calls the production enumerator in
+`games/synthetic/exact.py`, fails before exceeding the exact-profile guard, and
+is independent of the configured sample budget and RNG. The former sampler is
+retained explicitly as `SyntheticMCCompletion`; bundle dispatch distinguishes
+`exact` from `mc`.
+
+**Verification:** Exhaustive posterior/value calculations match an independent
+Kuhn enumeration, exact results are bitwise seed/sample-budget invariant, and a
+guard regression fails before infeasible enumeration. All three training modes
+complete production-path iterations on both exact Kuhn and exact Leduc.
+
+---
+
+### AUD-025 — Frozen rollout/model and transient objects live through optimization
+
+**Severity:** Moderate
+**Modes:** All current modes
+**Evidence:** `_one_iteration` formerly owned the deep-copied rollout model and
+completion/leaf objects in the same Python frame as optimization.
+
+**Consequence:** Frozen parameters and evaluator transients could overlap with
+train-time activations and optimizer state.
+
+**Recommendation:** Explicitly end frozen-model, completion, leaf-reach, and
+full-reach-cache lifetimes before training; avoid unconditional allocator flushes.
+
+**Model recommendation:** `5.6 Terra` with `medium` thinking.
+
+**Response:**
+
+**Implementation:** Rollout, completion, and target construction now run in the
+separate `_build_iteration_data` frame. Only compact normal data or the tree,
+targets, policy cache, alias table, and compact decision reaches cross its return
+boundary. The frozen model/bundle, diagnostic completion result, leaf reaches,
+learning completion view, and full reach cache become unreachable before the
+first optimization forward. No synchronization or allocator flush is forced.
+
+**Verification:** A weak-reference lifetime regression observes both the copied
+model and the full completion result being collected at the phase boundary while
+the returned targets remain usable. Focused normal/RB training and strict-resume
+tests pass.
+
+---
+
+### AUD-029 — Existing tests do not gate the requested capabilities
+
+**Severity:** Major
+**Modes:** All
+**Evidence:** The audit-time suite did not invoke normal training, exact
+cross-mode gradients, shipped reach replay, or architectural conformance paths.
+
+**Consequence:** A green suite was compatible with missing or broken requested
+capabilities.
+
+**Recommendation:** Implement the correctness gates in `validation_matrix.md`,
+including all modes on exact small games, beta-one equivalence, poker replay,
+history/folder effects, and engine differential fuzzing. Target H100 ceilings
+remain separately tracked by `AUD-005`.
+
+**Model recommendation:** `5.6 Terra` with `high` thinking.
+
+**Response:**
+
+**Implementation:** The suite now runs normal, sequential RB, and beta-one
+branched RB through exact Kuhn and Leduc production paths. A detached-target
+oracle exhaustively enumerates Kuhn continuation values and gates each mode's
+empirical root policy-gradient vector. Existing beta-one public-law,
+duplicate-label, chance replay through every street, board-conflict, lossless
+history/input-effect, folder no-op/effect, MHA incidence/geometry, and normal
+poker settlement tests are retained. Engine differential fuzzing now spans
+random legal histories for every supported table size from two through nine
+players, alongside deterministic all-in/reopening/side-pot cases.
+
+**Verification:** Focused exact/cross-mode/lifetime/branching/replay/history/
+folder/engine gates pass on CPU. CUDA-targeted model and rollout checks are run
+under the shared-server hygiene procedure. Device-local performance baselines
+are now implemented by `AUD-032`; Quest H100 ceilings remain owned by
+`AUD-005`, rather than being silently inferred from correctness CI.
+
+---
+
+### AUD-017 — The synthetic dial is not an interpolation to the target poker game
+
+**Severity:** Major
+**Modes:** All synthetic modes
+**Evidence:** `dial(public_scale, private_scale, n_players)` creates a capped limit game with only fold/check-call/one fixed raise and sets `board_per_round=(0,...,0)`. Increasing public scale adds betting rounds and raise caps but no public chance. Increasing private scale changes hand/deck size, while showdown strength remains the simple “paired with board, then max private rank” rule. It never approaches dynamic no-limit sizing, four Hold'em streets/board structure, side pots, or Hold'em hand ranking.
+
+**Consequence:** The dial can stress generic dimensions but cannot support scientific claims about a spectrum between Kuhn, Leduc, and 6-max NLHE. Results across the endpoints are not controlled changes of one game family.
+
+**Recommendation:** Define the intended interpolation axes explicitly: players, private cards/types, public board schedule, betting rounds, raise-size resolution, stack depth/all-ins/side pots, and showdown evaluator. Provide named points that exactly reproduce Kuhn and Leduc and a sequence that approaches the chosen NLHE abstraction. Add invariant/property tests across the grid.
+
+**Model recommendation:** `5.6 Sol` with `high` thinking — designing a scientifically meaningful two-axis family requires strong game abstraction and experimental-design judgment.
+
+**Response:** Ok yes this is problematic. But I also don't want 20 different dial axis. I think we should only have two axis:
+- private space and board: increase deck size
+- action space: increase bet options (tree width) and number of streets (tree depth).
+Probably we can keep the same poker rules throughout. We can brainstorm this more. The design should give only 2 axis (designed to showcase the strenght of rao-blackwellization and of branching) and should allow us to maximally reuse the same implementation.
+
+**Implementation:** The public helper is now exactly
+`dial(card_scale, action_scale)` and fixes player count at two. `card_scale`
+alone grows deck size, private types, and board-chance support. `action_scale`
+grows the number of streets, raise cap, and distinct per-round raise increments,
+so it controls both tree depth and width. The single synthetic state machine now
+supports multiple raise events without named-rule branches or event-id overlap.
+The two anchor points exactly reproduce the existing presets:
+`dial(1, 1) == kuhn()` and `dial(2, 2) == leduc()`.
+
+The intended scientific claim is explicit: this is a controlled two-axis
+algorithmic stress family for Rao--Blackwellization and branching, not a claim
+that a scalar path converges rule-for-rule to 6-max NLHE. Full NLHE remains the
+separate production endpoint. This removes the former hidden player-count axis
+and avoids presenting unrelated rule changes as independent experimental dials.
+
+**Verification:** Grid properties cover every action scale through four streets
+across multiple card scales, monotonic private/chance growth, fixed rule fields,
+raise-width/depth growth, exact Kuhn/Leduc anchors, distinct raise transitions,
+and disjoint player/chance event namespaces. The shipped example is one
+documented point on this two-axis helper.
+
+---
+
+### AUD-026 — Device-resident hot paths contain avoidable host synchronization
+
+**Severity:** Moderate
+**Modes:** All GPU modes
+**Evidence:** `AliasTable.build` copies weights to CPU and builds via Python lists in float64. `build_compact_map` uses `.item()` and a Python loop per batch row on every postflop forward. `MHA.forward` executes `count_nonzero(...).item()` every layer to choose a path even though reach bias is known to be present. Poker adapters and routing use multiple `bool(tensor.any())`/scalar conversions.
+
+**Consequence:** GPU pipelines repeatedly stall, and the “device residency” tests miss synchronization that does not spell `.cpu()` in the few scanned functions.
+
+**Recommendation:** Use device-native categorical sampling/alias construction, vectorized fixed-per-street compact maps, an explicit biased-attention call path, and tensorized validation outside the steady-state hot path. Profile synchronization counts with CUDA tooling and add a no-host-sync benchmark gate for model/minibatch execution.
+
+**Model recommendation:** `5.6 Terra` with `high` thinking — several CUDA hot paths need profiling-led rewrites without changing sampling or model semantics.
+
+**Response:** Yes
+
+**Implementation:** Decision-law construction now normalizes weights and samples
+categorically with `torch.multinomial` on the source device; the historical
+`AliasTable` name remains API-compatible, but no tensor is copied through CPU
+lists. Compact combo maps use a vectorized prefix-rank/scatter construction and
+vectorized inverse gather. Production poker rollout queues are split by street
+and pass the exact static compatible-combo width (1176/1128/1081), so no device
+reduction is read by the host. Reach-biased MHA has an explicit call path, and
+CUDA value validation in the policy heads, pre/post models, policy adapter,
+decision sampler, and compact-reach expansion uses asynchronous device asserts.
+
+**Verification:** Distribution tests retain the weighted decision law and
+compact gather/scatter gradient semantics. A CUDA sync-debug regression runs
+device categorical construction/sampling, fixed-street compaction, biased
+attention, and backward with host synchronization configured as an error.
+Static guards also reject reintroducing CPU/list alias construction or a scalar
+attention-path probe.
+
+---
+
+### AUD-013 — Completion and backward propagation were not genuinely streamed
+
+**Severity:** Critical  
+**Modes:** Sequential RB, branched RB  
+**Evidence:** Training formerly completed every leaf in one batch, retained the
+full completion result, and allocated `P/M [N,P,X]` for a whole root replica.
+The abstract default of 2,000,000 player rows permitted 21,216,000,000 bytes
+(19.76 GiB) for poker `P/M` alone, before targets and other live allocations.
+The implementation also treated branched rollout as a forest of replicas of
+the identical initial state.
+
+**Consequence:** Completion, whole-tree moments, targets, reaches, topology, and
+the frozen rollout model overlapped unnecessarily. The advertised chunking did
+not bound the value-phase peak in bytes.
+
+**Recommendation:** Use trajectories as the sequential unit and exactly one
+sampled branching tree per rank/GPU. Feed byte-limited completion microbatches
+into an upward `P/M` reduction frontier, replace completed siblings by a parent
+boundary summary, and retain only compact decision data for optimization.
+
+**Model recommendation:** `5.6 Sol` with `high` thinking.
+
+**Response:** Approved after clarifying that sequential samples are
+trajectories, branched RB has exactly one tree per GPU, and the retained
+boundary consists of `P-hat/M-hat` summaries at the leaves of the progressively
+contracted tree.
+
+**Implementation:** Branched configuration and sampling now require
+`n_trees=1` per rank; presets preserve their former total node ceiling by
+moving it into that tree's `node_budget`. Sequential modes continue to use the
+legacy serialized `n_trees` field as a trajectory count and documentation does
+not call those samples trees.
+
+Training selects completion microbatches from an explicit byte budget (at most
+256 leaves and at most one eighth of the phase budget). Each learning-only
+`p_hat/v_hat` batch is immediately inserted into the backward frontier. When
+all children of a parent are present, their `P/M` rows are averaged, decision
+targets are emitted, owner `M` is lambda-bootstrapped, and the children are
+replaced by one parent row. The persistent moment boundary never exceeds the
+initial leaf cut and no `[N,P,X]` moment arena exists. A conservative preflight
+counts completion fields, retained targets, `P/M`, overlapping gathers/copies,
+private-type width, dtype bytes, and structural scratch; over-budget plans fail
+before target allocation. The former abstract row cap is removed.
+
+The previous completion DTO and leaf reaches are released before the next
+completion call. The frozen rollout snapshot is released before completion.
+Full reaches and topology do not cross into optimization: decision state refs,
+owners, old outputs, alias weights, targets, and game-compacted reaches do.
+Sequential one-child parent/child posteriors share one storage allocation.
+Pinned-host target spilling was not assumed; the byte preflight rejects a
+resident target set that does not fit.
+
+**Verification:** Full and one-leaf-at-a-time target construction are bitwise
+equal across parent/child posteriors, advantages, values, and optional Q.
+Regressions cover duplicate labels, lambda boundaries, auxiliary bootstrap
+ordering, byte-budget rejection, one-tree enforcement, sequential posterior
+storage sharing, completion-result collection between microbatches, exact
+three-mode small-game gradients, and compact optimization without retained
+topology. The complete CPU suite and a conservative CUDA smoke are recorded in
+the implementation handoff: 196 CPU tests passed with 7 CUDA-only skips, and
+the targeted frontier CPU/CUDA parity test passed on an otherwise idle GPU.
+
+---

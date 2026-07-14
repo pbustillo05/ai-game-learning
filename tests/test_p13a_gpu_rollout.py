@@ -70,7 +70,10 @@ class _Profiles:
 
 class _RecordingModel:
     def __init__(self) -> None:
-        self.postflop = SimpleNamespace(cfg=SimpleNamespace(evaluator_summary_dim=0))
+        self.postflop = SimpleNamespace(
+            cfg=SimpleNamespace(evaluator_summary_dim=0),
+            requires_partition_summary=True,
+        )
         self.calls: list[tuple[str, int, int | None]] = []
 
     @staticmethod
@@ -198,9 +201,12 @@ def test_tensor_store_has_required_device_soa_and_prefix_allocation() -> None:
     assert all(value.device.type == "cpu" for value in vars(store).values() if isinstance(value, Tensor))
 
 
-def test_random_legal_trajectories_match_cpu_engine_step_for_step() -> None:
-    cfg = PokerConfig(n_players=3, stack_bb=10.0, n_ticks=5)
-    for seed in range(20):
+@pytest.mark.parametrize("n_players", range(2, 10))
+def test_random_legal_trajectories_match_cpu_engine_step_for_step(
+    n_players: int,
+) -> None:
+    cfg = PokerConfig(n_players=n_players, stack_bb=10.0)
+    for seed in range(4):
         rng = random.Random(seed)
         cpu = NLHEEngine(cfg)
         backend = _backend(cfg)
@@ -244,11 +250,11 @@ def test_random_legal_trajectories_match_cpu_engine_step_for_step() -> None:
 
 
 def test_parent_linked_history_reconstructs_exact_actions_arithmetic_and_streets() -> None:
-    cfg = PokerConfig(n_players=2, stack_bb=20.0, n_ticks=5)
+    cfg = PokerConfig(n_players=2, stack_bb=20.0)
     backend = _backend(cfg)
     root = backend.root_states(1)
     raised = backend.step(
-        root, EventBatch(torch.tensor([RAISE_OFFSET], dtype=torch.int32))
+        root, EventBatch(torch.tensor([RAISE_OFFSET + 3], dtype=torch.int32))
     )
     called = backend.step(
         raised, EventBatch(torch.tensor([CHECK_CALL], dtype=torch.int32))
@@ -294,7 +300,7 @@ def _install_state(backend: PokerRolloutBackend, state: _State) -> Tensor:
 
 
 def test_short_all_in_reopen_and_side_pot_strata_match_oracle() -> None:
-    cfg = PokerConfig(n_players=3, stack_bb=100.0, n_ticks=4)
+    cfg = PokerConfig(n_players=3, stack_bb=100.0)
     fixture = _State(
         street=1, board=(0, 5, 10), stacks=(92.0, 92.0, 2.0),
         committed_street=(8.0, 8.0, 8.0), committed_total=(8.0, 8.0, 98.0),
@@ -307,7 +313,7 @@ def test_short_all_in_reopen_and_side_pot_strata_match_oracle() -> None:
     backend = _backend(cfg)
     ref = _install_state(backend, fixture)
     assert torch.equal(backend.legal_events(ref)[1], cpu.legal_events(torch.tensor([cpu_ref]))[1])
-    event = RAISE_OFFSET + 3
+    event = RAISE_OFFSET + 19
     cpu_ref = int(cpu.step(torch.tensor([cpu_ref]), torch.tensor([event]))[0])
     ref = backend.step(ref, EventBatch(torch.tensor([event], dtype=torch.int32)))
     _compare_state(cpu, cpu_ref, backend, ref)
@@ -329,7 +335,7 @@ def test_short_all_in_reopen_and_side_pot_strata_match_oracle() -> None:
 
 
 def test_chance_labels_are_deterministic_street_disjoint_and_payload_is_padded() -> None:
-    cfg = PokerConfig(n_players=2, n_ticks=3)
+    cfg = PokerConfig(n_players=2)
     backend = _backend(cfg)
     ref = backend.root_states(2)
     ref = backend.step(ref, EventBatch(torch.full((2,), CHECK_CALL, dtype=torch.int32)))
@@ -349,7 +355,7 @@ def test_chance_labels_are_deterministic_street_disjoint_and_payload_is_padded()
 
 
 def test_policy_routes_one_large_preflop_and_one_shared_postflop_queue() -> None:
-    cfg = PokerConfig(n_players=2, n_ticks=3)
+    cfg = PokerConfig(n_players=2)
     partition = _Partition()
     backend = _backend(cfg, partition_adapter=partition)
     model = _RecordingModel()
@@ -370,8 +376,74 @@ def test_policy_routes_one_large_preflop_and_one_shared_postflop_queue() -> None
     assert backend.batch_size_histograms == {"preflop": [32], "postflop_2": [32]}
 
 
+def test_partition_cache_reuses_actions_and_invalidates_on_fold() -> None:
+    cfg = PokerConfig(n_players=3, stack_bb=10.0)
+    partition = _Partition()
+    backend = _backend(cfg, partition_adapter=partition)
+    state = _State(
+        street=1, board=(0, 5, 10), stacks=(8.0, 8.0, 8.0),
+        committed_street=(1.0, 1.0, 2.0), committed_total=(1.0, 1.0, 2.0),
+        status=(LIVE, LIVE, LIVE), actor=0, last_full_raise=1.0,
+        current_bet=2.0, acted=(False, False, False), button=0, phase=0,
+        betting_closed=False, n_raises=1, action_history=(),
+    )
+    current = _install_state(backend, state)
+    reach = torch.zeros((1, 3, 1326), dtype=torch.float32)
+    model = _RecordingModel()
+    backend.policy_forward(model, current, reach)
+    assert len(partition.calls) == 1
+
+    called = backend.step(current, EventBatch(torch.tensor([CHECK_CALL], dtype=torch.int32)))
+    backend.policy_forward(model, called, reach)
+    assert len(partition.calls) == 1
+
+    folded = backend.step(called, EventBatch(torch.tensor([FOLD], dtype=torch.int32)))
+    backend.policy_forward(model, folded, reach)
+    assert len(partition.calls) == 2
+
+    decision_states = torch.cat((called, folded))
+    decision_reach = torch.stack(
+        (
+            torch.arange(3 * 1326, dtype=torch.float32).reshape(3, 1326),
+            torch.arange(3 * 1326, dtype=torch.float32).reshape(3, 1326) + 10_000,
+        )
+    )
+    compact = backend.compact_decision_reach(decision_states, decision_reach)
+    # Three live seats before the fold and two after it are retained; the
+    # folded full row is gone while the model-ready folder summary stays cached.
+    assert compact.log_r.shape == (5, 1326)
+    sampled_rows = torch.tensor([1, 0, 1], dtype=torch.int64)
+    expanded = backend.expand_decision_reach(compact, sampled_rows)
+    status = backend.states.status[decision_states[sampled_rows].long()]
+    expected = decision_reach[sampled_rows]
+    assert torch.equal(expanded[status != FOLDED], expected[status != FOLDED])
+    assert torch.isneginf(expanded[status == FOLDED]).all()
+    backend.policy_forward(model, folded, expanded[:1])
+    assert len(partition.calls) == 2
+
+
+def test_policy_without_partition_consumer_skips_evaluator() -> None:
+    cfg = PokerConfig(n_players=2)
+    partition = _Partition()
+    backend = _backend(cfg, partition_adapter=partition)
+    model = _RecordingModel()
+    model.postflop.requires_partition_summary = False
+    roots = backend.root_states(1)
+    chance = backend.step(roots, EventBatch(torch.tensor([CHECK_CALL], dtype=torch.int32)))
+    chance = backend.step(chance, EventBatch(torch.tensor([CHECK_CALL], dtype=torch.int32)))
+    flop = backend.step(
+        chance,
+        EventBatch(
+            torch.tensor([100_000], dtype=torch.int32),
+            {"cards": torch.tensor([[3, 7, 11]], dtype=torch.int16)},
+        ),
+    )
+    backend.policy_forward(model, flop, torch.zeros((1, 2, 1326)))
+    assert not partition.calls
+
+
 def test_policy_planner_mixes_postflop_streets_and_splits_live_counts() -> None:
-    cfg = PokerConfig(n_players=3, n_ticks=3)
+    cfg = PokerConfig(n_players=3)
     backend = _backend(cfg)
     backend.execution_profile = load_config(
         "configs/train/nlhe6.yaml", hardware_profile="local_3x2080ti"
@@ -390,13 +462,17 @@ def test_policy_planner_mixes_postflop_streets_and_splits_live_counts() -> None:
         PostflopNet(PokerModelConfig(max_players=3)),
     )
     plans = backend.plan_policy_batches(model, states, "training")
-    assert len(plans) == 2
-    mixed = next(plan for plan in plans if plan.numel() == 3)
-    assert set(backend.states.street[rows[mixed]].tolist()) == {1, 2, 3}
+    assert len(plans) == 3
+    assert all(
+        len(set((backend.states.status[rows[plan]] != FOLDED).sum(1).tolist())) == 1
+        for plan in plans
+    )
+    mixed = next(plan for plan in plans if plan.numel() == 2)
+    assert set(backend.states.street[rows[mixed]].tolist()) == {2, 3}
 
 
 def test_core_sampler_accumulates_many_trees_before_model_forward() -> None:
-    cfg = PokerConfig(n_players=2, stack_bb=4.0, n_ticks=3)
+    cfg = PokerConfig(n_players=2, stack_bb=4.0)
     profiles = _Profiles()
     backend = _backend(cfg, capacity=2048, profile_sampler=profiles)
     model = _RecordingModel()
@@ -404,7 +480,7 @@ def test_core_sampler_accumulates_many_trees_before_model_forward() -> None:
         n_trees=16, node_budget=64, beta_mode="sequential", reach_storage="full"
     )
     tree, reach, policy = sample_trees(
-        GameBundle(model, backend, PokerPolicyAdapter(3), None),
+        GameBundle(model, backend, PokerPolicyAdapter(cfg.n_ticks), None),
         rollout,
         torch.Generator().manual_seed(123),
     )
@@ -425,18 +501,23 @@ def test_poker_recompute_replays_postflop_reach_exactly(
 ) -> None:
     """Full and replayed poker reaches agree through flop, turn, and river."""
 
-    cfg = PokerConfig(n_players=2, stack_bb=2.0, n_ticks=2)
+    cfg = PokerConfig(n_players=2, stack_bb=2.0)
     model = _AlwaysCheckModel()
-    common = dict(n_trees=2, node_budget=64, beta_mode=beta_mode, beta_fix=beta_fix)
+    common = dict(
+        n_trees=1 if beta_mode == "fixed" else 2,
+        node_budget=128 if beta_mode == "fixed" else 64,
+        beta_mode=beta_mode,
+        beta_fix=beta_fix,
+    )
     full_backend = _backend(cfg, capacity=256, beta_fix=beta_fix)
     replay_backend = _backend(cfg, capacity=256, beta_fix=beta_fix)
     full_tree, full_reach, full_policy = sample_trees(
-        GameBundle(model, full_backend, PokerPolicyAdapter(2), None),
+        GameBundle(model, full_backend, PokerPolicyAdapter(cfg.n_ticks), None),
         SimpleNamespace(**common, reach_storage="full"),
         torch.Generator().manual_seed(731),
     )
     replay_tree, replay_reach, replay_policy = sample_trees(
-        GameBundle(model, replay_backend, PokerPolicyAdapter(2), None),
+        GameBundle(model, replay_backend, PokerPolicyAdapter(cfg.n_ticks), None),
         SimpleNamespace(**common, reach_storage="recompute"),
         torch.Generator().manual_seed(731),
     )
@@ -463,7 +544,7 @@ def test_poker_recompute_replays_postflop_reach_exactly(
 
 
 def test_poker_recompute_replays_fold_reach_exactly() -> None:
-    cfg = PokerConfig(n_players=2, stack_bb=2.0, n_ticks=2)
+    cfg = PokerConfig(n_players=2, stack_bb=2.0)
     rollout = SimpleNamespace(
         n_trees=2, node_budget=8, beta_mode="sequential", reach_storage="full"
     )
@@ -471,12 +552,12 @@ def test_poker_recompute_replays_fold_reach_exactly() -> None:
     replay_backend = _backend(cfg, capacity=32)
     model = _AlwaysFoldModel()
     full_tree, full_reach, full_policy = sample_trees(
-        GameBundle(model, full_backend, PokerPolicyAdapter(2), None),
+        GameBundle(model, full_backend, PokerPolicyAdapter(cfg.n_ticks), None),
         rollout,
         torch.Generator().manual_seed(732),
     )
     replay_tree, replay_reach, replay_policy = sample_trees(
-        GameBundle(model, replay_backend, PokerPolicyAdapter(2), None),
+        GameBundle(model, replay_backend, PokerPolicyAdapter(cfg.n_ticks), None),
         SimpleNamespace(**dict(vars(rollout), reach_storage="recompute")),
         torch.Generator().manual_seed(732),
     )
@@ -488,7 +569,7 @@ def test_poker_recompute_replays_fold_reach_exactly() -> None:
 
 
 def test_completion_inputs_are_device_facade_tensors_and_conserve_pots() -> None:
-    backend = _backend(PokerConfig(n_players=3, stack_bb=10.0, n_ticks=3))
+    backend = _backend(PokerConfig(n_players=3, stack_bb=10.0))
     roots = backend.root_states(3)
     reach = torch.zeros((3, 3, 1326), dtype=torch.float32)
     inputs = backend.completion_inputs(roots, reach)
@@ -504,7 +585,7 @@ def test_completion_inputs_are_device_facade_tensors_and_conserve_pots() -> None
 
 def test_beta_buckets_use_exact_override_or_default() -> None:
     backend = _backend(
-        PokerConfig(n_players=2, n_ticks=3),
+        PokerConfig(n_players=2),
         beta_fix={"default": 1.25, "preflop": 2.0, "chance_to_flop": 3.0},
     )
     roots = backend.root_states(2)
@@ -540,7 +621,7 @@ def test_cuda_outputs_and_sibling_inputs_remain_on_original_device() -> None:
     device = torch.device("cuda:0")
     profiles, partition = _Profiles(), _Partition()
     backend = _backend(
-        PokerConfig(n_players=2, n_ticks=3), 1024, device,
+        PokerConfig(n_players=2), 1024, device,
         profile_sampler=profiles, partition_adapter=partition,
     )
     roots = backend.root_states(8)

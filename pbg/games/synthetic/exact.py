@@ -9,7 +9,9 @@ from typing import TypeAlias
 
 import numpy as np
 import torch
+from torch import Tensor
 
+from pbg.core.completion import BatchedCompletionStats
 from pbg.core.game import CHANCE, TERMINAL
 from pbg.games.synthetic.family import SyntheticPBG
 
@@ -98,6 +100,105 @@ def _profiles(game: SyntheticPBG) -> np.ndarray:
     if not feasible:
         raise FeasibilityError("game has no feasible private profile")
     return np.asarray(feasible, dtype=np.int64)  # [Z, P]
+
+
+def exact_completion_stats(
+    game: SyntheticPBG,
+    state_refs: Tensor,
+    reach_rows: Tensor,
+) -> BatchedCompletionStats:
+    """Enumerate exact posterior/value statistics at synthetic terminal cuts.
+
+    The joint posterior is proportional to the product of the per-player reach
+    factors, restricted to collision-free private profiles compatible with the
+    public board.  This is the same finite law sampled by
+    :meth:`SyntheticPBG.sample_profiles`, but contains no Monte Carlo error.
+    """
+
+    refs, device = game._refs(state_refs)
+    if reach_rows.shape != (len(refs), game.n_players, game.n_types):
+        raise ValueError("reach_rows must have shape [B, P, X]")
+    raw_profiles = math.prod(game.x_sizes)
+    if raw_profiles > MAX_EXACT_NODES:
+        raise FeasibilityError(
+            f"private profile product {raw_profiles} exceeds {MAX_EXACT_NODES}"
+        )
+
+    batch = len(refs)
+    x_max = max(game.x_sizes)
+    p_hat = torch.zeros(
+        (batch, game.n_players, x_max), dtype=torch.float64, device=device
+    )
+    v_hat = torch.zeros_like(p_hat)
+    vvec_hat = torch.zeros(
+        (batch, game.n_players), dtype=torch.float64, device=device
+    )
+    u_hat = torch.zeros(batch, dtype=torch.float64, device=device)
+    n_eff = torch.zeros(batch, dtype=torch.float64, device=device)
+    sample_count = torch.zeros(batch, dtype=torch.int64, device=device)
+    profile_counts: list[int] = []
+
+    for row, ref in enumerate(refs):
+        board = {card for card in game.states.board[ref] if card >= 0}
+        profiles = np.asarray(
+            [
+                profile
+                for profile in itertools.product(
+                    range(game.n_types), repeat=game.n_players
+                )
+                if game._profile_feasible(profile, board)
+            ],
+            dtype=np.int64,
+        )
+        if profiles.size == 0:
+            raise FeasibilityError("public board has no feasible private profile")
+        profile_counts.append(len(profiles))
+        profile_tensor = torch.from_numpy(profiles).to(device=device, dtype=torch.int64)
+        log_weight = torch.zeros(len(profiles), dtype=torch.float64, device=device)
+        for player in range(game.n_players):
+            log_weight += reach_rows[row, player, profile_tensor[:, player]].to(
+                torch.float64
+            )
+        weight = game._normalized_weights(log_weight)
+        n_eff[row] = weight.square().sum().reciprocal()
+        sample_count[row] = len(profiles)
+        rewards = game.reward(
+            profile_tensor.to(torch.int32),
+            torch.full((len(profiles),), ref, dtype=torch.int32, device=device),
+        ).to(torch.float64)
+        weighted_reward = weight[:, None] * rewards
+        vvec_hat[row] = weighted_reward.sum(0)
+        u_hat[row] = (weight * rewards.square().sum(1)).sum()
+        for player, width in enumerate(game.x_sizes):
+            types = profile_tensor[:, player]
+            mass = torch.zeros(width, dtype=torch.float64, device=device)
+            moment = torch.zeros_like(mass)
+            mass.index_add_(0, types, weight)
+            moment.index_add_(0, types, weighted_reward[:, player])
+            p_hat[row, player, :width] = mass
+            supported = mass > 0
+            v_hat[row, player, :width] = torch.where(
+                supported,
+                moment / mass.clamp_min(torch.finfo(mass.dtype).tiny),
+                torch.zeros_like(moment),
+            )
+
+    output_valid = p_hat > 0
+    return BatchedCompletionStats(
+        p_hat=p_hat.to(torch.float32),
+        v_hat=v_hat.to(torch.float32),
+        vvec_hat=vvec_hat.to(torch.float32),
+        u_hat=u_hat.to(torch.float32),
+        n_eff=n_eff.to(torch.float32),
+        output_valid=output_valid,
+        sample_count=sample_count,
+        estimator_stddev=torch.zeros_like(p_hat, dtype=torch.float32),
+        metadata={
+            "backend": "exact",
+            "exact_profile_count_min": min(profile_counts, default=0),
+            "exact_profile_count_max": max(profile_counts, default=0),
+        },
+    )
 
 
 def _resolve_node(tree_index: PublicTreeIndex, node: int) -> int:

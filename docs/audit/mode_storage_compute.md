@@ -64,7 +64,9 @@ During rollout, a folded range may be needed to update folded-card summaries on 
 Implemented through `training.mode: normal`. It shares the one-path frontier
 sampler, settles one sampled terminal reward, and compacts rollout output into
 scalar decision rows before minibatch optimization. It does not construct or
-invoke a completion backend.
+invoke a completion backend. Poker decision reaches are additionally compacted
+to ragged live-seat rows; folded full ranges are absent from the retained
+dataset and dense rows are reconstructed only for sampled physical minibatches.
 
 ## Mode 2: sequential Rao--Blackwell training
 
@@ -106,12 +108,19 @@ Folded full ranges are required through leaf completion because folded cards par
 
 ### Current implementation
 
-Algorithmically present through `training.mode: rao_blackwell`, but it uses the
-same maximal tree/target DTO as branching, duplicates the one-child posterior
-as parent and child tensors, retains generic completion fields, and has no
-byte-aware streaming.
+Implemented through `training.mode: rao_blackwell`. Here `rollout.n_trees`
+counts trajectories per rank; these are not called trees. Completion runs in
+byte-limited leaf microbatches that feed the backward reduction frontier.
+Previous completion results and selected leaf reaches die before the next
+microbatch. The one-child posterior is represented by one storage allocation
+shared by the parent and child views. Only compact targets, old outputs,
+decision sampling data, and compact decision reaches survive into optimization.
 
 ## Mode 3: fixed branched Rao--Blackwell training
+
+There is exactly one sampled branching tree per rank/GPU. Multiple replicas of
+the identical initial public state are neither configured nor silently batched;
+DDP combines gradients from the one independently sampled tree on each rank.
 
 ### Required rollout computation
 
@@ -154,7 +163,21 @@ Every branch owns independent reach evolution. Folded full ranges remain necessa
 
 ### Current implementation
 
-The probability law and backward target semantics are mostly aligned. The implementation nevertheless repeats identical model forwards for sibling children, preallocates capacity-sized reach/state tensors, completes all leaves before streaming the backward pass, and retains a full target table for all decisions.
+The probability law and backward target semantics are aligned. Policy/value
+evaluation runs once per unique player parent; child-local gathers preserve
+independent profiles, events, and reach updates. Completion is microbatched into
+a backward frontier that begins at completed pre-terminal leaves and moves
+upward. Whenever every child of a parent is present, child `P-hat/M-hat`
+summaries emit the parent targets and are replaced by one parent summary. The
+frontier therefore consists only of completed regions whose parents still await
+siblings; there is no whole-tree `[N,P,H]` moment arena.
+
+The sampler preallocates the explicitly byte-planned `node_budget` for this one
+tree and raises on overflow. This capacity bound is owned by the rollout memory
+preflight; it is not multiplied by root replicas. The frozen rollout snapshot
+dies before completion/backward. Full topology and reaches die before gradient
+steps; retained optimization data contains compact decision targets, old
+outputs, the alias law, and game-compacted decision model inputs.
 
 ## Comparative storage matrix
 
@@ -177,7 +200,7 @@ The probability law and backward target semantics are mostly aligned. The implem
 
 Every production configuration should be rejected or downscaled before allocation if the estimated peak exceeds a configured fraction of free device memory. The estimator must account for:
 
-- tree/state capacity actually scheduled in the current chunk, not `n_trees * per_tree_max` for the whole iteration;
+- sequential trajectory capacity, or the single branched-tree `node_budget`;
 - reach/frontier tensors;
 - frozen and trainable model parameters;
 - optimizer/scaler state;
@@ -187,4 +210,11 @@ Every production configuration should be rejected or downscaled before allocatio
 - compact decision targets;
 - training activations and attention workspace.
 
-Tree generation, completion, backward propagation, and target compaction should operate as a pipeline over whole-tree chunks. Chunking only the backward `P/M` workspace while retaining all leaves, all capacity-sized reaches, all targets, and the frozen model does not bound peak memory.
+Sequential modes pipeline completion over trajectory leaves. Branched mode does
+not split its one logical tree into fake root replicas: completion microbatches
+feed a contracted-tree backward frontier. The value-phase preflight counts
+bytes, including `P`, `M`, the 1326-type poker width, completion quality fields,
+retained targets, overlapping frontier gathers/copies, and structural scratch.
+An over-budget plan fails before target allocation. Compact targets remain
+resident only when the plan says they fit; host/pinned spilling remains an
+optional measured optimization rather than an assumed win.

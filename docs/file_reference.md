@@ -99,7 +99,7 @@ provenance or compatibility, not part of the current execution sequence.
 - `pbg/core/completion.py` defines game-neutral single/batched completion
   statistics, opaque `ReachView`, and the completion protocol.
 - `pbg/core/tree.py` implements `TreeBatch` invariants, CPU and preallocated
-  device builders, Walker alias sampling, stable frozen-policy rows, and
+  device builders, device-local categorical decision sampling, stable frozen-policy rows, and
   full/decision/recomputed reach caches.
 - `pbg/core/rollout.py` implements the device-resident sequential sampler and
   public sequential/fixed dispatch.
@@ -117,8 +117,9 @@ provenance or compatibility, not part of the current execution sequence.
   value-clipped, and entropy primitives plus the registered minimal `rb_ppo`
   composite.
 - `pbg/core/training.py` resolves game factories, freezes rollout models,
-  constructs targets, optimizes minibatches, handles AMP/DDP, and atomically
-  saves/restores complete checkpoints.
+  constructs targets, optimizes minibatches, handles AMP/DDP and explicit
+  reproducibility profiles, and atomically saves/restores identity-checked
+  resumable checkpoints with per-rank RNG state.
 - `pbg/core/logging_util.py` provides an append-only JSONL metric logger and an
   optional guarded Weights & Biases sink. The main loop currently writes JSONL
   directly with the same append-only convention.
@@ -130,10 +131,11 @@ provenance or compatibility, not part of the current execution sequence.
 - `pbg/games/synthetic/family.py` implements the configurable colex card game,
   deduplicated public state table, betting/chance/reward rules, reach and
   posterior sampling, public encoding, and generic rollout backend.
-- `pbg/games/synthetic/presets.py` builds Kuhn, Leduc, and independently scaled
-  dial configurations without named-game branches in the engine.
-- `pbg/games/synthetic/model.py` implements the public/private embedding MLP,
-  categorical policy adapter, and exact-policy-table exporter.
+- `pbg/games/synthetic/presets.py` builds Kuhn, Leduc, and the exact two-axis
+  card/action dial without named-game branches in the engine.
+- `pbg/games/synthetic/model.py` implements the default scaled MHA poker model,
+  explicit MLP baseline, categorical policy adapter, and reach-consistent
+  exact-policy-table exporter.
 - `pbg/games/synthetic/exact.py` enumerates feasible public trees/profiles and
   computes float64 posteriors, policy values, information-set best responses,
   and exploitability under hard guards.
@@ -244,9 +246,10 @@ provenance or compatibility, not part of the current execution sequence.
   errors, deterministic explicit generators, and JSONL logging.
 - `tests/test_p0_imports.py` AST-checks the permanent package dependency rule.
 - `tests/test_p1_family.py` checks standard Kuhn public structure, legal deals,
-  Leduc completion cuts, zero-sum rewards, and reach numerators.
+  Leduc completion cuts, multi-size raise events, zero-sum rewards, and reach
+  numerators.
 - `tests/test_p1_exact.py` checks exact exploitability/equilibria, posterior
-  sampling, feasibility guards, and independent dial axes.
+  sampling, feasibility guards, exact dial anchors, and the two-axis grid.
 - `tests/test_p1_adapter.py` checks categorical normalization, entropy, and
   exported exact policy tables.
 - `tests/test_p2_cards.py` checks all combos/classes, suit bijections, board
@@ -272,8 +275,11 @@ provenance or compatibility, not part of the current execution sequence.
 - `tests/test_p7_adapter.py` checks the fully composed event law, exact
   entropy/KL, profile row selection, complement chance draws, and evaluator
   showdown use.
-- `tests/test_p8_tree.py` checks CSR/depth/path invariants and alias decision
-  sampling.
+- `tests/test_p8_tree.py` checks CSR/depth/path invariants and categorical
+  decision sampling.
+- `tests/test_aud26_no_host_sync.py` gates device-local decision sampling,
+  fixed-street compact maps, and explicit biased attention under CUDA
+  synchronization-debug mode.
 - `tests/test_p8_rollout.py` retains sequential law, reach-mode, cache, and
   node-budget compatibility coverage.
 - `tests/test_p9_branching.py` retains sequential byte determinism and terminal

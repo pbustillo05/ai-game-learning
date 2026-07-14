@@ -854,65 +854,7 @@ Moreover, there are game-dependent constants $c,C>0$ such that, for every $0<\va
     While this still satisfies \autoref{lem:branched-terminal-distribution} marginally, it violates \autoref{lem:branched-branch-independence}.
     The sub-trees sampled by this process would be ``self-correlated'': for $\mathsf{a}\neq\mathsf{b}\in \mathfrak{E}_{\mathsf{s}}$, the sub-trees $\mathfrak{S}_{\mathsf{s}\mathsf{a} \preccurlyeq}$ and $\mathfrak{S}_{\mathsf{s}\mathsf{b} \preccurlyeq}$ share the same sampled private state and would not be independent.
     In particular, the sibling average used as the leave-one-out baseline for $\widehat{A}^\lambda$ would no longer be independent of the target branch after conditioning on the target action label.
-    Shared hidden states add cross-sibling covariance: for an average of $m$ sibling statistics with common variance $v$ and pairwise covariance $c$, the variance is $v/m+(m-1)c/m$, corresponding to effective sample size $mv/(v+(m-1)c)$ rather than $m$.
 \end{warning}
-
-\paragraph{Variance-Based Intensities (naïve version).}
-Using Neyman allocation principles, we target nodes with larger continuation variance.
-This paragraph records a research direction rather than the first implementation contract.
-The initial implementation uses only fixed public-stage-dependent intensities and defers the $\mathbf V$ and $U$ heads, their estimators and their losses until the allocation objective is better understood.
-\begin{equation}\label{eq:branched-neyman-intensity}
-  \beta(\sigma) \propto \sqrt{\operatorname{tr}\Cov^\pi(\mathbf{R}(x,\tau)\mid\sigma)}.
-\end{equation}
-For player nodes, in order to estimate this variance, we use two new heads:
-\begin{equation}\label{eq:V-vector-head}
-  \theta
-  \longmapsto
-  \mathbf V^\theta(\sigma)
-  \simeq
-  \mathbb{E}^\pi(\mathbf{R}(x,\tau)\mid \sigma)
-\end{equation}
-and
-\begin{equation}\label{eq:U-head}
-  \theta
-  \longmapsto
-  U^\theta(\sigma)
-  \simeq
-  \mathbb{E}^\pi(\|\mathbf{R}(x,\tau)\|_2^2\mid\sigma).
-\end{equation}
-We then use the identity
-\[
-  \operatorname{tr}\Cov^\pi(\mathbf{R}(x,\tau)\mid\sigma)
-  =
-  \mathbb{E}^\pi(\|\mathbf{R}(x,\tau)\|_2^2\mid\sigma)
-  -
-  \|\mathbb{E}^\pi(\mathbf{R}(x,\tau)\mid\sigma)\|_2^2.
-\]
-and define
-\[
-  s_k(\sigma)
-  :=
-  \sqrt{\left[U^{\theta_k}(\sigma)-\|\mathbf V^{\theta_k}(\sigma)\|_2^2\right]_+}
-\]
-Practically speaking, we can't immidiately use these heads in training before they are somewhat trained.
-So we define on player nodes a function $b(\sigma) \in \mathcal{B}$ partitioning them into buckets.
-Choose bucket-level functions $\beta_{\tt fix},\beta_{\tt avg},\beta_{\max}:\mathcal B\to[1,\infty)$, with $\beta_{\tt fix}(b)$ the warmup intensity, $\beta_{\tt avg}(b)$ the post-warmup average target, and $\beta_{\max}(b)$ the cap.
-During a warmup period, we use $\beta(\sigma) = \beta_{\tt fix}(b(\sigma))$.
-After this warmup period, for each bucket $b \in \mathcal{B}$, we define
-\[
-  \bar s_{k-1}(b)
-  :=
-  \frac{\sum_{\rho\in\mathbf S_{k-1}: b(\rho)=b}s_{k-1}(\rho)}
-       {\left|\{\rho\in\mathbf S_{k-1}: b(\rho)=b\}\right|}.
-\]
-and we use
-\[
-  \beta_k(\sigma)
-  :=
-  \clip\!\left(\beta_{\tt avg}(b(\sigma))\frac{s_k(\sigma)}{\bar s_{k-1}(b(\sigma))},1,\beta_{\max}(b(\sigma))\right)
-\]
-If the bucket is empty or its denominator is zero, we default to $\beta_{\tt fix}(b(\sigma))$.
-At a chance node $\sigma$, use a fixed intensity $\beta_{\mathsf c}(\sigma)\in[1,\infty)$.
 
 \paragraph{Primitive Functions.}
 Back to a synchronous rollout training, we fix weights $\theta_0,\ldots, \theta_k$.
@@ -923,12 +865,12 @@ For a player node $\mathsf{s}\in \mathfrak{S}$ with $\ell(\mathsf{s})=\sigma$, a
 \begin{equation}[rCl]
     \widehat{Q}^\lambda(x_p, \mathsf{s}\mathsf{a}) &=&
     \mathbb{E}^{\beta, \pi}\left(
-        \lambda^{|\tau \setminus \sigma|_p} R_p(x, \tau) \middle| x_p, \mathsf{s}\mathsf{a}\preccurlyeq\mathsf{T}
+        \lambda^{|\tau \setminus \sigma|_p} R_p(x, \tau) \middle| x_p, \mathsf{s}\mathsf{a}, \mathfrak{S}
     \right)\nonumber\\
     &&\quad+
-    (1 - \lambda) \mathbb{E}^{\beta, \pi}(|\tau \setminus \sigma|_{p} \mid \mathsf{s}\mathsf{a}\preccurlyeq\mathsf{T})
+    (1 - \lambda) \mathbb{E}^{\beta, \pi}(|\tau \setminus \sigma|_{p} \mid x_p, \mathsf{s}\mathsf{a}, \mathfrak{S})
     \mathbb{E}\left(
-        \lambda^{|\Sigma \setminus \sigma|_p - 1} V^{\theta_k}(X_p,\Sigma)
+        \lambda^{|\Sigma \setminus \sigma|_p - 1} V^{\theta_k}(x_p,\Sigma)
         \middle|
         \mathsf{s}\mathsf{a} \preccurlyeq \mathsf{S}, P = p, \mathfrak{S}
     \right)
@@ -936,38 +878,35 @@ For a player node $\mathsf{s}\in \mathfrak{S}$ with $\ell(\mathsf{s})=\sigma$, a
     \widehat{V}^\lambda(x_p, \mathsf{s})
     &=&
     \mathbb{E}^{\beta, \pi}\left(
-        \lambda^{|\tau \setminus \sigma|_p} R_p(x, \tau) \middle| x_p, \mathsf{s}\preccurlyeq\mathsf{T}
+        \lambda^{|\tau \setminus \sigma|_p} R_p(x, \tau) \middle| x_p, \mathsf{s}, \mathfrak{S}
     \right)\nonumber\\
     &&\quad+
-    (1 - \lambda) \mathbb{E}^{\beta, \pi}(|\tau \setminus \sigma|_{p} \mid \mathsf{s}\preccurlyeq\mathsf{T})
+    (1 - \lambda) \mathbb{E}^{\beta, \pi}(|\tau \setminus \sigma|_{p} \mid \mathsf{s}, \mathfrak{S})
     \mathbb{E}\left(
-        \lambda^{|\Sigma \setminus \sigma|_p - 1} V^{\theta_k}(X_p,\Sigma)
+        \lambda^{|\Sigma \setminus \sigma|_p - 1} V^{\theta_k}(x_p,\Sigma)
         \middle|
         \mathsf{s} \prec \mathsf{S}, P = p, \mathfrak{S}
     \right)
     \nonumber\\
     \widehat{V}^{\lambda,\neg\mathsf{a}}(x_p, \mathsf{s})
     &=&
-    \lambda\Bigg[
     \mathbb{E}^{\beta, \pi}\left(
         \lambda^{|\tau \setminus \sigma|_p} R_p(x, \tau)
         \middle|
-        x_p,\mathsf{s}\preccurlyeq\mathsf{T},\mathsf{s}\mathsf{a}\not\preccurlyeq\mathsf{T}
+        x_p,\mathsf{s} ,\neg \mathsf{s}\mathsf{a}, \mathfrak{S}
     \right)\nonumber\\
     &&\quad+
     (1 - \lambda)
     \mathbb{E}^{\beta, \pi}\left(
-        |\tau \setminus \sigma|_{p}
+        1+ |\tau \setminus \sigma|_{p}
         \middle|
-        \mathsf{s}\preccurlyeq\mathsf{T},\mathsf{s}\mathsf{a}\not\preccurlyeq\mathsf{T}
+        x_p, \mathsf{s}, \neg \mathsf{s}\mathsf{a},\mathfrak{S}
     \right)
     \mathbb{E}\left(
-        \lambda^{|\Sigma \setminus \sigma|_p - 1} V^{\theta_k}(X_p,\Sigma)
+        \lambda^{|\Sigma \setminus \sigma|_p - 1} V^{\theta_k}(x_p,\Sigma)
         \middle|
         \mathsf{s} \preccurlyeq \mathsf{S},\mathsf{s}\mathsf{a}\not\preccurlyeq \mathsf{S},P = p,\mathfrak{S}
     \right)
-    \Bigg]
-    +(1-\lambda)V^{\theta_k}(x_p,\sigma)
     \quad\textnormal{if }N(\mathsf{s})>1
     \nonumber\\
     \widehat{V}^{\lambda,\neg\mathsf{a}}(x_p, \mathsf{s})
@@ -980,62 +919,163 @@ For a player node $\mathsf{s}\in \mathfrak{S}$ with $\ell(\mathsf{s})=\sigma$, a
     \widehat{Q}^\lambda(x_p,\mathsf{s}\mathsf{a})
     -
     \widehat{V}^{\lambda,\neg\mathsf{a}}(x_p,\mathsf{s})
-    \nonumber\\
-    \widehat{\mathbf{V}}^\lambda(\mathsf{s})
-    &=&
-    \mathbb{E}^{\beta, \pi}\left(
-        \lambda^{|\tau \setminus \sigma|_{\textnormal{player}}} \mathbf{R}(x, \tau) \middle| \mathsf{s}\preccurlyeq\mathsf{T}
-    \right)\nonumber\\
-    &&\quad+
-    (1 - \lambda) \mathbb{E}^{\beta, \pi}(|\tau \setminus \sigma|_{\textnormal{player}} \mid \mathsf{s}\preccurlyeq\mathsf{T})
-    \mathbb{E}\left(
-        \lambda^{|\Sigma \setminus \sigma|_{\textnormal{player}}-1}\mathbf{V}^{\theta_k}(\Sigma)
-        \middle|
-        \mathsf{s} \prec \mathsf{S}, \mathfrak{S}
-    \right)
-    \nonumber\\
-    \widehat{U}^\lambda(\mathsf{s}) &=& \mathbb{E}^{\beta, \pi}\left(
-        \lambda^{|\tau \setminus \sigma|_{\textnormal{player}}} \|\mathbf{R}(x, \tau)\|_2^2 \middle| \mathsf{s}\preccurlyeq\mathsf{T}
-    \right)\nonumber\\
-    &&\quad+
-    (1 - \lambda) \mathbb{E}^{\beta, \pi}(|\tau \setminus \sigma|_{\textnormal{player}} \mid \mathsf{s}\preccurlyeq\mathsf{T})
-    \mathbb{E}\left(
-        \lambda^{|\Sigma \setminus \sigma|_{\textnormal{player}}-1} U^{\theta_k}(\Sigma)
-        \middle|
-        \mathsf{s} \prec \mathsf{S}, \mathfrak{S}
-    \right)
     \label{eq:branched-targets}
 \end{equation}
 \begin{lemma}[Unnormalised bucket moments]\label{lem:branched-bucket-moments}
-For every private-state bucket, the backward estimators $\widehat{\mathbb P}(x_p)$ and $\widehat M_p(x_p)=\widehat{\mathbb P}(x_p)\widehat V_p(x_p)$ are unbiased for the corresponding probability mass and posterior-weighted target moment, assuming unbiased leaf bucket statistics and perfect heads for bootstrapped terms.
-The conditional ratio $\operatorname{Cond}(\widehat M_p,\widehat{\mathbb P})$ is generally biased at finite sample size: one can estimate without bias how much target mass lies in a bucket, but not its conditional average by dividing by a random bucket size.
-If the true bucket mass is positive, the ratio is consistent as the effective descendant and completion sample size tends to infinity; for bounded rewards it is therefore asymptotically unbiased.
+  All of the above estimators are unbiased when multiplied by $\one_{x_p}$.
 \end{lemma}
 For $N(\mathsf{s})>1$, \autoref{lem:branched-branch-independence} makes the sibling average entering $\widehat{V}^{\lambda,\neg\mathsf{a}}$ independent of the target branch after conditioning on the target action label.
 It is thus a leave-one-branch, action-independent control variate for the target branch, rather than a finite-sample unbiased estimator of $V$ or $A$.
 All of these targets can be computed by backward propagation (see algorithm below).
 
-Now say we have a current parameter $\theta$.
-For a sampled $(P, \mathsf{S}, \Sigma)$, a sampled action $\mathsf{a}\in\mathfrak{E}_{\mathsf{S}}$ labeled by $\Sigma a_{\mathsf{a}}$, and a private state $x_P \in \mathcal{X}_P$, we use the local aliases $\widehat{Q}(x_P, \mathsf{a}) := \widehat{Q}^\lambda(x_P, \mathsf{S}\mathsf{a})$, $\widehat{A}(x_P, \mathsf{a}) := \widehat{A}^\lambda(x_P, \mathsf{S}\mathsf{a})$, $\widehat{V}(x_P) := \widehat{V}^\lambda(x_P, \mathsf{S})$, $\widehat{\mathbf{V}} := \widehat{\mathbf{V}}^\lambda(\mathsf{S})$ and $\widehat{U} := \widehat{U}^\lambda(\mathsf{S})$.
-We also define new loss function
-\begin{equation}\label{eq:branched-u-loss}
-\begin{aligned}
-    \mathcal L_{\tt U}[\widehat{U}^\lambda]
-    &= c_U\left(U^\theta(\Sigma) - \widehat{U}^\lambda\right)^2,\\
-    \mathcal L_{\mathbf V}[\widehat{\mathbf{V}}^\lambda]
-    &= c_{\mathbf V}\|\mathbf{V}^\theta(\Sigma)-\widehat{\mathbf{V}}^\lambda\|_2^2.
-\end{aligned}
+
+For a sampled $(P, \mathsf{S}, \Sigma)$, a sampled action $\mathsf{a}\in\mathfrak{E}_{\mathsf{S}}$ labeled by $\Sigma a_{\mathsf{a}}$, and a private state $x_P \in \mathcal{X}_P$, we use the local aliases $\widehat{Q}(x_P, \mathsf{a}) := \widehat{Q}^\lambda(x_P, \mathsf{S}\mathsf{a})$, $\widehat{A}(x_P, \mathsf{a}) := \widehat{A}^\lambda(x_P, \mathsf{S}\mathsf{a})$ and $\widehat{V}(x_P) := \widehat{V}^\lambda(x_P, \mathsf{S})$.
+
+\paragraph{Variance-Based Intensities using KKT.}
+Ideally, we'd like to pick $\beta$ so to reduce the variance of the gradient estimator.
+In practice, this is too noisy to be useful, so we use the following proxy.
+Firstly, we assume that the GAE horizon is $\lambda = 1$ for the variance calculation, so as to simplify notation: in practice this means that we are controlling the Monte Carlo source of variance in the estimators.
+Secondly, we define the vector Monte Carlo value estimator
+\[
+  \widehat{\mathbf{V}}(\mathsf{s})
+  =
+  \mathbb{E}^{\beta, \pi}\left(
+    \mathbf{R}(x, \tau) \middle| \mathsf{s}, \mathfrak{S}
+  \right)
+\]
+By Cauchy-Schwarz, we can bound the error of the gradient estimator by the squared error $\operatorname*{SqEr}(\mathbf V \mid \mathfrak{S}) = \mathbb{E}\left( \|\widehat{\mathbf V}(\mathsf{S}) - \mathbb{E}(\mathbf{R} \mid \Sigma)\|_2^2 \mid \mathfrak{S}\right)$.
+A reasonnable proxy is then to minimize the expected squarred error:
+\begin{equation*}[rCl]
+  \mathbb{E}\left(
+    \mathbb{E}(|\tau|_{\textnormal{player}} \mid \mathfrak{S})\operatorname*{SqEr}(\widehat{\mathbf{V}} \mid \mathfrak{S})
+  \right)
+  &=&
+  \mathbb{E}^\pi(|\tau|_{\textnormal{player}}) \mathbb{E}(\operatorname*{trCov}(\widehat{\mathbf{V}} \mid \Sigma))
+  \\
+  &=&
+  \sum_{\sigma\in\mathcal S\setminus\mathcal T}
+  \mathbb{P}^\pi(\sigma \preccurlyeq \tau) \mathbf{U}(\sigma)
+  \left(
+    \sum_{\substack{\rho \preccurlyeq \sigma \\ o(\rho)\in\mathcal P}}
+    \frac{1}{\prod_{\rho \preccurlyeq \alpha \preccurlyeq \sigma} N(\alpha)}
+  \right)
+\end{equation*}
+for $\mathbf{U}(\sigma) = \operatorname*{trCov}(\mathbb{E}(\mathbf{R} \mid \sigma A) \mid \sigma)$, the portion of the variance coming from the next decision only,
+subject to controlling the expected size of the sampled tree:
+\[
+  \mathbb{E}(|\mathfrak{S}|)
+  =
+  1+
+  \sum_{\sigma\in\mathcal S\setminus\mathcal T}
+  \mathbb{P}^\pi(\sigma \preccurlyeq \tau)
+  \prod_{\rho \preccurlyeq \sigma} N(\rho)
+  \leq M
+\]
+for a budget $M$.
+
+We see this as a \texttt{KKT} fixed point problem in the player-node variables
+$(N(\sigma))_{o(\sigma)\in\mathcal P}$, keeping chance-node intensities fixed,
+with rescaled inverse Lagrange multiplier $\kappa$.
+We compute the derivatives
+\begin{equation*}[rCl]
+  \frac{\partial}{\partial (1/N(\sigma))}
+  \left(
+      \mathbb{E}(\operatorname*{trCov}(\widehat{\mathbf V} \mid \Sigma))
+  \right)
+  &=&
+  \frac{\mathbb{P}^\pi(\sigma \preccurlyeq \tau)}{\mathbb{E}^\pi (|\tau|_{\textnormal{player}})}
+    \left(
+      \sum_{\substack{\rho \preccurlyeq \sigma \\ o(\rho)\in\mathcal P}}
+      \frac{1}{\prod_{\rho \preccurlyeq \alpha \prec \sigma} N(\alpha)}
+    \right)
+    \left(
+      \sum_{\sigma \preccurlyeq \eta}
+      \frac
+      {\mathbf{U}(\eta) \mathbb{P}^\pi(\eta \preccurlyeq \tau \mid \sigma)}
+      {\prod_{\sigma \prec \alpha \preccurlyeq \eta} N(\alpha)}
+    \right)
+    \\
+    &=&
+    \frac{\mathbb{P}^\pi(\sigma \preccurlyeq \tau)}{\mathbb{E}^\pi (|\tau|_{\textnormal{player}})}
+    \left(
+      \sum_{\substack{\rho \preccurlyeq \sigma \\ o(\rho)\in\mathcal P}}
+      \frac{1}{\prod_{\rho \preccurlyeq \alpha \prec \sigma} N(\alpha)}
+    \right)
+    \operatorname*{trCov}(\widehat{\mathbf V} \mid \sigma, N(\sigma) = 1)
+  \\
+    \frac{\partial}{\partial N(\sigma)}
+  \left(
+      \mathbb{E}(|\mathfrak{S}|)
+  \right)
+  &=&
+  \left(
+    \mathbb{P}^\pi(\sigma \preccurlyeq \tau)
+    \prod_{\rho \prec \sigma} N(\rho)
+  \right)
+  \mathbb{E}(|\mathfrak{S}_{\mathsf{s}\preccurlyeq}|-1
+  \mid \ell(\mathsf{s})=\sigma,N(\mathsf{s})=1)
+\end{equation*}
+This motivates us to define two new heads:
+\begin{enumerate}
+  \item \textbf{Log-Variance Head:} $W(\sigma) \simeq  \log\operatorname*{trCov}(\widehat{\mathbf V} \mid \sigma, N(\sigma) = 1)$,
+  \item \textbf{Log-Size Head:} $S(\sigma) \simeq \log \mathbb{E}(|\mathfrak{S}_{\mathsf{s}\preccurlyeq}|-1 \mid \ell(\mathsf{s})=\sigma,N(\mathsf{s})=1)$.
+\end{enumerate}
+Then we can define the iterative process as
+\begin{equation}[rCl]
+  \kappa_k &\gets& \kappa_{k-1} \frac{M}{|\mathfrak{S}_{k-1}|}
+  \\
+  \beta_k(\sigma) &\gets& \max\left(1, \sqrt{\kappa_k e^{W(\sigma)-S(\sigma)} \frac{\left(
+      \sum_{\substack{\rho \preccurlyeq \sigma \\ o(\rho)\in\mathcal P}}
+      \frac{1}{\prod_{\rho \preccurlyeq \alpha \prec \sigma} N(\alpha)}
+    \right)}
+    {\prod_{\rho \prec \sigma} N(\rho)}}\right)
 \end{equation}
-as well as $\mathcal L_{\tt U-clip}$ and $\mathcal L_{\mathbf{V}\tt-clip}$, defined analogously to $\mathcal L_{\tt V-clip}$.
+for $o(\sigma)\in\mathcal P$, while chance-node intensities remain fixed.
+Practically speaking, we can't immidiately use these heads in training before they are somewhat trained.
+So we warmup the training on a fixed intensity $\beta_{\tt fix}$ before starting this iterative process.
+To train the log-variance head, for every sampled node $\mathsf{s}$ labeled by
+$\sigma$ with $N(\mathsf{s})\geq 2$, we use the trace sample covariance
+\begin{equation}
+  \widehat{W}(\mathsf{s})
+  =
+  \log\left( \varepsilon_W + 
+    \frac{1}{N(\mathsf{s})-1}
+  \sum_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}}
+  \left\|
+    \widehat{\mathbf V}(\mathsf{s}\mathsf{a})
+    -\widehat{\mathbf V}(\mathsf{s})
+  \right\|_2^2
+  \right)
+  \label{eq:branched-log-variance-target}
+\end{equation}
+Sibling independence makes $\widehat{W}(\mathsf{s})$ unbiased for
+$\operatorname*{trCov}(\widehat{\mathbf V}\mid\sigma,N(\sigma)=1)$.
+Using the same GAE horizon $\lambda\in[0,1]$ as above, we define a raw size target $\widehat{S}^\lambda(\mathsf s)$, such that $\exp(\widehat{S}^1(\mathsf s)) = (|\mathfrak S_{\mathsf s\preccurlyeq}|-1)/N(\mathsf s)$ (see \autoref{alg:branched-value} for details).
+For a given sample, we let $\widehat W = \widehat W (\Sigma)$ and $\widehat{S}^\lambda = \widehat{S}^\lambda(\Sigma)$ and introduce losses
+\begin{equation}[rCl]
+  \mathcal L_W[\widehat W]
+  &=&
+  \begin{cases}[l"l]
+    c_W(W^\theta(\Sigma)-\widehat W)^2 & \textnormal{if $N(\mathsf S)\geq2$},\\
+    0 & \textnormal{if $N(\mathsf S)=1$},
+  \end{cases}
+  \\
+  \mathcal L_S[\widehat S^\lambda]
+  &=&
+  c_S(S^\theta(\Sigma)-\widehat S^\lambda)^2.
+  \label{eq:branched-intensity-head-losses}
+\end{equation}
+The losses are evaluated in log space so that very small and very large
+variance and size targets have comparable relative influence.
 
 \begin{algorithm}[H]
-\caption{$(\widehat{\mathbb P}^{\mathfrak r},\widehat V,\widehat{\mathbf V},\widehat U)\gets$~\texttt{PreTerminalMomentMC}$(\mathfrak r,\tau^{\mathsf{pre-c}})$}
+\caption{$(\widehat{\mathbb P}^{\mathfrak r},\widehat V,\widehat{\mathbf V})\gets$~\texttt{PreTerminalMomentMC}$(\mathfrak r,\tau^{\mathsf{pre-c}})$}
 \label{alg:mc-preterminal-moments}
 \DontPrintSemicolon
-\tcc{Black-box Monte Carlo completion from public pre-terminal prefixes, including the squared-norm moment.}
+\tcc{Black-box Monte Carlo completion from public pre-terminal prefixes.}
 \KwParam{$\mathfrak r$, leaf-specific reach cache; $\tau^{\mathsf{pre-c}}$, fixed pre-terminal trajectory}
 \KwHyper{Monte Carlo budget}
-\KwOut{$(\widehat{\mathbb P}^{\mathfrak r},\widehat V,\widehat{\mathbf V},\widehat U)$}
+\KwOut{$(\widehat{\mathbb P}^{\mathfrak r},\widehat V,\widehat{\mathbf V})$}
   Use a Monte Carlo simulation to sample $X\sim\mathbb P^{\mathfrak r}(\cdot\mid\tau^{\mathsf{pre-c}})$ with
   \[
     \mathbb P^{\mathfrak r}(x\mid\tau^{\mathsf{pre-c}})
@@ -1047,13 +1087,9 @@ as well as $\mathcal L_{\tt U-clip}$ and $\mathcal L_{\mathbf{V}\tt-clip}$, defi
   Store statistical occurrence $(\widehat{\mathbb P}^{\mathfrak r}(x_p))_{\substack{p \in \mathcal{P} \\ x_p \in \mathcal{X}_p}}$, statistical average
   \[
     \left(\widehat{V}(x_p) \simeq \mathbb{E}(R_p(X,\Tau) \mid X_p = x_p)\right)_{\substack{p \in \mathcal{P} \\ x_p \in \mathcal{X}_p}}
-  \]
-  and statistical average
-  \[
-    \widehat{U} \simeq \mathbb{E}(\|\mathbf{R}(X,\Tau)\|_2^2)
   \]\;
   Compute $\widehat{\mathbf{V}} \gets \left(\widehat{\mathbb P}^{\mathfrak r}(-_p) \cdot \widehat{V}(-_p)\right)_{p \in \mathcal{P}}$\;
-\Return{$(\widehat{\mathbb P}^{\mathfrak r},\widehat V,\widehat{\mathbf V},\widehat U)$}
+\Return{$(\widehat{\mathbb P}^{\mathfrak r},\widehat V,\widehat{\mathbf V})$}
 \end{algorithm}
 
 In the backward implementation, tuple operations are componentwise.
@@ -1097,11 +1133,11 @@ For posterior mass $w$ and posterior-weighted moment $m$, write
 In numerical implementations the denominator may be clamped to a small positive constant.
 
 \begin{algorithm}[H]
-\caption{$\mathcal O \gets$~\texttt{BranchedValue}$(\mathfrak{S}, V, \mathbf{V}, U, r)$}
+\caption{$\mathcal O \gets$~\texttt{BranchedValue}$(\mathfrak{S}, V, S, r)$}
 \label{alg:branched-value}
 \DontPrintSemicolon
 \tcc{Backward Propagation of Value Estimators.}
-\KwParam{$\mathfrak{S}^{\beta, \pi}$, sampled labeled tree with child counts $N$; $V$, $\mathbf{V}$, $U$, value heads; $r$, reach probabilities}
+\KwParam{$\mathfrak{S}^{\beta, \pi}$, sampled labeled tree with child counts $N$; $V$, value head; $S$, log-size head; $r$, reach probabilities}
 \KwHyper{$\lambda$, GAE horizon}
 \KwOut{target table $\mathcal O$}
 Initialize target table $\mathcal O\gets\varnothing$\;
@@ -1112,14 +1148,13 @@ Initialize target table $\mathcal O\gets\varnothing$\;
         \nonumber\\
         \widehat{V}_p(x_p, \mathsf{t}) &\simeq& \mathbb{E}^\pi(R_{p}(x, \tau) \mid \tau^{\mathsf{pre-c}}, x_p)
         \nonumber\\
-        \widehat{U}(\mathsf{t}) &\simeq& \mathbb{E}^\pi(\|\mathbf{R}(x, \tau)\|_2^2 \mid \tau^{\mathsf{pre-c}})
-        \nonumber\\
         \widehat{\mathbf V}(\mathsf{t}) &\simeq& \mathbb{E}^\pi(\mathbf{R}(x,\tau)\mid \tau^{\mathsf{pre-c}})
         \label{eq:branched-moment-terminal-estimates}
     \end{equation}   
     for $p \in \mathcal{P}$ and $x_p \in \mathcal{X}_p$ using $\algcall{alg:mc-preterminal-moments}{PreTerminalMomentMC}(\mathfrak r_{\mathsf t},\tau^{\mathsf{pre-c}})$\;
     Set $\widehat{M}_p(-_p,\mathsf t)\gets
     \widehat{\mathbb P}(-_p\mid\mathsf t)\widehat V_p(-_p,\mathsf t)$ for every $p\in\mathcal P$\;
+    Set $\widehat C(\mathsf t)\gets 0$\;
 }
 \For{node $\mathsf{s} \in \mathfrak{S}^{\beta, \pi}$ non-terminal, backward}{
   $\sigma \gets \ell(\mathsf{s})$\;
@@ -1128,20 +1163,33 @@ Initialize target table $\mathcal O\gets\varnothing$\;
     \left(
       \left(\widehat{\mathbb{P}}(-_p \mid \mathsf{s}),\widehat{M}_p(-_p,\mathsf{s})\right)_{p\in\mathcal P},
       \widehat{\mathbf V}(\mathsf{s}),
-      \widehat{U}(\mathsf{s})
+      \widehat{C}
     \right)
     &\gets&
     \operatorname{Avg}_{\mathsf{s}}\left[
       \left(
         \left(\widehat{\mathbb{P}}(-_p \mid \bullet),\widehat{M}_p(-_p,\bullet)\right)_{p\in\mathcal P},
         \widehat{\mathbf V}(\bullet),
-        \widehat{U}(\bullet)
+        1 + N(\sigma \bullet)\widehat C^\lambda(\bullet)
       \right)
     \right]
     \nonumber\\
     \label{eq:branched-backward-updates}
   \end{equation}
   \If{$o(\sigma) \in \mathcal{P}$}{
+      \If{$N(\mathsf s)\geq2$}{
+      Set
+      $\widehat W(\mathsf s)
+        \gets
+        \log\left(
+          \varepsilon_W
+          +
+          \frac{N(\mathsf s)}{N(\mathsf s)-1}
+          \left(\widehat{\mathcal V}_2(\mathsf s)
+          -\|\widehat{\mathbf V}(\mathsf s)\|_2^2\right)
+        \right);
+      $
+      }
       $\left(\widehat{Q}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a})\right)_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}}
       \gets
       \left(
@@ -1164,18 +1212,25 @@ Initialize target table $\mathcal O\gets\varnothing$\;
       $\left(\widehat{A}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a})\right)_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}}
       \gets
       \left(\widehat{Q}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a})-\widehat{V}^{\lambda,\neg\mathsf{a}}(-_{o(\sigma)},\mathsf{s})\right)_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}}$\;
-      Set $\widehat V_{o(\sigma)}(-_{o(\sigma)},\mathsf s)
+      $\widehat V_{o(\sigma)}(-_{o(\sigma)},\mathsf s)
       \gets\operatorname{Cond}(\widehat M_{o(\sigma)}(-_{o(\sigma)},\mathsf s),\widehat{\mathbb P}(-_{o(\sigma)}\mid\mathsf s))$\;
-      Store current targets $\mathcal O[\mathsf s] \gets \left(\widehat{\mathbb{P}}(-_{o(\sigma)} \mid \mathsf{s}),(\widehat{\mathbb{P}}(-_{o(\sigma)}\mid\mathsf{s}\mathsf{a}),\widehat{A}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a}),\widehat{Q}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a}))_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}},\widehat V_{o(\sigma)}(-_{o(\sigma)},\mathsf s), \widehat{\mathbf V}(\mathsf{s}), \widehat{U}(\mathsf{s})\right)$\;
-      Overwrite with the bootstrapped moments propagated to ancestors:
+      $\widehat S^\lambda(\mathsf s) \gets \log(\widehat{C}(\mathsf{s}))$\;
+      Store current targets $\mathcal O[\mathsf s] \gets \left(s\widehat{\mathbb{P}}(-_{o(\sigma)} \mid \mathsf{s}),(\widehat{A}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a}),\widehat{Q}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a}))_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}},\widehat V_{o(\sigma)}(-_{o(\sigma)},\mathsf s),\widehat W(\mathsf s),\widehat S^\lambda(\mathsf s)\right)$\;
+      Overwrite with the bootstrapped private-state moment propagated to ancestors:
       \begin{equation}[rCl]
-        \left(\widehat M_{o(\sigma)}(-_{o(\sigma)},\mathsf s),\widehat{\mathbf V}(\mathsf{s}), \widehat{U}(\mathsf{s})\right)
+        \widehat M_{o(\sigma)}(-_{o(\sigma)},\mathsf s)
         &\gets&
         \operatorname{Mix}_{\lambda}\left(
-          \left(\widehat M_{o(\sigma)}(-_{o(\sigma)},\mathsf s),\widehat{\mathbf V}(\mathsf{s}), \widehat{U}(\mathsf{s})\right),
-          \left(\widehat{\mathbb P}(-_{o(\sigma)}\mid\mathsf s)V(-_{o(\sigma)},\sigma),\mathbf{V}(\sigma), U(\sigma)\right)
+          \widehat M_{o(\sigma)}(-_{o(\sigma)},\mathsf s),
+          \widehat{\mathbb P}(-_{o(\sigma)}\mid\mathsf s)V(-_{o(\sigma)},\sigma)
         \right)
-        \nonumber\\
+        \\
+        \widehat C(\mathsf s)
+        &\gets&
+        \operatorname{Mix}_{\lambda}\left(
+          C(\mathsf s),
+          \exp(S(\sigma))
+        \right)
       \end{equation}
   }
 }
@@ -1193,15 +1248,16 @@ The fixed-intensity PPO v1 returns $\widehat{A}$ and does not store $\widehat Q$
 \tcc{Research template: the implementation companion freezes v1 to fixed intensities, actor-type $V$ heads, and PPO advantage targets.}
 \KwParam{$\theta_0$, initial weights; $\theta$, working copy of the next iterate}
 \KwHyper{$N$, tree count; $B$, minibatch size; $\lambda$; $\beta_{\max}$}
-\KwHyper{$\beta_{\tt fix}$, $\beta_{\tt avg}$, $k_{\tt warm}$; chosen number of gradient-descent steps per iterate}
+\KwHyper{$\beta_{\tt fix}$, $k_{\tt warm}$, $M$, $\kappa_0$; chosen number of gradient-descent steps per iterate}
 \KwOut{$(\theta_k)_{k\ge0}$}
 \For{$k=0,1,2,\dots$}{
-  Define $\beta_k=\beta_k^{U,\mathbf V}$ from frozen public moment heads $U^{\theta_k}, \mathbf{V}^{\theta_k}$ and previous-bucket means.\;
+  Define $\beta_k$ from the frozen public heads $W^{\theta_k}$ and $S^{\theta_k}$, the current inverse multiplier $\kappa_k$, and the KKT rule above\;
   Sample $((\mathfrak{S}, \ell:\mathfrak{S}\to\mathcal S, N:\mathfrak{S}\to\mathbb N)$ using $\algcall{alg:sample-tree}{SampleTree}(\pi^{\theta_k},\beta_k)$\;
-  Compute target table $\mathcal O\gets \algcall{alg:branched-value}{BranchedValue}(\mathfrak{S}, V^{\theta_k}, \mathbf{V}^{\theta_k}, U^{\theta_k}, r)$\;
+  Set $\kappa_{k+1}\gets\kappa_k M/|\mathfrak S|$\;
+  Compute target table $\mathcal O\gets \algcall{alg:branched-value}{BranchedValue}(\mathfrak{S}, V^{\theta_k}, S^{\theta_k}, r)$\;
   \For{each gradient-descent step}{
     Sample $(P_b, \mathsf{S}_b)_{b=1}^B \stackrel{\mathsf{iid}}{\sim} (P, \mathsf{S})$ and set $\Sigma_b=\ell(\mathsf{S}_b)$\;
-    Deduce $\widehat{\mathbb P}(x_{P_b}\mid\mathsf S_b\mathsf a)$, $\widehat{A}_b^\lambda(x_{P_b}, \mathsf{a})$, $\widehat{Q}_b^\lambda(x_{P_b}, \mathsf{a})$, $\widehat{V}_b(x_{P_b})$, $\widehat{\mathbf V}_b$ and $\widehat{U}_b$ from $\mathcal O$ at $\mathsf{S}_b$\;
+    Deduce $\widehat{\mathbb P}(x_{P_b}\mid\mathsf S_b\mathsf a)$, $\widehat{A}_b^\lambda(x_{P_b}, \mathsf{a})$, $\widehat{Q}_b^\lambda(x_{P_b}, \mathsf{a})$, $\widehat{V}_b(x_{P_b})$, $\widehat W_b$ and $\widehat S_b^\lambda$ from $\mathcal O$ at $\mathsf{S}_b$\;
     Estimate
     \begin{equation}[rCl]
       \widehat{l}(\theta)
@@ -1222,11 +1278,11 @@ The fixed-intensity PPO v1 returns $\widehat{A}$ and does not store $\widehat Q$
         \right)\widehat{\mathbb{P}}(x_{P_b} \mid \mathsf{S}_b)
       \nonumber\\
       && + \frac{1}{B}\sum_{b=1}^B
-      \mathcal{L}^{\mathbf{V}, U}\left(
-        (\mathbf{V}^\theta, U^\theta, \mathbf{V}^{\theta_k}, U^{\theta_k})(\Sigma_b),
-        \widehat{\mathbf V}_b,
-        \widehat{U}_b
-        \right)
+      \mathcal L^{W,S}\left(
+        (W^\theta,S^\theta)(\Sigma_b),
+        \widehat W_b,
+        \widehat S_b^\lambda
+      \right)
         \label{eq:branched-minibatch-loss}
     \end{equation}\;
     Descend $\theta$ along $\nabla_\theta \widehat{l}(\theta)$\;
@@ -1235,22 +1291,6 @@ The fixed-intensity PPO v1 returns $\widehat{A}$ and does not store $\widehat Q$
 }
 \Return{$(\theta_k)_{k\ge0}$}
 \end{algorithm}
-
-\paragraph{Variance-Minimizing Sampling.} The goal of this paragraph is to formalize and solve the problem of minimizing sampling variance.
-Typically, we want to pick the $\beta$ intensities so to:
-\begin{enumerate}
-  \item \textbf{Minimize:} the average variance 
-  \[
-    \mathbb{E}(\Var(\widehat{V}^1 \mid \Sigma)) = \sum_\sigma 
-  \]of the $\lambda = 1$ Monte Carlo value estimator,
-  \item \textbf{Subject to constraint:} $\mathbb{E}(|\mathfrak{S}|)\le M$ for some expected sampled-node budget $M$.
-\end{enumerate}
-This is obviously not the true variance of the loss estimator, but it is probably the best proxy we can get for it.
-To accomplish this, we can either:
-\begin{enumerate}
-  \item Learn $\beta^\theta$ directly using some sort of loss function,
-  \item Learn other heads (such as $U$ and $\mathbf{V}$ above) and use them to compute the chosen $\beta$ intensities.
-\end{enumerate}
 
 \section{Poker: a Perfect Example}
 
@@ -1311,9 +1351,9 @@ Several specificities impact our implementation:
 
   \item \textbf{Research loss design:} the full design combines clipped \texttt{PPO} with an optional \texttt{KL} term to an older reference index $\operatorname{ref}(k)$, an entropy term, and losses for each proposed value head:
   \[
-    \mathcal L_{\tt clip}[\widehat A^\lambda]+\mathcal L_{\tt H} + \mathcal L_{\tt KL} + \mathcal L_{\tt V}[\widehat V^\lambda] + \mathcal L_{\tt U}[\widehat U^\lambda]+\mathcal L_{\mathbf V}[\widehat{\mathbf V}^\lambda]
+    \mathcal L_{\tt clip}[\widehat A^\lambda]+\mathcal L_{\tt H} + \mathcal L_{\tt KL} + \mathcal L_{\tt V}[\widehat V^\lambda] + \mathcal L^{W,S}[\widehat W,\widehat S^\lambda]
   \]
-  The implementation companion's fixed-intensity PPO v1 uses only the clipped policy, actor-type value, and entropy terms. Reference-policy KL and the public $U/\mathbf V$ heads and losses are deferred research extensions, as are \texttt{NeuRD} and stored all-action $Q$ targets.
+  The implementation companion's fixed-intensity PPO v1 uses only the clipped policy, actor-type value, and entropy terms. Reference-policy KL and the public $W/S$ heads and losses are deferred research extensions, as are \texttt{NeuRD} and stored all-action $Q$ targets.
 
   \item Ideally, the implemtation should be clearly modular: it will be used for poker, but must be easily adaptable to other PBGs.
 \end{enumerate}

@@ -15,14 +15,22 @@ issues are tracked separately.
 
 - the poker model now consumes lossless public history and implements the binding MHA geometry/incidence/folder paths (`AUD-006`–`AUD-008` resolved);
 - dense postflop attention at the advertised batch size is infeasible;
-- folded-summary semantics are aligned, but refresh caching and the broader evaluator boundary remain open under `AUD-009` and `AUD-010`;
-- the synthetic dial is not a tested spectrum from Kuhn/Leduc to full no-limit poker.
+- folded summaries use exact street/fold cache invalidation and the evaluator-owned `pbg-folder-v1` model-ready boundary (`AUD-009` and `AUD-010` resolved);
+- branched rollout evaluates each unique player parent once, completion drops
+  unused diagnostics after enforcing quality, and poker decision storage keeps
+  only ragged live-seat reaches after completion (`AUD-012`, `AUD-014`, and
+  `AUD-015` resolved);
+- branched RB samples exactly one tree per rank/GPU and streams byte-limited
+  completion batches through an upward `P/M` frontier; sequential samples are
+  consistently described as trajectories (`AUD-013` resolved);
+- the synthetic family is now an explicit two-axis algorithmic stress grid with
+  exact Kuhn/Leduc anchors; it is not presented as literal convergence to NLHE.
 
 Accordingly, the current code is suitable as a small synthetic/CPU research scaffold and as a partial correctness prototype for fixed branching. It is not yet a production-capable full 6-max trainer in any of the three requested modes.
 
 ## Audit packet
 
-- [`findings.md`](findings.md): the 22 currently open findings and their response fields.
+- [`findings.md`](findings.md): the 4 currently open findings and their response fields.
 - [`resolved_findings.md`](resolved_findings.md): implemented and verified findings, preserving their original identifiers and history.
 - [`mode_storage_compute.md`](mode_storage_compute.md): the required compute and lifetime/storage contract for normal, sequential Rao--Blackwell, and branched Rao--Blackwell training.
 - [`validation_matrix.md`](validation_matrix.md): capability matrix, tests run, missing gates, and recommended implementation order.
@@ -32,10 +40,11 @@ Accordingly, the current code is suitable as a small synthetic/CPU research scaf
 
 The issues that should be decided before lower-level optimization work are:
 
-1. `AUD-013`: implement whole-iteration byte-budgeted streaming; for `AUD-005`, pass the local readiness gate and then measure Quest H100 tiers with intentionally staged jobs.
-2. `AUD-009` and `AUD-010`: cache folded summaries at their exact invalidation events and decide whether a richer single-call evaluator DTO should replace the correct but redundant per-folder facade calls.
-3. `AUD-011`: decide what “full NLHE” means for raise discretization and chip denomination.
-4. `AUD-017` and `AUD-018`: define the intended Kuhn/Leduc/dial relationship and whether every poker variant must use the MHA design.
+1. For `AUD-005`, pass the local readiness gate and then measure Quest H100
+   tiers with intentionally staged jobs, preserving the byte-budgeted
+   completion/frontier pipeline resolved in `AUD-013`.
+2. Preserve the resolved synthetic/full-poker MHA comparison contract and use
+   the `AUD-032` device-local gates during optimization work.
 
 ## Positive findings to preserve
 

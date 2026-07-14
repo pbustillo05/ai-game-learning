@@ -1,33 +1,34 @@
 game:
   name: synthetic
   synthetic:
-    n_players: 3
-    deck_size: 10
+    # dial(card_scale=3, action_scale=2): the public helper has only two axes.
+    n_players: 2
+    deck_size: 8
     n_suits: 2
     hand_size: 1
     n_rounds: 2
     board_per_round: [0, 1]
     max_raises: 2
-    bet_size: [1, 2]
+    bet_size: [2, 4]
+    raise_sizes: [[2], [4]]
     ante: 1
   poker: null
 rollout:
-  n_trees: 128
+  n_trees: 1
   beta:
     default: 1.0
     round_0: 1.25
     chance_round_1: 1.5
     round_1: 2.0
-  node_budget: 1024
+  node_budget: 131072  # One sampled branching tree per rank.
   reach_storage: decisions_only
 completion:
   n_samples: 1024
   backend: mc
 # Exact exploitability is disabled when P01's 2M feasibility guard is exceeded.
 model:
-  n_buckets: 1024
+  architecture: mha
   hidden_dim: 96
-  e_max: 3
 loss:
   name: rb_ppo
   lam: 0.95
@@ -36,7 +37,7 @@ loss:
   c_v: 0.5
   c_h: 0.01
   entropy_schedule: const
-  use_suit_consistency: false
+  value_loss: clipped
 training:
   mode: branched_rao_blackwell
   iters: 1000
@@ -49,4 +50,4 @@ training:
   seed: 17
   checkpoint_every: 50
   out_dir: runs/synthetic_dial
-debug_asserts: false
+  reproducibility: seeded

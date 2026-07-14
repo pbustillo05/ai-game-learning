@@ -14,7 +14,18 @@ import torch
 class _FakeResult:
     base_log_z: torch.Tensor
     single_card_log_ratio: torch.Tensor
-    pair_card_log_ratio: torch.Tensor | None
+    pair_card_log_ratio: torch.Tensor
+    beta_eigenvalue: torch.Tensor
+    beta_eigenvector: torch.Tensor
+    folder_log_mass: torch.Tensor
+    folder_single_card_log_ratio: torch.Tensor
+    folder_pair_card_log_ratio: torch.Tensor
+    folder_card_marginal: torch.Tensor
+    folder_delta: torch.Tensor
+    folder_sigma: torch.Tensor
+    sigma_total: torch.Tensor
+    tight_cluster_scalar: torch.Tensor
+    folder_output_valid: torch.Tensor
     output_valid: torch.Tensor
     metadata: dict[str, object]
 
@@ -25,14 +36,18 @@ def _install_fake(monkeypatch: pytest.MonkeyPatch, *, version: str = "pbg-v2") -
     package.__path__ = []  # type: ignore[attr-defined]
     facade = ModuleType("poker_gpu_evaluator.pbg")
     facade.API_VERSION = version  # type: ignore[attr-defined]
+    facade.FOLDER_API_VERSION = "pbg-folder-v1"  # type: ignore[attr-defined]
     facade.COMBO_CARDS = torch.triu_indices(52, 52, offset=1).T.to(torch.uint8)  # type: ignore[attr-defined]
-    facade.PartitionSummaryResult = _FakeResult  # type: ignore[attr-defined]
+    facade.FolderSummaryResult = _FakeResult  # type: ignore[attr-defined]
 
-    def partition_many(**kwargs: Any) -> _FakeResult:
+    def partition_folders(**kwargs: Any) -> _FakeResult:
         calls.setdefault("all", []).append(kwargs)
         board = kwargs["board_cards"]
         batch_size = board.shape[0]
+        folders = kwargs["range_weights"].shape[1]
+        rank = kwargs["beta_rank"]
         device = board.device
+        zeros = lambda *shape: torch.zeros(shape, dtype=torch.float32, device=device)
         result = _FakeResult(
             base_log_z=torch.arange(batch_size, dtype=torch.float32, device=device),
             single_card_log_ratio=torch.arange(
@@ -41,13 +56,27 @@ def _install_fake(monkeypatch: pytest.MonkeyPatch, *, version: str = "pbg-v2") -
             pair_card_log_ratio=torch.arange(
                 batch_size * 52 * 52, dtype=torch.float32, device=device
             ).reshape(batch_size, 52, 52),
+            beta_eigenvalue=zeros(batch_size, rank),
+            beta_eigenvector=zeros(batch_size, 52, rank),
+            folder_log_mass=zeros(batch_size, folders),
+            folder_single_card_log_ratio=zeros(batch_size, folders, 52),
+            folder_pair_card_log_ratio=zeros(batch_size, folders, 52, 52),
+            folder_card_marginal=zeros(batch_size, folders, 52),
+            folder_delta=zeros(batch_size, folders, 52),
+            folder_sigma=zeros(batch_size, folders, 52, 52),
+            sigma_total=zeros(batch_size, 52, 52),
+            tight_cluster_scalar=zeros(batch_size),
+            folder_output_valid=torch.ones((batch_size, folders), dtype=torch.bool, device=device),
             output_valid=torch.ones(batch_size, dtype=torch.bool, device=device),
-            metadata={"backend": "fake", "api_version": "pbg-v2"},
+            metadata={
+                "backend": "fake", "api_version": "pbg-v2",
+                "folder_api_version": "pbg-folder-v1",
+            },
         )
         calls.setdefault("_results", []).append(result)
         return result
 
-    facade.partition_many = partition_many  # type: ignore[attr-defined]
+    facade.partition_folders = partition_folders  # type: ignore[attr-defined]
     package.pbg = facade  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "poker_gpu_evaluator", package)
     monkeypatch.setitem(sys.modules, "poker_gpu_evaluator.pbg", facade)
@@ -99,8 +128,8 @@ def test_import_is_lazy_and_exact_facade_mapping(monkeypatch: pytest.MonkeyPatch
     )
 
     sibling_result = calls["_results"][0]
-    combined, per_folder = calls["all"]
-    assert set(combined) == {"board_cards", "range_weights", "row_mask"}
+    [combined] = calls["all"]
+    assert set(combined) == {"board_cards", "range_weights", "row_mask", "beta_rank"}
     assert combined["board_cards"].dtype == torch.uint8
     assert combined["board_cards"].tolist() == [[0, 5, 9, 255, 255], [4, 8, 12, 16, 20]]
     assert combined["board_cards"].is_contiguous()
@@ -109,15 +138,8 @@ def test_import_is_lazy_and_exact_facade_mapping(monkeypatch: pytest.MonkeyPatch
     assert combined["range_weights"].is_contiguous()
     assert combined["row_mask"].tolist() == folded.folder_mask.tolist()
     assert combined["row_mask"].is_contiguous()
-    assert per_folder["range_weights"].shape == (3, 1, 1326)
-    assert per_folder["row_mask"].all()
-    assert isinstance(result_type(**{
-        "base_log_z": output.fields["base_log_z"],
-        "single_card_log_ratio": output.fields["single_card_log_ratio"],
-        "pair_card_log_ratio": output.fields["pair_card_log_ratio"],
-        "output_valid": output.fields["output_valid"],
-        "metadata": output.metadata,
-    }), result_type)
+    assert combined["beta_rank"] == 16
+    assert isinstance(sibling_result, result_type)
     assert set(output.fields) == {
         "base_log_z",
         "single_card_log_ratio",
@@ -125,7 +147,11 @@ def test_import_is_lazy_and_exact_facade_mapping(monkeypatch: pytest.MonkeyPatch
         "output_valid",
         "folder_log_mass",
         "folder_single_card_log_ratio",
-        "folder_pair_card_log_ratio",
+        "beta_eigenvalue",
+        "beta_eigenvector",
+        "folder_card_marginal",
+        "folder_delta",
+        "tight_cluster_scalar",
         "folder_output_valid",
         "folder_mask",
         "folder_line_meta",
@@ -181,17 +207,14 @@ def test_version_and_result_contract_errors(monkeypatch: pytest.MonkeyPatch) -> 
     calls, _ = _install_fake(monkeypatch)
     facade = sys.modules["poker_gpu_evaluator.pbg"]
 
-    def bad_partition_many(**kwargs: Any) -> _FakeResult:
-        calls.update(kwargs)
-        return _FakeResult(
-            torch.zeros(2, dtype=torch.float64),
-            torch.zeros(2, 52),
-            None,
-            torch.ones(2, dtype=torch.bool),
-            {},
-        )
+    original = facade.partition_folders
 
-    facade.partition_many = bad_partition_many  # type: ignore[attr-defined]
+    def bad_partition_folders(**kwargs: Any) -> _FakeResult:
+        result = original(**kwargs)
+        result.base_log_z = result.base_log_z.double()
+        return result
+
+    facade.partition_folders = bad_partition_folders  # type: ignore[attr-defined]
     with pytest.raises(TypeError, match="base_log_z.*dtype"):
         PokerGPUPartitionAdapter().summarize(
             board_cards=board,
@@ -265,7 +288,7 @@ def test_real_sibling_smoke() -> None:
     facade = pytest.importorskip("poker_gpu_evaluator.pbg")
     if facade.API_VERSION != "pbg-v2":
         pytest.skip("installed sibling does not expose the pbg-v2 facade")
-    assert callable(facade.partition_many)
+    assert callable(facade.partition_folders)
     expected = torch.triu_indices(52, 52, offset=1).T.to(torch.uint8)
     assert torch.equal(facade.COMBO_CARDS, expected)
 

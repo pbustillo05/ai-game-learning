@@ -19,8 +19,16 @@ def main() -> None:
             "(default: local_3x2080ti; Quest must be selected explicitly)"
         ),
     )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="checkpoint in training.out_dir from which to resume safely",
+    )
     args = parser.parse_args()
-    train(load_config(args.config, hardware_profile=args.hardware_profile))
+    train(
+        load_config(args.config, hardware_profile=args.hardware_profile),
+        resume_from=args.resume,
+    )
 
 
 if __name__ == "__main__":

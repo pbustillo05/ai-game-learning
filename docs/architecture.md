@@ -45,16 +45,13 @@ One training iteration performs the following phases:
 1. Deep-copy the current model into a frozen rollout model.
 2. Ask the selected rollout backend for root state handles and initialize
    padded log-reach rows `[tree, player, private_type]`.
-3. Build sequential or fixed-intensity labeled sampled trees on the backend
-   device. Cache the frozen value rows and selected-event log probabilities at
-   every player decision.
-4. Complete all terminal or pre-terminal leaves through the game-owned
-   completion backend. Completion returns private-type posterior mass and
-   conditional values.
-5. Run `branched_value` backward over each whole tree. It propagates posterior
-   mass and posterior-weighted return mass, emits parent/child posteriors,
-   leave-one-branch advantages, and actor value targets.
-6. Build a Walker alias table over player nodes using sampled-tree path mass.
+3. Build sequential trajectories or one fixed-intensity labeled sampled tree
+   per rank. Cache frozen value rows and selected-event log probabilities.
+4. Release the frozen model. Complete leaves through the game-owned backend in
+   byte-limited microbatches.
+5. Feed each completion microbatch into the backward `P/M` reduction frontier.
+   Completed siblings emit targets and are replaced by one parent summary.
+6. Build a device-resident categorical table over player nodes using sampled-tree path mass.
 7. Repeatedly sample aligned decision rows, re-evaluate the current model, and
    optimize the clipped posterior-weighted policy, value, and entropy loss.
 8. Append metrics and periodically write an atomic checkpoint containing the
@@ -80,15 +77,18 @@ decision; completion owns its remaining chance/reward resolution.
 
 ### Stored trees
 
-`TreeBatch` is a structure-of-arrays tree forest. Node arrays store parent,
-tree, owner, depths, state handle, and accumulated path weight. CSR arrays
+`TreeBatch` is a shared CSR topology container. Sequential modes place a batch
+of independent trajectories in it; branched RB places exactly one sampled tree
+per rank/GPU in it. Node arrays store parent, logical-tree id, owner, depths,
+state handle, and accumulated path weight. CSR arrays
 `child_ptr`, `child_node`, `child_event`, and `nu` store outgoing edges. Equal
 public event labels are allowed on distinct child edges and are intentionally
 not deduplicated.
 
-`DeviceTreeBuffer` preallocates `n_trees * node_budget` node rows and appends
+`DeviceTreeBuffer` preallocates `n_trajectories * node_budget` rows in sequential
+modes and exactly `node_budget` rows for the one branched tree. It appends
 parent-major child batches with tensor prefix operations. Overflow is a loud
-error. It never truncates a tree or changes the offspring law to fit capacity.
+error; it never truncates a trajectory/tree or changes the offspring law.
 
 ### Reach and frozen-policy caches
 
@@ -114,6 +114,10 @@ fields preserve evaluator diagnostics without coupling core code to poker.
 `NodeTargets` is aligned to player-decision nodes and contains parent posterior,
 child posterior, direct advantages, value targets, child labels/masks/counts,
 and optional Q or auxiliary tensors.
+
+The previous completion result and its selected reaches are unreachable before
+the next completion call. The frontier moves upward until only the root of the
+branched tree remains; it never allocates a whole-tree `[N,P,X]` moment arena.
 
 ## Design choices
 
@@ -155,8 +159,10 @@ mode; CUDA uses the same tensor state transition path.
 ### Determinism is explicit
 
 Configuration loading is strict. Torch and NumPy generators are explicit and
-rank-local. Training enables deterministic algorithms, disables cuDNN
-benchmarking, and checkpoints explicit generator plus process RNG state. DDP
+rank-local. `training.reproducibility` selects `strict` deterministic kernels,
+`seeded` nondeterministic kernels without autotuning, or `throughput` kernels
+with cuDNN benchmarking and TF32 enabled. Every profile retains exact seeds and
+checkpoints explicit generator plus process RNG state for every DDP rank. DDP
 ranks sample locally and synchronize gradients only.
 
 ## Current scope and deliberate omissions
@@ -166,4 +172,3 @@ learned Neyman allocation, and public moment losses are deferred. `MomentHeads`
 and generic auxiliary propagation hooks exist as research extensions but are
 not wired into the default training path. Q targets are transient unless a
 caller explicitly requests `emit_q=True`.
-

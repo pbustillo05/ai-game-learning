@@ -41,7 +41,7 @@ def _small_poker_cfg(tmp_path: Path):
         "stack_bb": 2.0,
         "sb": 0.5,
         "bb": 1.0,
-        "n_ticks": 2,
+        "chip_unit_bb": 0.5,
     }
     cfg.rollout.n_trees = 2
     cfg.rollout.node_budget = 64
@@ -93,10 +93,19 @@ def test_all_first_run_presets_load_strictly_without_deferred_settings() -> None
     }
     nlhe = loaded["nlhe6_h100.yaml"]
     assert nlhe.game.poker["n_players"] == 6
-    assert nlhe.rollout.n_trees == 8 and nlhe.rollout.node_budget == 512
+    assert nlhe.rollout.n_trees == 1 and nlhe.rollout.node_budget == 4096
     assert nlhe.train.minibatch_size == 2
     assert nlhe.completion.backend == "cuda"
     assert nlhe.train.iters == 10_000 and nlhe.train.checkpoint_every == 100
+
+
+def test_shipped_dial_uses_one_embedding_row_per_public_history() -> None:
+    cfg = load_config(ROOT / "configs" / "synthetic_dial_example.yaml")
+    bundle = build_game_bundle(cfg, torch.device("cpu"))
+    game = bundle.rollout_backend.game
+    keys = torch.tensor(game.states.history_hash, dtype=torch.int64)
+    assert keys.unique().numel() == keys.numel()
+    assert bundle.model.n_buckets == int(keys.max()) + 1
 
 
 def test_poker_rollout_memory_plan_bounds_recompute_and_full_storage() -> None:
@@ -120,7 +129,7 @@ def test_h100_bootstrap_bundle_constructs_without_capacity_sized_history() -> No
     cfg = load_config(ROOT / "configs" / "nlhe6_h100.yaml")
     bundle = build_game_bundle(cfg, torch.device("cpu"))
     backend = bundle.rollout_backend
-    assert backend.rollout_memory_plan.peak_bytes == 306_318_404
+    assert backend.rollout_memory_plan.peak_bytes == 306_149_260
     assert "action_history" not in vars(backend.states)
     assert backend.states.history_parent.shape == (4_096,)
 

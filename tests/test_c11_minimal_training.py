@@ -15,7 +15,7 @@ def test_fixed_beta_minimal_training_and_bundle_boundary(tmp_path) -> None:
     cfg = load_config("configs/kuhn_smoke.yaml")
     cfg.training.mode = "branched_rao_blackwell"
     cfg.rollout.beta = {"default": 2.0}
-    cfg.rollout.n_trees = 4
+    cfg.rollout.n_trees = 1
     cfg.train.iters = 1
     cfg.train.minibatch_size = 4
     cfg.train.out_dir = str(tmp_path / "fixed")

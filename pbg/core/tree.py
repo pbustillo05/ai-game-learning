@@ -14,7 +14,7 @@ from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
 
 @dataclass
 class TreeBatch:
-    """A batch of public rollout trees in structure-of-arrays/CSR form."""
+    """CSR rollout topology: trajectories or one sampled branching tree."""
 
     parent: Tensor
     child_ptr: Tensor
@@ -417,7 +417,13 @@ class DeviceTreeBuffer:
 
 @dataclass
 class AliasTable:
-    """Walker alias table with optional external outcomes."""
+    """Device-resident categorical decision table with external outcomes.
+
+    The historical name is retained for the public API. Construction and
+    sampling stay on the source tensor's device; sampling delegates to
+    ``torch.multinomial`` instead of building a Walker table through CPU
+    lists and scalar transfers.
+    """
 
     probability: Tensor
     alias: Tensor
@@ -426,34 +432,32 @@ class AliasTable:
     @classmethod
     def build(cls, weights: Tensor | np.ndarray | Iterable[float]) -> "AliasTable":
         source_device = weights.device if isinstance(weights, Tensor) else torch.device("cpu")
-        values = torch.as_tensor(weights, dtype=torch.float64).flatten().cpu()
+        values = torch.as_tensor(weights, dtype=torch.float64, device=source_device).flatten()
         if values.numel() == 0:
             raise ValueError("alias weights cannot be empty")
-        if not bool(torch.isfinite(values).all()) or bool((values < 0).any()):
-            raise ValueError("alias weights must be finite and nonnegative")
-        total = float(values.sum())
-        if total <= 0:
-            raise ValueError("at least one alias weight must be positive")
+        finite_nonnegative = torch.isfinite(values).all() & (values >= 0).all()
+        positive_total = values.sum() > 0
+        if values.device.type == "cuda":
+            torch._assert_async(
+                finite_nonnegative,
+                "alias weights must be finite and nonnegative",
+            )
+            torch._assert_async(
+                positive_total,
+                "at least one alias weight must be positive",
+            )
+        else:
+            if not bool(finite_nonnegative):
+                raise ValueError("alias weights must be finite and nonnegative")
+            if not bool(positive_total):
+                raise ValueError("at least one alias weight must be positive")
         count = values.numel()
-        scaled = (values * count / total).tolist()
-        probability = [0.0] * count
-        alias = list(range(count))
-        small = [index for index, value in enumerate(scaled) if value < 1.0]
-        large = [index for index, value in enumerate(scaled) if value >= 1.0]
-        while small and large:
-            low = small.pop()
-            high = large.pop()
-            probability[low] = scaled[low]
-            alias[low] = high
-            scaled[high] = scaled[high] - (1.0 - scaled[low])
-            (small if scaled[high] < 1.0 else large).append(high)
-        for index in (*small, *large):
-            probability[index] = 1.0
-            alias[index] = index
+        probability = values / values.sum()
+        identity = torch.arange(count, dtype=torch.int64, device=source_device)
         return cls(
-            probability=torch.tensor(probability, dtype=torch.float64, device=source_device),
-            alias=torch.tensor(alias, dtype=torch.int64, device=source_device),
-            outcomes=torch.arange(count, dtype=torch.int32, device=source_device),
+            probability=probability,
+            alias=identity,
+            outcomes=identity.to(torch.int32),
         )
 
     @property
@@ -469,23 +473,25 @@ class AliasTable:
 
         if n < 0:
             raise ValueError("n must be nonnegative")
-        size = int(self.probability.numel())
         if isinstance(gen, np.random.Generator):
             if self.probability.device.type != "cpu":
                 raise ValueError("NumPy generators can only sample CPU alias tables")
-            columns = torch.from_numpy(gen.integers(size, size=n, dtype=np.int64))
-            uniforms = torch.from_numpy(gen.random(n))
+            columns = torch.from_numpy(
+                gen.choice(
+                    self.probability.numel(),
+                    size=n,
+                    replace=True,
+                    p=self.probability.numpy(),
+                ).astype(np.int64, copy=False)
+            )
         else:
-            columns = torch.randint(
-                size, (n,), generator=gen, dtype=torch.int64, device=self.probability.device
+            columns = torch.multinomial(
+                self.probability,
+                n,
+                replacement=True,
+                generator=gen,
             )
-            uniforms = torch.rand(
-                n, generator=gen, dtype=torch.float64, device=self.probability.device
-            )
-        picked = torch.where(
-            uniforms < self.probability[columns], columns, self.alias[columns]
-        )
-        return self.outcomes[picked].to(torch.int32)
+        return self.outcomes[columns].to(torch.int32)
 
 
 def build_decision_alias(tree: TreeBatch) -> AliasTable:
@@ -625,3 +631,69 @@ class ReachCache:
             return value
 
         return torch.stack([compute(int(node)) for node in requested.tolist()], dim=0)
+
+
+@dataclass
+class DecisionReachCache:
+    """Model-input reaches retained after rollout/completion has finished.
+
+    Games may replace dense ``[D,P,X]`` rows with an opaque compact payload.
+    The payload is expanded only for sampled optimization rows.
+    """
+
+    node_ids: Tensor  # int32 [D], aligned with decision/target rows
+    state_refs: Tensor  # int32 [D]
+    payload: Any
+    owners: Tensor | None = None  # int32 [D], present for compact RB minibatches
+
+    @classmethod
+    def from_rows(
+        cls,
+        node_ids: Tensor,
+        state_refs: Tensor,
+        rows: Tensor,
+        game: Any,
+        owners: Tensor | None = None,
+    ) -> "DecisionReachCache":
+        """Compact dense decision rows through the optional game boundary."""
+
+        if rows.ndim != 3 or rows.shape[0] != node_ids.numel():
+            raise ValueError("decision reach rows must have shape [D,P,X]")
+        if state_refs.shape != node_ids.shape:
+            raise ValueError("decision state refs must align with node ids")
+        compact = getattr(game, "compact_decision_reach", None)
+        payload = compact(state_refs, rows) if callable(compact) else rows
+        return cls(
+            node_ids=node_ids.to(torch.int32),
+            state_refs=state_refs.to(torch.int32),
+            payload=payload,
+            owners=None if owners is None else owners.to(torch.int32),
+        )
+
+    @classmethod
+    def from_reach_cache(
+        cls,
+        tree: TreeBatch,
+        reach: ReachCache,
+        policy: PolicyCache,
+        game: Any,
+    ) -> "DecisionReachCache":
+        """Materialize decision rows once, compact them, and release tree reaches."""
+
+        node_ids = policy.node_ids.to(torch.int32)
+        tree_rows = node_ids.to(device=tree.state_ref.device, dtype=torch.int64)
+        state_refs = tree.state_ref[tree_rows].to(torch.int32)
+        rows = reach.rows_for(tree, node_ids, game, policy).float()
+        owners = tree.owner[tree_rows].to(torch.int32)
+        return cls.from_rows(node_ids, state_refs, rows, game, owners)
+
+    def gather(self, rows: Tensor, game: Any) -> Tensor:
+        """Expand sampled decision rows to the backend's dense policy boundary."""
+
+        rows = rows.to(device=self.node_ids.device, dtype=torch.int64)
+        if isinstance(self.payload, Tensor):
+            return self.payload[rows]
+        expand = getattr(game, "expand_decision_reach", None)
+        if not callable(expand):
+            raise TypeError("game compacted decision reaches but cannot expand them")
+        return expand(self.payload, rows)

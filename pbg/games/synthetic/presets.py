@@ -37,33 +37,48 @@ def leduc() -> SyntheticDialConfig:
     )
 
 
-def dial(public_scale: int, private_scale: int, n_players: int) -> SyntheticDialConfig:
-    """Map positive integer dials to independently growing public/private games.
+def dial(card_scale: int, action_scale: int) -> SyntheticDialConfig:
+    """Return one point on the two-axis, two-player poker family.
 
-    ``public_scale`` adds betting rounds and raises. ``private_scale`` increases
-    the private hand size every other step and always expands the deck. Dial
-    rounds reveal no board cards, so changing the public dial does not change
-    the private type count.
+    ``card_scale`` grows the deck, hence both the private type space and every
+    board-chance support. ``action_scale`` grows the number of streets, the
+    raise cap (tree depth), and the raise-size menu (tree width). The rules and
+    one-card private-hand/showdown representation are otherwise unchanged.
+
+    The named anchors are exact: ``dial(1, 1) == kuhn()`` and
+    ``dial(2, 2) == leduc()``. At larger action scales, every betting round has
+    ``action_scale - 1`` distinct raise increments. At most four streets are
+    exposed, matching the intended poker depth axis.
     """
 
-    if public_scale < 1 or private_scale < 1:
-        raise ValueError("public_scale and private_scale must be positive")
-    if n_players < 2:
-        raise ValueError("n_players must be at least 2")
-    n_rounds = public_scale
-    board_per_round = (0,) * n_rounds
-    hand_size = 1 + (private_scale - 1) // 2
-    minimum_deck = n_players * hand_size + 1
-    target_deck = minimum_deck + 2 * private_scale
-    deck_size = target_deck + target_deck % 2
+    if card_scale < 1 or action_scale < 1:
+        raise ValueError("card_scale and action_scale must be positive")
+    if action_scale > 4:
+        raise ValueError("action_scale cannot exceed four poker streets")
+    deck_size = 3 if card_scale == 1 else 2 * card_scale + 2
+    n_suits = 1 if card_scale == 1 else 2
+    n_rounds = action_scale
+    board_per_round = (0,) + (1,) * (n_rounds - 1)
+    cards_needed = 2 + sum(board_per_round)
+    if cards_needed > deck_size:
+        raise ValueError(
+            "this card/action point cannot deal two private hands and its board"
+        )
+    option_count = max(1, action_scale - 1)
+    bases = tuple(action_scale * 2**round_index for round_index in range(n_rounds))
+    raise_sizes = tuple(
+        tuple(base * multiple for multiple in range(1, option_count + 1))
+        for base in bases
+    )
     return SyntheticDialConfig(
-        n_players=n_players,
+        n_players=2,
         deck_size=deck_size,
-        n_suits=2,
-        hand_size=hand_size,
+        n_suits=n_suits,
+        hand_size=1,
         n_rounds=n_rounds,
         board_per_round=board_per_round,
-        max_raises=public_scale,
-        bet_size=tuple(2 ** index for index in range(n_rounds)),
+        max_raises=action_scale,
+        bet_size=bases,
+        raise_sizes=raise_sizes,
         ante=1,
     )

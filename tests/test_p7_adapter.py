@@ -60,6 +60,23 @@ def test_adapter_composes_every_private_row_without_sampling_one():
     assert not torch.allclose(probability[:, 0], probability[:, -1])
 
 
+def test_allin_atom_targets_highest_currently_legal_denomination():
+    raw = _raw()
+    raw["type_logits"][:] = torch.tensor([[-100.0, -100.0, 100.0]])
+    raw["iota"].fill_(1.0)
+    ids = torch.arange(10, dtype=torch.int32)[None]
+    legal = torch.zeros((1, 10), dtype=torch.bool)
+    legal[0, CHECK_CALL] = True
+    legal[0, [4, 6, 7]] = True
+    probability = PokerPolicyAdapter(n_ticks=8).probabilities(raw, ids, legal)
+    assert probability[0, 7] == 1.0
+    assert torch.count_nonzero(probability[0, 2:7]) == 0
+    sampled = PokerPolicyAdapter(n_ticks=8).sample(
+        raw, ids, legal, torch.Generator().manual_seed(17)
+    )
+    assert sampled.tolist() == [7]
+
+
 def _advance_checks(engine, ref):
     while int(engine.owner_of(torch.tensor([ref], dtype=torch.int32))[0]) >= 0:
         ref = int(engine.step(torch.tensor([ref], dtype=torch.int32), torch.tensor([CHECK_CALL], dtype=torch.int32))[0])
@@ -67,7 +84,7 @@ def _advance_checks(engine, ref):
 
 
 def test_chance_draw_uses_only_profile_and_board_complement():
-    engine = NLHEEngine(PokerConfig(n_players=2, n_ticks=4))
+    engine = NLHEEngine(PokerConfig(n_players=2))
     game = PokerGame(engine, profile_sampler=object(), showdown_evaluator=object(), partition_adapter=object())
     chance = _advance_checks(engine, engine.new_hand(0))
     profiles = torch.tensor([[hand_index(0, 1), hand_index(2, 3)]], dtype=torch.int32)
@@ -94,7 +111,7 @@ class _FakeShowdown:
 
 
 def test_fixed_showdown_crosses_facade_and_uses_supplied_shares():
-    engine = NLHEEngine(PokerConfig(n_players=2, n_ticks=4))
+    engine = NLHEEngine(PokerConfig(n_players=2))
     fake = _FakeShowdown()
     game = PokerGame(engine, profile_sampler=object(), showdown_evaluator=fake, partition_adapter=object())
     ref = _advance_checks(engine, engine.new_hand(0))

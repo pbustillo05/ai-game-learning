@@ -33,6 +33,41 @@ def _stats(p_hat: torch.Tensor, v_hat: torch.Tensor, **metadata):
     )
 
 
+def test_completion_learning_view_releases_diagnostics_and_summarizes_quality() -> None:
+    stats = BatchedCompletionStats(
+        p_hat=torch.tensor([[[0.25, 0.75]]]),
+        v_hat=torch.tensor([[[2.0, -1.0]]]),
+        vvec_hat=torch.tensor([[-0.25]]),
+        u_hat=torch.tensor([1.75]),
+        n_eff=torch.tensor([7.0]),
+        equity_share=torch.zeros((1, 1, 2, 3)),
+        output_valid=torch.ones((1, 1, 2), dtype=torch.bool),
+        sample_count=torch.tensor([8]),
+        estimator_stddev=torch.tensor([[[0.2, 0.4]]]),
+    )
+    learning = stats.for_learning()
+    assert learning.p_hat is stats.p_hat and learning.v_hat is stats.v_hat
+    for field in (
+        "vvec_hat", "u_hat", "n_eff", "equity_share", "output_valid",
+        "sample_count", "estimator_stddev",
+    ):
+        assert getattr(learning, field) is None
+    assert learning.metadata["completion_min_n_eff"] == 7.0
+    assert learning.metadata["completion_max_estimator_stddev"] == pytest.approx(0.4)
+    with pytest.raises(RuntimeError, match="omit diagnostic moments"):
+        learning.row(0)
+
+
+def test_completion_learning_view_rejects_invalid_posterior_mass() -> None:
+    stats = BatchedCompletionStats(
+        p_hat=torch.tensor([[[0.25, 0.75]]]),
+        v_hat=torch.zeros((1, 1, 2)),
+        output_valid=torch.tensor([[[False, True]]]),
+    )
+    with pytest.raises(ValueError, match="posterior mass to invalid"):
+        stats.for_learning()
+
+
 def _posterior_shift_fixture():
     builder = TreeBuilder(1)
     root = builder.add_root(0, 0)
@@ -78,6 +113,10 @@ def test_single_child_baseline_is_old_value(lam: float) -> None:
     assert target.q_hat is None
     assert torch.allclose(target.a_hat[0, 0], torch.tensor([3.0, -5.0]))
     assert torch.allclose(target.v_hat[0], torch.tensor([4.0, -2.0]))
+    assert (
+        target.child_p_hat.untyped_storage().data_ptr()
+        == target.parent_p_hat.untyped_storage().data_ptr()
+    )
 
 
 def test_auxiliary_capture_precedes_player_bootstrap() -> None:
@@ -107,22 +146,17 @@ def test_auxiliary_capture_precedes_player_bootstrap() -> None:
     assert no_aux.aux == {}
 
 
-def test_chunking_matches_and_configuration_cap_is_loud() -> None:
+def test_frontier_byte_budget_is_loud() -> None:
     tree, stats, heads = _posterior_shift_fixture()
-    base = branched_value(
+    target = branched_value(
         tree, stats, None, heads, 0.95, _Game(), configured_node_budget=3,
-        max_resident_rows=100,
+        max_workspace_bytes=1 << 20,
     )
-    chunked = branched_value(
-        tree, stats, None, heads, 0.95, _Game(), configured_node_budget=3,
-        max_resident_rows=6,
-    )
-    for field in ("parent_p_hat", "child_p_hat", "a_hat", "v_hat"):
-        assert torch.equal(getattr(base, field), getattr(chunked, field))
-    with pytest.raises(ValueError, match="configured tree"):
+    assert torch.equal(target.parent_p_hat, torch.tensor([[0.5, 0.5]]))
+    with pytest.raises(MemoryError, match="byte budget"):
         branched_value(
             tree, stats, None, heads, 0.95, _Game(), configured_node_budget=3,
-            max_resident_rows=2,
+            max_workspace_bytes=1,
         )
 
 

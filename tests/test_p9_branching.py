@@ -87,16 +87,19 @@ def test_fixed_beta_one_has_the_sequential_terminal_law() -> None:
         game.n_types, game.n_player_events, {"n_buckets": 64, "hidden_dim": 8}
     )
     expected = _terminal_probabilities(game, net)
-    tree, _, _ = _sample(game, net, _cfg("fixed", 20_000), 907)
-    leaves = ((tree.owner == TERMINAL) | (tree.owner == PRETERM)).nonzero(
-        as_tuple=False
-    ).squeeze(1)
-    keys = game.encode_public(tree.state_ref[leaves]).numpy()
-    observed = np.asarray([(keys == key).sum() for key in expected], dtype=np.float64)
-    target = 20_000 * np.asarray(list(expected.values()))
+    iterations = 1_000
+    observed = np.zeros(len(expected), dtype=np.float64)
+    for iteration in range(iterations):
+        tree, _, _ = _sample(game, net, _cfg("fixed", 1), 907 + iteration)
+        leaves = ((tree.owner == TERMINAL) | (tree.owner == PRETERM)).nonzero(
+            as_tuple=False
+        ).squeeze(1)
+        keys = game.encode_public(tree.state_ref[leaves]).numpy()
+        observed += np.asarray([(keys == key).sum() for key in expected])
+        assert torch.equal(tree.nu, torch.ones_like(tree.nu))
+    target = iterations * np.asarray(list(expected.values()))
     # df=4 chi-square 0.001 upper critical value; H0 failure probability < .001.
     assert float((np.square(observed - target) / target).sum()) < 18.467
-    assert torch.equal(tree.nu, torch.ones_like(tree.nu))
 
 
 def test_labeled_leaf_measure_matches_exact_public_law_at_beta_three() -> None:
@@ -106,17 +109,21 @@ def test_labeled_leaf_measure_matches_exact_public_law_at_beta_three() -> None:
         game.n_types, game.n_player_events, {"n_buckets": 64, "hidden_dim": 8}
     )
     expected = _terminal_probabilities(game, net)
-    n_trees = 5_000
-    tree, _, _ = _sample(game, net, _cfg("fixed", n_trees, 3.0), 909)
-    leaves = ((tree.owner == TERMINAL) | (tree.owner == PRETERM)).nonzero(
-        as_tuple=False
-    ).squeeze(1)
-    keys = game.encode_public(tree.state_ref[leaves]).numpy()
-    weights = tree.path_weight[leaves]
-    observed = np.asarray(
-        [float(weights[torch.from_numpy(keys == key)].sum()) for key in expected]
-    )
-    target = n_trees * np.asarray(list(expected.values()))
+    iterations = 500
+    observed = np.zeros(len(expected), dtype=np.float64)
+    total_weight = 0.0
+    for iteration in range(iterations):
+        tree, _, _ = _sample(game, net, _cfg("fixed", 1, 3.0), 1909 + iteration)
+        leaves = ((tree.owner == TERMINAL) | (tree.owner == PRETERM)).nonzero(
+            as_tuple=False
+        ).squeeze(1)
+        keys = game.encode_public(tree.state_ref[leaves]).numpy()
+        weights = tree.path_weight[leaves]
+        observed += np.asarray(
+            [float(weights[torch.from_numpy(keys == key)].sum()) for key in expected]
+        )
+        total_weight += float(weights.sum())
+    target = iterations * np.asarray(list(expected.values()))
     # Importance-weighted labeled leaves retain the exact public terminal law.
     assert float((np.square(observed - target) / target).sum()) < 18.467
-    assert abs(float(weights.sum()) - n_trees) < 0.05
+    assert abs(total_weight - iterations) < 0.05

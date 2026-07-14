@@ -97,6 +97,11 @@ class PokerTensorStateStore:
         self.fold_line_meta = torch.zeros(
             (capacity, n_players, 8), dtype=torch.float32, device=self.device
         )
+        # Dependency anchor for folded-stat summaries. Ordinary player actions
+        # inherit it; a fold or street deal replaces it with the successor row.
+        self.partition_cache_key = torch.full(
+            (capacity,), -1, dtype=torch.int32, device=self.device
+        )
         self.size = torch.zeros((), dtype=torch.int32, device=self.device)
 
     def reset(self) -> None:
@@ -159,6 +164,7 @@ class PokerTensorStateStore:
             "fold_payoff",
             "board_at_fold",
             "fold_line_meta",
+            "partition_cache_key",
         ):
             value = getattr(self, name)
             value[dst] = value[src]
@@ -184,7 +190,7 @@ class PokerTensorStateStore:
         # Per-player fields: three fp32 commitments/stacks, one fp32 fold
         # payoff, one int8 status, and two bool flags.
         per_row = n_players * (4 * 4 + 1 + 1 + 1 + 5 + 8 * 4)
-        # Six int32 state/history-length fields, board, two public arithmetic
+        # Seven int32 state/history/cache fields, board, two public arithmetic
         # floats, two int32 parent/event links, and the lossless event payload.
-        per_row += 6 * 4 + 5 * 2 + 2 * 4 + 2 * 4 + 3 + 6 * 4
+        per_row += 7 * 4 + 5 * 2 + 2 * 4 + 2 * 4 + 3 + 6 * 4
         return capacity * per_row + 4  # allocation cursor

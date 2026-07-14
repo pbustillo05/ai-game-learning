@@ -14,6 +14,15 @@ from pbg.games.poker.model.incidence import IncidenceResidual
 from pbg.games.poker.model.primitives import FFN, LN, MHA
 
 
+def _require_device(condition: Tensor, message: str) -> None:
+    """Validate a scalar condition without synchronizing CUDA to the host."""
+
+    if condition.device.type == "cuda":
+        torch._assert_async(condition, message)
+    elif not bool(condition):
+        raise ValueError(message)
+
+
 @dataclass(frozen=True)
 class PokerModelConfig:
     """Configuration of the poker transformer and its output heads."""
@@ -306,8 +315,10 @@ class PreflopNet(nn.Module):
         if actor.shape != (batch,):
             raise ValueError("actor_seat must have shape [B]")
         actor = actor.to(device=device, dtype=torch.long)
-        if bool(((actor < 0) | (actor >= players)).any()):
-            raise ValueError("actor seat is outside the supplied seats")
+        _require_device(
+            ((actor >= 0) & (actor < players)).all(),
+            "actor seat is outside the supplied seats",
+        )
 
         seat_mask = _mask_value(masks, "seat_mask")
         if seat_mask is None:
@@ -316,8 +327,10 @@ class PreflopNet(nn.Module):
             seat_mask = torch.ones((batch, players), dtype=torch.bool, device=device)
         if seat_mask.shape != (batch, players) or seat_mask.dtype != torch.bool:
             raise TypeError("seat_mask must be bool [B,P]")
-        if not bool(seat_mask.gather(1, actor[:, None]).all()):
-            raise ValueError("the actor seat must be present")
+        _require_device(
+            seat_mask.gather(1, actor[:, None]).all(),
+            "the actor seat must be present",
+        )
 
         class_mask = _mask_value(masks, "class_mask")
         if class_mask is None:
@@ -332,8 +345,12 @@ class PreflopNet(nn.Module):
         if status is None:
             status = torch.zeros((batch, players), dtype=torch.long, device=device)
         status = status.to(device=device, dtype=torch.long)
-        if status.shape != (batch, players) or bool(((status < 0) | (status > 2)).any()):
+        if status.shape != (batch, players):
             raise ValueError("status must contain live/folded/all-in ids [B,P]")
+        _require_device(
+            ((status >= 0) & (status <= 2)).all(),
+            "status must contain live/folded/all-in ids [B,P]",
+        )
 
         class_ids = _mask_value(masks, "class_ids")
         if class_ids is None:
@@ -341,8 +358,12 @@ class PreflopNet(nn.Module):
         elif class_ids.ndim == 1:
             class_ids = class_ids[None, :].expand(batch, -1)
         class_ids = class_ids.to(device=device, dtype=torch.long)
-        if class_ids.shape != (batch, N_CLASSES) or bool(((class_ids < 0) | (class_ids >= N_CLASSES)).any()):
+        if class_ids.shape != (batch, N_CLASSES):
             raise ValueError("class_ids must have shape [169] or [B,169]")
+        _require_device(
+            ((class_ids >= 0) & (class_ids < N_CLASSES)).all(),
+            "class_ids must have shape [169] or [B,169]",
+        )
 
         supplied_embedding = _mask_value(masks, "class_embeddings")
         if supplied_embedding is not None:
@@ -547,7 +568,9 @@ class PreflopNet(nn.Module):
                 identical_scale,
             )
             normalized_x = layer_norm(x)
-            x_hat = x + attention(normalized_x, normalized_x, key_bias, key_mask)
+            x_hat = x + attention.forward_biased(
+                normalized_x, normalized_x, key_bias, key_mask
+            )
             dynamic = torch.cat(
                 (j, overlap_card * overlap_card, overlap_card * overlap_equal), dim=-1
             )

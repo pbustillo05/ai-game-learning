@@ -354,7 +354,9 @@ $\mathcal T=\{\operatorname{passive},\operatorname{call},\operatorname{raise}\}$
 with external legality mask; logits $\lambda_{\xi,t}=w_{\lambda,t}^\top
 z^T_{\xi,t}+b_{\lambda,t}$ and
 $\pi_T(t\mid \xi,\sigma)=\operatorname{softmax}_t(\lambda_{\xi,t}+\log M_{\mathcal T,t})$.
-Raise sizes on legal ticks $u_n=n/N(\sigma)$: mixture weights
+The default 100bb game has $N=200$ global 0.5bb raise-to denominations,
+$u_n=n/N$. A state supplies a legal subset $L(\sigma)$ rather than an affine
+subsample. Mixture weights
 $\omega_{\xi,m}=\operatorname{softmax}_m(w_\eta^\top z^R_{\xi,m}+b_\eta)$, locations
 $\mu_{\xi,m}=\operatorname{sigmoid}(w_\mu^\top z^R_{\xi,m}+b_\mu)$, scales
 $\sigma_{\xi,m}=\operatorname{softplus}(w_\sigma^\top z^R_{\xi,m}+b_\sigma)+\sigma_{\min}$,
@@ -364,10 +366,17 @@ $\iota_\xi=\operatorname{sigmoid}(w_\iota^\top z^T_{\xi,\operatorname{allin\_ctx
 $$
 \pi_R(n\mid \xi,\sigma)
 =
-\iota_\xi\mathbf 1[n=N(\sigma)]
-+(1-\iota_\xi)\sum_{m=1}^{M_R}\omega_{\xi,m}
-\operatorname{DLogisticTick}(n;N(\sigma),\mu_{\xi,m},\sigma_{\xi,m}).
+\iota_\xi\mathbf 1[n=\max L(\sigma)]
++(1-\iota_\xi)\frac{\mathbf 1[n\in L(\sigma)]}{C_{\xi,\sigma}}
+\sum_{m=1}^{M_R}\omega_{\xi,m}
+\operatorname{DLogisticTick}(n;N,\mu_{\xi,m},\sigma_{\xi,m}).
 $$
+
+$C_{\xi,\sigma}$ normalizes the logistic-mixture mass over the legal
+denominations. Thus the head remains a compact continuous density
+parameterization while sampling can select every fixed-denomination legal
+raise, and the all-in atom follows the spot's actual maximum rather than the
+global stack endpoint.
 
 Binomial ticks remain an ablation.
 

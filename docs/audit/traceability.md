@@ -5,14 +5,14 @@
 | Theoretical object | Intended semantics | Current code | Assessment |
 |---|---|---|---|
 | `SampleTerminal` | Sample one private profile and all public events through terminal reward | `pbg/core/normal.py`, shared sequential sampler, game-owned sampled terminal settlement | Implemented; resolved `AUD-001` |
-| Terminal empirical decision law | Pool player decisions with trajectory-length bias | `build_decision_alias` on one-path trees | Weight law would be correct, but no normal targets/loss |
+| Terminal empirical decision law | Pool player decisions with trajectory-length bias | `build_decision_alias` on trajectories | Weight law would be correct, but no normal targets/loss |
 | Sequential player-clock lambda return | Bootstrap only at later decisions of the same player | owner-only moment bootstrap in `branched_value` | Correct relative to `NOTATION.md`; TeX display needs correction (`AUD-021`) |
 | `SamplePreTerminal` | One private profile per root, carried along one public path; update all-type reaches | `_sample_trees_sequential` | Aligned in the current worktree |
-| `PreTerminalMC` | Collision-conditioned profile/runout completion; posterior and actor-type values | synthetic and poker completion backends | Semantically present; synthetic `exact` is MC; poker retains dead diagnostics |
-| `SequentialRaoBlackwellPG` | Integrate actor types using leaf posterior; pre-terminal one-path targets | sequential sampler + completion + `branched_value` + `rb_ppo` | Present, but implemented through branching-maximal storage |
+| `PreTerminalMC` | Collision-conditioned profile/runout completion; posterior and actor-type values | synthetic and poker completion backends | Semantically present; active training validates quality and retains only `p_hat`/`v_hat` |
+| `SequentialRaoBlackwellPG` | Integrate actor types using leaf posterior; pre-terminal one-path targets | sequential sampler + completion + `branched_value` + `rb_ppo` | Present; decision reaches compact after completion, while target layout remains shared with branching |
 | `SampleTree` | Randomized-rounded fixed offspring, public-mixture events, duplicate labels, fresh hidden event draws | `_sample_branched_labeled` | Probability law substantially aligned |
 | Branched decision law | Player nodes sampled by conditional path occupancy | `path_weight` + `build_decision_alias` | Aligned |
-| Branch independence | Fresh hidden draw and independent descendants/completion per abstract child | child-local profile samples and duplicate-preserving topology | Aligned; model forward is redundantly repeated |
+| Branch independence | Fresh hidden draw and independent descendants/completion per abstract child | child-local profile samples and duplicate-preserving topology | Aligned; policy/value forward runs once per unique parent |
 | `BranchedValue` | Average posterior mass and weighted moment; conditionalize at emission; leave-one-out baseline; owner bootstrap | `posterior_values.py` | Substantially aligned |
 | Branched PPO loss | child posterior for policy; parent posterior for value/entropy; uniform abstract-child average | `rb_ppo` | Aligned for the shipped fixed-beta PPO objective |
 | Fixed beta v1 | game-owned public-stage intensity, no learned controller | `beta_fn` in synthetic/poker backends | Aligned |
@@ -30,13 +30,20 @@ The sampler still maintains all-type reach rows so the curried policy sees the p
 
 Offspring are randomized-rounded and every child edge gets weight `1/K`. Parent-major append preserves duplicate events as separate nodes. Public event generation samples one posterior private profile per abstract edge. Player and chance edge reach updates are child-local. These properties match the corrected labeled-tree theory.
 
-The main algorithmic inefficiency is evaluation order: states are repeated by offspring before the policy forward, so identical parent outputs are recomputed. The hidden profile/event and reach update must be per edge; the policy/value forward does not.
+The sampler evaluates policy/value once per unique player parent, then gathers
+the tensor-structured output into child order. Hidden profiles, events, selected
+action likelihoods, and reach updates remain edge-local.
 
 ### Empirical node law
 
-For each stored player node, `path_weight` equals the product of uniform child probabilities on its prefix. Building one alias table over all decision nodes with those weights is equivalent to weighting each tree by its expected player-decision occupancy and then choosing a node within the tree. On sequential trees every path weight is one, reducing to pooling all sampled decisions.
+For each stored player node, `path_weight` equals the product of uniform child
+probabilities on its prefix. In the one branched tree, one alias table over all
+decision nodes implements the required occupancy law. On sequential
+trajectories every path weight is one, reducing to pooling sampled decisions.
 
-The probability law is correct. The alias implementation is not GPU-optimal because construction copies to CPU and uses Python/float64.
+The probability law is correct. The historical `AliasTable` API now stores the
+normalized categorical law and samples through device-local
+`torch.multinomial`; construction no longer copies through CPU/Python lists.
 
 ### Backward values
 
@@ -69,10 +76,11 @@ The consumer matches the sibling's current `pbg-v2` operation names and major te
 
 Completion includes folders in `dealt_mask`, and fold-terminal completion samples their blocker-conditioned hands even though payoff is public. This is correct for RB posterior mass.
 
-The folded partition law now receives folded rows only. Combined and per-folder
-facade calls provide the finite differences needed for `Lambda_B`, signed beta,
-pressure, and folder readout. A richer single-call DTO and event-keyed caching
-remain the performance/interface work tracked by `AUD-009` and `AUD-010`.
+The folded partition law now receives folded rows only. The evaluator-owned
+`pbg-folder-v1` call provides combined/per-folder finite differences, signed
+beta factors, pressure, deltas/covariances, and tight contraction. Compact
+model-ready summaries are cached by a dependency anchor inherited across
+ordinary actions and invalidated exactly by street/fold events (`AUD-009/010`).
 
 ## Poker model conformance matrix
 
@@ -95,7 +103,7 @@ remain the performance/interface work tracked by `AUD-009` and `AUD-010`.
 | Folder-corrected log reach `Lambda_B` | Implemented from evaluator finite differences |
 | Signed beta factor coordinates | Implemented from evaluator pair field |
 | Folder card-pressure channel | Implemented from per-folder evaluator fields |
-| Per-folder line/log-mass summary | Implemented; repeated facade calls await `AUD-009/010` |
+| Per-folder line/log-mass summary | Implemented through one versioned evaluator call and event-keyed cache (`AUD-009/010`) |
 | Folded-seat readout summary | Implemented |
 | Bilinear/order-3 side units | Implemented; optional public moments remain dormant |
 | Suit-consistency loss | Helper representation transforms exist; training loss is not wired |
@@ -109,18 +117,18 @@ remain the performance/interface work tracked by `AUD-009` and `AUD-010`.
 | `NOTATION.md` | Best current executable mathematical companion; explicitly corrects TeX typos |
 | `CONTRACTS.md` | Describes corrected RB v1, not the requested three-mode product; several moved-path references stale |
 | `pbg/core/rollout.py` | Correct efficient sequential RB sampling; no normal path; capacity-sized reach allocation |
-| `pbg/core/branching.py` | Correct labeled fixed branching; repeats model forwards per child; no byte planner |
-| `pbg/core/posterior_values.py` | Corrected mass/moment semantics; chunking does not bound end-to-end peak |
-| `pbg/core/losses.py` | Correct minimal RB-PPO weighting; only one composite; some dead primitives/config |
-| `pbg/core/tree.py` | Sound topology invariants; poker recompute uses child-state chance replay; alias construction host-bound |
-| `pbg/core/training.py` | Small complete loop; retains transients; no normal mode, resume, memory planning, or mode-specialized data |
-| `pbg/games/synthetic/family.py` | Useful small finite game oracle; dial is not NLHE spectrum; public/core preterminal semantics differ |
-| `pbg/games/synthetic/model.py` | Fine baseline MLP; hash collisions on shipped dial; not MHA-conforming |
+| `pbg/core/branching.py` | Correct labeled fixed branching with unique-parent model forwards; no byte planner |
+| `pbg/core/posterior_values.py` | Corrected mass/moment semantics; byte-planned streamed completion feeds a contracted-tree `P/M` frontier |
+| `pbg/core/losses.py` | Correct minimal RB-PPO weighting; normal/RB composites explicitly select MSE or clipped value loss |
+| `pbg/core/tree.py` | Sound topology invariants; poker recompute uses child-state chance replay; post-completion decision reaches have a game-owned compact boundary; decision sampling is device-local |
+| `pbg/core/training.py` | All three modes and identity-checked resume; one branched tree/rank; completion/leaf/full-reach/frozen-model/topology transients end before optimization |
+| `pbg/games/synthetic/family.py` | Useful small finite game oracle; exactly two public dials grow card/chance and action width/depth with exact Kuhn/Leduc anchors; deliberately not advertised as literal NLHE convergence |
+| `pbg/games/synthetic/model.py` | Scaled reach-biased MHA with action anchors, exact finite-card incidence, folded pressure, and policy-consistent exact export; MLP retained only as explicit baseline |
 | `pbg/games/synthetic/bundle.py` | MC completion only, including backend named `exact`; Python-loop implementation |
-| `pbg/games/poker/engine.py` | Broad public NLHE mechanics and side-pot coefficients; action space remains discretized float grid |
-| `pbg/games/poker/rollout_backend.py` | Tensor-native state transitions, lossless public history, fold snapshots, and evaluator calls; summary caching remains open |
+| `pbg/games/poker/engine.py` | Broad public NLHE mechanics, side-pot coefficients, and complete 0.5bb fixed-denomination raise set |
+| `pbg/games/poker/rollout_backend.py` | Tensor-native state transitions, lossless public history, fold snapshots, exact street/fold partition cache, and ragged live-seat decision reaches |
 | `pbg/games/poker/model/*` | MHA-conforming paths and exact bounded-memory attention; H100 ceilings remain unmeasured |
-| `pbg/games/poker/mc.py` | Current `pbg-v2` boundary substantially correct; consumer retains more output than active loss needs |
+| `pbg/games/poker/mc.py` | Current `pbg-v2` boundary substantially correct; full evaluator DTO is validated, quality-summarized, and collapsed before target construction |
 | `pbg/games/poker/folded.py` | Folded-only neutral adapter with exact no-folder identity and combined/per-folder fields; single-call facade extension remains desirable |
 | `configs/train/nlhe6.yaml` + `configs/hardware/*` | Scientific/execution split complete; Quest H100 ceilings remain open (`AUD-005`) |
-| `tests/` | Strong local shape/contract coverage; lacks requested mode, scale, MHA conformance, and performance gates |
+| `tests/` | Strong local shape/contract coverage, synthetic MHA conformance checks, and device/workload-matched performance-gate logic; hardware baselines remain device-local artifacts |

@@ -55,7 +55,7 @@ def _sample_trees_sequential(
 ) -> tuple[TreeBatch, ReachCache, PolicyCache] | tuple[
     TreeBatch, ReachCache, PolicyCache, Tensor
 ]:
-    """Sample sequential public trees with one private profile per root."""
+    """Sample public trajectories with one private profile per trajectory."""
 
     backend = bundle.rollout_backend
     rollout_cfg = getattr(cfg, "rollout", cfg)
@@ -219,7 +219,7 @@ def sample_trees(
     cfg: Any,
     gen: torch.Generator,
 ) -> tuple[TreeBatch, ReachCache, PolicyCache]:
-    """Sample sequential or fixed-intensity labeled trees."""
+    """Sample trajectories for sequential RB or one tree for branched RB."""
 
     rollout_cfg = getattr(cfg, "rollout", cfg)
     training = getattr(cfg, "training", None)

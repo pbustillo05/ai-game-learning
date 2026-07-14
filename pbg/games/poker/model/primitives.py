@@ -320,3 +320,14 @@ class MHA(nn.Module):
                 )
         merged = attended.transpose(1, 2).reshape(q.shape[0], q.shape[1], self.d_model)
         return self.w_o(merged)
+
+    def forward_biased(
+        self,
+        q: Tensor,
+        kv: Tensor,
+        key_bias: Tensor,
+        key_mask: Tensor,
+    ) -> Tensor:
+        """Explicit steady-state entry point for reach-biased attention."""
+
+        return self(q, kv, key_bias, key_mask)

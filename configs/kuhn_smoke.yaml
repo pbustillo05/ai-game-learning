@@ -20,9 +20,8 @@ completion:
   n_samples: 256
   backend: exact
 model:
-  n_buckets: 128
+  architecture: mha
   hidden_dim: 32
-  e_max: 3
 loss:
   name: rb_ppo
   lam: 0.95
@@ -31,7 +30,7 @@ loss:
   c_v: 0.5
   c_h: 0.01
   entropy_schedule: const
-  use_suit_consistency: false
+  value_loss: clipped
 training:
   mode: rao_blackwell
   iters: 300
@@ -44,4 +43,4 @@ training:
   seed: 7
   checkpoint_every: 25
   out_dir: runs/kuhn_smoke
-debug_asserts: true
+  reproducibility: strict

@@ -35,7 +35,7 @@ def _check_call(game: NLHEEngine, ref: int) -> int:
 
 
 def test_blinds_action_order_limp_fold_and_button_rotation() -> None:
-    game = NLHEEngine(PokerConfig(n_players=3, n_ticks=5))
+    game = NLHEEngine(PokerConfig(n_players=3))
     root = int(game.root_states(1)[0])
     assert game.states.button[root] == 0
     assert game.states.committed_street[root] == (0.0, 0.5, 1.0)
@@ -65,16 +65,22 @@ def test_blinds_action_order_limp_fold_and_button_rotation() -> None:
 
 
 def test_heads_up_order_minimum_raise_grid_and_fold_payoff() -> None:
-    game = NLHEEngine(PokerConfig(n_players=2, stack_bb=20.0, n_ticks=5))
+    game = NLHEEngine(PokerConfig(n_players=2, stack_bb=20.0))
     root = int(game.root_states(1)[0])
     assert game.states.committed_street[root] == (0.5, 1.0)
     assert game.states.actor[root] == 0  # button/small blind first preflop
     targets = game.raise_targets(torch.tensor([root], dtype=torch.int32))[0]
-    assert torch.equal(targets, torch.tensor([2.0, 6.5, 11.0, 15.5, 20.0]))
-    raised = _step(game, root, RAISE_OFFSET)
+    _, legal = game.legal_events(torch.tensor([root], dtype=torch.int32))
+    assert torch.equal(
+        targets[legal[0, RAISE_OFFSET:]], torch.arange(2.0, 20.5, 0.5)
+    )
+    raised = _step(game, root, RAISE_OFFSET + 3)
     assert game.states.current_bet[raised] == pytest.approx(2.0)
     assert game.states.last_full_raise[raised] == pytest.approx(1.0)
-    assert game.raise_targets(torch.tensor([raised], dtype=torch.int32))[0, 0] == 3.0
+    _, legal = game.legal_events(torch.tensor([raised], dtype=torch.int32))
+    assert game.raise_targets(torch.tensor([raised], dtype=torch.int32))[0][
+        legal[0, RAISE_OFFSET:]
+    ][0] == 3.0
 
     folded = _step(game, raised, FOLD)
     assert int(game.owner_of(torch.tensor([folded], dtype=torch.int32))[0]) == TERMINAL
@@ -82,8 +88,23 @@ def test_heads_up_order_minimum_raise_grid_and_fold_payoff() -> None:
     assert torch.equal(reward, torch.tensor([[1.0, -1.0]]))
 
 
+def test_default_denomination_exposes_every_half_blind_raise_amount() -> None:
+    cfg = PokerConfig(n_players=2)
+    assert cfg.n_ticks == 200
+    game = NLHEEngine(cfg)
+    root = game.root_states(1)
+    targets = game.raise_targets(root)[0]
+    _, legal = game.legal_events(root)
+    assert torch.equal(targets, torch.arange(0.5, 100.5, 0.5))
+    assert torch.equal(
+        targets[legal[0, RAISE_OFFSET:]], torch.arange(2.0, 100.5, 0.5)
+    )
+    with pytest.raises(ValueError, match="integer multiple"):
+        PokerConfig(chip_unit_bb=0.3)
+
+
 def test_short_all_in_does_not_reopen_prior_actors() -> None:
-    game = NLHEEngine(PokerConfig(n_players=3, stack_bb=100.0, n_ticks=4))
+    game = NLHEEngine(PokerConfig(n_players=3, stack_bb=100.0))
     # A public fixture with unequal effective stacks: seats 0 and 1 have acted
     # at 8, while seat 2 can only raise all-in to 10, short of the last full
     # raise size 7.  Seat 0 must still respond, but cannot re-raise.
@@ -107,8 +128,9 @@ def test_short_all_in_does_not_reopen_prior_actors() -> None:
         )
     )
     _, legal = game.legal_events(torch.tensor([ref], dtype=torch.int32))
-    assert legal[0, RAISE_OFFSET:].tolist() == [False, False, False, True]
-    short = _step(game, ref, RAISE_OFFSET + 3)
+    assert int(legal[0, RAISE_OFFSET:].sum()) == 1
+    assert legal[0, RAISE_OFFSET + 19]
+    short = _step(game, ref, RAISE_OFFSET + 19)
     assert game.states.status[short][2] == ALL_IN
     assert game.states.actor[short] == 0
     _, legal = game.legal_events(torch.tensor([short], dtype=torch.int32))
@@ -117,9 +139,9 @@ def test_short_all_in_does_not_reopen_prior_actors() -> None:
 
 
 def test_scripted_multiway_all_in_closes_at_runout_preterminal() -> None:
-    game = NLHEEngine(PokerConfig(n_players=3, stack_bb=10.0, n_ticks=5))
+    game = NLHEEngine(PokerConfig(n_players=3, stack_bb=10.0))
     ref = int(game.root_states(1)[0])
-    ref = _step(game, ref, RAISE_OFFSET + 4)
+    ref = _step(game, ref, RAISE_OFFSET + game.n_ticks - 1)
     assert game.states.status[ref][0] == ALL_IN
     ref = _check_call(game, ref)
     assert game.states.status[ref][1] == ALL_IN
@@ -133,7 +155,7 @@ def test_scripted_multiway_all_in_closes_at_runout_preterminal() -> None:
 
 
 def test_check_down_transitions_and_showdown_preterminal() -> None:
-    game = NLHEEngine(PokerConfig(n_players=2, n_ticks=3))
+    game = NLHEEngine(PokerConfig(n_players=2))
     ref = int(game.root_states(1)[0])
     # Preflop call/check, then three checked streets.
     ref = _check_call(game, ref)

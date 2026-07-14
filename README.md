@@ -11,14 +11,17 @@ implemented project.
 
 ## What is implemented
 
-- Strict configuration, explicit RNGs, deterministic checkpointing, AMP, and
-  gradient-only DDP.
+- Strict configuration, explicit RNGs, configurable reproducibility profiles,
+  resumable checkpoints, AMP, and gradient-only DDP.
 - Device-resident sequential and fixed-intensity public-tree rollout.
 - Duplicate-preserving labeled branching with randomized-rounded offspring.
 - Monte Carlo leaf completion and posterior-moment backward propagation.
 - Rao–Blackwellized PPO over all actor private types.
 - Configurable synthetic games, Kuhn and Leduc presets, exact posteriors, best
-  responses, and exploitability.
+  responses, exploitability, and scaled reach-biased MHA models (with an
+  explicit MLP baseline).
+- Comparative three-mode phase/throughput/memory profiling with same-device
+  regression gates.
 - A public NLHE engine with correct betting, short-all-in reopening, chance
   transitions, side pots, and affine chip-payoff assembly.
 - Preflop 169-class and compact postflop 1326-combo transformer models.
@@ -37,7 +40,7 @@ read-only under `pbg/eval/`.
 The active training pipeline is:
 
 ```text
-frozen model -> sampled public trees -> leaf completion
+frozen model -> sampled trajectories or one tree/rank -> leaf completion
              -> posterior P/M backward pass -> aligned decision minibatches
              -> posterior-weighted clipped policy + value + entropy update
 ```
@@ -74,7 +77,7 @@ Complete presets are provided in `configs/`:
 
 - `kuhn_smoke.yaml` — small sequential Kuhn run.
 - `leduc.yaml` — fixed-intensity Leduc branching.
-- `synthetic_dial_example.yaml` — scalable three-player synthetic example.
+- `synthetic_dial_example.yaml` — scalable two-player synthetic example.
 - `train/nlhe6.yaml` — hardware-independent six-player NLHE settings; combine
   with a profile under `configs/hardware/`.
 
@@ -106,7 +109,10 @@ must always be selected explicitly with `--hardware-profile quest_slurm`.
 
 Training writes append-only `metrics.jsonl` rows and atomic checkpoints to the
 configured output directory. Checkpoints contain model, optimizer, gradient
-scaler, configuration, iteration, and explicit Torch/NumPy RNG state.
+scaler, configuration, iteration, stable run identity, and per-rank explicit
+Torch/NumPy RNG state. Resume the same run with `--resume
+runs/.../ckpt_XXXXXXX.pt`; identity, configuration, world size, schedule, and
+the metrics prefix are validated before appending.
 
 For DDP, launch the same code with `torchrun`. Tree and minibatch sizes are per
 rank. Before CUDA work on a shared server, inspect `nvidia-smi`, use only an

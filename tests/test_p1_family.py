@@ -7,7 +7,7 @@ import torch
 from pbg.core.game import CHANCE, TERMINAL
 from pbg.games.synthetic.exact import enumerate_public_tree
 from pbg.games.synthetic.family import CHECK_CALL, FOLD, RAISE, SyntheticPBG
-from pbg.games.synthetic.presets import kuhn, leduc
+from pbg.games.synthetic.presets import dial, kuhn, leduc
 
 
 def _step(game: SyntheticPBG, ref: int, event: int) -> int:
@@ -71,7 +71,7 @@ def test_private_deals_legality_and_chance_rows_are_valid() -> None:
         elif owner != TERMINAL:
             legal = set(ids[0, mask[0]].tolist())
             assert CHECK_CALL in legal
-            assert legal <= {FOLD, CHECK_CALL, RAISE}
+            assert legal <= set(range(game.n_player_events))
 
 
 def test_leduc_preterminal_is_final_chance_prefix_not_fold_terminal() -> None:
@@ -94,6 +94,22 @@ def test_leduc_preterminal_is_final_chance_prefix_not_fold_terminal() -> None:
     fold_terminal = _step(game, _step(game, root, RAISE), FOLD)
     assert bool(game.is_terminal(torch.tensor([fold_terminal], dtype=torch.int32))[0])
     assert not bool(game.is_pre_terminal(torch.tensor([fold_terminal], dtype=torch.int32))[0])
+
+
+def test_action_axis_adds_distinct_raise_choices_without_chance_id_collisions() -> None:
+    game = SyntheticPBG(dial(card_scale=2, action_scale=3))
+    root = int(game.root_states(1)[0])
+    ids, mask = game.legal_events(torch.tensor([root], dtype=torch.int32))
+    legal = ids[0, mask[0]].tolist()
+    assert legal == [CHECK_CALL, RAISE, RAISE + 1]
+    small = game.states.state(_step(game, root, RAISE))
+    large = game.states.state(_step(game, root, RAISE + 1))
+    assert large.committed[0] > small.committed[0]
+
+    chance = _step(game, _step(game, root, CHECK_CALL), CHECK_CALL)
+    chance_ids, chance_mask = game.legal_events(torch.tensor([chance], dtype=torch.int32))
+    assert (chance_ids[0, chance_mask[0]] >= game.chance_event_offset).all()
+    assert game.chance_event_offset == game.n_player_events
 
 
 def test_rewards_are_zero_sum_on_10k_random_terminal_completions() -> None:
@@ -154,4 +170,3 @@ def test_reach_update_matches_direct_action_and_collision_numerators() -> None:
             assert torch.isneginf(chance_updated[0, :, xtype]).all()
         else:
             assert torch.equal(chance_updated[0, :, xtype], log_reach[0, :, xtype])
-

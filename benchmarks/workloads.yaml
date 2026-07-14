@@ -1,0 +1,32 @@
+schema: pbg-benchmark-workloads-v1
+workloads:
+  - name: kuhn_cpu
+    config: configs/kuhn_smoke.yaml
+    device: cpu
+    modes: [normal, rao_blackwell, branched_rao_blackwell]
+    args: [--n-trees, "512", --node-budget, "512", --completion-samples, "256"]
+  - name: leduc_cpu
+    config: configs/leduc.yaml
+    device: cpu
+    modes: [normal, rao_blackwell, branched_rao_blackwell]
+    args: [--n-trees, "128", --node-budget, "131072", --completion-samples, "128"]
+  - name: dial_3x2_cpu
+    config: configs/synthetic_dial_example.yaml
+    device: cpu
+    modes: [normal, rao_blackwell, branched_rao_blackwell]
+    args: [--n-trees, "64", --node-budget, "131072", --completion-samples, "128"]
+  - name: nlhe_tiny_cuda
+    config: configs/benchmarks/nlhe_hu_short.yaml
+    hardware_profile: local_3x2080ti
+    device: cuda
+    args: [--n-trees, "1", --node-budget, "256", --completion-samples, "8", --minibatch-size, "2", --gd-steps, "1"]
+  - name: nlhe_medium_cuda
+    config: configs/train/nlhe6.yaml
+    hardware_profile: local_3x2080ti
+    device: cuda
+    args: [--n-trees, "1", --node-budget, "512", --completion-samples, "16", --minibatch-size, "4", --gd-steps, "1"]
+  - name: nlhe6_production_chunk_cuda
+    config: configs/train/nlhe6.yaml
+    hardware_profile: quest_slurm
+    device: cuda
+    readiness_gate: AUD-005

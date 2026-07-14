@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from pbg.core.losses import l_clip, rb_ppo
+from pbg.core.losses import l_clip, l_v, l_v_clip, rb_ppo
 from pbg.core.minibatch import MinibatchSample
 from pbg.core.values import NodeTargets
 from pbg.games.synthetic.model import PolicyOutput, SyntheticPolicyAdapter
@@ -89,3 +89,18 @@ def test_composite_masks_padding_and_identity_metrics() -> None:
     assert metrics["approx_kl"] == 0.0
     assert metrics["clip_frac"] == 0.0
     assert metrics["ratio_max"] == 1.0
+
+
+def test_value_loss_control_selects_a_traceably_different_objective() -> None:
+    logits, adapter, _, sample, cfg = _fixture()
+    output = PolicyOutput(logits, torch.tensor([[0.3, -0.1]], dtype=logits.dtype))
+    sample.old_v.zero_()
+    mse, _ = l_v(output, sample, sample, adapter, cfg)
+    clipped, _ = l_v_clip(output, sample, sample, adapter, cfg)
+    assert not torch.equal(mse, clipped)
+
+    cfg.value_loss = "mse"
+    mse_composite, _ = rb_ppo(output, sample, sample, adapter, cfg)
+    cfg.value_loss = "clipped"
+    clipped_composite, _ = rb_ppo(output, sample, sample, adapter, cfg)
+    assert mse_composite != clipped_composite

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping
 
 import numpy as np
@@ -22,10 +22,12 @@ CHANCE_EVENT_OFFSET = 3
 
 @dataclass(frozen=True)
 class SyntheticDialConfig:
-    """Configure a finite limit-betting card game.
+    """Configure a finite capped, discrete-raise card game.
 
     ``board_per_round[i]`` cards are revealed as one chance event immediately
-    before betting round ``i``. Private hands use colexicographic type indices.
+    before betting round ``i``. ``raise_sizes[i]`` supplies the legal raise
+    increments in round ``i``; omitted rows use the legacy singleton
+    ``bet_size``. Private hands use colexicographic type indices.
     """
 
     n_players: int
@@ -36,6 +38,7 @@ class SyntheticDialConfig:
     board_per_round: tuple[int, ...]
     max_raises: int
     bet_size: tuple[int, ...]
+    raise_sizes: tuple[tuple[int, ...], ...] | None = None
     ante: int = 1
 
     def __post_init__(self) -> None:
@@ -43,6 +46,12 @@ class SyntheticDialConfig:
 
         object.__setattr__(self, "board_per_round", tuple(self.board_per_round))
         object.__setattr__(self, "bet_size", tuple(self.bet_size))
+        raise_sizes = self.raise_sizes
+        if raise_sizes is None:
+            raise_sizes = tuple((size,) for size in self.bet_size)
+        else:
+            raise_sizes = tuple(tuple(round_sizes) for round_sizes in raise_sizes)
+        object.__setattr__(self, "raise_sizes", raise_sizes)
         if self.n_players < 2:
             raise ValueError("n_players must be at least 2")
         if self.deck_size <= 0 or self.n_suits <= 0:
@@ -59,6 +68,16 @@ class SyntheticDialConfig:
             raise ValueError("board_per_round must start with zero and be nonnegative")
         if len(self.bet_size) != self.n_rounds or any(size <= 0 for size in self.bet_size):
             raise ValueError("bet_size must contain one positive size per round")
+        if len(raise_sizes) != self.n_rounds or any(not sizes for sizes in raise_sizes):
+            raise ValueError("raise_sizes must contain one nonempty row per round")
+        if any(
+            not all(size > 0 for size in sizes)
+            or tuple(sorted(set(sizes))) != sizes
+            for sizes in raise_sizes
+        ):
+            raise ValueError("each raise_sizes row must be positive, unique, and increasing")
+        if tuple(sizes[0] for sizes in raise_sizes) != self.bet_size:
+            raise ValueError("bet_size must equal the first raise size in each round")
         if self.max_raises < 0 or self.ante < 0:
             raise ValueError("max_raises and ante must be nonnegative")
         cards_needed = self.n_players * self.hand_size + sum(self.board_per_round)
@@ -162,6 +181,9 @@ class SyntheticPBG:
         self._hand_to_type = {hand: index for index, hand in enumerate(self.hands)}
         self._hand_sets = tuple(frozenset(hand) for hand in self.hands)
 
+        self.n_player_events = 2 + max(len(sizes) for sizes in cfg.raise_sizes)
+        self.chance_event_offset = self.n_player_events
+
         chance_sizes = {count for count in cfg.board_per_round if count > 0}
         self._chance_combos: dict[int, tuple[tuple[int, ...], ...]] = {}
         self._chance_event_to_cards: dict[int, dict[int, tuple[int, ...]]] = {}
@@ -170,13 +192,12 @@ class SyntheticPBG:
             combos.sort(key=colex_index)
             self._chance_combos[count] = tuple(combos)
             self._chance_event_to_cards[count] = {
-                CHANCE_EVENT_OFFSET + colex_index(combo): combo for combo in combos
+                self.chance_event_offset + colex_index(combo): combo for combo in combos
             }
         self.e_max = max(
-            [N_PLAYER_EVENTS]
+            [self.n_player_events]
             + [math.comb(cfg.deck_size, count) for count in chance_sizes]
         )
-        self.n_player_events = N_PLAYER_EVENTS
 
         self.states = StateTable(cfg.n_players, sum(cfg.board_per_round))
         self.state_table = self.states
@@ -260,7 +281,7 @@ class SyntheticPBG:
             count = self.cfg.board_per_round[self.states.round[ref]]
             board = {card for card in self.states.board[ref] if card >= 0}
             return [
-                CHANCE_EVENT_OFFSET + colex_index(combo)
+                self.chance_event_offset + colex_index(combo)
                 for combo in self._chance_combos[count]
                 if board.isdisjoint(combo)
             ]
@@ -271,7 +292,10 @@ class SyntheticPBG:
         if facing:
             events.insert(0, FOLD)
         if self.states.raises_this_round[ref] < self.cfg.max_raises:
-            events.append(RAISE)
+            events.extend(
+                RAISE + index
+                for index in range(len(self.cfg.raise_sizes[self.states.round[ref]]))
+            )
         return events
 
     def legal_events(self, state_refs: Tensor) -> tuple[Tensor, Tensor]:
@@ -371,8 +395,8 @@ class SyntheticPBG:
             contributions[actor] = current_bet
             committed[actor] += payment
             acted[actor] = True
-        elif event == RAISE:
-            target = current_bet + self.cfg.bet_size[state.round]
+        elif RAISE <= event < RAISE + len(self.cfg.raise_sizes[state.round]):
+            target = current_bet + self.cfg.raise_sizes[state.round][event - RAISE]
             payment = target - contributions[actor]
             contributions[actor] = target
             committed[actor] += payment
@@ -384,7 +408,7 @@ class SyntheticPBG:
         live_tuple = tuple(live)
         next_state = _State(
             round=state.round,
-            raises_this_round=state.raises_this_round + int(event == RAISE),
+            raises_this_round=state.raises_this_round + int(event >= RAISE),
             to_act=self._next_live(live_tuple, actor) if sum(live_tuple) > 1 else -1,
             committed=tuple(committed),
             live=live_tuple,
@@ -687,7 +711,25 @@ class SyntheticRolloutBackend:
     def policy_forward(self, frozen_model: Any, states: Tensor, reach: Tensor) -> Any:
         """Evaluate all private types at player states ``[B]``."""
 
-        del reach
+        if states.numel() > 1:
+            unique, inverse = torch.unique(states, sorted=True, return_inverse=True)
+            if unique.numel() < states.numel():
+                order = torch.argsort(states)
+                sorted_states = states[order]
+                first_mask = torch.ones_like(sorted_states, dtype=torch.bool)
+                first_mask[1:] = sorted_states[1:] != sorted_states[:-1]
+                first = order[first_mask]
+                compact = self.policy_forward(
+                    frozen_model, states[first], reach[first]
+                )
+                replacements = {
+                    name: value[inverse]
+                    for name in compact.__dataclass_fields__
+                    if isinstance((value := getattr(compact, name)), Tensor)
+                    and value.ndim > 0
+                    and value.shape[0] == unique.numel()
+                }
+                return replace(compact, **replacements)
         legal_ids, legal_mask = self.legal_events(states)
         width = int(getattr(frozen_model, "e_max", self.game.n_player_events))
         head_mask = torch.zeros(
@@ -695,7 +737,23 @@ class SyntheticRolloutBackend:
         )  # [B,E]
         rows = torch.arange(states.shape[0], device=self.device)[:, None].expand_as(legal_ids)
         head_mask[rows[legal_mask], legal_ids[legal_mask].to(torch.int64)] = True
-        return frozen_model(self.game.encode_public(states), head_mask)
+        kwargs: dict[str, Tensor] = {}
+        if getattr(frozen_model, "uses_reach_context", False):
+            refs, _ = self.game._refs(states)
+            kwargs = {
+                "reach": reach,
+                "actor": torch.tensor(
+                    [self.game.states.to_act[ref] for ref in refs],
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+                "live": torch.tensor(
+                    [self.game.states.live[ref] for ref in refs],
+                    dtype=torch.bool,
+                    device=self.device,
+                ),
+            }
+        return frozen_model(self.game.encode_public(states), head_mask, **kwargs)
 
     def plan_policy_batches(
         self, model: Any, states: Tensor, phase: str

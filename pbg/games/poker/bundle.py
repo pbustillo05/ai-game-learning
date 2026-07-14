@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 import torch
@@ -223,6 +223,22 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
         )
 
 
+def validate_config(cfg: RootConfig) -> None:
+    """Validate poker-owned game and model mappings without building them."""
+
+    values = dict(cfg.game.poker or {})
+    unknown = sorted(
+        set(values) - {field.name for field in fields(PokerConfig) if field.init}
+    )
+    if unknown:
+        raise ValueError(f"root.game.poker.{unknown[0]}: unknown configuration key")
+    try:
+        PokerConfig(**values)
+        PokerModelConfig.from_dict(cfg.model)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"root poker configuration: {exc}") from exc
+
+
 def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     """Construct one owning poker model and its device-resident backends."""
 
@@ -239,7 +255,7 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
                 )
     adapter = PokerPolicyAdapter(engine_cfg.n_ticks)
     profiles = PokerGPURejectionSampler(backend=cfg.completion.backend)
-    partition = PokerGPUPartitionAdapter()
+    partition = PokerGPUPartitionAdapter(beta_rank=model_cfg.folder_beta_rank)
     plan = estimate_rollout_memory(
         n_trees=cfg.rollout.n_trees,
         node_budget=cfg.rollout.node_budget,

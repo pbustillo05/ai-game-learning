@@ -10,6 +10,7 @@ import yaml
 
 from pbg.core.config import ConfigError, load_config, seed_all
 from pbg.core.logging_util import MetricsLogger
+from pbg.core.training import _configure_reproducibility
 
 
 ROOT = Path(__file__).parents[1]
@@ -22,10 +23,11 @@ def test_kuhn_smoke_loads_every_config_field() -> None:
     assert cfg.rollout.beta_fix == {"default": 1.0}
     assert cfg.completion.n_samples == 256
     assert cfg.completion.backend == "exact"
-    assert cfg.model["n_buckets"] == 128
+    assert cfg.model == {"architecture": "mha", "hidden_dim": 32}
     assert cfg.loss.lam == pytest.approx(0.95)
+    assert cfg.loss.value_loss == "clipped"
     assert cfg.train.adam_betas == (0.9, 0.999)
-    assert cfg.debug_asserts is True
+    assert cfg.train.reproducibility == "strict"
 
 
 def test_hardware_profile_is_composed_without_changing_scientific_config() -> None:
@@ -46,6 +48,61 @@ def test_unknown_nested_key_reports_full_path(tmp_path: Path) -> None:
     path = tmp_path / "bad.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ConfigError, match=r"root\.rollout\.surprise"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "pattern"),
+    [
+        ("game.synthetic", "mispelled_ante", r"root\.game\.synthetic\.mispelled_ante"),
+        ("model", "e_max", r"unknown synthetic model configuration key: e_max"),
+    ],
+)
+def test_game_owned_mappings_reject_unknown_keys(
+    tmp_path: Path, section: str, key: str, pattern: str
+) -> None:
+    raw = yaml.safe_load((ROOT / "configs" / "kuhn_smoke.yaml").read_text())
+    target = raw
+    for component in section.split("."):
+        target = target[component]
+    target[key] = 3
+    path = tmp_path / "bad_owned.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match=pattern):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "pattern"),
+    [
+        ("game.poker", "stacks_bb", r"root\.game\.poker\.stacks_bb"),
+        ("model", "unknown_head", r"unknown poker model configuration key"),
+    ],
+)
+def test_poker_owned_mappings_are_strict_at_top_level_load(
+    tmp_path: Path, section: str, key: str, pattern: str
+) -> None:
+    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
+    target = raw
+    for component in section.split("."):
+        target = target[component]
+    target[key] = 3
+    path = tmp_path / "bad_poker_owned.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match=pattern):
+        load_config(path)
+
+
+@pytest.mark.parametrize("field", ["debug_asserts", "use_suit_consistency"])
+def test_removed_noop_controls_are_rejected(tmp_path: Path, field: str) -> None:
+    raw = yaml.safe_load((ROOT / "configs" / "kuhn_smoke.yaml").read_text())
+    if field == "debug_asserts":
+        raw[field] = True
+    else:
+        raw["loss"][field] = True
+    path = tmp_path / "noop.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match=field):
         load_config(path)
 
 
@@ -84,6 +141,42 @@ def test_seed_all_returns_repeatable_explicit_generators() -> None:
     assert np.array_equal(draw_numpy_a, draw_numpy_b)
     assert not torch.equal(draw_torch_a, torch.rand(8, generator=torch_other))
     assert not np.array_equal(draw_numpy_a, numpy_other.random(8))
+
+
+def test_reproducibility_profiles_change_backend_controls() -> None:
+    _configure_reproducibility("strict")
+    assert torch.are_deterministic_algorithms_enabled()
+    assert torch.backends.cudnn.deterministic
+    assert not torch.backends.cudnn.benchmark
+
+    _configure_reproducibility("seeded")
+    assert not torch.are_deterministic_algorithms_enabled()
+    assert not torch.backends.cudnn.deterministic
+    assert not torch.backends.cudnn.benchmark
+
+    _configure_reproducibility("throughput")
+    assert not torch.are_deterministic_algorithms_enabled()
+    assert not torch.backends.cudnn.deterministic
+    assert torch.backends.cudnn.benchmark
+    _configure_reproducibility("strict")
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("training", "reproducibility", "sometimes"),
+        ("loss", "value_loss", "silent_noop"),
+    ],
+)
+def test_behavioral_profile_enums_are_strict(
+    tmp_path: Path, section: str, field: str, value: str
+) -> None:
+    raw = yaml.safe_load((ROOT / "configs" / "kuhn_smoke.yaml").read_text())
+    raw[section][field] = value
+    path = tmp_path / "bad_profile.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match=field):
+        load_config(path)
 
 
 def test_metrics_logger_appends_json_lines(tmp_path: Path) -> None:

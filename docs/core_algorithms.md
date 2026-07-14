@@ -126,10 +126,13 @@ Capture-before-bootstrap is important: targets at the current decision describe
 its continuation before the current value head is mixed in. Chance nodes only
 aggregate. Q is retained only when requested.
 
-The implementation processes complete trees in contiguous tree-id chunks under
-`max_resident_rows`; a dependency chain is never split. Leaf accumulators must
-be fp32 or wider, padded types are zeroed, and configured or realized tree-size
-violations raise.
+The implementation feeds byte-limited completion microbatches into an upward
+reduction frontier. The frontier begins at completed leaves; whenever all
+children of a parent are available, their `P/M` summaries are reduced and
+replaced by the parent's summary. A byte preflight accounts for completion
+fields, persistent targets, frontier rows, overlapping scratch, and structural
+storage before allocation. Leaf accumulators must be fp32 or wider, padded
+types are zeroed, and configured or realized tree-size violations raise.
 
 ## Posterior-weighted RB-PPO
 

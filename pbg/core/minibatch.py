@@ -9,7 +9,13 @@ import torch
 from torch import Tensor
 
 from pbg.core.game import GameBundle
-from pbg.core.tree import AliasTable, PolicyCache, ReachCache, TreeBatch
+from pbg.core.tree import (
+    AliasTable,
+    DecisionReachCache,
+    PolicyCache,
+    ReachCache,
+    TreeBatch,
+)
 from pbg.core.values import NodeTargets
 
 
@@ -63,11 +69,11 @@ def _gather_targets(targets: NodeTargets, rows: Tensor) -> NodeTargets:
 
 
 def sample_minibatch(
-    tree: TreeBatch,
+    tree: TreeBatch | None,
     targets: NodeTargets,
     alias: AliasTable,
     policy_cache: PolicyCache,
-    reach_cache: ReachCache,
+    reach_cache: ReachCache | DecisionReachCache,
     bundle: GameBundle,
     B: int,
     gen: torch.Generator,
@@ -79,22 +85,52 @@ def sample_minibatch(
     if not torch.equal(policy_cache.node_ids, targets.node_ids):
         raise ValueError("PolicyCache and NodeTargets node_ids must match exactly")
     rows = alias.sample(B, gen).to(device=targets.node_ids.device, dtype=torch.int64)
-    if rows.numel() and (bool((rows < 0).any()) or bool((rows >= targets.node_ids.numel()).any())):
-        raise ValueError("alias table produced an invalid decision row")
+    if rows.numel():
+        valid_rows = ((rows >= 0) & (rows < targets.node_ids.numel())).all()
+        if rows.device.type == "cuda":
+            torch._assert_async(valid_rows, "alias table produced an invalid decision row")
+        elif not bool(valid_rows):
+            raise ValueError("alias table produced an invalid decision row")
     gathered = _gather_targets(targets, rows)
     node_ids = gathered.node_ids.to(torch.int64)
-    tree_rows = node_ids.to(tree.state_ref.device)
-    state_refs = tree.state_ref[tree_rows].to(device=targets.node_ids.device, dtype=torch.int32)
-    reach = reach_cache.rows_for(
-        tree, gathered.node_ids, bundle.rollout_backend, policy_cache
-    ).to(device=targets.node_ids.device, dtype=torch.float32)
+    if isinstance(reach_cache, DecisionReachCache):
+        if not torch.equal(reach_cache.node_ids, targets.node_ids):
+            raise ValueError("DecisionReachCache and NodeTargets node_ids must match")
+        state_refs = reach_cache.state_refs[rows].to(
+            device=targets.node_ids.device, dtype=torch.int32
+        )
+        if reach_cache.owners is None:
+            if tree is None:
+                raise ValueError("compact decision reaches require cached owners")
+            tree_rows = node_ids.to(tree.owner.device)
+            owners = tree.owner[tree_rows].to(
+                device=targets.node_ids.device, dtype=torch.int64
+            )
+        else:
+            owners = reach_cache.owners[rows].to(
+                device=targets.node_ids.device, dtype=torch.int64
+            )
+        reach = reach_cache.gather(rows, bundle.rollout_backend)
+    else:
+        if tree is None:
+            raise ValueError("a full ReachCache requires the sampled topology")
+        tree_rows = node_ids.to(tree.state_ref.device)
+        state_refs = tree.state_ref[tree_rows].to(
+            device=targets.node_ids.device, dtype=torch.int32
+        )
+        owners = tree.owner[tree_rows].to(
+            device=targets.node_ids.device, dtype=torch.int64
+        )
+        reach = reach_cache.rows_for(
+            tree, gathered.node_ids, bundle.rollout_backend, policy_cache
+        )
+    reach = reach.to(device=targets.node_ids.device, dtype=torch.float32)
     legal_ids, legal_mask = bundle.rollout_backend.legal_events(
         state_refs.to(bundle.rollout_backend.device)
     )
     legal_ids = legal_ids.to(device=targets.node_ids.device, dtype=torch.int32)
     legal_mask = legal_mask.to(device=targets.node_ids.device, dtype=torch.bool)
 
-    owners = tree.owner[tree_rows].to(device=targets.node_ids.device, dtype=torch.int64)
     x_max = targets.parent_p_hat.shape[1]
     widths = torch.tensor(
         bundle.rollout_backend.x_sizes, dtype=torch.int64, device=targets.node_ids.device

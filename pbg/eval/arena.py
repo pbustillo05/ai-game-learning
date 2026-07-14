@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -102,7 +103,11 @@ def _policy_probabilities(
     postflop_masks = None
     if game.engine.states.street[ref] != 0:
         compatible = ~board_conflict_mask(public.board.to(torch.int16))
-        postflop_masks = PostflopMasks(compatibility=compatible)
+        street = game.engine.states.street[ref]
+        postflop_masks = PostflopMasks(
+            compatibility=compatible,
+            compact_size=math.comb(52 - (street + 2), 2),
+        )
     with torch.no_grad():
         output = model(public, ranges, postflop_masks=postflop_masks)
         legal_ids, legal_mask = game.legal_events(refs)

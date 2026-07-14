@@ -37,7 +37,7 @@ pbg/
   core/                    # GENERIC. Must not import from pbg.games.
     config.py              # dataclass configs + YAML loading
     game.py                # PBG Protocols, event/owner constants
-    tree.py                # TreeBatch (SoA rollout tree), alias tables
+    tree.py                # TreeBatch (SoA rollout tree), categorical decision tables
     rollout.py             # optimized SamplePreTerminal (one profile per root)
     branching.py           # labeled SampleTree, fixed beta_fn
     values.py              # BranchedValue backward propagation
@@ -98,7 +98,8 @@ and reach DTOs. `eval` may import both.
   field names are owned and versioned by the evaluator facade.
 - **Shapes in comments.** Every tensor-returning function documents shapes with
   bracket comments: `# [N, P, X]`. Dimension letters (fixed vocabulary):
-  - `N` nodes in a TreeBatch, `C` child edges (CSR), `G` trees in batch,
+  - `N` nodes in a TreeBatch, `C` child edges (CSR), `G` trajectories in
+    sequential modes or `G=1` tree in branched RB,
   - `P` players (padded to `P_max`), `X` private-type count (padded to `X_max`),
   - `E` events at a node (padded to `E_max`), `B` minibatch size,
   - `T` action types (poker: 3), `M` raise-mixture components, `H` = 1326, `K` = 169.
@@ -111,8 +112,8 @@ and reach DTOs. `eval` may import both.
 - **RNG.** Every sampling function takes an explicit `torch.Generator` (GPU) or
   `numpy.random.Generator` (CPU). Global seeding: `seed_all(seed, rank)` in
   `core/config.py`; per-rank seed = `seed * 1000 + rank`. No use of global RNG state.
-- **Errors.** Fail loudly: `assert` on shape/mask invariants in debug paths, guarded
-  by `cfg.debug_asserts`. No silent broadcasting across `P`/`X` dims — reshape explicitly.
+- **Errors.** Fail loudly on shape/mask invariants. No silent broadcasting across
+  `P`/`X` dims — reshape explicitly.
 - **Determinism for tests.** Statistical tests use fixed seeds and documented
   tolerances (see §9). Exact tests use fp64 on CPU.
 
@@ -132,9 +133,9 @@ class GameConfig:
 
 @dataclass
 class RolloutConfig:
-    n_trees: int                 # G per iteration (per rank: G // world_size)
+    n_trees: int                 # trajectories/rank in sequential modes; exactly 1 in branched RB
     beta: dict[str, float] | None # per-bucket intensity; branched RB only
-    node_budget: int             # hard cap on nodes per tree; sampler raises past it
+    node_budget: int             # per-trajectory cap, or total cap for the one branched tree
     reach_storage: str           # "full" | "decisions_only" | "recompute"
 
 @dataclass
@@ -149,7 +150,7 @@ class LossConfig:
     clip_eps: float; clip_eps_v: float
     c_v: float; c_h: float
     entropy_schedule: str        # "const" | "linear_decay"
-    use_suit_consistency: bool   # default False
+    value_loss: str              # "mse" | "clipped"
 
 @dataclass
 class TrainingConfig:
@@ -157,13 +158,13 @@ class TrainingConfig:
     iters: int; gd_steps_per_iter: int; minibatch_size: int
     lr: float; adam_betas: tuple; grad_clip: float
     amp: bool; seed: int; checkpoint_every: int; out_dir: str
+    reproducibility: str         # "strict" | "seeded" | "throughput"
 
 @dataclass
 class RootConfig:
     game: GameConfig; rollout: RolloutConfig; completion: CompletionConfig
     model: dict                  # game-owned; poker model config parsed in games/poker
     loss: LossConfig; training: TrainingConfig
-    debug_asserts: bool = False
 ```
 
 ---
@@ -180,9 +181,9 @@ PRETERM: int = -3       # owner value for pre-terminal leaves of a stored tree
 
 ### 4.2 `TreeBatch` (`core/tree.py`) — the SoA rollout tree
 
-One object holds `G` trees, concatenated. All tensors CPU or GPU per
-`cfg` (rollout on GPU where the game supports vectorized stepping; synthetic family
-may run CPU). Frozen fields:
+One object holds concatenated sequential trajectories or exactly one branched
+tree. All tensors CPU or GPU per `cfg` (rollout on GPU where supported;
+synthetic may run CPU). Frozen fields:
 
 ```python
 @dataclass
@@ -208,7 +209,7 @@ Invariants (asserted in `TreeBatch.validate()`):
 `nu[child_ptr[i]:child_ptr[i+1]].sum() == 1` for every non-leaf `i`; leaves have
 `owner ∈ {TERMINAL, PRETERM}`; `depth_*` consistent with parent chain.
 
-`build_alias_tables(tree: TreeBatch) -> AliasTable` — one alias table over all
+`build_alias_tables(tree: TreeBatch) -> AliasTable` — one categorical table over all
 player-decision nodes, weights `path_weight[i] * 1[owner[i] ∈ players]`, used by
 `minibatch.py` for `(P, Σ)` sampling per NOTATION §4. `AliasTable.sample(n, gen) -> int32 [n]`.
 
@@ -232,6 +233,14 @@ In `"recompute"` mode `reach_at` walks parent pointers and calls
 leaf, because collision-conditioned leaf posteriors require the reach state. Consumers
 never care which mode is active.
 
+After normal terminal targets are built, or after RB completion and target
+construction, the training loop replaces this rollout cache with a
+`DecisionReachCache`. Games may keep dense decision rows or provide an opaque
+compact payload plus an expansion method. Poker stores only ragged live-seat
+combo rows, seat ids, and row pointers; full folded ranges are not retained
+after their final completion/summary consumer. Dense policy inputs are
+materialized only for sampled physical minibatches.
+
 ### 4.4 `CompletionStats` (`core/completion.py`)
 
 Output of MC completion at one pre-terminal node (fp32 everywhere):
@@ -245,6 +254,15 @@ class CompletionStats:
     u_hat:    Tensor  # []              E[||R||_2^2]
     n_eff:    Tensor  # []              effective sample size (diagnostics)
 ```
+
+The batched evaluator DTO may additionally carry equity, elementwise validity,
+sample-count, and standard-error tensors. Active training completes leaves in
+byte-limited microbatches and calls `BatchedCompletionStats.for_learning()` on
+each result. That boundary validates posterior/value finiteness, rejects
+posterior mass on invalid outputs and inconsistent sample-quality fields, and
+records scalar quality summaries. Its `p_hat`/`v_hat` rows are immediately fed
+to the backward frontier; the original evaluator DTO and selected leaf reaches
+are released before the next completion microbatch.
 
 ### 4.5 `NodeTargets` and `MinibatchSample` (`core/values.py`, `core/minibatch.py`)
 
@@ -338,7 +356,7 @@ P1 provides the uniform/tabular one).
 
 ```python
 class NLHEEngine:
-    def __init__(self, cfg: PokerConfig): ...          # n_players, stacks in bb, blinds, tick grid
+    def __init__(self, cfg: PokerConfig): ...          # players, stacks/blinds, fixed chip_unit_bb
     # StateTable: SoA of packed states; all methods vectorized over int32 state_refs
     # fields: street, board(5 x int8, -1 pad), pot, stacks[P], committed[P], status[P] (live/folded/allin),
     #         to_act, last_raise, n_raises, parent-linked lossless public-history event
@@ -349,6 +367,10 @@ which live behind `adapter.py`/`mc.py`. `cards.py` exposes
 `class_members(k)`, `suit_perm_apply(perm,h)`, board-conflict maps, and uniform
 sampling from a supplied complement card set. It contains no hand rank,
 category, kicker, winner, tie, or showdown-payoff implementation.
+
+The default 100bb game uses a 0.5bb integer denomination and exposes all 200
+raise-to amounts globally; each state masks the exact legal interval (including
+a short all-in). There is no affine raise-size subsampling.
 
 The engine constructs nested `stratum_players`, `stratum_amount`, and
 `payoff_baseline` from public commitments/status. Fixed showdowns call
@@ -386,9 +408,12 @@ class PokerGPUPartitionAdapter:
 ```
 Acceptance: fake-facade field mapping, version/device/shape checks, and sibling
 integration tests. The adapter verifies the facade's defensive `COMBO_CARDS`
-copy and calls the evaluator 0.3.0+ partition signature without the removed
-query/seed arguments. No local Φ/α/β/Λ implementation or Monte Carlo oracle is
-permitted.
+copy and calls the evaluator's `pbg-folder-v1` `partition_folders` extension.
+The evaluator owns combined/per-folder probes, card marginals/deltas, covariance
+contractions, and signed beta factors. The caller caches only the compact
+model-ready subset; ordinary actions inherit the cache key and only a street or
+fold event invalidates it. A model declaring no partition consumer skips the
+facade entirely. No local Φ/α/β/Λ implementation or Monte Carlo oracle is permitted.
 
 ### P5 — `games/poker/mc.py`
 
@@ -468,6 +493,7 @@ class RolloutBackend(Protocol):
     def beta_fn(self, states) -> Tensor: ...       # fp32 [B], fixed public-stage values
 
 def sample_trees(bundle, cfg: RolloutConfig, gen) -> tuple[TreeBatch, ReachCache, OldOutCache]
+# Legacy function name: sequential RB returns trajectories; branched RB one tree.
 # K = floor(beta) + Bernoulli(beta-floor(beta)). Every abstract child is stored,
 # including repeated public labels, with edge probability exactly 1/K.
 # training.mode="rao_blackwell" uses the profile-carrying one-child sampler;
@@ -483,7 +509,8 @@ hot path. Buffer overflow raises rather than changing the sampled law.
 ```python
 def branched_value(tree, leaf_stats, reach, value_heads, lam, game, *,
                    configured_node_budget,
-                   emit_q=False, auxiliary_reducers=()) -> NodeTargets
+                   emit_q=False, auxiliary_reducers=(),
+                   max_workspace_bytes=1 << 30) -> NodeTargets
 # The core_math BranchedValue algorithm, transcribed in NOTATION §7:
 #   1. MC completion at PRETERM leaves -> CompletionStats
 #   2. Backward pass: uniform-child aggregation of posterior mass P and
@@ -492,6 +519,11 @@ def branched_value(tree, leaf_stats, reach, value_heads, lam, game, *,
 #      baselines, emit A and V, then lambda-mix owner M before parent consumption.
 # Q is transient unless emit_q=True. Public moment channels are deferred.
 # Backward-MC posterior is the ONLY production path (signed-off decision).
+# Production training uses streamed_branched_value: completion microbatches feed
+# a P/M reduction frontier. Completed sibling summaries are replaced by one
+# parent summary, so no [N,P,X] whole-tree moment arena is allocated. The byte
+# plan includes private-type width, completion fields, targets, frontier copies,
+# and structural scratch; an over-budget plan fails before target allocation.
 ```
 
 ### P11 — `core/losses.py`, `core/training.py`
@@ -504,9 +536,12 @@ def branched_value(tree, leaf_stats, reach, value_heads, lam, game, *,
 COMPOSITES: dict[str, LossFn] = {"rb_ppo": ...}
 # Policy terms consume a_hat and child_p_hat with uniform abstract-child weights;
 # value/entropy terms consume parent_p_hat.
-def train(cfg: RootConfig) -> None       # torchrun entry; DDP; phase-alternating:
-# each rank samples n_trees/world locally -> branched_value locally -> gd_steps with
-# DDP-allreduced grads; GradScaler; checkpoint {model, opt, scaler, iter, cfg, rng}.
+def train(cfg: RootConfig, *, resume_from: str | Path | None = None) -> None
+# torchrun entry; DDP; phase-alternating; identity/config-checked resume:
+# each rank samples trajectories locally, or exactly one tree in branched RB,
+# then constructs compact targets -> gd_steps with
+# DDP-allreduced grads; GradScaler; checkpoint {model, opt, scaler, iter, cfg,
+# per-rank rng, run_id}.
 ```
 
 Game construction returns a typed bundle rather than a positional tuple:

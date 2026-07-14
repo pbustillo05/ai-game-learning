@@ -10,6 +10,7 @@ from torch import Tensor
 
 from pbg.core.game import GameBundle
 from pbg.core.rollout import _sample_trees_sequential
+from pbg.core.tree import DecisionReachCache
 
 
 @dataclass
@@ -17,7 +18,7 @@ class NormalDataset:
     """Flat scalar decision rows retained by ordinary trajectory training."""
 
     state_refs: Tensor  # int32 [D]
-    reach: Tensor  # float32 [D,P,X]
+    reach: DecisionReachCache
     actor_type: Tensor  # int64 [D]
     event: Tensor  # int32 [D]
     old_logp: Tensor  # float32 [D]
@@ -69,6 +70,17 @@ def build_normal_dataset(
     sampled = _sample_trees_sequential(
         bundle, cfg.rollout, gen, return_profiles=True
     )
+    return build_normal_dataset_from_sampled(bundle, cfg, gen, sampled)
+
+
+def build_normal_dataset_from_sampled(
+    bundle: GameBundle,
+    cfg: Any,
+    gen: torch.Generator,
+    sampled: tuple[Any, Any, Any, Tensor],
+) -> NormalDataset:
+    """Emit compact scalar targets from sampled terminal trajectories."""
+
     tree, reach_cache, policy_cache, root_profiles = sampled
     device = tree.owner.device
     p_max = int(bundle.rollout_backend.n_players)
@@ -77,7 +89,12 @@ def build_normal_dataset(
         x_max = max(int(size) for size in bundle.rollout_backend.x_sizes)
         return NormalDataset(
             state_refs=torch.empty(0, dtype=torch.int32, device=device),
-            reach=torch.empty((0, p_max, x_max), dtype=torch.float32, device=device),
+            reach=DecisionReachCache.from_rows(
+                torch.empty(0, dtype=torch.int32, device=device),
+                torch.empty(0, dtype=torch.int32, device=device),
+                torch.empty((0, p_max, x_max), dtype=torch.float32, device=device),
+                bundle.rollout_backend,
+            ),
             actor_type=torch.empty(0, dtype=torch.int64, device=device),
             event=torch.empty(0, dtype=torch.int32, device=device),
             old_logp=torch.empty(0, dtype=torch.float32, device=device),
@@ -125,15 +142,22 @@ def build_normal_dataset(
             + (1.0 - float(cfg.loss.lam)) * old_v[selected]
         )
 
-    reach = reach_cache.rows_for(
+    reach_rows = reach_cache.rows_for(
         tree,
         decisions.to(torch.int32),
         bundle.rollout_backend,
         policy_cache,
     ).float()
+    state_refs = tree.state_ref[decisions].to(torch.int32)
+    decision_reach = DecisionReachCache.from_rows(
+        decisions.to(torch.int32),
+        state_refs,
+        reach_rows,
+        bundle.rollout_backend,
+    )
     return NormalDataset(
-        state_refs=tree.state_ref[decisions].to(torch.int32),
-        reach=reach,
+        state_refs=state_refs,
+        reach=decision_reach,
         actor_type=actor_type,
         event=event,
         old_logp=old_logp.detach().float(),
@@ -162,7 +186,7 @@ def sample_normal_minibatch(
     legal_ids, legal_mask = bundle.rollout_backend.legal_events(states)
     return NormalMinibatch(
         state_refs=states,
-        reach=dataset.reach[rows],
+        reach=dataset.reach.gather(rows, bundle.rollout_backend),
         actor_type=dataset.actor_type[rows],
         event=dataset.event[rows],
         old_logp=dataset.old_logp[rows],

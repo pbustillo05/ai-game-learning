@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import MISSING, dataclass, fields, is_dataclass
+import importlib
 import math
 from pathlib import Path
 from types import UnionType
@@ -28,7 +29,11 @@ class GameConfig:
 
 @dataclass
 class RolloutConfig:
-    """Configure public rollout storage and optional branching intensity."""
+    """Configure rollout storage and optional branching intensity.
+
+    ``n_trees`` is the legacy serialized name.  It counts trajectories in
+    normal/sequential RB and must equal one sampled tree per rank in branched RB.
+    """
 
     n_trees: int
     beta: dict[str, float] | None
@@ -61,7 +66,7 @@ class LossConfig:
     c_v: float
     c_h: float
     entropy_schedule: str
-    use_suit_consistency: bool = False
+    value_loss: str = "mse"
 
 
 @dataclass
@@ -79,6 +84,7 @@ class TrainingConfig:
     seed: int
     checkpoint_every: int
     out_dir: str
+    reproducibility: str = "strict"
 
 
 @dataclass
@@ -115,7 +121,6 @@ class RootConfig:
     model: dict[str, Any]
     loss: LossConfig
     training: TrainingConfig
-    debug_asserts: bool = False
     hardware: HardwareProfileConfig | None = None
 
     @property
@@ -126,6 +131,11 @@ class RootConfig:
 
 
 _ConfigT = TypeVar("_ConfigT")
+
+_GAME_CONFIG_VALIDATORS = {
+    "synthetic": "pbg.games.synthetic.bundle:validate_config",
+    "poker": "pbg.games.poker.bundle:validate_config",
+}
 
 
 def _type_name(annotation: Any) -> str:
@@ -225,15 +235,26 @@ def _validate_config(cfg: RootConfig) -> None:
 
     if cfg.game.name not in {"synthetic", "poker"}:
         raise ConfigError("root.game.name: expected 'synthetic' or 'poker'")
-    if cfg.game.name == "synthetic" and cfg.game.synthetic is None:
-        raise ConfigError("root.game.synthetic: required when game.name is 'synthetic'")
+    if cfg.game.name == "synthetic":
+        if cfg.game.synthetic is None:
+            raise ConfigError("root.game.synthetic: required when game.name is 'synthetic'")
+        if cfg.game.poker is not None:
+            raise ConfigError("root.game.poker: must be null when game.name is 'synthetic'")
     if cfg.game.name == "poker":
         if cfg.game.poker is None:
             raise ConfigError("root.game.poker: required when game.name is 'poker'")
+        if cfg.game.synthetic is not None:
+            raise ConfigError("root.game.synthetic: must be null when game.name is 'poker'")
         if cfg.completion.backend not in {"auto", "cpu", "cuda"}:
             raise ConfigError(
                 "root.completion.backend: poker requires 'auto', 'cpu', or 'cuda'"
             )
+    module_name, _, function_name = _GAME_CONFIG_VALIDATORS[cfg.game.name].partition(":")
+    validator = getattr(importlib.import_module(module_name), function_name)
+    try:
+        validator(cfg)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
     modes = {"normal", "rao_blackwell", "branched_rao_blackwell"}
     if cfg.training.mode not in modes:
         raise ConfigError(
@@ -250,6 +271,11 @@ def _validate_config(cfg: RootConfig) -> None:
                 raise ConfigError(
                     f"root.rollout.beta.{bucket}: expected a finite value at least one"
                 )
+        if cfg.rollout.n_trees != 1:
+            raise ConfigError(
+                "root.rollout.n_trees: branched_rao_blackwell requires exactly "
+                "one sampled tree per rank"
+            )
     elif cfg.rollout.beta is not None:
         raise ConfigError(
             f"root.rollout.beta: only valid for branched_rao_blackwell, not {cfg.training.mode}"
@@ -260,6 +286,12 @@ def _validate_config(cfg: RootConfig) -> None:
         )
     if cfg.loss.entropy_schedule not in {"const", "linear_decay"}:
         raise ConfigError("root.loss.entropy_schedule: expected 'const' or 'linear_decay'")
+    if cfg.loss.value_loss not in {"mse", "clipped"}:
+        raise ConfigError("root.loss.value_loss: expected 'mse' or 'clipped'")
+    if cfg.training.reproducibility not in {"strict", "seeded", "throughput"}:
+        raise ConfigError(
+            "root.training.reproducibility: expected 'strict', 'seeded', or 'throughput'"
+        )
     from pbg.core.losses import COMPOSITES
 
     loss_spec = COMPOSITES.get(cfg.loss.name)

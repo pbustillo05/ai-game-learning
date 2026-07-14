@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
 from pbg.games.synthetic.exact import enumerate_public_tree
 from pbg.games.synthetic.family import SyntheticPBG
@@ -33,6 +34,13 @@ def test_adapter_log_prob_normalizes_and_entropy_is_exact() -> None:
     ).sum(dim=-1)
     assert torch.allclose(adapter.entropy(output, ids, legal), numerical)
     assert torch.allclose(adapter.kl(output, output), torch.zeros((2, 3)), atol=1e-7)
+
+
+def test_synthetic_public_embedding_rejects_aliasing_keys() -> None:
+    net = SyntheticNet(3, 3, {"n_buckets": 8, "hidden_dim": 4})
+    legal = torch.ones((1, 3), dtype=torch.bool)
+    with pytest.raises(ValueError, match="collision-free"):
+        net(torch.tensor([8], dtype=torch.int64), legal)
 
 
 def test_exported_model_policy_tables_are_legal_and_normalized() -> None:

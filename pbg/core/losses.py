@@ -148,7 +148,8 @@ def rb_ppo(
     policy_weight = child_p / count * child_valid.to(child_p)
     per_row = (policy * policy_weight).sum((1, 2))
 
-    value, _ = l_v(new, old, targets, adapter, cfg)
+    value_fn = l_v_clip if _cfg(cfg, "value_loss", "mse") == "clipped" else l_v
+    value, _ = value_fn(new, old, targets, adapter, cfg)
     entropy, entropy_metrics = l_h(new, old, targets, adapter, cfg, iteration=iteration)
     type_weight = parent_p * valid.to(parent_p)
     per_row = per_row + ((value + entropy) * type_weight).sum(1)
@@ -202,7 +203,6 @@ def ppo(
 ) -> tuple[Tensor, dict[str, Any]]:
     """Ordinary PPO on one sampled private type and scalar target per row."""
 
-    del old
     actor_type = targets.actor_type.to(new.v.device, dtype=torch.int64)
     rows = torch.arange(actor_type.numel(), device=new.v.device)
     logp_all = adapter.log_prob(
@@ -220,7 +220,16 @@ def ppo(
 
     value = new.v[rows, actor_type]
     wanted = targets.v_target.to(value)
-    value_loss = float(_cfg(cfg, "c_v")) * (value - wanted).square()
+    if _cfg(cfg, "value_loss", "mse") == "clipped":
+        old_value = targets.old_v.to(value)
+        clipped_value = old_value + (value - old_value).clamp(
+            -float(_cfg(cfg, "clip_eps_v")), float(_cfg(cfg, "clip_eps_v"))
+        )
+        value_loss = float(_cfg(cfg, "c_v")) * torch.maximum(
+            (value - wanted).square(), (clipped_value - wanted).square()
+        )
+    else:
+        value_loss = float(_cfg(cfg, "c_v")) * (value - wanted).square()
     entropy_all = adapter.entropy(
         new,
         targets.legal_event_ids.to(new.v.device),

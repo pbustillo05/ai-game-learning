@@ -9,7 +9,7 @@ from pbg.core.completion import BatchedCompletionStats
 from pbg.core.game import TERMINAL
 from pbg.core.posterior_values import NodeTargets as CorrectedTargets
 from pbg.core.tree import TreeBuilder
-from pbg.core.values import HeadEvals, NodeTargets, branched_value
+from pbg.core.values import HeadEvals, NodeTargets, branched_value, streamed_branched_value
 
 
 @dataclass
@@ -91,9 +91,32 @@ def test_lambda_boundaries_are_finite_and_q_is_opt_in(lam: float) -> None:
     assert torch.isfinite(targets.v_hat).all()
 
 
-def test_chunking_whole_trees_matches() -> None:
-    base = _run(0.95, max_resident_rows=100)
-    chunked = _run(0.95, max_resident_rows=10)
+def test_streamed_leaf_batches_match_full_completion() -> None:
+    tree, stats, heads = _fixture()
+    base = _run(0.95)
+    leaves = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero().squeeze(1)
+    batches = [
+        (
+            leaves[first : first + 1].to(torch.int32),
+            BatchedCompletionStats(
+                p_hat=stats.p_hat[first : first + 1],
+                v_hat=stats.v_hat[first : first + 1],
+            ),
+        )
+        for first in range(leaves.numel())
+    ]
+    chunked = streamed_branched_value(
+        tree,
+        leaves,
+        batches,
+        None,
+        heads,
+        0.95,
+        _Game(),
+        configured_node_budget=5,
+        completion_batch_rows=1,
+        emit_q=True,
+    )
     for field in ("parent_p_hat", "child_p_hat", "a_hat", "v_hat", "q_hat"):
         assert torch.equal(getattr(base, field), getattr(chunked, field))
 

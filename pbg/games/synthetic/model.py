@@ -1,14 +1,16 @@
-"""Small neural policy/value model for the synthetic game family."""
+"""Policy/value models for the finite synthetic-poker family."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+import math
 from typing import Any, Mapping
 
 import numpy as np
 import torch
 from torch import Tensor, nn
 
+from pbg.core.game import CHANCE
 from pbg.games.synthetic.exact import PolicyTables, PublicTreeIndex
 from pbg.games.synthetic.family import SyntheticPBG
 
@@ -25,8 +27,48 @@ class PolicyOutput:
     u: Tensor | None = None  # float32 [B]
 
 
+@dataclass(frozen=True)
+class SyntheticModelConfig:
+    """Strict configuration for synthetic MHA or the explicit MLP baseline."""
+
+    architecture: str = "mha"
+    hidden_dim: int = 64
+    n_buckets: int | None = None
+    n_heads: int = 4
+    n_layers: int = 2
+
+    def __post_init__(self) -> None:
+        if self.hidden_dim <= 0:
+            raise ValueError("model.hidden_dim must be positive")
+        if self.n_buckets is not None and self.n_buckets <= 0:
+            raise ValueError("model.n_buckets must be positive when supplied")
+        if self.architecture not in {"mha", "mlp_baseline"}:
+            raise ValueError("model.architecture must be 'mha' or 'mlp_baseline'")
+        if self.n_heads <= 0 or self.hidden_dim % self.n_heads:
+            raise ValueError("model.n_heads must positively divide model.hidden_dim")
+        if self.n_layers <= 0:
+            raise ValueError("model.n_layers must be positive")
+
+    @classmethod
+    def from_dict(
+        cls, values: Mapping[str, Any] | None
+    ) -> SyntheticModelConfig:
+        """Parse a synthetic model mapping while rejecting unknown keys."""
+
+        data = dict(values or {})
+        allowed = {field.name for field in fields(cls)}
+        unknown = sorted(set(data) - allowed)
+        if unknown:
+            raise ValueError(
+                f"unknown synthetic model configuration key: {unknown[0]}"
+            )
+        return cls(**data)
+
+
 class SyntheticNet(nn.Module):
-    """Embed public keys and private types, then emit categorical logits and V."""
+    """Explicit small-MLP baseline for synthetic poker experiments."""
+
+    uses_reach_context = False
 
     def __init__(
         self,
@@ -40,9 +82,9 @@ class SyntheticNet(nn.Module):
         """Create the two-layer MLP from a game-owned configuration mapping."""
 
         super().__init__()
-        values = dict(cfg or {})
-        n_buckets = int(values.get("n_buckets", n_buckets))
-        hidden_dim = int(values.get("hidden_dim", hidden_dim))
+        values = SyntheticModelConfig.from_dict(cfg)
+        n_buckets = n_buckets if values.n_buckets is None else values.n_buckets
+        hidden_dim = values.hidden_dim if cfg is not None else hidden_dim
         if x_max <= 0 or e_max <= 0 or n_buckets <= 0 or hidden_dim <= 0:
             raise ValueError("x_max, e_max, n_buckets, and hidden_dim must be positive")
         self.x_max = x_max
@@ -59,6 +101,8 @@ class SyntheticNet(nn.Module):
         )
         self.policy_head = nn.Linear(hidden_dim, e_max)
         self.value_head = nn.Linear(hidden_dim, 1)
+        nn.init.zeros_(self.policy_head.weight)
+        nn.init.zeros_(self.policy_head.bias)
 
     def forward(self, pub_keys: Tensor, legal_mask: Tensor) -> PolicyOutput:
         """Return masked logits ``[B, X, E]`` and values ``[B, X]``.
@@ -74,7 +118,11 @@ class SyntheticNet(nn.Module):
         if not legal_mask.any(dim=-1).all():
             raise ValueError("every model row must contain a legal event")
         batch = pub_keys.shape[0]
-        public = self.public_embedding(torch.remainder(pub_keys, self.n_buckets))
+        if bool(((pub_keys < 0) | (pub_keys >= self.n_buckets)).any()):
+            raise ValueError(
+                "public key is outside the collision-free synthetic embedding capacity"
+            )
+        public = self.public_embedding(pub_keys)
         public = public[:, None, :].expand(batch, self.x_max, self.hidden_dim)
         type_ids = torch.arange(self.x_max, device=pub_keys.device)
         private = self.type_embedding(type_ids)[None, :, :].expand(
@@ -85,6 +133,279 @@ class SyntheticNet(nn.Module):
         logits = logits.masked_fill(~legal_mask[:, None, :], -torch.inf)  # [B, X, E]
         value = self.value_head(hidden).squeeze(-1)  # [B, X]
         return PolicyOutput(raw=logits, v=value)
+
+
+class _ReachBiasedLayer(nn.Module):
+    """Pre-norm attention layer with an untempered additive key log-prior."""
+
+    def __init__(self, width: int, heads: int) -> None:
+        super().__init__()
+        self.width = width
+        self.heads = heads
+        self.head_width = width // heads
+        self.norm_attention = nn.LayerNorm(width)
+        self.qkv = nn.Linear(width, 3 * width)
+        self.attention_out = nn.Linear(width, width)
+        self.temperature = nn.Parameter(torch.ones(heads))
+        self.norm_ffn = nn.LayerNorm(width)
+        self.ffn = nn.Sequential(
+            nn.Linear(width, 2 * width),
+            nn.GELU(),
+            nn.Linear(2 * width, width),
+        )
+        self.norm_incidence = nn.LayerNorm(width)
+        self.incidence_source = nn.Linear(width, width, bias=False)
+        self.incidence_equal = nn.Linear(width, width, bias=False)
+        self.incidence_own = nn.Linear(width, width, bias=False)
+        self.incidence_out = nn.Linear(width, width)
+
+    def _incidence(
+        self, rows: Tensor, mass: Tensor, card_incidence: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return exact other-card, identical-row, and own-card accumulators."""
+
+        normalized = self.norm_incidence(rows)
+        source = self.incidence_source(normalized) * mass[..., None]
+        card_accumulator = torch.einsum("xc,bpxd->bpcd", card_incidence, source)
+        card_overlap = torch.einsum("xc,bpcd->bpxd", card_incidence, card_accumulator)
+        same = source
+        other_equal = same.sum(1, keepdim=True) - same
+        other_card = card_overlap.sum(1, keepdim=True) - card_overlap - 2.0 * other_equal
+        own_card = card_overlap - 2.0 * same
+        return other_card, other_equal, own_card
+
+    def forward(
+        self,
+        sequence: Tensor,
+        key_log_prior: Tensor,
+        key_valid: Tensor,
+        *,
+        row_count: int,
+        players: int,
+        types: int,
+        mass: Tensor,
+        card_incidence: Tensor,
+    ) -> Tensor:
+        """Update a mixed row/public/action sequence while preserving row geometry."""
+
+        batch, tokens, _ = sequence.shape
+        normalized = self.norm_attention(sequence)
+        qkv = self.qkv(normalized).reshape(batch, tokens, 3, self.heads, self.head_width)
+        query, key, value = qkv.unbind(2)
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        content = torch.matmul(query, key.transpose(-1, -2))
+        scale = self.temperature.abs().clamp_min(1.0e-3)[:, None, None]
+        scores = content / (math.sqrt(self.head_width) * scale)
+        scores = scores + key_log_prior[:, None, None, :]
+        scores = scores.masked_fill(~key_valid[:, None, None, :], -torch.inf)
+        probability = torch.softmax(scores, dim=-1)
+        attended = torch.matmul(probability, value).transpose(1, 2).reshape(
+            batch, tokens, self.width
+        )
+        sequence = sequence + self.attention_out(attended)
+        sequence = sequence + self.ffn(self.norm_ffn(sequence))
+
+        rows = sequence[:, :row_count].reshape(batch, players, types, self.width)
+        other_card, other_equal, own_card = self._incidence(
+            rows, mass, card_incidence.to(rows.dtype)
+        )
+        residual = self.incidence_out(
+            torch.nn.functional.gelu(
+                self.norm_incidence(rows)
+                + other_card
+                + self.incidence_equal(other_equal)
+                + self.incidence_own(own_card)
+            )
+        )
+        sequence = sequence.clone()
+        sequence[:, :row_count] = (rows + residual).reshape(batch, row_count, self.width)
+        return sequence
+
+
+class SyntheticMHANet(nn.Module):
+    """Scaled MHA poker design over every player/type row.
+
+    Synthetic games have a discrete raise menu rather than the continuous NLHE
+    tick lattice, so learned per-event action anchors are the game-appropriate
+    factored head. Folded ranges are integrated into a compact per-card pressure
+    feature instead of being retained as attention rows.
+    """
+
+    uses_reach_context = True
+
+    def __init__(
+        self,
+        x_max: int,
+        e_max: int,
+        n_players: int,
+        card_incidence: Tensor,
+        cfg: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        values = SyntheticModelConfig.from_dict(cfg)
+        if values.architecture != "mha":
+            raise ValueError("SyntheticMHANet requires model.architecture: mha")
+        if card_incidence.ndim != 2 or card_incidence.shape[0] != x_max:
+            raise ValueError("card_incidence must have shape [X,C]")
+        if card_incidence.dtype != torch.bool:
+            raise TypeError("card_incidence must be boolean")
+        n_buckets = values.n_buckets or 4096
+        self.x_max = x_max
+        self.e_max = e_max
+        self.n_players = n_players
+        self.n_buckets = n_buckets
+        self.hidden_dim = values.hidden_dim
+        self.register_buffer("card_incidence", card_incidence.float(), persistent=True)
+        self.public_embedding = nn.Embedding(n_buckets, values.hidden_dim)
+        self.type_embedding = nn.Embedding(x_max, values.hidden_dim)
+        self.player_embedding = nn.Embedding(n_players, values.hidden_dim)
+        self.status_embedding = nn.Embedding(3, values.hidden_dim)
+        self.action_anchors = nn.Parameter(torch.empty(e_max, values.hidden_dim))
+        nn.init.normal_(self.action_anchors, std=values.hidden_dim ** -0.5)
+        self.range_features = nn.Linear(2, values.hidden_dim)
+        self.card_features = nn.Linear(card_incidence.shape[1], values.hidden_dim, bias=False)
+        self.fold_pressure = nn.Linear(1, values.hidden_dim)
+        self.public_token = nn.Linear(values.hidden_dim, values.hidden_dim)
+        self.layers = nn.ModuleList(
+            _ReachBiasedLayer(values.hidden_dim, values.n_heads)
+            for _ in range(values.n_layers)
+        )
+        self.final_norm = nn.LayerNorm(values.hidden_dim)
+        self.policy_query = nn.Linear(values.hidden_dim, values.hidden_dim, bias=False)
+        self.policy_anchor = nn.Linear(values.hidden_dim, values.hidden_dim, bias=False)
+        self.policy_bias = nn.Parameter(torch.zeros(e_max))
+        self.value_head = nn.Linear(values.hidden_dim, 1)
+        nn.init.zeros_(self.policy_query.weight)
+        nn.init.zeros_(self.value_head.weight)
+        nn.init.zeros_(self.value_head.bias)
+
+    def _context(
+        self,
+        pub_keys: Tensor,
+        reach: Tensor | None,
+        actor: Tensor | None,
+        live: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        batch = pub_keys.numel()
+        device = pub_keys.device
+        if reach is None:
+            reach = torch.zeros(
+                (batch, self.n_players, self.x_max), device=device, dtype=torch.float32
+            )
+        if reach.shape != (batch, self.n_players, self.x_max):
+            raise ValueError("reach must have shape [B,P,X]")
+        finite = torch.isfinite(reach)
+        if not finite.any(-1).all():
+            raise ValueError("every synthetic player range must have positive support")
+        safe = torch.where(finite, reach.float(), torch.full_like(reach.float(), -torch.inf))
+        log_mass = safe - torch.logsumexp(safe, dim=-1, keepdim=True)
+        mass = torch.where(finite, torch.exp(log_mass), torch.zeros_like(log_mass))
+        if actor is None:
+            actor = torch.zeros(batch, dtype=torch.long, device=device)
+        actor = actor.to(device=device, dtype=torch.long)
+        if actor.shape != (batch,) or bool(((actor < 0) | (actor >= self.n_players)).any()):
+            raise ValueError("actor must be integer [B] within the player range")
+        if live is None:
+            live = torch.ones((batch, self.n_players), dtype=torch.bool, device=device)
+        live = live.to(device=device)
+        if live.shape != (batch, self.n_players) or live.dtype != torch.bool:
+            raise TypeError("live must be bool [B,P]")
+        return log_mass, mass, actor, live
+
+    def forward(
+        self,
+        pub_keys: Tensor,
+        legal_mask: Tensor,
+        *,
+        reach: Tensor | None = None,
+        actor: Tensor | None = None,
+        live: Tensor | None = None,
+    ) -> PolicyOutput:
+        """Return all-actor-type policy/value rows for one public batch."""
+
+        if pub_keys.ndim != 1:
+            raise ValueError("pub_keys must have shape [B]")
+        if legal_mask.shape != (pub_keys.shape[0], self.e_max) or legal_mask.dtype != torch.bool:
+            raise ValueError("legal_mask must be bool [B, E]")
+        if not legal_mask.any(dim=-1).all():
+            raise ValueError("every model row must contain a legal event")
+        if bool(((pub_keys < 0) | (pub_keys >= self.n_buckets)).any()):
+            raise ValueError("public key is outside the collision-free synthetic embedding capacity")
+        batch = pub_keys.numel()
+        log_mass, mass, actor, live = self._context(pub_keys, reach, actor, live)
+        width = self.hidden_dim
+        type_ids = torch.arange(self.x_max, device=pub_keys.device)
+        player_ids = torch.arange(self.n_players, device=pub_keys.device)
+        public = self.public_embedding(pub_keys)
+        card = self.card_features(self.card_incidence.to(public.dtype))
+        status = torch.where(
+            live,
+            torch.ones_like(live, dtype=torch.long),
+            torch.full_like(live, 2, dtype=torch.long),
+        )
+        status.scatter_(1, actor[:, None], 0)
+
+        folded_mass = mass * (~live)[..., None]
+        folded_cards = torch.einsum(
+            "bpx,xc->bc", folded_mass, self.card_incidence.to(mass.dtype)
+        )
+        type_pressure = torch.einsum(
+            "xc,bc->bx", self.card_incidence.to(mass.dtype), folded_cards
+        )
+        rows = (
+            self.type_embedding(type_ids)[None, None]
+            + self.player_embedding(player_ids)[None, :, None]
+            + self.status_embedding(status)[:, :, None]
+            + card[None, None]
+            + public[:, None, None]
+            + self.range_features(torch.stack((mass, log_mass.clamp_min(-30.0)), dim=-1))
+            + self.fold_pressure(type_pressure[:, None, :, None])
+        )
+        row_count = self.n_players * self.x_max
+        public_rows = self.public_token(public)[:, None]
+        anchors = self.action_anchors[None].expand(batch, -1, -1)
+        sequence = torch.cat((rows.reshape(batch, row_count, width), public_rows, anchors), dim=1)
+        row_valid = (finite := torch.isfinite(log_mass)) & live[..., None]
+        key_valid = torch.cat(
+            (
+                row_valid.reshape(batch, row_count),
+                torch.ones((batch, 1 + self.e_max), dtype=torch.bool, device=pub_keys.device),
+            ),
+            dim=1,
+        )
+        key_log_prior = torch.cat(
+            (
+                torch.where(finite, log_mass, torch.zeros_like(log_mass)).reshape(batch, row_count),
+                torch.zeros((batch, 1 + self.e_max), device=pub_keys.device),
+            ),
+            dim=1,
+        )
+        for layer in self.layers:
+            sequence = layer(
+                sequence,
+                key_log_prior,
+                key_valid,
+                row_count=row_count,
+                players=self.n_players,
+                types=self.x_max,
+                mass=mass * live[..., None],
+                card_incidence=self.card_incidence,
+            )
+        sequence = self.final_norm(sequence)
+        final_rows = sequence[:, :row_count].reshape(
+            batch, self.n_players, self.x_max, width
+        )
+        gather = actor[:, None, None, None].expand(-1, 1, self.x_max, width)
+        actor_rows = final_rows.gather(1, gather).squeeze(1)
+        action_rows = sequence[:, row_count + 1 :]
+        logits = torch.einsum(
+            "bxd,bed->bxe", self.policy_query(actor_rows), self.policy_anchor(action_rows)
+        ) / math.sqrt(width)
+        logits = logits + self.policy_bias
+        logits = logits.masked_fill(~legal_mask[:, None], -torch.inf)
+        return PolicyOutput(raw=logits, v=self.value_head(actor_rows).squeeze(-1))
 
 
 class SyntheticPolicyAdapter:
@@ -194,40 +515,54 @@ class SyntheticPolicyAdapter:
 
 
 def export_policy_tables(
-    net: SyntheticNet, game: SyntheticPBG, tree_index: PublicTreeIndex
+    net: nn.Module, game: SyntheticPBG, tree_index: PublicTreeIndex
 ) -> PolicyTables:
-    """Evaluate ``net`` at every player node and return float64 ``[X, E]`` tables."""
+    """Evaluate policy-consistent belief inputs down an enumerated public tree."""
 
-    decision_indices = [
-        index
-        for index, owner in enumerate(tree_index.owners)
-        if 0 <= int(owner) < game.n_players
-    ]
-    if not decision_indices:
-        return {}
     device = next(net.parameters()).device
-    refs = torch.tensor(
-        [tree_index.nodes[index] for index in decision_indices],
-        dtype=torch.int32,
-        device=device,
-    )
-    pub_keys = game.encode_public(refs)
-    event_ids, event_mask = game.legal_events(refs)
-    legal_mask = torch.zeros(
-        (len(decision_indices), net.e_max), dtype=torch.bool, device=device
-    )  # [B, E]
-    for row in range(len(decision_indices)):
-        events = event_ids[row, event_mask[row]].to(torch.int64)
-        if (events >= net.e_max).any():
-            raise ValueError("network event head is too small for a player event")
-        legal_mask[row, events] = True
+    reaches: dict[int, Tensor] = {
+        0: torch.zeros((game.n_players, game.n_types), dtype=torch.float32, device=device)
+    }
+    tables: PolicyTables = {}
     was_training = net.training
     net.eval()
     with torch.no_grad():
-        output = net(pub_keys, legal_mask)
-        probabilities = torch.softmax(output.raw, dim=-1).cpu().numpy().astype(np.float64)
+        for index, ref in enumerate(tree_index.nodes):
+            reach = reaches[index]
+            owner = int(tree_index.owners[index])
+            policy: Tensor | None = None
+            if 0 <= owner < game.n_players:
+                refs = torch.tensor([ref], dtype=torch.int32, device=device)
+                event_ids, event_mask = game.legal_events(refs)
+                legal_mask = torch.zeros((1, net.e_max), dtype=torch.bool, device=device)
+                events = event_ids[0, event_mask[0]].long()
+                legal_mask[0, events] = True
+                kwargs: dict[str, Tensor] = {}
+                if getattr(net, "uses_reach_context", False):
+                    state = game.states.state(ref)
+                    kwargs = {
+                        "reach": reach[None],
+                        "actor": torch.tensor([owner], device=device),
+                        "live": torch.tensor([state.live], dtype=torch.bool, device=device),
+                    }
+                output = net(game.encode_public(refs), legal_mask, **kwargs)
+                policy = torch.softmax(output.raw[0], dim=-1)
+                tables[int(tree_index.node_keys[index])] = (
+                    policy.cpu().numpy().astype(np.float64)
+                )
+            for event, child in tree_index.children[index]:
+                child_reach = reach.clone()
+                if 0 <= owner < game.n_players:
+                    assert policy is not None
+                    child_reach[owner] += torch.log(policy[:, event])
+                elif owner == CHANCE:
+                    cards = set(game._event_cards(ref, event))
+                    conflict = torch.tensor(
+                        [not cards.isdisjoint(hand) for hand in game._hand_sets],
+                        dtype=torch.bool,
+                        device=device,
+                    )
+                    child_reach[:, conflict] = -torch.inf
+                reaches[child] = child_reach
     net.train(was_training)
-    return {
-        int(tree_index.node_keys[index]): probabilities[row]
-        for row, index in enumerate(decision_indices)
-    }
+    return tables

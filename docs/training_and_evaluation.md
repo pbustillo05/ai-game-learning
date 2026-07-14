@@ -31,11 +31,19 @@ Top-level sections are:
 - `completion`: samples per leaf (`null` in normal mode) and evaluator backend.
 - `model`: game-owned network dimensions.
 - `loss`: a registered mode-compatible objective (`ppo` for normal and
-  `rb_ppo` for the current RB paths), lambda, clipping, and regularization.
+  `rb_ppo` for the current RB paths), lambda, policy/value clipping, and
+  regularization. `value_loss` explicitly selects `mse` or `clipped`.
 - `training`: `normal`, `rao_blackwell`, or `branched_rao_blackwell`, plus
   iterations, gradient steps, minibatch size, Adam settings, AMP, seed,
-  checkpoint cadence, and output directory.
-- `debug_asserts`: enables expensive validation where supported.
+  checkpoint cadence, output directory, and the `strict`, `seeded`, or
+  `throughput` reproducibility profile.
+
+Synthetic game and model mappings are validated against their owned typed
+schemas during `load_config`, as are poker mappings. Synthetic public-state
+embedding capacity is derived from complete public-tree enumeration; supplied
+capacities smaller than the reachable tree are rejected.
+Synthetic poker uses `model.architecture: mha` by default; the former MLP is
+available only as `mlp_baseline` for controlled ablations.
 
 Every branched `rollout.beta` map requires `default`, and every intensity must
 be finite and at least one. Non-branched modes require `beta: null`.
@@ -47,7 +55,7 @@ be finite and at least one. Non-branched modes require `beta: null`.
   smoke run.
 - `configs/leduc.yaml`: fixed branching on Leduc, with more branching after
   public chance.
-- `configs/synthetic_dial_example.yaml`: three-player configurable game using
+- `configs/synthetic_dial_example.yaml`: two-player configurable game using
   decision-only reach storage.
 - `configs/train/nlhe6.yaml`: hardware-independent six-player 100bb NLHE
   settings, combined with `configs/hardware/local_3x2080ti.yaml` or the
@@ -62,26 +70,55 @@ pbg-train --config configs/train/nlhe6.yaml \
   --hardware-profile local_3x2080ti
 ```
 
+Resume into the same run directory with its existing checkpoint, run identity,
+and gap-free metrics prefix:
+
+```bash
+pbg-train --config configs/train/nlhe6.yaml \
+  --hardware-profile local_3x2080ti \
+  --resume runs/nlhe6/ckpt_0000100.pt
+```
+
 Omitting `--hardware-profile` defaults to `local_3x2080ti`. Quest access is
 available, but cluster execution is deliberately deferred until the local
 readiness gate in `HARDWARE.md` passes and always requires an explicit
 `--hardware-profile quest_slurm` selection.
 
-For multiple ranks, launch the same entry code with `torchrun`. Tree counts and
-minibatch sizes remain per rank; they are not divided by world size.
+For multiple ranks, launch the same entry code with `torchrun`. Sequential
+trajectory counts and minibatch sizes remain per rank; they are not divided by
+world size. Branched RB always samples exactly one tree per rank/GPU.
 
 Before any CUDA run on the shared server, inspect `nvidia-smi`, select only an
 idle GPU explicitly, begin with a tiny smoke configuration, and verify that
 memory/process state returns to idle afterward. The NLHE preset should be
-profiled before increasing trees, node budget, completions, model size, or
+profiled before increasing trajectories (sequential modes), the single-tree
+node budget (branched RB), completions, model size, or
 minibatch size.
+
+## Comparative performance profiles
+
+`pbg-benchmark` profiles any scientific config under all three training modes,
+with mode-appropriate completion and branching settings. It emits normalized
+throughput, retained bytes per decision, realized topology, phase timings, and
+CUDA phase peaks. Save a same-device baseline and gate later runs with:
+
+```bash
+pbg-benchmark --config configs/kuhn_smoke.yaml --warmup 2 --repeats 7 \
+  --output benchmarks/results/kuhn_cpu.json
+pbg-benchmark --config configs/kuhn_smoke.yaml --warmup 2 --repeats 7 \
+  --baseline benchmarks/results/kuhn_cpu.json
+```
+
+See `benchmarks/README.md` and `benchmarks/workloads.yaml` for tolerance,
+environment matching, GPU hygiene, and the minimum workload matrix.
 
 ## Metrics and checkpoints
 
 Rank zero appends one JSON object per iteration to `metrics.jsonl`. Reported
 fields include total loss, policy/value/entropy components, approximate KL,
 clip fraction, exact policy entropy, explained variance, and maximum active PPO
-ratio.
+ratio. Every record carries the stable identity in `run.json`; starting a new
+run refuses to append over existing run artifacts.
 
 Checkpoints are written through a temporary file and atomic replace. They
 contain:
@@ -89,11 +126,14 @@ contain:
 - unwrapped model state;
 - optimizer and gradient-scaler state;
 - completed iteration and serialized configuration;
-- explicit Torch and NumPy generator state; and
-- process Torch CPU and all CUDA RNG states.
+- explicit Torch and NumPy generator state for every DDP rank;
+- process Torch CPU and all CUDA RNG states for every rank; and
+- the stable run identity.
 
-`load_checkpoint` can restore all training state or only the model. Exact RNG
-restoration is covered by tests.
+`train(..., resume_from=...)` validates the scientific configuration, run
+identity, DDP world size, iteration schedule, checkpoint location, and metrics
+prefix before continuing at the stored iteration. Strict-mode interrupted and
+uninterrupted runs are bitwise-equal in the end-to-end regression test.
 
 ## Synthetic exploitability
 

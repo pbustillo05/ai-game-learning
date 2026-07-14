@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import pytest
 import torch
@@ -102,18 +104,47 @@ def test_leduc_exact_posterior_matches_seeded_profile_sampling() -> None:
         assert (observed[~positive] == 0).all()
 
 
-def test_large_private_dial_trips_exact_feasibility_guard() -> None:
-    game = SyntheticPBG(dial(public_scale=1, private_scale=3, n_players=4))
+def test_large_card_dial_trips_exact_feasibility_guard() -> None:
+    game = SyntheticPBG(dial(card_scale=800, action_scale=1))
     tree = enumerate_public_tree(game)
     with pytest.raises(FeasibilityError, match="private profile product"):
         exact_posterior(game, tree, 0)
 
 
-def test_dial_axes_change_public_and_private_sizes_independently() -> None:
-    base = dial(public_scale=1, private_scale=1, n_players=2)
-    public = dial(public_scale=3, private_scale=1, n_players=2)
-    private = dial(public_scale=1, private_scale=3, n_players=2)
-    assert (public.deck_size, public.hand_size) == (base.deck_size, base.hand_size)
-    assert public.n_rounds > base.n_rounds
-    assert private.n_rounds == base.n_rounds
-    assert SyntheticPBG(private).n_types > SyntheticPBG(base).n_types
+def test_dial_has_exactly_two_monotone_axes_and_named_anchors() -> None:
+    assert tuple(inspect.signature(dial).parameters) == ("card_scale", "action_scale")
+    assert dial(card_scale=1, action_scale=1) == kuhn()
+    assert dial(card_scale=2, action_scale=2) == leduc()
+
+    base = dial(card_scale=2, action_scale=1)
+    action = dial(card_scale=2, action_scale=3)
+    cards = dial(card_scale=4, action_scale=1)
+    assert (action.deck_size, action.hand_size) == (base.deck_size, base.hand_size)
+    assert action.n_rounds > base.n_rounds
+    assert len(action.raise_sizes[0]) > len(base.raise_sizes[0])
+    assert action.max_raises > base.max_raises
+    assert cards.n_rounds == base.n_rounds
+    assert SyntheticPBG(cards).n_types > SyntheticPBG(base).n_types
+
+
+def test_dial_grid_preserves_rules_and_grows_board_chance_support() -> None:
+    for card_scale in range(2, 6):
+        private_sizes = []
+        chance_widths = []
+        for action_scale in range(1, 5):
+            cfg = dial(card_scale=card_scale, action_scale=action_scale)
+            game = SyntheticPBG(cfg)
+            assert cfg.n_players == 2
+            assert cfg.hand_size == 1
+            assert cfg.board_per_round == (0,) + (1,) * (action_scale - 1)
+            assert len(cfg.raise_sizes[0]) == max(1, action_scale - 1)
+            private_sizes.append(game.n_types)
+            if action_scale > 1:
+                chance_widths.append(len(game._chance_combos[1]))
+        assert len(set(private_sizes)) == 1
+        assert len(set(chance_widths)) == 1
+
+    small = SyntheticPBG(dial(card_scale=2, action_scale=2))
+    large = SyntheticPBG(dial(card_scale=5, action_scale=2))
+    assert large.n_types > small.n_types
+    assert len(large._chance_combos[1]) > len(small._chance_combos[1])

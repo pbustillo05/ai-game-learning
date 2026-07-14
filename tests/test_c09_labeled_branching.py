@@ -12,7 +12,11 @@ import torch
 import yaml
 from torch import Tensor, nn
 
-from pbg.core.branching import _offspring_counts, _sample_branched_labeled
+from pbg.core.branching import (
+    _index_policy_output,
+    _offspring_counts,
+    _sample_branched_labeled,
+)
 from pbg.core.config import ConfigError, load_config
 from pbg.core.game import EventBatch, GameBundle, TERMINAL
 from pbg.core.rollout import _selected_policy_logp
@@ -31,9 +35,10 @@ class _Output:
 class _Model(nn.Module):
     def forward(self, states: Tensor) -> _Output:
         batch = states.shape[0]
+        values = states.to(torch.float32).reshape(batch, 1)
         return _Output(
-            raw=torch.zeros((batch, 1, 2), device=states.device),
-            v=torch.zeros((batch, 1), device=states.device),
+            raw=values[:, :, None].expand(-1, -1, 2).clone(),
+            v=values,
         )
 
 
@@ -60,6 +65,7 @@ class _LabeledBackend:
     def __init__(self, beta: float, two_levels: bool = False) -> None:
         self.beta = beta
         self.two_levels = two_levels
+        self.forward_batch_sizes: list[int] = []
 
     def root_states(self, n: int) -> Tensor:
         return torch.zeros(n, dtype=torch.int32)
@@ -77,6 +83,7 @@ class _LabeledBackend:
 
     def policy_forward(self, model: nn.Module, states: Tensor, reach: Tensor) -> _Output:
         del reach
+        self.forward_batch_sizes.append(int(states.numel()))
         return model(states)
 
     def sample_profiles(
@@ -141,7 +148,7 @@ def test_integer_and_fractional_randomized_rounding() -> None:
 
 
 def test_equal_labeled_siblings_remain_distinct_with_uniform_weights() -> None:
-    tree, _, policy = _sample(_LabeledBackend(4.0), _cfg(8, 4.0))
+    tree, _, policy = _sample(_LabeledBackend(4.0), _cfg(1, 4.0))
     tree.validate()
     roots = (tree.parent == -1).nonzero().squeeze(1)
     counts = tree.child_ptr[roots + 1] - tree.child_ptr[roots]
@@ -149,29 +156,48 @@ def test_equal_labeled_siblings_remain_distinct_with_uniform_weights() -> None:
     assert torch.equal(tree.child_event, torch.zeros_like(tree.child_event))
     assert torch.allclose(tree.nu, torch.full_like(tree.nu, 0.25), atol=0, rtol=0)
     assert torch.allclose(tree.path_weight[tree.child_node], tree.nu, atol=0, rtol=0)
-    assert policy.old_logp_child.shape == (8, 4, 1)
+    assert policy.old_logp_child.shape == (1, 4, 1)
 
 
 def test_duplicate_siblings_expand_independently_without_label_sorting() -> None:
-    tree, _, _ = _sample(_LabeledBackend(2.0, two_levels=True), _cfg(128, 2.0), 7)
+    backend = _LabeledBackend(2.0, two_levels=True)
+    tree, _, _ = _sample(backend, _cfg(1, 2.0), 7)
+    assert backend.forward_batch_sizes == [1, 2]
     roots = (tree.parent == -1).nonzero().squeeze(1)
-    mixed = 0
+    assert roots.numel() == 1
     for root in roots:
         first = tree.child_node[tree.child_ptr[root] : tree.child_ptr[root + 1]]
         assert torch.equal(
             tree.child_event[tree.child_ptr[root] : tree.child_ptr[root + 1]],
             torch.zeros(2, dtype=torch.int32),
         )
-        descendant_events = torch.cat(
-            [tree.child_event[tree.child_ptr[node] : tree.child_ptr[node + 1]] for node in first]
-        )
-        mixed += int(descendant_events.unique().numel() == 2)
-    assert mixed > 60
+        descendants = [
+            tree.child_node[tree.child_ptr[node] : tree.child_ptr[node + 1]]
+            for node in first
+        ]
+        assert all(children.numel() == 2 for children in descendants)
+        assert torch.cat(descendants).unique().numel() == 4
+
+
+def test_policy_output_row_expansion_matches_explicit_sibling_forward() -> None:
+    model = _Model()
+    parent_states = torch.tensor([0, 1, 2], dtype=torch.int32)
+    parent_output = model(parent_states)
+    rows = torch.tensor([0, 0, 2, 2, 2], dtype=torch.int64)
+    gathered = _index_policy_output(parent_output, rows)
+    repeated = model(parent_states[rows])
+    assert torch.equal(gathered.raw, repeated.raw)
+    assert torch.equal(gathered.v, repeated.v)
 
 
 def test_overflow_raises_instead_of_clamping_or_returning_partial_tree() -> None:
     with pytest.raises(RuntimeError, match=r"requested nodes=.*capacity nodes="):
-        _sample(_LabeledBackend(4.0), _cfg(2, 4.0, budget=1))
+        _sample(_LabeledBackend(4.0), _cfg(1, 4.0, budget=1))
+
+
+def test_branched_sampler_rejects_multiple_root_replicas() -> None:
+    with pytest.raises(ValueError, match="n_trees=1 per rank"):
+        _sample(_LabeledBackend(2.0), _cfg(2, 2.0))
 
 
 def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> None:
@@ -185,6 +211,10 @@ def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> 
     raw["rollout"]["beta"] = {"default": float("nan")}
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ConfigError, match="finite value at least one"):
+        load_config(path)
+    raw["rollout"]["beta"] = {"default": 2.0}
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="exactly one sampled tree per rank"):
         load_config(path)
 
 

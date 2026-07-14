@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from typing import Any, Callable, Mapping
 
 import numpy as np
@@ -64,12 +64,36 @@ def _offspring_counts(beta: Tensor, gen: torch.Generator) -> Tensor:
     return (base + extra).to(torch.int64)  # [B]
 
 
+def _index_policy_output(output: Any, rows: Tensor) -> Any:
+    """Gather batch rows from a lightweight, tensor-structured policy output."""
+
+    if isinstance(output, Tensor):
+        return output[rows]
+    if is_dataclass(output) and not isinstance(output, type):
+        return type(output)(
+            **{
+                field.name: _index_policy_output(getattr(output, field.name), rows)
+                for field in fields(output)
+            }
+        )
+    if isinstance(output, Mapping):
+        return type(output)(
+            (key, _index_policy_output(value, rows)) for key, value in output.items()
+        )
+    if isinstance(output, tuple):
+        return type(output)(_index_policy_output(value, rows) for value in output)
+    if isinstance(output, list):
+        return [_index_policy_output(value, rows) for value in output]
+    # Immutable metadata may be shared by all gathered rows.
+    return output
+
+
 def _sample_branched_labeled(
     bundle: GameBundle,
     cfg: RolloutConfig,
     gen: torch.Generator,
 ) -> tuple[TreeBatch, ReachCache, PolicyCache]:
-    """Sample fixed-intensity labeled public trees on the backend device.
+    """Sample one fixed-intensity labeled public tree on the backend device.
 
     The returned tree contains ``N`` nodes and ``C`` duplicate-preserving edges;
     reach rows are ``[N_stored,P,X_max]`` and cached decision rows are
@@ -88,8 +112,10 @@ def _sample_branched_labeled(
         raise ValueError("unknown reach_storage mode")
     n_trees = int(rollout_cfg.n_trees)
     node_budget = int(rollout_cfg.node_budget)
-    if n_trees < 0 or node_budget <= 0:
-        raise ValueError("n_trees must be nonnegative and node_budget positive")
+    if n_trees != 1 or node_budget <= 0:
+        raise ValueError(
+            "branched rollout requires n_trees=1 per rank and a positive node_budget"
+        )
 
     p_max = int(backend.n_players)
     x_sizes = tuple(int(value) for value in backend.x_sizes)
@@ -154,28 +180,40 @@ def _sample_branched_labeled(
         player_output: Any | None = None
 
         if player_positions.numel() != 0:
+            decision_parent_positions = (
+                (active_owner >= 0) & (active_owner < p_max)
+            ).nonzero().squeeze(1)  # [Nd_wave]
+            unique_player_states = active_states[decision_parent_positions]  # [Nd_wave]
+            unique_player_reach = active_reach[decision_parent_positions]  # [Nd_wave,P,X]
+            child_parent_positions = parent_positions[player_positions]  # [Cp]
+            child_output_rows = torch.searchsorted(
+                decision_parent_positions, child_parent_positions
+            )  # [Cp]
             player_states = states[player_positions]  # [Cp]
             player_reach = reaches[player_positions]  # [Cp,P,X]
             with torch.no_grad():
                 player_output = backend.policy_forward(
-                    bundle.model, player_states, player_reach
+                    bundle.model, unique_player_states, unique_player_reach
+                )
+                child_player_output = _index_policy_output(
+                    player_output, child_output_rows
                 )
                 player_events = backend.sample_events(
                     player_states,
                     profiles[player_positions],
-                    player_output,
+                    child_player_output,
                     bundle.policy_adapter,
                     gen,
                 )
                 next_reach[player_positions] = backend.reach_update(
-                    player_reach, player_states, player_events, player_output
+                    player_reach, player_states, player_events, child_player_output
                 )
                 legal_ids, legal_mask = backend.legal_events(player_states)
                 from pbg.core.rollout import _selected_policy_logp
 
                 player_logp = _selected_policy_logp(
                     bundle.policy_adapter,
-                    player_output,
+                    child_player_output,
                     player_events.public_id[:, None],
                     legal_ids,
                     legal_mask,
@@ -216,18 +254,8 @@ def _sample_branched_labeled(
             )  # [C_new]
             policy_edge_ids.append(edge_rows[player_positions])
             policy_edge_logp.append(player_logp)
-            decision_parent_positions = (
-                (active_owner >= 0) & (active_owner < p_max)
-            ).nonzero().squeeze(1)
-            player_counts = offspring[decision_parent_positions]  # [Nd_wave]
-            value_rows = torch.cat(
-                (
-                    torch.zeros(1, dtype=torch.int64, device=device),
-                    torch.cumsum(player_counts, dim=0)[:-1],
-                )
-            )  # [Nd_wave]
             policy_node_ids.append(active_nodes[decision_parent_positions].to(torch.int32))
-            policy_node_values.append(player_output.v[value_rows].detach().float())
+            policy_node_values.append(player_output.v.detach().float())
 
         frontier_nodes = child_nodes
         frontier_states = next_states
