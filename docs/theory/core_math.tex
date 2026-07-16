@@ -1060,6 +1060,27 @@ Then we can define the iterative process as
     \right)}
     {\prod_{\rho \prec \sigma} N(\rho)}}\right)
 \end{equation}
+{\color{red}
+\paragraph{Experimental constant-utility specialization (not a training contract).}
+Setting the variance proxy in the preceding KKT intensity to a constant gives
+\[
+  \beta_\kappa(\sigma)
+  =
+  \max\left(
+    1,
+    \sqrt{
+      \kappa e^{-S(\sigma)}
+      \frac{
+        \sum_{\rho\preccurlyeq\sigma,\ o(\rho)\in\mathcal P}
+        \left(\prod_{\rho\preccurlyeq\alpha\prec\sigma}N(\alpha)\right)^{-1}
+      }{
+        \prod_{\rho\prec\sigma}N(\rho)
+      }
+    }
+  \right),
+\]
+subject to the experimentally selected street/depth cap.
+}
 for $o(\sigma)\in\mathcal P$, while chance-node intensities remain fixed.
 Practically speaking, we can't immidiately use these heads in training before they are somewhat trained.
 So we warmup the training on a fixed intensity $\beta_{\tt fix}$ before starting this iterative process.
@@ -1097,6 +1118,26 @@ For a given sample, we let $\widehat W = \widehat W (\Sigma)$ and $\widehat{S}^\
   c_S(S^\theta(\Sigma)-\widehat S^\lambda)^2.
   \label{eq:branched-intensity-head-losses}
 \end{equation}
+{\color{red}
+\paragraph{Experimental arithmetic-mean size estimand (not a training contract).}
+An alternative log-output head may instead target
+\[
+  \widehat C(\mathsf s)=\exp(\widehat S^1(\mathsf s)),
+  \qquad
+  S_{\mathrm{mean}}(\sigma)
+  =
+  \log\mathbb E[\widehat C(\mathsf s)\mid\ell(\mathsf s)=\sigma],
+\]
+using the Gamma-deviance loss
+\[
+  \widehat C e^{-S_{\mathrm{mean}}}
+  +S_{\mathrm{mean}}
+  -\log\widehat C
+  -1.
+\]
+Its expected optimum satisfies
+\(e^{S_{\mathrm{mean}}}=\mathbb E[\widehat C\mid\sigma]\).
+}
 The losses are evaluated in log space so that very small and very large
 variance and size targets have comparable relative influence.
 

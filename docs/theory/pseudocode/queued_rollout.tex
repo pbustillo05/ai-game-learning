@@ -1,0 +1,320 @@
+\documentclass[10pt,varwidth=190mm,border=1mm]{standalone}
+\makeatletter
+\IfFileExists{preamble/preamble.tex}{
+  \def\theoryroot{}
+}{
+  \IfFileExists{../preamble/preamble.tex}{
+    \def\theoryroot{../}
+  }{
+    \IfFileExists{docs/theory/preamble/preamble.tex}{
+      \def\theoryroot{docs/theory/}
+    }{
+      \PackageError{queued_rollout}{Cannot locate docs/theory/preamble/preamble.tex}{}
+    }
+  }
+}
+\edef\input@path{{\theoryroot}}
+\makeatother
+\input{\theoryroot preamble/preamble}
+
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0pt}
+\setlength{\algomargin}{1.0em}
+\SetAlFnt{\footnotesize}
+\SetAlCapFnt{\footnotesize\bfseries}
+\SetAlCapNameFnt{\footnotesize\bfseries}
+\SetAlCapSkip{0.35em}
+\SetKwInput{KwState}{State}
+\SetKwInput{KwDef}{Definitions}
+\newcommand{\Qready}[1]{\mathcal Q_{#1}}
+\newcommand{\ChildBatch}{\operatorname{\texttt{SampleChildren}}}
+\newcommand{\ChanceClose}{\operatorname{\texttt{ChanceClose}}}
+\newcommand{\ForwardFamily}{\operatorname{\texttt{Forward}}}
+\newcommand{\PackFamily}{\operatorname{\texttt{Pack}}}
+\newcommand{\ForwardCache}{\operatorname{\texttt{FrozenForwardCache}}}
+
+\begin{document}
+
+\begin{algorithm}[H]
+\caption{$((\mathfrak R_g,\mathcal D_g,\mathcal L_g))_{g\in\mathcal G}
+\gets\texttt{MultiGPUQueuedRollout}(\pi,\mathsf m,N_{\mathsf{seq}})$}
+\label{alg:queued-rollout-pbg}
+\DontPrintSemicolon
+\tcc{The rollout profile is frozen and identical on all GPUs; queues and rollout state are GPU-local.}
+\KwParam{finite PBG $(\mathcal S,\mathcal T,\mathcal P,o,(\mathcal E_\sigma)_\sigma,
+\mathcal X,\mu,\chi)$; frozen $\pi=\pi^{\theta_k}$;
+$\mathsf m\in\{\mathsf{normal},\mathsf{RB},\mathsf{branched\text{-}RB}\}$;
+GPU set $\mathcal G$; $N_{\mathsf{seq}}$ sequential trajectory starts,
+unused in branched-RB}
+\KwParam{finite execution-family priority poset $(\mathcal M,\leq_{\mathcal M})$;
+public routing map
+$\kappa:\{\sigma:o(\sigma)\in\mathcal P\}\to\mathcal M$;
+one curried forward implementation $\ForwardFamily_m$ per $m$}
+\KwParam{for branched-RB, a frozen public black-box intensity
+$\beta:\mathcal S\setminus\mathcal T^{\mathsf{pre-c}}\to[1,\infty)$}
+\KwHyper{per-GPU hard memory limits; calibrated family-only packers,
+full-batch thresholds, and warmed execution plans for a small set of batch
+quanta; optional byte-capped exact frozen-forward cache}
+\KwDef{$\mathsf{seq}\gets\one_{\mathsf m\ne\mathsf{branched\text{-}RB}}$;
+$\mathcal T_{\mathsf m}\gets\mathcal T$ if $\mathsf m=\mathsf{normal}$,
+else $\mathcal T^{\mathsf{pre-c}}$;
+$\operatorname{Stop}_{\mathsf m}(\sigma)\gets\one_{\sigma\in\mathcal T_{\mathsf m}}$}
+\KwDef{
+$\operatorname{Round}(z;K)=\lfloor z\rfloor+
+\operatorname{Bernoulli}(z-\lfloor z\rfloor;K)$;
+$\iota(\mathsf s)$ is the schedule- and placement-independent logical address of
+$\mathsf s$: (global trajectory index, path) in sequential modes and
+(GPU tree index, abstract tree path) in branched-RB.  All draws use disjoint keys
+$K(k,\iota(\mathsf s),u,\mathsf{purpose})$}
+\KwDef{
+$\displaystyle
+\mathbb P^{\mathfrak r_{\mathsf s}}(x\mid\sigma)=
+\frac{\mu(x)\prod_{q\in\mathcal P\cup\{\mathsf c\}}
+r_{\mathsf s,q}(\sigma\mid x_q)}
+{\sum_{y\in\mathcal X}\mu(y)\prod_{q\in\mathcal P\cup\{\mathsf c\}}
+r_{\mathsf s,q}(\sigma\mid y_q)}$}
+\KwDef{
+$\PackFamily_{g,m}(\mathcal Q)$ returns a stable maximum-fill feasible
+occurrence batch containing only family $m$; it never subdivides or routes by
+street or any other public-stage label.  Feasibility counts one model row per
+distinct exact current-model input, the maximum padded forward cost across the mixed-stage
+rows, child sampling, and expansion workspace;
+$\phi_{g,m}(\mathcal B)\in[0,1]$ is its calibrated fill;
+$\operatorname{load}_{g,m}(\mathcal Q)$ is queued work in full-batch units and
+$\operatorname{age}(\mathcal Q)$ is the oldest wait time;
+$\operatorname{Full}_{g,m}(\mathcal Q)$ holds when the packed batch reaches the
+family's full-batch threshold}
+\KwDef{
+$\mathfrak A_g$ is a preallocated chunked struct-of-arrays arena addressed only
+by integer occurrence handles; it owns topology, state references, reach rows,
+RNG addresses, child spans, and the monotone status
+$\mathsf{NEW}\to\mathsf{QUEUED}\to\mathsf{EVALUATING}\to\mathsf{DONE}$.
+The family queues, counters, pack metadata, and reusable input/output/sampler
+staging slabs are device-resident; the steady-state scheduler performs no
+per-call scalar read or device-to-host transfer}
+\KwDef{
+$\operatorname{Enqueue}_g(\mathcal P')$ appends each $\mathsf s\in\mathcal P'$
+to the bounded FIFO queue $\Qready{g,\kappa(\ell_g(\mathsf s))}$ and atomically
+changes its status from $\mathsf{NEW}$ to $\mathsf{QUEUED}$;
+$\operatorname{SafeAdmit}_g(a)$ reserves retained storage and the largest
+in-flight transaction before admitting $a$ further sequential starts;
+$\max\varnothing\gets0$}
+\KwOut{$\mathfrak R_g$: one labeled tree rooted at $\varnothing$ if branched-RB,
+or GPU-local sequential trajectory records otherwise;
+decision rows $\mathcal D_g$; stopped leaves $\mathcal L_g$}
+
+\tcc{Poker specialization:
+$\mathcal M=\{\mathsf{pre}\}\sqcup\{\mathsf{post}_A:2\leq A\leq|\mathcal P|\}$,
+$\mathsf{pre}\prec\mathsf{post}_A$ for every $A$, and the $\mathsf{post}_A$ are
+pairwise incomparable.  Street is ordinary row metadata: mixed streets in the
+same $\mathsf{post}_A$ call are padded and masked, never scheduled separately.}
+Before sampling, deterministically partition
+$\{1,\ldots,N_{\mathsf{seq}}\}=\bigsqcup_{g\in\mathcal G}\mathcal I_g$
+if $\mathsf{seq}=1$, using calibrated per-GPU safe capacities and throughput
+(equal shares on homogeneous GPUs)\;
+
+\ForEach{$g\in\mathcal G$ \textbf{in parallel}}{
+  $\mathcal D_g,\mathcal L_g\gets\varnothing$\;
+  $(\Qready{g,m})_{m\in\mathcal M}\gets\varnothing$\;
+  $C_g\gets\ForwardCache(\theta_k)$, empty and capped by pre-reserved bytes, or
+  $\bot$ when the calibrated cache is disabled\;
+  \uIf{$\mathsf{seq}=0$}{
+    $\mathfrak S_g\gets\{\varnothing\}$\;
+    $\ell_g(\varnothing)\gets\varnothing$\;
+    $\mathfrak r_{g,\varnothing}\gets(1)_{q\in\mathcal P\cup\{\mathsf c\}}$\;
+    $\iota(\varnothing)\gets(g,\varnothing)$\;
+    $\mathfrak R_g\gets(\mathfrak S_g,\ell_g,N_g,\mathfrak r_g)$\;
+    $(\mathcal P_0,\mathcal L_0)\gets
+      \ChanceClose_g(\{\varnothing\},\mathsf m)$\;
+    $\operatorname{Enqueue}_g(\mathcal P_0)$\;
+    $\mathcal L_g\gets\mathcal L_g\sqcup\mathcal L_0$\;
+    $\mathcal U_g\gets\varnothing$
+    \tcc*[r]{exactly one root on this GPU}
+  }
+  \Else{
+    $\mathfrak R_g\gets\varnothing$\;
+    $\mathcal U_g\gets\mathcal I_g$
+    \tcc*[r]{unstarted trajectory indices}
+  }
+
+  \While{$\mathcal U_g\ne\varnothing\ \textnormal{or}\
+  \bigsqcup_{m\in\mathcal M}\Qready{g,m}\ne\varnothing$}{
+    $\mathcal F_g\gets
+      \{m\in\mathcal M:\operatorname{Full}_{g,m}(\Qready{g,m})\}$\;
+
+    \uIf{$\mathcal F_g\ne\varnothing$}{
+      $m\gets\argmax_{m\in\min_{\leq_{\mathcal M}}\mathcal F_g}
+      (\operatorname{load}_{g,m}(\Qready{g,m}),\operatorname{age}(\Qready{g,m}))$
+      \tcc*[r]{lexicographic; upstream full work first}
+    }
+    \uElseIf{$\mathsf{seq}=1$ and
+    $a_g\gets\max\{a\leq|\mathcal U_g|:\operatorname{SafeAdmit}_g(a)\}>0$}{
+      Remove $a_g$ indices $i$ from $\mathcal U_g$ in stable order and, in one device batch,
+      allocate trajectory-start occurrences $\mathsf s_i^0$ with
+      $\ell_g(\mathsf s_i^0)=\varnothing$,
+      $\mathfrak r_{g,\mathsf s_i^0}=(1)_q$,
+      $X_i\sim\mu$ using $K(k,(i,\varnothing),0,\mathsf{private})$, and
+      $\iota(\mathsf s_i^0)=(i,\varnothing)$\;
+      Append these occurrences to $\mathfrak R_g$\;
+      $(\mathcal P_0,\mathcal L_0)\gets
+        \ChanceClose_g(\{\mathsf s_i^0\}_i,\mathsf m)$\;
+      $\operatorname{Enqueue}_g(\mathcal P_0)$\;
+      $\mathcal L_g\gets\mathcal L_g\sqcup\mathcal L_0$\;
+      \textbf{continue}\;
+    }
+    \Else{
+      $\operatorname{assert}(\bigsqcup_m\Qready{g,m}\ne\varnothing)$\;
+      $m\gets\argmax_{m:\Qready{g,m}\ne\varnothing}
+      (\phi_{g,m}(\PackFamily_{g,m}(\Qready{g,m})),
+       \operatorname{age}(\Qready{g,m}),-h(m))$
+      \tcc*[r]{forced partial drain; $h$ is any topological height}
+    }
+
+    $\mathcal B\gets\PackFamily_{g,m}(\Qready{g,m})$, remove its handles from
+    $\Qready{g,m}$, and atomically mark them $\mathsf{EVALUATING}$\;
+    Let $\mathcal V\subseteq\mathcal B$ contain one stable representative of each
+    exact current-model input and scatter map, and let $\mathcal V_{\mathsf{miss}}$
+    be $\mathcal V$ if $C_g=\bot$, or the representatives absent from $C_g$
+    otherwise\;
+    \ForEach{$\mathsf s\in\mathcal V_{\mathsf{miss}}$ \textbf{in one warmed family-$m$ GPU call}}{
+      $\sigma_{\mathsf s}\gets\ell_g(\mathsf s)$\;
+      $p_{\mathsf s}\gets o(\sigma_{\mathsf s})$\;
+      $\Pi_{\mathsf s}\gets
+      \ForwardFamily_m(\sigma_{\mathsf s},\mathfrak r_{g,\mathsf s};\theta_k)
+      =\bigl(\pi(\cdot\mid x_{p_{\mathsf s}},\sigma_{\mathsf s}),
+      V^{\theta_k}(x_{p_{\mathsf s}},\sigma_{\mathsf s}),\ldots\bigr)_
+      {x_{p_{\mathsf s}}\in\mathcal X_{p_{\mathsf s}}}$\;
+    }
+    Publish cache misses to $C_g$ when enabled and gather $\Pi_{\mathsf s}$ from
+    cached or newly evaluated representatives to all $\mathsf s\in\mathcal B$\;
+    $(\mathcal A,\mathcal F)\gets
+      \ChildBatch_g(\mathcal B,(\Pi_{\mathsf s})_{\mathsf s\in\mathcal B},\mathsf m)$\;
+    $(\mathcal P',\mathcal L')\gets\ChanceClose_g(\mathcal F,\mathsf m)$\;
+    $\mathcal D_g\gets\mathcal D_g\sqcup\mathcal A$\;
+    $\operatorname{Enqueue}_g(\mathcal P')$\;
+    $\mathcal L_g\gets\mathcal L_g\sqcup\mathcal L'$\;
+    Mark every occurrence in $\mathcal B$ $\mathsf{DONE}$; only deterministic
+    frozen outputs may be shared---every child keeps its own profile, event,
+    reach, descendants, and later completion draws\;
+
+    $\operatorname{assert}(\bigsqcup_m\Qready{g,m}
+      =\{\textnormal{all live, non-in-flight player occurrences on GPU }g\})$\;
+    $\operatorname{assert}(\textnormal{no chance occurrence is pending})$\;
+    $\operatorname{assert}(\textnormal{hard structural and memory budgets hold})$\;
+  }
+  \If{$\mathsf{seq}=0$}{
+    $\operatorname{assert}(\mathfrak S_g\textnormal{ is one tree with the unique root }\varnothing)$\;
+  }
+}
+Impose no terminal barrier and perform no queue or model collective inside this
+routine: each GPU may proceed directly from its completed local rollout to local
+completion, backward target construction, and compaction; the first required
+collective is the normalization reduction in
+\texttt{DistributedFixedRolloutUpdate}\;
+\Return{$((\mathfrak R_g,\mathcal D_g,\mathcal L_g))_{g\in\mathcal G}$}\;
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$(\mathcal A,\mathcal F')\gets
+\texttt{SampleChildren}_g(\mathcal B,\Pi,\mathsf m)$}
+\label{alg:queued-sample-children-pbg}
+\DontPrintSemicolon
+\tcc{$\mathcal B$ is a player batch with curried output $\Pi$, or a chance batch with $\Pi=\bot$.}
+\KwIn{sampled occurrences $\mathcal B=(\mathsf s_j)_{j=1}^b$ of one owner kind;
+mode $\mathsf m$; GPU-local rollout state and schedule-independent keys}
+\KwOut{decision rows $\mathcal A$ (empty for chance); all sampled children $\mathcal F'$}
+$\mathcal A,\mathcal F'\gets\varnothing$\;
+\For{$j=1,\ldots,b$ \textbf{in one device batch}}{
+  $\sigma_j\gets\ell_g(\mathsf s_j)$\;
+  $q_j\gets o(\sigma_j)$\;
+  $n_j\gets
+  \begin{cases}[l"l]
+    1, & \mathsf m\ne\mathsf{branched\text{-}RB},\\
+    \operatorname{Round}(\beta(\sigma_j);
+      K(k,\iota(\mathsf s_j),0,\mathsf{round})),
+      & \mathsf m=\mathsf{branched\text{-}RB};
+  \end{cases}$\;
+  \If{$\mathsf m=\mathsf{branched\text{-}RB}$}{$N_g(\mathsf s_j)\gets n_j$\;}
+}
+$\mathcal I\gets\{(j,u):1\leq j\leq b,1\leq u\leq n_j\}$ by prefix sum\;
+reserve the exact child/edge block and maximum-feasible ragged sampler workspace\;
+fail loudly rather than changing $(n_j)_j$ if a hard budget is exceeded\;
+
+\ForEach{$(j,u)\in\mathcal I$ \textbf{in maximum-feasible device batches}}{
+  $X_{j,u}\gets
+  \begin{cases}[l"l]
+    X_{i(j)}, & \mathsf m\ne\mathsf{branched\text{-}RB},\\
+    X\sim\mathbb P^{\mathfrak r_{g,\mathsf s_j}}(\cdot\mid\sigma_j)
+    \textnormal{ with }K(k,\iota(\mathsf s_j),u,\mathsf{posterior}),
+    & \mathsf m=\mathsf{branched\text{-}RB};
+  \end{cases}$\;
+  \tcc*[r]{the sibling evaluator intentionally returns a full joint profile}
+  $E_{j,u}\sim
+  \begin{cases}[l"l]
+    \pi(\cdot\mid X_{j,u,q_j},\sigma_j)\textnormal{ from }\Pi_j,
+      & q_j\in\mathcal P,\\
+    \chi(\cdot\mid X_{j,u},\sigma_j), & q_j=\mathsf c,
+  \end{cases}$
+  using $K(k,\iota(\mathsf s_j),u,\mathsf{action})$ or
+  $K(k,\iota(\mathsf s_j),u,\mathsf{chance})$, respectively\;
+  allocate a distinct abstract child $\mathsf s_j\mathsf a_{j,u}$ and set
+  $\iota(\mathsf s_j\mathsf a_{j,u})=(\iota(\mathsf s_j),u)$,
+  $\ell_g(\mathsf s_j\mathsf a_{j,u})=\sigma_jE_{j,u}$\;
+  $\mathfrak r_{g,\mathsf s_j\mathsf a_{j,u},v}\gets
+    \mathfrak r_{g,\mathsf s_j,v}$ for $v\ne q_j$\;
+  $\mathfrak r_{g,\mathsf s_j\mathsf a_{j,u},q_j}\gets
+    \operatorname{Normalize}\!\left(
+    \mathfrak r_{g,\mathsf s_j,q_j}\odot
+    \begin{cases}[l"l]
+      \pi(E_{j,u}\mid-,\sigma_j), & q_j\in\mathcal P,\\
+      \chi(E_{j,u}\mid-,\sigma_j), & q_j=\mathsf c
+    \end{cases}\right)$\;
+  append $\mathsf s_j\mathsf a_{j,u}$ to $\mathfrak S_g$ in branched-RB,
+  or to its trajectory record otherwise, and append it to $\mathcal F'$\;
+}
+\If{$\Pi\ne\bot$}{
+  $\mathcal A\gets
+  \{(\mathsf s_j,(\mathsf a_{j,u},E_{j,u})_{u=1}^{n_j},n_j,
+  \mathfrak r_{g,\mathsf s_j},
+  \operatorname{Old}(\Pi_j,(E_{j,u})_{u=1}^{n_j})):1\leq j\leq b\}$
+  \tcc*[r]{retain only loss-required old policy/value slices}
+}
+Discard branched-RB posterior profiles $X_{j,u}$\;
+\Return{$(\mathcal A,\mathcal F')$}\;
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$(\mathcal P',\mathcal L')\gets
+\texttt{ChanceClose}_g(\mathcal F,\mathsf m)$}
+\label{alg:queued-chance-close-pbg}
+\DontPrintSemicolon
+\tcc{Close every chance-only segment before returning control to the model-family scheduler.}
+\KwIn{new sampled occurrences $\mathcal F$; mode $\mathsf m$; GPU-local rollout state}
+\KwOut{next player occurrences $\mathcal P'$ and stopped leaves $\mathcal L'$}
+$\mathcal P',\mathcal L'\gets\varnothing$\;
+\While{$\mathcal F\ne\varnothing$}{
+  Partition $\mathcal F$ into
+  $\mathcal L_0=\{\mathsf s:\operatorname{Stop}_{\mathsf m}(\ell_g(\mathsf s))=1\}$,
+  $\mathcal P_0=\{\mathsf s:\operatorname{Stop}_{\mathsf m}(\ell_g(\mathsf s))=0,
+  o(\ell_g(\mathsf s))\in\mathcal P\}$, and
+  $\mathcal C_0=\{\mathsf s:\operatorname{Stop}_{\mathsf m}(\ell_g(\mathsf s))=0,
+  o(\ell_g(\mathsf s))=\mathsf c\}$\;
+  $\operatorname{assert}(|\mathcal F|=|\mathcal L_0|+|\mathcal P_0|+|\mathcal C_0|)$\;
+  $\mathcal P'\gets\mathcal P'\sqcup\mathcal P_0$\;
+  $\mathcal L'\gets\mathcal L'\sqcup\mathcal L_0$\;
+  \If{$\mathsf m=\mathsf{branched\text{-}RB}$}{
+    $N_g(\mathsf s)\gets0$ for $\mathsf s\in\mathcal L_0$\;
+  }
+  Partition $\mathcal C_0$ into stable maximum-feasible chance-sampling batches
+  $(\mathcal C_v)_v$\;
+  $\mathcal F\gets\varnothing$\;
+  \ForEach{$\mathcal C_v$}{
+    $(\varnothing,\mathcal F_v)\gets\ChildBatch_g(\mathcal C_v,\bot,\mathsf m)$\;
+    $\mathcal F\gets\mathcal F\sqcup\mathcal F_v$\;
+  }
+}
+\Return{$(\mathcal P',\mathcal L')$}\;
+\end{algorithm}
+
+\end{document}

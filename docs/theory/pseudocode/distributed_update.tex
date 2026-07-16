@@ -1,0 +1,189 @@
+\documentclass[10pt,varwidth=190mm,border=1mm]{standalone}
+\makeatletter
+\IfFileExists{preamble/preamble.tex}{
+  \def\theoryroot{}
+}{
+  \IfFileExists{../preamble/preamble.tex}{
+    \def\theoryroot{../}
+  }{
+    \IfFileExists{docs/theory/preamble/preamble.tex}{
+      \def\theoryroot{docs/theory/}
+    }{
+      \PackageError{distributed_update}{Cannot locate docs/theory/preamble/preamble.tex}{}
+    }
+  }
+}
+\edef\input@path{{\theoryroot}}
+\makeatother
+\input{\theoryroot preamble/preamble}
+
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0pt}
+\setlength{\algomargin}{1.0em}
+\SetAlFnt{\footnotesize}
+\SetAlCapFnt{\footnotesize\bfseries}
+\SetAlCapNameFnt{\footnotesize\bfseries}
+\SetAlCapSkip{0.35em}
+\SetKwInput{KwDef}{Definitions}
+\newcommand{\BackwardTargets}{\operatorname{\texttt{BackwardTargets}}}
+\newcommand{\ModeLoss}{\operatorname{\texttt{ModeLoss}}}
+\newcommand{\Alias}{\operatorname{\texttt{Alias}}}
+\newcommand{\AllReduceSum}{\operatorname{\texttt{AllReduceSum}}}
+\newcommand{\IAllReduceSum}{\operatorname{\texttt{IAllReduceSum}}}
+\newcommand{\Await}{\operatorname{\texttt{Await}}}
+\newcommand{\OptimizerStep}{\operatorname{\texttt{OptimizerStep}}}
+
+\begin{document}
+
+\begin{algorithm}[H]
+\caption{$\theta_{k+1}\gets
+\texttt{DistributedFixedRolloutUpdate}
+(\theta_k,((\mathfrak R_g,\mathcal D_g,\mathcal L_g))_{g\in\mathcal G},\mathsf m)$}
+\label{alg:distributed-fixed-rollout-update}
+\DontPrintSemicolon
+\tcc{Targets, old-policy outputs, topology, and the empirical decision law stay frozen; only $\theta$ changes.}
+\tcc{In branched-RB, $\mathfrak R_g$ is the one rollout tree on GPU $g$; sequential records contain trajectory starts.}
+\KwParam{finite PBG; rollout profile $\pi=\pi^{\theta_k}$;
+$\mathsf m\in\{\mathsf{normal},\mathsf{RB},\mathsf{branched\text{-}RB}\}$;
+fixed GPU-local rollout outputs from \texttt{MultiGPUQueuedRollout}; GPU set $\mathcal G$}
+\KwParam{execution-family priority poset $(\mathcal M,\leq_{\mathcal M})$ and
+public routing map $\kappa$; mode-correct per-decision loss
+$\ModeLoss_{\mathsf m}$; batches are keyed only by $m\in\mathcal M$}
+\KwHyper{$K$, common number of synchronous optimizer steps;
+calibrated family execution-cost curves $C_{g,m}(b)$ and admissible integer
+bounds/quanta for logical stratum sizes $B_{g,m}$, with $B_{g,m}\geq1$ whenever
+the stratum has positive mass; common predicted per-GPU time budgets $T_g$;
+optimizer, common AMP loss scale, and global gradient-clipping rule; optional
+frozen-reference cache}
+\KwDef{$\mathcal D_{g,m}\gets
+\{\mathsf s\in\mathcal D_g:\kappa(\ell_g(\mathsf s))=m\}$;
+for a player-decision occurrence $\mathsf s$,
+\[
+  \omega_g(\mathsf s)\gets
+  \begin{cases}[l"l]
+    1,
+      & \mathsf m\in\{\mathsf{normal},\mathsf{RB}\},\\
+    \displaystyle\prod_{\mathsf r\prec\mathsf s}\frac{1}{N_g(\mathsf r)},
+      & \mathsf m=\mathsf{branched\text{-}RB}
+  \end{cases}
+\]}
+\KwDef{$Z_{g,m}\gets\sum_{\mathsf s\in\mathcal D_{g,m}}\omega_g(\mathsf s)$,
+$Z_g\gets\sum_m Z_{g,m}$,
+$Z\gets\sum_g Z_g$, and, when $Z_{g,m}>0$,
+\[
+  q_{g,m}(\mathsf s)\gets
+  \frac{\omega_g(\mathsf s)}{Z_{g,m}},
+  \qquad
+  \alpha_{g,m}\gets\frac{Z_{g,m}}{Z}.
+\]}
+\KwDef{$\ModeLoss_{\mathsf m}(\theta;\mathsf s,\mathcal O_g)$ is the corresponding
+loss of \texttt{core\_math}: posterior sums are inside the RB losses and, in branched-RB,
+\[
+  \ModeLoss_{\mathsf{branched\text{-}RB}}(\theta;\mathsf s,\mathcal O_g)
+  =\frac{1}{N_g(\mathsf s)}
+    \sum_{\mathsf a\in\mathfrak E_{\mathsf s}}\mathcal L^\pi_{g,\mathsf s,\mathsf a}(\theta)
+   +\mathcal L^{\mathsf{node}}_{g,\mathsf s}(\theta),
+\]
+where $\mathcal L^\pi$ includes the edge target and
+$\widehat{\mathbb P}(x_p\mid\mathsf s\mathsf a)$ weight, while
+$\mathcal L^{\mathsf{node}}$ contains the enabled value, entropy, and reference-KL
+terms with $\widehat{\mathbb P}(x_p\mid\mathsf s)$ weight.  The rollout intensity
+$\beta$ is an external black box and has no head, target, or loss in this algorithm}
+\KwDef{$\widehat\sigma_{g,m}^2$ is a frozen lagged estimate of
+$\operatorname{trCov}_{q_{g,m}}[\nabla_\theta\ModeLoss_{\mathsf m}]$, or a
+configured cheap proxy calibrated against it; it affects only learner work
+allocation, never the objective or rollout law}
+\KwOut{identical updated parameters $\theta_{k+1}$ and optimizer state on every GPU}
+
+\ForEach{$g\in\mathcal G$ \textbf{as soon as its local rollout completes}}{
+  Compute $(\omega_g(\mathsf s))_{\mathsf s\in\mathcal D_g}$ and
+  $(Z_{g,m})_{m\in\mathcal M}$ in one pass over the local rollout records\;
+}
+$Z^\star\gets\IAllReduceSum_g(Z_g)$ without a preceding barrier\;
+
+\ForEach{$g\in\mathcal G$ \textbf{in parallel}}{
+  Stream terminal rewards or pre-terminal completion microbatches through the
+  mode-correct backward reduction frontier and construct the fixed compact
+  struct-of-arrays target table
+  $\mathcal O_g\gets\BackwardTargets_{\mathsf m}
+  (\mathfrak R_g,\mathcal D_g,\mathcal L_g;V^{\theta_k})$, laid out by $m$ but
+  never by street
+  \tcc*[r]{completed child summaries are contracted immediately}
+  \ForEach{$m\in\mathcal M:Z_{g,m}>0$}{
+    $Q_{g,m}\gets\Alias((\omega_g(\mathsf s))_{\mathsf s\in\mathcal D_{g,m}})$\;
+  }
+  If reference KL is enabled and its byte plan fits, evaluate the frozen
+  reference once per distinct retained input, in family-only calls, and attach
+  the exact sufficient reference outputs to $\mathcal O_g$; otherwise retain the
+  inputs needed to recompute those exact outputs inside each physical family call\;
+  Release leaf reaches, completion workspaces, reduction-frontier summaries,
+  frozen-rollout transients, and topology not owned by the compact target table\;
+}
+$Z\gets\Await(Z^\star)$ and assert $Z>0$\;
+Choose integer $B_{g,m}$ under a common per-GPU time budget by minimizing the
+lagged variance proxy
+\[
+  \sum_{m:Z_{g,m}>0}
+  \frac{(Z_{g,m}/Z)^2\widehat\sigma_{g,m}^2}{B_{g,m}}
+  \quad\textnormal{subject to}\quad
+  \sum_m C_{g,m}(B_{g,m})\leq T_g.
+\]
+Use $B_{g,m}\propto Z_{g,m}\widehat\sigma_{g,m}/\sqrt{c_{g,m}}$, where
+$c_{g,m}$ is the calibrated local linear slope of $C_{g,m}$, only as the
+linear-cost warm start; then round/search over efficient family batch quanta\;
+$\theta\gets\theta_k$ on every GPU\;
+
+\For{$t=0,\ldots,K-1$}{
+  \ForEach{$g\in\mathcal G$ \textbf{in parallel}}{
+    \ForEach{$m\in\mathcal M:Z_{g,m}>0$}{
+      Sample
+      $(\mathsf S_{g,m,b})_{b=1}^{B_{g,m}}
+      \stackrel{\mathsf{iid}}{\sim}q_{g,m}$ using $Q_{g,m}$\;
+    }
+    Set the rank-local stratified loss
+    \[
+      \widehat l_{g,t}(\theta)
+      \gets
+      \sum_{m:Z_{g,m}>0}
+      \alpha_{g,m}\frac{1}{B_{g,m}}
+      \sum_{b=1}^{B_{g,m}}
+      \ModeLoss_{\mathsf m}
+      (\theta;\mathsf S_{g,m,b},\mathcal O_g).
+    \]
+    Keep $\mathcal O_g$ GPU-resident and gather it only by device index tensors.
+    Group the sampled logical decisions only by $m$, coalesce equal current-model
+    inputs while retaining their loss multiplicities, pad and mask mixed public
+    stages inside maximum-feasible family-$m$ physical forward/backward
+    microbatches without subdividing by street, and accumulate the exactly scaled
+    physical loss sums into
+    $G_{g,t}\gets\nabla_\theta\widehat l_{g,t}(\theta)$ without an optimizer step;
+    never average a physical microbatch independently\;
+    Flatten the common-scale fp32 gradients in fixed parameter order into one
+    preallocated buffer, inserting zeros for absent parameters\;
+  }
+  $G_t\gets\AllReduceSum_g(G_{g,t})$ on the flat buffers, with no division by
+  $|\mathcal G|$\;
+  Derive the identical nonfinite decision locally from the reduced flat buffer
+  (no second collective), unscale once, apply the common global clipping rule,
+  and set $\theta\gets\OptimizerStep(\theta,G_t)$ and the next loss scale
+  identically on every GPU\;
+}
+$\theta_{k+1}\gets\theta$\;
+
+\tcc{No path weight is multiplied into a sampled loss: it is already represented by the alias law and $\alpha_{g,m}$.}
+\tcc{Conditionally on the fixed distributed rollout, for every current $\theta$,}
+\[
+  \mathbb E(G_t\mid(\mathfrak R_g)_g,\theta)
+  =\nabla_\theta
+  \sum_{g\in\mathcal G}\sum_{\mathsf s\in\mathcal D_g}
+  \frac{\omega_g(\mathsf s)}{Z}
+  \ModeLoss_{\mathsf m}(\theta;\mathsf s,\mathcal O_g).
+\]
+\tcc{The flat SUM reduction is intentional: $\alpha_{g,m}=Z_{g,m}/Z$ already
+supplies the exact global normalization, so neither rank-local means nor DDP's
+default equal-rank averaging may be introduced.}
+\Return{$\theta_{k+1}$}\;
+\end{algorithm}
+
+\end{document}
