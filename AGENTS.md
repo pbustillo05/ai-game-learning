@@ -18,6 +18,7 @@ as its sole active game.
 - `/home/pablob/poker-gpu-evaluator/docs/api_pbg.md` (read-only rights, you are not authorized to modify that file): binding interface to the sibling poker evaluator. We **have** to use that sibling repo for posterior sampling and Monte Carlo equity/posterior simulations.
 - `IMPLEMENTATION_NOTES.md`: historical implementation ledger; use
   `docs/audit/` for current readiness and open issues.
+- In Markdown, write math with `$...$` and `$$...$$` rather than `\(...\)` or `\[...\]` so it renders in VS Code.
 
 ## PBG tree terminology and rollout convention
 
