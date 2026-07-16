@@ -7,9 +7,9 @@ import torch
 
 from pbg.core.completion import BatchedCompletionStats
 from pbg.core.game import TERMINAL
-from pbg.core.posterior_values import NodeTargets as CorrectedTargets
+from pbg.core.values import NodeTargets as CorrectedTargets
 from pbg.core.tree import TreeBuilder
-from pbg.core.values import HeadEvals, NodeTargets, branched_value, streamed_branched_value
+from pbg.core.values import HeadEvals, NodeTargets, streamed_branched_value
 
 
 @dataclass
@@ -60,9 +60,11 @@ def _fixture():
 
 def _run(lam: float, **kwargs) -> NodeTargets:
     tree, stats, heads = _fixture()
-    return branched_value(
-        tree, stats, None, heads, lam, _Game(), configured_node_budget=5,
-        emit_q=True, **kwargs,
+    leaves = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero().squeeze(1)
+    return streamed_branched_value(
+        tree, leaves, [(leaves.to(torch.int32), stats)], None, heads, lam, _Game(),
+        configured_node_budget=5, completion_batch_rows=leaves.numel(), emit_q=True,
+        **kwargs,
     )
 
 
@@ -83,15 +85,17 @@ def test_values_module_is_the_corrected_public_api_and_masks_padding() -> None:
 @pytest.mark.parametrize("lam", [0.0, 0.5, 0.95, 1.0])
 def test_lambda_boundaries_are_finite_and_q_is_opt_in(lam: float) -> None:
     tree, stats, heads = _fixture()
-    targets = branched_value(
-        tree, stats, None, heads, lam, _Game(), configured_node_budget=5
+    leaves = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero().squeeze(1)
+    targets = streamed_branched_value(
+        tree, leaves, [(leaves.to(torch.int32), stats)], None, heads, lam, _Game(),
+        configured_node_budget=5, completion_batch_rows=leaves.numel(),
     )
     assert targets.q_hat is None
     assert torch.isfinite(targets.a_hat).all()
     assert torch.isfinite(targets.v_hat).all()
 
 
-def test_streamed_leaf_batches_match_full_completion() -> None:
+def test_streamed_leaf_batches_match_single_completion_batch() -> None:
     tree, stats, heads = _fixture()
     base = _run(0.95)
     leaves = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero().squeeze(1)
@@ -125,6 +129,10 @@ def test_rejects_half_precision_accumulators() -> None:
     tree, stats, heads = _fixture()
     stats.p_hat = stats.p_hat.half()
     with pytest.raises(TypeError, match="fp16"):
-        branched_value(
-            tree, stats, None, heads, 0.5, _Game(), configured_node_budget=5
+        streamed_branched_value(
+            tree,
+            (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero().squeeze(1),
+            [((tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero().squeeze(1).to(torch.int32), stats)],
+            None, heads, 0.5, _Game(), configured_node_budget=5,
+            completion_batch_rows=stats.p_hat.shape[0],
         )

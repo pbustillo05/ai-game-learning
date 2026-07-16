@@ -16,7 +16,7 @@ from pbg.core.branching import (
     _index_policy_output,
     sample_branched_tree,
 )
-from pbg.core.config import ConfigError, load_config
+from pbg.config import ConfigError, load_config
 from pbg.core.game import EventBatch, GameBundle, TERMINAL
 from pbg.core.rollout import _selected_policy_logp
 from pbg.core.tree import DeviceTreeBuffer
@@ -67,14 +67,14 @@ class _LabeledBackend:
         self.forward_batch_sizes: list[int] = []
         self.actual_cost_batch_sizes: list[int] = []
 
-    def root_states(self, n: int) -> Tensor:
+    def _initial_state_batch(self, n: int) -> Tensor:
         return torch.zeros(n, dtype=torch.int32)
 
     def sequential_start_states(self, count: int) -> Tensor:
-        return self.root_states(count)
+        return self._initial_state_batch(count)
 
     def branched_root_state(self) -> Tensor:
-        return self.root_states(1)
+        return self._initial_state_batch(1)
 
     def classify(self, states: Tensor) -> Tensor:
         terminal_at = 2 if self.two_levels else 1
@@ -138,11 +138,9 @@ class _LabeledBackend:
         return torch.full(states.shape, self.beta, dtype=torch.float32)
 
 
-def _cfg(n_trees: int, beta: float, budget: int = 32) -> SimpleNamespace:
+def _cfg(root_count: int, beta: float, budget: int = 32) -> SimpleNamespace:
     return SimpleNamespace(
-        n_trees=n_trees,
-        beta_mode="fixed",
-        beta_fix={"default": beta},
+        sequential_starts=root_count,
         node_budget=budget,
         reach_storage="full",
     )
@@ -208,7 +206,6 @@ def test_branched_uses_one_root_and_preserves_duplicate_children() -> None:
 def test_branched_dispatches_actual_cost_family_blocks() -> None:
     backend = _LabeledBackend(2.0, two_levels=True)
     cfg = _cfg(1, 2.0)
-    cfg.queue_packing = "actual_cost_greedy"
     tree, _, policy = _sample(backend, cfg, 7)
 
     tree.validate()

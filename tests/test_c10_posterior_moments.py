@@ -8,9 +8,8 @@ import torch
 from pbg.core.completion import BatchedCompletionStats
 from pbg.core.game import TERMINAL
 from pbg.core.values import (
-    AuxiliaryChannelSpec,
     HeadEvals,
-    branched_value,
+    streamed_branched_value,
 )
 from pbg.core.tree import TreeBatch, TreeBuilder
 
@@ -30,6 +29,23 @@ def _stats(p_hat: torch.Tensor, v_hat: torch.Tensor, **metadata):
         u_hat=torch.zeros(leaves),
         n_eff=torch.ones(leaves),
         metadata=metadata,
+    )
+
+
+def _targets(tree, stats, heads, lam, *, emit_q=False, max_workspace_bytes=1 << 30):
+    leaves = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero().squeeze(1)
+    return streamed_branched_value(
+        tree,
+        leaves,
+        [(leaves.to(torch.int32), stats)],
+        None,
+        heads,
+        lam,
+        _Game(),
+        configured_node_budget=3,
+        completion_batch_rows=max(1, int(leaves.numel())),
+        emit_q=emit_q,
+        max_workspace_bytes=max_workspace_bytes,
     )
 
 
@@ -86,9 +102,7 @@ def _posterior_shift_fixture():
 
 def test_posterior_moment_aggregation_and_leave_one_out() -> None:
     tree, stats, heads = _posterior_shift_fixture()
-    target = branched_value(
-        tree, stats, None, heads, 0.5, _Game(), configured_node_budget=3, emit_q=True
-    )
+    target = _targets(tree, stats, heads, 0.5, emit_q=True)
 
     # Directly averaging the two conditional leaf values would give [1,4].
     assert torch.equal(target.parent_p_hat, torch.tensor([[0.5, 0.5]]))
@@ -109,7 +123,7 @@ def test_single_child_baseline_is_old_value(lam: float) -> None:
     tree = builder.finalize()
     stats = _stats(torch.tensor([[[0.25, 0.75]]]), torch.tensor([[[4.0, -2.0]]]))
     heads = HeadEvals(torch.tensor([root], dtype=torch.int32), torch.tensor([[1.0, 3.0]]))
-    target = branched_value(tree, stats, None, heads, lam, _Game(), configured_node_budget=2)
+    target = _targets(tree, stats, heads, lam)
     assert target.q_hat is None
     assert torch.allclose(target.a_hat[0, 0], torch.tensor([3.0, -5.0]))
     assert torch.allclose(target.v_hat[0], torch.tensor([4.0, -2.0]))
@@ -119,58 +133,25 @@ def test_single_child_baseline_is_old_value(lam: float) -> None:
     )
 
 
-def test_auxiliary_capture_precedes_player_bootstrap() -> None:
-    builder = TreeBuilder(1)
-    root = builder.add_root(0, 0)
-    child = builder.add_child(root, 1, 4, 1.0, 0)
-    builder.add_child(child, 2, 5, 1.0, TERMINAL)
-    tree = builder.finalize()
-    stats = _stats(torch.tensor([[[0.5, 0.5]]]), torch.tensor([[[2.0, 4.0]]]))
-    stats.aux_scalar = torch.tensor([6.0])
-    heads = HeadEvals(
-        torch.tensor([root, child], dtype=torch.int32),
-        torch.zeros((2, 2)),
-        aux={"scalar": torch.tensor([10.0, 2.0])},
-    )
-    spec = AuxiliaryChannelSpec(
-        "dummy", "aux_scalar", "scalar", "every_player_node", "captured"
-    )
-    target = branched_value(
-        tree, stats, None, heads, 0.5, _Game(), configured_node_budget=3,
-        auxiliary_reducers=(spec,),
-    )
-    # Child captures 6 before mixing it to 4; root then captures propagated 4.
-    assert torch.equal(target.aux["captured"], torch.tensor([4.0, 6.0]))
-
-    no_aux = branched_value(tree, stats, None, heads, 0.5, _Game(), configured_node_budget=3)
-    assert no_aux.aux == {}
-
-
 def test_frontier_byte_budget_is_loud() -> None:
     tree, stats, heads = _posterior_shift_fixture()
-    target = branched_value(
-        tree, stats, None, heads, 0.95, _Game(), configured_node_budget=3,
-        max_workspace_bytes=1 << 20,
-    )
+    target = _targets(tree, stats, heads, 0.95, max_workspace_bytes=1 << 20)
     assert torch.equal(target.parent_p_hat, torch.tensor([[0.5, 0.5]]))
     with pytest.raises(MemoryError, match="byte budget"):
-        branched_value(
-            tree, stats, None, heads, 0.95, _Game(), configured_node_budget=3,
-            max_workspace_bytes=1,
-        )
+        _targets(tree, stats, heads, 0.95, max_workspace_bytes=1)
 
 
 def test_rejects_low_precision_leaf_accumulators() -> None:
     tree, stats, heads = _posterior_shift_fixture()
     stats.p_hat = stats.p_hat.half()
     with pytest.raises(TypeError, match="fp16"):
-        branched_value(tree, stats, None, heads, 0.5, _Game(), configured_node_budget=3)
+        _targets(tree, stats, heads, 0.5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_small_cpu_cuda_parity() -> None:
     tree, stats, heads = _posterior_shift_fixture()
-    cpu = branched_value(tree, stats, None, heads, 0.5, _Game(), configured_node_budget=3)
+    cpu = _targets(tree, stats, heads, 0.5)
     device = torch.device("cuda")
     gpu_tree = TreeBatch(**{
         name: getattr(tree, name).to(device)
@@ -178,8 +159,6 @@ def test_small_cpu_cuda_parity() -> None:
     })
     gpu_stats = _stats(stats.p_hat.to(device), stats.v_hat.to(device))
     gpu_heads = HeadEvals(heads.node_ids.to(device), heads.v.to(device))
-    gpu = branched_value(
-        gpu_tree, gpu_stats, None, gpu_heads, 0.5, _Game(), configured_node_budget=3
-    )
+    gpu = _targets(gpu_tree, gpu_stats, gpu_heads, 0.5)
     for field in ("parent_p_hat", "child_p_hat", "a_hat", "v_hat"):
         assert torch.equal(getattr(cpu, field), getattr(gpu, field).cpu())

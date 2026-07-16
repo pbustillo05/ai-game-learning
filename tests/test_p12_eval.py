@@ -9,7 +9,7 @@ import pytest
 import torch
 from torch import nn
 
-from pbg.core.config import load_config
+from pbg.config import load_config
 from pbg.eval import arena as arena_module
 from pbg.eval.arena import arena
 from pbg.games.poker.cards import hand_index, hand_cards
@@ -84,7 +84,9 @@ def _install_fake_sibling(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
 
 def _poker_cfg():
     cfg = load_config("configs/nlhe6_h100.yaml")
-    cfg.game.poker = {"n_players": 2, "stack_bb": 10.0, "rank_count": 13}
+    cfg.game.n_players = 2
+    cfg.game.stack_bb = 10.0
+    cfg.game.rank_count = 13
     cfg.model = {
         "d_model": 8,
         "n_heads": 2,

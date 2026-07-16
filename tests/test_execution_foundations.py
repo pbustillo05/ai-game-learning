@@ -8,13 +8,12 @@ import pytest
 import torch
 
 from pbg.core.distributed import (
-    equal_rank_mean_baseline,
     global_mass_objective,
     stratum_objective_scale,
     weighted_decision_stats,
 )
 from pbg.core.observability import ExecutionMetrics
-from pbg.core.queued import (
+from pbg.core.execution import (
     DONE,
     EVALUATING,
     NEW,
@@ -22,12 +21,10 @@ from pbg.core.queued import (
     ArenaField,
     ByteAccountant,
     ChunkedOccurrenceArena,
-    DeviceFifoRing,
+    DeviceWorkQueue,
     DrawPurpose,
-    FamilyPacker,
-    FamilyPackingLimits,
     ReusableStagingSlabs,
-    SequentialAdmissionPlan,
+    TrajectoryAdmissionPlan,
     arena_fields,
     child_path_keys,
     logical_categorical,
@@ -43,7 +40,7 @@ from pbg.core.training import (
 )
 
 
-def test_global_mass_objective_is_not_equal_rank_mean() -> None:
+def test_global_mass_objective_uses_exact_unequal_rank_mass() -> None:
     theta = torch.tensor(2.0, dtype=torch.float64, requires_grad=True)
     rank0 = weighted_decision_stats(theta * torch.tensor([0.0]), torch.ones(1))
     rank1 = weighted_decision_stats(theta * torch.ones(3), torch.ones(3))
@@ -51,11 +48,9 @@ def test_global_mass_objective_is_not_equal_rank_mean() -> None:
     masses = torch.stack((rank0.mass, rank1.mass))
 
     objective = global_mass_objective(numerators, masses)
-    baseline = equal_rank_mean_baseline(numerators, masses)
     objective.backward()
 
     assert float(objective.detach()) == pytest.approx(1.5)
-    assert float(baseline.detach()) == pytest.approx(1.0)
     assert float(theta.grad) == pytest.approx(0.75)
     assert float(stratum_objective_scale(masses[1], masses.sum())) == pytest.approx(0.75)
 
@@ -252,10 +247,10 @@ def test_arena_multi_field_gather_scatter_share_cross_chunk_indexing() -> None:
     assert torch.equal(arena.gather("state_ref", selected), values["state_ref"])
 
 
-def test_fifo_status_lifecycle_duplicate_guard_and_overflow_are_exact() -> None:
+def test_work_queue_status_lifecycle_duplicate_guard_and_overflow_are_exact() -> None:
     arena = ChunkedOccurrenceArena(6, 2, "cpu")
     handles = arena.allocate(6)
-    queue = DeviceFifoRing(3, "cpu")
+    queue = DeviceWorkQueue(3, "cpu")
     queue.enqueue(handles[:3], arena=arena)
     assert queue.host_count == 3
     assert torch.equal(arena.gather("status", handles[:3]), torch.full((3,), QUEUED))
@@ -263,7 +258,7 @@ def test_fifo_status_lifecycle_duplicate_guard_and_overflow_are_exact() -> None:
     popped = queue.dequeue(2, arena=arena)
     assert torch.equal(popped, handles[:2])
     assert torch.equal(arena.gather("status", popped), torch.full((2,), EVALUATING))
-    DeviceFifoRing.mark_done(arena, popped)
+    DeviceWorkQueue.mark_done(arena, popped)
     assert torch.equal(arena.gather("status", popped), torch.full((2,), DONE))
 
     depth = queue.host_count
@@ -273,28 +268,28 @@ def test_fifo_status_lifecycle_duplicate_guard_and_overflow_are_exact() -> None:
     assert queue.host_count == depth
     assert torch.equal(arena.gather("status", handles), status)
 
-    with pytest.raises(MemoryError, match="FIFO overflow"):
+    with pytest.raises(MemoryError, match="insertion-order overflow"):
         queue.enqueue(handles[3:], arena=arena)
     assert queue.host_count == depth
     assert torch.equal(arena.gather("status", handles[3:]), torch.full((3,), NEW))
 
 
-def test_fifo_queue_age_tracks_oldest_live_enqueue_without_device_reads() -> None:
+def test_work_queue_age_tracks_oldest_live_enqueue_without_device_reads() -> None:
     arena = ChunkedOccurrenceArena(6, 3, "cpu")
     handles = arena.allocate(6)
-    queue = DeviceFifoRing(6, "cpu")
+    queue = DeviceWorkQueue(6, "cpu")
     queue.enqueue(handles[:2], arena=arena, logical_time=3)
     queue.enqueue(handles[2:5], arena=arena, logical_time=7)
 
     assert queue.oldest_age(9) == 6
     first = queue.dequeue(2, arena=arena)
-    DeviceFifoRing.mark_done(arena, first)
+    DeviceWorkQueue.mark_done(arena, first)
     assert queue.oldest_age(9) == 2
     queue.enqueue(handles[5:], arena=arena, logical_time=10)
     assert queue.oldest_age(12) == 5
 
     rest = queue.dequeue(4, arena=arena)
-    DeviceFifoRing.mark_done(arena, rest)
+    DeviceWorkQueue.mark_done(arena, rest)
     assert queue.oldest_age(99) == 0
     with pytest.raises(ValueError, match="monotone"):
         queue.enqueue(torch.empty(0, dtype=torch.int64), logical_time=9)
@@ -316,7 +311,7 @@ def test_reusable_staging_slabs_reserve_exact_bytes() -> None:
 
 
 def test_safe_admit_reserves_retained_and_max_inflight_before_live_rows() -> None:
-    plan = SequentialAdmissionPlan(
+    plan = TrajectoryAdmissionPlan(
         limit_bytes=1_000,
         retained_bytes=300,
         max_inflight_bytes=200,
@@ -333,7 +328,7 @@ def test_safe_admit_reserves_retained_and_max_inflight_before_live_rows() -> Non
     # retained and maximum in-flight reservations never change.
     assert plan.safe_admit(active_starts=3, unstarted=5, requested=5) == 2
 
-    impossible = SequentialAdmissionPlan(599, 300, 200, 100)
+    impossible = TrajectoryAdmissionPlan(599, 300, 200, 100)
     with pytest.raises(MemoryError, match="no capacity for one"):
         impossible.require_progress_capacity(1)
 
@@ -430,41 +425,6 @@ def test_logical_rng_namespaces_and_draw_ordinals_are_disjoint_on_address_grid()
     )
 
 
-def test_family_packer_uses_mixed_stage_cost_without_stage_partition() -> None:
-    packer = FamilyPacker(
-        "post_3",
-        FamilyPackingLimits(
-            max_rows=4,
-            max_padded_tokens=60,
-            max_padded_token_pairs=2_000,
-            max_workspace_bytes=100,
-        ),
-    )
-    handles = torch.tensor([9, 4, 12], dtype=torch.int64)
-    # These can represent flop/river/flop rows.  Only their padded work is
-    # visible; stable FIFO order and the post_3 family identity are preserved.
-    packed = packer.pack(
-        handles,
-        torch.tensor([10, 30, 20]),
-        torch.tensor([20, 30, 10]),
-    )
-    assert packed.family == "post_3"
-    assert torch.equal(packed.handles, handles[:2])
-    assert torch.equal(packed.padded_width, torch.tensor([30]))
-    assert torch.equal(packed.workspace_bytes, torch.tensor([50]))
-
-    masked = packer.pack_masked(
-        handles,
-        torch.tensor([10, 30, 20]),
-        torch.tensor([20, 30, 10]),
-    )
-    assert torch.equal(masked.candidate_handles, handles)
-    assert torch.equal(masked.selected_mask, torch.tensor([True, True, False]))
-    assert torch.equal(masked.selected_count, torch.tensor(2))
-
-    with pytest.raises(RuntimeError, match="one family row"):
-        packer.pack(torch.tensor([1]), torch.tensor([100]))
-
 
 def test_queue_hot_primitives_have_no_explicit_scalar_host_transfer() -> None:
     banned = {"cpu", "numpy", "tolist", "item"}
@@ -474,11 +434,9 @@ def test_queue_hot_primitives_have_no_explicit_scalar_host_transfer() -> None:
         ChunkedOccurrenceArena.scatter,
         ChunkedOccurrenceArena.scatter_many,
         ChunkedOccurrenceArena.transition,
-        DeviceFifoRing.enqueue,
-        DeviceFifoRing.peek,
-        DeviceFifoRing.dequeue,
-        FamilyPacker.pack,
-        FamilyPacker.pack_masked,
+        DeviceWorkQueue.enqueue,
+        DeviceWorkQueue.peek,
+        DeviceWorkQueue.dequeue,
         logical_rng_keys,
         logical_categorical,
         logical_categorical_from_valid_probability,
@@ -494,7 +452,7 @@ def test_queue_hot_primitives_have_no_explicit_scalar_host_transfer() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_queue_arena_rng_and_packer_execute_transactionally() -> None:
+def test_cuda_queue_arena_and_rng_execute_transactionally() -> None:
     """Exercise the Phase-1 primitives on-device with only tiny allocations."""
 
     device = torch.device("cuda", torch.cuda.current_device())
@@ -519,13 +477,13 @@ def test_cuda_queue_arena_rng_and_packer_execute_transactionally() -> None:
     arena.scatter("trajectory_id", handles, trajectories)
     arena.scatter("path_key", handles, paths)
 
-    queue = DeviceFifoRing(5, device)
+    queue = DeviceWorkQueue(5, device)
     queue.enqueue(handles[:5], arena=arena)
     first = queue.dequeue(3, arena=arena)
-    DeviceFifoRing.mark_done(arena, first)
+    DeviceWorkQueue.mark_done(arena, first)
     queue.enqueue(handles[5:8], arena=arena)  # force ring wraparound
     wrapped = queue.dequeue(5, arena=arena)
-    DeviceFifoRing.mark_done(arena, wrapped)
+    DeviceWorkQueue.mark_done(arena, wrapped)
 
     keys = logical_rng_keys(
         seed=17,
@@ -537,14 +495,6 @@ def test_cuda_queue_arena_rng_and_packer_execute_transactionally() -> None:
     )
     probability = torch.tensor([[0.25, 0.75]], device=device).expand(8, -1)
     samples = logical_categorical(probability, keys)
-    packed = FamilyPacker(
-        "post_2",
-        FamilyPackingLimits(4, 80, 2_000, 128),
-    ).pack_masked(
-        handles,
-        torch.tensor([10, 15, 20, 25, 30, 35, 40, 45], device=device),
-        torch.full((8,), 8, dtype=torch.int64, device=device),
-    )
     partition = stable_partition_masked(
         handles,
         torch.tensor([0, 1, 0, 2, 1, 0, 2, 1], dtype=torch.int32, device=device),
@@ -559,11 +509,6 @@ def test_cuda_queue_arena_rng_and_packer_execute_transactionally() -> None:
         arena.gather("status", handles).cpu(), torch.full((8,), DONE)
     )
     assert samples.shape == (8,)
-    assert torch.equal(
-        packed.candidate_handles[packed.selected_mask].cpu(),
-        torch.tensor([0, 1, 2]),
-    )
-    assert int(packed.selected_count.cpu()) == 3
     assert torch.equal(partition.selected_count.cpu(), torch.tensor([3, 3, 2]))
     assert torch.equal(
         partition.candidate_handles[0][partition.valid_mask[0]].cpu(),
@@ -581,8 +526,8 @@ def test_cuda_queue_arena_rng_and_packer_execute_transactionally() -> None:
 
     fresh = ChunkedOccurrenceArena(3, 3, device)
     fresh_handles = fresh.allocate(3)
-    small_queue = DeviceFifoRing(2, device)
-    with pytest.raises(MemoryError, match="FIFO overflow"):
+    small_queue = DeviceWorkQueue(2, device)
+    with pytest.raises(MemoryError, match="work queue overflow"):
         small_queue.enqueue(fresh_handles, arena=fresh)
     torch.cuda.synchronize(device)
     assert small_queue.host_count == 0

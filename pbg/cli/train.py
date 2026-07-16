@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 
-from pbg.core.config import load_config
-from pbg.core.training import train
+from pbg.config import load_config
+from pbg.runtime import train
 
 
 def main() -> None:

@@ -13,8 +13,7 @@ from torch import Tensor, nn
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
 from pbg.core.observability import ExecutionMetrics
-from pbg.core.queued import (
-    FamilyPackingLimits,
+from pbg.core.execution import (
     child_path_keys,
     logical_categorical_from_valid_probability,
     logical_uniform,
@@ -74,7 +73,7 @@ class PokerRolloutBackend:
         capacity: Maximum number of state rows resident in this pipeline.
         device: Owning CPU or CUDA device.
         max_rollout_steps: Maximum public transitions in one sampled path.
-        beta_fix: Fixed branching intensities by public-stage bucket.
+        beta_table: Fixed branching intensities by public-stage bucket.
         profile_sampler: Exact sibling-facade joint-profile adapter.
         partition_adapter: Sibling-facade neutral-partition adapter.
         evaluator_backend: ``"auto"``, ``"cpu"``, or ``"cuda"``.
@@ -96,7 +95,7 @@ class PokerRolloutBackend:
         device: torch.device | str,
         *,
         max_rollout_steps: int | None = None,
-        beta_fix: Mapping[str, float] | Any | None = None,
+        beta_table: Mapping[str, float] | Any | None = None,
         profile_sampler: PokerGPURejectionSampler | Any | None = None,
         partition_adapter: PokerGPUPartitionAdapter | Any | None = None,
         evaluator_backend: str = "auto",
@@ -125,11 +124,11 @@ class PokerRolloutBackend:
             capacity, self.max_rollout_steps, self.device, cfg.n_players
         )
         self.state_store = self.states
-        table = getattr(beta_fix, "beta_fix", beta_fix)
-        self.beta_fix = dict(table or {"default": 1.0})
-        if "default" not in self.beta_fix:
-            raise ValueError("beta_fix requires a 'default' entry")
-        if any(not math.isfinite(float(value)) or float(value) < 1.0 for value in self.beta_fix.values()):
+        table = getattr(beta_table, "beta_table", beta_table)
+        self.beta_table = dict(table or {"default": 1.0})
+        if "default" not in self.beta_table:
+            raise ValueError("beta_table requires a 'default' entry")
+        if any(not math.isfinite(float(value)) or float(value) < 1.0 for value in self.beta_table.values()):
             raise ValueError("rollout beta values must be finite and at least one")
         self.profile_sampler = profile_sampler or PokerGPURejectionSampler(
             backend=evaluator_backend, rank_count=cfg.rank_count
@@ -191,15 +190,15 @@ class PokerRolloutBackend:
         buttons = torch.remainder(
             torch.arange(count, dtype=torch.int32, device=self.device), self.n_players
         )  # [B]
-        return self._root_states_with_buttons(buttons)
+        return self._initial_states_with_buttons(buttons)
 
     def branched_root_state(self) -> Tensor:
         """Reset storage and return exactly one canonical root for this rank."""
 
         buttons = torch.zeros(1, dtype=torch.int32, device=self.device)
-        return self._root_states_with_buttons(buttons)
+        return self._initial_states_with_buttons(buttons)
 
-    def _root_states_with_buttons(self, buttons: Tensor) -> Tensor:
+    def _initial_states_with_buttons(self, buttons: Tensor) -> Tensor:
         """Reset storage and initialize roots for explicit buttons ``[B]``."""
 
         n = buttons.shape[0]
@@ -264,7 +263,7 @@ class PokerRolloutBackend:
         buttons = torch.remainder(
             self.states.button[states.to(torch.int64)].clone() + 1, self.n_players
         )
-        return self._root_states_with_buttons(buttons)
+        return self._initial_states_with_buttons(buttons)
 
     def _validate_handles(self, states: Tensor) -> None:
         if states.ndim != 1 or states.dtype != torch.int32:
@@ -1145,65 +1144,6 @@ class PokerRolloutBackend:
         tokens = torch.where(street == 0, pre_tokens, post_tokens)
         return tokens, torch.zeros_like(tokens)
 
-    def queued_static_pack_capacity(
-        self,
-        model: nn.Module,
-        family: str,
-        phase: str,
-        limits: FamilyPackingLimits,
-    ) -> int:
-        """Return a fixed CUDA quantum feasible for every row in one family.
-
-        The queue key deliberately omits street.  Consequently ``post_A`` uses
-        the largest flop width and maximum retained history in its proof.  The
-        resulting host-known quantum may be conservative for turn/river rows,
-        but the masked device packer can consume it without exposing a dynamic
-        prefix length to Python.  Phase 4 may replace the current physical
-        street splitter without changing this queue-level safety contract.
-        """
-
-        if phase not in {"training", "inference"}:
-            raise ValueError("phase must be 'training' or 'inference'")
-        source = model.module if hasattr(model, "module") else model
-        post_model = getattr(source, "postflop", None)
-        k_act = int(getattr(getattr(post_model, "cfg", None), "k_act", 0))
-        scalar_count = 3 * self.n_players + 13 + self.e_max + self.n_ticks
-        if family == "pre":
-            maximum_width = (
-                self.n_players * N_CLASSES
-                + scalar_count
-                + 1
-                + self.max_rollout_steps
-                + k_act
-            )
-        elif family.startswith("post_"):
-            try:
-                live = int(family.removeprefix("post_"))
-            except ValueError as exc:
-                raise ValueError(f"invalid poker execution family {family!r}") from exc
-            if not 2 <= live <= self.n_players:
-                raise ValueError(f"invalid poker execution family {family!r}")
-            maximum_width = (
-                live * 1176
-                + scalar_count
-                + 6
-                + self.max_rollout_steps
-                + k_act
-            )
-        else:
-            raise ValueError(f"invalid poker execution family {family!r}")
-
-        capacity = min(
-            limits.max_rows,
-            limits.max_padded_tokens // maximum_width,
-            limits.max_padded_token_pairs // (maximum_width * maximum_width),
-        )
-        if capacity <= 0:
-            raise MemoryError(
-                f"one worst-case {family} row needs {maximum_width} padded tokens, "
-                "beyond its calibrated CUDA family limits"
-            )
-        return int(capacity)
 
     def _record_policy_model_call(
         self,
@@ -1341,12 +1281,6 @@ class PokerRolloutBackend:
         # Family routing and row count are host-known at this declared launch
         # boundary. Padded work uses the calibrated worst-case family width and
         # therefore introduces no hidden device scalar read.
-        limits = FamilyPackingLimits(
-            max_rows=max(states.numel(), 1),
-            max_padded_tokens=1 << 62,
-            max_padded_token_pairs=1 << 62,
-            max_workspace_bytes=1 << 62,
-        )
         width = self._family_maximum_width(frozen_model, family)
         phase = "training" if torch.is_grad_enabled() else "inference"
         self.execution_metrics.record_model_call(
@@ -1401,7 +1335,7 @@ class PokerRolloutBackend:
         # current prototype still reads the fixed-size width vector to plan
         # greedy boundaries, but reconstructing every physical pack from a
         # Python list used to add one H2D index transfer per model call.  A
-        # stable device argsort has precisely the requested width/FIFO tiebreak
+        # stable device argsort has precisely the requested width/insertion-order tiebreak
         # order and lets all spans below remain device views.
         ordered_positions = torch.argsort(widths, stable=True)
         # Do not transfer the permutation back merely to plan its boundaries:
@@ -1725,17 +1659,17 @@ class PokerRolloutBackend:
         street = self.states.street[rows]
         phase = self.states.phase[rows]
         result = torch.full(
-            (states.shape[0],), float(self.beta_fix["default"]),
+            (states.shape[0],), float(self.beta_table["default"]),
             dtype=torch.float32, device=self.device,
         )  # [B]
         player_names = ("preflop", "flop", "turn", "river")
         chance_names = ("chance_to_flop", "chance_to_turn", "chance_to_river")
         for index, name in enumerate(player_names):
-            if name in self.beta_fix:
-                result[(phase == _PLAYER) & (street == index)] = float(self.beta_fix[name])
+            if name in self.beta_table:
+                result[(phase == _PLAYER) & (street == index)] = float(self.beta_table[name])
         for index, name in enumerate(chance_names):
-            if name in self.beta_fix:
-                result[(phase == _CHANCE) & (street == index)] = float(self.beta_fix[name])
+            if name in self.beta_table:
+                result[(phase == _CHANCE) & (street == index)] = float(self.beta_table[name])
         return result
 
     def pot_strata(self, states: Tensor) -> PotStrata:

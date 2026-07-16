@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -38,12 +38,11 @@ class ArenaReport:
 
 
 def _poker_config(cfg: RootConfig) -> PokerConfig:
-    values = dict(cfg.game.poker or {})
-    allowed = {field.name for field in fields(PokerConfig)}
-    unknown = sorted(set(values) - allowed)
-    if unknown:
-        raise ValueError(f"unknown poker engine configuration key: {unknown[0]}")
-    return PokerConfig(**values)
+    return PokerConfig(
+        n_players=cfg.game.n_players,
+        stack_bb=cfg.game.stack_bb,
+        rank_count=cfg.game.rank_count,
+    )
 
 
 def _build_model(cfg: RootConfig) -> PokerModelBundle:
@@ -257,8 +256,6 @@ def arena(
 ) -> ArenaReport:
     """Evaluate A against B using paired deals and return a paired t interval."""
 
-    if cfg.game.name != "poker":
-        raise ValueError("arena requires a poker config")
     engine_cfg = _poker_config(cfg)
     if isinstance(n_hands, bool) or not isinstance(n_hands, int) or n_hands <= 0:
         raise ValueError("n_hands must be a positive integer")

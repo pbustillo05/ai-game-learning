@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -54,7 +54,7 @@ class PokerRolloutMemoryPlan:
 
 def estimate_rollout_memory(
     *,
-    n_trees: int,
+    root_count: int,
     node_budget: int,
     n_players: int,
     reach_storage: str,
@@ -67,25 +67,25 @@ def estimate_rollout_memory(
     frontiers: a branched wave can retain active rows while constructing its
     successors. Sequential execution in recompute mode is tighter: exactly one
     live occurrence exists per trajectory and execution allocates root and
-    overwriteable working reaches with ``n_trees`` rows each. It excludes model,
+    overwriteable working reaches with ``root_count`` rows each. It excludes model,
     completion, optimizer, and autograd allocations, so the CUDA preflight
     leaves half of currently free device memory for those phases.
     """
 
     if reach_storage not in {"full", "decisions_only", "recompute"}:
         raise ValueError("unknown reach storage mode")
-    if n_trees < 0 or node_budget <= 0 or n_players <= 0:
+    if root_count < 0 or node_budget <= 0 or n_players <= 0:
         raise ValueError("invalid rollout memory-plan dimensions")
     if sequential_recompute_live_rows and reach_storage != "recompute":
         raise ValueError("sequential live-row planning requires recompute storage")
-    capacity = n_trees * node_budget
-    edge_capacity = capacity - n_trees
+    capacity = root_count * node_budget
+    edge_capacity = capacity - root_count
     node_bytes = capacity * (6 * 4 + n_players * 4)
     edge_bytes = edge_capacity * 4 * 4
     n_hands = DeckGeometry(rank_count).n_hands
     reach_row_bytes = n_players * n_hands * 4
     reach_cache = (
-        n_trees if reach_storage == "recompute" else capacity
+        root_count if reach_storage == "recompute" else capacity
     ) * reach_row_bytes
     return PokerRolloutMemoryPlan(
         capacity=capacity,
@@ -93,7 +93,7 @@ def estimate_rollout_memory(
         tree_bytes=node_bytes + edge_bytes,
         reach_cache_bytes=reach_cache,
         frontier_reach_bytes=(
-            2 * n_trees * reach_row_bytes
+            2 * root_count * reach_row_bytes
             if sequential_recompute_live_rows
             else 2 * capacity * reach_row_bytes
         ),
@@ -115,7 +115,7 @@ def _preflight_cuda_rollout(plan: PokerRolloutMemoryPlan, device: torch.device) 
             "poker rollout plan requires "
             f"{plan.peak_bytes / gib:.2f} GiB, exceeding half of the currently free "
             f"{free_bytes / gib:.2f} GiB on {device} (total {total_bytes / gib:.2f} GiB); "
-            "reduce rollout.n_trees/node_budget or use a smaller storage plan"
+            "reduce rollout.sequential_starts/node_budget or use a smaller storage plan"
         )
 
 
@@ -307,14 +307,12 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
 def validate_config(cfg: RootConfig) -> None:
     """Validate poker-owned game and model mappings without building them."""
 
-    values = dict(cfg.game.poker or {})
-    unknown = sorted(
-        set(values) - {field.name for field in fields(PokerConfig) if field.init}
-    )
-    if unknown:
-        raise ValueError(f"root.game.poker.{unknown[0]}: unknown configuration key")
     try:
-        poker_cfg = PokerConfig(**values)
+        poker_cfg = PokerConfig(
+            n_players=cfg.game.n_players,
+            stack_bb=cfg.game.stack_bb,
+            rank_count=cfg.game.rank_count,
+        )
         PokerModelConfig.from_dict(cfg.model)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"root poker configuration: {exc}") from exc
@@ -330,7 +328,11 @@ def validate_config(cfg: RootConfig) -> None:
 def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     """Construct one owning poker model and its device-resident backends."""
 
-    engine_cfg = PokerConfig(**dict(cfg.game.poker or {}))
+    engine_cfg = PokerConfig(
+        n_players=cfg.game.n_players,
+        stack_bb=cfg.game.stack_bb,
+        rank_count=cfg.game.rank_count,
+    )
     model_cfg = PokerModelConfig.from_dict(cfg.model)
     if model_cfg.max_players < engine_cfg.n_players:
         raise ValueError("model.max_players must cover every configured poker seat")
@@ -348,9 +350,9 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     partition = PokerGPUPartitionAdapter(
         beta_rank=model_cfg.folder_beta_rank, rank_count=engine_cfg.rank_count
     )
-    resident_trees = cfg.rollout.n_trees
+    resident_trees = cfg.rollout.sequential_starts
     plan = estimate_rollout_memory(
-        n_trees=resident_trees,
+        root_count=resident_trees,
         node_budget=cfg.rollout.node_budget,
         n_players=engine_cfg.n_players,
         reach_storage=cfg.rollout.reach_storage,
@@ -365,7 +367,7 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         engine_cfg,
         plan.capacity,
         device,
-        beta_fix=cfg.rollout.beta_fix,
+        beta_table=cfg.rollout.beta or {"default": 1.0},
         profile_sampler=profiles,
         partition_adapter=partition,
         evaluator_backend=cfg.completion.backend,

@@ -1,9 +1,7 @@
 game:
-  name: poker
-  poker:
-    n_players: 6
-    stack_bb: 100.0
-    rank_count: 13
+  n_players: 6
+  stack_bb: 100.0
+  rank_count: 13
 rollout:
   sequential_starts: 1
   beta:

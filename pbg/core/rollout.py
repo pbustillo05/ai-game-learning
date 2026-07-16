@@ -10,14 +10,12 @@ import torch.distributed as dist
 from torch import Tensor
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch, GameBundle
-from pbg.core.queued import (
+from pbg.core.execution import (
     DONE,
     ChunkedOccurrenceArena,
-    DeviceFifoRing,
+    DeviceWorkQueue,
     DrawPurpose,
-    FamilyPacker,
-    FamilyPackingLimits,
-    SequentialAdmissionPlan,
+    TrajectoryAdmissionPlan,
     arena_fields,
     child_path_keys,
     logical_rng_keys,
@@ -42,7 +40,7 @@ def _selected_policy_logp(
 
 
 
-def _queued_family_spec(
+def _family_spec(
     backend: Any,
 ) -> tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
     """Return stable execution-family names and their device routing values."""
@@ -60,7 +58,7 @@ def _queued_family_spec(
     return names, values, priorities
 
 
-def _queued_family_ids(backend: Any, states: Tensor) -> Tensor:
+def _family_ids(backend: Any, states: Tensor) -> Tensor:
     route = getattr(backend, "rollout_family_ids", None)
     if callable(route):
         result = route(states)
@@ -96,31 +94,31 @@ def sequential_leaf_logical_rng_keys(
     global trajectory.  Their abstract path is therefore determined by the
     chain's edge count.  Building the small depth-to-path table on CPU avoids
     a device scalar read or one CUDA launch per stored node while producing the
-    same recursive path address used by the queued scheduler.
+    same recursive path address used by the family-scheduled scheduler.
     """
 
     rollout_cfg = getattr(cfg, "rollout", cfg)
-    n_trees = int(rollout_cfg.n_trees)
+    start_count = int(rollout_cfg.sequential_starts)
     node_budget = int(
         getattr(rollout_cfg, "node_budget", max(int(tree.parent.numel()), 1))
     )
     leaves = leaf_ids.to(device=tree.parent.device, dtype=torch.int64)
     if leaves.ndim != 1:
         raise ValueError("sequential leaf ids must be one-dimensional")
-    if n_trees <= 0 or node_budget <= 0:
+    if start_count <= 0 or node_budget <= 0:
         raise ValueError("sequential rollout dimensions are invalid")
-    if leaves.numel() != n_trees:
+    if leaves.numel() != start_count:
         raise ValueError("sequential rollout must contain one stopped leaf per trajectory")
 
     tree_ids = tree.tree_id.to(torch.int64)
-    counts = torch.bincount(tree_ids, minlength=n_trees)
+    counts = torch.bincount(tree_ids, minlength=start_count)
     selected_tree = tree_ids[leaves]
     valid = (
         (selected_tree >= 0)
-        & (selected_tree < n_trees)
-        & (counts[selected_tree.clamp(0, max(n_trees - 1, 0))] <= node_budget)
+        & (selected_tree < start_count)
+        & (counts[selected_tree.clamp(0, max(start_count - 1, 0))] <= node_budget)
     )
-    unique = torch.bincount(selected_tree.clamp_min(0), minlength=n_trees)[:n_trees] == 1
+    unique = torch.bincount(selected_tree.clamp_min(0), minlength=start_count)[:start_count] == 1
     if tree.parent.device.type == "cuda":
         torch._assert_async(valid.all(), "invalid sequential stopped-leaf address")
         torch._assert_async(unique.all(), "sequential trajectories require one stopped leaf")
@@ -133,7 +131,7 @@ def sequential_leaf_logical_rng_keys(
         depth_paths[depth] = child_path_keys(depth_paths[depth - 1 : depth], 1)[0]
     leaf_depth = counts[selected_tree] - 1
     path = depth_paths.to(tree.parent.device)[leaf_depth]
-    start = _global_trajectory_start(cfg, n_trees)
+    start = _global_trajectory_start(cfg, start_count)
     return logical_rng_keys(
         seed=_logical_seed(cfg, gen),
         iteration=iteration,
@@ -144,7 +142,7 @@ def sequential_leaf_logical_rng_keys(
     )
 
 
-def _global_trajectory_start(cfg: Any, n_trees: int) -> int:
+def _global_trajectory_start(cfg: Any, start_count: int) -> int:
     rollout_cfg = getattr(cfg, "rollout", cfg)
     configured = getattr(rollout_cfg, "trajectory_start_index", None)
     if configured is not None:
@@ -157,31 +155,31 @@ def _global_trajectory_start(cfg: Any, n_trees: int) -> int:
             raise ValueError(
                 "trajectory_rank_counts has no quota for the current distributed rank"
             )
-        if counts[rank] != n_trees:
+        if counts[rank] != start_count:
             raise ValueError(
-                "local rollout.n_trees does not match trajectory_rank_counts for "
-                f"rank {rank}: local={n_trees}, quota={counts[rank]}"
+                "local rollout.start_count does not match trajectory_rank_counts for "
+                f"rank {rank}: local={start_count}, quota={counts[rank]}"
             )
         return sum(counts[:rank])
-    return rank * n_trees
+    return rank * start_count
 
 
-def _queued_admission_plan(
+def _admission_plan(
     *,
     backend: Any,
     rollout_cfg: Any,
     buffer: DeviceTreeBuffer,
     arena: ChunkedOccurrenceArena,
-    queues: dict[str, DeviceFifoRing],
+    queues: dict[str, DeviceWorkQueue],
     root_reach: Tensor,
     root_profiles: Tensor,
     working_reach: Tensor,
     batch_rows: int,
     desired_resident_starts: int,
-) -> SequentialAdmissionPlan:
+) -> TrajectoryAdmissionPlan:
     """Build the pre-sampling retained plus maximum-in-flight byte transaction."""
 
-    calibrated = getattr(backend, "queued_admission_byte_terms", None)
+    calibrated = getattr(backend, "admission_byte_terms", None)
     if callable(calibrated):
         retained, resident_per_start, max_inflight = calibrated(
             rollout_cfg, batch_rows
@@ -227,58 +225,21 @@ def _queued_admission_plan(
         inflight_per_row = 2 * reach_row + 2 * x_max * 4 + profile_row + 128
         max_inflight = batch_rows * inflight_per_row
 
-    configured_limit = getattr(rollout_cfg, "queue_memory_bytes", None)
+    configured_limit = getattr(rollout_cfg, "execution_memory_bytes", None)
     if configured_limit is None:
         resident_capacity = max(1, int(desired_resident_starts))
         configured_limit = (
             retained + max_inflight + resident_capacity * resident_per_start
         )
-    plan = SequentialAdmissionPlan(
+    plan = TrajectoryAdmissionPlan(
         limit_bytes=int(configured_limit),
         retained_bytes=retained,
         max_inflight_bytes=max_inflight,
         resident_bytes_per_start=resident_per_start,
     )
-    plan.require_progress_capacity(int(rollout_cfg.n_trees))
+    plan.require_progress_capacity(int(rollout_cfg.sequential_starts))
     return plan
 
-
-def _queued_family_packers(
-    backend: Any,
-    cfg: Any,
-    family_names: tuple[str, ...],
-    batch_rows: int,
-) -> dict[str, FamilyPacker]:
-    """Construct family-only calibrated limits without introducing stage keys."""
-
-    hook = getattr(backend, "queued_family_packing_limits", None)
-    profile = getattr(backend, "execution_profile", None)
-    result: dict[str, FamilyPacker] = {}
-    for family in family_names:
-        if callable(hook):
-            limits = hook(family, "inference", batch_rows)
-            if not isinstance(limits, FamilyPackingLimits):
-                raise TypeError(
-                    "queued_family_packing_limits must return FamilyPackingLimits"
-                )
-        elif profile is not None:
-            limits = FamilyPackingLimits(
-                max_rows=batch_rows,
-                max_padded_tokens=int(profile.inference_max_tokens),
-                max_padded_token_pairs=int(profile.inference_max_token_pairs),
-                max_workspace_bytes=int(
-                    getattr(cfg, "queue_workspace_bytes", None) or (1 << 62)
-                ),
-            )
-        else:
-            limits = FamilyPackingLimits(
-                max_rows=batch_rows,
-                max_padded_tokens=1 << 62,
-                max_padded_token_pairs=1 << 62,
-                max_workspace_bytes=1 << 62,
-            )
-        result[family] = FamilyPacker(family, limits)
-    return result
 
 
 def _sample_profiles_logical(
@@ -319,7 +280,7 @@ def _sample_trees_sequential(
 ) -> tuple[TreeBatch, ReachCache, PolicyCache] | tuple[
     TreeBatch, ReachCache, PolicyCache, Tensor
 ]:
-    """Sample sequential paths with persistent family FIFO ready queues.
+    """Sample sequential paths with persistent family work queue ready queues.
 
     The model scheduler may change batch boundaries without changing private,
     action, or chance draws: every stochastic boundary is addressed by the
@@ -333,32 +294,32 @@ def _sample_trees_sequential(
         raise ValueError("rollout generator must be created on the backend device")
     if rollout_cfg.reach_storage not in {"full", "decisions_only", "recompute"}:
         raise ValueError("unknown reach_storage mode")
-    n_trees = int(rollout_cfg.n_trees)
+    start_count = int(rollout_cfg.sequential_starts)
     node_budget = int(rollout_cfg.node_budget)
-    if n_trees < 0 or node_budget <= 0:
-        raise ValueError("n_trees must be nonnegative and node_budget positive")
+    if start_count < 0 or node_budget <= 0:
+        raise ValueError("start_count must be nonnegative and node_budget positive")
     batch_rows = int(
-        getattr(rollout_cfg, "queue_batch_rows", None) or min(n_trees, 256)
+        getattr(rollout_cfg, "family_batch_rows", None) or min(start_count, 256)
     )
     admission_size = int(
-        getattr(rollout_cfg, "queue_admission_size", None) or batch_rows
+        getattr(rollout_cfg, "max_active_trajectories", None) or batch_rows
     )
     if batch_rows <= 0 or admission_size <= 0:
-        raise ValueError("queued batch and admission sizes must be positive")
+        raise ValueError("family-scheduled batch and admission sizes must be positive")
     chunk_nodes = int(
         getattr(rollout_cfg, "arena_chunk_nodes", None)
-        or min(n_trees * node_budget, max(batch_rows, 256))
+        or min(start_count * node_budget, max(batch_rows, 256))
     )
 
     p_max = int(backend.n_players)
     x_sizes = tuple(int(value) for value in backend.x_sizes)
     x_max = max(x_sizes)
-    roots = backend.sequential_start_states(n_trees)
-    if roots.shape != (n_trees,) or roots.dtype != torch.int32 or roots.device != device:
+    roots = backend.sequential_start_states(start_count)
+    if roots.shape != (start_count,) or roots.dtype != torch.int32 or roots.device != device:
         raise ValueError("sequential_start_states must return device-local int32 [count]")
     root_owner = backend.classify(roots).to(torch.int32)
     metrics = getattr(backend, "execution_metrics", None)
-    buffer = DeviceTreeBuffer(n_trees, node_budget, p_max, device)
+    buffer = DeviceTreeBuffer(start_count, node_budget, p_max, device)
     root_nodes = buffer.add_roots(roots, root_owner)
     arena = ChunkedOccurrenceArena(
         buffer.node_capacity,
@@ -367,20 +328,20 @@ def _sample_trees_sequential(
         fields=arena_fields(("trajectory_id", "path_key")),
         label="sequential_occurrences",
     )
-    root_handles = arena.allocate(n_trees)
+    root_handles = arena.allocate(start_count)
     expected_roots = root_nodes.to(torch.int64)
     if device.type == "cuda":
         torch._assert_async(
             (root_handles == expected_roots).all(),
-            "queued occurrence and tree root handles diverged",
+            "family-scheduled occurrence and tree root handles diverged",
         )
     elif not torch.equal(root_handles, expected_roots):
-        raise RuntimeError("queued occurrence and tree root handles diverged")
+        raise RuntimeError("family-scheduled occurrence and tree root handles diverged")
 
-    trajectory_start = _global_trajectory_start(cfg, n_trees)
+    trajectory_start = _global_trajectory_start(cfg, start_count)
     trajectory_ids = torch.arange(
         trajectory_start,
-        trajectory_start + n_trees,
+        trajectory_start + start_count,
         dtype=torch.int64,
         device=device,
     )
@@ -388,12 +349,12 @@ def _sample_trees_sequential(
         root_handles,
         {
             "trajectory_id": trajectory_ids,
-            "path_key": torch.zeros(n_trees, dtype=torch.int64, device=device),
+            "path_key": torch.zeros(start_count, dtype=torch.int64, device=device),
         },
     )
 
     root_reach = torch.zeros(
-        (n_trees, p_max, x_max), dtype=torch.float32, device=device
+        (start_count, p_max, x_max), dtype=torch.float32, device=device
     )
     for player, size in enumerate(x_sizes):
         root_reach[:, player, size:] = -torch.inf
@@ -401,35 +362,28 @@ def _sample_trees_sequential(
     # therefore needs one transient row per trajectory, not one row per
     # possible node; the row is overwritten as that trajectory advances.
     working_reach_rows = (
-        n_trees
+        start_count
         if rollout_cfg.reach_storage == "recompute"
         else buffer.node_capacity
     )
     working_reach = torch.empty(
         (working_reach_rows, p_max, x_max), dtype=torch.float32, device=device
     )
-    working_reach[:n_trees] = root_reach
+    working_reach[:start_count] = root_reach
     root_profiles = torch.empty(
-        (n_trees, p_max), dtype=torch.int32, device=device
+        (start_count, p_max), dtype=torch.int32, device=device
     )
 
-    family_names, family_values, family_priorities = _queued_family_spec(backend)
+    family_names, family_values, family_priorities = _family_spec(backend)
     queues = {
-        name: DeviceFifoRing(n_trees, device) for name in family_names
+        name: DeviceWorkQueue(start_count, device) for name in family_names
     }
-    packers = _queued_family_packers(
-        backend, rollout_cfg, family_names, batch_rows
+    actual_cost_forward = getattr(
+        backend, "policy_forward_family_actual_cost", None
     )
-    queue_packing = getattr(
-        rollout_cfg, "queue_packing", "fixed_family_quantum"
-    )
-    if queue_packing == "actual_cost_greedy" and not callable(
-        getattr(backend, "policy_forward_family_actual_cost", None)
-    ):
-        raise ValueError(
-            "actual_cost_greedy requires a backend actual-cost family forward"
-        )
-    admission_plan = _queued_admission_plan(
+    if not callable(actual_cost_forward):
+        raise ValueError("production requires an actual-cost family forward")
+    admission_plan = _admission_plan(
         backend=backend,
         rollout_cfg=rollout_cfg,
         buffer=buffer,
@@ -439,7 +393,7 @@ def _sample_trees_sequential(
         root_profiles=root_profiles,
         working_reach=working_reach,
         batch_rows=batch_rows,
-        desired_resident_starts=min(n_trees, admission_size),
+        desired_resident_starts=min(start_count, admission_size),
     )
     logical_seed = _logical_seed(cfg, gen)
     policy_nodes: list[Tensor] = []
@@ -475,65 +429,14 @@ def _sample_trees_sequential(
         return tuple(int(value) for value in host.tolist())
 
     def planned_family_pack(name: str) -> tuple[int, float, bool]:
-        """Return logical rows, calibrated fill, and full-threshold status."""
+        """Return logical rows, batch fill, and full-threshold status."""
 
         queue = queues[name]
         if queue.host_count == 0:
             return 0, 0.0, False
-        packer = packers[name]
-        candidate_limit = packer.limits.max_rows
-        static_capacity = getattr(backend, "queued_static_pack_capacity", None)
-        actual_cost_greedy = queue_packing == "actual_cost_greedy"
-        if device.type == "cuda" and callable(static_capacity) and not actual_cost_greedy:
-            candidate_limit = min(
-                candidate_limit,
-                int(static_capacity(bundle.model, name, "inference", packer.limits)),
-            )
-            if candidate_limit <= 0:
-                raise MemoryError(
-                    f"execution family {name!r} has no statically safe CUDA row"
-                )
-        candidate_count = min(queue.host_count, candidate_limit)
-        candidates = queue.peek(candidate_count)
-        states = buffer.state_ref[candidates]
-        row_cost = getattr(backend, "rollout_row_cost", None)
-        if callable(row_cost):
-            padded_width, workspace = row_cost(bundle.model, states)
-        else:
-            padded_width = torch.ones_like(candidates, dtype=torch.int64)
-            workspace = torch.zeros_like(candidates, dtype=torch.int64)
-        if device.type == "cpu":
-            packed = packer.pack(candidates, padded_width, workspace)
-            selected = int(packed.handles.numel())
-            fill = float(packed.fill)
-        elif actual_cost_greedy:
-            # This is a logical dequeue block. The backend transfers its fixed-
-            # shape cost vector once and emits several actual-cost physical
-            # calls, so the block itself need not fit one worst-case launch.
-            selected = candidate_count
-            fill = selected / float(packer.limits.max_rows)
-        elif bool(getattr(backend, "queued_static_pack_safe", False)) or callable(
-            static_capacity
-        ):
-            # Backend calibration proves this fixed candidate quantum is
-            # feasible.  Consume the masked device representation and assert
-            # that proof on-device; its computed prefix length never becomes a
-            # host scalar.
-            masked = packer.pack_masked(candidates, padded_width, workspace)
-            torch._assert_async(
-                masked.selected_mask.all(),
-                "calibrated CUDA family quantum exceeds masked packing limits",
-            )
-            selected = candidate_count
-            fill = selected / float(candidate_limit)
-        else:
-            # Until a backend provides a static/masked execution kernel, retain
-            # its existing maximum-feasible physical splitter on CUDA.
-            selected = candidate_count
-            fill = selected / float(packer.limits.max_rows)
-        full_threshold = (
-            selected == packer.limits.max_rows or selected < queue.host_count
-        )
+        selected = min(queue.host_count, batch_rows)
+        fill = selected / float(batch_rows)
+        full_threshold = selected == batch_rows
         return selected, fill, full_threshold
 
     def record_queues() -> None:
@@ -566,10 +469,10 @@ def _sample_trees_sequential(
         if device.type == "cuda":
             torch._assert_async(
                 (child_handles == children.to(torch.int64)).all(),
-                "queued occurrence and tree child handles diverged",
+                "family-scheduled occurrence and tree child handles diverged",
             )
         elif not torch.equal(child_handles, children.to(torch.int64)):
-            raise RuntimeError("queued occurrence and tree child handles diverged")
+            raise RuntimeError("family-scheduled occurrence and tree child handles diverged")
         parent_rows = parents.to(torch.int64)
         parent_address = arena.gather_many(
             ("trajectory_id", "path_key"), parent_rows
@@ -595,7 +498,7 @@ def _sample_trees_sequential(
             rows = frontier.to(torch.int64)
             owners = buffer.owner[rows]
             states = buffer.state_ref[rows]
-            family_ids = _queued_family_ids(backend, states)
+            family_ids = _family_ids(backend, states)
             chance_route = -1
             leaf_route = -2
             invalid_route = -3
@@ -622,7 +525,7 @@ def _sample_trees_sequential(
             family_counts = counts[: len(family_names)]
             chance_count, stopped = counts[-2:]
             if stopped > active_starts:
-                raise RuntimeError("queued active-trajectory accounting underflow")
+                raise RuntimeError("family-scheduled active-trajectory accounting underflow")
             active_starts -= stopped
             if metrics is not None:
                 metrics.maximum(
@@ -673,10 +576,10 @@ def _sample_trees_sequential(
             )
 
     admitted = 0
-    while admitted < n_trees or any(queue.host_count for queue in queues.values()):
+    while admitted < start_count or any(queue.host_count for queue in queues.values()):
         scheduler_steps += 1
-        if scheduler_steps > n_trees * (int(backend.max_rollout_steps) + 2):
-            raise RuntimeError("queued rollout scheduler exceeded its progress bound")
+        if scheduler_steps > start_count * (int(backend.max_rollout_steps) + 2):
+            raise RuntimeError("family-scheduled rollout scheduler exceeded its progress bound")
 
         family_plans = {
             name: planned_family_pack(name)
@@ -687,7 +590,7 @@ def _sample_trees_sequential(
         selected_family: str | None = None
         if full:
             # family_names is a topological priority order; within the first
-            # priority layer the fullest FIFO wins with stable ties.
+            # priority layer the fullest work queue wins with stable ties.
             upstream = min(
                 family_priorities[family_names.index(name)] for name in full
             )
@@ -704,10 +607,10 @@ def _sample_trees_sequential(
                     -family_names.index(name),
                 ),
             )
-        elif admitted < n_trees and (
+        elif admitted < start_count and (
             safe_count := admission_plan.safe_admit(
                 active_starts=active_starts,
-                unstarted=n_trees - admitted,
+                unstarted=start_count - admitted,
                 requested=admission_size,
             )
         ) > 0:
@@ -771,17 +674,8 @@ def _sample_trees_sequential(
         tree_ids = buffer.tree_id[batch_rows_index].to(torch.int64)
         profiles = root_profiles[tree_ids]
         with torch.no_grad():
-            actual_cost_forward = getattr(
-                backend, "policy_forward_family_actual_cost", None
-            )
-            family_forward = getattr(backend, "policy_forward_family", None)
-            output = (
-                actual_cost_forward(bundle.model, selected_family, states, reaches)
-                if queue_packing == "actual_cost_greedy"
-                and callable(actual_cost_forward)
-                else family_forward(bundle.model, selected_family, states, reaches)
-                if callable(family_forward)
-                else backend.policy_forward(bundle.model, states, reaches)
+            output = actual_cost_forward(
+                bundle.model, selected_family, states, reaches
             )
             address = arena.gather_many(
                 ("trajectory_id", "path_key"), batch_rows_index
@@ -822,13 +716,13 @@ def _sample_trees_sequential(
             ).detach()
         )
         policy_values.append(output.v.detach().float())
-        DeviceFifoRing.mark_done(arena, batch_nodes.to(torch.int64))
+        DeviceWorkQueue.mark_done(arena, batch_nodes.to(torch.int64))
         chance_close(children)
 
     tree = buffer.finalize()
-    if admitted != n_trees or active_starts != 0:
+    if admitted != start_count or active_starts != 0:
         raise RuntimeError(
-            "queued rollout terminated with incomplete trajectory admission/accounting"
+            "family-scheduled rollout terminated with incomplete trajectory admission/accounting"
         )
     all_nodes = torch.arange(buffer.node_count, dtype=torch.int32, device=device)
     if rollout_cfg.reach_storage == "full":
@@ -890,7 +784,6 @@ def sample_trees(
 ) -> tuple[TreeBatch, ReachCache, PolicyCache]:
     """Sample trajectories for sequential RB or one tree for branched RB."""
 
-    rollout_cfg = getattr(cfg, "rollout", cfg)
     training = getattr(cfg, "training", None)
     mode = getattr(training, "mode", None)
     if mode == "rao_blackwell":

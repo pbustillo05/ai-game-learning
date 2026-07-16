@@ -323,7 +323,7 @@ class NLHEEngine:
         refs, device = self._refs(state_refs)
         return torch.tensor([self.next_hand(ref) for ref in refs], dtype=torch.int32, device=device)
 
-    def root_states(self, g: int, button: int = 0) -> Tensor:
+    def initial_states(self, g: int, button: int = 0) -> Tensor:
         if g < 0:
             raise ValueError("g must be nonnegative")
         return torch.full((g,), self.new_hand(button), dtype=torch.int32)

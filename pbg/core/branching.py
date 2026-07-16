@@ -30,10 +30,10 @@ def sample_branched_tree(
     import time
     import torch.distributed as dist
 
-    from pbg.core.queued import (
+    from pbg.core.execution import (
         DONE,
         ChunkedOccurrenceArena,
-        DeviceFifoRing,
+        DeviceWorkQueue,
         DrawPurpose,
         arena_fields,
         child_path_keys,
@@ -43,8 +43,8 @@ def sample_branched_tree(
     )
     from pbg.core.rollout import (
         _logical_seed,
-        _queued_family_ids,
-        _queued_family_spec,
+        _family_ids,
+        _family_spec,
         _sample_events_logical,
         _sample_profiles_logical,
         _selected_policy_logp,
@@ -55,8 +55,8 @@ def sample_branched_tree(
     device = torch.device(backend.device)
     if torch.device(gen.device) != device:
         raise ValueError("rollout generator must be created on the backend device")
-    if int(rollout_cfg.n_trees) != 1 or int(rollout_cfg.node_budget) <= 0:
-        raise ValueError("queued branched rollout requires one root and a positive budget")
+    if int(rollout_cfg.sequential_starts) != 1 or int(rollout_cfg.node_budget) <= 0:
+        raise ValueError("family-scheduled branched rollout requires one root and a positive budget")
     if rollout_cfg.reach_storage not in {"full", "decisions_only", "recompute"}:
         raise ValueError("unknown reach_storage mode")
 
@@ -97,19 +97,14 @@ def sample_branched_tree(
         (node_budget, p_max, x_max), dtype=torch.float32, device=device
     )
     reach_rows[0] = root_reach[0]
-    family_names, family_values, family_priorities = _queued_family_spec(backend)
-    queues = {name: DeviceFifoRing(node_budget, device) for name in family_names}
+    family_names, family_values, family_priorities = _family_spec(backend)
+    queues = {name: DeviceWorkQueue(node_budget, device) for name in family_names}
     metrics = getattr(backend, "execution_metrics", None)
-    queue_packing = getattr(
-        rollout_cfg, "queue_packing", "fixed_family_quantum"
-    )
     actual_cost_forward = getattr(
         backend, "policy_forward_family_actual_cost", None
     )
-    if queue_packing == "actual_cost_greedy" and not callable(actual_cost_forward):
-        raise ValueError(
-            "actual_cost_greedy requires a backend actual-cost family forward"
-        )
+    if not callable(actual_cost_forward):
+        raise ValueError("production requires an actual-cost family forward")
     logical_seed = _logical_seed(cfg, gen)
     tree_address = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     scheduler_step = 0
@@ -202,15 +197,7 @@ def sample_branched_tree(
         output = None
         child_output = None
         if family is not None:
-            forward = getattr(backend, "policy_forward_family", None)
-            output = (
-                actual_cost_forward(bundle.model, family, states, reaches)
-                if queue_packing == "actual_cost_greedy"
-                and callable(actual_cost_forward)
-                else forward(bundle.model, family, states, reaches)
-                if callable(forward)
-                else backend.policy_forward(bundle.model, states, reaches)
-            )
+            output = actual_cost_forward(bundle.model, family, states, reaches)
             child_output = _index_policy_output(output, parent_positions)
         event_keys = logical_rng_keys(
             seed=logical_seed,
@@ -277,7 +264,7 @@ def sample_branched_tree(
             policy_edge_logp.append(edge_logp)
             policy_node_ids.append(nodes.to(torch.int32))
             policy_node_values.append(output.v.detach().float())
-            DeviceFifoRing.mark_done(arena, rows)
+            DeviceWorkQueue.mark_done(arena, rows)
         return children
 
     def chance_close(frontier: Tensor) -> None:
@@ -289,7 +276,7 @@ def sample_branched_tree(
             rows = frontier.to(torch.int64)
             owners = buffer.owner[rows]
             states = buffer.state_ref[rows]
-            family_ids = _queued_family_ids(backend, states)
+            family_ids = _family_ids(backend, states)
             chance_route, leaf_route, invalid_route = -1, -2, -3
             player = (owners >= 0) & (owners < p_max)
             route = torch.where(
@@ -335,7 +322,7 @@ def sample_branched_tree(
     while any(queue.host_count for queue in queues.values()):
         scheduler_step += 1
         if scheduler_step > progress_limit:
-            raise RuntimeError("queued branched scheduler exceeded its progress bound")
+            raise RuntimeError("family-scheduled branched scheduler exceeded its progress bound")
         nonempty = [name for name in family_names if queues[name].host_count]
         upstream = min(family_priorities[family_names.index(name)] for name in nonempty)
         eligible = [
@@ -353,7 +340,7 @@ def sample_branched_tree(
         )
         queue = queues[family]
         configured_rows = int(
-            getattr(rollout_cfg, "queue_batch_rows", None) or queue.host_count
+            getattr(rollout_cfg, "family_batch_rows", None) or queue.host_count
         )
         count = min(queue.host_count, configured_rows)
         nodes = queue.dequeue(count, arena=arena).to(torch.int32)
@@ -394,7 +381,7 @@ def sample_branched_tree(
             (buffer.node_count,), -1, dtype=torch.int64, device=device
         )
         node_to_row[decision_nodes] = torch.arange(decision_nodes.numel(), device=device)
-        # Append-order edge ids are not CSR positions under FIFO scheduling:
+        # Append-order edge ids are not CSR positions under work queue scheduling:
         # another family may expand a later node first. DeviceTreeBuffer stores
         # each edge's stable parent-local ordinal explicitly for this mapping.
         columns = buffer.edge_ordinal[edge_ids].to(torch.int64)
@@ -403,7 +390,7 @@ def sample_branched_tree(
         cached_values = torch.cat(policy_node_values).to(torch.float32)
         order = torch.argsort(cached_nodes.to(torch.int64))
         if not torch.equal(cached_nodes[order], decision_nodes):
-            raise RuntimeError("queued branched rollout omitted a decision cache row")
+            raise RuntimeError("family-scheduled branched rollout omitted a decision cache row")
         old_v = cached_values[order]
     else:
         logp_child = torch.empty((0, 0, x_max), dtype=torch.float32, device=device)

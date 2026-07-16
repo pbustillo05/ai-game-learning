@@ -51,14 +51,6 @@ def _ratio(new: Any, old: Any, targets: Any, adapter: Any) -> tuple[Tensor, Tens
     return torch.exp(difference), target.a_hat.to(new.v)
 
 
-def l_pg(new: Any, old: Any, targets: Any, adapter: Any, cfg: Any) -> tuple[Tensor, dict]:
-    """Return direct-advantage policy loss elements ``[B,E,X]``."""
-
-    del cfg
-    ratio, advantage = _ratio(new, old, targets, adapter)
-    return -ratio * advantage, {"ratio": ratio}
-
-
 def l_clip(new: Any, old: Any, targets: Any, adapter: Any, cfg: Any) -> tuple[Tensor, dict]:
     """Return PPO-clipped direct-advantage elements ``[B,E,X]``."""
 

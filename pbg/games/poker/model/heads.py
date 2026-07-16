@@ -124,39 +124,6 @@ def raise_tick_probs(
     return (1.0 - iota[..., None]) * mixture + iota[..., None] * allin
 
 
-class BinomialTickHead(nn.Module):
-    """Flag-gated binomial raise-tick ablation with an all-in atom."""
-
-    def __init__(self, in_dim: int) -> None:
-        super().__init__()
-        self.in_dim = in_dim
-        self.prob_affine = nn.Linear(in_dim, 1)
-        self.allin_affine = nn.Linear(in_dim, 1)
-
-    def forward(self, z_raise: Tensor, n_ticks: int) -> Tensor:
-        """Return binomial-plus-all-in probabilities ``[...,n_ticks]``."""
-
-        if n_ticks <= 0 or z_raise.shape[-1] != self.in_dim:
-            raise ValueError("invalid tick count or feature dimension")
-        if n_ticks == 1:
-            return torch.ones(z_raise.shape[:-1] + (1,), dtype=z_raise.dtype, device=z_raise.device)
-        p = torch.sigmoid(self.prob_affine(z_raise)).squeeze(-1)
-        iota = torch.sigmoid(self.allin_affine(z_raise)).squeeze(-1)
-        count = n_ticks - 1
-        ticks = torch.arange(n_ticks, dtype=torch.float32, device=z_raise.device)
-        log_choose = (
-            torch.lgamma(torch.tensor(float(count + 1), device=z_raise.device))
-            - torch.lgamma(ticks + 1.0)
-            - torch.lgamma(float(count) - ticks + 1.0)
-        )
-        p32 = p.float().clamp(torch.finfo(torch.float32).eps, 1.0 - torch.finfo(torch.float32).eps)
-        log_prob = log_choose + ticks * torch.log(p32[..., None]) + (count - ticks) * torch.log1p(-p32[..., None])
-        base = torch.softmax(log_prob, dim=-1).to(z_raise.dtype)
-        allin = torch.zeros_like(base)
-        allin[..., -1] = 1.0
-        return (1.0 - iota[..., None]) * base + iota[..., None] * allin
-
-
 class ValueHead(nn.Module):
     """Emit one scalar value per actor private-type row."""
 

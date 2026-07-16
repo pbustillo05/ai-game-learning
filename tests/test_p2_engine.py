@@ -36,7 +36,7 @@ def _check_call(game: NLHEEngine, ref: int) -> int:
 
 def test_blinds_action_order_limp_fold_and_button_rotation() -> None:
     game = NLHEEngine(PokerConfig(n_players=3))
-    root = int(game.root_states(1)[0])
+    root = int(game.initial_states(1)[0])
     assert game.states.button[root] == 0
     assert game.states.committed_street[root] == (0.0, 0.5, 1.0)
     assert game.states.actor[root] == 0
@@ -66,7 +66,7 @@ def test_blinds_action_order_limp_fold_and_button_rotation() -> None:
 
 def test_heads_up_order_minimum_raise_grid_and_fold_payoff() -> None:
     game = NLHEEngine(PokerConfig(n_players=2, stack_bb=20.0))
-    root = int(game.root_states(1)[0])
+    root = int(game.initial_states(1)[0])
     assert game.states.committed_street[root] == (0.5, 1.0)
     assert game.states.actor[root] == 0  # button/small blind first preflop
     targets = game.raise_targets(torch.tensor([root], dtype=torch.int32))[0]
@@ -92,7 +92,7 @@ def test_default_denomination_exposes_every_half_blind_raise_amount() -> None:
     cfg = PokerConfig(n_players=2)
     assert cfg.n_ticks == 200
     game = NLHEEngine(cfg)
-    root = game.root_states(1)
+    root = game.initial_states(1)
     targets = game.raise_targets(root)[0]
     _, legal = game.legal_events(root)
     assert torch.equal(targets, torch.arange(0.5, 100.5, 0.5))
@@ -140,7 +140,7 @@ def test_short_all_in_does_not_reopen_prior_actors() -> None:
 
 def test_scripted_multiway_all_in_closes_at_runout_preterminal() -> None:
     game = NLHEEngine(PokerConfig(n_players=3, stack_bb=10.0))
-    ref = int(game.root_states(1)[0])
+    ref = int(game.initial_states(1)[0])
     ref = _step(game, ref, RAISE_OFFSET + game.n_ticks - 1)
     assert game.states.status[ref][0] == ALL_IN
     ref = _check_call(game, ref)
@@ -156,7 +156,7 @@ def test_scripted_multiway_all_in_closes_at_runout_preterminal() -> None:
 
 def test_check_down_transitions_and_showdown_preterminal() -> None:
     game = NLHEEngine(PokerConfig(n_players=2))
-    ref = int(game.root_states(1)[0])
+    ref = int(game.initial_states(1)[0])
     # Preflop call/check, then three checked streets.
     ref = _check_call(game, ref)
     ref = _check_call(game, ref)

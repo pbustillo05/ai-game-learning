@@ -136,10 +136,10 @@ def test_configuration_rejects_out_of_contract_values(
 
 def test_rollout_memory_uses_compact_private_width() -> None:
     short = estimate_rollout_memory(
-        n_trees=2, node_budget=8, n_players=2, reach_storage="full", rank_count=4
+        root_count=2, node_budget=8, n_players=2, reach_storage="full", rank_count=4
     )
     full = estimate_rollout_memory(
-        n_trees=2, node_budget=8, n_players=2, reach_storage="full", rank_count=13
+        root_count=2, node_budget=8, n_players=2, reach_storage="full", rank_count=13
     )
     assert short.reach_cache_bytes * 1326 == full.reach_cache_bytes * 120
     assert short.frontier_reach_bytes * 1326 == full.frontier_reach_bytes * 120

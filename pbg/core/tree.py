@@ -265,25 +265,25 @@ class TreeBuilder:
 class DeviceTreeBuffer:
     """Preallocated device-resident storage for a batch of rollout trees.
 
-    Node capacity is ``n_trees * node_budget`` and edge capacity is that value
-    minus ``n_trees``.  Roots always occupy the first ``n_trees`` rows.
+    Node capacity is ``root_count * node_budget`` and edge capacity is that value
+    minus ``root_count``.  Roots always occupy the first ``root_count`` rows.
     """
 
     def __init__(
         self,
-        n_trees: int,
+        root_count: int,
         node_budget: int,
         n_players: int,
         device: torch.device | str,
     ) -> None:
-        if n_trees < 0 or node_budget <= 0 or n_players <= 0:
-            raise ValueError("n_trees must be nonnegative and budgets must be positive")
-        self.n_trees = int(n_trees)
+        if root_count < 0 or node_budget <= 0 or n_players <= 0:
+            raise ValueError("root_count must be nonnegative and budgets must be positive")
+        self.root_count = int(root_count)
         self.node_budget = int(node_budget)
         self.n_players = int(n_players)
         self.device = torch.device(device)
-        self.node_capacity = self.n_trees * self.node_budget
-        self.edge_capacity = self.node_capacity - self.n_trees
+        self.node_capacity = self.root_count * self.node_budget
+        self.edge_capacity = self.node_capacity - self.root_count
         self.node_count = 0
         self.edge_count = 0
 
@@ -330,22 +330,22 @@ class DeviceTreeBuffer:
     def add_roots(self, states: Tensor, owners: Tensor) -> Tensor:
         """Store int32 root ``states``/``owners`` ``[G]`` and return node ids."""
 
-        if states.shape != (self.n_trees,) or owners.shape != (self.n_trees,):
-            raise ValueError("root tensors must have shape [n_trees]")
+        if states.shape != (self.root_count,) or owners.shape != (self.root_count,):
+            raise ValueError("root tensors must have shape [root_count]")
         if states.device != self.device or owners.device != self.device:
             raise ValueError("root tensors must be on the buffer device")
-        ids = torch.arange(self.n_trees, dtype=torch.int32, device=self.device)  # [G]
-        self.state_ref[: self.n_trees] = states.to(torch.int32)
-        self.owner[: self.n_trees] = owners.to(torch.int32)
-        self.tree_id[: self.n_trees] = ids
+        ids = torch.arange(self.root_count, dtype=torch.int32, device=self.device)  # [G]
+        self.state_ref[: self.root_count] = states.to(torch.int32)
+        self.owner[: self.root_count] = owners.to(torch.int32)
+        self.tree_id[: self.root_count] = ids
         root_owners = owners.to(torch.int64)
         player_mask = (root_owners >= 0) & (root_owners < self.n_players)
-        self.depth_p[: self.n_trees].zero_()
+        self.depth_p[: self.root_count].zero_()
         safe_owner = root_owners.clamp(0, self.n_players - 1)
         self.depth_p[ids.to(torch.int64), safe_owner] = player_mask.to(torch.int32)
-        self.depth_player[: self.n_trees] = player_mask.to(torch.int32)
-        self.path_weight[: self.n_trees] = 1.0
-        self.node_count = self.n_trees
+        self.depth_player[: self.root_count] = player_mask.to(torch.int32)
+        self.path_weight[: self.root_count] = 1.0
+        self.node_count = self.root_count
         return ids
 
     append_roots = add_roots
@@ -433,7 +433,7 @@ class DeviceTreeBuffer:
 
         # ``parents`` is parent-major by contract.  Retain the stable ordinal of
         # every abstract child so finalization can scatter edges directly into
-        # CSR order even when queued execution expands parents across depths.
+        # CSR order even when family-scheduled execution expands parents across depths.
         local_rows = torch.arange(count, dtype=torch.int32, device=self.device)
         group_start = torch.zeros(count, dtype=torch.int32, device=self.device)
         group_start[0] = 0

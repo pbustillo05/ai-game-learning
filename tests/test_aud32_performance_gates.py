@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from pbg.benchmark import benchmark_modes, compare_benchmark
-from pbg.core.config import load_config
+from pbg.config import load_config
 
 
 def _result(speed: float, seconds: float, target_bytes: float) -> dict:
@@ -33,9 +33,8 @@ def _result(speed: float, seconds: float, target_bytes: float) -> dict:
             "model_initialization_seed": 7,
             "repeat_seeds": [104_736, 209_465],
             "profile_iteration": 1,
-            "queue_batch_rows": None,
-            "queue_packing": None,
-            "queue_admission_size": None,
+            "family_batch_rows": None,
+            "max_active_trajectories": None,
             "arena_chunk_nodes": None,
         },
         "modes": [

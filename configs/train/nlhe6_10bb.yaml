@@ -1,0 +1,63 @@
+game:
+  n_players: 6
+  stack_bb: 10.0
+  rank_count: 13
+rollout:
+  sequential_starts: 1
+  beta:
+    # A 600-iteration launch gate at 1.10 doubled mean decision coverage while
+    # keeping the largest observed tree at 681/4,096 nodes.  The old 1.25
+    # candidate remains unsafe for an unattended run.
+    default: 1.0
+    preflop: 1.10
+    flop: 1.25
+    turn: 1.25
+    river: 1.25
+    chance_to_flop: 1.5
+    chance_to_turn: 1.25
+    chance_to_river: 1.25
+  node_budget: 4096
+  reach_storage: recompute
+completion:
+  n_samples: 64
+  backend: cuda
+model:
+  d_model: 96
+  n_heads: 4
+  n_layers_pre: 2
+  n_layers_post: 2
+  m_raise: 4
+  k_act: 7
+  max_players: 6
+training:
+  mode: branched_rao_blackwell
+  # This is a ceiling for a wall-clock-limited seven-hour launch.  Runtime
+  # becomes slower as policies reach postflop more often, so use the documented
+  # external timeout and rely on periodic checkpoints rather than assuming all
+  # 20,000 iterations will complete.
+  iters: 20000
+  gd_steps_per_iter: 1
+  minibatch_size: 32
+  lr: 0.0001
+  adam_betas: [0.9, 0.999]
+  grad_clip: 0.5
+  amp: false
+  seed: 47
+  checkpoint_every: 250
+  out_dir: runs/nlhe6_10bb_7h
+  reproducibility: throughput
+  kl_ref_interval: 50
+  optimizer: adamw
+loss:
+  name: rb_ppo
+  lam: 1.0
+  clip_eps: 0.2
+  clip_eps_v: 0.2
+  # At 0.002 the value term dominated late smoke updates by roughly 8:1 while
+  # explained variance stayed near zero.  The 0.0005 gate made the final value
+  # and policy contributions comparable (about 0.056 and 0.085).
+  c_v: 0.0005
+  c_h: 0.1
+  c_kl: 0.2
+  entropy_schedule: const
+  value_loss: clipped

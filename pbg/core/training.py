@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -21,6 +21,7 @@ import torch.distributed as dist
 from torch import Tensor, nn
 
 from pbg.core.config import RootConfig, seed_all
+from pbg.core.distributed import stratum_objective_scale
 from pbg.core.game import GameBundle
 from pbg.core.losses import COMPOSITES, LossSpec, _selected_logp, finalize_metric_stats
 from pbg.core.minibatch import (
@@ -39,31 +40,9 @@ from pbg.core.rollout import (
     sample_trees_sequential,
     sequential_leaf_logical_rng_keys,
 )
-from pbg.core.queued import LOGICAL_RNG_VERSION, DrawPurpose
+from pbg.core.execution import LOGICAL_RNG_VERSION, DrawPurpose
 from pbg.core.tree import DecisionReachCache, build_decision_alias
 from pbg.core.values import HeadEvals, streamed_branched_value
-
-
-GAME_FACTORIES = {
-    "poker": "pbg.games.poker.bundle:build_bundle",
-}
-
-
-def build_game_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
-    """Resolve and call the selected game factory without static game imports."""
-
-    try:
-        location = GAME_FACTORIES[cfg.game.name]
-    except KeyError as exc:
-        raise NotImplementedError(f"no game factory is registered for {cfg.game.name!r}") from exc
-    module_name, separator, function_name = location.partition(":")
-    if not separator:
-        raise RuntimeError(f"invalid game factory location {location!r}")
-    factory = getattr(importlib.import_module(module_name), function_name)
-    bundle = factory(cfg, device)
-    if not isinstance(bundle, GameBundle):
-        raise TypeError("game factory must return GameBundle")
-    return bundle
 
 
 def save_checkpoint(
@@ -254,7 +233,7 @@ def _loss_spec(cfg: RootConfig) -> LossSpec:
 
 def _precision(cfg: RootConfig, device: torch.device) -> tuple[bool, torch.dtype]:
     name = "fp16" if cfg.hardware is None else cfg.hardware.precision
-    if device.type != "cuda" or name == "fp32" or not cfg.train.amp:
+    if device.type != "cuda" or name == "fp32" or not cfg.training.amp:
         return False, torch.float32
     return True, torch.bfloat16 if name == "bf16" else torch.float16
 
@@ -275,7 +254,7 @@ def _hardware_metadata(
         "cuda_toolkit": os.environ.get("CUDA_HOME"),
         "scheduler_job_id": os.environ.get("SLURM_JOB_ID"),
         "scheduler_time_limit": os.environ.get("SLURM_TIMELIMIT"),
-        "reproducibility": cfg.train.reproducibility,
+        "reproducibility": cfg.training.reproducibility,
         "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
         "cudnn_deterministic": torch.backends.cudnn.deterministic,
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
@@ -283,27 +262,25 @@ def _hardware_metadata(
         "logical_rng": LOGICAL_RNG_VERSION,
         "scheduler_control_sync_policy": "one_fixed_control_block_per_decision_v1",
         "completion_backend": cfg.completion.backend,
-        "queue_calibration": {
-            "batch_rows": cfg.rollout.queue_batch_rows,
-            "packing": cfg.rollout.queue_packing,
-            "admission_size": cfg.rollout.queue_admission_size,
+        "execution_calibration": {
+            "batch_rows": cfg.rollout.family_batch_rows,
+            "max_active_trajectories": cfg.rollout.max_active_trajectories,
             "arena_chunk_nodes": cfg.rollout.arena_chunk_nodes,
         },
         "memory_limits": {
-            "queue_memory_bytes": cfg.rollout.queue_memory_bytes,
+            "execution_memory_bytes": cfg.rollout.execution_memory_bytes,
             "node_budget": cfg.rollout.node_budget,
             "reserve_vram_gib": None if cfg.hardware is None else cfg.hardware.reserve_vram_gib,
             "max_memory_fraction": None if cfg.hardware is None else cfg.hardware.max_memory_fraction,
         },
     }
-    if cfg.game.name == "poker":
-        try:
-            evaluator = importlib.import_module("poker_gpu_evaluator.pbg")
-            metadata["evaluator_api_version"] = evaluator.API_VERSION
-            metadata["evaluator_module"] = str(Path(evaluator.__file__).resolve())
-        except (ImportError, AttributeError):
-            metadata["evaluator_api_version"] = None
-            metadata["evaluator_module"] = None
+    try:
+        evaluator = importlib.import_module("poker_gpu_evaluator.pbg")
+        metadata["evaluator_api_version"] = evaluator.API_VERSION
+        metadata["evaluator_module"] = str(Path(evaluator.__file__).resolve())
+    except (ImportError, AttributeError):
+        metadata["evaluator_api_version"] = None
+        metadata["evaluator_module"] = None
     if cfg.training.mode == "branched_rao_blackwell":
         metadata["rank_start_quotas"] = [1] * world
         metadata["global_sequential_starts"] = None
@@ -648,7 +625,9 @@ def _stratified_decision_rows(
             probability, metrics=getattr(backend, "execution_metrics", None)
         )
         sampled = rows[_sample_alias(threshold, alias, count, gen)]
-        alpha = (mass / global_mass.to(mass.device)).to(torch.float32)
+        alpha = stratum_objective_scale(
+            mass, global_mass.to(mass.device)
+        ).to(torch.float32)
         result.append((name, sampled, alpha))
     return result
 
@@ -812,7 +791,7 @@ def _analytical_memory_plan(
     types = max(int(value) for value in backend.x_sizes)
     events = int(getattr(backend, "e_max", 1))
     resident_trees = int(
-        cfg.rollout.n_trees
+        cfg.rollout.sequential_starts
     )
     nodes = resident_trees * int(cfg.rollout.node_budget)
     fp32 = 4
@@ -1048,7 +1027,7 @@ def _build_iteration_data(
                 offspring = tree.child_ptr[1:] - tree.child_ptr[:-1]
                 profile_metrics.update(
                     {
-                        "trajectories": float(cfg.rollout.n_trees),
+                        "trajectories": float(cfg.rollout.sequential_starts),
                         "nodes": float(tree.owner.numel()),
                         "leaves": float(leaves),
                         "decisions": float(decisions),
@@ -1227,7 +1206,7 @@ def _build_iteration_data(
                     "sampled_trees"
                     if cfg.training.mode == "branched_rao_blackwell"
                     else "trajectories"
-                ): float(cfg.rollout.n_trees),
+                ): float(cfg.rollout.sequential_starts),
                 "nodes": float(tree.owner.numel()),
                 "leaves": float(leaf_ids.numel()),
                 "decisions": float(decisions),
@@ -1397,7 +1376,7 @@ def _one_iteration(
     device = next(model.parameters()).device
     amp_enabled, amp_dtype = _precision(cfg, device)
     normal = cfg.training.mode == "normal"
-    total_trajectories = int(cfg.rollout.n_trees)
+    total_trajectories = int(cfg.rollout.sequential_starts)
     profile_parts: list[dict[str, float]] = []
     quality_parts: list[tuple[int, dict[str, float]]] = []
     optimization_records: list[tuple[int, int, dict[str, float]]] = []
@@ -1416,7 +1395,7 @@ def _one_iteration(
             identity_metrics = _validate_old_policy_identity(cfg, bundle, data)
         else:
             # The identity gate is launch/resume validation, not scientific
-            # rollout or learner work.  Excluding it keeps exact executor
+            # rollout or learner work.  Excluding it keeps exact execution
             # counters invariant under checkpoint continuation.
             with execution_metrics.suspended():
                 identity_metrics = _validate_old_policy_identity(
@@ -1436,7 +1415,9 @@ def _one_iteration(
     local_mass, global_mass = _await_global_decision_mass(
         data, metrics=execution_metrics
     )
-    rank_objective_scale = (local_mass / global_mass).to(torch.float32)
+    rank_objective_scale = stratum_objective_scale(
+        local_mass, global_mass
+    ).to(torch.float32)
     if data.profile_metrics is not None:
         data.profile_metrics["local_decision_mass"] = float(local_mass)
         data.profile_metrics["global_decision_mass"] = float(global_mass)
@@ -1452,17 +1433,17 @@ def _one_iteration(
             torch.cuda.reset_peak_memory_stats(device)
         optimization_start = time.perf_counter()
 
-    if cfg.train.ppo_epochs is None:
+    if cfg.training.ppo_epochs is None:
         batches: list[tuple[int, Tensor | None]] = [
-            (-1, None) for _ in range(cfg.train.gd_steps_per_iter)
+            (-1, None) for _ in range(cfg.training.gd_steps_per_iter)
         ]
     else:
         batches = []
-        for epoch in range(cfg.train.ppo_epochs):
+        for epoch in range(cfg.training.ppo_epochs):
             permutation = torch.randperm(decisions, generator=torch_gen, device=device)
-            for first in range(0, decisions, cfg.train.minibatch_size):
+            for first in range(0, decisions, cfg.training.minibatch_size):
                 batches.append(
-                    (epoch, permutation[first : first + cfg.train.minibatch_size])
+                    (epoch, permutation[first : first + cfg.training.minibatch_size])
                 )
 
     for epoch, selected_rows in batches:
@@ -1477,7 +1458,7 @@ def _one_iteration(
                 data,
                 bundle,
                 source,
-                cfg.train.minibatch_size,
+                cfg.training.minibatch_size,
                 global_mass,
                 torch_gen,
                 variance_ema,
@@ -1587,14 +1568,14 @@ def _one_iteration(
         )
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), cfg.train.grad_clip
+            model.parameters(), cfg.training.grad_clip
         )
         scaler.step(optimizer)
         scaler.update()
         step_metrics = finalize_metric_stats(metric_parts)
         step_metrics["grad_norm_pre_clip"] = float(grad_norm)
         step_metrics["grad_clip_scale"] = min(
-            1.0, float(cfg.train.grad_clip) / max(float(grad_norm), 1.0e-12)
+            1.0, float(cfg.training.grad_clip) / max(float(grad_norm), 1.0e-12)
         )
         step_metrics["reduced_gradients_finite"] = float(gradients_finite)
         optimization_records.append((epoch, effective_total, step_metrics))
@@ -1603,15 +1584,15 @@ def _one_iteration(
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         assert optimization_start is not None
-        chunk_profile = profile_parts[-1]
-        chunk_profile["phase_optimization_seconds"] = (
+        iteration_profile = profile_parts[-1]
+        iteration_profile["phase_optimization_seconds"] = (
             time.perf_counter() - optimization_start
         )
         if device.type == "cuda":
-            chunk_profile["phase_optimization_peak_allocated_bytes"] = float(
+            iteration_profile["phase_optimization_peak_allocated_bytes"] = float(
                 torch.cuda.max_memory_allocated(device)
             )
-            chunk_profile["phase_optimization_peak_reserved_bytes"] = float(
+            iteration_profile["phase_optimization_peak_reserved_bytes"] = float(
                 torch.cuda.max_memory_reserved(device)
             )
 
@@ -1654,13 +1635,13 @@ def _one_iteration(
             ),
         }
     )
-    if cfg.train.ppo_epochs is not None:
-        metrics["ppo_epochs"] = float(cfg.train.ppo_epochs)
+    if cfg.training.ppo_epochs is not None:
+        metrics["ppo_epochs"] = float(cfg.training.ppo_epochs)
         metrics["decision_epoch_coverage"] = (
             sum(rows for _, rows, _ in optimization_records)
-            / max(decision_total * cfg.train.ppo_epochs, 1)
+            / max(decision_total * cfg.training.ppo_epochs, 1)
         )
-        for epoch in range(cfg.train.ppo_epochs):
+        for epoch in range(cfg.training.ppo_epochs):
             epoch_records = [
                 record for record in optimization_records if record[0] == epoch
             ]
@@ -1734,32 +1715,37 @@ def _one_iteration(
     return metrics
 
 
-def train(
-    cfg: RootConfig, *, resume_from: str | Path | None = None
+def run_training(
+    cfg: RootConfig,
+    *,
+    bundle_builder: Callable[[RootConfig, torch.device], GameBundle],
+    resume_from: str | Path | None = None,
 ) -> None:
     """Train from scratch or resume an identity-checked complete run."""
 
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    if cfg.game.name == "poker" and cfg.completion.backend == "cpu":
+    if cfg.completion.backend == "cpu":
         requested = torch.device("cpu")
-    elif cfg.game.name == "poker" and cfg.completion.backend == "cuda":
+    elif cfg.completion.backend == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("poker completion backend 'cuda' requires an available CUDA device")
         requested = torch.device(f"cuda:{local_rank}")
     else:
         requested = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    _configure_reproducibility(cfg.train.reproducibility)
+    _configure_reproducibility(cfg.training.reproducibility)
     local_cfg = _rank_local_config(cfg, rank, world)
     _hardware_metadata(cfg, requested, world)
-    torch_gen, np_gen = seed_all(cfg.train.seed, rank, requested)
-    bundle = build_game_bundle(local_cfg, requested)
+    torch_gen, np_gen = seed_all(cfg.training.seed, rank, requested)
+    bundle = bundle_builder(local_cfg, requested)
+    if not isinstance(bundle, GameBundle):
+        raise TypeError("bundle builder must return GameBundle")
     device = torch.device(bundle.rollout_backend.device)
     if device.type == "cuda":
         torch.cuda.set_device(device)
     if torch_gen.device != device:
-        torch_gen, np_gen = seed_all(cfg.train.seed, rank, device)
+        torch_gen, np_gen = seed_all(cfg.training.seed, rank, device)
     bundle.model.to(device)
     if world > 1:
         if not dist.is_initialized():
@@ -1769,11 +1755,11 @@ def train(
         # flat SUM path; DDP's equal-rank averaging is intentionally not used.
     optimizer_cls = (
         torch.optim.AdamW
-        if cfg.train.optimizer == "adamw"
+        if cfg.training.optimizer == "adamw"
         else torch.optim.Adam
     )
     optimizer = optimizer_cls(
-        bundle.model.parameters(), lr=cfg.train.lr, betas=cfg.train.adam_betas
+        bundle.model.parameters(), lr=cfg.training.lr, betas=cfg.training.adam_betas
     )
     source_model = (
         bundle.model.module if hasattr(bundle.model, "module") else bundle.model
@@ -1785,7 +1771,7 @@ def train(
         reference_model.requires_grad_(False)
     amp_enabled, amp_dtype = _precision(cfg, device)
     scaler = _scaler(bool(amp_enabled and amp_dtype == torch.float16))
-    out_dir = Path(cfg.train.out_dir)
+    out_dir = Path(cfg.training.out_dir)
     start_iteration = 0
     run_id: str | None = None
     resume_path = None if resume_from is None else Path(resume_from)
@@ -1807,7 +1793,7 @@ def train(
         if checkpoint_metadata["cfg_dict"] != _scientific_config(cfg):
             raise RuntimeError("resume configuration does not match the checkpoint")
         start_iteration = int(checkpoint_metadata["iter"])
-        if not 0 <= start_iteration <= cfg.train.iters:
+        if not 0 <= start_iteration <= cfg.training.iters:
             raise RuntimeError("checkpoint iteration is outside the configured schedule")
         run_id = checkpoint_metadata["run_id"]
         reference_iteration = checkpoint_metadata["reference_iteration"]
@@ -1874,8 +1860,8 @@ def train(
         dist.barrier()
     assert run_id is not None
 
-    for iteration in range(start_iteration, cfg.train.iters):
-        if reference_model is not None and iteration % cfg.train.kl_ref_interval == 0:
+    for iteration in range(start_iteration, cfg.training.iters):
+        if reference_model is not None and iteration % cfg.training.kl_ref_interval == 0:
             reference_model.load_state_dict(source_model.state_dict())
             reference_model.eval()
             reference_iteration = iteration
@@ -1901,7 +1887,7 @@ def train(
             metrics["reference_iteration"] = float(reference_iteration)
         _add_distributed_metric_summaries(metrics, device, world)
         checkpoint_every = (
-            cfg.train.checkpoint_every
+            cfg.training.checkpoint_every
             if cfg.hardware is None or cfg.hardware.checkpoint_every is None
             else cfg.hardware.checkpoint_every
         )

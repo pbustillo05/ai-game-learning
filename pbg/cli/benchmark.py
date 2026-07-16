@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from pbg.benchmark import MODES, benchmark_modes, compare_benchmark
-from pbg.core.config import load_config
+from pbg.config import load_config
 
 
 def main() -> None:
@@ -29,13 +29,8 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--sequential-starts", type=int, default=None)
     parser.add_argument("--node-budget", type=int, default=None)
-    parser.add_argument("--queue-batch-rows", type=int, default=None)
-    parser.add_argument(
-        "--queue-packing",
-        choices=("fixed_family_quantum", "actual_cost_greedy"),
-        default=None,
-    )
-    parser.add_argument("--queue-admission-size", type=int, default=None)
+    parser.add_argument("--family-batch-rows", type=int, default=None)
+    parser.add_argument("--max-active-trajectories", type=int, default=None)
     parser.add_argument("--arena-chunk-nodes", type=int, default=None)
     parser.add_argument("--completion-samples", type=int, default=None)
     parser.add_argument(
@@ -53,12 +48,10 @@ def main() -> None:
         cfg.rollout.sequential_starts = args.sequential_starts
     if args.node_budget is not None:
         cfg.rollout.node_budget = args.node_budget
-    if args.queue_batch_rows is not None:
-        cfg.rollout.queue_batch_rows = args.queue_batch_rows
-    if args.queue_packing is not None:
-        cfg.rollout.queue_packing = args.queue_packing
-    if args.queue_admission_size is not None:
-        cfg.rollout.queue_admission_size = args.queue_admission_size
+    if args.family_batch_rows is not None:
+        cfg.rollout.family_batch_rows = args.family_batch_rows
+    if args.max_active_trajectories is not None:
+        cfg.rollout.max_active_trajectories = args.max_active_trajectories
     if args.arena_chunk_nodes is not None:
         cfg.rollout.arena_chunk_nodes = args.arena_chunk_nodes
     if args.completion_samples is not None:

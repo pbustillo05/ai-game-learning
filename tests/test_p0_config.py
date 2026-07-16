@@ -8,7 +8,8 @@ import pytest
 import torch
 import yaml
 
-from pbg.core.config import ConfigError, load_config, seed_all
+from pbg.config import ConfigError, load_config
+from pbg.core.config import seed_all
 from pbg.core.logging_util import MetricsLogger
 from pbg.core.training import _configure_reproducibility
 
@@ -18,17 +19,18 @@ ROOT = Path(__file__).parents[1]
 
 def test_nlhe_loads_every_config_field() -> None:
     cfg = load_config(ROOT / "configs" / "train" / "nlhe6.yaml")
-    assert cfg.game.name == "poker"
-    assert cfg.game.poker == {"n_players": 6, "stack_bb": 100.0, "rank_count": 13}
-    assert cfg.rollout.beta_fix["preflop"] == 1.0
-    assert cfg.rollout.queue_packing == "actual_cost_greedy"
+    assert cfg.game.n_players == 6
+    assert cfg.game.stack_bb == 100.0
+    assert cfg.game.rank_count == 13
+    assert cfg.rollout.beta is not None
+    assert cfg.rollout.beta["preflop"] == 1.0
     assert cfg.completion.n_samples == 256
     assert cfg.completion.backend == "cuda"
     assert cfg.model["d_model"] == 192
     assert cfg.loss.lam == pytest.approx(0.95)
     assert cfg.loss.value_loss == "clipped"
-    assert cfg.train.adam_betas == (0.9, 0.999)
-    assert cfg.train.reproducibility == "throughput"
+    assert cfg.training.adam_betas == (0.9, 0.999)
+    assert cfg.training.reproducibility == "throughput"
 
 
 def test_hardware_profile_is_composed_without_changing_scientific_config() -> None:
@@ -55,7 +57,7 @@ def test_unknown_nested_key_reports_full_path(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("section", "key", "pattern"),
     [
-        ("game.poker", "mispelled_ante", r"root\.game\.poker\.mispelled_ante"),
+        ("game", "mispelled_ante", r"root\.game\.mispelled_ante"),
         ("model", "e_max", r"unknown poker model configuration key"),
     ],
 )
@@ -76,7 +78,7 @@ def test_game_owned_mappings_reject_unknown_keys(
 @pytest.mark.parametrize(
     ("section", "key", "pattern"),
     [
-        ("game.poker", "stacks_bb", r"root\.game\.poker\.stacks_bb"),
+        ("game", "stacks_bb", r"root\.game\.stacks_bb"),
         ("model", "unknown_head", r"unknown poker model configuration key"),
     ],
 )
@@ -131,7 +133,9 @@ def test_training_mode_validates_beta_completion_and_loss_axes(tmp_path: Path) -
         load_config(path)
 
 
-@pytest.mark.parametrize("key", ["executor", "trajectory_chunk_size"])
+@pytest.mark.parametrize(
+    "key", ["executor", "trajectory_chunk_size", "queue_packing", "n_trees"]
+)
 def test_removed_rollout_implementation_keys_are_rejected(
     tmp_path: Path, key: str
 ) -> None:
@@ -152,34 +156,26 @@ def test_production_execution_config_is_explicit_and_strict(
     raw["rollout"]["sequential_starts"] = 10
     raw["rollout"].update(
         {
-            "queue_batch_rows": 8,
-            "queue_admission_size": 16,
+            "family_batch_rows": 8,
+            "max_active_trajectories": 16,
             "arena_chunk_nodes": 32,
-            "queue_memory_bytes": 1_000_000,
-            "queue_packing": "actual_cost_greedy",
+            "execution_memory_bytes": 1_000_000,
         }
     )
-    path = tmp_path / "queued.yaml"
+    path = tmp_path / "execution.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     cfg = load_config(path)
-    assert cfg.rollout.queue_batch_rows == 8
-    assert cfg.rollout.queue_admission_size == 16
+    assert cfg.rollout.family_batch_rows == 8
+    assert cfg.rollout.max_active_trajectories == 16
     assert cfg.rollout.arena_chunk_nodes == 32
-    assert cfg.rollout.queue_memory_bytes == 1_000_000
-    assert cfg.rollout.queue_packing == "actual_cost_greedy"
+    assert cfg.rollout.execution_memory_bytes == 1_000_000
 
-    raw["rollout"]["queue_batch_rows"] = 0
+    raw["rollout"]["family_batch_rows"] = 0
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match="queue_batch_rows"):
+    with pytest.raises(ConfigError, match="family_batch_rows"):
         load_config(path)
 
-    raw["rollout"]["queue_batch_rows"] = 8
-    raw["rollout"]["queue_packing"] = "mystery"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match="queue_packing"):
-        load_config(path)
-
-    raw["rollout"]["queue_packing"] = "fixed_family_quantum"
+    raw["rollout"]["family_batch_rows"] = 8
     raw["rollout"]["trajectory_start_index"] = 3
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ConfigError, match="unknown configuration key"):

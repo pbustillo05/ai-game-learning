@@ -70,13 +70,3 @@ def stratum_objective_scale(local_mass: Tensor, global_mass: Tensor) -> Tensor:
     if bool(local_mass < 0) or not bool(global_mass > 0):
         raise ValueError("local mass must be nonnegative and global mass positive")
     return local_mass / global_mass
-
-
-def equal_rank_mean_baseline(rank_numerators: Tensor, rank_masses: Tensor) -> Tensor:
-    """Named diagnostic for the legacy equal-rank objective (never the target law)."""
-
-    if rank_numerators.ndim != 1 or rank_numerators.shape != rank_masses.shape:
-        raise ValueError("rank numerators and masses must be matching vectors")
-    if bool((rank_masses <= 0).any()):
-        raise ValueError("the equal-rank baseline requires positive mass on every rank")
-    return (rank_numerators / rank_masses).mean()

@@ -15,13 +15,13 @@ from typing import Any, Iterable
 import torch
 
 from pbg.core.config import RootConfig, seed_all
-from pbg.core.queued import LOGICAL_RNG_VERSION
+from pbg.core.execution import LOGICAL_RNG_VERSION
 from pbg.core.training import (
     _one_iteration,
     _precision,
     _scaler,
-    build_game_bundle,
 )
+from pbg.runtime import build_game_bundle
 
 
 MODES = ("normal", "rao_blackwell", "branched_rao_blackwell")
@@ -266,9 +266,8 @@ def benchmark_modes(
                     "model_checkpoint": checkpoint_metadata,
                     "repeat_seeds": repeat_seeds,
                     "profile_iteration": profile_iteration,
-                    "queue_batch_rows": local.rollout.queue_batch_rows,
-                    "queue_packing": local.rollout.queue_packing,
-                    "queue_admission_size": local.rollout.queue_admission_size,
+                    "family_batch_rows": local.rollout.family_batch_rows,
+                    "max_active_trajectories": local.rollout.max_active_trajectories,
                     "arena_chunk_nodes": local.rollout.arena_chunk_nodes,
                 },
                 "metrics": _median_metrics(samples),
@@ -311,7 +310,7 @@ def benchmark_modes(
         "schema": "pbg-performance-v1",
         "environment": environment,
         "workload": {
-            "game": cfg.game.name,
+            "game": "nlhe",
             "sequential_starts": cfg.rollout.sequential_starts,
             "node_budget": cfg.rollout.node_budget,
             "completion_samples": cfg.completion.n_samples,
@@ -328,9 +327,8 @@ def benchmark_modes(
                 for repeat in range(repeats)
             ],
             "profile_iteration": warmup,
-            "queue_batch_rows": cfg.rollout.queue_batch_rows,
-            "queue_packing": cfg.rollout.queue_packing,
-            "queue_admission_size": cfg.rollout.queue_admission_size,
+            "family_batch_rows": cfg.rollout.family_batch_rows,
+            "max_active_trajectories": cfg.rollout.max_active_trajectories,
             "arena_chunk_nodes": cfg.rollout.arena_chunk_nodes,
             "warmup": warmup,
             "repeats": repeats,
@@ -380,9 +378,8 @@ def compare_benchmark(
         "model_checkpoint",
         "repeat_seeds",
         "profile_iteration",
-        "queue_batch_rows",
-        "queue_packing",
-        "queue_admission_size",
+        "family_batch_rows",
+        "max_active_trajectories",
         "arena_chunk_nodes",
     )
     if any(current["workload"].get(key) != baseline["workload"].get(key) for key in workload_keys):

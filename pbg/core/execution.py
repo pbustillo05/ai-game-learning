@@ -1,8 +1,8 @@
-"""Generic device-local primitives for queued rollout execution.
+"""Generic device-local primitives for family-scheduled rollout execution.
 
-This module contains no game-specific routing.  In particular, a
-:class:`FamilyPacker` is constructed for exactly one execution family and sees
-public-stage variation only through per-row padded-work estimates.
+This module contains no game-specific routing. Logical work queues, occurrence
+arenas, admission accounting, stable routing, and schedule-independent random
+addresses are shared by all three production training modes.
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ class ByteAccountant:
 
 
 @dataclass(frozen=True)
-class SequentialAdmissionPlan:
+class TrajectoryAdmissionPlan:
     """Byte-complete transaction bound for sequential rollout admission.
 
     ``retained_bytes`` and ``max_inflight_bytes`` are reserved before sampling.
@@ -138,7 +138,7 @@ class SequentialAdmissionPlan:
             active_starts=0, unstarted=total_starts, requested=1
         ) != 1:
             raise MemoryError(
-                "queued SafeAdmit has no capacity for one trajectory start: "
+                "admission plan has no capacity for one trajectory start: "
                 f"retained={self.retained_bytes}, "
                 f"max_inflight={self.max_inflight_bytes}, "
                 f"resident_per_start={self.resident_bytes_per_start}, "
@@ -483,8 +483,8 @@ class ChunkedOccurrenceArena:
         )
 
 
-class DeviceFifoRing:
-    """Bounded FIFO whose storage and live metadata reside on one device."""
+class DeviceWorkQueue:
+    """Bounded insertion-order whose storage and live metadata reside on one device."""
 
     def __init__(self, capacity: int, device: torch.device | str) -> None:
         if isinstance(capacity, bool) or capacity <= 0:
@@ -498,7 +498,7 @@ class DeviceFifoRing:
         # A deterministic mirror avoids reading device scalars at scheduler
         # boundaries while the device tensors remain kernel-visible metadata.
         self._host_count = 0
-        # Logical enqueue-time runs mirror FIFO mutations exactly.  They make
+        # Logical enqueue-time runs mirror insertion-order mutations exactly.  They make
         # queue age observable without reading a device handle or clock scalar.
         self._age_runs: deque[tuple[int, int]] = deque()
         self._last_logical_time = 0
@@ -520,7 +520,7 @@ class DeviceFifoRing:
             return 0
         oldest = self._age_runs[0][1]
         if logical_time < oldest:
-            raise ValueError("logical time cannot precede the oldest queued row")
+            raise ValueError("logical time cannot precede the oldest waiting row")
         return int(logical_time) - oldest
 
     def enqueue(
@@ -534,13 +534,13 @@ class DeviceFifoRing:
 
         handles = handles.to(device=self.device, dtype=torch.int64)
         if handles.ndim != 1:
-            raise ValueError("queued handles must be one-dimensional")
+            raise ValueError("work handles must be one-dimensional")
         if isinstance(logical_time, bool) or logical_time < self._last_logical_time:
             raise ValueError("queue logical times must be nonnegative and monotone")
         added = int(handles.numel())
         if self._host_count + added > self.capacity:
             raise MemoryError(
-                f"FIFO overflow: depth={self._host_count}, added={added}, "
+                f"insertion-order overflow: depth={self._host_count}, added={added}, "
                 f"capacity={self.capacity}"
             )
         if arena is not None:
@@ -561,11 +561,11 @@ class DeviceFifoRing:
                 self._age_runs.append((added, int(logical_time)))
 
     def peek(self, count: int | None = None) -> Tensor:
-        """Return a FIFO-ordered copy without changing queue state."""
+        """Return a insertion-order-ordered copy without changing queue state."""
 
         selected = self._host_count if count is None else int(count)
         if selected < 0 or selected > self._host_count:
-            raise ValueError("peek count is outside the live FIFO depth")
+            raise ValueError("peek count is outside the live insertion-order depth")
         positions = torch.remainder(
             self.head + torch.arange(selected, device=self.device), self.capacity
         )
@@ -577,10 +577,10 @@ class DeviceFifoRing:
         *,
         arena: ChunkedOccurrenceArena | None = None,
     ) -> Tensor:
-        """Pop FIFO handles, optionally transitioning QUEUED -> EVALUATING."""
+        """Pop insertion-order handles, optionally transitioning QUEUED -> EVALUATING."""
 
         if isinstance(count, bool) or count < 0 or count > self._host_count:
-            raise ValueError("dequeue count is outside the live FIFO depth")
+            raise ValueError("dequeue count is outside the live insertion-order depth")
         handles = self.peek(count)
         if arena is not None:
             arena.transition(handles, QUEUED, EVALUATING)
@@ -844,145 +844,6 @@ def logical_categorical_from_valid_probability(
         probability.shape[1] - 1
     )
 
-
-@dataclass(frozen=True)
-class FamilyPackingLimits:
-    """Hard calibrated limits for one execution family."""
-
-    max_rows: int
-    max_padded_tokens: int
-    max_padded_token_pairs: int
-    max_workspace_bytes: int
-
-    def __post_init__(self) -> None:
-        if any(
-            isinstance(value, bool) or value <= 0
-            for value in (
-                self.max_rows,
-                self.max_padded_tokens,
-                self.max_padded_token_pairs,
-                self.max_workspace_bytes,
-            )
-        ):
-            raise ValueError("family packing limits must be positive integers")
-
-
-@dataclass(frozen=True)
-class PackedFamilyBatch:
-    """Stable maximum-fill feasible prefix for one family queue."""
-
-    family: str
-    handles: Tensor
-    padded_width: Tensor
-    workspace_bytes: Tensor
-    fill: Tensor
-
-
-@dataclass(frozen=True)
-class MaskedFamilyBatch:
-    """Fixed-shape feasible-prefix representation for CUDA schedulers."""
-
-    family: str
-    candidate_handles: Tensor
-    selected_mask: Tensor
-    selected_count: Tensor
-    padded_width: Tensor
-    workspace_bytes: Tensor
-    fill: Tensor
-
-
-class FamilyPacker:
-    """Stable packer that never partitions its input by public-stage metadata."""
-
-    def __init__(self, family: str, limits: FamilyPackingLimits) -> None:
-        if not family:
-            raise ValueError("execution family must be nonempty")
-        self.family = family
-        self.limits = limits
-
-    def pack(
-        self,
-        handles: Tensor,
-        padded_width: Tensor,
-        workspace_bytes: Tensor | None = None,
-    ) -> PackedFamilyBatch:
-        """Materialize a maximum feasible prefix on CPU.
-
-        CUDA schedulers must consume :meth:`pack_masked`, whose output shape is
-        independent of the device-computed feasible prefix length.
-        """
-
-        if handles.device.type == "cuda":
-            raise RuntimeError("CUDA family packing requires pack_masked")
-        masked = self.pack_masked(handles, padded_width, workspace_bytes)
-        selected = masked.candidate_handles[masked.selected_mask]
-        return PackedFamilyBatch(
-            family=self.family,
-            handles=selected,
-            padded_width=masked.padded_width,
-            workspace_bytes=masked.workspace_bytes,
-            fill=masked.fill,
-        )
-
-    def pack_masked(
-        self,
-        handles: Tensor,
-        padded_width: Tensor,
-        workspace_bytes: Tensor | None = None,
-    ) -> MaskedFamilyBatch:
-        """Return a fixed-shape feasible-prefix mask without dynamic indexing."""
-
-        if handles.ndim != 1 or padded_width.shape != handles.shape:
-            raise ValueError("handles and padded widths must be matching vectors")
-        if handles.numel() == 0:
-            raise ValueError("cannot pack an empty family queue")
-        if handles.device != padded_width.device:
-            raise ValueError("family pack inputs must share a device")
-        if workspace_bytes is None:
-            workspace_bytes = torch.zeros_like(padded_width, dtype=torch.int64)
-        if workspace_bytes.shape != handles.shape or workspace_bytes.device != handles.device:
-            raise ValueError("workspace bytes must match handles and device")
-        widths = padded_width.to(torch.int64)
-        workspace = workspace_bytes.to(torch.int64)
-        _device_assert(
-            ((widths > 0) & (workspace >= 0)).all(),
-            "family row costs must have positive width and nonnegative workspace",
-        )
-        candidate_count = min(handles.numel(), self.limits.max_rows)
-        handles = handles[:candidate_count]
-        widths = widths[:candidate_count]
-        workspace = workspace[:candidate_count]
-        row_count = torch.arange(1, handles.numel() + 1, device=handles.device)
-        maximum_width = widths.cummax(0).values
-        cumulative_workspace = workspace.cumsum(0)
-        feasible = (
-            (row_count <= self.limits.max_rows)
-            & (row_count * maximum_width <= self.limits.max_padded_tokens)
-            & (
-                row_count * maximum_width * maximum_width
-                <= self.limits.max_padded_token_pairs
-            )
-            & (cumulative_workspace <= self.limits.max_workspace_bytes)
-        )
-        _device_assert(feasible[0], "one family row exceeds its hard packing limits")
-        selected_count = feasible.to(torch.int64).sum()
-        last = (selected_count - 1).clamp_min(0).reshape(1)
-        selected_width = maximum_width.gather(0, last)
-        selected_workspace = cumulative_workspace.gather(0, last)
-        padded_tokens = selected_count.to(torch.float32) * selected_width.to(torch.float32)
-        fill = torch.minimum(
-            torch.tensor(1.0, device=handles.device),
-            padded_tokens / float(self.limits.max_padded_tokens),
-        )
-        return MaskedFamilyBatch(
-            family=self.family,
-            candidate_handles=handles,
-            selected_mask=feasible,
-            selected_count=selected_count,
-            padded_width=selected_width,
-            workspace_bytes=selected_workspace,
-            fill=fill,
-        )
 
 
 def arena_fields(

@@ -1,0 +1,53 @@
+game:
+  n_players: 6
+  stack_bb: 10.0
+  rank_count: 13
+rollout:
+  sequential_starts: 512
+  beta: null
+  node_budget: 128
+  reach_storage: recompute
+  # q bounds one family drain/model launch. Admission controls the resident
+  # trajectory pool separately; keep all configured starts eligible to fill
+  # queues across public depths.
+  family_batch_rows: 64
+  # One declared cost-vector transfer plans several actual-width physical calls.
+  max_active_trajectories: 512
+  arena_chunk_nodes: 256
+  execution_memory_bytes: 4294967296
+completion:
+  n_samples: 64
+  backend: cuda
+model:
+  # Exact architecture of runs/nlhe6_10bb_7h/ckpt_0005750.pt.
+  d_model: 96
+  n_heads: 4
+  n_layers_pre: 2
+  n_layers_post: 2
+  m_raise: 4
+  k_act: 7
+  max_players: 6
+training:
+  mode: rao_blackwell
+  iters: 1
+  gd_steps_per_iter: 1
+  minibatch_size: 32
+  lr: 0.0001
+  adam_betas: [0.9, 0.999]
+  grad_clip: 0.5
+  amp: false
+  seed: 47
+  checkpoint_every: 1
+  out_dir: runs/bench_nlhe6_10bb_checkpoint
+  reproducibility: throughput
+  optimizer: adamw
+loss:
+  name: rb_ppo
+  lam: 1.0
+  clip_eps: 0.2
+  clip_eps_v: 0.2
+  c_v: 0.0005
+  c_h: 0.1
+  c_kl: 0.0
+  entropy_schedule: const
+  value_loss: clipped

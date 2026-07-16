@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import MISSING, dataclass, fields, is_dataclass
-import importlib
 import math
 from pathlib import Path
 from types import UnionType
@@ -20,10 +19,11 @@ class ConfigError(ValueError):
 
 @dataclass
 class GameConfig:
-    """Select NLHE and retain its game-owned configuration mapping."""
+    """Configure the sole active game: equal-stack NLHE cash poker."""
 
-    name: str
-    poker: dict[str, Any] | None = None
+    n_players: int
+    stack_bb: float
+    rank_count: int
 
 
 @dataclass
@@ -41,32 +41,10 @@ class RolloutConfig:
     beta: dict[str, float] | None
     node_budget: int
     reach_storage: str
-    queue_batch_rows: int | None = None
-    queue_admission_size: int | None = None
+    family_batch_rows: int | None = None
+    max_active_trajectories: int | None = None
     arena_chunk_nodes: int | None = None
-    queue_memory_bytes: int | None = None
-    queue_packing: str = "actual_cost_greedy"
-
-    @property
-    def n_trees(self) -> int:
-        """Temporary internal spelling while rollout storage is being renamed.
-
-        YAML configuration deliberately does not accept ``n_trees``.  Keeping
-        the property localizes the mechanical storage migration without
-        preserving the ambiguous public interface.
-        """
-
-        return self.sequential_starts
-
-    @n_trees.setter
-    def n_trees(self, value: int) -> None:
-        self.sequential_starts = value
-
-    @property
-    def beta_fix(self) -> dict[str, float]:
-        """Return the fixed-beta table expected by game-owned backends."""
-
-        return self.beta or {"default": 1.0}
+    execution_memory_bytes: int | None = None
 
 
 @dataclass
@@ -149,19 +127,7 @@ class RootConfig:
     training: TrainingConfig
     hardware: HardwareProfileConfig | None = None
 
-    @property
-    def train(self) -> TrainingConfig:
-        """Compatibility alias for code that predates ``training.mode``."""
-
-        return self.training
-
-
 _ConfigT = TypeVar("_ConfigT")
-
-_GAME_CONFIG_VALIDATORS = {
-    "poker": "pbg.games.poker.bundle:validate_config",
-}
-
 
 def _type_name(annotation: Any) -> str:
     return getattr(annotation, "__name__", str(annotation))
@@ -256,22 +222,12 @@ def _parse_dataclass(cls: type[_ConfigT], value: Any, path: str) -> _ConfigT:
 
 
 def _validate_config(cfg: RootConfig) -> None:
-    """Validate frozen enumerations and the external evaluator boundary."""
+    """Validate game-independent frozen enumerations."""
 
-    if cfg.game.name != "poker":
-        raise ConfigError("root.game.name: expected 'poker'")
-    if cfg.game.poker is None:
-        raise ConfigError("root.game.poker: required")
     if cfg.completion.backend not in {"auto", "cpu", "cuda"}:
         raise ConfigError(
             "root.completion.backend: poker requires 'auto', 'cpu', or 'cuda'"
         )
-    module_name, _, function_name = _GAME_CONFIG_VALIDATORS[cfg.game.name].partition(":")
-    validator = getattr(importlib.import_module(module_name), function_name)
-    try:
-        validator(cfg)
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(str(exc)) from exc
     modes = {"normal", "rao_blackwell", "branched_rao_blackwell"}
     if cfg.training.mode not in modes:
         raise ConfigError(
@@ -304,22 +260,14 @@ def _validate_config(cfg: RootConfig) -> None:
             "root.rollout.reach_storage: expected 'full', 'decisions_only', or 'recompute'"
         )
     for name in (
-        "queue_batch_rows",
-        "queue_admission_size",
+        "family_batch_rows",
+        "max_active_trajectories",
         "arena_chunk_nodes",
-        "queue_memory_bytes",
+        "execution_memory_bytes",
     ):
         value = getattr(cfg.rollout, name)
         if value is not None and (isinstance(value, bool) or value <= 0):
             raise ConfigError(f"root.rollout.{name}: expected a positive integer")
-    if cfg.rollout.queue_packing not in {
-        "fixed_family_quantum",
-        "actual_cost_greedy",
-    }:
-        raise ConfigError(
-            "root.rollout.queue_packing: expected 'fixed_family_quantum' or "
-            "'actual_cost_greedy'"
-        )
     if cfg.loss.entropy_schedule not in {"const", "linear_decay"}:
         raise ConfigError("root.loss.entropy_schedule: expected 'const' or 'linear_decay'")
     if cfg.loss.value_loss not in {"mse", "clipped"}:
@@ -422,10 +370,10 @@ def _hardware_path(profile: str | Path) -> Path:
     return root / "configs" / "hardware" / f"{candidate.name}.yaml"
 
 
-def load_config(
+def parse_config(
     path: str | Path, *, hardware_profile: str | Path | None = None
 ) -> RootConfig:
-    """Load ``path`` as a strict :class:`RootConfig`.
+    """Parse ``path`` as a strict game-independent :class:`RootConfig`.
 
     Unknown keys and absent required fields raise :class:`ConfigError` with a
     dotted path to the offending location.

@@ -439,8 +439,8 @@ class PokerGame:
         self.range_state = self.ranges
         self._combo_cards = torch.triu_indices(52, 52, offset=1).T.to(torch.int16)
 
-    def root_states(self, g: int) -> Tensor:
-        return self.engine.root_states(g)
+    def initial_states(self, g: int) -> Tensor:
+        return self.engine.initial_states(g)
 
     def reset_ranges(self, n_slots: int, device: torch.device | str | None = None) -> RangeState:
         """Allocate the action-likelihood slots owned by this public game."""
@@ -481,7 +481,7 @@ class PokerGame:
         return self.profile_sampler.sample(reach_rows, board, dealt, n, gen)
 
     def sample_mu(self, g: int, gen: torch.Generator) -> Tensor:
-        refs = self.root_states(g)
+        refs = self.initial_states(g)
         reach = torch.zeros((g, self.n_players, N_HANDS), dtype=torch.float32, device=refs.device)
         return self.sample_profiles(refs, reach, 1, gen)[:, 0]
 

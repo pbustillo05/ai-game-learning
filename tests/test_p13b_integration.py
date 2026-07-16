@@ -8,9 +8,10 @@ import pytest
 import torch
 import yaml
 
-from pbg.core.config import load_config
+from pbg.config import load_config
 from pbg.core.game import GameBundle
-from pbg.core.training import GAME_FACTORIES, build_game_bundle, load_checkpoint, train
+from pbg.core.training import load_checkpoint
+from pbg.runtime import build_game_bundle, train
 from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
 from pbg.games.poker.cards import validate_evaluator_combo_cards
 from pbg.games.poker.folded import PokerGPUPartitionAdapter
@@ -31,11 +32,9 @@ DEFERRED = {
 
 def _small_poker_cfg(tmp_path: Path):
     cfg = load_config(ROOT / "configs" / "nlhe6_h100.yaml")
-    cfg.game.poker = {
-        "n_players": 2,
-        "stack_bb": 8.0,
-        "rank_count": 13,
-    }
+    cfg.game.n_players = 2
+    cfg.game.stack_bb = 8.0
+    cfg.game.rank_count = 13
     cfg.rollout.sequential_starts = 2
     cfg.rollout.node_budget = 64
     cfg.training.mode = "rao_blackwell"
@@ -53,11 +52,11 @@ def _small_poker_cfg(tmp_path: Path):
         "max_players": 2,
         "class_embedding_dim": 4,
     }
-    cfg.train.iters = 3
-    cfg.train.gd_steps_per_iter = 1
-    cfg.train.minibatch_size = 2
-    cfg.train.checkpoint_every = 1
-    cfg.train.out_dir = str(tmp_path / "poker_cpu")
+    cfg.training.iters = 3
+    cfg.training.gd_steps_per_iter = 1
+    cfg.training.minibatch_size = 2
+    cfg.training.checkpoint_every = 1
+    cfg.training.out_dir = str(tmp_path / "poker_cpu")
     return cfg
 
 
@@ -81,21 +80,21 @@ def test_all_first_run_presets_load_strictly_without_deferred_settings() -> None
         raw = yaml.safe_load((ROOT / "configs" / name).read_text(encoding="utf-8"))
         assert not (_keys(raw) & DEFERRED)
     nlhe = loaded["nlhe6_h100.yaml"]
-    assert nlhe.game.poker["n_players"] == 6
+    assert nlhe.game.n_players == 6
     assert nlhe.rollout.sequential_starts == 1 and nlhe.rollout.node_budget == 4096
-    assert nlhe.train.minibatch_size == 6
+    assert nlhe.training.minibatch_size == 6
     assert nlhe.completion.backend == "cuda"
-    assert nlhe.train.iters == 10_000 and nlhe.train.checkpoint_every == 100
+    assert nlhe.training.iters == 10_000 and nlhe.training.checkpoint_every == 100
 
 def test_poker_rollout_memory_plan_bounds_recompute_and_full_storage() -> None:
     safe = estimate_rollout_memory(
-        n_trees=8, node_budget=512, n_players=6, reach_storage="recompute"
+        root_count=8, node_budget=512, n_players=6, reach_storage="recompute"
     )
     legacy = estimate_rollout_memory(
-        n_trees=256, node_budget=8192, n_players=6, reach_storage="recompute"
+        root_count=256, node_budget=8192, n_players=6, reach_storage="recompute"
     )
     full = estimate_rollout_memory(
-        n_trees=256, node_budget=8192, n_players=6, reach_storage="full"
+        root_count=256, node_budget=8192, n_players=6, reach_storage="full"
     )
     gib = 1024**3
     assert safe.capacity == 4096
@@ -103,15 +102,15 @@ def test_poker_rollout_memory_plan_bounds_recompute_and_full_storage() -> None:
     assert legacy.frontier_reach_bytes > 100 * gib
     assert full.reach_cache_bytes > 60 * gib
 
-    fifo = estimate_rollout_memory(
-        n_trees=256,
+    execution = estimate_rollout_memory(
+        root_count=256,
         node_budget=8192,
         n_players=6,
         reach_storage="recompute",
         sequential_recompute_live_rows=True,
     )
-    assert fifo.frontier_reach_bytes == 2 * 256 * 6 * 1326 * 4
-    assert fifo.frontier_reach_bytes < legacy.frontier_reach_bytes
+    assert execution.frontier_reach_bytes == 2 * 256 * 6 * 1326 * 4
+    assert execution.frontier_reach_bytes < legacy.frontier_reach_bytes
 
 
 def test_h100_bootstrap_bundle_constructs_without_capacity_sized_history() -> None:
@@ -123,10 +122,9 @@ def test_h100_bootstrap_bundle_constructs_without_capacity_sized_history() -> No
     assert backend.states.history_parent.shape == (4_096,)
 
 
-def test_explicit_registry_builds_one_owning_poker_model(tmp_path: Path) -> None:
+def test_nlhe_builder_constructs_one_owning_poker_model(tmp_path: Path) -> None:
     cfg = _small_poker_cfg(tmp_path)
     bundle = build_game_bundle(cfg, torch.device("cpu"))
-    assert GAME_FACTORIES["poker"] == "pbg.games.poker.bundle:build_bundle"
     assert isinstance(bundle, GameBundle)
     assert isinstance(bundle.model, PokerModelBundle)
     assert isinstance(bundle.rollout_backend, PokerRolloutBackend)
@@ -159,11 +157,11 @@ def test_three_iteration_cpu_sibling_smoke_is_finite_and_checkpoints(tmp_path: P
     train(cfg)
     metrics = [
         json.loads(line)
-        for line in (Path(cfg.train.out_dir) / "metrics.jsonl").read_text().splitlines()
+        for line in (Path(cfg.training.out_dir) / "metrics.jsonl").read_text().splitlines()
     ]
     assert len(metrics) == 3
     assert all(torch.isfinite(torch.tensor(row["loss"])) for row in metrics)
-    checkpoint = Path(cfg.train.out_dir) / "ckpt_0000003.pt"
+    checkpoint = Path(cfg.training.out_dir) / "ckpt_0000003.pt"
     bundle = build_game_bundle(cfg, torch.device("cpu"))
     metadata = load_checkpoint(checkpoint, bundle.model)
     assert metadata["iter"] == 3
@@ -185,12 +183,12 @@ def test_normal_poker_settles_sampled_showdown_without_completion(tmp_path: Path
     cfg.training.mode = "normal"
     cfg.completion.n_samples = None
     cfg.loss.name = "ppo"
-    cfg.train.iters = 1
-    cfg.train.out_dir = str(tmp_path / "poker_normal")
+    cfg.training.iters = 1
+    cfg.training.out_dir = str(tmp_path / "poker_normal")
     bundle = build_game_bundle(cfg, torch.device("cpu"))
     assert bundle.completion_backend is None
     train(cfg)
     record = json.loads(
-        (Path(cfg.train.out_dir) / "metrics.jsonl").read_text().splitlines()[0]
+        (Path(cfg.training.out_dir) / "metrics.jsonl").read_text().splitlines()[0]
     )
     assert torch.isfinite(torch.tensor(record["loss"]))

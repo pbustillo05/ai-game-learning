@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from pbg.core.config import load_config
+from pbg.config import load_config
 from pbg.core.training import _add_distributed_metric_summaries, _sync_scaled_gradients
 
 
@@ -78,7 +78,7 @@ def test_ddp_keeps_tree_and_batch_values_per_rank() -> None:
     two_rank = copy.deepcopy(cfg)
     assert one_rank.rollout.sequential_starts == 1
     assert two_rank.rollout.sequential_starts == one_rank.rollout.sequential_starts
-    assert two_rank.train.minibatch_size == one_rank.train.minibatch_size
+    assert two_rank.training.minibatch_size == one_rank.training.minibatch_size
 
 
 def test_distributed_metric_summaries_allow_rank_local_optional_metrics(

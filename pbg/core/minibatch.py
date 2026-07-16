@@ -64,7 +64,6 @@ def _gather_targets(targets: NodeTargets, rows: Tensor) -> NodeTargets:
         child_mask=targets.child_mask[rows],
         child_count=targets.child_count[rows],
         q_hat=None if targets.q_hat is None else targets.q_hat[rows],
-        aux={name: value[rows] for name, value in targets.aux.items()},
     )
 
 

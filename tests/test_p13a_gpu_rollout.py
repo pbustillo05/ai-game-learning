@@ -12,11 +12,10 @@ import pytest
 import torch
 from torch import Tensor
 
-from pbg.core.config import load_config
+from pbg.config import load_config
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
 from pbg.core.game import GameBundle
 from pbg.core.normal import build_normal_dataset_from_sampled
-from pbg.core.queued import FamilyPacker, FamilyPackingLimits
 from pbg.core.rollout import sample_trees, sample_trees_sequential
 from pbg.core.tree import DecisionReachCache
 from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
@@ -248,7 +247,7 @@ def test_random_legal_trajectories_match_cpu_engine_step_for_step(
         rng = random.Random(seed)
         cpu = NLHEEngine(cfg)
         backend = _backend(cfg)
-        cpu_ref = int(cpu.root_states(1)[0])
+        cpu_ref = int(cpu.initial_states(1)[0])
         ref = backend.sequential_start_states(1)
         for _ in range(100):
             cpu_owner = int(cpu.owner_of(torch.tensor([cpu_ref], dtype=torch.int32))[0])
@@ -549,7 +548,7 @@ def test_core_sampler_accumulates_many_trees_before_model_forward() -> None:
     backend = _backend(cfg, capacity=2048, profile_sampler=profiles)
     model = _RecordingModel()
     rollout = SimpleNamespace(
-        n_trees=16, node_budget=64, beta_mode="sequential", reach_storage="full"
+        sequential_starts=16, node_budget=64, reach_storage="full"
     )
     tree, reach, policy = sample_trees_sequential(
         GameBundle(model, backend, PokerPolicyAdapter(cfg.n_ticks), None),
@@ -564,7 +563,7 @@ def test_core_sampler_accumulates_many_trees_before_model_forward() -> None:
     assert profiles.devices == [backend.device]
 
 
-def test_poker_family_fifo_sequential_rollout_closes_chance_segments() -> None:
+def test_poker_family_scheduled_sequential_rollout_closes_chance_segments() -> None:
     """The opt-in queue runs poker paths across depths without pending chance rows."""
 
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
@@ -572,12 +571,11 @@ def test_poker_family_fifo_sequential_rollout_closes_chance_segments() -> None:
     backend = _backend(cfg, capacity=1024, profile_sampler=profiles)
     model = _AlwaysCheckModel()
     rollout = SimpleNamespace(
-        n_trees=8,
+        sequential_starts=8,
         node_budget=64,
-        beta_mode="sequential",
-        reach_storage="full",
-        queue_batch_rows=4,
-        queue_admission_size=8,
+                reach_storage="full",
+        family_batch_rows=4,
+        max_active_trajectories=8,
         arena_chunk_nodes=32,
         logical_seed=123,
     )
@@ -595,30 +593,6 @@ def test_poker_family_fifo_sequential_rollout_closes_chance_segments() -> None:
     assert all(batch > 1 for _, batch, _ in model.calls)
     assert profiles.devices == [backend.device]
 
-
-def test_poker_static_cuda_family_capacity_is_conservative_and_positive() -> None:
-    cfg = PokerConfig(n_players=2, stack_bb=8.0)
-    backend = _backend(cfg, capacity=128)
-    model = _AlwaysCheckModel()
-    generous = FamilyPackingLimits(
-        max_rows=5,
-        max_padded_tokens=1 << 40,
-        max_padded_token_pairs=1 << 60,
-        max_workspace_bytes=1 << 20,
-    )
-    assert backend.queued_static_pack_capacity(
-        model, "pre", "inference", generous
-    ) == 5
-    assert backend.queued_static_pack_capacity(
-        model, "post_2", "inference", generous
-    ) == 5
-    with pytest.raises(MemoryError, match="worst-case post_2"):
-        backend.queued_static_pack_capacity(
-            model,
-            "post_2",
-            "inference",
-            FamilyPackingLimits(5, 1, 1, 1 << 20),
-        )
 
 
 def test_poker_actual_cost_family_block_sorts_and_splits_without_changing_order() -> None:
@@ -709,55 +683,8 @@ def test_poker_actual_cost_keeps_physical_pack_indices_on_device() -> None:
     assert snapshot["execution_h2d_bytes"] == 0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-def test_poker_queued_cuda_consumes_masked_static_family_quanta(monkeypatch) -> None:
-    """Poker queue packing stays fixed-shape without reading device counts."""
 
-    device = torch.device("cuda", torch.cuda.current_device())
-    cfg = PokerConfig(n_players=2, stack_bb=8.0)
-    profiles = _Profiles()
-    backend = _backend(cfg, capacity=512, device=device, profile_sampler=profiles)
-    backend.execution_profile = SimpleNamespace(
-        name="test_cuda_static_pack",
-        inference_max_tokens=1 << 30,
-        inference_max_token_pairs=1 << 50,
-        training_max_tokens=1 << 30,
-        training_max_token_pairs=1 << 50,
-    )
-    model = _AlwaysCheckModel()
-    observed: list[torch.Tensor] = []
-    original = FamilyPacker.pack_masked
-
-    def tracked(self, handles, padded_width, workspace_bytes=None):
-        result = original(self, handles, padded_width, workspace_bytes)
-        observed.append(result.selected_mask)
-        return result
-
-    monkeypatch.setattr(FamilyPacker, "pack_masked", tracked)
-    rollout = SimpleNamespace(
-        n_trees=4,
-        node_budget=64,
-        beta_mode="sequential",
-        reach_storage="recompute",
-        queue_batch_rows=2,
-        queue_admission_size=4,
-        arena_chunk_nodes=16,
-        logical_seed=827,
-    )
-    tree, _, _ = sample_trees_sequential(
-        GameBundle(model, backend, PokerPolicyAdapter(cfg.n_ticks), None),
-        rollout,
-        torch.Generator(device=device).manual_seed(1),
-        iteration=7,
-    )
-    torch.cuda.synchronize(device)
-
-    tree.validate()
-    assert observed and all(mask.device == device for mask in observed)
-    assert all(bool(mask.all()) for mask in observed)
-
-
-def _queued_public_paths(tree) -> tuple[tuple[int, ...], ...]:
+def _execution_public_paths(tree) -> tuple[tuple[int, ...], ...]:
     paths: list[tuple[int, ...]] = []
     roots = (tree.parent == -1).nonzero(as_tuple=False).squeeze(1)
     for root in roots.cpu().tolist():
@@ -775,7 +702,7 @@ def _queued_public_paths(tree) -> tuple[tuple[int, ...], ...]:
     return tuple(paths)
 
 
-def _real_queued_poker_sample(
+def _real_execution_poker_sample(
     device: torch.device, *, batch_rows: int, admission: int
 ):
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
@@ -790,12 +717,11 @@ def _real_queued_poker_sample(
     )
     model = _AlwaysCheckModel()
     rollout = SimpleNamespace(
-        n_trees=4,
+        sequential_starts=4,
         node_budget=64,
-        beta_mode="sequential",
-        reach_storage="recompute",
-        queue_batch_rows=batch_rows,
-        queue_admission_size=admission,
+                reach_storage="recompute",
+        family_batch_rows=batch_rows,
+        max_active_trajectories=admission,
         arena_chunk_nodes=16,
         logical_seed=741,
     )
@@ -810,7 +736,7 @@ def _real_queued_poker_sample(
     return cfg, backend, model, sampled
 
 
-def _assert_real_queued_poker_sample(cfg, backend, model, sampled) -> None:
+def _assert_real_execution_poker_sample(cfg, backend, model, sampled) -> None:
     facade = pytest.importorskip("poker_gpu_evaluator.pbg")
     tree, reach, policy, profiles = sampled
     tree.validate()
@@ -838,18 +764,18 @@ def _assert_real_queued_poker_sample(cfg, backend, model, sampled) -> None:
     assert metrics["execution_evaluator_calls"] >= 1
 
 
-def test_real_sibling_queued_poker_cpu_is_logically_addressed_and_collision_free() -> None:
+def test_real_sibling_execution_poker_cpu_is_logically_addressed_and_collision_free() -> None:
     pytest.importorskip("poker_gpu_evaluator.pbg")
-    left = _real_queued_poker_sample(torch.device("cpu"), batch_rows=1, admission=1)
-    right = _real_queued_poker_sample(torch.device("cpu"), batch_rows=4, admission=4)
-    _assert_real_queued_poker_sample(*left)
-    _assert_real_queued_poker_sample(*right)
+    left = _real_execution_poker_sample(torch.device("cpu"), batch_rows=1, admission=1)
+    right = _real_execution_poker_sample(torch.device("cpu"), batch_rows=4, admission=4)
+    _assert_real_execution_poker_sample(*left)
+    _assert_real_execution_poker_sample(*right)
     assert torch.equal(left[3][3], right[3][3])
-    assert _queued_public_paths(left[3][0]) == _queued_public_paths(right[3][0])
+    assert _execution_public_paths(left[3][0]) == _execution_public_paths(right[3][0])
 
     normal_cfg = SimpleNamespace(
         rollout=SimpleNamespace(
-            n_trees=4,
+            sequential_starts=4,
             logical_seed=741,
         ),
         loss=SimpleNamespace(lam=0.95),
@@ -895,34 +821,39 @@ def test_real_sibling_queued_poker_cpu_is_logically_addressed_and_collision_free
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-def test_real_sibling_queued_poker_tiny_cuda() -> None:
-    sampled = _real_queued_poker_sample(
+def test_real_sibling_execution_poker_tiny_cuda() -> None:
+    sampled = _real_execution_poker_sample(
         torch.device("cuda", torch.cuda.current_device()), batch_rows=2, admission=2
     )
-    _assert_real_queued_poker_sample(*sampled)
+    _assert_real_execution_poker_sample(*sampled)
     torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize(
-    ("beta_mode", "beta_fix"),
-    (("sequential", {"default": 1.0}), ("fixed", {"default": 1.0, "preflop": 2.0})),
+    ("mode", "beta_table"),
+    (
+        ("rao_blackwell", {"default": 1.0}),
+        ("branched_rao_blackwell", {"default": 1.0, "preflop": 2.0}),
+    ),
 )
 def test_poker_recompute_replays_postflop_reach_exactly(
-    beta_mode: str, beta_fix: dict[str, float]
+    mode: str, beta_table: dict[str, float]
 ) -> None:
     """Full and replayed poker reaches agree through flop, turn, and river."""
 
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
     model = _AlwaysCheckModel()
     common = dict(
-        n_trees=1 if beta_mode == "fixed" else 2,
-        node_budget=128 if beta_mode == "fixed" else 64,
-        beta_mode=beta_mode,
-        beta_fix=beta_fix,
+        sequential_starts=1 if mode == "branched_rao_blackwell" else 2,
+        node_budget=128 if mode == "branched_rao_blackwell" else 64,
     )
-    full_backend = _backend(cfg, capacity=256, beta_fix=beta_fix)
-    replay_backend = _backend(cfg, capacity=256, beta_fix=beta_fix)
-    sampler = sample_branched_tree if beta_mode == "fixed" else sample_trees_sequential
+    full_backend = _backend(cfg, capacity=256, beta_table=beta_table)
+    replay_backend = _backend(cfg, capacity=256, beta_table=beta_table)
+    sampler = (
+        sample_branched_tree
+        if mode == "branched_rao_blackwell"
+        else sample_trees_sequential
+    )
     full_tree, full_reach, full_policy = sampler(
         GameBundle(model, full_backend, PokerPolicyAdapter(cfg.n_ticks), None),
         SimpleNamespace(**common, reach_storage="full"),
@@ -946,7 +877,7 @@ def test_poker_recompute_replays_postflop_reach_exactly(
     assert bool(((events >= 100_000) & (events < 200_000)).any())
     assert bool(((events >= 200_000) & (events < 300_000)).any())
     assert bool(((events >= 300_000) & (events < 400_000)).any())
-    if beta_mode == "fixed":
+    if mode == "branched_rao_blackwell":
         has_duplicate_label = False
         for parent in range(replay_tree.parent.numel()):
             start, stop = int(replay_tree.child_ptr[parent]), int(replay_tree.child_ptr[parent + 1])
@@ -958,7 +889,7 @@ def test_poker_recompute_replays_postflop_reach_exactly(
 def test_poker_recompute_replays_fold_reach_exactly() -> None:
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
     rollout = SimpleNamespace(
-        n_trees=2, node_budget=8, beta_mode="sequential", reach_storage="full"
+        sequential_starts=2, node_budget=8, reach_storage="full"
     )
     full_backend = _backend(cfg, capacity=32)
     replay_backend = _backend(cfg, capacity=32)
@@ -1059,7 +990,7 @@ def test_real_tensor_poker_keyed_completion_mixes_showdown_and_fold_rows() -> No
 def test_beta_buckets_use_exact_override_or_default() -> None:
     backend = _backend(
         PokerConfig(n_players=2),
-        beta_fix={"default": 1.25, "preflop": 2.0, "chance_to_flop": 3.0},
+        beta_table={"default": 1.25, "preflop": 2.0, "chance_to_flop": 3.0},
     )
     roots = backend.sequential_start_states(2)
     assert torch.equal(backend.beta_fn(roots), torch.full((2,), 2.0))
