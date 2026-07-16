@@ -38,6 +38,7 @@ from pbg.core.training import (
     _sequential_start_quotas,
     _sync_scaled_gradients,
 )
+from pbg.core.optimization import finite_gated_optimizer_step
 
 
 def test_global_mass_objective_uses_exact_unequal_rank_mass() -> None:
@@ -144,6 +145,83 @@ def test_flat_gradient_sum_zero_fills_absent_parameters_and_reuses_buffer() -> N
     parameters[1].grad = None
     assert not _sync_scaled_gradients(model, 1)
     assert first is next(iter(model._pbg_flat_gradient_buffers.values()))
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16, torch.float16))
+def test_nonfinite_common_decision_skips_disabled_scaler_optimizer_step(dtype) -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=dtype))
+    optimizer = torch.optim.SGD([parameter], lr=0.25)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+    parameter.grad = torch.full_like(parameter, float("inf"))
+    model = torch.nn.ParameterList([parameter])
+    common_finite = _sync_scaled_gradients(model, 1)
+
+    result = finite_gated_optimizer_step(
+        model,
+        optimizer,
+        scaler,
+        gradients_finite=common_finite,
+        grad_clip=1.0,
+    )
+
+    assert not result.optimizer_step_applied
+    assert result.loss_scale_before == result.loss_scale_after == 1.0
+    assert result.grad_clip_scale == 0.0
+    assert torch.equal(parameter.detach(), torch.tensor([1.0], dtype=dtype))
+    assert parameter.grad is None
+
+
+class _RecordingEnabledScaler:
+    def __init__(self) -> None:
+        self.scale_value = 1024.0
+        self.unscale_calls = 0
+        self.step_calls = 0
+        self.explicit_updates: list[float | None] = []
+
+    def is_enabled(self) -> bool:
+        return True
+
+    def get_scale(self) -> float:
+        return self.scale_value
+
+    def get_backoff_factor(self) -> float:
+        return 0.5
+
+    def unscale_(self, optimizer) -> None:
+        del optimizer
+        self.unscale_calls += 1
+
+    def step(self, optimizer) -> None:
+        self.step_calls += 1
+        optimizer.step()
+
+    def update(self, new_scale=None) -> None:
+        self.explicit_updates.append(new_scale)
+        if new_scale is not None:
+            self.scale_value = float(new_scale)
+
+
+def test_nonfinite_common_decision_controls_fp16_scaler_transition() -> None:
+    model = torch.nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.25)
+    scaler = _RecordingEnabledScaler()
+    before = model.weight.detach().clone()
+    model.weight.grad = torch.full_like(model.weight, float("inf"))
+
+    result = finite_gated_optimizer_step(
+        model,
+        optimizer,
+        scaler,
+        gradients_finite=False,
+        grad_clip=1.0,
+    )
+
+    assert not result.optimizer_step_applied
+    assert scaler.unscale_calls == scaler.step_calls == 0
+    assert scaler.explicit_updates == [512.0]
+    assert result.loss_scale_before == 1024.0
+    assert result.loss_scale_after == 512.0
+    assert torch.equal(model.weight, before)
 
 
 def test_global_sequential_starts_partition_into_contiguous_rank_quotas() -> None:

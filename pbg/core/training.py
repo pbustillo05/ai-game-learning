@@ -35,6 +35,10 @@ from pbg.core.normal import (
     index_normal_minibatch,
     sample_normal_minibatch,
 )
+from pbg.core.optimization import (
+    finite_gated_optimizer_step as _finite_gated_optimizer_step,
+    sync_scaled_gradients as _sync_scaled_gradients,
+)
 from pbg.core.rollout import (
     sample_trees,
     sample_trees_sequential,
@@ -366,56 +370,6 @@ def _rank_local_config(cfg: RootConfig, rank: int, world: int) -> RootConfig:
     # These attributes are execution metadata, not accepted YAML keys.
     local.rollout.trajectory_rank_counts = quotas
     return local
-
-
-def _sync_scaled_gradients(
-    model: nn.Module, world: int, *, metrics: Any | None = None
-) -> bool:
-    """SUM one reusable flat fp32 buffer and return the common finite decision."""
-
-    source = model.module if hasattr(model, "module") else model
-    parameters = [parameter for parameter in source.parameters() if parameter.requires_grad]
-    total = sum(parameter.numel() for parameter in parameters)
-    if total == 0:
-        return True
-    cache = getattr(source, "_pbg_flat_gradient_buffers", None)
-    if cache is None:
-        cache = {}
-        source._pbg_flat_gradient_buffers = cache
-    key = (str(parameters[0].device), total)
-    flat = cache.get(key)
-    if flat is None or flat.device != parameters[0].device:
-        flat = torch.empty(total, dtype=torch.float32, device=parameters[0].device)
-        cache[key] = flat
-    offset = 0
-    for parameter in parameters:
-        count = parameter.numel()
-        if parameter.grad is None:
-            flat[offset : offset + count].zero_()
-        else:
-            flat[offset : offset + count].copy_(
-                parameter.grad.detach().reshape(-1).to(torch.float32)
-            )
-        offset += count
-    if world > 1:
-        started = time.perf_counter()
-        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-        if metrics is not None:
-            metrics.record_collective(
-                nbytes=flat.numel() * flat.element_size(),
-                seconds=time.perf_counter() - started,
-            )
-    finite = bool(torch.isfinite(flat).all())
-    offset = 0
-    for parameter in parameters:
-        count = parameter.numel()
-        if parameter.grad is None:
-            parameter.grad = torch.zeros_like(parameter)
-        parameter.grad.copy_(
-            flat[offset : offset + count].view_as(parameter).to(parameter.grad.dtype)
-        )
-        offset += count
-    return finite
 
 
 def _alias_table(
@@ -1566,18 +1520,15 @@ def _one_iteration(
             int(os.environ.get("WORLD_SIZE", "1")),
             metrics=execution_metrics,
         )
-        scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), cfg.training.grad_clip
+        step_result = _finite_gated_optimizer_step(
+            model,
+            optimizer,
+            scaler,
+            gradients_finite=gradients_finite,
+            grad_clip=cfg.training.grad_clip,
         )
-        scaler.step(optimizer)
-        scaler.update()
         step_metrics = finalize_metric_stats(metric_parts)
-        step_metrics["grad_norm_pre_clip"] = float(grad_norm)
-        step_metrics["grad_clip_scale"] = min(
-            1.0, float(cfg.training.grad_clip) / max(float(grad_norm), 1.0e-12)
-        )
-        step_metrics["reduced_gradients_finite"] = float(gradients_finite)
+        step_metrics.update(step_result.metrics())
         optimization_records.append((epoch, effective_total, step_metrics))
 
     if profile:
@@ -1629,7 +1580,10 @@ def _one_iteration(
         {
             "trajectories": float(total_trajectories),
             "decisions": float(decision_total),
-            "optimizer_steps": float(len(optimization_records)),
+            "optimizer_steps": sum(
+                values["optimizer_step_applied"]
+                for _, _, values in optimization_records
+            ),
             "optimized_decision_rows": float(
                 sum(rows for _, rows, _ in optimization_records)
             ),

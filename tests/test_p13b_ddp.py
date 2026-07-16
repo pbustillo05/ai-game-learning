@@ -10,7 +10,12 @@ import torch
 import torch.distributed as dist
 
 from pbg.config import load_config
-from pbg.core.training import _add_distributed_metric_summaries, _sync_scaled_gradients
+from pbg.core.optimization import finite_gated_optimizer_step
+from pbg.core.training import (
+    _add_distributed_metric_summaries,
+    _scaler,
+    _sync_scaled_gradients,
+)
 
 
 def _asymmetric_metric_worker(
@@ -64,6 +69,45 @@ def _unequal_mass_gradient_worker(
                 {
                     "weight": float(model.weight.grad.squeeze()),
                     "bias": float(model.bias.grad.squeeze()),
+                }
+            ),
+            encoding="utf-8",
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _unequal_nonfinite_gradient_worker(
+    rank: int, world: int, rendezvous: str, output_dir: str
+) -> None:
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world
+    )
+    try:
+        model = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(3.0)
+        model.weight.grad = torch.tensor(
+            [[1.0 if rank == 0 else float("inf")]]
+        )
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.5)
+        scaler = _scaler(False)
+        common_finite = _sync_scaled_gradients(model, world)
+        result = finite_gated_optimizer_step(
+            model,
+            optimizer,
+            scaler,
+            gradients_finite=common_finite,
+            grad_clip=1.0,
+        )
+        Path(output_dir, f"nonfinite_{rank}.json").write_text(
+            json.dumps(
+                {
+                    "common_finite": common_finite,
+                    "step_applied": result.optimizer_step_applied,
+                    "weight": float(model.weight),
+                    "scale": float(scaler.get_scale()),
                 }
             ),
             encoding="utf-8",
@@ -132,3 +176,19 @@ def test_unequal_rank_flat_sum_matches_concatenated_rollout_oracle(tmp_path) -> 
         reduced = json.loads((tmp_path / f"gradient_{rank}.json").read_text())
         assert reduced["weight"] == pytest.approx(float(oracle.weight.grad.squeeze()), abs=0)
         assert reduced["bias"] == pytest.approx(float(oracle.bias.grad.squeeze()), abs=0)
+
+
+def test_unequal_rank_nonfinite_decision_skips_every_optimizer(tmp_path) -> None:
+    world = 2
+    torch.multiprocessing.spawn(
+        _unequal_nonfinite_gradient_worker,
+        args=(world, str(tmp_path / "nonfinite_rendezvous"), str(tmp_path)),
+        nprocs=world,
+        join=True,
+    )
+    for rank in range(world):
+        record = json.loads((tmp_path / f"nonfinite_{rank}.json").read_text())
+        assert not record["common_finite"]
+        assert not record["step_applied"]
+        assert record["weight"] == 3.0
+        assert record["scale"] == 1.0
