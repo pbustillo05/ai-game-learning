@@ -49,7 +49,10 @@ def test_kuhn_smoke_and_checkpoint_restores_rng(tmp_path) -> None:
     assert np.array_equal(np_gen.random(5), expected_numpy)
 
 
-def test_strict_training_resume_is_bitwise_continuation(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("c_kl", [0.0, 0.2])
+def test_strict_training_resume_is_bitwise_continuation(
+    tmp_path, monkeypatch, c_kl: float
+) -> None:
     def small_cfg(out_dir):
         cfg = load_config("configs/kuhn_smoke.yaml")
         cfg.rollout.n_trees = 8
@@ -59,6 +62,8 @@ def test_strict_training_resume_is_bitwise_continuation(tmp_path, monkeypatch) -
         cfg.train.checkpoint_every = 1
         cfg.train.out_dir = str(out_dir)
         cfg.train.reproducibility = "strict"
+        cfg.loss.c_kl = c_kl
+        cfg.train.kl_ref_interval = 2
         return cfg
 
     uninterrupted = small_cfg(tmp_path / "uninterrupted")

@@ -483,9 +483,16 @@ class SyntheticPolicyAdapter:
         terms = policy * log_policy
         return -terms.sum(dim=-1)  # [B, X]
 
-    def kl(self, out_new: PolicyOutput, out_ref: PolicyOutput) -> Tensor:
+    def kl(
+        self,
+        out_new: PolicyOutput,
+        out_ref: PolicyOutput,
+        legal_event_ids: Tensor | None = None,
+        legal_event_mask: Tensor | None = None,
+    ) -> Tensor:
         """Return ``KL(new || ref)`` for every node/type as ``[B, X]``."""
 
+        del legal_event_ids, legal_event_mask
         if out_new.raw.shape != out_ref.raw.shape:
             raise ValueError("new and reference logits must have identical shapes")
         log_new = torch.log_softmax(out_new.raw, dim=-1)  # [B, X, E]

@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, GameBundle
+from pbg.core.config import load_config, seed_all
+from pbg.core.training import build_game_bundle, _build_iteration_data, _loss_spec
 from pbg.core.rollout import _sample_trees_sequential, sample_trees
 from pbg.core.tree import DeviceTreeBuffer
 from pbg.games.synthetic.family import SyntheticPBG, SyntheticRolloutBackend
@@ -128,3 +130,21 @@ def test_production_hot_functions_contain_no_explicit_host_transfers() -> None:
             if isinstance(node, ast.Attribute) and node.attr in banned
         }
         assert not used
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_synthetic_training_boundary_honors_cuda_device() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    cfg = load_config("configs/kuhn_smoke.yaml")
+    cfg.rollout.n_trees = 2
+    cfg.completion.n_samples = 1
+    cfg.model["hidden_dim"] = 8
+    bundle = build_game_bundle(cfg, device)
+    generator, _ = seed_all(cfg.training.seed, 0, device)
+    data = _build_iteration_data(cfg, bundle, generator, _loss_spec(cfg))
+    assert bundle.rollout_backend.device.type == "cuda"
+    assert next(bundle.model.parameters()).device.type == "cuda"
+    assert data.targets.node_ids.device.type == "cuda"
+    assert data.decision_reach.state_refs.device.type == "cuda"
+    assert isinstance(data.decision_reach.payload, torch.Tensor)
+    assert data.decision_reach.payload.device.type == "cuda"

@@ -11,6 +11,7 @@ from torch import Tensor
 from pbg.core.completion import BatchedCompletionStats
 from pbg.core.config import RootConfig
 from pbg.core.game import GameBundle
+from pbg.core.queued import child_path_keys
 from pbg.games.synthetic.family import (
     SyntheticDialConfig,
     SyntheticPBG,
@@ -42,11 +43,60 @@ class SyntheticMCCompletion:
     ) -> BatchedCompletionStats:
         """Complete leaves into fp32 tensors ``[L,P,X]`` and ``[L,P]``."""
 
+        return self._complete_impl(
+            game, tree, node_ids, reach, n_samples, gen=gen, keys=None
+        )
+
+    def complete_keyed(
+        self,
+        game: Any,
+        tree: Any,
+        node_ids: Tensor,
+        reach: Tensor,
+        n_samples: int,
+        keys: Tensor,
+    ) -> BatchedCompletionStats:
+        """Complete leaves from one caller-owned logical stream per row."""
+
+        return self._complete_impl(
+            game, tree, node_ids, reach, n_samples, gen=None, keys=keys
+        )
+
+    def _complete_impl(
+        self,
+        game: Any,
+        tree: Any,
+        node_ids: Tensor,
+        reach: Tensor,
+        n_samples: int,
+        *,
+        gen: torch.Generator | None,
+        keys: Tensor | None,
+    ) -> BatchedCompletionStats:
+        """Shared mutable/keyed synthetic MC completion implementation."""
+
         del game
         if n_samples <= 0:
             raise ValueError("completion.n_samples must be positive")
         refs = tree.state_ref[node_ids.to(tree.state_ref.device).long()]
-        profiles = self.family.sample_profiles(refs, reach, n_samples, gen)  # [L,S,P]
+        if keys is None:
+            if gen is None:
+                raise RuntimeError("mutable synthetic completion requires a generator")
+            profiles = self.family.sample_profiles(
+                refs, reach, n_samples, gen
+            )  # [L,S,P]
+        else:
+            if keys.shape != node_ids.shape or keys.dtype != torch.int64:
+                raise ValueError("completion keys must be int64 [L]")
+            if keys.device != refs.device:
+                raise ValueError("completion keys and leaves must share a device")
+            ordinals = torch.arange(
+                1, n_samples + 1, dtype=torch.int64, device=refs.device
+            )
+            sample_keys = child_path_keys(keys[:, None], ordinals[None, :])
+            profiles = self.family.sample_profiles_keyed(
+                refs, reach, sample_keys
+            )  # [L,S,P]
         leaves = int(node_ids.numel())
         players, x_max = self.family.n_players, max(self.family.x_sizes)
         p_hat = torch.zeros((leaves, players, x_max), dtype=torch.float32, device=refs.device)
@@ -156,8 +206,9 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         "n_heads": model_cfg.n_heads,
         "n_layers": model_cfg.n_layers,
     }
-    # The synthetic state table is the deliberately retained CPU oracle.
-    backend_device = torch.device("cpu")
+    # State-table lookup is a Python control plane; all boundary tensors and
+    # neural computation live on the requested device.
+    backend_device = torch.device(device)
     if model_cfg.architecture == "mha":
         incidence = torch.zeros(
             (family.n_types, family.cfg.deck_size), dtype=torch.bool
@@ -175,7 +226,6 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         model = SyntheticNet(
             max(family.x_sizes), family.n_player_events, model_values
         ).to(backend_device)
-    del device
     return GameBundle(
         model=model,
         rollout_backend=SyntheticRolloutBackend(family, cfg.rollout.beta_fix, backend_device),

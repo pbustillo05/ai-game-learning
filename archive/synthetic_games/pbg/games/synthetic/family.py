@@ -12,6 +12,10 @@ import torch
 from torch import Tensor
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
+from pbg.core.observability import ExecutionMetrics
+from pbg.core.queued import (
+    logical_categorical_from_valid_probability,
+)
 
 FOLD = 0
 CHECK_CALL = 1
@@ -618,17 +622,32 @@ class SyntheticPBG:
                         for player, xtype in enumerate(profile):
                             log_weight = log_weight + rows[batch, player, xtype]
                         log_weights.append(log_weight)
-                weights = self._normalized_weights(torch.stack(log_weights).to(torch.float64)).cpu()
+                weights = self._normalized_weights(
+                    torch.stack(log_weights).to(torch.float64)
+                )
                 if isinstance(gen, torch.Generator):
                     indices = torch.multinomial(weights, n, replacement=True, generator=gen)
-                    chosen = [profiles[int(index)] for index in indices]
+                    profile_table = torch.tensor(
+                        profiles, dtype=torch.int32, device=device
+                    )
+                    output[batch] = profile_table[indices.to(device)]
                 else:
-                    indices = gen.choice(len(profiles), size=n, replace=True, p=weights.numpy())
+                    indices = gen.choice(
+                        len(profiles),
+                        size=n,
+                        replace=True,
+                        p=weights.detach().cpu().numpy(),
+                    )
                     chosen = [profiles[int(index)] for index in indices]
-                output[batch] = torch.tensor(chosen, dtype=torch.int32, device=device)
+                    output[batch] = torch.tensor(
+                        chosen, dtype=torch.int32, device=device
+                    )
                 continue
 
-            player_probs = [self._normalized_weights(rows[batch, p]).cpu() for p in range(self.n_players)]
+            player_probs = [
+                self._normalized_weights(rows[batch, p])
+                for p in range(self.n_players)
+            ]
             accepted: list[tuple[int, ...]] = []
             attempts = 0
             max_attempts = max(10_000, 10_000 * n)
@@ -641,13 +660,75 @@ class SyntheticPBG:
                     )
                 else:
                     profile = tuple(
-                        int(gen.choice(self.n_types, p=prob.numpy())) for prob in player_probs
+                        int(
+                            gen.choice(
+                                self.n_types, p=prob.detach().cpu().numpy()
+                            )
+                        )
+                        for prob in player_probs
                     )
                 if self._profile_feasible(profile, board):
                     accepted.append(profile)
             if len(accepted) != n:
                 raise RuntimeError("posterior rejection sampler exhausted its attempt budget")
             output[batch] = torch.tensor(accepted, dtype=torch.int32, device=device)
+        return output
+
+    def sample_profiles_keyed(
+        self,
+        state_refs: Tensor,
+        reach_rows: Tensor,
+        keys: Tensor,
+    ) -> Tensor:
+        """Draw profiles from schedule-independent keys ``[B,S]``.
+
+        The keyed path enumerates the exact finite joint support, matching the
+        logical-address rollout sampler.  Large synthetic supports retain the
+        existing explicit feasibility guard instead of silently falling back
+        to queue-order mutable RNG.
+        """
+
+        if keys.ndim != 2 or keys.dtype != torch.int64:
+            raise ValueError("synthetic profile keys must be int64 [B,S]")
+        squeeze = reach_rows.ndim == 2
+        rows = reach_rows.unsqueeze(0) if squeeze else reach_rows
+        refs, device = self._refs(state_refs)
+        if keys.shape[0] != len(refs) or keys.device != device:
+            raise ValueError("synthetic profile keys must match rows and device")
+        if rows.shape != (len(refs), self.n_players, self.n_types):
+            raise ValueError("reach_rows must have shape [B,P,X]")
+        if math.prod(self.x_sizes) > 2_000_000:
+            raise RuntimeError(
+                "keyed synthetic profile enumeration exceeds the exact feasibility guard"
+            )
+        samples = int(keys.shape[1])
+        output = torch.empty(
+            (len(refs), samples, self.n_players),
+            dtype=torch.int32,
+            device=device,
+        )
+        for batch, ref in enumerate(refs):
+            board = {card for card in self.states.board[ref] if card >= 0}
+            profiles: list[tuple[int, ...]] = []
+            log_weights: list[Tensor] = []
+            for profile in itertools.product(
+                range(self.n_types), repeat=self.n_players
+            ):
+                if not self._profile_feasible(profile, board):
+                    continue
+                profiles.append(profile)
+                weight = torch.zeros((), dtype=rows.dtype, device=rows.device)
+                for player, xtype in enumerate(profile):
+                    weight = weight + rows[batch, player, xtype]
+                log_weights.append(weight)
+            weights = self._normalized_weights(
+                torch.stack(log_weights).to(torch.float64)
+            )
+            chosen = logical_categorical_from_valid_probability(
+                weights[None].expand(samples, -1), keys[batch]
+            )
+            table = torch.tensor(profiles, dtype=torch.int32, device=device)
+            output[batch] = table[chosen]
         return output
 
     def encode_public(self, state_refs: Tensor) -> Tensor:
@@ -660,7 +741,12 @@ class SyntheticPBG:
 
 
 class SyntheticRolloutBackend:
-    """CPU mathematical-oracle implementation of the batched rollout boundary."""
+    """Device-resident tensor boundary backed by a Python state oracle.
+
+    Opaque state lookup and mutation remain a small CPU control-plane operation.
+    State handles, reaches, sampling, model calls, targets, and losses remain on
+    ``device``.
+    """
 
     def __init__(
         self,
@@ -670,8 +756,8 @@ class SyntheticRolloutBackend:
     ) -> None:
         self.game = game
         self.device = torch.device(device)
-        if self.device.type != "cpu":
-            raise ValueError("the synthetic state-table oracle is CPU-only")
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self.n_players = game.n_players
         self.x_sizes = game.x_sizes
         self.max_rollout_steps = (
@@ -682,6 +768,13 @@ class SyntheticRolloutBackend:
         self.beta_fix = dict(table or {"default": 1.0})
         if "default" not in self.beta_fix:
             raise ValueError("beta_fix requires a 'default' entry")
+        self.execution_metrics = ExecutionMetrics()
+        self.execution_families = ("synthetic",)
+        self.execution_family_values = (0,)
+        self.execution_family_priorities = (0,)
+        # Unit row costs make every configured fixed-quantum masked pack safe
+        # without reading a device-computed prefix length on the host.
+        self.queued_static_pack_safe = True
 
     def root_states(self, n: int) -> Tensor:
         """Return opaque int32 root handles ``[B]`` on the backend device."""
@@ -753,7 +846,16 @@ class SyntheticRolloutBackend:
                     device=self.device,
                 ),
             }
-        return frozen_model(self.game.encode_public(states), head_mask, **kwargs)
+        output = frozen_model(self.game.encode_public(states), head_mask, **kwargs)
+        rows = int(states.numel())
+        self.execution_metrics.record_model_call(
+            "training" if torch.is_grad_enabled() else "inference",
+            "synthetic",
+            rows,
+            padded_tokens=rows,
+            padded_token_pairs=rows,
+        )
+        return output
 
     def plan_policy_batches(
         self, model: Any, states: Tensor, phase: str
@@ -772,12 +874,32 @@ class SyntheticRolloutBackend:
 
         return self.game.sample_profiles(states, reach, 1, gen)[:, 0]  # [B,P]
 
+    def sample_profiles_keyed(
+        self, states: Tensor, reach: Tensor, keys: Tensor
+    ) -> Tensor:
+        """Draw exact finite-game profiles from logical-address keys ``[B]``."""
+
+        if keys.shape != states.shape or keys.dtype != torch.int64:
+            raise ValueError("profile keys must be int64 [B]")
+        return self.game.sample_profiles_keyed(
+            states, reach, keys[:, None]
+        )[:, 0]
+
     def sampled_terminal_reward(
         self, states: Tensor, profiles: Tensor, gen: torch.Generator
     ) -> Tensor:
         """Settle one sampled private profile at each synthetic leaf."""
 
         del gen
+        return self.game.reward(profiles, states).float()
+
+    def sampled_terminal_reward_keyed(
+        self, states: Tensor, profiles: Tensor, keys: Tensor
+    ) -> Tensor:
+        """Settle deterministic synthetic leaves under logical completion keys."""
+
+        if keys.shape != states.shape or keys.dtype != torch.int64:
+            raise ValueError("terminal reward keys must be int64 [B]")
         return self.game.reward(profiles, states).float()
 
     @staticmethod
@@ -821,6 +943,46 @@ class SyntheticRolloutBackend:
         columns = torch.multinomial(probability / normalizer, 1, generator=gen)
         public_id = legal_ids.gather(1, columns).squeeze(1).to(torch.int32)  # [B]
         return EventBatch(public_id=public_id)
+
+    def sample_events_keyed(
+        self,
+        states: Tensor,
+        profiles: Tensor,
+        policy_out: Any | None,
+        adapter: Any,
+        keys: Tensor,
+    ) -> EventBatch:
+        """Draw one public event per row from logical-address keys."""
+
+        if keys.shape != states.shape or keys.dtype != torch.int64:
+            raise ValueError("event keys must be int64 [B]")
+        legal_ids, legal_mask = self.legal_events(states)
+        owners = self.classify(states)
+        if policy_out is None:
+            probability = self.game.chance_probs(states, profiles)
+        else:
+            all_logp = self._log_prob(adapter, policy_out, legal_ids, legal_mask)
+            actor_type = profiles.gather(1, owners.to(torch.int64)[:, None]).squeeze(1)
+            rows = torch.arange(states.shape[0], device=self.device)
+            probability = torch.exp(all_logp[rows, :, actor_type])
+        probability = probability.masked_fill(~legal_mask, 0.0)
+        columns = logical_categorical_from_valid_probability(probability, keys)
+        public_id = legal_ids.gather(1, columns[:, None]).squeeze(1)
+        return EventBatch(public_id=public_id.to(torch.int32))
+
+    def rollout_family_ids(self, states: Tensor) -> Tensor:
+        """Route every synthetic player occurrence to its one family."""
+
+        return torch.zeros(states.shape, dtype=torch.int64, device=states.device)
+
+    def rollout_row_cost(
+        self, model: Any, states: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Return unit padded work for the small synthetic executor."""
+
+        del model
+        ones = torch.ones(states.shape, dtype=torch.int64, device=states.device)
+        return ones, torch.zeros_like(ones)
 
     def step(self, states: Tensor, events: EventBatch) -> Tensor:
         """Apply ``events`` and return successor handles ``[B]``."""

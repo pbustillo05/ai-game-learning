@@ -1,0 +1,51 @@
+game:
+  name: synthetic
+  synthetic:
+    n_players: 2
+    deck_size: 3
+    n_suits: 1
+    hand_size: 1
+    n_rounds: 1
+    board_per_round: [0]
+    max_raises: 1
+    bet_size: [1]
+    ante: 1
+  poker: null
+rollout:
+  n_trees: 512
+  beta: null
+  node_budget: 128
+  reach_storage: full
+completion:
+  n_samples: 256
+  backend: exact
+model:
+  architecture: mha
+  hidden_dim: 32
+loss:
+  name: rb_ppo
+  lam: 0.95
+  clip_eps: 0.2
+  clip_eps_v: 0.2
+  c_v: 0.5
+  c_h: 0.1
+  c_kl: 0.2
+  entropy_schedule: const
+  value_loss: clipped
+training:
+  mode: rao_blackwell
+  iters: 300
+  # Four reuse steps are the safe translation of four PPO epochs here.  The
+  # paper's four-minibatch split is not 16 with-replacement steps in this API.
+  gd_steps_per_iter: 4
+  minibatch_size: 256
+  lr: 0.0003
+  adam_betas: [0.9, 0.999]
+  grad_clip: 0.5
+  amp: true
+  seed: 7
+  checkpoint_every: 25
+  out_dir: runs/kuhn_nashpg_gpu_smoke
+  reproducibility: strict
+  kl_ref_interval: 25
+  optimizer: adamw
