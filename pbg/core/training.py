@@ -769,6 +769,7 @@ def _build_iteration_data(
 
     source = bundle.model.module if hasattr(bundle.model, "module") else bundle.model
     device = next(source.parameters()).device
+    amp_enabled, amp_dtype = _precision(cfg, device)
     execution_metrics = getattr(bundle.rollout_backend, "execution_metrics", None)
     profile_metrics: dict[str, float] = {}
     owns_frozen_model = frozen_model is None
@@ -787,6 +788,27 @@ def _build_iteration_data(
         completion_backend=bundle.completion_backend,
     )
     normal = cfg.training.mode == "normal"
+
+    def sample_normal_rollout() -> Any:
+        with torch.autocast(
+            device_type=device.type, enabled=amp_enabled, dtype=amp_dtype
+        ):
+            return sample_trees_sequential(
+                frozen_bundle,
+                cfg,
+                torch_gen,
+                return_profiles=True,
+                iteration=iteration,
+            )
+
+    def sample_rb_rollout() -> Any:
+        with torch.autocast(
+            device_type=device.type, enabled=amp_enabled, dtype=amp_dtype
+        ):
+            return sample_trees(
+                frozen_bundle, cfg, torch_gen, iteration=iteration
+            )
+
     with torch.no_grad():
         if normal:
             sampled = _profiled_call(
@@ -794,13 +816,7 @@ def _build_iteration_data(
                 "rollout",
                 device,
                 profile,
-                lambda: sample_trees_sequential(
-                    frozen_bundle,
-                    cfg,
-                    torch_gen,
-                    return_profiles=True,
-                    iteration=iteration,
-                ),
+                sample_normal_rollout,
             )
             sampled_tree, _, sampled_policy, _ = sampled
             local_mass = torch.tensor(
@@ -862,9 +878,7 @@ def _build_iteration_data(
             "rollout",
             device,
             profile,
-            lambda: sample_trees(
-                frozen_bundle, cfg, torch_gen, iteration=iteration
-            ),
+            sample_rb_rollout,
         )
         decision_weight = tree.path_weight[
             policy_cache.node_ids.to(tree.path_weight.device, dtype=torch.int64)
@@ -1151,16 +1165,27 @@ def _validate_old_policy_identity(
     )
     ok = value_ok & logp_ok & unclipped
     if device.type == "cuda":
-        torch._assert_async(ok, "old/current-policy identity launch gate failed")
+        # This launch/resume gate is an explicit synchronization boundary: its
+        # four diagnostics are returned to the host immediately below.  Raise a
+        # normal exception with the measured disagreement instead of poisoning
+        # the CUDA context with a device-side assertion.
         torch.cuda.synchronize(device)
-    elif not bool(ok):
-        raise RuntimeError("old/current-policy identity launch gate failed")
-    return {
+    diagnostics = {
         "identity_max_abs_logp_error": float(maximum_logp_error),
         "identity_max_abs_value_error": float(maximum_value_error),
         "identity_ratio_min": float(ratio_min),
         "identity_ratio_max": float(ratio_max),
     }
+    if not bool(ok):
+        raise RuntimeError(
+            "old/current-policy identity launch gate failed: "
+            f"max_abs_logp_error={diagnostics['identity_max_abs_logp_error']:.8g}, "
+            f"max_abs_value_error={diagnostics['identity_max_abs_value_error']:.8g}, "
+            f"ratio_min={diagnostics['identity_ratio_min']:.8g}, "
+            f"ratio_max={diagnostics['identity_ratio_max']:.8g}, "
+            f"tolerance={tolerance:.8g}"
+        )
+    return diagnostics
 
 
 def _one_iteration(

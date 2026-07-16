@@ -3,12 +3,14 @@ from __future__ import annotations
 import inspect
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 import yaml
 
 from pbg.config import load_config
+from pbg.core import training as training_module
 from pbg.core.game import GameBundle
 from pbg.core.training import load_checkpoint
 from pbg.core.training import run_training
@@ -214,3 +216,45 @@ def test_python_training_api_rejects_cuda_without_hardware_profile(
     with pytest.raises(RuntimeError, match="explicit hardware profile"):
         run_training(cfg, bundle_builder=forbidden_builder)
     assert not built
+
+
+@pytest.mark.parametrize(
+    ("mode", "sampler_name"),
+    (
+        ("normal", "sample_trees_sequential"),
+        ("rao_blackwell", "sample_trees"),
+    ),
+)
+def test_frozen_rollout_policy_uses_learner_autocast_precision(
+    monkeypatch, mode: str, sampler_name: str
+) -> None:
+    """Behavior caches and learner ratios must use the same precision."""
+
+    class RolloutObserved(RuntimeError):
+        pass
+
+    def observed_sampler(*args, **kwargs):
+        assert torch.is_autocast_enabled("cpu")
+        assert torch.get_autocast_dtype("cpu") == torch.bfloat16
+        raise RolloutObserved
+
+    monkeypatch.setattr(
+        training_module,
+        "_precision",
+        lambda cfg, device: (True, torch.bfloat16),
+    )
+    monkeypatch.setattr(training_module, sampler_name, observed_sampler)
+    bundle = GameBundle(
+        model=torch.nn.Linear(1, 1),
+        rollout_backend=SimpleNamespace(device=torch.device("cpu")),
+        policy_adapter=object(),
+        completion_backend=None,
+    )
+    cfg = SimpleNamespace(training=SimpleNamespace(mode=mode))
+    with pytest.raises(RolloutObserved):
+        training_module._build_iteration_data(
+            cfg,
+            bundle,
+            torch.Generator(),
+            SimpleNamespace(),
+        )
