@@ -21,12 +21,9 @@ Read the pages in this order:
   commands, presets, checkpoints, DDP, and evaluation. It is maintained as a
   separate operational guide.
 
-The current performance assessment is [Rollout and training efficiency audit,
-2026-07-15](audit/rollout_efficiency_2026-07-15.md). Its most important finding
-is that poker forwards are GPU-batched, but rollout does **not** implement the
-requested persistent preflop and postflop ready queues. It packs only the
-currently active frontier wave. The audit quantifies the resulting fragmentation
-and the overly conservative sequential memory preflight.
+Current readiness and the cleanup reachability inventory are indexed in
+[`audit/README.md`](audit/README.md). Superseded performance investigations and
+promotion comparisons are preserved under `../archive/`.
 
 The binding authorities are:
 

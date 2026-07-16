@@ -36,8 +36,8 @@ largest public prefix after which no player-owned node remains. All player
 actions are complete; continuation consists only of zero or more public-chance
 draws and terminal reward resolution. In poker, closed betting with an
 incomplete board is pre-terminal and completion owns the runout and showdown.
-In Leduc, the state before the public card is not pre-terminal because another
-betting round follows; the state after final betting is a completion leaf.
+More generally, a state before a public chance event is not pre-terminal when
+another player decision can follow that event.
 
 ---
 
@@ -102,6 +102,25 @@ Given a stored batch of G trees (sequential trajectories are trees with β≡1):
    in the tree, weighted ν(a|Σ) (§10.3). (Sampled-action variants would draw
    A ∼ ν(·|Σ); not used by `rb_ppo`.)
 
+### 4.1 Distributed fixed-rollout normalization
+
+For rank `g` and execution family `m`, let `D[g,m]` be its retained player
+decisions and let `omega_g(s)` be one in normal/sequential RB or the stored
+root-to-node `path_weight` in branched RB.  Define
+
+`Z[g,m] = sum_{s in D[g,m]} omega_g(s)` and `Z = sum_{g,m} Z[g,m]`.
+
+The fixed-rollout objective is
+
+`L(theta) = sum_{g,m} sum_{s in D[g,m]} omega_g(s) ModeLoss(theta;s) / Z`.
+
+Thus a family-stratified local draw uses
+`q[g,m](s)=omega_g(s)/Z[g,m]` and scale
+`alpha[g,m]=Z[g,m]/Z`.  The path weight appears in the sampling law and alpha;
+it is not multiplied into the sampled loss a second time.  Summing the already
+globally scaled rank gradients is exact.  Equal averaging of independently
+normalized rank losses is a different objective whenever rank masses differ.
+
 **Convergence statements (filling the source's two red placeholders).**
 As G → ∞, the joint law of (Σ, A) under the empirical decision law converges in
 total variation to the ideal law of §2 marginalized over X (sequential case), resp.
@@ -162,10 +181,9 @@ fp32 statistics (CONTRACTS §4.4):
   player reward component, including deterministic folded-player payoffs;
 - Û ≈ 𝔼(‖**R**(X,Τ)‖₂² | τ^pre-c).
 
-Reference implementation: sequential importance sampling (poker); synthetic family
-can use exact enumeration when small (also the T6 oracle). Suit-symmetry statistics
-augmentation (storing the 4! permutations of each draw) is an optional flag, default
-off in v1.
+The production implementation uses the sibling poker evaluator's documented
+collision-conditioned Monte Carlo operations. There is no local exact or
+suit-augmentation completion alternative.
 
 Terminal fold-win leaves use the same collision-conditioned posterior law for
 P̂; normalizing each player's reach row independently is not equivalent when μ
@@ -212,8 +230,7 @@ for σ in reverse topological order (children before parents), σ not a leaf:
   for it. The shipped PPO objective consumes Â directly.
 - Branch independence makes the sibling baseline action-independent for the
   target branch. It does not make the conditional ratio finite-sample unbiased.
-- Additional estimator channels may reuse the same aggregate/conditionalize/
-  bootstrap/emit kernels, but no unused moment tensors are part of v1.
+- No auxiliary estimator channels or unused moment targets are active.
 
 Complexity: one O(|𝐒| · P_max · X_max) pass; poker X_max = 1326 → keep P̂/M̂ in fp32 on
 GPU, stream by tree if memory-bound.
@@ -249,9 +266,8 @@ later defining recursion.
 The active implementation exposes `training.mode` as `normal`,
 `rao_blackwell`, or `branched_rao_blackwell`. Only the branched mode accepts a
 `rollout.beta` map. A game-owned batched `beta_fn(states) -> float32[B]` returns
-public-stage-dependent values in [1,∞): poker uses preflop/flop/turn/river (and
-optional chance-transition buckets), while synthetic games use betting
-round/chance phase. There is no learned controller state.
+public-stage-dependent values in [1,∞) for poker's preflop/flop/turn/river and
+optional chance-transition buckets. There is no learned controller state.
 
 The Neyman proxy based on public **V** and U heads remains a deliberately
 naïve research direction in `core_math.tex`. Its heads, estimators, losses and
@@ -269,8 +285,10 @@ bucket updates are deferred until the correct variance/cost objective is known.
 - ℒ_clip = −min( ρ Â, clip(ρ, 1−ε, 1+ε) Â )
 - ℒ_V = c_V (V^θ − V̂)²;  ℒ_V-clip with V_clip^θ = V^{θ_k} + clip(V^θ − V^{θ_k}, ±ε_V)
 - ℒ_H = −c_H · Ent(π^θ(·|x_p,Σ))  (exact over the factored head, per adapter)
-- Adapter KL and centered-logit operations may remain reusable primitives, but
-  reference snapshots, KL loss, moment losses and NeuRD/R-NaD are deferred.
+- Adapter KL and centered-logit operations remain reusable primitives. Exact
+  legal-action `KL(new || reference)` and periodic immutable reference
+  snapshots are implemented for normal, sequential-RB, and branched-RB modes;
+  moment losses and NeuRD/R-NaD remain deferred.
 
 ### 10.2 What the gradient targets
 

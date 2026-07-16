@@ -29,9 +29,6 @@ as its sole active game.
   intensity by the ordinary randomized-rounding rule. Do not give
   $\varnothing$ special multiplicity or branch there more aggressively.
 - In sequential mode (normal or Rao-Blackwell), this logic is reversed: only $\varnothing$ has branching.
-- Some implementation APIs use legacy names such as `root_states` or
-  `n_trees`. This must eventually be converted back to this design choice.
-
 ## Actual Games
 - Kuhn, Leduc, and synthetic games are retired and archived because they are
   too small for this setup.

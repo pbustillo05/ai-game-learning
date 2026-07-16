@@ -1,0 +1,101 @@
+{
+  "bootstrap_resamples": 10000,
+  "bootstrap_seed": 0,
+  "common_workload": {
+    "completion_backend": "cuda",
+    "completion_samples": 64,
+    "game": "poker",
+    "gd_steps_per_iter": 1,
+    "minibatch_size": 32,
+    "model_checkpoint": {
+      "iteration": 5750,
+      "path": "runs/nlhe6_10bb_7h/ckpt_0005750.pt",
+      "run_id": "b22db98a547548fc898c1d0b243640b5",
+      "sha256": "e0cacf78cbce9aae77c8a3877fc08f92726f5744d5d7df64d43b3083bf6a477d"
+    },
+    "model_initialization_protocol": "checkpoint_model_state_v1",
+    "model_initialization_seed": 47,
+    "node_budget": 4096,
+    "profile_iteration": 1,
+    "repeat_seeds": [
+      104776,
+      209505,
+      314234
+    ],
+    "repeats": 3,
+    "sequential_starts": 1,
+    "training_seed": 47,
+    "warmup": 1
+  },
+  "comparison": "family_fifo_v1_over_wavefront_v1",
+  "confidence": 0.95,
+  "environment": {
+    "compute_capability": [
+      7,
+      5
+    ],
+    "cuda": "13.0",
+    "device_name": "NVIDIA GeForce RTX 2080 Ti",
+    "device_type": "cuda",
+    "torch": "2.12.1+cu130",
+    "torch_threads": 14
+  },
+  "gate_failures": [
+    "branched_rao_blackwell.phase_rollout_seconds_per_decision: upper=2.057974 > 1.200000",
+    "branched_rao_blackwell.profiled_iteration_seconds_per_decision: upper=1.807323 > 1.200000"
+  ],
+  "max_upper_ratio": 1.2,
+  "modes": [
+    {
+      "metrics": {
+        "phase_rollout_seconds_per_decision": {
+          "paired_ratio_bootstrap_interval": [
+            1.0576375698006435,
+            2.057973524770336
+          ],
+          "paired_ratio_median": 1.154796336528113,
+          "paired_ratios": [
+            1.0576375698006435,
+            1.154796336528113,
+            2.057973524770336
+          ],
+          "passes_upper_bound": false,
+          "queued_median": 0.035505136711955335,
+          "wavefront_median": 0.030745799574235986
+        },
+        "profiled_iteration_seconds_per_decision": {
+          "paired_ratio_bootstrap_interval": [
+            1.0391737049770506,
+            1.8073227011112456
+          ],
+          "paired_ratio_median": 1.1186521576285,
+          "paired_ratios": [
+            1.1186521576285,
+            1.0391737049770506,
+            1.8073227011112456
+          ],
+          "passes_upper_bound": false,
+          "queued_median": 0.08073747257835098,
+          "wavefront_median": 0.07453176257383477
+        }
+      },
+      "mode": "branched_rao_blackwell"
+    }
+  ],
+  "paired_by": "repeat_seed",
+  "passed": false,
+  "pathwise_identical": false,
+  "queued_calibration": {
+    "arena_chunk_nodes": 256,
+    "queue_admission_size": 128,
+    "queue_batch_rows": 128,
+    "queue_packing": "actual_cost_greedy",
+    "queued_logical_rng": "counter_hash_v2"
+  },
+  "repeat_seeds": [
+    104776,
+    209505,
+    314234
+  ],
+  "schema": "pbg-executor-comparison-v1"
+}

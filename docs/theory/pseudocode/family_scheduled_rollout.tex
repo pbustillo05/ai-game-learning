@@ -9,7 +9,7 @@
     \IfFileExists{docs/theory/preamble/preamble.tex}{
       \def\theoryroot{docs/theory/}
     }{
-      \PackageError{queued_rollout}{Cannot locate docs/theory/preamble/preamble.tex}{}
+      \PackageError{family_scheduled_rollout}{Cannot locate docs/theory/preamble/preamble.tex}{}
     }
   }
 }
@@ -32,14 +32,13 @@
 \newcommand{\ChanceClose}{\operatorname{\texttt{ChanceClose}}}
 \newcommand{\ForwardFamily}{\operatorname{\texttt{Forward}}}
 \newcommand{\PackFamily}{\operatorname{\texttt{Pack}}}
-\newcommand{\ForwardCache}{\operatorname{\texttt{FrozenForwardCache}}}
 
 \begin{document}
 
 \begin{algorithm}[H]
 \caption{$((\mathfrak R_g,\mathcal D_g,\mathcal L_g))_{g\in\mathcal G}
-\gets\texttt{MultiGPUQueuedRollout}(\pi,\mathsf m,N_{\mathsf{seq}})$}
-\label{alg:queued-rollout-pbg}
+\gets\texttt{MultiGPUFamilyRollout}(\pi,\mathsf m,N_{\mathsf{seq}})$}
+\label{alg:family-scheduled-rollout-pbg}
 \DontPrintSemicolon
 \tcc{The rollout profile is frozen and identical on all GPUs; queues and rollout state are GPU-local.}
 \KwParam{finite PBG $(\mathcal S,\mathcal T,\mathcal P,o,(\mathcal E_\sigma)_\sigma,
@@ -53,9 +52,8 @@ $\kappa:\{\sigma:o(\sigma)\in\mathcal P\}\to\mathcal M$;
 one curried forward implementation $\ForwardFamily_m$ per $m$}
 \KwParam{for branched-RB, a frozen public black-box intensity
 $\beta:\mathcal S\setminus\mathcal T^{\mathsf{pre-c}}\to[1,\infty)$}
-\KwHyper{per-GPU hard memory limits; calibrated family-only packers,
-full-batch thresholds, and warmed execution plans for a small set of batch
-quanta; optional byte-capped exact frozen-forward cache}
+\KwHyper{per-GPU hard memory limits; family batch-row limits; calibrated
+actual-cost physical forward planner; chunked arena and active-trajectory limits}
 \KwDef{$\mathsf{seq}\gets\one_{\mathsf m\ne\mathsf{branched\text{-}RB}}$;
 $\mathcal T_{\mathsf m}\gets\mathcal T$ if $\mathsf m=\mathsf{normal}$,
 else $\mathcal T^{\mathsf{pre-c}}$;
@@ -65,7 +63,7 @@ $\operatorname{Round}(z;K)=\lfloor z\rfloor+
 \operatorname{Bernoulli}(z-\lfloor z\rfloor;K)$;
 $\iota(\mathsf s)$ is the schedule- and placement-independent logical address of
 $\mathsf s$: (global trajectory index, path) in sequential modes and
-(GPU tree index, abstract tree path) in branched-RB.  All draws use disjoint keys
+(rank tree index, abstract tree path) in branched-RB.  All draws use disjoint keys
 $K(k,\iota(\mathsf s),u,\mathsf{purpose})$}
 \KwDef{
 $\displaystyle
@@ -75,13 +73,17 @@ r_{\mathsf s,q}(\sigma\mid x_q)}
 {\sum_{y\in\mathcal X}\mu(y)\prod_{q\in\mathcal P\cup\{\mathsf c\}}
 r_{\mathsf s,q}(\sigma\mid y_q)}$}
 \KwDef{
-$\PackFamily_{g,m}(\mathcal Q)$ returns a stable maximum-fill feasible
-occurrence batch containing only family $m$; it never subdivides or routes by
-street or any other public-stage label.  Feasibility counts one model row per
-distinct exact current-model input, the maximum padded forward cost across the mixed-stage
-rows, child sampling, and expansion workspace;
+$\PackFamily_{g,m}(\mathcal Q)$ returns a stable insertion-order block containing
+only family $m$; it never subdivides or routes by street or any other
+public-stage label.  $\operatorname{PhysicalPacks}_{g,m}(\mathcal B)$ may sort
+the block's exact current-model rows by predicted padded work and split it into
+one or more safe physical forwards, with a device-resident inverse scatter back
+to the logical block.  It may not change queue membership, logical order,
+sampling addresses, or the mixed-street contract.  Feasibility counts one model
+row per distinct exact current-model input, the maximum padded forward cost
+within each physical pack, child sampling, and expansion workspace;
 $\phi_{g,m}(\mathcal B)\in[0,1]$ is its calibrated fill;
-$\operatorname{load}_{g,m}(\mathcal Q)$ is queued work in full-batch units and
+$\operatorname{load}_{g,m}(\mathcal Q)$ is waiting work in full-batch units and
 $\operatorname{age}(\mathcal Q)$ is the oldest wait time;
 $\operatorname{Full}_{g,m}(\mathcal Q)$ holds when the packed batch reaches the
 family's full-batch threshold}
@@ -90,12 +92,16 @@ $\mathfrak A_g$ is a preallocated chunked struct-of-arrays arena addressed only
 by integer occurrence handles; it owns topology, state references, reach rows,
 RNG addresses, child spans, and the monotone status
 $\mathsf{NEW}\to\mathsf{QUEUED}\to\mathsf{EVALUATING}\to\mathsf{DONE}$.
-The family queues, counters, pack metadata, and reusable input/output/sampler
-staging slabs are device-resident; the steady-state scheduler performs no
-per-call scalar read or device-to-host transfer}
+The family work queues, counters, pack metadata, inverse scatters, and reusable
+input/output/sampler staging slabs are device-resident. Stable-v1 permits a
+declared fixed-size device-to-host control block for each logical family
+decision (including an actual-cost vector when used), never one scalar/control
+round trip per physical pack; it is recorded as control-sync count, elapsed
+time, and bytes. Dynamic compaction, scalar tensor reads, and every undeclared
+scheduler synchronization remain forbidden}
 \KwDef{
 $\operatorname{Enqueue}_g(\mathcal P')$ appends each $\mathsf s\in\mathcal P'$
-to the bounded FIFO queue $\Qready{g,\kappa(\ell_g(\mathsf s))}$ and atomically
+to the bounded work queue $\Qready{g,\kappa(\ell_g(\mathsf s))}$ and atomically
 changes its status from $\mathsf{NEW}$ to $\mathsf{QUEUED}$;
 $\operatorname{SafeAdmit}_g(a)$ reserves retained storage and the largest
 in-flight transaction before admitting $a$ further sequential starts;
@@ -117,8 +123,6 @@ if $\mathsf{seq}=1$, using calibrated per-GPU safe capacities and throughput
 \ForEach{$g\in\mathcal G$ \textbf{in parallel}}{
   $\mathcal D_g,\mathcal L_g\gets\varnothing$\;
   $(\Qready{g,m})_{m\in\mathcal M}\gets\varnothing$\;
-  $C_g\gets\ForwardCache(\theta_k)$, empty and capped by pre-reserved bytes, or
-  $\bot$ when the calibrated cache is disabled\;
   \uIf{$\mathsf{seq}=0$}{
     $\mathfrak S_g\gets\{\varnothing\}$\;
     $\ell_g(\varnothing)\gets\varnothing$\;
@@ -173,21 +177,17 @@ if $\mathsf{seq}=1$, using calibrated per-GPU safe capacities and throughput
 
     $\mathcal B\gets\PackFamily_{g,m}(\Qready{g,m})$, remove its handles from
     $\Qready{g,m}$, and atomically mark them $\mathsf{EVALUATING}$\;
-    Let $\mathcal V\subseteq\mathcal B$ contain one stable representative of each
-    exact current-model input and scatter map, and let $\mathcal V_{\mathsf{miss}}$
-    be $\mathcal V$ if $C_g=\bot$, or the representatives absent from $C_g$
-    otherwise\;
-    \ForEach{$\mathsf s\in\mathcal V_{\mathsf{miss}}$ \textbf{in one warmed family-$m$ GPU call}}{
-      $\sigma_{\mathsf s}\gets\ell_g(\mathsf s)$\;
-      $p_{\mathsf s}\gets o(\sigma_{\mathsf s})$\;
+    $(\mathcal J_1,\ldots,\mathcal J_r)\gets
+    \operatorname{PhysicalPacks}_{g,m}(\mathcal B)$\;
+    \ForEach{$\mathcal J_j$ \textbf{in one warmed family-$m$ GPU call}}{
+      $\sigma_{\mathsf s}\gets\ell_g(\mathsf s)$ for $\mathsf s\in\mathcal J_j$\;
+      $p_{\mathsf s}\gets o(\sigma_{\mathsf s})$ for $\mathsf s\in\mathcal J_j$\;
       $\Pi_{\mathsf s}\gets
       \ForwardFamily_m(\sigma_{\mathsf s},\mathfrak r_{g,\mathsf s};\theta_k)
       =\bigl(\pi(\cdot\mid x_{p_{\mathsf s}},\sigma_{\mathsf s}),
       V^{\theta_k}(x_{p_{\mathsf s}},\sigma_{\mathsf s}),\ldots\bigr)_
       {x_{p_{\mathsf s}}\in\mathcal X_{p_{\mathsf s}}}$\;
     }
-    Publish cache misses to $C_g$ when enabled and gather $\Pi_{\mathsf s}$ from
-    cached or newly evaluated representatives to all $\mathsf s\in\mathcal B$\;
     $(\mathcal A,\mathcal F)\gets
       \ChildBatch_g(\mathcal B,(\Pi_{\mathsf s})_{\mathsf s\in\mathcal B},\mathsf m)$\;
     $(\mathcal P',\mathcal L')\gets\ChanceClose_g(\mathcal F,\mathsf m)$\;
@@ -218,7 +218,7 @@ collective is the normalization reduction in
 \begin{algorithm}[H]
 \caption{$(\mathcal A,\mathcal F')\gets
 \texttt{SampleChildren}_g(\mathcal B,\Pi,\mathsf m)$}
-\label{alg:queued-sample-children-pbg}
+\label{alg:family-sample-children-pbg}
 \DontPrintSemicolon
 \tcc{$\mathcal B$ is a player batch with curried output $\Pi$, or a chance batch with $\Pi=\bot$.}
 \KwIn{sampled occurrences $\mathcal B=(\mathsf s_j)_{j=1}^b$ of one owner kind;
@@ -287,7 +287,7 @@ Discard branched-RB posterior profiles $X_{j,u}$\;
 \begin{algorithm}[H]
 \caption{$(\mathcal P',\mathcal L')\gets
 \texttt{ChanceClose}_g(\mathcal F,\mathsf m)$}
-\label{alg:queued-chance-close-pbg}
+\label{alg:family-chance-close-pbg}
 \DontPrintSemicolon
 \tcc{Close every chance-only segment before returning control to the model-family scheduler.}
 \KwIn{new sampled occurrences $\mathcal F$; mode $\mathsf m$; GPU-local rollout state}

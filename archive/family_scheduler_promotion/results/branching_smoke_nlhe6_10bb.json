@@ -1,0 +1,1477 @@
+{
+  "config": {
+    "beta": {
+      "chance_to_flop": 1.5,
+      "chance_to_river": 1.25,
+      "chance_to_turn": 1.25,
+      "default": 1.0,
+      "flop": 1.25,
+      "preflop": 1.1,
+      "river": 1.25,
+      "turn": 1.25
+    },
+    "beta_max": null,
+    "costs": {},
+    "initial_kappa": 1.0,
+    "kappa_eta": 1.0,
+    "node_budget": 4096,
+    "schedule": {},
+    "seed": 20260715,
+    "soft_budget_fraction": null,
+    "target_size": null,
+    "trials": 1
+  },
+  "environment": {
+    "cuda": "13.0",
+    "cuda_visible_devices": "2",
+    "device": "cuda:0",
+    "device_name": "NVIDIA GeForce RTX 2080 Ti",
+    "python": "3.10.12",
+    "torch": "2.12.1+cu130"
+  },
+  "experiments": [
+    {
+      "checkpoint": {
+        "iteration": 250,
+        "path": "runs/nlhe6_10bb_7h/ckpt_0000250.pt",
+        "run_id": "b22db98a547548fc898c1d0b243640b5",
+        "sha256": "454f09d48f5b69a71edea8149f00eff58e9f2c6384c007ee86071f1daef46695"
+      },
+      "controller": "legacy",
+      "summary": {
+        "cost_estimands": {
+          "player:0:0": {
+            "arithmetic_prediction": 7.0,
+            "gamma_deviance_optimum": 7.0,
+            "geometric_prediction": 6.999999999999999,
+            "held_out_count": 0,
+            "training_count": 1
+          },
+          "player:0:1": {
+            "arithmetic_prediction": 6.0,
+            "gamma_deviance_optimum": 6.0,
+            "geometric_prediction": 6.0,
+            "held_out_count": 0,
+            "training_count": 1
+          },
+          "player:0:2": {
+            "arithmetic_prediction": 5.0,
+            "gamma_deviance_optimum": 5.0,
+            "geometric_prediction": 4.999999999999999,
+            "held_out_count": 0,
+            "training_count": 1
+          },
+          "player:0:3": {
+            "arithmetic_prediction": 4.0,
+            "gamma_deviance_optimum": 4.0,
+            "geometric_prediction": 4.0,
+            "held_out_count": 0,
+            "training_count": 1
+          },
+          "player:0:4": {
+            "arithmetic_prediction": 3.0,
+            "gamma_deviance_optimum": 3.0,
+            "geometric_prediction": 3.0000000000000004,
+            "held_out_count": 0,
+            "training_count": 1
+          },
+          "player:0:5": {
+            "arithmetic_prediction": 2.0,
+            "gamma_deviance_optimum": 2.0,
+            "geometric_prediction": 2.0,
+            "held_out_count": 0,
+            "training_count": 1
+          },
+          "player:0:6": {
+            "arithmetic_prediction": 1.0,
+            "gamma_deviance_optimum": 1.0,
+            "geometric_prediction": 1.0,
+            "held_out_count": 0,
+            "training_count": 1
+          }
+        },
+        "kappa_after": {
+          "count": 1.0,
+          "max": 1.0,
+          "mean": 1.0,
+          "median": 1.0,
+          "min": 1.0,
+          "p95": 1.0,
+          "p99": 1.0,
+          "std": 0.0
+        },
+        "kappa_before": {
+          "count": 1.0,
+          "max": 1.0,
+          "mean": 1.0,
+          "median": 1.0,
+          "min": 1.0,
+          "p95": 1.0,
+          "p99": 1.0,
+          "std": 0.0
+        },
+        "street_depth": {
+          "player:0:0": {
+            "budget_admitted_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "budget_admitted_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "budget_forced_spine_rate": 0.0,
+            "cap_hit_rate": 0.0,
+            "configured_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "duplicate_label_rate": {
+              "count": 1.0,
+              "max": 0.0,
+              "mean": 0.0,
+              "median": 0.0,
+              "min": 0.0,
+              "p95": 0.0,
+              "p99": 0.0,
+              "std": 0.0
+            },
+            "kkt_proposed_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "randomized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "realized_descendant_cost": {
+              "count": 1.0,
+              "max": 7.0,
+              "mean": 7.0,
+              "median": 7.0,
+              "min": 7.0,
+              "p95": 7.0,
+              "p99": 7.0,
+              "std": 0.0
+            },
+            "realized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "reserve_after_admission": {
+              "count": 1.0,
+              "max": 2.0,
+              "mean": 2.0,
+              "median": 2.0,
+              "min": 2.0,
+              "p95": 2.0,
+              "p99": 2.0,
+              "std": 0.0
+            },
+            "reserve_after_child_realization": {
+              "count": 1.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "median": 3.0,
+              "min": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "std": 0.0
+            },
+            "reserve_before_proposal": {
+              "count": 1.0,
+              "max": 2.0,
+              "mean": 2.0,
+              "median": 2.0,
+              "min": 2.0,
+              "p95": 2.0,
+              "p99": 2.0,
+              "std": 0.0
+            },
+            "street_depth_capped_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            }
+          },
+          "player:0:1": {
+            "budget_admitted_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "budget_admitted_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "budget_forced_spine_rate": 0.0,
+            "cap_hit_rate": 0.0,
+            "configured_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "duplicate_label_rate": {
+              "count": 1.0,
+              "max": 0.0,
+              "mean": 0.0,
+              "median": 0.0,
+              "min": 0.0,
+              "p95": 0.0,
+              "p99": 0.0,
+              "std": 0.0
+            },
+            "kkt_proposed_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "randomized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "realized_descendant_cost": {
+              "count": 1.0,
+              "max": 6.0,
+              "mean": 6.0,
+              "median": 6.0,
+              "min": 6.0,
+              "p95": 6.0,
+              "p99": 6.0,
+              "std": 0.0
+            },
+            "realized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "reserve_after_admission": {
+              "count": 1.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "median": 3.0,
+              "min": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "std": 0.0
+            },
+            "reserve_after_child_realization": {
+              "count": 1.0,
+              "max": 4.0,
+              "mean": 4.0,
+              "median": 4.0,
+              "min": 4.0,
+              "p95": 4.0,
+              "p99": 4.0,
+              "std": 0.0
+            },
+            "reserve_before_proposal": {
+              "count": 1.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "median": 3.0,
+              "min": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "std": 0.0
+            },
+            "street_depth_capped_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            }
+          },
+          "player:0:2": {
+            "budget_admitted_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "budget_admitted_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "budget_forced_spine_rate": 0.0,
+            "cap_hit_rate": 0.0,
+            "configured_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "duplicate_label_rate": {
+              "count": 1.0,
+              "max": 0.0,
+              "mean": 0.0,
+              "median": 0.0,
+              "min": 0.0,
+              "p95": 0.0,
+              "p99": 0.0,
+              "std": 0.0
+            },
+            "kkt_proposed_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "randomized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "realized_descendant_cost": {
+              "count": 1.0,
+              "max": 5.0,
+              "mean": 5.0,
+              "median": 5.0,
+              "min": 5.0,
+              "p95": 5.0,
+              "p99": 5.0,
+              "std": 0.0
+            },
+            "realized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "reserve_after_admission": {
+              "count": 1.0,
+              "max": 4.0,
+              "mean": 4.0,
+              "median": 4.0,
+              "min": 4.0,
+              "p95": 4.0,
+              "p99": 4.0,
+              "std": 0.0
+            },
+            "reserve_after_child_realization": {
+              "count": 1.0,
+              "max": 5.0,
+              "mean": 5.0,
+              "median": 5.0,
+              "min": 5.0,
+              "p95": 5.0,
+              "p99": 5.0,
+              "std": 0.0
+            },
+            "reserve_before_proposal": {
+              "count": 1.0,
+              "max": 4.0,
+              "mean": 4.0,
+              "median": 4.0,
+              "min": 4.0,
+              "p95": 4.0,
+              "p99": 4.0,
+              "std": 0.0
+            },
+            "street_depth_capped_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            }
+          },
+          "player:0:3": {
+            "budget_admitted_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "budget_admitted_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "budget_forced_spine_rate": 0.0,
+            "cap_hit_rate": 0.0,
+            "configured_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "duplicate_label_rate": {
+              "count": 1.0,
+              "max": 0.0,
+              "mean": 0.0,
+              "median": 0.0,
+              "min": 0.0,
+              "p95": 0.0,
+              "p99": 0.0,
+              "std": 0.0
+            },
+            "kkt_proposed_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "randomized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "realized_descendant_cost": {
+              "count": 1.0,
+              "max": 4.0,
+              "mean": 4.0,
+              "median": 4.0,
+              "min": 4.0,
+              "p95": 4.0,
+              "p99": 4.0,
+              "std": 0.0
+            },
+            "realized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "reserve_after_admission": {
+              "count": 1.0,
+              "max": 5.0,
+              "mean": 5.0,
+              "median": 5.0,
+              "min": 5.0,
+              "p95": 5.0,
+              "p99": 5.0,
+              "std": 0.0
+            },
+            "reserve_after_child_realization": {
+              "count": 1.0,
+              "max": 6.0,
+              "mean": 6.0,
+              "median": 6.0,
+              "min": 6.0,
+              "p95": 6.0,
+              "p99": 6.0,
+              "std": 0.0
+            },
+            "reserve_before_proposal": {
+              "count": 1.0,
+              "max": 5.0,
+              "mean": 5.0,
+              "median": 5.0,
+              "min": 5.0,
+              "p95": 5.0,
+              "p99": 5.0,
+              "std": 0.0
+            },
+            "street_depth_capped_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            }
+          },
+          "player:0:4": {
+            "budget_admitted_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "budget_admitted_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "budget_forced_spine_rate": 0.0,
+            "cap_hit_rate": 0.0,
+            "configured_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "duplicate_label_rate": {
+              "count": 1.0,
+              "max": 0.0,
+              "mean": 0.0,
+              "median": 0.0,
+              "min": 0.0,
+              "p95": 0.0,
+              "p99": 0.0,
+              "std": 0.0
+            },
+            "kkt_proposed_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "randomized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "realized_descendant_cost": {
+              "count": 1.0,
+              "max": 3.0,
+              "mean": 3.0,
+              "median": 3.0,
+              "min": 3.0,
+              "p95": 3.0,
+              "p99": 3.0,
+              "std": 0.0
+            },
+            "realized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "reserve_after_admission": {
+              "count": 1.0,
+              "max": 6.0,
+              "mean": 6.0,
+              "median": 6.0,
+              "min": 6.0,
+              "p95": 6.0,
+              "p99": 6.0,
+              "std": 0.0
+            },
+            "reserve_after_child_realization": {
+              "count": 1.0,
+              "max": 7.0,
+              "mean": 7.0,
+              "median": 7.0,
+              "min": 7.0,
+              "p95": 7.0,
+              "p99": 7.0,
+              "std": 0.0
+            },
+            "reserve_before_proposal": {
+              "count": 1.0,
+              "max": 6.0,
+              "mean": 6.0,
+              "median": 6.0,
+              "min": 6.0,
+              "p95": 6.0,
+              "p99": 6.0,
+              "std": 0.0
+            },
+            "street_depth_capped_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            }
+          },
+          "player:0:5": {
+            "budget_admitted_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "budget_admitted_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "budget_forced_spine_rate": 0.0,
+            "cap_hit_rate": 0.0,
+            "configured_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "duplicate_label_rate": {
+              "count": 1.0,
+              "max": 0.0,
+              "mean": 0.0,
+              "median": 0.0,
+              "min": 0.0,
+              "p95": 0.0,
+              "p99": 0.0,
+              "std": 0.0
+            },
+            "kkt_proposed_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "randomized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "realized_descendant_cost": {
+              "count": 1.0,
+              "max": 2.0,
+              "mean": 2.0,
+              "median": 2.0,
+              "min": 2.0,
+              "p95": 2.0,
+              "p99": 2.0,
+              "std": 0.0
+            },
+            "realized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "reserve_after_admission": {
+              "count": 1.0,
+              "max": 7.0,
+              "mean": 7.0,
+              "median": 7.0,
+              "min": 7.0,
+              "p95": 7.0,
+              "p99": 7.0,
+              "std": 0.0
+            },
+            "reserve_after_child_realization": {
+              "count": 1.0,
+              "max": 8.0,
+              "mean": 8.0,
+              "median": 8.0,
+              "min": 8.0,
+              "p95": 8.0,
+              "p99": 8.0,
+              "std": 0.0
+            },
+            "reserve_before_proposal": {
+              "count": 1.0,
+              "max": 7.0,
+              "mean": 7.0,
+              "median": 7.0,
+              "min": 7.0,
+              "p95": 7.0,
+              "p99": 7.0,
+              "std": 0.0
+            },
+            "street_depth_capped_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            }
+          },
+          "player:0:6": {
+            "budget_admitted_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "budget_admitted_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "budget_forced_spine_rate": 0.0,
+            "cap_hit_rate": 0.0,
+            "configured_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "duplicate_label_rate": {
+              "count": 1.0,
+              "max": 0.0,
+              "mean": 0.0,
+              "median": 0.0,
+              "min": 0.0,
+              "p95": 0.0,
+              "p99": 0.0,
+              "std": 0.0
+            },
+            "kkt_proposed_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            },
+            "randomized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "realized_descendant_cost": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "realized_offspring": {
+              "count": 1.0,
+              "max": 1.0,
+              "mean": 1.0,
+              "median": 1.0,
+              "min": 1.0,
+              "p95": 1.0,
+              "p99": 1.0,
+              "std": 0.0
+            },
+            "reserve_after_admission": {
+              "count": 1.0,
+              "max": 8.0,
+              "mean": 8.0,
+              "median": 8.0,
+              "min": 8.0,
+              "p95": 8.0,
+              "p99": 8.0,
+              "std": 0.0
+            },
+            "reserve_after_child_realization": {
+              "count": 1.0,
+              "max": 8.0,
+              "mean": 8.0,
+              "median": 8.0,
+              "min": 8.0,
+              "p95": 8.0,
+              "p99": 8.0,
+              "std": 0.0
+            },
+            "reserve_before_proposal": {
+              "count": 1.0,
+              "max": 8.0,
+              "mean": 8.0,
+              "median": 8.0,
+              "min": 8.0,
+              "p95": 8.0,
+              "p99": 8.0,
+              "std": 0.0
+            },
+            "street_depth_capped_beta": {
+              "count": 1.0,
+              "max": 1.100000023841858,
+              "mean": 1.100000023841858,
+              "median": 1.100000023841858,
+              "min": 1.100000023841858,
+              "p95": 1.100000023841858,
+              "p99": 1.100000023841858,
+              "std": 0.0
+            }
+          }
+        },
+        "trees": {
+          "arithmetic_predicted_tree_nodes": {
+            "count": 1.0,
+            "max": 8.0,
+            "mean": 8.0,
+            "median": 8.0,
+            "min": 8.0,
+            "p95": 8.0,
+            "p99": 8.0,
+            "std": 0.0
+          },
+          "arithmetic_tree_size_error": {
+            "count": 1.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "std": 0.0
+          },
+          "arithmetic_tree_size_relative_error": {
+            "count": 1.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "std": 0.0
+          },
+          "decision_law_ess": {
+            "count": 1.0,
+            "max": 7.0,
+            "mean": 7.0,
+            "median": 7.0,
+            "min": 7.0,
+            "p95": 7.0,
+            "p99": 7.0,
+            "std": 0.0
+          },
+          "decision_rows": {
+            "count": 1.0,
+            "max": 7.0,
+            "mean": 7.0,
+            "median": 7.0,
+            "min": 7.0,
+            "p95": 7.0,
+            "p99": 7.0,
+            "std": 0.0
+          },
+          "gamma_predicted_tree_nodes": {
+            "count": 1.0,
+            "max": 8.0,
+            "mean": 8.0,
+            "median": 8.0,
+            "min": 8.0,
+            "p95": 8.0,
+            "p99": 8.0,
+            "std": 0.0
+          },
+          "gamma_tree_size_error": {
+            "count": 1.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "std": 0.0
+          },
+          "gamma_tree_size_relative_error": {
+            "count": 1.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "std": 0.0
+          },
+          "geometric_predicted_tree_nodes": {
+            "count": 1.0,
+            "max": 7.999999999999999,
+            "mean": 7.999999999999999,
+            "median": 7.999999999999999,
+            "min": 7.999999999999999,
+            "p95": 7.999999999999999,
+            "p99": 7.999999999999999,
+            "std": 0.0
+          },
+          "geometric_tree_size_error": {
+            "count": 1.0,
+            "max": -8.881784197001252e-16,
+            "mean": -8.881784197001252e-16,
+            "median": -8.881784197001252e-16,
+            "min": -8.881784197001252e-16,
+            "p95": -8.881784197001252e-16,
+            "p99": -8.881784197001252e-16,
+            "std": 0.0
+          },
+          "geometric_tree_size_relative_error": {
+            "count": 1.0,
+            "max": 1.1102230246251565e-16,
+            "mean": 1.1102230246251565e-16,
+            "median": 1.1102230246251565e-16,
+            "min": 1.1102230246251565e-16,
+            "p95": 1.1102230246251565e-16,
+            "p99": 1.1102230246251565e-16,
+            "std": 0.0
+          },
+          "leaves": {
+            "count": 1.0,
+            "max": 1.0,
+            "mean": 1.0,
+            "median": 1.0,
+            "min": 1.0,
+            "p95": 1.0,
+            "p99": 1.0,
+            "std": 0.0
+          },
+          "nodes": {
+            "count": 1.0,
+            "max": 8.0,
+            "mean": 8.0,
+            "median": 8.0,
+            "min": 8.0,
+            "p95": 8.0,
+            "p99": 8.0,
+            "std": 0.0
+          },
+          "overflow_margin_nodes": {
+            "count": 1.0,
+            "max": 4088.0,
+            "mean": 4088.0,
+            "median": 4088.0,
+            "min": 4088.0,
+            "p95": 4088.0,
+            "p99": 4088.0,
+            "std": 0.0
+          },
+          "peak_allocated_bytes": {
+            "count": 1.0,
+            "max": 48466432.0,
+            "mean": 48466432.0,
+            "median": 48466432.0,
+            "min": 48466432.0,
+            "p95": 48466432.0,
+            "p99": 48466432.0,
+            "std": 0.0
+          },
+          "peak_reserved_bytes": {
+            "count": 1.0,
+            "max": 65011712.0,
+            "mean": 65011712.0,
+            "median": 65011712.0,
+            "min": 65011712.0,
+            "p95": 65011712.0,
+            "p99": 65011712.0,
+            "std": 0.0
+          },
+          "rollout_seconds": {
+            "count": 1.0,
+            "max": 4.4327403269999195,
+            "mean": 4.4327403269999195,
+            "median": 4.4327403269999195,
+            "min": 4.4327403269999195,
+            "p95": 4.4327403269999195,
+            "p99": 4.4327403269999195,
+            "std": 0.0
+          }
+        }
+      },
+      "trials": [
+        {
+          "gradient_proxy_variance": null,
+          "kappa_after": 1.0,
+          "kappa_before": 1.0,
+          "metrics": {
+            "arithmetic_predicted_tree_nodes": 8.0,
+            "arithmetic_tree_size_error": 0.0,
+            "arithmetic_tree_size_relative_error": 0.0,
+            "decision_law_ess": 7.0,
+            "decision_rows": 7.0,
+            "gamma_predicted_tree_nodes": 8.0,
+            "gamma_tree_size_error": 0.0,
+            "gamma_tree_size_relative_error": 0.0,
+            "geometric_predicted_tree_nodes": 7.999999999999999,
+            "geometric_tree_size_error": -8.881784197001252e-16,
+            "geometric_tree_size_relative_error": 1.1102230246251565e-16,
+            "leaves": 1.0,
+            "nodes": 8.0,
+            "overflow_margin_nodes": 4088.0,
+            "peak_allocated_bytes": 48466432.0,
+            "peak_reserved_bytes": 65011712.0,
+            "rollout_seconds": 4.4327403269999195
+          },
+          "nodes": [
+            {
+              "arithmetic_bucket_prediction": 7.0,
+              "bucket": "player:0:0",
+              "budget_admitted_beta": 1.100000023841858,
+              "budget_admitted_offspring": 1,
+              "cap_hit": false,
+              "configured_beta": 1.100000023841858,
+              "controller_cap": 1.100000023841858,
+              "duplicate_label_rate": 0.0,
+              "gamma_bucket_prediction": 7.0,
+              "geometric_bucket_prediction": 6.999999999999999,
+              "kkt_proposed_beta": 1.100000023841858,
+              "node": 0,
+              "phase": "player",
+              "predicted_descendant_cost": 1.0,
+              "randomized_offspring": 1,
+              "realized_descendant_cost": 7.0,
+              "realized_offspring": 1,
+              "reserve_after_admission": 2.0,
+              "reserve_after_child_realization": 3.0,
+              "reserve_before_proposal": 2.0,
+              "sampled_public_labels": [
+                1
+              ],
+              "street": 0,
+              "street_depth": 0,
+              "street_depth_capped_beta": 1.100000023841858,
+              "total_player_depth": 1,
+              "unique_label_fraction": 1.0
+            },
+            {
+              "arithmetic_bucket_prediction": 6.0,
+              "bucket": "player:0:1",
+              "budget_admitted_beta": 1.100000023841858,
+              "budget_admitted_offspring": 1,
+              "cap_hit": false,
+              "configured_beta": 1.100000023841858,
+              "controller_cap": 1.100000023841858,
+              "duplicate_label_rate": 0.0,
+              "gamma_bucket_prediction": 6.0,
+              "geometric_bucket_prediction": 6.0,
+              "kkt_proposed_beta": 1.100000023841858,
+              "node": 1,
+              "phase": "player",
+              "predicted_descendant_cost": 1.0,
+              "randomized_offspring": 1,
+              "realized_descendant_cost": 6.0,
+              "realized_offspring": 1,
+              "reserve_after_admission": 3.0,
+              "reserve_after_child_realization": 4.0,
+              "reserve_before_proposal": 3.0,
+              "sampled_public_labels": [
+                21
+              ],
+              "street": 0,
+              "street_depth": 1,
+              "street_depth_capped_beta": 1.100000023841858,
+              "total_player_depth": 2,
+              "unique_label_fraction": 1.0
+            },
+            {
+              "arithmetic_bucket_prediction": 5.0,
+              "bucket": "player:0:2",
+              "budget_admitted_beta": 1.100000023841858,
+              "budget_admitted_offspring": 1,
+              "cap_hit": false,
+              "configured_beta": 1.100000023841858,
+              "controller_cap": 1.100000023841858,
+              "duplicate_label_rate": 0.0,
+              "gamma_bucket_prediction": 5.0,
+              "geometric_bucket_prediction": 4.999999999999999,
+              "kkt_proposed_beta": 1.100000023841858,
+              "node": 2,
+              "phase": "player",
+              "predicted_descendant_cost": 1.0,
+              "randomized_offspring": 1,
+              "realized_descendant_cost": 5.0,
+              "realized_offspring": 1,
+              "reserve_after_admission": 4.0,
+              "reserve_after_child_realization": 5.0,
+              "reserve_before_proposal": 4.0,
+              "sampled_public_labels": [
+                0
+              ],
+              "street": 0,
+              "street_depth": 2,
+              "street_depth_capped_beta": 1.100000023841858,
+              "total_player_depth": 3,
+              "unique_label_fraction": 1.0
+            },
+            {
+              "arithmetic_bucket_prediction": 4.0,
+              "bucket": "player:0:3",
+              "budget_admitted_beta": 1.100000023841858,
+              "budget_admitted_offspring": 1,
+              "cap_hit": false,
+              "configured_beta": 1.100000023841858,
+              "controller_cap": 1.100000023841858,
+              "duplicate_label_rate": 0.0,
+              "gamma_bucket_prediction": 4.0,
+              "geometric_bucket_prediction": 4.0,
+              "kkt_proposed_beta": 1.100000023841858,
+              "node": 3,
+              "phase": "player",
+              "predicted_descendant_cost": 1.0,
+              "randomized_offspring": 1,
+              "realized_descendant_cost": 4.0,
+              "realized_offspring": 1,
+              "reserve_after_admission": 5.0,
+              "reserve_after_child_realization": 6.0,
+              "reserve_before_proposal": 5.0,
+              "sampled_public_labels": [
+                1
+              ],
+              "street": 0,
+              "street_depth": 3,
+              "street_depth_capped_beta": 1.100000023841858,
+              "total_player_depth": 4,
+              "unique_label_fraction": 1.0
+            },
+            {
+              "arithmetic_bucket_prediction": 3.0,
+              "bucket": "player:0:4",
+              "budget_admitted_beta": 1.100000023841858,
+              "budget_admitted_offspring": 1,
+              "cap_hit": false,
+              "configured_beta": 1.100000023841858,
+              "controller_cap": 1.100000023841858,
+              "duplicate_label_rate": 0.0,
+              "gamma_bucket_prediction": 3.0,
+              "geometric_bucket_prediction": 3.0000000000000004,
+              "kkt_proposed_beta": 1.100000023841858,
+              "node": 4,
+              "phase": "player",
+              "predicted_descendant_cost": 1.0,
+              "randomized_offspring": 1,
+              "realized_descendant_cost": 3.0,
+              "realized_offspring": 1,
+              "reserve_after_admission": 6.0,
+              "reserve_after_child_realization": 7.0,
+              "reserve_before_proposal": 6.0,
+              "sampled_public_labels": [
+                1
+              ],
+              "street": 0,
+              "street_depth": 4,
+              "street_depth_capped_beta": 1.100000023841858,
+              "total_player_depth": 5,
+              "unique_label_fraction": 1.0
+            },
+            {
+              "arithmetic_bucket_prediction": 2.0,
+              "bucket": "player:0:5",
+              "budget_admitted_beta": 1.100000023841858,
+              "budget_admitted_offspring": 1,
+              "cap_hit": false,
+              "configured_beta": 1.100000023841858,
+              "controller_cap": 1.100000023841858,
+              "duplicate_label_rate": 0.0,
+              "gamma_bucket_prediction": 2.0,
+              "geometric_bucket_prediction": 2.0,
+              "kkt_proposed_beta": 1.100000023841858,
+              "node": 5,
+              "phase": "player",
+              "predicted_descendant_cost": 1.0,
+              "randomized_offspring": 1,
+              "realized_descendant_cost": 2.0,
+              "realized_offspring": 1,
+              "reserve_after_admission": 7.0,
+              "reserve_after_child_realization": 8.0,
+              "reserve_before_proposal": 7.0,
+              "sampled_public_labels": [
+                1
+              ],
+              "street": 0,
+              "street_depth": 5,
+              "street_depth_capped_beta": 1.100000023841858,
+              "total_player_depth": 6,
+              "unique_label_fraction": 1.0
+            },
+            {
+              "arithmetic_bucket_prediction": 1.0,
+              "bucket": "player:0:6",
+              "budget_admitted_beta": 1.100000023841858,
+              "budget_admitted_offspring": 1,
+              "cap_hit": false,
+              "configured_beta": 1.100000023841858,
+              "controller_cap": 1.100000023841858,
+              "duplicate_label_rate": 0.0,
+              "gamma_bucket_prediction": 1.0,
+              "geometric_bucket_prediction": 1.0,
+              "kkt_proposed_beta": 1.100000023841858,
+              "node": 6,
+              "phase": "player",
+              "predicted_descendant_cost": 1.0,
+              "randomized_offspring": 1,
+              "realized_descendant_cost": 1.0,
+              "realized_offspring": 1,
+              "reserve_after_admission": 8.0,
+              "reserve_after_child_realization": 8.0,
+              "reserve_before_proposal": 8.0,
+              "sampled_public_labels": [
+                1
+              ],
+              "street": 0,
+              "street_depth": 6,
+              "street_depth_capped_beta": 1.100000023841858,
+              "total_player_depth": 7,
+              "unique_label_fraction": 1.0
+            }
+          ],
+          "seed": 20260715,
+          "target_variance": null,
+          "trial": 0,
+          "unavailable_metrics": [
+            "target_variance",
+            "gradient_proxy_variance"
+          ]
+        }
+      ]
+    }
+  ],
+  "schema": "pbg-branching-experiment-v1",
+  "scientific_config": {
+    "completion": {
+      "backend": "cuda",
+      "n_samples": 64
+    },
+    "game": {
+      "name": "poker",
+      "poker": {
+        "bb": 1.0,
+        "chip_unit_bb": 0.5,
+        "n_players": 6,
+        "sb": 0.5,
+        "stack_bb": 10.0
+      },
+      "synthetic": null
+    },
+    "loss": {
+      "c_h": 0.1,
+      "c_kl": 0.2,
+      "c_v": 0.0005,
+      "clip_eps": 0.2,
+      "clip_eps_v": 0.2,
+      "entropy_schedule": "const",
+      "lam": 1.0,
+      "name": "rb_ppo",
+      "value_loss": "clipped"
+    },
+    "model": {
+      "d_model": 96,
+      "k_act": 7,
+      "m_raise": 4,
+      "max_players": 6,
+      "n_heads": 4,
+      "n_layers_post": 2,
+      "n_layers_pre": 2
+    },
+    "rollout": {
+      "beta": {
+        "chance_to_flop": 1.5,
+        "chance_to_river": 1.25,
+        "chance_to_turn": 1.25,
+        "default": 1.0,
+        "flop": 1.25,
+        "preflop": 1.1,
+        "river": 1.25,
+        "turn": 1.25
+      },
+      "n_trees": 1,
+      "node_budget": 4096,
+      "reach_storage": "recompute",
+      "trajectory_chunk_size": null
+    },
+    "training": {
+      "adam_betas": [
+        0.9,
+        0.999
+      ],
+      "amp": false,
+      "checkpoint_every": 250,
+      "gd_steps_per_iter": 1,
+      "grad_clip": 0.5,
+      "iters": 20000,
+      "kl_ref_interval": 50,
+      "lr": 0.0001,
+      "minibatch_size": 32,
+      "mode": "branched_rao_blackwell",
+      "optimizer": "adamw",
+      "out_dir": "runs/nlhe6_10bb_7h",
+      "ppo_epochs": null,
+      "reproducibility": "throughput",
+      "seed": 47
+    }
+  }
+}

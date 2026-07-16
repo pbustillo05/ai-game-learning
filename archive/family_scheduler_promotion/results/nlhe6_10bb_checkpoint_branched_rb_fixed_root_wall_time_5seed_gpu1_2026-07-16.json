@@ -1,0 +1,41 @@
+{
+  "bootstrap_resamples": 10000,
+  "bootstrap_seed": 0,
+  "comparison": "family_fifo_v1_over_wavefront_v1_fixed_root_wall_time",
+  "confidence": 0.95,
+  "decision": "accepted_topology_aware_exception",
+  "max_upper_ratio": 1.2,
+  "metrics": {
+    "phase_rollout_seconds": {
+      "aggregate_bootstrap_interval": [0.9717440351174499, 1.197704019792516],
+      "aggregate_ratio": 1.0768687308179632,
+      "paired_ratios": [
+        0.8838319055783177,
+        1.0472903934679674,
+        1.019282309408276,
+        1.223053885620668,
+        1.2559242906930075
+      ],
+      "passes_upper_bound": true
+    },
+    "profiled_iteration_seconds": {
+      "aggregate_bootstrap_interval": [0.9196085276152066, 1.079765883380066],
+      "aggregate_ratio": 0.9944671601796189,
+      "paired_ratios": [
+        0.8794737175251977,
+        1.0217854816575014,
+        0.9150506927372042,
+        1.0662733600735024,
+        1.12368930081076
+      ],
+      "passes_upper_bound": true
+    }
+  },
+  "note": "One root/tree is the fixed scientific work unit. Per-decision normalization is inadmissible here because the executor artifacts are not pathwise identical and realize different topology.",
+  "queued_decisions": [6, 7, 7, 7, 9],
+  "queued_source": "nlhe6_10bb_checkpoint_fifo_branched_rb_actual_cost_singleton_q128_5seed_gpu1_2026-07-16.json",
+  "repeat_seeds": [104776, 209505, 314234, 418963, 523692],
+  "schema": "pbg-fixed-root-executor-comparison-v1",
+  "wavefront_decisions": [7, 7, 14, 10, 7],
+  "wavefront_source": "nlhe6_10bb_checkpoint_wavefront_branched_rb_5seed_gpu1_2026-07-16.json"
+}

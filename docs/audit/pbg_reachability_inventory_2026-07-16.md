@@ -1,108 +1,82 @@
 # Active `pbg/` reachability inventory — 2026-07-16
 
-This inventory records the evidence used for the post-FIFO cleanup.  It was
-written before deleting implementation code.  The authoritative runtime roots
-are the `pbg-train` and `pbg-benchmark` entry points in `pyproject.toml`; the
-accepted active game is configurable NLHE cash poker.  Imports were checked
-across `pbg/` and `tests/`, all YAML files were loaded through the strict
-configuration schema, and the pre-cleanup CPU suite produced 223 passes and 14
-skips.  Its two failures were sandbox-denied Gloo socket creation in the two
-CPU distributed tests.
+This inventory was established before deletion and checked again after cleanup.
+Evidence came from package imports, `pyproject.toml` entry points, strict loading
+of every active YAML file, runtime dispatch, test imports, and the broad CPU
+suite. The only active game is configurable NLHE cash poker.
 
 ## Dependency map
 
 ```text
-pbg-train -> cli.train -> core.config -> games.poker.bundle
-                         core.training -> core.rollout/core.branching
-                                       -> core queue/execution primitives
-                                       -> core values/loss/minibatch/tree
-                         games.poker.bundle -> engine/cards/ranges/model
-                                            -> tensor rollout backend
-                                            -> sibling evaluator PBG API
+pbg-train
+  -> pbg.config -> core config parser + poker validation
+  -> pbg.runtime -> poker bundle + core training
+       -> core rollout/branching -> core execution/tree
+       -> core completion/values/normal/minibatch/losses/distributed
+       -> poker tensor backend/model -> sibling evaluator PBG API
 
-pbg-benchmark -> cli.benchmark -> benchmark -> the same config, bundle,
-                                                rollout, value, and learner path
-
-eval.arena -> poker engine/model/evaluator adapters (offline support tooling)
+pbg-benchmark -> the same config, bundle, rollout, value, and learner path
+pbg.eval.arena -> poker engine/model/evaluator adapters (offline support)
 ```
 
-The normal, sequential Rao--Blackwell, and branched Rao--Blackwell modes all
-reach the same family-scheduled implementation.  The former wavefront routines
-are reached only by `rollout.executor` dispatch, executor comparison tooling,
-and their regression tests/configurations.
+`pbg.core` has no static game/evaluation import. The top-level composition
+modules own the only core-to-poker connection. Normal, sequential RB, and
+branched RB reach the same family scheduler; there is no runtime implementation
+selector.
 
-## Classification
+## Classification and disposition
 
 ### Active production
 
-- `pbg/core/{config,game,rollout,branching,completion,tree,values,normal,
-  minibatch,losses,training}.py`: configuration, rollout/value construction,
-  and learning.  `posterior_values.py` contains the current implementation but
-  is hidden behind a `values.py` compatibility re-export; these will be
-  consolidated under `values.py`.
-- `pbg/core/{distributed,observability}.py`: the global-mass/gradient law and
-  execution measurements.  `distributed.py` is directly exercised by law
-  tests; production's equivalent calculations will be kept aligned rather than
-  discarded as test-only code.
-- The family scheduler, occurrence arena, stable routing, logical RNG, and
-  admission primitives currently in `pbg/core/queued.py`.  They are production
-  mechanisms, not migration code, and will move to a neutral module/name.
-- Every Python module under `pbg/games/poker/` except empty package markers:
-  NLHE rules, compact-deck geometry, ranges, model, rollout backend, completion,
-  and the read-only sibling evaluator boundary are all reached by bundle
-  construction, training, evaluation, or contract tests.
+- `pbg/config.py` and `pbg/runtime.py`: strict NLHE composition roots.
+- `pbg/core/config.py`, `game.py`, `execution.py`, `rollout.py`,
+  `branching.py`, `completion.py`, `tree.py`, `values.py`, `normal.py`,
+  `minibatch.py`, `losses.py`, `distributed.py`, `observability.py`, and
+  `training.py`: the single rollout/value/learner implementation.
+- Every nonempty module under `pbg/games/poker/`: NLHE rules, compact deck,
+  ranges, model, tensor rollout, completion, and evaluator boundary.
 
 ### Active support/tooling
 
-- `pbg/benchmark.py`, `pbg/cli/benchmark.py`: single-implementation performance
-  and mode benchmarking remains useful; executor A/B comparison code does not.
-- `pbg/eval/arena.py`: accepted offline poker evaluation surface.
-- `pbg/core/logging_util.py` and `pbg/cli/train.py`: metrics and launch surfaces.
-- `TreeBuilder` and small CPU fixtures in `tree.py`: deterministic construction
-  support for value-law tests, not an alternate rollout implementation.
+- `pbg/benchmark.py` and its CLI: same-implementation profiling across modes.
+- `pbg/eval/arena.py`: offline duplicate-deal evaluation.
+- `pbg/core/logging_util.py`, the training CLI, and `tools/poker-python`.
+- `TreeBuilder` and CPU fixtures used for deterministic target-law tests.
 
-### Historical and worth archiving
+### Historical and archived
 
-- `pbg/experiments/branching.py`, `pbg/cli/branching_experiment.py`, and the
-  experiment-controller hooks in legacy branching: useful record of branching
-  intensity investigations, but absent from production training dispatch.
-- FIFO migration plans, the executor comparison experiment log/results, and
-  wavefront benchmark configurations: useful promotion evidence, but no longer
-  operational guidance or supported configuration.
-- The already archived Kuhn/Leduc/synthetic snapshot.  It remains outside
-  `pbg/`, is not selected by package discovery, and is excluded by pytest's
-  `testpaths = ["tests"]`.
+- The branching-controller experiment and CLI.
+- Scheduler migration plans, promotion comparisons, raw benchmark JSON, and
+  one-off launch scripts under `archive/family_scheduler_promotion/`.
+- Pre-production audit generations under `archive/audits/`.
+- Kuhn, Leduc, and synthetic implementations under `archive/synthetic_games/`.
+  Archived Python is outside package discovery and CI test paths.
 
-### Obsolete and safe to delete
+### Obsolete and deleted
 
-- Wavefront sequential and branched rollout bodies, their dispatch constants,
-  `rollout.executor`, trajectory-chunk compatibility, executor-comparison CLI,
-  benchmark comparison functions, tests, and supported-documentation claims.
-- `pbg/core/policy_adapter.py`: no runtime or test import; poker owns the only
-  active adapter/output contracts.
-- `pbg/core/values.py` as a re-export shim after moving the implementation into
-  that canonical module.
-- `RootConfig.train`, `RolloutConfig.n_trees`, and `beta_mode` compatibility
-  aliases.  Current checkpoints restore tensor/optimizer/RNG state and do not
-  parse their saved configuration back into the active schema, so these aliases
-  are not needed for checkpoint resume.
-- Fixed-family-quantum packing and its selector.  Accepted production uses the
-  actual-cost family splitter; retaining a second physical packing path would
-  preserve an unsupported alternate implementation.
+- Sequential and branched wavefront implementations, executor dispatch,
+  comparison CLI/benchmark code, configs, shims, and regression-only tests.
+- Fixed-family-quantum packing and its configuration selector.
+- `pbg/core/policy_adapter.py`; poker owns the sole active adapter contract.
+- The `posterior_values.py`/`values.py` compatibility split and the test-only
+  full-completion value reducer; production has one streamed reducer.
+- The unused auxiliary value channel, keyed completion protocol, normal rollout
+  wrapper, equal-rank diagnostic, and binomial raise-head ablation.
+- Game factory/selector machinery and all active retired-game surfaces.
+- `RootConfig.train`, `RolloutConfig.n_trees`, `beta_fix`, `beta_mode`,
+  `root_states`, FIFO/version names, queue-packing flags, and trajectory chunks.
 
-### Uncertain pending evidence
+### Compatibility retained deliberately
 
-- No active `pbg/` module remains uncertain.  Historical reference-paper text
-  mentioning retired games is third-party source material and is deliberately
-  not rewritten.  Raw run/checkpoint directories are runtime artifacts rather
-  than package architecture; only promotion evidence selected for archive will
-  be committed.
+Checkpoint resume still normalizes CUDA RNG byte tensors to CPU before calling
+the CUDA RNG setter. Relevant NLHE checkpoints restore tensors, optimizer,
+scaler, and explicit RNG payloads directly; their saved configuration is
+compared as data, not reparsed through YAML. No general legacy-config loader is
+therefore retained.
 
-## Planned archive/delete set
+## Uncertain areas
 
-Archive the branching experiment and migration/promotion narrative under
-`archive/`.  Delete wavefront and executor comparison implementation, obsolete
-configuration presets, comparison-only tests, dead adapter protocol code, and
-duplicate API shims.  Rename the surviving queue implementation and controls
-to production-neutral execution/family terminology.  All active YAML files
-will use one strict NLHE-only schema and removed keys will fail as unknown.
+No active `pbg/` module remains unclassified. Third-party reference-paper text
+and historical archive content intentionally retain old game and migration
+terminology. Existing `runs/` directories are runtime artifacts rather than
+source architecture and were not rewritten by this cleanup.

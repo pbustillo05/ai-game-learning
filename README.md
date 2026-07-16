@@ -1,172 +1,101 @@
-# Public-action Bayesian game learning
+# GPU NLHE strategy learning
 
-`pbg` is a GPU-oriented research framework for learning strategies in
-imperfect-information games. Its sole active game is configurable no-limit
-Texas hold'em; the retired synthetic games are preserved under
-`archive/synthetic_games/` as inert history.
+`pbg` is a GPU-oriented framework for learning strategies in configurable
+imperfect-information no-limit Hold'em cash games. NLHE is the sole active
+game. Retired Kuhn, Leduc, and synthetic implementations are inert history
+under `archive/synthetic_games/`.
 
-The implementation plan in `archive/prompts/` is complete. Those files remain as
-development history; this README describes the repository as a normal,
-implemented project.
+## Production surface
 
-## What is implemented
+- equal-stack NLHE with 2--6 players, 8--128 bb stacks, and 4--13 highest ranks;
+- normal PPO, sequential Rao--Blackwell PPO, and branched Rao--Blackwell PPO;
+- one family-scheduled rollout implementation across all three modes;
+- logical RNG addressing invariant to queue order and physical batching;
+- streamed evaluator completion and posterior-mass value reduction;
+- exact global decision-mass scaling and flat distributed gradient `SUM`;
+- strict configuration, memory preflight, metrics, atomic checkpoint, and resume;
+- preflop class and compact postflop attention models; and
+- duplicate-deal checkpoint evaluation and same-implementation benchmarking.
 
-- Strict configuration, explicit RNGs, configurable reproducibility profiles,
-  resumable checkpoints, AMP, and gradient-only DDP.
-- Device-resident sequential and fixed-intensity public-tree rollout.
-- Duplicate-preserving labeled branching with randomized-rounded offspring.
-- Monte Carlo leaf completion and posterior-moment backward propagation.
-- Rao–Blackwellized PPO over all actor private types.
-- NLHE configuration by player count, stack depth, and compact suffix-deck rank
-  count.
-- Comparative three-mode phase/throughput/memory profiling with same-device
-  regression gates.
-- A public NLHE engine with correct betting, short-all-in reopening, chance
-  transitions, side pots, and affine chip-payoff assembly.
-- Preflop 169-class and compact postflop 1326-combo transformer models.
-- CPU/CUDA tensor-native poker rollout and paired duplicate-deal evaluation.
-- A strict adapter boundary to `poker-gpu-evaluator` for all private poker
-  combinatorics and showdown evaluation.
+This repository owns public poker state, policy, likelihood reaches, and chip
+accounting. The read-only sibling `poker_gpu_evaluator.pbg` API owns all joint
+private-profile sampling, collision-conditioned completion, folded-card
+partition summaries, and showdown comparison. There is no local poker-math
+fallback.
 
 ## Architecture
 
-The generic package under `pbg/core/` operates on opaque state handles and
-game-neutral tensor protocols. A game factory returns one typed `GameBundle`
-containing its model, rollout backend, policy adapter, and completion backend.
-Synthetic and poker implementations live under `pbg/games/`; evaluation is
-read-only under `pbg/eval/`.
+```text
+pbg.config / pbg.runtime     strict NLHE composition
+  pbg.core                   generic execution, rollout, values, loss, training
+  pbg.games.poker            NLHE engine, model, tensor backend, evaluator API
+  pbg.eval                   offline duplicate-deal arena
+```
 
-The active training pipeline is:
+The active iteration is:
 
 ```text
-frozen model -> sampled trajectories or one tree/rank -> leaf completion
-             -> posterior P/M backward pass -> aligned decision minibatches
-             -> posterior-weighted clipped policy + value + entropy update
+frozen model -> family-scheduled trajectories or one labeled tree/rank
+             -> sampled settlement or streamed evaluator completion
+             -> compact aligned targets -> globally scaled learner update
 ```
 
-Poker ownership is intentionally split. This repository owns public game
-navigation, policies, ranges, pots, and chip-EV assembly.
-`poker_gpu_evaluator.pbg` owns collision-conditioned private profiles,
-folded-card partition summaries, completion/equity, hand comparison, ties, and
-per-pot winner shares. See
-[`archive/POKER_GPU_EVALUATOR_IO.md`](archive/POKER_GPU_EVALUATOR_IO.md).
+There is no game selector, rollout executor selector, wavefront compatibility
+path, or active legacy-game package.
 
-## Requirements and installation
+## Environment
 
-- Python 3.10+
-- PyTorch 2.2+
-- NumPy, PyYAML, and pytest
-- The sibling `poker-gpu-evaluator` repository for poker completion and
-  integration paths
+Use Python 3.10+, PyTorch 2.2+, NumPy, PyYAML, pytest, and the sibling evaluator.
+On the shared GPU server use `/home/pablob/.venvs/poker`; do not install into
+system Python. `tools/poker-python` verifies the checked CUDA toolkit and sibling
+API before launching Python.
 
-On the shared GPU server, use the persistent poker virtual environment and do
-not install into system Python:
+## Train
 
 ```bash
-/home/pablob/.venvs/poker/bin/python -m pip install -e .
-/home/pablob/.venvs/poker/bin/python -m pip install -e ../poker-gpu-evaluator
-```
-
-The sibling install is optional for synthetic-only work and required for real
-poker evaluator calls.
-
-## Configuration
-
-Complete presets are provided in `configs/`:
-
-- `kuhn_smoke.yaml` — small sequential Kuhn run.
-- `leduc.yaml` — fixed-intensity Leduc branching.
-- `synthetic_dial_example.yaml` — scalable two-player synthetic example.
-- `train/nlhe6.yaml` — hardware-independent six-player NLHE settings; combine
-  with a profile under `configs/hardware/`.
-
-Configuration loading rejects unknown or missing fields. Game-owned mappings
-are validated when their bundle is constructed. See
-[`docs/training_and_evaluation.md`](docs/training_and_evaluation.md) for the
-schema and preset details.
-
-## Training
-
-Long-running training accepts a scientific config and a separate hardware
-profile:
-
-```bash
-pbg-train \
-  --config configs/train/nlhe6.yaml \
+pbg-train --config configs/train/nlhe6.yaml \
   --hardware-profile local_3x2080ti
 ```
 
-The equivalent Python API is
-`load_config(path, hardware_profile="local_3x2080ti")`. Hardware profiles
-control execution ceilings and launch metadata only; they do not alter the
-game, model, estimator, loss, or checkpoint parameter schema.
+Resume with the identical scientific config and existing run directory:
 
-The console entry point defaults to `local_3x2080ti` when the hardware flag is
-omitted. Quest access is available, but the cluster profile is intentionally
-deferred pending the local readiness gate in [`HARDWARE.md`](HARDWARE.md) and
-must always be selected explicitly with `--hardware-profile quest_slurm`.
+```bash
+pbg-train --config configs/train/nlhe6.yaml \
+  --hardware-profile local_3x2080ti \
+  --resume runs/nlhe6/ckpt_0000100.pt
+```
 
-Training writes append-only `metrics.jsonl` rows and atomic checkpoints to the
-configured output directory. Checkpoints contain model, optimizer, gradient
-scaler, configuration, iteration, stable run identity, and per-rank explicit
-Torch/NumPy RNG state. Resume the same run with `--resume
-runs/.../ckpt_XXXXXXX.pt`; identity, configuration, world size, schedule, and
-the metrics prefix are validated before appending.
+The Python entry points are `pbg.config.load_config` and `pbg.runtime.train`.
+Hardware profiles change execution limits only. For multiple ranks use
+`torchrun`; global sequential starts are partitioned across ranks, while
+branched mode creates one root/tree per rank.
 
-For DDP, launch the same code with `torchrun`. Tree and minibatch sizes are per
-rank. Before CUDA work on a shared server, inspect `nvidia-smi`, use only an
-idle explicitly selected GPU, stage small smoke runs first, and verify the GPU
-returns to idle afterward.
+Before CUDA work, inspect `nvidia-smi`, select only idle devices, start with a
+tiny smoke, retain the configured reserve, and verify clean teardown.
 
-## Evaluation
-
-`pbg.eval.exploitability` performs exact read-only evaluation of feasible
-synthetic checkpoints and writes iteration-sorted exploitability curves.
-
-`pbg.eval.arena` compares poker checkpoints using paired duplicate deals,
-complement runouts, seat rotation, and paired Student-t confidence intervals.
-Every showdown crosses the evaluator facade.
-
-## Tests
-
-Run the full suite from the repository root:
+## Validate
 
 ```bash
 /home/pablob/.venvs/poker/bin/python -m pytest -q
 ```
 
-The tests cover strict contracts, exact synthetic oracles, sampled terminal
-laws, posterior targets, loss weighting, public poker rules, model behavior,
-CPU/tensor parity, evaluator boundaries, device residency, DDP, checkpointing,
-and short integration runs. CUDA- and sibling-dependent tests skip when their
-prerequisites are unavailable.
+Tests cover strict retired-key rejection, all three modes, labeled topology,
+randomized rounding, logical RNG invariance, old-policy identity, real evaluator
+integration, completion, unequal distributed mass, finite gradients,
+checkpoint/resume, and GPU memory safety. CUDA and sibling-dependent tests skip
+when prerequisites are unavailable.
 
 ## Documentation
 
-The implementation documentation starts at [`docs/README.md`](docs/README.md):
+- [`CONTRACTS.md`](CONTRACTS.md) — active runtime/configuration invariants.
+- [`NOTATION.md`](NOTATION.md) and
+  [`docs/theory/core_math.tex`](docs/theory/core_math.tex) — mathematics.
+- [`docs/README.md`](docs/README.md) — implementation documentation index.
+- [`docs/training_and_evaluation.md`](docs/training_and_evaluation.md) —
+  configuration, commands, checkpoints, benchmarks, and GPU procedure.
+- [`docs/audit/README.md`](docs/audit/README.md) — current readiness and cleanup
+  reachability evidence.
+- [`archive/`](archive/) — retired games, superseded audits, migration plans,
+  raw promotion comparisons, and historical prompts.
 
-- [`docs/architecture.md`](docs/architecture.md)
-- [`docs/core_algorithms.md`](docs/core_algorithms.md)
-- [`archive/synthetic_games/`](archive/synthetic_games/)
-- [`docs/poker.md`](docs/poker.md)
-- [`docs/training_and_evaluation.md`](docs/training_and_evaluation.md)
-- [`docs/file_reference.md`](docs/file_reference.md), covering every tracked
-  file
-
-Authoritative technical sources are
-[`CONTRACTS.md`](CONTRACTS.md), [`NOTATION.md`](NOTATION.md), and
-[`docs/theory/core_math.tex`](docs/theory/core_math.tex). The current audit and
-status matrix start at [`docs/audit/README.md`](docs/audit/README.md).
-Historical implementation status and decisions are recorded in
-[`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md).
-
-## Project status
-
-All implementation and correction prompts through P13B are historical. The
-current default is the corrected fixed-intensity RB-PPO path, with active
-readiness gaps tracked in [`docs/audit/findings.md`](docs/audit/findings.md)
-and completed audit work tracked in
-[`docs/audit/resolved_findings.md`](docs/audit/resolved_findings.md). Learned
-Neyman allocation, reference-policy KL, NeuRD/R-NaD objectives, and public
-moment losses remain explicit research extensions rather than unfinished
-requirements.
+`IMPLEMENTATION_NOTES.md` is a historical ledger, not a current contract.
