@@ -41,6 +41,22 @@ The historical baseline implementation was retained only long enough to produce
 this evidence. Removing it does not alter the accepted estimator or scheduling
 contract.
 
+## Cleanup revalidation
+
+The simplified tree was revalidated after removal of the alternate paths:
+
+- The broad CPU suite passed with 212 tests and 12 CUDA/environment skips;
+  the socket-enabled DDP suite separately passed all 3 tests.
+- Four focused CUDA/evaluator tests passed on GPU 1, including transactional
+  queue/arena/RNG behavior and real sibling-evaluator integration.
+- One-iteration trained NLHE smokes passed for normal, sequential RB, and
+  branched RB through the same scheduler, with finite gradients and checkpoints
+  in every mode.
+- A two-rank normal smoke on GPUs 1 and 2 exercised unequal local decision
+  masses (19 and 24), exact global mass 43, a finite reduced gradient, and a
+  successful two-rank load of its checkpoint.
+- GPUs 1 and 2 returned to their initial idle footprints of 9 MiB and 19 MiB.
+
 ## Current validation requirement
 
 Before CUDA work, inspect `nvidia-smi`; use only idle RTX 2080 Ti devices and
