@@ -21,9 +21,6 @@ from pbg.games.poker.rollout_backend import PokerRolloutBackend
 
 ROOT = Path(__file__).parents[1]
 PRESETS = (
-    "kuhn_smoke.yaml",
-    "leduc.yaml",
-    "synthetic_dial_example.yaml",
     "nlhe6_h100.yaml",
 )
 DEFERRED = {
@@ -33,15 +30,11 @@ DEFERRED = {
 
 
 def _small_poker_cfg(tmp_path: Path):
-    cfg = load_config(ROOT / "configs" / "kuhn_smoke.yaml")
-    cfg.game.name = "poker"
-    cfg.game.synthetic = None
+    cfg = load_config(ROOT / "configs" / "nlhe6_h100.yaml")
     cfg.game.poker = {
         "n_players": 2,
-        "stack_bb": 2.0,
-        "sb": 0.5,
-        "bb": 1.0,
-        "chip_unit_bb": 0.5,
+        "stack_bb": 8.0,
+        "rank_count": 13,
     }
     cfg.rollout.n_trees = 2
     cfg.rollout.node_budget = 64
@@ -87,26 +80,12 @@ def test_all_first_run_presets_load_strictly_without_deferred_settings() -> None
     for name in PRESETS:
         raw = yaml.safe_load((ROOT / "configs" / name).read_text(encoding="utf-8"))
         assert not (_keys(raw) & DEFERRED)
-    assert loaded["kuhn_smoke.yaml"].rollout.n_trees == 512
-    assert loaded["leduc.yaml"].rollout.beta_fix == {
-        "default": 1.0, "round_0": 1.0, "chance_round_1": 2.0, "round_1": 2.0,
-    }
     nlhe = loaded["nlhe6_h100.yaml"]
     assert nlhe.game.poker["n_players"] == 6
     assert nlhe.rollout.n_trees == 1 and nlhe.rollout.node_budget == 4096
     assert nlhe.train.minibatch_size == 2
     assert nlhe.completion.backend == "cuda"
     assert nlhe.train.iters == 10_000 and nlhe.train.checkpoint_every == 100
-
-
-def test_shipped_dial_uses_one_embedding_row_per_public_history() -> None:
-    cfg = load_config(ROOT / "configs" / "synthetic_dial_example.yaml")
-    bundle = build_game_bundle(cfg, torch.device("cpu"))
-    game = bundle.rollout_backend.game
-    keys = torch.tensor(game.states.history_hash, dtype=torch.int64)
-    assert keys.unique().numel() == keys.numel()
-    assert bundle.model.n_buckets == int(keys.max()) + 1
-
 
 def test_poker_rollout_memory_plan_bounds_recompute_and_full_storage() -> None:
     safe = estimate_rollout_memory(

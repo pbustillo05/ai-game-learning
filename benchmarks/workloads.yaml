@@ -1,20 +1,5 @@
 schema: pbg-benchmark-workloads-v1
 workloads:
-  - name: kuhn_cpu
-    config: configs/kuhn_smoke.yaml
-    device: cpu
-    modes: [normal, rao_blackwell, branched_rao_blackwell]
-    args: [--n-trees, "512", --node-budget, "512", --completion-samples, "256"]
-  - name: leduc_cpu
-    config: configs/leduc.yaml
-    device: cpu
-    modes: [normal, rao_blackwell, branched_rao_blackwell]
-    args: [--n-trees, "128", --node-budget, "131072", --completion-samples, "128"]
-  - name: dial_3x2_cpu
-    config: configs/synthetic_dial_example.yaml
-    device: cpu
-    modes: [normal, rao_blackwell, branched_rao_blackwell]
-    args: [--n-trees, "64", --node-budget, "131072", --completion-samples, "128"]
   - name: nlhe_tiny_cuda
     config: configs/benchmarks/nlhe_hu_short.yaml
     hardware_profile: local_3x2080ti

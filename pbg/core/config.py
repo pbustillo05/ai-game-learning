@@ -20,10 +20,9 @@ class ConfigError(ValueError):
 
 @dataclass
 class GameConfig:
-    """Select a game and retain its game-owned configuration mapping."""
+    """Select NLHE and retain its game-owned configuration mapping."""
 
     name: str
-    synthetic: dict[str, Any] | None = None
     poker: dict[str, Any] | None = None
 
 
@@ -133,7 +132,6 @@ class RootConfig:
 _ConfigT = TypeVar("_ConfigT")
 
 _GAME_CONFIG_VALIDATORS = {
-    "synthetic": "pbg.games.synthetic.bundle:validate_config",
     "poker": "pbg.games.poker.bundle:validate_config",
 }
 
@@ -233,22 +231,14 @@ def _parse_dataclass(cls: type[_ConfigT], value: Any, path: str) -> _ConfigT:
 def _validate_config(cfg: RootConfig) -> None:
     """Validate frozen enumerations and the external evaluator boundary."""
 
-    if cfg.game.name not in {"synthetic", "poker"}:
-        raise ConfigError("root.game.name: expected 'synthetic' or 'poker'")
-    if cfg.game.name == "synthetic":
-        if cfg.game.synthetic is None:
-            raise ConfigError("root.game.synthetic: required when game.name is 'synthetic'")
-        if cfg.game.poker is not None:
-            raise ConfigError("root.game.poker: must be null when game.name is 'synthetic'")
-    if cfg.game.name == "poker":
-        if cfg.game.poker is None:
-            raise ConfigError("root.game.poker: required when game.name is 'poker'")
-        if cfg.game.synthetic is not None:
-            raise ConfigError("root.game.synthetic: must be null when game.name is 'poker'")
-        if cfg.completion.backend not in {"auto", "cpu", "cuda"}:
-            raise ConfigError(
-                "root.completion.backend: poker requires 'auto', 'cpu', or 'cuda'"
-            )
+    if cfg.game.name != "poker":
+        raise ConfigError("root.game.name: expected 'poker'")
+    if cfg.game.poker is None:
+        raise ConfigError("root.game.poker: required")
+    if cfg.completion.backend not in {"auto", "cpu", "cuda"}:
+        raise ConfigError(
+            "root.completion.backend: poker requires 'auto', 'cpu', or 'cuda'"
+        )
     module_name, _, function_name = _GAME_CONFIG_VALIDATORS[cfg.game.name].partition(":")
     validator = getattr(importlib.import_module(module_name), function_name)
     try:

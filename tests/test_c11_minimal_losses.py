@@ -9,11 +9,11 @@ from pbg.core.losses import COMPOSITES, LossSpec, finalize_metric_stats
 from pbg.core.normal import NormalMinibatch, index_normal_minibatch
 from pbg.core.minibatch import MinibatchSample
 from pbg.core.values import NodeTargets
-from pbg.games.synthetic.model import PolicyOutput, SyntheticPolicyAdapter
+from tests.categorical_policy_fixture import CategoricalPolicyAdapter, PolicyOutput
 
 
 def test_registered_minimal_loss_uses_duplicate_children_independently() -> None:
-    adapter = SyntheticPolicyAdapter()
+    adapter = CategoricalPolicyAdapter()
     logits = torch.tensor([[[0.0, 0.0]]], requires_grad=True)
     output = PolicyOutput(logits, torch.zeros((1, 1), requires_grad=True))
     legal_ids = torch.tensor([[0, 1]], dtype=torch.int32)
@@ -58,7 +58,7 @@ def test_registered_minimal_loss_uses_duplicate_children_independently() -> None
 
 
 def test_normal_ppo_selects_only_the_sampled_private_type() -> None:
-    adapter = SyntheticPolicyAdapter()
+    adapter = CategoricalPolicyAdapter()
     logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], requires_grad=True)
     output = PolicyOutput(logits, torch.tensor([[1.0, 7.0]], requires_grad=True))
     legal_ids = torch.tensor([[0, 1]], dtype=torch.int32)
@@ -91,7 +91,7 @@ def test_normal_ppo_selects_only_the_sampled_private_type() -> None:
 
 
 def test_physical_batch_loss_and_metrics_equal_effective_batch() -> None:
-    adapter = SyntheticPolicyAdapter()
+    adapter = CategoricalPolicyAdapter()
     base_logits = torch.tensor(
         [[[0.2, -0.1], [0.0, 0.3]], [[-0.2, 0.4], [0.5, -0.3]]]
     )

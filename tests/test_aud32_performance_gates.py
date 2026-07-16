@@ -17,7 +17,7 @@ def _result(speed: float, seconds: float, target_bytes: float) -> dict:
             "torch_threads": 1,
         },
         "workload": {
-            "game": "synthetic",
+            "game": "poker",
             "n_trees": 64,
             "node_budget": 128,
             "completion_samples": 32,

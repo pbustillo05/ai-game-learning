@@ -1,12 +1,9 @@
 game:
   name: poker
-  synthetic: null
   poker:
     n_players: 2
-    stack_bb: 5.0
-    sb: 0.5
-    bb: 1.0
-    chip_unit_bb: 0.5
+    stack_bb: 8.0
+    rank_count: 13
 rollout:
   n_trees: 1
   beta:

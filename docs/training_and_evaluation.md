@@ -20,12 +20,12 @@ integration tests.
 `load_config` converts YAML recursively into typed top-level dataclasses.
 Unknown keys, missing required keys, wrong scalar/container types, invalid
 enumerations, and invalid beta values raise `ConfigError` with a dotted field
-path. Game-owned `synthetic`, `poker`, and `model` mappings are validated by
-their factories.
+path. Game-owned `poker` and `model` mappings are validated by the poker
+factory.
 
 Top-level sections are:
 
-- `game`: selects `synthetic` or `poker` and supplies its owned mapping.
+- `game`: selects `poker` and supplies its `(P,S,R)` mapping.
 - `rollout`: tree count per rank, optional branched-only public-stage `beta`
   map, per-tree node budget, and reach storage mode.
 - `completion`: samples per leaf (`null` in normal mode) and evaluator backend.
@@ -51,12 +51,6 @@ be finite and at least one. Non-branched modes require `beta: null`.
 
 ## Shipped presets
 
-- `configs/kuhn_smoke.yaml`: small sequential Kuhn training and checkpoint
-  smoke run.
-- `configs/leduc.yaml`: fixed branching on Leduc, with more branching after
-  public chance.
-- `configs/synthetic_dial_example.yaml`: two-player configurable game using
-  decision-only reach storage.
 - `configs/train/nlhe6.yaml`: hardware-independent six-player 100bb NLHE
   settings, combined with `configs/hardware/local_3x2080ti.yaml` or the
   conservative, explicitly selected `quest_slurm.yaml` execution profile.
@@ -103,10 +97,10 @@ throughput, retained bytes per decision, realized topology, phase timings, and
 CUDA phase peaks. Save a same-device baseline and gate later runs with:
 
 ```bash
-pbg-benchmark --config configs/kuhn_smoke.yaml --warmup 2 --repeats 7 \
-  --output benchmarks/results/kuhn_cpu.json
-pbg-benchmark --config configs/kuhn_smoke.yaml --warmup 2 --repeats 7 \
-  --baseline benchmarks/results/kuhn_cpu.json
+pbg-benchmark --config configs/train/nlhe6.yaml --warmup 2 --repeats 7 \
+  --output benchmarks/results/nlhe6.json
+pbg-benchmark --config configs/train/nlhe6.yaml --warmup 2 --repeats 7 \
+  --baseline benchmarks/results/nlhe6.json
 ```
 
 See `benchmarks/README.md` and `benchmarks/workloads.yaml` for tolerance,
@@ -135,18 +129,6 @@ identity, DDP world size, iteration schedule, checkpoint location, and metrics
 prefix before continuing at the stored iteration. Strict-mode interrupted and
 uninterrupted runs are bitwise-equal in the end-to-end regression test.
 
-## Synthetic exploitability
-
-`exploitability_of_checkpoint` rebuilds the synthetic bundle, loads the model,
-exports exact policy tables, and evaluates exact best responses. It is read
-only. `exploitability_curve` expands a checkpoint glob, reads stored iteration
-numbers, sorts by iteration rather than filename, evaluates each checkpoint,
-and writes rows identical to `exploitability.jsonl`.
-
-Exact evaluation is restricted by the synthetic solver's profile/tree guard.
-Large dial games are intentionally rejected rather than approximated under the
-same API.
-
 ## Poker duplicate-deal arena
 
 `arena` compares two checkpoints with the independent CPU NLHE engine. It
@@ -172,8 +154,8 @@ Tests fall into four groups:
 
 - contract tests for strict configuration, import direction, shape/dtype/device
   rules, and forbidden local poker math;
-- exact/statistical tests for synthetic posteriors, terminal laws, branching,
-  and exploitability;
+- exact tests for compact deck geometry, category odds, rollout topology, and
+  branching;
 - CPU reference and parity tests for poker rules, model adapters, ranges,
   completion, and GPU-style tensor transitions; and
 - integration/device tests for the real sibling facade, CUDA residency, DDP,

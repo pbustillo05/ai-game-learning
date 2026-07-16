@@ -99,7 +99,7 @@ def test_default_denomination_exposes_every_half_blind_raise_amount() -> None:
     assert torch.equal(
         targets[legal[0, RAISE_OFFSET:]], torch.arange(2.0, 100.5, 0.5)
     )
-    with pytest.raises(ValueError, match="integer multiple"):
+    with pytest.raises(TypeError, match="unexpected keyword"):
         PokerConfig(chip_unit_bb=0.3)
 
 

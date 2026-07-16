@@ -7,13 +7,13 @@ import torch
 from pbg.core.losses import l_clip, l_v, l_v_clip, rb_ppo
 from pbg.core.minibatch import MinibatchSample
 from pbg.core.values import NodeTargets
-from pbg.games.synthetic.model import PolicyOutput, SyntheticPolicyAdapter
+from tests.categorical_policy_fixture import CategoricalPolicyAdapter, PolicyOutput
 
 
 def _fixture(dtype=torch.float64):
     logits = torch.tensor([[[0.2, -0.1, -torch.inf], [-0.3, 0.4, -torch.inf]]], dtype=dtype)
     old_out = PolicyOutput(logits.clone(), torch.tensor([[0.1, -0.2]], dtype=dtype))
-    adapter = SyntheticPolicyAdapter()
+    adapter = CategoricalPolicyAdapter()
     events = torch.tensor([[0, 1, -1]], dtype=torch.int32)
     targets = NodeTargets(
         node_ids=torch.tensor([0], dtype=torch.int32),

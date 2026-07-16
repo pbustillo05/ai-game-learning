@@ -16,18 +16,18 @@ from pbg.core.training import _configure_reproducibility
 ROOT = Path(__file__).parents[1]
 
 
-def test_kuhn_smoke_loads_every_config_field() -> None:
-    cfg = load_config(ROOT / "configs" / "kuhn_smoke.yaml")
-    assert cfg.game.name == "synthetic"
-    assert cfg.game.synthetic is not None
-    assert cfg.rollout.beta_fix == {"default": 1.0}
+def test_nlhe_loads_every_config_field() -> None:
+    cfg = load_config(ROOT / "configs" / "train" / "nlhe6.yaml")
+    assert cfg.game.name == "poker"
+    assert cfg.game.poker == {"n_players": 6, "stack_bb": 100.0, "rank_count": 13}
+    assert cfg.rollout.beta_fix["preflop"] == 1.0
     assert cfg.completion.n_samples == 256
-    assert cfg.completion.backend == "exact"
-    assert cfg.model == {"architecture": "mha", "hidden_dim": 32}
+    assert cfg.completion.backend == "cuda"
+    assert cfg.model["d_model"] == 192
     assert cfg.loss.lam == pytest.approx(0.95)
     assert cfg.loss.value_loss == "clipped"
     assert cfg.train.adam_betas == (0.9, 0.999)
-    assert cfg.train.reproducibility == "strict"
+    assert cfg.train.reproducibility == "throughput"
 
 
 def test_hardware_profile_is_composed_without_changing_scientific_config() -> None:
@@ -43,7 +43,7 @@ def test_hardware_profile_is_composed_without_changing_scientific_config() -> No
 
 
 def test_unknown_nested_key_reports_full_path(tmp_path: Path) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "kuhn_smoke.yaml").read_text())
+    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
     raw["rollout"]["surprise"] = 1
     path = tmp_path / "bad.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
@@ -54,14 +54,14 @@ def test_unknown_nested_key_reports_full_path(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("section", "key", "pattern"),
     [
-        ("game.synthetic", "mispelled_ante", r"root\.game\.synthetic\.mispelled_ante"),
-        ("model", "e_max", r"unknown synthetic model configuration key: e_max"),
+        ("game.poker", "mispelled_ante", r"root\.game\.poker\.mispelled_ante"),
+        ("model", "e_max", r"unknown poker model configuration key"),
     ],
 )
 def test_game_owned_mappings_reject_unknown_keys(
     tmp_path: Path, section: str, key: str, pattern: str
 ) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "kuhn_smoke.yaml").read_text())
+    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
     target = raw
     for component in section.split("."):
         target = target[component]
@@ -95,7 +95,7 @@ def test_poker_owned_mappings_are_strict_at_top_level_load(
 
 @pytest.mark.parametrize("field", ["debug_asserts", "use_suit_consistency"])
 def test_removed_noop_controls_are_rejected(tmp_path: Path, field: str) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "kuhn_smoke.yaml").read_text())
+    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
     if field == "debug_asserts":
         raw[field] = True
     else:
@@ -107,10 +107,11 @@ def test_removed_noop_controls_are_rejected(tmp_path: Path, field: str) -> None:
 
 
 def test_training_mode_validates_beta_completion_and_loss_axes(tmp_path: Path) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "kuhn_smoke.yaml").read_text())
+    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
     raw["training"]["mode"] = "normal"
     raw["completion"]["n_samples"] = None
     raw["loss"]["name"] = "ppo"
+    raw["rollout"]["beta"] = None
     path = tmp_path / "normal.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     cfg = load_config(path)
@@ -171,7 +172,7 @@ def test_reproducibility_profiles_change_backend_controls() -> None:
 def test_behavioral_profile_enums_are_strict(
     tmp_path: Path, section: str, field: str, value: str
 ) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "kuhn_smoke.yaml").read_text())
+    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
     raw[section][field] = value
     path = tmp_path / "bad_profile.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")

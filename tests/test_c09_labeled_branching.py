@@ -201,7 +201,7 @@ def test_branched_sampler_rejects_multiple_root_replicas() -> None:
 
 
 def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "kuhn_smoke.yaml").read_text())
+    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
     raw["training"]["mode"] = "neyman"
     path = tmp_path / "neyman.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
@@ -213,6 +213,7 @@ def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> 
     with pytest.raises(ConfigError, match="finite value at least one"):
         load_config(path)
     raw["rollout"]["beta"] = {"default": 2.0}
+    raw["rollout"]["n_trees"] = 2
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ConfigError, match="exactly one sampled tree per rank"):
         load_config(path)

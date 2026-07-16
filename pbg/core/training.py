@@ -34,7 +34,6 @@ from pbg.core.values import HeadEvals, streamed_branched_value
 
 
 GAME_FACTORIES = {
-    "synthetic": "pbg.games.synthetic.bundle:build_bundle",
     "poker": "pbg.games.poker.bundle:build_bundle",
 }
 

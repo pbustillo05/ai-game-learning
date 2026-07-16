@@ -1,9 +1,9 @@
 # Public-action Bayesian game learning
 
 `pbg` is a GPU-oriented research framework for learning strategies in
-imperfect-information games. It implements policy-gradient self-play for finite
-public-action Bayesian games, with exact synthetic card games for validation
-and no-limit Texas hold'em as the main large-scale domain.
+imperfect-information games. Its sole active game is configurable no-limit
+Texas hold'em; the retired synthetic games are preserved under
+`archive/synthetic_games/` as inert history.
 
 The implementation plan in `archive/prompts/` is complete. Those files remain as
 development history; this README describes the repository as a normal,
@@ -17,9 +17,8 @@ implemented project.
 - Duplicate-preserving labeled branching with randomized-rounded offspring.
 - Monte Carlo leaf completion and posterior-moment backward propagation.
 - Rao–Blackwellized PPO over all actor private types.
-- Configurable synthetic games, Kuhn and Leduc presets, exact posteriors, best
-  responses, exploitability, and scaled reach-biased MHA models (with an
-  explicit MLP baseline).
+- NLHE configuration by player count, stack depth, and compact suffix-deck rank
+  count.
 - Comparative three-mode phase/throughput/memory profiling with same-device
   regression gates.
 - A public NLHE engine with correct betting, short-all-in reopening, chance
@@ -148,7 +147,7 @@ The implementation documentation starts at [`docs/README.md`](docs/README.md):
 
 - [`docs/architecture.md`](docs/architecture.md)
 - [`docs/core_algorithms.md`](docs/core_algorithms.md)
-- [`docs/synthetic_games.md`](docs/synthetic_games.md)
+- [`archive/synthetic_games/`](archive/synthetic_games/)
 - [`docs/poker.md`](docs/poker.md)
 - [`docs/training_and_evaluation.md`](docs/training_and_evaluation.md)
 - [`docs/file_reference.md`](docs/file_reference.md), covering every tracked

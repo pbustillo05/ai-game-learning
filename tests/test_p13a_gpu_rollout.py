@@ -201,7 +201,7 @@ def test_tensor_store_has_required_device_soa_and_prefix_allocation() -> None:
     assert all(value.device.type == "cpu" for value in vars(store).values() if isinstance(value, Tensor))
 
 
-@pytest.mark.parametrize("n_players", range(2, 10))
+@pytest.mark.parametrize("n_players", range(2, 7))
 def test_random_legal_trajectories_match_cpu_engine_step_for_step(
     n_players: int,
 ) -> None:
@@ -472,7 +472,7 @@ def test_policy_planner_mixes_postflop_streets_and_splits_live_counts() -> None:
 
 
 def test_core_sampler_accumulates_many_trees_before_model_forward() -> None:
-    cfg = PokerConfig(n_players=2, stack_bb=4.0)
+    cfg = PokerConfig(n_players=2, stack_bb=8.0)
     profiles = _Profiles()
     backend = _backend(cfg, capacity=2048, profile_sampler=profiles)
     model = _RecordingModel()
@@ -501,7 +501,7 @@ def test_poker_recompute_replays_postflop_reach_exactly(
 ) -> None:
     """Full and replayed poker reaches agree through flop, turn, and river."""
 
-    cfg = PokerConfig(n_players=2, stack_bb=2.0)
+    cfg = PokerConfig(n_players=2, stack_bb=8.0)
     model = _AlwaysCheckModel()
     common = dict(
         n_trees=1 if beta_mode == "fixed" else 2,
@@ -544,7 +544,7 @@ def test_poker_recompute_replays_postflop_reach_exactly(
 
 
 def test_poker_recompute_replays_fold_reach_exactly() -> None:
-    cfg = PokerConfig(n_players=2, stack_bb=2.0)
+    cfg = PokerConfig(n_players=2, stack_bb=8.0)
     rollout = SimpleNamespace(
         n_trees=2, node_budget=8, beta_mode="sequential", reach_storage="full"
     )

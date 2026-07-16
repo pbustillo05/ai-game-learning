@@ -12,15 +12,15 @@ and RNG state, so realized topology and sampled work are stable across repeats.
 Create a device-local baseline after the machine is idle:
 
 ```bash
-pbg-benchmark --config configs/kuhn_smoke.yaml --warmup 2 --repeats 7 \
-  --output benchmarks/results/kuhn_cpu.json
+pbg-benchmark --config configs/train/nlhe6.yaml --warmup 2 --repeats 7 \
+  --output benchmarks/results/nlhe6.json
 ```
 
 Enforce a later run with the default 20% tolerance:
 
 ```bash
-pbg-benchmark --config configs/kuhn_smoke.yaml --warmup 2 --repeats 7 \
-  --baseline benchmarks/results/kuhn_cpu.json
+pbg-benchmark --config configs/train/nlhe6.yaml --warmup 2 --repeats 7 \
+  --baseline benchmarks/results/nlhe6.json
 ```
 
 The gate refuses a different device, compute capability, CPU thread count, or
@@ -36,7 +36,7 @@ must still run `nvidia-smi` before and after the command to
 ensure the selected GPU is globally idle; the process cannot identify another
 user's workload safely.
 
-`workloads.yaml` is the minimum coverage matrix. Dial anchors `(1,1)` and
-`(2,2)` are Kuhn and Leduc; `(3,2)` is the shipped example. Larger dial and
+`workloads.yaml` is the minimum active NLHE coverage matrix. Compact-deck
+coverage is exercised by the poker geometry and integration tests. Larger
 NLHE rows use command-line size overrides so the scientific configs remain the
 single source of game/model semantics.

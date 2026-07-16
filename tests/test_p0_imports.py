@@ -44,11 +44,11 @@ def test_t12_import_direction() -> None:
         for target in _import_targets(path):
             if module.startswith("pbg.core") and target.startswith(("pbg.games", "pbg.eval")):
                 violations.append(f"{module} imports {target}")
-            if module.startswith("pbg.games.synthetic") and target.startswith("pbg."):
-                if not target.startswith(("pbg.core", "pbg.games.synthetic")):
-                    violations.append(f"{module} imports {target}")
             if module.startswith("pbg.games.poker") and target.startswith("pbg."):
                 if not target.startswith(("pbg.core", "pbg.games.poker")):
                     violations.append(f"{module} imports {target}")
     assert violations == []
 
+
+def test_retired_synthetic_package_is_not_importable() -> None:
+    assert importlib.util.find_spec("pbg.games.synthetic") is None

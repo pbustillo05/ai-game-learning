@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -11,45 +10,10 @@ import torch
 from torch import nn
 
 from pbg.core.config import load_config
-from pbg.core.training import build_game_bundle
 from pbg.eval import arena as arena_module
 from pbg.eval.arena import arena
-from pbg.eval.exploitability import exploitability_curve, exploitability_of_checkpoint
 from pbg.games.poker.cards import hand_index, hand_cards
 from pbg.games.poker.model.preflop import PolicyOutput
-from pbg.games.synthetic.exact import exploitability, uniform_policy_tables
-
-
-def _synthetic_checkpoint(path: Path, iteration: int) -> object:
-    cfg = load_config("configs/kuhn_smoke.yaml")
-    torch.manual_seed(0)
-    bundle = build_game_bundle(cfg, torch.device("cpu"))
-    torch.save(
-        {"model": bundle.model.state_dict(), "iteration": iteration}, path
-    )
-    return cfg
-
-
-def test_fresh_kuhn_checkpoint_agrees_with_uniform_and_curve_is_sorted(
-    tmp_path: Path,
-) -> None:
-    cfg = _synthetic_checkpoint(tmp_path / "z.pt", 9)
-    _synthetic_checkpoint(tmp_path / "a.pt", 2)
-    _synthetic_checkpoint(tmp_path / "m.pt", 5)
-    cfg.train.out_dir = str(tmp_path / "out")
-    bundle = build_game_bundle(cfg, torch.device("cpu"))
-    game = bundle.rollout_backend.game
-    uniform = exploitability(game, uniform_policy_tables(game))
-    observed = exploitability_of_checkpoint(tmp_path / "z.pt", cfg)
-    assert observed == pytest.approx(uniform, rel=0.10)
-
-    rows = exploitability_curve(cfg, tmp_path / "*.pt")
-    assert [row["iter"] for row in rows] == [2, 5, 9]
-    written = [
-        json.loads(line)
-        for line in (tmp_path / "out" / "exploitability.jsonl").read_text().splitlines()
-    ]
-    assert written == rows
 
 
 class _CheckCallModel(nn.Module):
@@ -118,16 +82,8 @@ def _install_fake_sibling(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
 
 
 def _poker_cfg():
-    cfg = load_config("configs/kuhn_smoke.yaml")
-    cfg.game.name = "poker"
-    cfg.game.synthetic = None
-    cfg.game.poker = {
-        "n_players": 2,
-        "stack_bb": 10.0,
-        "sb": 0.5,
-        "bb": 1.0,
-        "chip_unit_bb": 0.5,
-    }
+    cfg = load_config("configs/nlhe6_h100.yaml")
+    cfg.game.poker = {"n_players": 2, "stack_bb": 10.0, "rank_count": 13}
     cfg.model = {
         "d_model": 8,
         "n_heads": 2,

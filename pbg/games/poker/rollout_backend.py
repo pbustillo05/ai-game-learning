@@ -89,6 +89,11 @@ class PokerRolloutBackend:
         partition_adapter: PokerGPUPartitionAdapter | Any | None = None,
         evaluator_backend: str = "auto",
     ) -> None:
+        if cfg.rank_count != 13:
+            raise RuntimeError(
+                "compact-deck rollout is waiting for sibling evaluator pbg-v3; "
+                "see docs/todo/POKER_GPU_EVALUATOR_COMPACT_DECK_REQUEST.md"
+            )
         self.cfg = cfg
         self.device = torch.device(device)
         self.n_players = cfg.n_players

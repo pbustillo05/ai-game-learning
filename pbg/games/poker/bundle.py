@@ -12,7 +12,7 @@ from pbg.core.completion import BatchedCompletionStats
 from pbg.core.config import RootConfig
 from pbg.core.game import PRETERM, GameBundle
 from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
-from pbg.games.poker.cards import N_HANDS
+from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.engine import PokerConfig
 from pbg.games.poker.folded import PokerGPUPartitionAdapter
 from pbg.games.poker.mc import (
@@ -53,7 +53,12 @@ class PokerRolloutMemoryPlan:
 
 
 def estimate_rollout_memory(
-    *, n_trees: int, node_budget: int, n_players: int, reach_storage: str
+    *,
+    n_trees: int,
+    node_budget: int,
+    n_players: int,
+    reach_storage: str,
+    rank_count: int = 13,
 ) -> PokerRolloutMemoryPlan:
     """Estimate worst-case rollout bytes before allocating a poker backend.
 
@@ -71,7 +76,8 @@ def estimate_rollout_memory(
     edge_capacity = capacity - n_trees
     node_bytes = capacity * (6 * 4 + n_players * 4)
     edge_bytes = edge_capacity * 4 * 4
-    reach_row_bytes = n_players * N_HANDS * 4
+    n_hands = DeckGeometry(rank_count).n_hands
+    reach_row_bytes = n_players * n_hands * 4
     reach_cache = (
         n_trees if reach_storage == "recompute" else capacity
     ) * reach_row_bytes
@@ -83,7 +89,7 @@ def estimate_rollout_memory(
         frontier_reach_bytes=2 * capacity * reach_row_bytes,
         # Selected policy likelihoods and values are retained only for realized
         # player edges/nodes, but this remains a safe capacity bound.
-        policy_cache_bytes=(edge_capacity + capacity) * N_HANDS * 4,
+        policy_cache_bytes=(edge_capacity + capacity) * n_hands * 4,
     )
 
 
@@ -261,6 +267,7 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         node_budget=cfg.rollout.node_budget,
         n_players=engine_cfg.n_players,
         reach_storage=cfg.rollout.reach_storage,
+        rank_count=engine_cfg.rank_count,
     )
     _preflight_cuda_rollout(plan, device)
     backend = PokerRolloutBackend(

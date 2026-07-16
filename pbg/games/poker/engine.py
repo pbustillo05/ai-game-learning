@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import torch
 from torch import Tensor
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL
+from pbg.games.poker.cards import DeckGeometry
 
 FOLD = 0
 CHECK_CALL = 1
@@ -37,33 +39,37 @@ _EPS = 1e-6
 
 @dataclass(frozen=True)
 class PokerConfig:
-    """Configuration for one cash-game table in an exact fixed denomination."""
+    """Configuration for one fixed compact-deck NLHE cash-game run."""
 
     n_players: int = 6
     stack_bb: float = 100.0
-    sb: float = 0.5
-    bb: float = 1.0
-    chip_unit_bb: float = 0.5
+    rank_count: int = 13
     n_ticks: int = field(init=False)
+    geometry: DeckGeometry = field(init=False, repr=False)
+
+    sb: ClassVar[float] = 0.5
+    bb: ClassVar[float] = 1.0
+    chip_unit_bb: ClassVar[float] = 0.5
 
     def __post_init__(self) -> None:
-        if not 2 <= self.n_players <= 9:
-            raise ValueError("n_players must be in [2,9]")
-        if self.stack_bb <= 0.0:
-            raise ValueError("stack_bb must be positive")
-        if self.sb <= 0.0 or self.bb <= 0.0 or self.sb > self.bb:
-            raise ValueError("blinds must satisfy 0 < sb <= bb")
-        if not math.isfinite(self.chip_unit_bb) or self.chip_unit_bb <= 0.0:
-            raise ValueError("chip_unit_bb must be finite and positive")
-        units = []
-        for name, value in (("stack_bb", self.stack_bb), ("sb", self.sb), ("bb", self.bb)):
-            count = round(value / self.chip_unit_bb)
-            if count <= 0 or not math.isclose(
-                value, count * self.chip_unit_bb, rel_tol=0.0, abs_tol=1e-9
-            ):
-                raise ValueError(f"{name} must be an integer multiple of chip_unit_bb")
-            units.append(count)
-        object.__setattr__(self, "n_ticks", units[0])
+        if (
+            isinstance(self.n_players, bool)
+            or not isinstance(self.n_players, int)
+            or not 2 <= self.n_players <= 6
+        ):
+            raise ValueError("n_players must be an integer in [2,6]")
+        if not math.isfinite(self.stack_bb) or not 8.0 <= self.stack_bb <= 128.0:
+            raise ValueError("stack_bb must be finite and in [8,128]")
+        ticks = round(self.stack_bb / self.chip_unit_bb)
+        if not math.isclose(
+            self.stack_bb, ticks * self.chip_unit_bb, rel_tol=0.0, abs_tol=1e-9
+        ):
+            raise ValueError("stack_bb must be an integer multiple of 0.5 bb")
+        geometry = DeckGeometry(self.rank_count)
+        if 2 * self.n_players + 5 >= geometry.n_cards:
+            raise ValueError("compact deck must satisfy 2*n_players + 5 < 4*rank_count")
+        object.__setattr__(self, "n_ticks", ticks)
+        object.__setattr__(self, "geometry", geometry)
 
 
 @dataclass(frozen=True)
@@ -597,8 +603,10 @@ class NLHEEngine:
             expected = 3 if state.street == PREFLOP else 1
             if len(supplied) != expected:
                 raise ValueError(f"street requires exactly {expected} public card(s)")
-            if any(card < 0 or card >= 52 for card in supplied):
-                raise ValueError("public card ids must be in [0,52)")
+            if any(
+                card < self.cfg.geometry.first_card or card >= 52 for card in supplied
+            ):
+                raise ValueError("public card ids must belong to the active deck")
             if len(set(supplied)) != len(supplied) or set(supplied) & set(state.board):
                 raise ValueError("public cards must be unique")
             if expected == 3:
