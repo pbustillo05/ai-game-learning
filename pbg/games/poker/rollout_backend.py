@@ -36,6 +36,8 @@ from pbg.games.poker.folded import (
     PokerGPUPartitionAdapter,
 )
 from pbg.games.poker.mc import PokerGPURejectionSampler, PokerGPUShowdownEvaluator
+from pbg.games.poker.model_inputs import DeviceHistoryMaterializer
+from pbg.games.poker.partition_cache import DevicePartitionSummaryCache
 from pbg.games.poker.model.postflop import PostflopMasks
 from pbg.games.poker.model.preflop import (
     PackedPublicHistory,
@@ -102,6 +104,8 @@ class PokerRolloutBackend:
         self.cfg = cfg
         self.geometry = cfg.geometry
         self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self.n_players = cfg.n_players
         self.n_cards = self.geometry.n_cards
         self.n_hands = self.geometry.n_hands
@@ -123,6 +127,10 @@ class PokerRolloutBackend:
             capacity, self.max_rollout_steps, self.device, cfg.n_players
         )
         self.state_store = self.states
+        self.history_materializer = DeviceHistoryMaterializer(self.states)
+        self.partition_summary_cache = DevicePartitionSummaryCache(
+            capacity, max(0, cfg.n_players - 2), self.device
+        )
         table = getattr(beta_table, "beta_table", beta_table)
         self.beta_table = dict(table or {"default": 1.0})
         if "default" not in self.beta_table:
@@ -165,7 +173,6 @@ class PokerRolloutBackend:
             0,
             *(1 for _ in range(2, cfg.n_players + 1)),
         )
-        self._partition_cache: dict[int, PartitionSummaryBatch] = {}
         self.game = self
 
     def _dynamic_positions(self, mask: Tensor, source: str) -> Tensor:
@@ -201,7 +208,7 @@ class PokerRolloutBackend:
 
         n = buttons.shape[0]
         self.states.reset()
-        self._partition_cache.clear()
+        self.partition_summary_cache.reset()
         handles = self.states.allocate_all(n)  # [B]
         rows = handles.to(torch.int64)
         if self.n_players == 2:
@@ -242,7 +249,7 @@ class PokerRolloutBackend:
         self.states.board[rows] = -1
         self.states.last_full_raise[rows] = float(self.cfg.bb)
         self.states.current_bet[rows] = committed.max(1).values
-        self.states.history_parent[rows] = -1
+        self.states.history_jump[rows] = -1
         self.states.history_event[rows] = -1
         self.states.history_actor[rows] = -1
         self.states.history_street[rows] = -1
@@ -592,49 +599,9 @@ class PokerRolloutBackend:
         return successors
 
     def _packed_history(self, states: Tensor) -> PackedPublicHistory:
-        """Reconstruct parent-linked histories as a padded chronological batch."""
+        """Gather parent-linked histories without a trajectory-length loop."""
 
-        rows = states.to(torch.int64)
-        lengths = self.states.history_length[rows].to(torch.int64)
-        width = int(lengths.max().item()) if states.numel() else 0
-        shape = (states.shape[0], width)
-        actor = torch.full(shape, -1, dtype=torch.int64, device=self.device)
-        street = torch.full(shape, -1, dtype=torch.int64, device=self.device)
-        action = torch.full(shape, -1, dtype=torch.int64, device=self.device)
-        mask = torch.zeros(shape, dtype=torch.bool, device=self.device)
-        floats = {
-            name: torch.zeros(shape, dtype=torch.float32, device=self.device)
-            for name in (
-                "amount", "pot_before", "call_amount", "current_bet",
-                "min_raise_to", "max_raise_to",
-            )
-        }
-        cursor = states.to(torch.int32)
-        batch = torch.arange(states.shape[0], device=self.device)
-        for offset in range(width):
-            position = lengths - 1 - offset
-            valid = position >= 0
-            safe_cursor = cursor.clamp_min(0).to(torch.int64)
-            selected_batch = batch[valid]
-            selected_pos = position[valid]
-            selected_rows = safe_cursor[valid]
-            actor[selected_batch, selected_pos] = self.states.history_actor[selected_rows].long()
-            street[selected_batch, selected_pos] = self.states.history_street[selected_rows].long()
-            action[selected_batch, selected_pos] = self.states.history_action[selected_rows].long()
-            mask[selected_batch, selected_pos] = True
-            for target, source in (
-                ("amount", "history_amount"),
-                ("pot_before", "history_pot_before"),
-                ("call_amount", "history_call_amount"),
-                ("current_bet", "history_current_bet"),
-                ("min_raise_to", "history_min_raise_to"),
-                ("max_raise_to", "history_max_raise_to"),
-            ):
-                floats[target][selected_batch, selected_pos] = getattr(self.states, source)[selected_rows]
-            cursor = torch.where(valid, self.states.history_parent[safe_cursor], cursor)
-        return PackedPublicHistory(
-            actor=actor, street=street, action=action, mask=mask, **floats
-        )
+        return self.history_materializer.pack(states)
 
     def sample_profiles(self, states: Tensor, reach: Tensor, gen: torch.Generator) -> Tensor:
         """Draw one exact collision-conditioned profile as int32 ``[B,P]``."""
@@ -1056,10 +1023,10 @@ class PokerRolloutBackend:
                 u[positions] = output.u
         return PolicyOutput(raw=raw, v=value, vvec=vvec, u=u)
 
-    def plan_policy_batches(
+    def _planned_policy_batches(
         self, model: nn.Module, states: Tensor, phase: str
-    ) -> list[Tensor]:
-        """Return deterministic pre/post/live-count batches within profile limits."""
+    ) -> list[tuple[Tensor, str]]:
+        """Return deterministic bounded batches with host-known family names."""
 
         if phase not in {"training", "inference"}:
             raise ValueError("phase must be 'training' or 'inference'")
@@ -1069,11 +1036,11 @@ class PokerRolloutBackend:
             return []
         profile = self.execution_profile
         if profile is None:
-            return [torch.arange(states.numel(), device=states.device)]
+            return [(torch.arange(states.numel(), device=states.device), "")]
         source = model.module if hasattr(model, "module") else model
         post_model = getattr(source, "postflop", None)
         if post_model is None:
-            return [torch.arange(states.numel(), device=states.device)]
+            return [(torch.arange(states.numel(), device=states.device), "")]
         token_count, family = self._policy_work_rows(model, states)
         max_tokens = (
             profile.training_max_tokens
@@ -1085,39 +1052,65 @@ class PokerRolloutBackend:
             if phase == "training"
             else profile.inference_max_token_pairs
         )
-        result: list[Tensor] = []
-        for family_id in torch.unique(family, sorted=True).tolist():
-            positions = self._dynamic_positions(family == family_id, "poker_policy_family")
-            order = torch.argsort(token_count[positions], stable=True)
-            ordered = positions[order]
-            current: list[int] = []
-            current_max = 0
-            for position, length in zip(
-                ordered.tolist(), token_count[ordered].tolist(), strict=True
-            ):
-                if length > max_tokens or length * length > max_pairs:
-                    raise MemoryError(
-                        f"one policy sequence needs {length} tokens/{length * length} "
-                        f"token pairs, beyond hardware profile {profile.name!r}"
-                    )
-                candidate_max = max(current_max, int(length))
-                candidate_batch = len(current) + 1
-                if current and (
-                    candidate_batch * candidate_max > max_tokens
-                    or candidate_batch * candidate_max * candidate_max > max_pairs
-                ):
-                    result.append(torch.tensor(current, device=states.device, dtype=torch.long))
-                    current = []
-                    current_max = 0
-                current.append(int(position))
-                current_max = max(current_max, int(length))
-            if current:
-                result.append(torch.tensor(current, device=states.device, dtype=torch.long))
-        for positions in result:
-            lengths = token_count[positions]
-            maximum = int(lengths.max().item())
-            family_id = int(family[positions[0]].item())
+        control = torch.stack((token_count, family), dim=1)
+        if control.device.type == "cuda":
+            started = time.perf_counter()
+            host_control = control.to(device="cpu")
+            self.execution_metrics.record_scheduler_control_synchronization(
+                seconds=time.perf_counter() - started,
+                nbytes=control.numel() * control.element_size(),
+            )
+        else:
+            host_control = control
+        host_rows = host_control.tolist()
+        host_order = sorted(
+            range(states.numel()),
+            key=lambda position: (
+                int(host_rows[position][1]),
+                int(host_rows[position][0]),
+                position,
+            ),
+        )
+        token_order = torch.argsort(token_count, stable=True)
+        device_order = token_order[
+            torch.argsort(family[token_order], stable=True)
+        ]
+
+        plans: list[tuple[int, int, int, int]] = []
+        start = 0
+        count = 0
+        current_family = -1
+        current_max = 0
+        for ordered_index, position in enumerate(host_order):
+            length, family_id = (int(value) for value in host_rows[position])
+            if length > max_tokens or length * length > max_pairs:
+                raise MemoryError(
+                    f"one policy sequence needs {length} tokens/{length * length} "
+                    f"token pairs, beyond hardware profile {profile.name!r}"
+                )
+            family_changed = count > 0 and family_id != current_family
+            candidate_max = max(current_max, length)
+            candidate_count = count + 1
+            capacity_exceeded = count > 0 and (
+                candidate_count * candidate_max > max_tokens
+                or candidate_count * candidate_max * candidate_max > max_pairs
+            )
+            if family_changed or capacity_exceeded:
+                plans.append((start, count, current_family, current_max))
+                start = ordered_index
+                count = 0
+                current_max = 0
+            count += 1
+            current_family = family_id
+            current_max = max(current_max, length)
+        if count:
+            plans.append((start, count, current_family, current_max))
+
+        result: list[tuple[Tensor, str]] = []
+        for start, count, family_id, maximum in plans:
+            positions = device_order.narrow(0, start, count)
             family_name = "pre" if family_id == 0 else f"post_{family_id}"
+            result.append((positions, family_name))
             self.execution_metrics.record_policy_pack(
                 phase,
                 family_name,
@@ -1126,6 +1119,16 @@ class PokerRolloutBackend:
                 padded_token_pairs=int(positions.numel()) * maximum * maximum,
             )
         return result
+
+    def plan_policy_batches(
+        self, model: nn.Module, states: Tensor, phase: str
+    ) -> list[Tensor]:
+        """Return deterministic pre/post/live-count batches within profile limits."""
+
+        return [
+            positions
+            for positions, _ in self._planned_policy_batches(model, states, phase)
+        ]
 
     def _policy_work_rows(
         self, model: nn.Module, states: Tensor
@@ -1139,6 +1142,8 @@ class PokerRolloutBackend:
         street = self.states.street[rows].to(torch.int64)
         live = (self.states.status[rows] != FOLDED).sum(1).to(torch.int64)
         history = self.states.history_length[rows].to(torch.int64)
+        if self.device.type == "cuda":
+            history = torch.full_like(history, self.max_rollout_steps)
         scalar_count = 3 * self.n_players + 13 + self.e_max + self.n_ticks
         pre_tokens = (
             self.n_players * self.n_classes
@@ -1183,6 +1188,8 @@ class PokerRolloutBackend:
         street = self.states.street[rows].to(torch.int64)
         live = (self.states.status[rows] != FOLDED).sum(1).to(torch.int64)
         history = self.states.history_length[rows].to(torch.int64)
+        if self.device.type == "cuda":
+            history = torch.full_like(history, self.max_rollout_steps)
         scalar_count = 3 * self.n_players + 13 + self.e_max + self.n_ticks
         pre_tokens = (
             self.n_players * self.n_classes
@@ -1214,8 +1221,11 @@ class PokerRolloutBackend:
     ) -> None:
         """Aggregate one actual direct model call, including padded work."""
 
-        token_count, _ = self._policy_work_rows(model, states[positions])
-        maximum = int(token_count.max().item())
+        if self.device.type == "cuda":
+            maximum = self._family_maximum_width(model, family)
+        else:
+            token_count, _ = self._policy_work_rows(model, states[positions])
+            maximum = int(token_count.max())
         rows = int(positions.numel())
         self.execution_metrics.record_model_call(
             "training" if torch.is_grad_enabled() else "inference",
@@ -1229,13 +1239,21 @@ class PokerRolloutBackend:
         """Route and bounded-batch policy calls, returning combo rows ``[B,H]``."""
 
         if not torch.is_grad_enabled() and self.execution_profile is not None:
-            plans = self.plan_policy_batches(frozen_model, states, "inference")
-            if len(plans) > 1:
+            plans = self._planned_policy_batches(
+                frozen_model, states, "inference"
+            )
+            if all(family for _, family in plans):
                 parts = [
-                    (positions, self._policy_forward_direct(
-                        frozen_model, states[positions], reach[positions]
-                    ))
-                    for positions in plans
+                    (
+                        positions,
+                        self.policy_forward_family(
+                            frozen_model,
+                            family,
+                            states[positions],
+                            reach[positions],
+                        ),
+                    )
+                    for positions, family in plans
                 ]
                 return self._combine_outputs(parts, states.shape[0])
         return self._policy_forward_direct(frozen_model, states, reach)
@@ -1378,16 +1396,15 @@ class PokerRolloutBackend:
         if profile is None:
             return self.policy_forward_family(frozen_model, family, states, reach)
 
+        # CUDA history tensors are materialized at the family-wide bounded
+        # width, so every row in this already-routed family has identical
+        # padded cost. The queue calibration has already enforced the profile;
+        # a width-vector host transfer cannot improve this physical plan.
+        if self.device.type == "cuda":
+            return self.policy_forward_family(frozen_model, family, states, reach)
+
         widths, _ = self.rollout_row_cost(frozen_model, states)
-        if widths.device.type == "cuda":
-            started = time.perf_counter()
-            host_widths = widths.to(device="cpu")
-            self.execution_metrics.record_scheduler_control_synchronization(
-                seconds=time.perf_counter() - started,
-                nbytes=widths.numel() * widths.element_size(),
-            )
-        else:
-            host_widths = widths
+        host_widths = widths
 
         max_tokens = int(profile.inference_max_tokens)
         max_pairs = int(profile.inference_max_token_pairs)
@@ -1641,49 +1658,44 @@ class PokerRolloutBackend:
     def _partition_summary(
         self, states: Tensor, board: Tensor, weights: Tensor, status: Tensor, n_live: int
     ) -> PartitionSummaryBatch:
-        """Reuse summaries until their street/fold dependency anchor changes."""
+        """Merge evaluator rows through device-indexed dependency anchors."""
 
         rows = states.to(torch.int64)
-        keys = self.states.partition_cache_key[rows].clone()
-        missing_anchor = keys < 0
-        if bool(missing_anchor.any()):
-            keys[missing_anchor] = states[missing_anchor]
-            self.states.partition_cache_key[rows[missing_anchor]] = states[missing_anchor]
-        key_values = [int(value) for value in keys.detach().cpu().tolist()]
-        representatives: dict[int, int] = {}
-        for position, key in enumerate(key_values):
-            if key not in self._partition_cache and key not in representatives:
-                representatives[key] = position
-        if representatives:
-            selected = torch.tensor(
-                list(representatives.values()), dtype=torch.long, device=self.device
-            )
-            computed = self._partition_summary_uncached(
-                states[selected], board[selected], weights[selected], status[selected], n_live
-            )
-            for offset, key in enumerate(representatives):
-                self._partition_cache[key] = PartitionSummaryBatch(
-                    fields={name: value[offset : offset + 1] for name, value in computed.fields.items()},
-                    metadata=dict(computed.metadata),
-                )
-        cached = [self._partition_cache[key] for key in key_values]
-        field_names = tuple(cached[0].fields)
-        return PartitionSummaryBatch(
-            fields={
-                name: torch.cat([summary.fields[name] for summary in cached], dim=0)
-                for name in field_names
-            },
-            metadata={
-                "cache": "street_or_fold",
-                "cache_hits": len(key_values) - len(representatives),
-                "cache_misses": len(representatives),
-                "folder_api_version": computed.metadata.get("folder_api_version")
-                if representatives else cached[0].metadata.get("folder_api_version"),
-            },
+        inherited = self.states.partition_cache_key[rows]
+        keys = torch.where(inherited >= 0, inherited, states).to(torch.int64)
+        self.states.partition_cache_key[rows] = keys.to(torch.int32)
+        hits = self.partition_summary_cache.contains(keys)
+        compute_mask = ~hits
+        # Cached rows may arrive after folded full reaches were discarded. Give
+        # the masked evaluator rows finite dummy weights; their results are
+        # ignored by the device merge and the real cached tensors are gathered.
+        evaluator_weights = torch.where(
+            hits[:, None, None], torch.ones_like(weights), weights
+        )
+        computed = self._partition_summary_uncached(
+            states,
+            board,
+            evaluator_weights,
+            status,
+            n_live,
+            compute_mask=compute_mask,
+        )
+        return self.partition_summary_cache.merge(
+            keys=keys,
+            computed=computed,
+            compute_mask=compute_mask,
+            folder_count=self.n_players - n_live,
         )
 
     def _partition_summary_uncached(
-        self, states: Tensor, board: Tensor, weights: Tensor, status: Tensor, n_live: int
+        self,
+        states: Tensor,
+        board: Tensor,
+        weights: Tensor,
+        status: Tensor,
+        n_live: int,
+        *,
+        compute_mask: Tensor | None = None,
     ) -> PartitionSummaryBatch:
         """Call the sibling folder facade for dependency-distinct rows."""
 
@@ -1696,6 +1708,8 @@ class PokerRolloutBackend:
         live_weights = ordered[:, :n_live].contiguous()  # [B,L,H]
         folded_weights = ordered[:, n_live:].contiguous()  # [B,F,H]
         folders = self.n_players - n_live
+        if compute_mask is None:
+            compute_mask = torch.ones(batch, dtype=torch.bool, device=self.device)
         state_rows = states.to(torch.int64)
         batch_rows = state_rows[:, None].expand(-1, folders)
         folded = FoldSnapshotBatch(
@@ -1706,7 +1720,7 @@ class PokerRolloutBackend:
             line_meta=self.states.fold_line_meta[
                 batch_rows, order[:, n_live:]
             ].contiguous(),
-            folder_mask=torch.ones((batch, folders), dtype=torch.bool, device=self.device),
+            folder_mask=compute_mask[:, None].expand(-1, folders).contiguous(),
             seat_ids=order[:, n_live:].to(torch.int64).contiguous(),
         )
         return self.partition_adapter.summarize(

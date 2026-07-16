@@ -118,9 +118,11 @@ def test_h100_bootstrap_bundle_constructs_without_capacity_sized_history() -> No
     cfg = load_config(ROOT / "configs" / "nlhe6_h100.yaml")
     bundle = build_game_bundle(cfg, torch.device("cpu"))
     backend = bundle.rollout_backend
-    assert backend.rollout_memory_plan.peak_bytes == 306_149_260
+    assert backend.rollout_memory_plan.peak_bytes == 376_362_892
     assert "action_history" not in vars(backend.states)
     assert backend.states.history_parent.shape == (4_096,)
+    assert backend.states.history_jump.shape == (4_096, 10)
+    assert backend.rollout_memory_plan.partition_cache_bytes == 70_066_176
 
 
 def test_nlhe_builder_constructs_one_owning_poker_model(tmp_path: Path) -> None:

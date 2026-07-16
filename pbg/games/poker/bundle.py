@@ -28,6 +28,7 @@ from pbg.games.poker.model.capacity import (
 )
 from pbg.games.poker.model.preflop import PokerModelConfig, PreflopNet
 from pbg.games.poker.model.primitives import MHA
+from pbg.games.poker.partition_cache import DevicePartitionSummaryCache
 from pbg.games.poker.rollout_backend import PokerRolloutBackend
 from pbg.games.poker.tensor_state import PokerTensorStateStore
 
@@ -42,6 +43,7 @@ class PokerRolloutMemoryPlan:
     reach_cache_bytes: int
     frontier_reach_bytes: int
     policy_cache_bytes: int
+    partition_cache_bytes: int
 
     @property
     def peak_bytes(self) -> int:
@@ -52,6 +54,7 @@ class PokerRolloutMemoryPlan:
                 self.reach_cache_bytes,
                 self.frontier_reach_bytes,
                 self.policy_cache_bytes,
+                self.partition_cache_bytes,
             )
         )
 
@@ -64,6 +67,8 @@ def estimate_rollout_memory(
     reach_storage: str,
     rank_count: int = 13,
     sequential_recompute_live_rows: bool = False,
+    max_history_tokens: int = 1,
+    folder_beta_rank: int = 16,
 ) -> PokerRolloutMemoryPlan:
     """Estimate worst-case rollout bytes before allocating a poker backend.
 
@@ -93,7 +98,9 @@ def estimate_rollout_memory(
     ) * reach_row_bytes
     return PokerRolloutMemoryPlan(
         capacity=capacity,
-        state_bytes=PokerTensorStateStore.storage_nbytes(capacity, n_players),
+        state_bytes=PokerTensorStateStore.storage_nbytes(
+            capacity, n_players, max_history_tokens
+        ),
         tree_bytes=node_bytes + edge_bytes,
         reach_cache_bytes=reach_cache,
         frontier_reach_bytes=(
@@ -104,6 +111,12 @@ def estimate_rollout_memory(
         # Selected policy likelihoods and values are retained only for realized
         # player edges/nodes, but this remains a safe capacity bound.
         policy_cache_bytes=(edge_capacity + capacity) * n_hands * 4,
+        partition_cache_bytes=DevicePartitionSummaryCache.storage_nbytes(
+            capacity,
+            n_cards=4 * rank_count,
+            beta_rank=folder_beta_rank,
+            max_folders=max(0, n_players - 2),
+        ),
     )
 
 
@@ -445,6 +458,8 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
             cfg.training.mode != "branched_rao_blackwell"
             and cfg.rollout.reach_storage == "recompute"
         ),
+        max_history_tokens=model_cfg.max_history_tokens,
+        folder_beta_rank=model_cfg.folder_beta_rank,
     )
     _preflight_cuda_rollout(plan, device)
     backend = PokerRolloutBackend(

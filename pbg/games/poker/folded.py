@@ -21,6 +21,15 @@ EXPECTED_API_VERSION = "pbg-v3"
 EXPECTED_FOLDER_API_VERSION = "pbg-folder-v1"
 
 
+def _require_device(predicate: Tensor, message: str) -> None:
+    """Validate a scalar predicate without synchronizing a CUDA caller."""
+
+    if predicate.device.type == "cuda":
+        torch._assert_async(predicate, message)
+    elif not bool(predicate):
+        raise ValueError(message)
+
+
 @dataclass
 class FoldSnapshotBatch:
     """Batched frozen fold-time inputs.
@@ -122,11 +131,15 @@ class PokerGPUPartitionAdapter:
         valid = padding | (
             (board_cards >= self.geometry.first_card) & (board_cards < 52)
         )  # [B,5]
-        if not bool(valid.all()):
-            raise ValueError("board_cards must contain card ids in [0,52), -1, or 255")
+        _require_device(
+            valid.all(),
+            "board_cards must contain card ids in [0,52), -1, or 255",
+        )
         after_padding = padding.to(torch.int32).cumsum(dim=1) > 0  # [B,5]
-        if bool((~padding & after_padding).any()):
-            raise ValueError("real board cards must precede padding")
+        _require_device(
+            (~padding & after_padding).logical_not().all(),
+            "real board cards must precede padding",
+        )
         return torch.where(
             padding,
             torch.full_like(board_cards, PAD_CARD),
@@ -176,11 +189,15 @@ class PokerGPUPartitionAdapter:
         fold_valid = fold_padding | (
             (fold_board >= self.geometry.first_card) & (fold_board < 52)
         )  # [B,F,5]
-        if not bool(fold_valid.all()):
-            raise ValueError("folded.board_at_fold must contain card ids in [0,52) or 255")
+        _require_device(
+            fold_valid.all(),
+            "folded.board_at_fold must contain card ids in [0,52) or 255",
+        )
         fold_after_padding = fold_padding.to(torch.int32).cumsum(dim=2) > 0  # [B,F,5]
-        if bool((~fold_padding & fold_after_padding).any()):
-            raise ValueError("real fold-time board cards must precede padding")
+        _require_device(
+            (~fold_padding & fold_after_padding).logical_not().all(),
+            "real fold-time board cards must precede padding",
+        )
         if line_meta.ndim != 3 or line_meta.shape[:2] != (batch_size, n_folders):
             raise ValueError("folded.line_meta must have shape [B,F,D]")
         if line_meta.dtype != torch.float32:
@@ -271,7 +288,7 @@ class PokerGPUPartitionAdapter:
         # only because they remain part of the versioned call-site contract;
         # including them in the neutral partition law would double-count live
         # collision geometry and produce a non-neutral correction with K=0.
-        if folded.reach_weights.shape[1] == 0 or not bool(folded.folder_mask.any()):
+        if folded.reach_weights.shape[1] == 0:
             zeros = torch.zeros(
                 (batch_size,), dtype=torch.float32, device=boundary_board.device
             )

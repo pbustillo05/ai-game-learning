@@ -6,13 +6,18 @@ import torch
 from torch import Tensor
 
 
+def _history_jump_levels(max_rollout_steps: int) -> int:
+    """Return binary-lift columns needed for every legal ancestor distance."""
+
+    return max(1, int(max_rollout_steps).bit_length())
+
+
 class PokerTensorStateStore:
     """Store public poker states in preallocated tensors.
 
     Args:
         capacity: Maximum number of state rows.
-        max_rollout_steps: Maximum public action count, retained as a bound for
-            callers but not materialized per state.
+        max_rollout_steps: Maximum public action count and ancestor-gather bound.
         device: Owning Torch device.
         n_players: Number of table seats ``P``.
 
@@ -58,13 +63,16 @@ class PokerTensorStateStore:
         self.board = torch.full((capacity, 5), -1, dtype=torch.int16, device=self.device)
         self.last_full_raise = torch.empty(capacity, dtype=torch.float32, device=self.device)
         self.current_bet = torch.empty(capacity, dtype=torch.float32, device=self.device)
-        # Public action history is a persistent parent-linked event chain:
-        # successor ``s`` stores its predecessor and the player action that
-        # produced it.  This replaces an O(capacity * max_rollout_steps) copy
-        # of the entire prefix at every state.
-        self.history_parent = torch.full(
-            (capacity,), -1, dtype=torch.int32, device=self.device
+        # Public action history is a persistent event chain augmented with a
+        # logarithmic binary-lift table. It enables one batched gather of every
+        # ancestor without materializing O(capacity * max_rollout_steps) payloads.
+        self.history_jump = torch.full(
+            (capacity, _history_jump_levels(max_rollout_steps)),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
         )
+        self.history_parent = self.history_jump[:, 0]
         self.history_event = torch.full(
             (capacity,), -1, dtype=torch.int32, device=self.device
         )
@@ -174,23 +182,36 @@ class PokerTensorStateStore:
 
         destination = self.allocate_all(source.shape[0])  # [B]
         self.copy_rows(source, destination)
-        self.history_parent[destination.to(torch.int64)] = source.to(torch.int32)
-        self.history_event[destination.to(torch.int64)] = -1
-        self.history_actor[destination.to(torch.int64)] = -1
-        self.history_street[destination.to(torch.int64)] = -1
-        self.history_action[destination.to(torch.int64)] = -1
+        dst = destination.to(torch.int64)
+        self.history_jump[dst, 0] = source.to(torch.int32)
+        for level in range(1, self.history_jump.shape[1]):
+            previous = self.history_jump[dst, level - 1]
+            safe = previous.clamp_min(0).to(torch.int64)
+            ancestor = self.history_jump[safe, level - 1]
+            self.history_jump[dst, level] = torch.where(
+                previous >= 0, ancestor, -torch.ones_like(ancestor)
+            )
+        self.history_event[dst] = -1
+        self.history_actor[dst] = -1
+        self.history_street[dst] = -1
+        self.history_action[dst] = -1
         return destination
 
     @staticmethod
-    def storage_nbytes(capacity: int, n_players: int) -> int:
+    def storage_nbytes(
+        capacity: int, n_players: int, max_rollout_steps: int = 1
+    ) -> int:
         """Return bytes reserved by the state tensors for one store instance."""
 
         if capacity < 0 or n_players <= 0:
             raise ValueError("capacity must be nonnegative and n_players positive")
+        if max_rollout_steps <= 0:
+            raise ValueError("max_rollout_steps must be positive")
         # Per-player fields: three fp32 commitments/stacks, one fp32 fold
         # payoff, one int8 status, and two bool flags.
         per_row = n_players * (4 * 4 + 1 + 1 + 1 + 5 + 8 * 4)
         # Seven int32 state/history/cache fields, board, two public arithmetic
-        # floats, two int32 parent/event links, and the lossless event payload.
-        per_row += 7 * 4 + 5 * 2 + 2 * 4 + 2 * 4 + 3 + 6 * 4
+        # floats, the event id, a logarithmic ancestor table, and payload.
+        per_row += 7 * 4 + 5 * 2 + 2 * 4 + 4
+        per_row += _history_jump_levels(max_rollout_steps) * 4 + 3 + 6 * 4
         return capacity * per_row + 4  # allocation cursor

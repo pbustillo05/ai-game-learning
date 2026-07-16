@@ -439,7 +439,7 @@ def test_policy_routes_one_large_preflop_and_one_shared_postflop_queue() -> None
     assert backend.batch_size_histograms == {"preflop": [32], "postflop_2": [32]}
 
 
-def test_partition_cache_reuses_actions_and_invalidates_on_fold() -> None:
+def test_device_partition_cache_masks_hits_and_invalidates_on_fold() -> None:
     cfg = PokerConfig(n_players=3, stack_bb=10.0)
     partition = _Partition()
     backend = _backend(cfg, partition_adapter=partition)
@@ -458,11 +458,12 @@ def test_partition_cache_reuses_actions_and_invalidates_on_fold() -> None:
 
     called = backend.step(current, EventBatch(torch.tensor([CHECK_CALL], dtype=torch.int32)))
     backend.policy_forward(model, called, reach)
-    assert len(partition.calls) == 1
+    assert len(partition.calls) == 2
 
     folded = backend.step(called, EventBatch(torch.tensor([FOLD], dtype=torch.int32)))
     backend.policy_forward(model, folded, reach)
-    assert len(partition.calls) == 2
+    assert len(partition.calls) == 3
+    assert partition.calls[-1]["folded"].folder_mask.tolist() == [[True]]
 
     decision_states = torch.cat((called, folded))
     decision_reach = torch.stack(
@@ -490,7 +491,8 @@ def test_partition_cache_reuses_actions_and_invalidates_on_fold() -> None:
     assert torch.equal(expanded[status != FOLDED], expected[status != FOLDED])
     assert torch.isneginf(expanded[status == FOLDED]).all()
     backend.policy_forward(model, folded, expanded[:1])
-    assert len(partition.calls) == 2
+    assert len(partition.calls) == 4
+    assert partition.calls[-1]["folded"].folder_mask.tolist() == [[False]]
 
 
 def test_policy_without_partition_consumer_skips_evaluator() -> None:
@@ -656,7 +658,7 @@ def test_poker_actual_cost_singleton_skips_cost_planning(monkeypatch) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_poker_actual_cost_keeps_physical_pack_indices_on_device() -> None:
-    """One declared width read must not cause per-pack H2D index uploads."""
+    """Bounded CUDA history makes a family width read unnecessary."""
 
     device = torch.device("cuda", torch.cuda.current_device())
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
@@ -677,8 +679,8 @@ def test_poker_actual_cost_keeps_physical_pack_indices_on_device() -> None:
 
     assert output.v.shape == (4, 1326)
     snapshot = backend.execution_metrics.snapshot()
-    assert snapshot["execution_model_calls"] == 2
-    assert snapshot["execution_scheduler_control_synchronizations"] == 1
+    assert snapshot["execution_model_calls"] == 1
+    assert snapshot["execution_scheduler_control_synchronizations"] == 0
     assert snapshot["execution_h2d_transfers"] == 0
     assert snapshot["execution_h2d_bytes"] == 0
 

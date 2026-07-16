@@ -274,6 +274,23 @@ def test_every_rank_count_runs_folded_partition_boundary(rank_count: int) -> Non
     )
     assert summary.fields["output_valid"].tolist() == [True]
 
+    masked = FoldSnapshotBatch(
+        reach_weights=folded.reach_weights,
+        board_at_fold=folded.board_at_fold,
+        line_meta=folded.line_meta,
+        folder_mask=torch.zeros_like(folded.folder_mask),
+        seat_ids=folded.seat_ids,
+    )
+    neutral = PokerGPUPartitionAdapter(
+        beta_rank=min(4, geometry.n_cards), rank_count=rank_count
+    ).summarize(
+        board_cards=board,
+        live_range_weights=live,
+        folded=masked,
+    )
+    assert torch.count_nonzero(neutral.fields["single_card_log_ratio"]) == 0
+    assert torch.count_nonzero(neutral.fields["pair_card_log_ratio"]) == 0
+
 
 @pytest.mark.parametrize("rank_count", range(4, 14))
 def test_every_rank_count_completes_a_boundary_training_iteration(
