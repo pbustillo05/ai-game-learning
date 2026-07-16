@@ -1688,6 +1688,11 @@ def run_training(
         requested = torch.device(f"cuda:{local_rank}")
     else:
         requested = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if requested.type == "cuda" and cfg.hardware is None:
+        raise RuntimeError(
+            "CUDA training requires an explicit hardware profile with token, "
+            "memory, and device limits"
+        )
     _configure_reproducibility(cfg.training.reproducibility)
     local_cfg = _rank_local_config(cfg, rank, world)
     _hardware_metadata(cfg, requested, world)

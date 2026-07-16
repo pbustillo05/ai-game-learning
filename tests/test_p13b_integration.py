@@ -11,6 +11,7 @@ import yaml
 from pbg.config import load_config
 from pbg.core.game import GameBundle
 from pbg.core.training import load_checkpoint
+from pbg.core.training import run_training
 from pbg.runtime import build_game_bundle, train
 from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
 from pbg.games.poker.cards import validate_evaluator_combo_cards
@@ -192,3 +193,22 @@ def test_normal_poker_settles_sampled_showdown_without_completion(tmp_path: Path
         (Path(cfg.training.out_dir) / "metrics.jsonl").read_text().splitlines()[0]
     )
     assert torch.isfinite(torch.tensor(record["loss"]))
+
+
+def test_python_training_api_rejects_cuda_without_hardware_profile(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cfg = _small_poker_cfg(tmp_path)
+    cfg.completion.backend = "cuda"
+    cfg.hardware = None
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    built = False
+
+    def forbidden_builder(config, device):
+        nonlocal built
+        built = True
+        raise AssertionError((config, device))
+
+    with pytest.raises(RuntimeError, match="explicit hardware profile"):
+        run_training(cfg, bundle_builder=forbidden_builder)
+    assert not built
