@@ -175,3 +175,21 @@ class MCCompletion(Protocol):
         """Complete selected leaves and return one statistics row per node."""
 
         ...
+
+
+@runtime_checkable
+class KeyedMCCompletion(Protocol):
+    """Optional schedule-independent completion boundary for queued rollout."""
+
+    def complete_keyed(
+        self,
+        game: Any,
+        tree: Any,
+        node_ids: Tensor,
+        reach: ReachView | Tensor | Any,
+        n_samples: int,
+        keys: Tensor,
+    ) -> BatchedCompletionStats:
+        """Complete rows using one caller-owned int64 stream key per leaf."""
+
+        ...

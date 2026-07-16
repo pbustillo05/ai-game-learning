@@ -19,7 +19,7 @@ from pbg.games.poker.cards import validate_evaluator_combo_cards
 N_CARDS = 52
 N_COMBOS = 1326
 PAD_CARD = 255
-EXPECTED_API_VERSION = "pbg-v2"
+EXPECTED_API_VERSION = "pbg-v3"
 EXPECTED_FOLDER_API_VERSION = "pbg-folder-v1"
 
 
@@ -57,10 +57,13 @@ class PartitionSummaryBatch:
 class PokerGPUPartitionAdapter:
     """Thin, lazy adapter for evaluator-owned model-ready folder summaries."""
 
-    def __init__(self, beta_rank: int = 16) -> None:
+    def __init__(self, beta_rank: int = 16, rank_count: int = 13) -> None:
         if isinstance(beta_rank, bool) or not isinstance(beta_rank, int) or not 0 <= beta_rank <= 52:
             raise ValueError("beta_rank must be an integer in [0,52]")
         self.beta_rank = beta_rank
+        if isinstance(rank_count, bool) or not 4 <= rank_count <= 13:
+            raise ValueError("rank_count must be an integer in [4,13]")
+        self.rank_count = int(rank_count)
         self._partition_folders: Callable[..., Any] | None = None
         self._result_type: type[Any] | None = None
 
@@ -70,14 +73,14 @@ class PokerGPUPartitionAdapter:
         try:
             from poker_gpu_evaluator.pbg import (
                 API_VERSION,
-                COMBO_CARDS,
                 FOLDER_API_VERSION,
                 FolderSummaryResult,
+                combo_cards,
                 partition_folders,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             raise RuntimeError(
-                "poker_gpu_evaluator with the public pbg-v2 facade is required; "
+                "poker_gpu_evaluator with the public pbg-v3 facade is required; "
                 "install the sibling package (an editable install is sufficient)"
             ) from exc
         if API_VERSION != EXPECTED_API_VERSION:
@@ -90,7 +93,7 @@ class PokerGPUPartitionAdapter:
                 "incompatible evaluator folder facade: expected FOLDER_API_VERSION "
                 f"{EXPECTED_FOLDER_API_VERSION!r}, got {FOLDER_API_VERSION!r}"
             )
-        validate_evaluator_combo_cards(COMBO_CARDS)
+        validate_evaluator_combo_cards(combo_cards(13))
         self._partition_folders = partition_folders
         self._result_type = FolderSummaryResult
         return partition_folders, FolderSummaryResult
@@ -283,6 +286,7 @@ class PokerGPUPartitionAdapter:
         range_weights = folded.reach_weights.contiguous()  # [B,F,1326]
         row_mask = folded.folder_mask.contiguous()  # [B,F]
         result = partition_folders(
+            rank_count=self.rank_count,
             board_cards=boundary_board,
             range_weights=range_weights,
             row_mask=row_mask,

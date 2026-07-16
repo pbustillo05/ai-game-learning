@@ -30,14 +30,37 @@ class GameConfig:
 class RolloutConfig:
     """Configure rollout storage and optional branching intensity.
 
-    ``n_trees`` is the legacy serialized name.  It counts trajectories in
-    normal/sequential RB and must equal one sampled tree per rank in branched RB.
+    ``sequential_starts`` is a global logical-work count in normal and
+    sequential RB.  The training launcher partitions it into collision-free
+    rank-local prefixes.  Branched RB ignores the count and always samples one
+    root per rank; it is retained there as the explicit value ``1`` so one
+    frozen schema can serve every mode.
     """
 
-    n_trees: int
+    sequential_starts: int
     beta: dict[str, float] | None
     node_budget: int
     reach_storage: str
+    queue_batch_rows: int | None = None
+    queue_admission_size: int | None = None
+    arena_chunk_nodes: int | None = None
+    queue_memory_bytes: int | None = None
+    queue_packing: str = "actual_cost_greedy"
+
+    @property
+    def n_trees(self) -> int:
+        """Temporary internal spelling while rollout storage is being renamed.
+
+        YAML configuration deliberately does not accept ``n_trees``.  Keeping
+        the property localizes the mechanical storage migration without
+        preserving the ambiguous public interface.
+        """
+
+        return self.sequential_starts
+
+    @n_trees.setter
+    def n_trees(self, value: int) -> None:
+        self.sequential_starts = value
 
     @property
     def beta_fix(self) -> dict[str, float]:
@@ -66,6 +89,7 @@ class LossConfig:
     c_h: float
     entropy_schedule: str
     value_loss: str = "mse"
+    c_kl: float = 0.0
 
 
 @dataclass
@@ -84,6 +108,9 @@ class TrainingConfig:
     checkpoint_every: int
     out_dir: str
     reproducibility: str = "strict"
+    kl_ref_interval: int = 1
+    optimizer: str = "adam"
+    ppo_epochs: int | None = None
 
 
 @dataclass
@@ -261,23 +288,63 @@ def _validate_config(cfg: RootConfig) -> None:
                 raise ConfigError(
                     f"root.rollout.beta.{bucket}: expected a finite value at least one"
                 )
-        if cfg.rollout.n_trees != 1:
+        if cfg.rollout.sequential_starts != 1:
             raise ConfigError(
-                "root.rollout.n_trees: branched_rao_blackwell requires exactly "
-                "one sampled tree per rank"
+                "root.rollout.sequential_starts: use 1 for branched_rao_blackwell; "
+                "production creates exactly one root per rank"
             )
     elif cfg.rollout.beta is not None:
         raise ConfigError(
             f"root.rollout.beta: only valid for branched_rao_blackwell, not {cfg.training.mode}"
         )
+    if cfg.rollout.sequential_starts <= 0:
+        raise ConfigError("root.rollout.sequential_starts: expected a positive integer")
     if cfg.rollout.reach_storage not in {"full", "decisions_only", "recompute"}:
         raise ConfigError(
             "root.rollout.reach_storage: expected 'full', 'decisions_only', or 'recompute'"
+        )
+    for name in (
+        "queue_batch_rows",
+        "queue_admission_size",
+        "arena_chunk_nodes",
+        "queue_memory_bytes",
+    ):
+        value = getattr(cfg.rollout, name)
+        if value is not None and (isinstance(value, bool) or value <= 0):
+            raise ConfigError(f"root.rollout.{name}: expected a positive integer")
+    if cfg.rollout.queue_packing not in {
+        "fixed_family_quantum",
+        "actual_cost_greedy",
+    }:
+        raise ConfigError(
+            "root.rollout.queue_packing: expected 'fixed_family_quantum' or "
+            "'actual_cost_greedy'"
         )
     if cfg.loss.entropy_schedule not in {"const", "linear_decay"}:
         raise ConfigError("root.loss.entropy_schedule: expected 'const' or 'linear_decay'")
     if cfg.loss.value_loss not in {"mse", "clipped"}:
         raise ConfigError("root.loss.value_loss: expected 'mse' or 'clipped'")
+    if not math.isfinite(cfg.loss.c_kl) or cfg.loss.c_kl < 0.0:
+        raise ConfigError("root.loss.c_kl: expected a finite nonnegative value")
+    if isinstance(cfg.training.kl_ref_interval, bool) or cfg.training.kl_ref_interval <= 0:
+        raise ConfigError("root.training.kl_ref_interval: expected a positive integer")
+    if cfg.training.optimizer not in {"adam", "adamw"}:
+        raise ConfigError("root.training.optimizer: expected 'adam' or 'adamw'")
+    if cfg.training.ppo_epochs is not None:
+        if (
+            isinstance(cfg.training.ppo_epochs, bool)
+            or cfg.training.ppo_epochs <= 0
+        ):
+            raise ConfigError("root.training.ppo_epochs: expected a positive integer")
+        if cfg.training.gd_steps_per_iter != 1:
+            raise ConfigError(
+                "root.training.gd_steps_per_iter: must equal one when ppo_epochs is set"
+            )
+        if cfg.training.mode == "branched_rao_blackwell":
+            raise ConfigError(
+                "root.training.ppo_epochs: shuffled epochs currently support only "
+                "normal and sequential Rao--Blackwell training"
+            )
     if cfg.training.reproducibility not in {"strict", "seeded", "throughput"}:
         raise ConfigError(
             "root.training.reproducibility: expected 'strict', 'seeded', or 'throughput'"

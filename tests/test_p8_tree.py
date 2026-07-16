@@ -101,6 +101,39 @@ def test_device_tree_depth_uses_the_same_inclusive_convention(device: str) -> No
     assert tree.depth_player.tolist() == [1, 2, 2]
 
 
+def test_device_tree_finalizes_cross_depth_expansion_without_sorting() -> None:
+    buffer = DeviceTreeBuffer(2, 3, 2, "cpu")
+    roots = buffer.add_roots(
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.tensor([0, 0], dtype=torch.int32),
+    )
+    later_root_child = buffer.append_children(
+        roots[1:2],
+        torch.tensor([20], dtype=torch.int32),
+        torch.tensor([TERMINAL], dtype=torch.int32),
+        torch.tensor([200], dtype=torch.int32),
+        torch.tensor([1.0]),
+    )
+    earlier_root_children = buffer.append_children(
+        roots[0:1].expand(2),
+        torch.tensor([10, 11], dtype=torch.int32),
+        torch.tensor([TERMINAL, TERMINAL], dtype=torch.int32),
+        torch.tensor([100, 101], dtype=torch.int32),
+        torch.tensor([0.25, 0.75]),
+    )
+
+    tree = buffer.finalize()
+
+    tree.validate()
+    assert tree.child_ptr.tolist() == [0, 2, 3, 3, 3, 3]
+    assert tree.child_node.tolist() == [
+        *earlier_root_children.tolist(),
+        *later_root_child.tolist(),
+    ]
+    assert tree.child_event.tolist() == [100, 101, 200]
+    assert torch.equal(tree.nu, torch.tensor([0.25, 0.75, 1.0]))
+
+
 def test_validate_rejects_bad_nu_and_path_weight() -> None:
     tree, _ = _hand_tree()
     bad_nu = tree.nu.clone()

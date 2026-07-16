@@ -9,7 +9,8 @@ import torch
 from torch import Tensor
 
 from pbg.core.game import GameBundle
-from pbg.core.rollout import _sample_trees_sequential
+from pbg.core.queued import DrawPurpose
+from pbg.core.rollout import sample_trees_sequential, sequential_leaf_logical_rng_keys
 from pbg.core.tree import DecisionReachCache
 
 
@@ -67,8 +68,8 @@ def build_normal_dataset(
 ) -> NormalDataset:
     """Roll out sampled profiles to terminal rewards and emit scalar targets."""
 
-    sampled = _sample_trees_sequential(
-        bundle, cfg.rollout, gen, return_profiles=True
+    sampled = sample_trees_sequential(
+        bundle, cfg, gen, return_profiles=True
     )
     return build_normal_dataset_from_sampled(bundle, cfg, gen, sampled)
 
@@ -78,6 +79,8 @@ def build_normal_dataset_from_sampled(
     cfg: Any,
     gen: torch.Generator,
     sampled: tuple[Any, Any, Any, Tensor],
+    *,
+    iteration: int = 0,
 ) -> NormalDataset:
     """Emit compact scalar targets from sampled terminal trajectories."""
 
@@ -106,9 +109,26 @@ def build_normal_dataset_from_sampled(
     leaf = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero(as_tuple=False).squeeze(1)
     leaf_tree = tree.tree_id[leaf].to(torch.int64)
     leaf_profiles = root_profiles[leaf_tree]
-    terminal_reward = bundle.rollout_backend.sampled_terminal_reward(
-        tree.state_ref[leaf], leaf_profiles, gen
-    ).float()
+    keyed_reward = getattr(
+        bundle.rollout_backend, "sampled_terminal_reward_keyed", None
+    )
+    if callable(keyed_reward):
+        keys = sequential_leaf_logical_rng_keys(
+            tree,
+            cfg,
+            gen,
+            leaf,
+            iteration=iteration,
+            purpose=DrawPurpose.COMPLETION,
+            draw=1,
+        )
+        terminal_reward = keyed_reward(
+            tree.state_ref[leaf], leaf_profiles, keys
+        ).float()
+    else:
+        terminal_reward = bundle.rollout_backend.sampled_terminal_reward(
+            tree.state_ref[leaf], leaf_profiles, gen
+        ).float()
     n_trees = int(cfg.rollout.n_trees)
     reward_by_tree = torch.empty(
         (n_trees, p_max), dtype=torch.float32, device=device
@@ -184,6 +204,17 @@ def sample_normal_minibatch(
     rows = torch.randint(
         len(dataset), (size,), generator=gen, device=dataset.state_refs.device
     )
+    return gather_normal_minibatch(dataset, bundle, rows)
+
+
+def gather_normal_minibatch(
+    dataset: NormalDataset,
+    bundle: GameBundle,
+    rows: Tensor,
+) -> NormalMinibatch:
+    """Gather explicit ordinary-training rows without resampling."""
+
+    rows = rows.to(device=dataset.state_refs.device, dtype=torch.int64)
     states = dataset.state_refs[rows]
     legal_ids, legal_mask = bundle.rollout_backend.legal_events(states)
     return NormalMinibatch(

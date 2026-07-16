@@ -47,8 +47,12 @@ class RolloutBackend(Protocol):
     x_sizes: tuple[int, ...]
     max_rollout_steps: int
 
-    def root_states(self, n: int) -> StateBatch:
-        """Return device-local opaque int32 state handles ``[B]``."""
+    def sequential_start_states(self, count: int) -> StateBatch:
+        """Return ``count`` device-local sequential starts as int32 ``[B]``."""
+        ...
+
+    def branched_root_state(self) -> StateBatch:
+        """Return the unique device-local branched root as int32 ``[1]``."""
         ...
 
     def classify(self, states: StateBatch) -> Tensor:

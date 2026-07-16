@@ -36,7 +36,7 @@ def _small_poker_cfg(tmp_path: Path):
         "stack_bb": 8.0,
         "rank_count": 13,
     }
-    cfg.rollout.n_trees = 2
+    cfg.rollout.sequential_starts = 2
     cfg.rollout.node_budget = 64
     cfg.training.mode = "rao_blackwell"
     cfg.rollout.beta = None
@@ -82,8 +82,8 @@ def test_all_first_run_presets_load_strictly_without_deferred_settings() -> None
         assert not (_keys(raw) & DEFERRED)
     nlhe = loaded["nlhe6_h100.yaml"]
     assert nlhe.game.poker["n_players"] == 6
-    assert nlhe.rollout.n_trees == 1 and nlhe.rollout.node_budget == 4096
-    assert nlhe.train.minibatch_size == 2
+    assert nlhe.rollout.sequential_starts == 1 and nlhe.rollout.node_budget == 4096
+    assert nlhe.train.minibatch_size == 6
     assert nlhe.completion.backend == "cuda"
     assert nlhe.train.iters == 10_000 and nlhe.train.checkpoint_every == 100
 
@@ -102,6 +102,16 @@ def test_poker_rollout_memory_plan_bounds_recompute_and_full_storage() -> None:
     assert safe.peak_bytes < gib
     assert legacy.frontier_reach_bytes > 100 * gib
     assert full.reach_cache_bytes > 60 * gib
+
+    fifo = estimate_rollout_memory(
+        n_trees=256,
+        node_budget=8192,
+        n_players=6,
+        reach_storage="recompute",
+        sequential_recompute_live_rows=True,
+    )
+    assert fifo.frontier_reach_bytes == 2 * 256 * 6 * 1326 * 4
+    assert fifo.frontier_reach_bytes < legacy.frontier_reach_bytes
 
 
 def test_h100_bootstrap_bundle_constructs_without_capacity_sized_history() -> None:
@@ -132,10 +142,10 @@ def test_explicit_registry_builds_one_owning_poker_model(tmp_path: Path) -> None
 
 def test_real_sibling_combo_table_and_partition_signature() -> None:
     pbg = pytest.importorskip("poker_gpu_evaluator.pbg")
-    assert pbg.API_VERSION == "pbg-v2"
-    validate_evaluator_combo_cards(pbg.COMBO_CARDS)
+    assert pbg.API_VERSION == "pbg-v3"
+    validate_evaluator_combo_cards(pbg.combo_cards(13))
     assert tuple(inspect.signature(pbg.partition_many).parameters) == (
-        "board_cards", "range_weights", "row_mask", "field_order", "backend",
+        "rank_count", "board_cards", "range_weights", "row_mask", "field_order", "backend",
     )
     source = inspect.getsource(PokerGPUPartitionAdapter.summarize)
     assert "query_combo_ids" not in source
@@ -158,7 +168,7 @@ def test_three_iteration_cpu_sibling_smoke_is_finite_and_checkpoints(tmp_path: P
     metadata = load_checkpoint(checkpoint, bundle.model)
     assert metadata["iter"] == 3
     backend = bundle.rollout_backend
-    roots = backend.root_states(2)
+    roots = backend.sequential_start_states(2)
     inputs = backend.completion_inputs(
         roots, torch.zeros((2, 2, 1326), dtype=torch.float32)
     )

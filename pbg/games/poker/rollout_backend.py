@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections import deque
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +12,13 @@ import torch
 from torch import Tensor, nn
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
+from pbg.core.observability import ExecutionMetrics
+from pbg.core.queued import (
+    FamilyPackingLimits,
+    child_path_keys,
+    logical_categorical_from_valid_probability,
+    logical_uniform,
+)
 from pbg.games.poker.cards import N_CLASSES, N_HANDS
 from pbg.games.poker.engine import (
     ALL_IN,
@@ -77,6 +84,11 @@ class PokerRolloutBackend:
     list-based correctness oracle used only by tests and evaluation.
     """
 
+    # Folded-seat ranges still affect preflop tokens and reach-derived features.
+    # Retain the exact rollout input until an immutable folded-summary cache is
+    # part of the model-input contract.
+    requires_full_decision_reach = True
+
     def __init__(
         self,
         cfg: PokerConfig,
@@ -91,8 +103,7 @@ class PokerRolloutBackend:
     ) -> None:
         if cfg.rank_count != 13:
             raise RuntimeError(
-                "compact-deck rollout is waiting for sibling evaluator pbg-v3; "
-                "see docs/todo/POKER_GPU_EVALUATOR_COMPACT_DECK_REQUEST.md"
+                "compact-deck model tensors are not yet migrated to variable hand width"
             )
         self.cfg = cfg
         self.device = torch.device(device)
@@ -121,10 +132,14 @@ class PokerRolloutBackend:
         if any(not math.isfinite(float(value)) or float(value) < 1.0 for value in self.beta_fix.values()):
             raise ValueError("rollout beta values must be finite and at least one")
         self.profile_sampler = profile_sampler or PokerGPURejectionSampler(
-            backend=evaluator_backend
+            backend=evaluator_backend, rank_count=cfg.rank_count
         )
-        self.showdown_evaluator = PokerGPUShowdownEvaluator(backend=evaluator_backend)
-        self.partition_adapter = partition_adapter or PokerGPUPartitionAdapter()
+        self.showdown_evaluator = PokerGPUShowdownEvaluator(
+            backend=evaluator_backend, rank_count=cfg.rank_count
+        )
+        self.partition_adapter = partition_adapter or PokerGPUPartitionAdapter(
+            rank_count=cfg.rank_count
+        )
         combo_cards = torch.triu_indices(52, 52, offset=1, device=self.device).T
         self.combo_cards = combo_cards.to(torch.int16)  # [H,2]
         a, b = combo_cards[:, 0], combo_cards[:, 1]
@@ -141,18 +156,47 @@ class PokerRolloutBackend:
             **{f"postflop_{live}": [] for live in range(2, cfg.n_players + 1)},
         }
         self.execution_profile = None
-        self.policy_batch_metrics: deque[dict[str, int | str]] = deque(maxlen=4096)
+        # Aggregate counters are intentionally lossless.  The former bounded
+        # deque silently discarded early calls in long iterations.
+        self.execution_metrics = ExecutionMetrics()
+        self.execution_families = (
+            "pre",
+            *(f"post_{live}" for live in range(2, cfg.n_players + 1)),
+        )
+        self.execution_family_values = (0, *range(2, cfg.n_players + 1))
+        self.execution_family_priorities = (
+            0,
+            *(1 for _ in range(2, cfg.n_players + 1)),
+        )
         self._partition_cache: dict[int, PartitionSummaryBatch] = {}
         self.game = self
 
-    def root_states(self, n: int) -> Tensor:
-        """Reset storage, post blinds, and return int32 root handles ``[B]``."""
+    def _dynamic_positions(self, mask: Tensor, source: str) -> Tensor:
+        """Compact a mask and record CUDA's implicit dynamic-shape sync."""
 
-        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
-            raise ValueError("n must be a nonnegative integer")
+        if mask.device.type != "cuda":
+            return mask.nonzero(as_tuple=False).squeeze(1)
+        started = time.perf_counter()
+        positions = mask.nonzero(as_tuple=False).squeeze(1)
+        self.execution_metrics.record_host_synchronization(
+            seconds=time.perf_counter() - started, source=source
+        )
+        return positions
+
+    def sequential_start_states(self, count: int) -> Tensor:
+        """Reset storage and return ``count`` deterministically rotated starts."""
+
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("count must be a nonnegative integer")
         buttons = torch.remainder(
-            torch.arange(n, dtype=torch.int32, device=self.device), self.n_players
+            torch.arange(count, dtype=torch.int32, device=self.device), self.n_players
         )  # [B]
+        return self._root_states_with_buttons(buttons)
+
+    def branched_root_state(self) -> Tensor:
+        """Reset storage and return exactly one canonical root for this rank."""
+
+        buttons = torch.zeros(1, dtype=torch.int32, device=self.device)
         return self._root_states_with_buttons(buttons)
 
     def _root_states_with_buttons(self, buttons: Tensor) -> Tensor:
@@ -303,11 +347,48 @@ class PokerRolloutBackend:
         if events.public_id.shape != states.shape:
             raise ValueError("events and states must have matching shape [B]")
         phase = self.states.phase[states.to(torch.int64)]
-        if "cards" in events.payload:
-            torch._assert((phase == _CHANCE).all(), "card payload requires chance states")
-            return self._step_chance(states, events.payload["cards"])
-        torch._assert((phase == _PLAYER).all(), "player event requires player states")
+        player = self._dynamic_positions(phase == _PLAYER, "poker_step_player")
+        chance = self._dynamic_positions(phase == _CHANCE, "poker_step_chance")
+        torch._assert(
+            player.numel() + chance.numel() == states.numel(),
+            "poker step requires player or chance states",
+        )
+        if chance.numel() and "cards" not in events.payload:
+            raise ValueError("chance events require a card payload")
+
+        # A branched frontier may contain player and chance rows at the same
+        # depth.  Generic event collation pads chance-only payloads across the
+        # combined batch, so payload-key presence cannot classify every row.
+        successors = torch.empty_like(states)
+        if player.numel():
+            successors[player] = self._step_player(
+                states[player], events.public_id[player]
+            )
+        if chance.numel():
+            successors[chance] = self._step_chance(
+                states[chance], events.payload["cards"][chance]
+            )
+        return successors
+
+    def step_player_batch(self, states: Tensor, events: EventBatch) -> Tensor:
+        """Apply a scheduler-declared homogeneous player batch without compaction."""
+
+        self._validate_handles(states)
+        if events.public_id.shape != states.shape:
+            raise ValueError("events and states must have matching shape [B]")
+        phase = self.states.phase[states.to(torch.int64)]
+        torch._assert_async((phase == _PLAYER).all(), "player batch contains non-player state")
         return self._step_player(states, events.public_id)
+
+    def step_chance_batch(self, states: Tensor, events: EventBatch) -> Tensor:
+        """Apply a scheduler-declared homogeneous chance batch without compaction."""
+
+        self._validate_handles(states)
+        if events.public_id.shape != states.shape or "cards" not in events.payload:
+            raise ValueError("chance events require matching states and card payload")
+        phase = self.states.phase[states.to(torch.int64)]
+        torch._assert_async((phase == _CHANCE).all(), "chance batch contains non-chance state")
+        return self._step_chance(states, events.payload["cards"])
 
     def _step_player(self, states: Tensor, event_ids: Tensor) -> Tensor:
         """Apply batched legal player actions ``[B]``."""
@@ -560,12 +641,65 @@ class PokerRolloutBackend:
         profiles = self.profile_sampler.sample(
             reach, self.states.board[rows], dealt, 1, gen
         )
+        self.execution_metrics.record_evaluator(rows=int(states.numel()))
         return profiles[:, 0].to(torch.int32)  # [B,P]
+
+    def sample_profiles_keyed(
+        self, states: Tensor, reach: Tensor, keys: Tensor
+    ) -> Tensor:
+        """Draw profiles from caller-owned logical-address seeds ``[B]``."""
+
+        self._validate_handles(states)
+        if keys.shape != states.shape or keys.dtype != torch.int64:
+            raise ValueError("profile keys must be int64 [B]")
+        rows = states.to(torch.int64)
+        dealt = torch.ones(
+            (states.shape[0], self.n_players), dtype=torch.bool, device=self.device
+        )
+        seeded = getattr(self.profile_sampler, "sample_seeded", None)
+        if callable(seeded):
+            profiles = seeded(
+                reach,
+                self.states.board[rows],
+                dealt,
+                1,
+                keys.to(device=self.device, dtype=torch.int64),
+            )
+        else:
+            # Test doubles predating the keyed facade are deterministic.  Real
+            # evaluator adapters expose sample_seeded and never take this path.
+            fallback = torch.Generator(device=self.device).manual_seed(0)
+            profiles = self.profile_sampler.sample(
+                reach, self.states.board[rows], dealt, 1, fallback
+            )
+        self.execution_metrics.record_evaluator(rows=int(states.numel()))
+        return profiles[:, 0].to(torch.int32)
 
     def sampled_terminal_reward(
         self, states: Tensor, profiles: Tensor, gen: torch.Generator
     ) -> Tensor:
         """Draw missing board cards and settle one sampled profile per leaf."""
+
+        return self._sampled_terminal_reward_impl(states, profiles, gen=gen, keys=None)
+
+    def sampled_terminal_reward_keyed(
+        self, states: Tensor, profiles: Tensor, keys: Tensor
+    ) -> Tensor:
+        """Settle leaves with schedule-independent runout keys ``[B]``."""
+
+        if keys.shape != states.shape or keys.dtype != torch.int64:
+            raise ValueError("terminal reward keys must be int64 [B]")
+        return self._sampled_terminal_reward_impl(states, profiles, gen=None, keys=keys)
+
+    def _sampled_terminal_reward_impl(
+        self,
+        states: Tensor,
+        profiles: Tensor,
+        *,
+        gen: torch.Generator | None,
+        keys: Tensor | None,
+    ) -> Tensor:
+        """Common sampled-showdown implementation for mutable or keyed RNG."""
 
         self._validate_handles(states)
         if profiles.shape != (states.shape[0], self.n_players):
@@ -596,10 +730,22 @@ class PokerRolloutBackend:
             )
             batch = torch.arange(board.shape[0], device=self.device)[:, None].expand_as(valid)
             blocked[batch[valid], unavailable[valid].to(torch.int64)] = True
-            keys = torch.rand(
-                (board.shape[0], 52), generator=gen, device=self.device
-            ).masked_fill(blocked, torch.inf)
-            runout = torch.argsort(keys, dim=1)[:, :5].to(torch.int16)
+            if keys is None:
+                if gen is None:
+                    raise RuntimeError("sampled terminal reward requires an RNG source")
+                scores = torch.rand(
+                    (board.shape[0], 52), generator=gen, device=self.device
+                )
+            else:
+                showdown_keys = keys[showdown]
+                card_ordinals = torch.arange(
+                    1, 53, dtype=torch.int64, device=self.device
+                )
+                scores = logical_uniform(
+                    child_path_keys(showdown_keys[:, None], card_ordinals[None, :])
+                )
+            scores = scores.masked_fill(blocked, torch.inf)
+            runout = torch.argsort(scores, dim=1)[:, :5].to(torch.int16)
             missing = board < 0
             missing_rank = (missing.to(torch.int64).cumsum(1) - 1).clamp_min(0)
             complete_board = torch.where(
@@ -627,6 +773,7 @@ class PokerRolloutBackend:
                 active_mask=active.contiguous(),
                 stratum_players=evaluator_players.contiguous(),
             )
+            self.execution_metrics.record_evaluator(rows=int(selected_rows.numel()))
             reward[showdown] = assemble_showdown_payoff(
                 settlement, result.showdown_share
             )
@@ -669,6 +816,57 @@ class PokerRolloutBackend:
         one_label = cards[:, 0].to(torch.int32)
         street = self.states.street[rows]
         label = torch.where(street == 0, flop_label + _CHANCE_OFFSETS[0], one_label + _CHANCE_OFFSETS[1])
+        label = torch.where(street == 2, one_label + _CHANCE_OFFSETS[2], label)
+        return EventBatch(public_id=label.to(torch.int32), payload={"cards": cards})
+
+    def sample_events_keyed(
+        self,
+        states: Tensor,
+        profiles: Tensor,
+        policy_out: PolicyOutput | None,
+        adapter: Any,
+        keys: Tensor,
+    ) -> EventBatch:
+        """Draw actions/cards from schedule-independent logical keys ``[B]``."""
+
+        if keys.shape != states.shape or keys.dtype != torch.int64:
+            raise ValueError("event keys must be int64 [B]")
+        owners = self.classify(states)
+        if policy_out is not None:
+            legal_ids, legal_mask = self.legal_events(states)
+            selected = adapter.select_actor_row(
+                policy_out, profiles, owners.to(torch.int64)
+            )
+            probability = adapter.probabilities(selected, legal_ids, legal_mask)
+            columns = logical_categorical_from_valid_probability(probability, keys)
+            public_id = legal_ids.gather(1, columns[:, None]).squeeze(1)
+            return EventBatch(public_id=public_id.to(torch.int32))
+
+        rows = states.to(torch.int64)
+        board = self.states.board[rows]
+        private = self.combo_cards[profiles.to(torch.int64)].reshape(states.shape[0], -1)
+        unavailable = torch.cat((board, private), dim=1)
+        valid = unavailable >= 0
+        blocked = torch.zeros((states.shape[0], 52), dtype=torch.bool, device=self.device)
+        batch_rows = torch.arange(states.shape[0], device=self.device)[:, None].expand_as(valid)
+        blocked[batch_rows[valid], unavailable[valid].to(torch.int64)] = True
+        card_ordinals = torch.arange(1, 53, dtype=torch.int64, device=self.device)
+        card_keys = child_path_keys(keys[:, None], card_ordinals[None, :])
+        scores = logical_uniform(card_keys).masked_fill(blocked, torch.inf)
+        draw = torch.argsort(scores, dim=1)[:, :3].to(torch.int16)
+        count = torch.where(self.states.street[rows] == 0, 3, 1)
+        keep = torch.arange(3, device=self.device)[None, :] < count[:, None]
+        cards = draw.masked_fill(~keep, -1)
+        sorted_cards = torch.sort(cards.masked_fill(cards < 0, 127), dim=1).values
+        c0 = sorted_cards[:, 0].to(torch.int32)
+        c1 = sorted_cards[:, 1].to(torch.int32)
+        c2 = sorted_cards[:, 2].to(torch.int32)
+        flop_label = c0 + c1 * (c1 - 1) // 2 + c2 * (c2 - 1) * (c2 - 2) // 6
+        one_label = cards[:, 0].to(torch.int32)
+        street = self.states.street[rows]
+        label = torch.where(
+            street == 0, flop_label + _CHANCE_OFFSETS[0], one_label + _CHANCE_OFFSETS[1]
+        )
         label = torch.where(street == 2, one_label + _CHANCE_OFFSETS[2], label)
         return EventBatch(public_id=label.to(torch.int32), payload={"cards": cards})
 
@@ -836,27 +1034,7 @@ class PokerRolloutBackend:
         post_model = getattr(source, "postflop", None)
         if post_model is None:
             return [torch.arange(states.numel(), device=states.device)]
-        cfg = post_model.cfg
-        rows = states.to(torch.int64)
-        street = self.states.street[rows].to(torch.int64)
-        live = (self.states.status[rows] != FOLDED).sum(1).to(torch.int64)
-        history = self.states.history_length[rows].to(torch.int64)
-        scalar_count = 3 * self.n_players + 13 + self.e_max + self.n_ticks
-        pre_tokens = (
-            self.n_players * N_CLASSES + scalar_count + 1 + history + cfg.k_act
-        )
-        combo_count = torch.where(
-            street == 1,
-            torch.full_like(street, 1176),
-            torch.where(
-                street == 2,
-                torch.full_like(street, 1128),
-                torch.full_like(street, 1081),
-            ),
-        )
-        post_tokens = live * combo_count + scalar_count + 6 + history + cfg.k_act
-        token_count = torch.where(street == 0, pre_tokens, post_tokens)
-        family = torch.where(street == 0, torch.zeros_like(live), live)
+        token_count, family = self._policy_work_rows(model, states)
         max_tokens = (
             profile.training_max_tokens
             if phase == "training"
@@ -869,7 +1047,7 @@ class PokerRolloutBackend:
         )
         result: list[Tensor] = []
         for family_id in torch.unique(family, sorted=True).tolist():
-            positions = (family == family_id).nonzero(as_tuple=False).squeeze(1)
+            positions = self._dynamic_positions(family == family_id, "poker_policy_family")
             order = torch.argsort(token_count[positions], stable=True)
             ordered = positions[order]
             current: list[int] = []
@@ -898,16 +1076,154 @@ class PokerRolloutBackend:
         for positions in result:
             lengths = token_count[positions]
             maximum = int(lengths.max().item())
-            self.policy_batch_metrics.append(
-                {
-                    "phase": phase,
-                    "batch_size": int(positions.numel()),
-                    "max_tokens": maximum,
-                    "padded_tokens": int(positions.numel()) * maximum,
-                    "padded_token_pairs": int(positions.numel()) * maximum * maximum,
-                }
+            family_id = int(family[positions[0]].item())
+            family_name = "pre" if family_id == 0 else f"post_{family_id}"
+            self.execution_metrics.record_policy_pack(
+                phase,
+                family_name,
+                rows=int(positions.numel()),
+                padded_tokens=int(positions.numel()) * maximum,
+                padded_token_pairs=int(positions.numel()) * maximum * maximum,
             )
         return result
+
+    def _policy_work_rows(
+        self, model: nn.Module, states: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Return per-row padded-work lengths and execution-family ids."""
+
+        source = model.module if hasattr(model, "module") else model
+        post_model = getattr(source, "postflop", None)
+        k_act = int(getattr(getattr(post_model, "cfg", None), "k_act", 0))
+        rows = states.to(torch.int64)
+        street = self.states.street[rows].to(torch.int64)
+        live = (self.states.status[rows] != FOLDED).sum(1).to(torch.int64)
+        history = self.states.history_length[rows].to(torch.int64)
+        scalar_count = 3 * self.n_players + 13 + self.e_max + self.n_ticks
+        pre_tokens = self.n_players * N_CLASSES + scalar_count + 1 + history + k_act
+        combo_count = torch.where(
+            street == 1,
+            torch.full_like(street, 1176),
+            torch.where(
+                street == 2,
+                torch.full_like(street, 1128),
+                torch.full_like(street, 1081),
+            ),
+        )
+        post_tokens = live * combo_count + scalar_count + 6 + history + k_act
+        return (
+            torch.where(street == 0, pre_tokens, post_tokens),
+            torch.where(street == 0, torch.zeros_like(live), live),
+        )
+
+    def rollout_family_ids(self, states: Tensor) -> Tensor:
+        """Return ``0=pre`` or ``A=post_A`` without street partitioning."""
+
+        rows = states.to(torch.int64)
+        street = self.states.street[rows]
+        live = (self.states.status[rows] != FOLDED).sum(1).to(torch.int64)
+        return torch.where(street == 0, torch.zeros_like(live), live)
+
+    def rollout_row_cost(
+        self, model: nn.Module, states: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Return padded-token width and non-model workspace estimates ``[B]``."""
+
+        source = model.module if hasattr(model, "module") else model
+        post_model = getattr(source, "postflop", None)
+        k_act = int(getattr(getattr(post_model, "cfg", None), "k_act", 0))
+        rows = states.to(torch.int64)
+        street = self.states.street[rows].to(torch.int64)
+        live = (self.states.status[rows] != FOLDED).sum(1).to(torch.int64)
+        history = self.states.history_length[rows].to(torch.int64)
+        scalar_count = 3 * self.n_players + 13 + self.e_max + self.n_ticks
+        pre_tokens = self.n_players * N_CLASSES + scalar_count + 1 + history + k_act
+        # post_A deliberately mixes flop/turn/river in one invocation. Its
+        # compact tensor is therefore padded to the flop width for every row;
+        # only the realized history component varies within the family.
+        post_tokens = live * math.comb(49, 2) + scalar_count + 6 + history + k_act
+        tokens = torch.where(street == 0, pre_tokens, post_tokens)
+        return tokens, torch.zeros_like(tokens)
+
+    def queued_static_pack_capacity(
+        self,
+        model: nn.Module,
+        family: str,
+        phase: str,
+        limits: FamilyPackingLimits,
+    ) -> int:
+        """Return a fixed CUDA quantum feasible for every row in one family.
+
+        The queue key deliberately omits street.  Consequently ``post_A`` uses
+        the largest flop width and maximum retained history in its proof.  The
+        resulting host-known quantum may be conservative for turn/river rows,
+        but the masked device packer can consume it without exposing a dynamic
+        prefix length to Python.  Phase 4 may replace the current physical
+        street splitter without changing this queue-level safety contract.
+        """
+
+        if phase not in {"training", "inference"}:
+            raise ValueError("phase must be 'training' or 'inference'")
+        source = model.module if hasattr(model, "module") else model
+        post_model = getattr(source, "postflop", None)
+        k_act = int(getattr(getattr(post_model, "cfg", None), "k_act", 0))
+        scalar_count = 3 * self.n_players + 13 + self.e_max + self.n_ticks
+        if family == "pre":
+            maximum_width = (
+                self.n_players * N_CLASSES
+                + scalar_count
+                + 1
+                + self.max_rollout_steps
+                + k_act
+            )
+        elif family.startswith("post_"):
+            try:
+                live = int(family.removeprefix("post_"))
+            except ValueError as exc:
+                raise ValueError(f"invalid poker execution family {family!r}") from exc
+            if not 2 <= live <= self.n_players:
+                raise ValueError(f"invalid poker execution family {family!r}")
+            maximum_width = (
+                live * 1176
+                + scalar_count
+                + 6
+                + self.max_rollout_steps
+                + k_act
+            )
+        else:
+            raise ValueError(f"invalid poker execution family {family!r}")
+
+        capacity = min(
+            limits.max_rows,
+            limits.max_padded_tokens // maximum_width,
+            limits.max_padded_token_pairs // (maximum_width * maximum_width),
+        )
+        if capacity <= 0:
+            raise MemoryError(
+                f"one worst-case {family} row needs {maximum_width} padded tokens, "
+                "beyond its calibrated CUDA family limits"
+            )
+        return int(capacity)
+
+    def _record_policy_model_call(
+        self,
+        model: nn.Module,
+        states: Tensor,
+        positions: Tensor,
+        family: str,
+    ) -> None:
+        """Aggregate one actual direct model call, including padded work."""
+
+        token_count, _ = self._policy_work_rows(model, states[positions])
+        maximum = int(token_count.max().item())
+        rows = int(positions.numel())
+        self.execution_metrics.record_model_call(
+            "training" if torch.is_grad_enabled() else "inference",
+            family,
+            rows,
+            padded_tokens=rows * maximum,
+            padded_token_pairs=rows * maximum * maximum,
+        )
 
     def policy_forward(self, frozen_model: nn.Module, states: Tensor, reach: Tensor) -> PolicyOutput:
         """Route and bounded-batch policy calls, returning combo rows ``[B,H]``."""
@@ -923,6 +1239,243 @@ class PokerRolloutBackend:
                 ]
                 return self._combine_outputs(parts, states.shape[0])
         return self._policy_forward_direct(frozen_model, states, reach)
+
+    def policy_forward_family(
+        self,
+        frozen_model: nn.Module,
+        family: str,
+        states: Tensor,
+        reach: Tensor,
+    ) -> PolicyOutput:
+        """Execute one already-routed family, allowing mixed postflop streets."""
+
+        self._validate_handles(states)
+        if states.ndim != 1 or states.numel() == 0:
+            raise ValueError("a family policy call requires a nonempty state vector")
+        if reach.shape != (states.shape[0], self.n_players, N_HANDS):
+            raise ValueError("reach must have shape [B,P,1326]")
+        rows = states.to(torch.int64)
+        street = self.states.street[rows]
+        live = (self.states.status[rows] != FOLDED).sum(1)
+        if family == "pre":
+            expected = street == 0
+        elif family.startswith("post_"):
+            try:
+                expected_live = int(family.removeprefix("post_"))
+            except ValueError as exc:
+                raise ValueError(f"invalid poker execution family {family!r}") from exc
+            if not 2 <= expected_live <= self.n_players:
+                raise ValueError(f"invalid poker execution family {family!r}")
+            expected = (street != 0) & (live == expected_live)
+        else:
+            raise ValueError(f"invalid poker execution family {family!r}")
+        if states.device.type == "cuda":
+            torch._assert_async(expected.all(), "family queue contains a misrouted poker row")
+        elif not bool(expected.all()):
+            raise ValueError("family queue contains a misrouted poker row")
+
+        finite = torch.isfinite(reach)
+        gauge = reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
+        weights = torch.exp(reach - gauge).masked_fill(~finite, 0.0)
+        pub = self.encode_public(states)
+        positions = torch.arange(states.numel(), device=self.device)
+        if family == "pre":
+            class_ranges = torch.zeros(
+                (states.numel(), self.n_players, N_CLASSES),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            class_ids = self.combo_class[None, None, :].expand_as(weights)
+            class_ranges.scatter_add_(2, class_ids, weights)
+            masks = PreflopMasks(seat_mask=pub.seat_mask, status=pub.status)
+            output = frozen_model.forward_preflop(pub, class_ranges, pub.to_act, masks)
+            if output.v.shape[1] == N_CLASSES:
+                output = PolicyOutput(
+                    raw={
+                        name: value[:, self.combo_class]
+                        for name, value in output.raw.items()
+                    },
+                    v=output.v[:, self.combo_class],
+                    vvec=output.vvec,
+                    u=output.u,
+                )
+            self.batch_size_histograms["preflop"].append(states.numel())
+        else:
+            source = frozen_model.module if hasattr(frozen_model, "module") else frozen_model
+            post_model = getattr(source, "postflop", None)
+            consumes_partition = bool(
+                getattr(
+                    post_model,
+                    "requires_partition_summary",
+                    getattr(getattr(post_model, "cfg", None), "evaluator_summary_dim", 0) > 0,
+                )
+            )
+            expected_live = int(family.removeprefix("post_"))
+            compatibility = self._compatibility(pub.board)
+            partition = None
+            if consumes_partition:
+                partition = self._partition_summary(
+                    states, pub.board, weights, pub.status, expected_live
+                )
+            live_seat_ids = torch.where(
+                pub.status != FOLDED,
+                torch.arange(self.n_players, device=self.device)[None],
+                self.n_players,
+            ).sort(1).values[:, :expected_live]
+            masks = PostflopMasks(
+                compatibility=compatibility,
+                seat_mask=pub.seat_mask,
+                combo_mask=weights > 0,
+                status=pub.status,
+                evaluator_summary=partition,
+                live_seat_ids=live_seat_ids,
+                # Flop has the widest compatible set. Turn/river rows are
+                # padded and masked inside this same post_A invocation.
+                compact_size=math.comb(49, 2),
+            )
+            output = frozen_model.forward_postflop(pub, weights, pub.to_act, masks)
+            self.batch_size_histograms[f"postflop_{expected_live}"].append(
+                states.numel()
+            )
+
+        # Family routing and row count are host-known at this declared launch
+        # boundary. Padded work uses the calibrated worst-case family width and
+        # therefore introduces no hidden device scalar read.
+        limits = FamilyPackingLimits(
+            max_rows=max(states.numel(), 1),
+            max_padded_tokens=1 << 62,
+            max_padded_token_pairs=1 << 62,
+            max_workspace_bytes=1 << 62,
+        )
+        width = self._family_maximum_width(frozen_model, family)
+        phase = "training" if torch.is_grad_enabled() else "inference"
+        self.execution_metrics.record_model_call(
+            phase,
+            family,
+            states.numel(),
+            padded_tokens=states.numel() * width,
+            padded_token_pairs=states.numel() * width * width,
+        )
+        return output
+
+    def policy_forward_family_actual_cost(
+        self,
+        frozen_model: nn.Module,
+        family: str,
+        states: Tensor,
+        reach: Tensor,
+    ) -> PolicyOutput:
+        """Greedily split one logical family block using its actual row costs.
+
+        The cost vector is the sole device-to-host scheduler control transfer
+        for the logical block.  Planning on that fixed-size vector amortizes
+        the boundary across all physical calls and keeps queue/RNG identities
+        independent of the resulting width order.
+        """
+
+        if states.ndim != 1 or states.numel() == 0:
+            raise ValueError("a family policy block requires a nonempty state vector")
+        # A singleton has exactly one possible physical plan.  Avoid reading a
+        # cost vector that cannot change that plan; narrow branched trees hit
+        # this case frequently.
+        if states.numel() == 1:
+            return self.policy_forward_family(frozen_model, family, states, reach)
+        profile = self.execution_profile
+        if profile is None:
+            return self.policy_forward_family(frozen_model, family, states, reach)
+
+        widths, _ = self.rollout_row_cost(frozen_model, states)
+        if widths.device.type == "cuda":
+            started = time.perf_counter()
+            host_widths = widths.to(device="cpu")
+            self.execution_metrics.record_scheduler_control_synchronization(
+                seconds=time.perf_counter() - started,
+                nbytes=widths.numel() * widths.element_size(),
+            )
+        else:
+            host_widths = widths
+
+        max_tokens = int(profile.inference_max_tokens)
+        max_pairs = int(profile.inference_max_token_pairs)
+        # Keep indexed input/output destinations on the rollout device.  The
+        # current prototype still reads the fixed-size width vector to plan
+        # greedy boundaries, but reconstructing every physical pack from a
+        # Python list used to add one H2D index transfer per model call.  A
+        # stable device argsort has precisely the requested width/FIFO tiebreak
+        # order and lets all spans below remain device views.
+        ordered_positions = torch.argsort(widths, stable=True)
+        # Do not transfer the permutation back merely to plan its boundaries:
+        # the already-declared width vector supplies the same stable ordering
+        # on the host, while ``ordered_positions`` remains the sole index
+        # source used for device gathers/scatters.
+        ordered = sorted(
+            range(states.numel()), key=lambda position: (int(host_widths[position]), position)
+        )
+        plans: list[tuple[int, int]] = []
+        current_start = 0
+        current_rows = 0
+        current_max = 0
+        for ordered_index in range(states.numel()):
+            position = ordered[ordered_index]
+            width = int(host_widths[position])
+            if width > max_tokens or width * width > max_pairs:
+                raise MemoryError(
+                    f"one {family} row needs {width} tokens/{width * width} token pairs"
+                )
+            candidate_max = max(current_max, width)
+            candidate_rows = current_rows + 1
+            if current_rows and (
+                candidate_rows * candidate_max > max_tokens
+                or candidate_rows * candidate_max * candidate_max > max_pairs
+            ):
+                plans.append((current_start, current_rows))
+                current_start = ordered_index
+                current_rows = 0
+                current_max = 0
+            current_rows += 1
+            current_max = max(current_max, width)
+        if current_rows:
+            plans.append((current_start, current_rows))
+
+        if len(plans) == 1 and plans[0] == (0, states.numel()):
+            return self.policy_forward_family(frozen_model, family, states, reach)
+
+        parts: list[tuple[Tensor, PolicyOutput]] = []
+        for start, count in plans:
+            positions = ordered_positions.narrow(0, start, count)
+            parts.append(
+                (
+                    positions,
+                    self.policy_forward_family(
+                        frozen_model, family, states[positions], reach[positions]
+                    ),
+                )
+            )
+        return self._combine_outputs(parts, states.numel())
+
+    def _family_maximum_width(self, model: nn.Module, family: str) -> int:
+        """Return the host-known padded width used by queue calibration."""
+
+        source = model.module if hasattr(model, "module") else model
+        post_model = getattr(source, "postflop", None)
+        k_act = int(getattr(getattr(post_model, "cfg", None), "k_act", 0))
+        scalar_count = 3 * self.n_players + 13 + self.e_max + self.n_ticks
+        if family == "pre":
+            return (
+                self.n_players * N_CLASSES
+                + scalar_count
+                + 1
+                + self.max_rollout_steps
+                + k_act
+            )
+        live = int(family.removeprefix("post_"))
+        return (
+            live * math.comb(49, 2)
+            + scalar_count
+            + 6
+            + self.max_rollout_steps
+            + k_act
+        )
 
     def compact_decision_reach(
         self, states: Tensor, reach: Tensor
@@ -995,7 +1548,9 @@ class PokerRolloutBackend:
         pub = self.encode_public(states)
         rows = states.to(torch.int64)
         parts: list[tuple[Tensor, PolicyOutput]] = []
-        preflop = (self.states.street[rows] == 0).nonzero().squeeze(1)
+        preflop = self._dynamic_positions(
+            self.states.street[rows] == 0, "poker_forward_preflop"
+        )
         if preflop.numel():
             selected = weights[preflop]
             class_ranges = torch.zeros(
@@ -1019,8 +1574,13 @@ class PokerRolloutBackend:
                 )
             parts.append((preflop, output))
             self.batch_size_histograms["preflop"].append(preflop.shape[0])
+            self._record_policy_model_call(
+                frozen_model, states, preflop, "pre"
+            )
 
-        post = (self.states.street[rows] != 0).nonzero().squeeze(1)
+        post = self._dynamic_positions(
+            self.states.street[rows] != 0, "poker_forward_postflop"
+        )
         if post.numel():
             source_model = frozen_model.module if hasattr(frozen_model, "module") else frozen_model
             post_model = getattr(source_model, "postflop", None)
@@ -1067,6 +1627,9 @@ class PokerRolloutBackend:
                     self.batch_size_histograms[
                         f"postflop_{live}"
                     ].append(positions.shape[0])
+                    self._record_policy_model_call(
+                        frozen_model, states, positions, f"post_{live}"
+                    )
         return self._combine_outputs(parts, states.shape[0])
 
     def _compatibility(self, board: Tensor) -> Tensor:

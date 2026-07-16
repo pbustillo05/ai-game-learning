@@ -311,6 +311,12 @@ class DeviceTreeBuffer:
         self.edge_parent = torch.empty(
             self.edge_capacity, dtype=torch.int32, device=self.device
         )
+        self.child_count = torch.zeros(
+            self.node_capacity, dtype=torch.int32, device=self.device
+        )
+        self.edge_ordinal = torch.empty(
+            self.edge_capacity, dtype=torch.int32, device=self.device
+        )
         self.child_node = torch.empty(
             self.edge_capacity, dtype=torch.int32, device=self.device
         )
@@ -343,6 +349,32 @@ class DeviceTreeBuffer:
         return ids
 
     append_roots = add_roots
+
+    def require_child_capacity(self, count: int | Tensor) -> None:
+        """Fail before a wave allocates expanded child/state/reach tensors."""
+
+        remaining = min(
+            self.node_capacity - self.node_count,
+            self.edge_capacity - self.edge_count,
+        )
+        if isinstance(count, Tensor):
+            if count.numel() != 1:
+                raise ValueError("child count must be scalar")
+            condition = count <= remaining
+            if count.device.type == "cuda":
+                torch._assert_async(
+                    condition,
+                    "DeviceTreeBuffer overflow before child expansion",
+                )
+                return
+            count = int(count)
+        if int(count) > remaining:
+            raise RuntimeError(
+                "DeviceTreeBuffer overflow before child expansion: "
+                f"requested nodes={self.node_count + int(count)}, "
+                f"edges={self.edge_count + int(count)}; capacity "
+                f"nodes={self.node_capacity}, edges={self.edge_capacity}"
+            )
 
     def append_children(
         self,
@@ -399,10 +431,29 @@ class DeviceTreeBuffer:
         )
         self.path_weight[node_rows] = self.path_weight[parent_rows] * weights.float()
 
+        # ``parents`` is parent-major by contract.  Retain the stable ordinal of
+        # every abstract child so finalization can scatter edges directly into
+        # CSR order even when queued execution expands parents across depths.
+        local_rows = torch.arange(count, dtype=torch.int32, device=self.device)
+        group_start = torch.zeros(count, dtype=torch.int32, device=self.device)
+        group_start[0] = 0
+        if count > 1:
+            starts = parents[1:] != parents[:-1]
+            group_start[1:] = torch.where(starts, local_rows[1:], 0)
+        group_start = torch.cummax(group_start, dim=0).values
+        local_ordinal = local_rows - group_start
+        child_base = self.child_count[parent_rows]
+
         self.edge_parent[edges] = parents.to(torch.int32)
+        self.edge_ordinal[edges] = child_base + local_ordinal
         self.child_node[edges] = nodes
         self.child_event[edges] = events.to(torch.int32)
         self.edge_weight[edges] = weights.float()
+        self.child_count.index_add_(
+            0,
+            parent_rows,
+            torch.ones(count, dtype=torch.int32, device=self.device),
+        )
         self.node_count = requested_nodes
         self.edge_count = requested_edges
         return nodes
@@ -413,19 +464,31 @@ class DeviceTreeBuffer:
         n = self.node_count
         c = self.edge_count
         edge_parent = self.edge_parent[:c].to(torch.int64)  # [C]
-        counts = torch.bincount(edge_parent, minlength=n).to(torch.int32)  # [N]
+        counts = self.child_count[:n]  # [N]
         child_ptr = torch.cat(
             (
                 torch.zeros(1, dtype=torch.int32, device=self.device),
                 torch.cumsum(counts, dim=0).to(torch.int32),
             )
         )  # [N+1]
+        # Queued execution can finish a deeper occurrence before an older
+        # occurrence in another family.  Stable ordinals recorded at expansion
+        # make this a direct O(C) scatter, with no label sort or host transfer.
+        edge_destination = (
+            child_ptr[edge_parent] + self.edge_ordinal[:c]
+        ).to(torch.int64)
+        child_node = torch.empty_like(self.child_node[:c])
+        child_event = torch.empty_like(self.child_event[:c])
+        edge_weight = torch.empty_like(self.edge_weight[:c])
+        child_node[edge_destination] = self.child_node[:c]
+        child_event[edge_destination] = self.child_event[:c]
+        edge_weight[edge_destination] = self.edge_weight[:c]
         return TreeBatch(
             parent=self.parent[:n],
             child_ptr=child_ptr,
-            child_node=self.child_node[:c],
-            child_event=self.child_event[:c],
-            nu=self.edge_weight[:c],
+            child_node=child_node,
+            child_event=child_event,
+            nu=edge_weight,
             tree_id=self.tree_id[:n],
             owner=self.owner[:n],
             depth_p=self.depth_p[:n],
@@ -682,6 +745,8 @@ class DecisionReachCache:
         if state_refs.shape != node_ids.shape:
             raise ValueError("decision state refs must align with node ids")
         compact = getattr(game, "compact_decision_reach", None)
+        if bool(getattr(game, "requires_full_decision_reach", False)):
+            compact = None
         payload = compact(state_refs, rows) if callable(compact) else rows
         return cls(
             node_ids=node_ids.to(torch.int32),

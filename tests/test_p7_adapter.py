@@ -77,6 +77,26 @@ def test_allin_atom_targets_highest_currently_legal_denomination():
     assert sampled.tolist() == [7]
 
 
+def test_legal_event_conditioning_does_not_underflow_when_illegal_type_dominates():
+    raw = _raw(2)
+    raw["type_logits"][:] = torch.tensor(
+        [[-1000.0, -1001.0, 1000.0], [-1000.0, -1001.0, 1000.0]]
+    )
+    ids = torch.arange(6, dtype=torch.int32)[None].expand(2, -1).clone()
+    legal = torch.zeros((2, 6), dtype=torch.bool)
+    legal[0, CHECK_CALL] = True
+    legal[1, :2] = True
+
+    probability = PokerPolicyAdapter(n_ticks=4).probabilities(raw, ids, legal)
+
+    torch.testing.assert_close(probability.sum(1), torch.ones(2))
+    assert probability[0, CHECK_CALL] == 1.0
+    torch.testing.assert_close(
+        probability[1, :2], torch.softmax(torch.tensor([-1000.0, -1001.0]), 0)
+    )
+    assert torch.count_nonzero(probability.masked_select(~legal)) == 0
+
+
 def _advance_checks(engine, ref):
     while int(engine.owner_of(torch.tensor([ref], dtype=torch.int32))[0]) >= 0:
         ref = int(engine.step(torch.tensor([ref], dtype=torch.int32), torch.tensor([CHECK_CALL], dtype=torch.int32))[0])

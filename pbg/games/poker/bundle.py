@@ -59,19 +59,25 @@ def estimate_rollout_memory(
     n_players: int,
     reach_storage: str,
     rank_count: int = 13,
+    sequential_recompute_live_rows: bool = False,
 ) -> PokerRolloutMemoryPlan:
     """Estimate worst-case rollout bytes before allocating a poker backend.
 
-    The estimate intentionally counts two capacity-sized reach frontiers: a
-    branched wave can retain the active rows while constructing its successors.
-    It excludes model, completion, optimizer, and autograd allocations, so the
-    CUDA preflight leaves half of currently free device memory for those phases.
+    The general estimate intentionally counts two capacity-sized reach
+    frontiers: a branched wave can retain active rows while constructing its
+    successors. Sequential execution in recompute mode is tighter: exactly one
+    live occurrence exists per trajectory and execution allocates root and
+    overwriteable working reaches with ``n_trees`` rows each. It excludes model,
+    completion, optimizer, and autograd allocations, so the CUDA preflight
+    leaves half of currently free device memory for those phases.
     """
 
     if reach_storage not in {"full", "decisions_only", "recompute"}:
         raise ValueError("unknown reach storage mode")
     if n_trees < 0 or node_budget <= 0 or n_players <= 0:
         raise ValueError("invalid rollout memory-plan dimensions")
+    if sequential_recompute_live_rows and reach_storage != "recompute":
+        raise ValueError("sequential live-row planning requires recompute storage")
     capacity = n_trees * node_budget
     edge_capacity = capacity - n_trees
     node_bytes = capacity * (6 * 4 + n_players * 4)
@@ -86,7 +92,11 @@ def estimate_rollout_memory(
         state_bytes=PokerTensorStateStore.storage_nbytes(capacity, n_players),
         tree_bytes=node_bytes + edge_bytes,
         reach_cache_bytes=reach_cache,
-        frontier_reach_bytes=2 * capacity * reach_row_bytes,
+        frontier_reach_bytes=(
+            2 * n_trees * reach_row_bytes
+            if sequential_recompute_live_rows
+            else 2 * capacity * reach_row_bytes
+        ),
         # Selected policy likelihoods and values are retained only for realized
         # player edges/nodes, but this remains a safe capacity bound.
         policy_cache_bytes=(edge_capacity + capacity) * n_hands * 4,
@@ -141,6 +151,38 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
     ) -> BatchedCompletionStats:
         """Return fp32 completion rows ``[B,P,1326]`` without host tensor copies."""
 
+        return self._complete_impl(
+            game, tree, node_ids, reach, n_samples, gen=gen, keys=None
+        )
+
+    def complete_keyed(
+        self,
+        game: Any,
+        tree: Any,
+        node_ids: Tensor,
+        reach: Any,
+        n_samples: int,
+        keys: Tensor,
+    ) -> BatchedCompletionStats:
+        """Complete tensor-native leaves from logical-address seeds ``[B]``."""
+
+        return self._complete_impl(
+            game, tree, node_ids, reach, n_samples, gen=None, keys=keys
+        )
+
+    def _complete_impl(
+        self,
+        game: Any,
+        tree: Any,
+        node_ids: Tensor,
+        reach: Any,
+        n_samples: int,
+        *,
+        gen: torch.Generator | None,
+        keys: Tensor | None,
+    ) -> BatchedCompletionStats:
+        """Shared mutable/keyed tensor-native completion implementation."""
+
         if isinstance(n_samples, bool) or not isinstance(n_samples, int) or n_samples <= 0:
             raise ValueError("n_samples must be a positive integer")
         rows = _reach_rows(reach)
@@ -149,6 +191,14 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
             raise ValueError("reach rows must have shape [B,P,1326]")
         batch, players = rows.shape[:2]
         device = rows.device
+        if keys is not None and (
+            keys.shape != node_ids.shape
+            or keys.dtype != torch.int64
+            or keys.device != device
+        ):
+            raise ValueError("completion keys must be device-local int64 [B]")
+        if keys is None and gen is None:
+            raise RuntimeError("mutable poker completion requires a generator")
         p_hat = torch.zeros((batch, players, 1326), dtype=torch.float32, device=device)
         v_hat = torch.zeros_like(p_hat)
         vvec_hat = torch.zeros((batch, players), dtype=torch.float32, device=device)
@@ -165,12 +215,20 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
             states = state_refs[preterm]
             selected_reach = rows[preterm]
             inputs = game.completion_inputs(states, selected_reach)
-            seed = _allocate_seeds(preterm.numel(), gen)
+            seed = (
+                _allocate_seeds(preterm.numel(), gen)
+                if keys is None
+                else keys[preterm].contiguous()
+            )
             result = self._operation()(
+                rank_count=self.rank_count,
                 **inputs,
                 seed=seed,
                 config=_CompletionConfig(n_samples, self.n_partials, self.backend),
             )
+            metrics = getattr(game, "execution_metrics", None)
+            if metrics is not None:
+                metrics.record_evaluator(rows=int(preterm.numel()))
             stats = self._validate_result(
                 result,
                 preterm.numel(),
@@ -199,9 +257,26 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
                 (terminal.numel(), players), dtype=torch.bool, device=device
             )  # [Bt,P]
             boards = game.states.board[states.to(torch.int64)]
-            profiles = game.profile_sampler.sample(
-                selected_reach, boards, dealt, n_samples, gen
-            )  # [Bt,S,P]
+            if keys is None:
+                profiles = game.profile_sampler.sample(
+                    selected_reach, boards, dealt, n_samples, gen
+                )  # [Bt,S,P]
+            else:
+                seeded = getattr(game.profile_sampler, "sample_seeded", None)
+                if not callable(seeded):
+                    raise TypeError(
+                        "keyed poker completion requires a seeded joint-profile sampler"
+                    )
+                profiles = seeded(
+                    selected_reach,
+                    boards,
+                    dealt,
+                    n_samples,
+                    keys[terminal].contiguous(),
+                )  # [Bt,S,P]
+            metrics = getattr(game, "execution_metrics", None)
+            if metrics is not None:
+                metrics.record_evaluator(rows=int(terminal.numel()))
             counts = torch.zeros(
                 (terminal.numel(), players, 1326), dtype=torch.float32, device=device
             )  # [Bt,P,H]
@@ -239,10 +314,17 @@ def validate_config(cfg: RootConfig) -> None:
     if unknown:
         raise ValueError(f"root.game.poker.{unknown[0]}: unknown configuration key")
     try:
-        PokerConfig(**values)
+        poker_cfg = PokerConfig(**values)
         PokerModelConfig.from_dict(cfg.model)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"root poker configuration: {exc}") from exc
+    # Active poker has one preflop family plus post_A for every possible live
+    # count A=2..P, hence P potentially nonempty learner strata.
+    if cfg.training.minibatch_size < poker_cfg.n_players:
+        raise ValueError(
+            "root.training.minibatch_size: must cover every potentially nonempty "
+            f"poker execution family ({poker_cfg.n_players})"
+        )
 
 
 def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
@@ -260,14 +342,23 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
                     cfg.hardware.attention_backend, cfg.hardware.query_chunk_size
                 )
     adapter = PokerPolicyAdapter(engine_cfg.n_ticks)
-    profiles = PokerGPURejectionSampler(backend=cfg.completion.backend)
-    partition = PokerGPUPartitionAdapter(beta_rank=model_cfg.folder_beta_rank)
+    profiles = PokerGPURejectionSampler(
+        backend=cfg.completion.backend, rank_count=engine_cfg.rank_count
+    )
+    partition = PokerGPUPartitionAdapter(
+        beta_rank=model_cfg.folder_beta_rank, rank_count=engine_cfg.rank_count
+    )
+    resident_trees = cfg.rollout.n_trees
     plan = estimate_rollout_memory(
-        n_trees=cfg.rollout.n_trees,
+        n_trees=resident_trees,
         node_budget=cfg.rollout.node_budget,
         n_players=engine_cfg.n_players,
         reach_storage=cfg.rollout.reach_storage,
         rank_count=engine_cfg.rank_count,
+        sequential_recompute_live_rows=(
+            cfg.training.mode != "branched_rao_blackwell"
+            and cfg.rollout.reach_storage == "recompute"
+        ),
     )
     _preflight_cuda_rollout(plan, device)
     backend = PokerRolloutBackend(
@@ -284,7 +375,9 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     completion = (
         None
         if cfg.training.mode == "normal"
-        else _TensorPokerGPUCompletion(backend=cfg.completion.backend)
+        else _TensorPokerGPUCompletion(
+            backend=cfg.completion.backend, rank_count=engine_cfg.rank_count
+        )
     )
     return GameBundle(
         model=model,

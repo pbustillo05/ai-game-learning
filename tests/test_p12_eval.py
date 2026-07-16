@@ -36,10 +36,11 @@ class _CheckCallModel(nn.Module):
 def _install_fake_sibling(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     package = ModuleType("poker_gpu_evaluator")
     facade = ModuleType("poker_gpu_evaluator.pbg")
-    facade.API_VERSION = "pbg-v2"  # type: ignore[attr-defined]
-    facade.COMBO_CARDS = torch.tensor(  # type: ignore[attr-defined]
+    facade.API_VERSION = "pbg-v3"  # type: ignore[attr-defined]
+    combo_table = torch.tensor(
         [hand_cards(combo) for combo in range(1326)], dtype=torch.uint8
     )
+    facade.combo_cards = lambda rank_count: combo_table.clone()  # type: ignore[attr-defined]
     calls: dict[str, object] = {"showdowns": []}
 
     def sample_joint_profiles(**kwargs):
@@ -130,7 +131,9 @@ def test_duplicate_self_play_is_zero_rotates_seats_and_crosses_showdown_facade(
 
 def test_real_sibling_combo_export_matches_every_local_row() -> None:
     facade = pytest.importorskip("poker_gpu_evaluator.pbg")
-    assert facade.COMBO_CARDS.dtype == torch.uint8
-    assert facade.COMBO_CARDS.tolist() == [
+    combo_cards = facade.combo_cards(13)
+    assert facade.API_VERSION == "pbg-v3"
+    assert combo_cards.dtype == torch.uint8
+    assert combo_cards.tolist() == [
         list(hand_cards(combo)) for combo in range(1326)
     ]

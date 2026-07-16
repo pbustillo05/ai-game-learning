@@ -20,7 +20,7 @@ from pbg.games.poker.engine import FOLDED, NLHEEngine
 
 N_COMBOS = 1326
 PAD_CARD = 255
-EXPECTED_API_VERSION = "pbg-v2"
+EXPECTED_API_VERSION = "pbg-v3"
 
 
 class EvaluatorContractError(RuntimeError):
@@ -73,11 +73,11 @@ def _load_operation(name: str) -> Callable[..., Any]:
     try:
         facade = importlib.import_module("poker_gpu_evaluator.pbg")
         api_version = facade.API_VERSION
-        combo_cards = facade.COMBO_CARDS
+        combo_cards = facade.combo_cards(13)
         operation = getattr(facade, name)
     except (ImportError, ModuleNotFoundError, AttributeError) as exc:
         raise RuntimeError(
-            "poker_gpu_evaluator with the public pbg-v2 facade is required; "
+            "poker_gpu_evaluator with the public pbg-v3 facade is required; "
             "install or update the sibling package (an editable install is sufficient)"
         ) from exc
     if api_version != EXPECTED_API_VERSION:
@@ -197,13 +197,18 @@ def _engine(game: Any) -> NLHEEngine:
 class PokerGPUCompletion:
     """Adapter for evaluator-owned Monte Carlo completion."""
 
-    def __init__(self, *, backend: str = "auto", n_partials: int = 8) -> None:
+    def __init__(
+        self, *, backend: str = "auto", n_partials: int = 8, rank_count: int = 13
+    ) -> None:
         if backend not in {"auto", "cpu", "cuda"}:
             raise ValueError("backend must be 'auto', 'cpu', or 'cuda'")
         if isinstance(n_partials, bool) or not isinstance(n_partials, int) or n_partials <= 0:
             raise ValueError("n_partials must be a positive integer")
         self.backend = backend
         self.n_partials = n_partials
+        if isinstance(rank_count, bool) or not 4 <= rank_count <= 13:
+            raise ValueError("rank_count must be an integer in [4,13]")
+        self.rank_count = int(rank_count)
         self._complete: Callable[..., Any] | None = None
 
     def _operation(self) -> Callable[..., Any]:
@@ -219,6 +224,36 @@ class PokerGPUCompletion:
         reach: ReachView | Tensor | Any,
         n_samples: int,
         gen: torch.Generator,
+    ) -> BatchedCompletionStats:
+        return self._complete_impl(
+            game, tree, node_ids, reach, n_samples, gen=gen, seed=None
+        )
+
+    def complete_keyed(
+        self,
+        game: Any,
+        tree: Any,
+        node_ids: Tensor,
+        reach: ReachView | Tensor | Any,
+        n_samples: int,
+        keys: Tensor,
+    ) -> BatchedCompletionStats:
+        """Complete rows using caller-owned evaluator stream seeds ``[B]``."""
+
+        return self._complete_impl(
+            game, tree, node_ids, reach, n_samples, gen=None, seed=keys
+        )
+
+    def _complete_impl(
+        self,
+        game: Any,
+        tree: Any,
+        node_ids: Tensor,
+        reach: ReachView | Tensor | Any,
+        n_samples: int,
+        *,
+        gen: torch.Generator | None,
+        seed: Tensor | None,
     ) -> BatchedCompletionStats:
         if isinstance(n_samples, bool) or not isinstance(n_samples, int) or n_samples <= 0:
             raise ValueError("n_samples must be a positive integer")
@@ -260,8 +295,19 @@ class PokerGPUCompletion:
         stratum_players[:, :, : engine.n_players] = strata.stratum_players
         payoff_baseline = torch.zeros((batch_size, p_max), dtype=torch.float32, device=rows.device)
         payoff_baseline[:, : engine.n_players] = strata.payoff_baseline
-        seed = _allocate_seeds(batch_size, gen)
+        if seed is None:
+            if gen is None:
+                raise RuntimeError("mutable poker completion requires a generator")
+            seed = _allocate_seeds(batch_size, gen)
+        elif (
+            seed.shape != (batch_size,)
+            or seed.dtype != torch.int64
+            or seed.device != rows.device
+        ):
+            raise ValueError("completion seeds must be device-local int64 [B]")
+        seed = seed.contiguous()
         result = self._operation()(
+            rank_count=self.rank_count,
             board_cards=board_cards,
             range_weights=range_weights,
             dealt_mask=dealt_mask.contiguous(),
@@ -272,6 +318,9 @@ class PokerGPUCompletion:
             seed=seed,
             config=_CompletionConfig(n_samples, self.n_partials, self.backend),
         )
+        metrics = getattr(game, "execution_metrics", None)
+        if metrics is not None:
+            metrics.record_evaluator(rows=batch_size)
         return self._validate_result(result, batch_size, p_max, k, rows.device)
 
     @staticmethod
@@ -310,13 +359,22 @@ class PokerGPUCompletion:
 class PokerGPURejectionSampler:
     """Adapter for exact whole-profile independent rejection sampling."""
 
-    def __init__(self, *, backend: str = "auto", max_attempts: int = 100_000) -> None:
+    def __init__(
+        self,
+        *,
+        backend: str = "auto",
+        max_attempts: int = 100_000,
+        rank_count: int = 13,
+    ) -> None:
         if backend not in {"auto", "cpu", "cuda"}:
             raise ValueError("backend must be 'auto', 'cpu', or 'cuda'")
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts <= 0:
             raise ValueError("max_attempts must be a positive integer")
         self.backend = backend
         self.max_attempts = max_attempts
+        if isinstance(rank_count, bool) or not 4 <= rank_count <= 13:
+            raise ValueError("rank_count must be an integer in [4,13]")
+        self.rank_count = int(rank_count)
         self._sample: Callable[..., Any] | None = None
 
     def _operation(self) -> Callable[..., Any]:
@@ -337,12 +395,43 @@ class PokerGPURejectionSampler:
         board_cards = _normalize_board(board)
         if dealt_mask.dtype != torch.bool or dealt_mask.ndim != 2:
             raise TypeError("dealt_mask must be bool [B,P]")
+        batch_size = dealt_mask.shape[0]
+        if board_cards.shape[0] != batch_size or board_cards.device != reach_rows.device:
+            raise ValueError("board, reach rows, and dealt_mask must share B and device")
+        seed = _allocate_seeds(batch_size, gen)
+        return self.sample_seeded(
+            reach_rows, board_cards, dealt_mask, n, seed,
+            board_is_normalized=True,
+        )
+
+    def sample_seeded(
+        self,
+        reach_rows: Tensor,
+        board: Tensor,
+        dealt_mask: Tensor,
+        n: int,
+        seed: Tensor,
+        *,
+        board_is_normalized: bool = False,
+    ) -> Tensor:
+        """Sample with one caller-owned deterministic seed per batch row."""
+
+        if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+            raise ValueError("n must be a positive integer")
+        board_cards = board if board_is_normalized else _normalize_board(board)
+        if dealt_mask.dtype != torch.bool or dealt_mask.ndim != 2:
+            raise TypeError("dealt_mask must be bool [B,P]")
         range_weights = _linear_reach(reach_rows, dealt_mask)
         batch_size, p_max = dealt_mask.shape
         if board_cards.shape[0] != batch_size or board_cards.device != reach_rows.device:
             raise ValueError("board, reach rows, and dealt_mask must share B and device")
-        seed = _allocate_seeds(batch_size, gen)
+        if seed.shape != (batch_size,) or seed.dtype != torch.int64:
+            raise ValueError("seed must be int64 [B]")
+        if seed.device != reach_rows.device:
+            raise ValueError("seed and reach rows must share a device")
+        seed = seed.contiguous()
         result = self._operation()(
+            rank_count=self.rank_count,
             board_cards=board_cards,
             range_weights=range_weights,
             dealt_mask=dealt_mask.contiguous(),
@@ -376,10 +465,13 @@ class PokerGPURejectionSampler:
 class PokerGPUShowdownEvaluator:
     """Adapter for exact fixed-showdown winner masks and shares."""
 
-    def __init__(self, *, backend: str = "auto") -> None:
+    def __init__(self, *, backend: str = "auto", rank_count: int = 13) -> None:
         if backend not in {"auto", "cpu", "cuda"}:
             raise ValueError("backend must be 'auto', 'cpu', or 'cuda'")
         self.backend = backend
+        if isinstance(rank_count, bool) or not 4 <= rank_count <= 13:
+            raise ValueError("rank_count must be an integer in [4,13]")
+        self.rank_count = int(rank_count)
         self._evaluate: Callable[..., Any] | None = None
 
     def _operation(self) -> Callable[..., Any]:
@@ -413,6 +505,7 @@ class PokerGPUShowdownEvaluator:
         if bool((stratum_players & ~active_mask[:, None, :]).any()):
             raise ValueError("every stratum-eligible player must be active")
         result = self._operation()(
+            rank_count=self.rank_count,
             board_cards=board,
             combo_ids=combo_ids.contiguous(),
             active_mask=active_mask.contiguous(),

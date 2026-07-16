@@ -4,8 +4,9 @@ from types import SimpleNamespace
 
 import torch
 
-from pbg.core.losses import l_clip, l_v, l_v_clip, rb_ppo
+from pbg.core.losses import l_clip, ppo, l_v, l_v_clip, rb_ppo
 from pbg.core.minibatch import MinibatchSample
+from pbg.core.normal import NormalMinibatch
 from pbg.core.values import NodeTargets
 from tests.categorical_policy_fixture import CategoricalPolicyAdapter, PolicyOutput
 
@@ -104,3 +105,83 @@ def test_value_loss_control_selects_a_traceably_different_objective() -> None:
     cfg.value_loss = "clipped"
     clipped_composite, _ = rb_ppo(output, sample, sample, adapter, cfg)
     assert mse_composite != clipped_composite
+
+
+def test_padding_uses_a_legal_event_when_column_zero_is_illegal() -> None:
+    logits, adapter, targets, sample, cfg = _fixture()
+    targets.child_event_row[:] = torch.tensor([[1, 1, -1]], dtype=torch.int32)
+    sample.legal_event_mask[:] = torch.tensor([[False, True]])
+    cached = adapter.log_prob(
+        PolicyOutput(logits, sample.old_v),
+        torch.tensor([[1, 1, 1]], dtype=torch.int32),
+        sample.legal_event_ids,
+        sample.legal_event_mask,
+    )
+    sample.old_logp_child[:] = cached
+    loss, _ = rb_ppo(
+        PolicyOutput(logits.clone().requires_grad_(), sample.old_v),
+        sample,
+        sample,
+        adapter,
+        cfg,
+    )
+    assert torch.isfinite(loss)
+
+
+def test_normal_and_rb_modes_use_the_same_exact_kl_term() -> None:
+    logits, adapter, _, sample, cfg = _fixture()
+    cfg.c_kl = 0.2
+    cfg.c_v = 0.0
+    cfg.c_h = 0.0
+    sample.targets.a_hat.zero_()
+    rb_logits = logits.clone().requires_grad_()
+    current = PolicyOutput(rb_logits, sample.old_v)
+    reference = PolicyOutput(logits + torch.tensor([[[0.3, -0.2, 0.0]]]), sample.old_v)
+    rb_loss, rb_metrics = rb_ppo(
+        current, sample, sample, adapter, cfg, reference=reference
+    )
+    rb_gradient = torch.autograd.grad(rb_loss, rb_logits)[0]
+
+    actor_type = torch.tensor([0, 0, 1, 1, 1], dtype=torch.int64)
+    repeats = actor_type.numel()
+    normal = NormalMinibatch(
+        state_refs=torch.zeros(repeats, dtype=torch.int32),
+        reach=torch.zeros((repeats, 2, 2)),
+        actor_type=actor_type,
+        event=torch.zeros(repeats, dtype=torch.int32),
+        old_logp=torch.zeros(repeats),
+        old_v=torch.zeros(repeats),
+        advantage=torch.zeros(repeats),
+        v_target=torch.zeros(repeats),
+        legal_event_ids=sample.legal_event_ids.expand(repeats, -1),
+        legal_event_mask=sample.legal_event_mask.expand(repeats, -1),
+    )
+    normal_logits = logits.clone().requires_grad_()
+    expanded_current = PolicyOutput(
+        normal_logits.expand(repeats, -1, -1), current.v.expand(repeats, -1)
+    )
+    expanded_reference = PolicyOutput(
+        reference.raw.expand(repeats, -1, -1), reference.v.expand(repeats, -1)
+    )
+    normal.old_logp = adapter.log_prob(
+        expanded_current,
+        normal.event[:, None],
+        normal.legal_event_ids,
+        normal.legal_event_mask,
+    )[:, 0].gather(1, actor_type[:, None]).squeeze(1)
+    normal_loss, normal_metrics = ppo(
+        expanded_current,
+        normal,
+        normal,
+        adapter,
+        cfg,
+        reference=expanded_reference,
+    )
+    normal_gradient = torch.autograd.grad(normal_loss, normal_logits)[0]
+    assert torch.allclose(
+        torch.tensor(normal_metrics["reference_kl"]),
+        torch.tensor(rb_metrics["reference_kl"]),
+        atol=1e-12,
+        rtol=0,
+    )
+    torch.testing.assert_close(normal_gradient, rb_gradient, atol=1e-12, rtol=0)

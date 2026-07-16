@@ -91,6 +91,24 @@ def sample_minibatch(
             torch._assert_async(valid_rows, "alias table produced an invalid decision row")
         elif not bool(valid_rows):
             raise ValueError("alias table produced an invalid decision row")
+    return gather_minibatch_rows(
+        tree, targets, policy_cache, reach_cache, bundle, rows
+    )
+
+
+def gather_minibatch_rows(
+    tree: TreeBatch | None,
+    targets: NodeTargets,
+    policy_cache: PolicyCache,
+    reach_cache: ReachCache | DecisionReachCache,
+    bundle: GameBundle,
+    rows: Tensor,
+) -> MinibatchSample:
+    """Gather explicit decision rows in the same format used by optimization."""
+
+    rows = rows.to(device=targets.node_ids.device, dtype=torch.int64)
+    if not torch.equal(policy_cache.node_ids, targets.node_ids):
+        raise ValueError("PolicyCache and NodeTargets node_ids must match exactly")
     gathered = _gather_targets(targets, rows)
     node_ids = gathered.node_ids.to(torch.int64)
     if isinstance(reach_cache, DecisionReachCache):

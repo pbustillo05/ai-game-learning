@@ -110,7 +110,14 @@ class PokerPolicyAdapter:
         n_ticks = self.n_ticks if self.n_ticks is not None else inferred
         if n_ticks <= 0:
             raise ValueError("the legal event set has no raise-tick width")
-        type_probability = torch.softmax(type_logits.float(), dim=-1)
+        type_logits = type_logits.float()
+        _require_device(
+            torch.stack(
+                [torch.isfinite(fields[name]).all() for name in sorted(required)]
+            ).all(),
+            "raw policy fields must be finite",
+        )
+        type_probability = torch.softmax(type_logits, dim=-1)
         prefix = type_logits.shape[:-1]
         omega = fields["omega"].float()
         mu = fields["mu"].float()
@@ -139,27 +146,81 @@ class PokerPolicyAdapter:
         allin = allin.reshape(mask_shape).expand_as(mixture)
         ticks = (1.0 - iota[..., None]) * mixture + iota[..., None] * allin
         ticks = ticks.masked_fill(~expanded_raise_mask, 0.0)
-        full = torch.zeros(prefix + (RAISE_OFFSET + n_ticks,), dtype=torch.float32, device=type_logits.device)
+
+        # Preserve the ordinary probability-space path exactly.  This keeps
+        # seeded rollout behavior unchanged except on the zero-mass corner
+        # which previously raised a device-side assertion.
+        full = torch.zeros(
+            prefix + (RAISE_OFFSET + n_ticks,),
+            dtype=torch.float32,
+            device=type_logits.device,
+        )
         facing_bet = ((legal_event_ids == FOLD) & legal_mask).any(dim=1)
         facing = facing_bet.reshape((batch,) + (1,) * (type_logits.ndim - 2))
         full[..., FOLD] = torch.where(facing, type_probability[..., 0], 0.0)
-        full[..., CHECK_CALL] = torch.where(facing, type_probability[..., 1], type_probability[..., 0])
+        full[..., CHECK_CALL] = torch.where(
+            facing, type_probability[..., 1], type_probability[..., 0]
+        )
         full[..., RAISE_OFFSET:] = type_probability[..., 2, None] * ticks
-        ids = legal_event_ids.to(device=full.device, dtype=torch.long)
+
+        # Condition on the currently legal raise grid before taking logs.  In
+        # exact arithmetic the mixture already has positive mass on every
+        # interval, but extreme learned locations/scales can underflow an
+        # entire legal tail in fp32.  A uniform conditional fallback is used
+        # only for that zero-mass numerical corner.
+        tick_mass = ticks.sum(-1, keepdim=True)
+        legal_raise_count = expanded_raise_mask.sum(-1, keepdim=True)
+        uniform_legal_raise = expanded_raise_mask.to(ticks) / legal_raise_count.clamp_min(1)
+        stable_ticks = torch.where(
+            (tick_mass > 0) | (legal_raise_count == 0),
+            ticks / tick_mass.clamp_min(self.eps),
+            uniform_legal_raise,
+        )
+
+        # Build unnormalized event *logits* and softmax only over supplied
+        # legal events.  The previous probability-space implementation first
+        # softmaxed all three action types, then discarded illegal types.  If
+        # an illegal type exceeded every legal type by roughly 100 logits,
+        # every supplied legal probability underflowed to exactly zero.
+        full_logits = torch.full(
+            prefix + (RAISE_OFFSET + n_ticks,),
+            -torch.inf,
+            dtype=torch.float32,
+            device=type_logits.device,
+        )
+        full_logits[..., FOLD] = type_logits[..., 0]
+        full_logits[..., CHECK_CALL] = torch.where(
+            facing, type_logits[..., 1], type_logits[..., 0]
+        )
+        tick_logits = torch.where(
+            stable_ticks > 0,
+            torch.log(stable_ticks.clamp_min(self.eps)),
+            torch.full_like(stable_ticks, -torch.inf),
+        )
+        full_logits[..., RAISE_OFFSET:] = type_logits[..., 2, None] + tick_logits
+        ids = legal_event_ids.to(device=full_logits.device, dtype=torch.long)
         _require_device(
-            ((ids >= 0) & (ids < full.shape[-1])).all(),
+            ((ids >= 0) & (ids < full_logits.shape[-1])).all(),
             "legal event id is outside the factorized event space",
         )
         event_shape = (batch,) + (1,) * (type_logits.ndim - 2) + (ids.shape[1],)
         ids = ids.reshape(event_shape).expand(prefix + (ids.shape[1],))
-        mask = legal_mask.to(full.device).reshape(event_shape).expand_as(ids)
+        mask = legal_mask.to(full_logits.device).reshape(event_shape).expand_as(ids)
+        _require_device(
+            mask.any(-1).all(),
+            "each policy row must supply at least one legal event",
+        )
         probability = full.gather(-1, ids).masked_fill(~mask, 0.0)
         normalizer = probability.sum(dim=-1, keepdim=True)
+        ordinary = probability / normalizer.clamp_min(self.eps)
+        legal_logits = full_logits.gather(-1, ids).masked_fill(~mask, -torch.inf)
+        fallback = torch.softmax(legal_logits, dim=-1).masked_fill(~mask, 0.0)
+        probability = torch.where(normalizer > 0, ordinary, fallback)
         _require_device(
-            (normalizer > 0).all(),
-            "supplied legal events have zero policy mass",
+            torch.isfinite(probability).all(),
+            "legal-event probabilities must be finite",
         )
-        return probability / normalizer
+        return probability
 
     compose = probabilities
 

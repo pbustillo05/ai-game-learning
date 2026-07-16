@@ -145,6 +145,6 @@ def test_rollout_memory_uses_compact_private_width() -> None:
     assert short.frontier_reach_bytes * 1326 == full.frontier_reach_bytes * 120
 
 
-def test_reduced_deck_rollout_fails_loudly_until_pbg_v3_exists() -> None:
-    with pytest.raises(RuntimeError, match="pbg-v3"):
+def test_reduced_deck_rollout_fails_loudly_until_model_width_is_migrated() -> None:
+    with pytest.raises(RuntimeError, match="variable hand width"):
         PokerRolloutBackend(PokerConfig(n_players=2, stack_bb=8, rank_count=4), 4, "cpu")

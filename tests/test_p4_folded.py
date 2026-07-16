@@ -30,14 +30,15 @@ class _FakeResult:
     metadata: dict[str, object]
 
 
-def _install_fake(monkeypatch: pytest.MonkeyPatch, *, version: str = "pbg-v2") -> tuple[dict[str, Any], type[_FakeResult]]:
+def _install_fake(monkeypatch: pytest.MonkeyPatch, *, version: str = "pbg-v3") -> tuple[dict[str, Any], type[_FakeResult]]:
     calls: dict[str, Any] = {}
     package = ModuleType("poker_gpu_evaluator")
     package.__path__ = []  # type: ignore[attr-defined]
     facade = ModuleType("poker_gpu_evaluator.pbg")
     facade.API_VERSION = version  # type: ignore[attr-defined]
     facade.FOLDER_API_VERSION = "pbg-folder-v1"  # type: ignore[attr-defined]
-    facade.COMBO_CARDS = torch.triu_indices(52, 52, offset=1).T.to(torch.uint8)  # type: ignore[attr-defined]
+    combo_table = torch.triu_indices(52, 52, offset=1).T.to(torch.uint8)
+    facade.combo_cards = lambda rank_count: combo_table.clone()  # type: ignore[attr-defined]
     facade.FolderSummaryResult = _FakeResult  # type: ignore[attr-defined]
 
     def partition_folders(**kwargs: Any) -> _FakeResult:
@@ -69,7 +70,7 @@ def _install_fake(monkeypatch: pytest.MonkeyPatch, *, version: str = "pbg-v2") -
             folder_output_valid=torch.ones((batch_size, folders), dtype=torch.bool, device=device),
             output_valid=torch.ones(batch_size, dtype=torch.bool, device=device),
             metadata={
-                "backend": "fake", "api_version": "pbg-v2",
+                "backend": "fake", "api_version": "pbg-v3",
                 "folder_api_version": "pbg-folder-v1",
             },
         )
@@ -129,7 +130,10 @@ def test_import_is_lazy_and_exact_facade_mapping(monkeypatch: pytest.MonkeyPatch
 
     sibling_result = calls["_results"][0]
     [combined] = calls["all"]
-    assert set(combined) == {"board_cards", "range_weights", "row_mask", "beta_rank"}
+    assert set(combined) == {
+        "rank_count", "board_cards", "range_weights", "row_mask", "beta_rank"
+    }
+    assert combined["rank_count"] == 13
     assert combined["board_cards"].dtype == torch.uint8
     assert combined["board_cards"].tolist() == [[0, 5, 9, 255, 255], [4, 8, 12, 16, 20]]
     assert combined["board_cards"].is_contiguous()
@@ -197,7 +201,7 @@ def test_version_and_result_contract_errors(monkeypatch: pytest.MonkeyPatch) -> 
     from pbg.games.poker.folded import PokerGPUPartitionAdapter
 
     board, live, folded = _inputs()
-    with pytest.raises(RuntimeError, match="expected API_VERSION 'pbg-v2'"):
+    with pytest.raises(RuntimeError, match="expected API_VERSION 'pbg-v3'"):
         PokerGPUPartitionAdapter().summarize(
             board_cards=board,
             live_range_weights=live,
@@ -311,7 +315,9 @@ def test_real_sibling_smoke() -> None:
 def test_incompatible_combo_table_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake(monkeypatch)
     facade = sys.modules["poker_gpu_evaluator.pbg"]
-    facade.COMBO_CARDS[0] = torch.tensor([0, 2], dtype=torch.uint8)
+    bad = facade.combo_cards(13)
+    bad[0] = torch.tensor([0, 2], dtype=torch.uint8)
+    facade.combo_cards = lambda rank_count: bad.clone()
     from pbg.games.poker.folded import PokerGPUPartitionAdapter
 
     board, live, folded = _inputs()

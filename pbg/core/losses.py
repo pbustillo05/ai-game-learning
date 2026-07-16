@@ -32,7 +32,9 @@ def _selected_logp(new: Any, targets: Any, adapter: Any) -> Tensor:
     legal_mask = targets.legal_event_mask.to(new.v.device)
     if legal_ids.ndim != 2 or not bool(legal_mask.any(1).all()):
         raise ValueError("every minibatch row must contain a legal event")
-    safe = torch.where(child_mask, selected, legal_ids[:, :1].expand_as(selected))
+    safe_column = legal_mask.to(torch.int64).argmax(1, keepdim=True)
+    safe_event = legal_ids.gather(1, safe_column).expand_as(selected)
+    safe = torch.where(child_mask, selected, safe_event)
     result = adapter.log_prob(new, safe, legal_ids, legal_mask)
     if result.shape != target.a_hat.shape:
         raise ValueError("adapter log probabilities are not aligned with a_hat")
@@ -124,6 +126,22 @@ def _sum(value: Tensor, mask: Tensor, dims: tuple[int, ...]) -> Tensor:
     return (value * mask.to(value)).sum(dim=dims)
 
 
+def _policy_kl(new: Any, reference: Any, targets: Any, adapter: Any) -> Tensor:
+    """Return exact legal-action ``KL(new || reference)`` as ``[B,X]``."""
+
+    if reference is None:
+        raise ValueError("a reference-policy output is required when c_kl is positive")
+    legal_ids = targets.legal_event_ids.to(new.v.device)
+    legal_mask = targets.legal_event_mask.to(new.v.device)
+    try:
+        result = adapter.kl(new, reference, legal_ids, legal_mask)
+    except TypeError:
+        result = adapter.kl(new, reference)
+    if result.shape != new.v.shape:
+        raise ValueError("adapter KL must have shape [B,X]")
+    return result
+
+
 def rb_ppo(
     new: Any,
     old: Any,
@@ -133,8 +151,9 @@ def rb_ppo(
     *,
     iteration: int = 0,
     reduction: str = "mean",
+    reference: Any | None = None,
 ) -> tuple[Tensor, dict[str, Any]]:
-    """Return ``L_clip[A_hat] + L_H + L_V[V_hat]`` averaged over rows."""
+    """Return clipped policy, value, entropy, and optional NashPG KL losses."""
 
     target, _, _ = _parts(old, targets)
     valid = targets.valid_type_mask.to(new.v.device)
@@ -152,7 +171,13 @@ def rb_ppo(
     value, _ = value_fn(new, old, targets, adapter, cfg)
     entropy, entropy_metrics = l_h(new, old, targets, adapter, cfg, iteration=iteration)
     type_weight = parent_p * valid.to(parent_p)
-    per_row = per_row + ((value + entropy) * type_weight).sum(1)
+    c_kl = float(_cfg(cfg, "c_kl", 0.0))
+    kl = (
+        torch.zeros_like(new.v)
+        if c_kl == 0.0
+        else c_kl * _policy_kl(new, reference, targets, adapter)
+    )
+    per_row = per_row + ((value + entropy + kl) * type_weight).sum(1)
 
     policy_denominator = policy_weight.sum()
     denominator = policy_denominator.clamp_min(torch.finfo(policy_weight.dtype).eps)
@@ -170,6 +195,7 @@ def rb_ppo(
         "policy_sum": (policy * policy_weight).sum().detach(),
         "value_sum": (value * type_weight).sum().detach(),
         "entropy_loss_sum": (entropy * type_weight).sum().detach(),
+        "reference_kl_sum": (kl * type_weight).sum().detach(),
         "kl_num": (policy_weight * (ratio - 1.0 - log_ratio)).sum().detach(),
         "kl_den": policy_denominator.detach(),
         "clip_num": (
@@ -200,8 +226,9 @@ def ppo(
     *,
     iteration: int = 0,
     reduction: str = "mean",
+    reference: Any | None = None,
 ) -> tuple[Tensor, dict[str, Any]]:
-    """Ordinary PPO on one sampled private type and scalar target per row."""
+    """Ordinary PPO with the same optional NashPG KL as the RB modes."""
 
     actor_type = targets.actor_type.to(new.v.device, dtype=torch.int64)
     rows = torch.arange(actor_type.numel(), device=new.v.device)
@@ -237,7 +264,13 @@ def ppo(
     )
     entropy = entropy_all[rows, actor_type]
     entropy_loss = -_entropy_coefficient(cfg, iteration) * entropy
-    per_row = policy + value_loss + entropy_loss
+    c_kl = float(_cfg(cfg, "c_kl", 0.0))
+    if c_kl == 0.0:
+        kl_loss = torch.zeros_like(value)
+    else:
+        kl_all = _policy_kl(new, reference, targets, adapter)
+        kl_loss = c_kl * kl_all[rows, actor_type]
+    per_row = policy + value_loss + entropy_loss + kl_loss
 
     residual = (wanted - value).square().sum()
     rows_count = per_row.new_tensor(per_row.shape[0])
@@ -247,6 +280,7 @@ def ppo(
         "policy_sum": policy.sum().detach(),
         "value_sum": value_loss.sum().detach(),
         "entropy_loss_sum": entropy_loss.sum().detach(),
+        "reference_kl_sum": kl_loss.sum().detach(),
         "kl_num": (ratio - 1.0 - torch.log(ratio)).sum().detach(),
         "kl_den": rows_count,
         "clip_num": (ratio != clipped).to(ratio).sum().detach(),
@@ -285,6 +319,7 @@ def finalize_metric_stats(parts: list[dict[str, Tensor]]) -> dict[str, float]:
         "policy": float(summed["policy_sum"] / rows),
         "value": float(summed["value_sum"] / rows),
         "entropy_loss": float(summed["entropy_loss_sum"] / rows),
+        "reference_kl": float(summed["reference_kl_sum"] / rows),
         "approx_kl": float(summed["kl_num"] / kl_den),
         "clip_frac": float(summed["clip_num"] / kl_den),
         "entropy": float(summed["entropy_num"] / entropy_den),

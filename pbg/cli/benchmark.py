@@ -13,13 +13,34 @@ from pbg.core.config import load_config
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark PBG training modes")
     parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="optional read-only model checkpoint used to initialize every mode",
+    )
     parser.add_argument("--hardware-profile", default=None)
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="explicit torch device (for example cpu or cuda:0); default is auto",
+    )
     parser.add_argument("--mode", action="append", choices=MODES, dest="modes")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument("--n-trees", type=int, default=None)
+    parser.add_argument("--sequential-starts", type=int, default=None)
     parser.add_argument("--node-budget", type=int, default=None)
+    parser.add_argument("--queue-batch-rows", type=int, default=None)
+    parser.add_argument(
+        "--queue-packing",
+        choices=("fixed_family_quantum", "actual_cost_greedy"),
+        default=None,
+    )
+    parser.add_argument("--queue-admission-size", type=int, default=None)
+    parser.add_argument("--arena-chunk-nodes", type=int, default=None)
     parser.add_argument("--completion-samples", type=int, default=None)
+    parser.add_argument(
+        "--completion-backend", choices=("auto", "cpu", "cuda"), default=None
+    )
     parser.add_argument("--minibatch-size", type=int, default=None)
     parser.add_argument("--gd-steps", type=int, default=None)
     parser.add_argument("--output", default=None, help="optional JSON result/baseline path")
@@ -28,12 +49,22 @@ def main() -> None:
     parser.add_argument("--allow-environment-mismatch", action="store_true")
     args = parser.parse_args()
     cfg = load_config(args.config, hardware_profile=args.hardware_profile)
-    if args.n_trees is not None:
-        cfg.rollout.n_trees = args.n_trees
+    if args.sequential_starts is not None:
+        cfg.rollout.sequential_starts = args.sequential_starts
     if args.node_budget is not None:
         cfg.rollout.node_budget = args.node_budget
+    if args.queue_batch_rows is not None:
+        cfg.rollout.queue_batch_rows = args.queue_batch_rows
+    if args.queue_packing is not None:
+        cfg.rollout.queue_packing = args.queue_packing
+    if args.queue_admission_size is not None:
+        cfg.rollout.queue_admission_size = args.queue_admission_size
+    if args.arena_chunk_nodes is not None:
+        cfg.rollout.arena_chunk_nodes = args.arena_chunk_nodes
     if args.completion_samples is not None:
         cfg.completion.n_samples = args.completion_samples
+    if args.completion_backend is not None:
+        cfg.completion.backend = args.completion_backend
     if args.minibatch_size is not None:
         cfg.training.minibatch_size = args.minibatch_size
     if args.gd_steps is not None:
@@ -43,6 +74,8 @@ def main() -> None:
         args.modes or MODES,
         warmup=args.warmup,
         repeats=args.repeats,
+        device=args.device,
+        checkpoint=args.checkpoint,
     )
     encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output:

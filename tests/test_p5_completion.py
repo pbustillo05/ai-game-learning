@@ -44,14 +44,15 @@ class _ShowdownResult:
 
 
 def _install_fake(
-    monkeypatch: pytest.MonkeyPatch, *, version: str = "pbg-v2"
+    monkeypatch: pytest.MonkeyPatch, *, version: str = "pbg-v3"
 ) -> dict[str, dict[str, Any]]:
     calls: dict[str, dict[str, Any]] = {}
     package = ModuleType("poker_gpu_evaluator")
     package.__path__ = []  # type: ignore[attr-defined]
     facade = ModuleType("poker_gpu_evaluator.pbg")
     facade.API_VERSION = version  # type: ignore[attr-defined]
-    facade.COMBO_CARDS = torch.triu_indices(52, 52, offset=1).T.to(torch.uint8)  # type: ignore[attr-defined]
+    combo_table = torch.triu_indices(52, 52, offset=1).T.to(torch.uint8)
+    facade.combo_cards = lambda rank_count: combo_table.clone()  # type: ignore[attr-defined]
 
     def complete(**kwargs: Any) -> _CompletionResult:
         calls["complete"] = kwargs
@@ -69,7 +70,7 @@ def _install_fake(
             output_valid=torch.ones((batch, players, 1326), dtype=torch.bool, device=device),
             sample_count=torch.full((batch,), kwargs["config"].n_samples, dtype=torch.int64, device=device),
             estimator_stddev=torch.zeros((batch, players, 1326), device=device),
-            metadata={"backend": "fake", "api_version": "pbg-v2"},
+            metadata={"backend": "fake", "api_version": "pbg-v3"},
         )
 
     def sample_joint_profiles(**kwargs: Any) -> _JointResult:
@@ -159,7 +160,8 @@ def test_completion_exact_mapping_padding_seeds_and_diagnostics(
     expected_gen = torch.Generator().manual_seed(123)
     expected_seed = torch.empty(1, dtype=torch.int64).random_(generator=expected_gen)
 
-    result = module.PokerGPUCompletion(backend="cpu", n_partials=4).complete(
+    completion = module.PokerGPUCompletion(backend="cpu", n_partials=4)
+    result = completion.complete(
         game,
         tree,
         torch.tensor([0], dtype=torch.int32),
@@ -178,7 +180,9 @@ def test_completion_exact_mapping_padding_seeds_and_diagnostics(
         "stratum_amount",
         "seed",
         "config",
+        "rank_count",
     }
+    assert call["rank_count"] == 13
     assert call["board_cards"].tolist() == [[0, 5, 9, 255, 255]]
     assert call["board_cards"].dtype == torch.uint8 and call["board_cards"].is_contiguous()
     assert call["dealt_mask"].tolist() == [[True, True, True, False]]
@@ -198,7 +202,18 @@ def test_completion_exact_mapping_padding_seeds_and_diagnostics(
     assert result.p_hat.shape == (1, 4, 1326)
     assert result.equity_share is not None and result.equity_share.shape == (1, 4, 1326, 2)
     assert result.sample_count is not None and result.sample_count.item() == 17
-    assert result.metadata == {"backend": "fake", "api_version": "pbg-v2"}
+    assert result.metadata == {"backend": "fake", "api_version": "pbg-v3"}
+
+    logical_seed = torch.tensor([987654321], dtype=torch.int64)
+    completion.complete_keyed(
+        game,
+        tree,
+        torch.tensor([0], dtype=torch.int32),
+        module.ReachView(log_r),
+        17,
+        logical_seed,
+    )
+    assert torch.equal(calls["complete"]["seed"], logical_seed)
 
 
 def test_rejection_returns_whole_profiles_and_reports_partial_failure(
@@ -224,9 +239,19 @@ def test_rejection_returns_whole_profiles_and_reports_partial_failure(
         "seed",
         "max_attempts",
         "backend",
+        "rank_count",
     }
+    assert call["rank_count"] == 13
     assert call["max_attempts"] == 91
     assert call["board_cards"].tolist()[1] == [255] * 5
+
+    logical_seeds = torch.tensor([1234, 5678], dtype=torch.int64)
+    seeded = PokerGPURejectionSampler(max_attempts=92).sample_seeded(
+        rows, board, dealt, 3, logical_seeds
+    )
+    assert seeded.shape == profiles.shape
+    assert torch.equal(calls["sample"]["seed"], logical_seeds)
+    assert calls["sample"]["max_attempts"] == 92
 
     facade = sys.modules["poker_gpu_evaluator.pbg"]
 
@@ -280,7 +305,9 @@ def test_showdown_stipulated_strata_validate_and_assemble(
         "active_mask",
         "stratum_players",
         "backend",
+        "rank_count",
     }
+    assert call["rank_count"] == 13
     strata = PotStrata(
         stratum_players=eligible,
         stratum_amount=torch.tensor([[30.0, 10.0]]),
@@ -298,7 +325,7 @@ def test_version_result_contract_and_forbidden_implementation_scan(
     _install_fake(monkeypatch, version="pbg-v1")
     from pbg.games.poker.mc import PokerGPUShowdownEvaluator
 
-    with pytest.raises(RuntimeError, match="expected API_VERSION 'pbg-v2'"):
+    with pytest.raises(RuntimeError, match="expected API_VERSION 'pbg-v3'"):
         PokerGPUShowdownEvaluator().evaluate(
             board_cards=torch.tensor([[0, 4, 8, 12, 16]], dtype=torch.uint8),
             combo_ids=torch.tensor([[1, 2]], dtype=torch.int32),
@@ -314,8 +341,8 @@ def test_version_result_contract_and_forbidden_implementation_scan(
 def test_real_sibling_facade_version_when_installed() -> None:
     facade = pytest.importorskip(
         "poker_gpu_evaluator.pbg",
-        reason="poker_gpu_evaluator pbg-v2 facade is not installed",
+        reason="poker_gpu_evaluator pbg-v3 facade is not installed",
     )
-    assert facade.API_VERSION == "pbg-v2"
+    assert facade.API_VERSION == "pbg-v3"
     expected = torch.triu_indices(52, 52, offset=1).T.to(torch.uint8)
-    assert torch.equal(facade.COMBO_CARDS, expected)
+    assert torch.equal(facade.combo_cards(13), expected)

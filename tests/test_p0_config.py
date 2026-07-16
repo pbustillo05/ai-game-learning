@@ -21,6 +21,7 @@ def test_nlhe_loads_every_config_field() -> None:
     assert cfg.game.name == "poker"
     assert cfg.game.poker == {"n_players": 6, "stack_bb": 100.0, "rank_count": 13}
     assert cfg.rollout.beta_fix["preflop"] == 1.0
+    assert cfg.rollout.queue_packing == "actual_cost_greedy"
     assert cfg.completion.n_samples == 256
     assert cfg.completion.backend == "cuda"
     assert cfg.model["d_model"] == 192
@@ -129,6 +130,60 @@ def test_training_mode_validates_beta_completion_and_loss_axes(tmp_path: Path) -
     with pytest.raises(ConfigError, match="does not support mode 'normal'"):
         load_config(path)
 
+
+@pytest.mark.parametrize("key", ["executor", "trajectory_chunk_size"])
+def test_removed_rollout_implementation_keys_are_rejected(
+    tmp_path: Path, key: str
+) -> None:
+    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
+    raw["rollout"][key] = "wavefront_v1" if key == "executor" else 4
+    path = tmp_path / "removed.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match=key):
+        load_config(path)
+
+
+def test_production_execution_config_is_explicit_and_strict(
+    tmp_path: Path,
+) -> None:
+    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
+    raw["training"]["mode"] = "rao_blackwell"
+    raw["rollout"]["beta"] = None
+    raw["rollout"]["sequential_starts"] = 10
+    raw["rollout"].update(
+        {
+            "queue_batch_rows": 8,
+            "queue_admission_size": 16,
+            "arena_chunk_nodes": 32,
+            "queue_memory_bytes": 1_000_000,
+            "queue_packing": "actual_cost_greedy",
+        }
+    )
+    path = tmp_path / "queued.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.rollout.queue_batch_rows == 8
+    assert cfg.rollout.queue_admission_size == 16
+    assert cfg.rollout.arena_chunk_nodes == 32
+    assert cfg.rollout.queue_memory_bytes == 1_000_000
+    assert cfg.rollout.queue_packing == "actual_cost_greedy"
+
+    raw["rollout"]["queue_batch_rows"] = 0
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="queue_batch_rows"):
+        load_config(path)
+
+    raw["rollout"]["queue_batch_rows"] = 8
+    raw["rollout"]["queue_packing"] = "mystery"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="queue_packing"):
+        load_config(path)
+
+    raw["rollout"]["queue_packing"] = "fixed_family_quantum"
+    raw["rollout"]["trajectory_start_index"] = 3
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="unknown configuration key"):
+        load_config(path)
 
 def test_seed_all_returns_repeatable_explicit_generators() -> None:
     torch_a, numpy_a = seed_all(19, rank=2)

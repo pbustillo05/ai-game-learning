@@ -5,7 +5,7 @@ game:
     stack_bb: 8.0
     rank_count: 13
 rollout:
-  n_trees: 1
+  sequential_starts: 1
   beta:
     default: 1.0
     preflop: 1.0

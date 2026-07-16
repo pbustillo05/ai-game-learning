@@ -2,43 +2,416 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, is_dataclass
-from typing import Any, Callable, Mapping
+from dataclasses import fields, is_dataclass
+from typing import Any, Mapping
 
-import numpy as np
 import torch
 from torch import Tensor
 
-from pbg.core.config import RolloutConfig
-from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch, GameBundle
+from pbg.core.game import CHANCE, PRETERM, TERMINAL, GameBundle
 from pbg.core.tree import (
     DeviceTreeBuffer,
     PolicyCache,
     ReachCache,
     TreeBatch,
-    TreeBuilder,
-    _replay_reach_update,
 )
 
 
-def _combine_event_rows(
-    size: int,
-    parts: list[tuple[Tensor, EventBatch]],
-    device: torch.device,
-) -> EventBatch:
-    """Scatter partitioned event batches into abstract-child order ``[C]``."""
+def sample_branched_tree(
+    bundle: GameBundle,
+    cfg: Any,
+    gen: torch.Generator,
+    *,
+    iteration: int = 0,
+) -> tuple[TreeBatch, ReachCache, PolicyCache]:
+    """Sample one duplicate-preserving branched tree through execution families."""
 
-    public_id = torch.empty(size, dtype=torch.int32, device=device)  # [C]
-    payload: dict[str, Tensor] = {}
-    for positions, events in parts:
-        public_id[positions] = events.public_id
-        for key, value in events.payload.items():
-            if key not in payload:
-                payload[key] = torch.zeros(
-                    (size, *value.shape[1:]), dtype=value.dtype, device=device
-                )  # [C,...]
-            payload[key][positions] = value
-    return EventBatch(public_id=public_id, payload=payload)
+    # Imports are local because rollout dispatch imports this module lazily.
+    import time
+    import torch.distributed as dist
+
+    from pbg.core.queued import (
+        DONE,
+        ChunkedOccurrenceArena,
+        DeviceFifoRing,
+        DrawPurpose,
+        arena_fields,
+        child_path_keys,
+        logical_rng_keys,
+        logical_uniform,
+        stable_partition_masked,
+    )
+    from pbg.core.rollout import (
+        _logical_seed,
+        _queued_family_ids,
+        _queued_family_spec,
+        _sample_events_logical,
+        _sample_profiles_logical,
+        _selected_policy_logp,
+    )
+
+    rollout_cfg = getattr(cfg, "rollout", cfg)
+    backend = bundle.rollout_backend
+    device = torch.device(backend.device)
+    if torch.device(gen.device) != device:
+        raise ValueError("rollout generator must be created on the backend device")
+    if int(rollout_cfg.n_trees) != 1 or int(rollout_cfg.node_budget) <= 0:
+        raise ValueError("queued branched rollout requires one root and a positive budget")
+    if rollout_cfg.reach_storage not in {"full", "decisions_only", "recompute"}:
+        raise ValueError("unknown reach_storage mode")
+
+    p_max = int(backend.n_players)
+    x_sizes = tuple(int(value) for value in backend.x_sizes)
+    x_max = max(x_sizes)
+    node_budget = int(rollout_cfg.node_budget)
+    roots = backend.branched_root_state()
+    if roots.shape != (1,) or roots.dtype != torch.int32 or roots.device != device:
+        raise ValueError("branched_root_state must return device-local int32 [1]")
+    root_owner = backend.classify(roots).to(torch.int32)
+    buffer = DeviceTreeBuffer(1, node_budget, p_max, device)
+    root_nodes = buffer.add_roots(roots, root_owner)
+    arena = ChunkedOccurrenceArena(
+        node_budget,
+        int(getattr(rollout_cfg, "arena_chunk_nodes", None) or min(node_budget, 256)),
+        device,
+        fields=arena_fields(("path_key",)),
+        label="branched_occurrences",
+    )
+    root_handles = arena.allocate(1)
+    if device.type == "cuda":
+        torch._assert_async(
+            (root_handles == root_nodes.to(torch.int64)).all(),
+            "branched occurrence and root handles diverged",
+        )
+    elif not torch.equal(root_handles, root_nodes.to(torch.int64)):
+        raise RuntimeError("branched occurrence and root handles diverged")
+    arena.scatter_many(
+        root_handles,
+        {"path_key": torch.zeros(1, dtype=torch.int64, device=device)},
+    )
+
+    root_reach = torch.zeros((1, p_max, x_max), dtype=torch.float32, device=device)
+    for player, size in enumerate(x_sizes):
+        root_reach[:, player, size:] = -torch.inf
+    reach_rows = torch.empty(
+        (node_budget, p_max, x_max), dtype=torch.float32, device=device
+    )
+    reach_rows[0] = root_reach[0]
+    family_names, family_values, family_priorities = _queued_family_spec(backend)
+    queues = {name: DeviceFifoRing(node_budget, device) for name in family_names}
+    metrics = getattr(backend, "execution_metrics", None)
+    queue_packing = getattr(
+        rollout_cfg, "queue_packing", "fixed_family_quantum"
+    )
+    actual_cost_forward = getattr(
+        backend, "policy_forward_family_actual_cost", None
+    )
+    if queue_packing == "actual_cost_greedy" and not callable(actual_cost_forward):
+        raise ValueError(
+            "actual_cost_greedy requires a backend actual-cost family forward"
+        )
+    logical_seed = _logical_seed(cfg, gen)
+    tree_address = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    scheduler_step = 0
+    policy_edge_ids: list[Tensor] = []
+    policy_edge_logp: list[Tensor] = []
+    policy_node_ids: list[Tensor] = []
+    policy_node_values: list[Tensor] = []
+
+    def read_control(value: Tensor) -> tuple[int, ...]:
+        if value.ndim != 1 or value.dtype != torch.int64:
+            raise ValueError("branched scheduler control must be int64 [K]")
+        if device.type == "cuda":
+            started = time.perf_counter()
+            host = value.to("cpu")
+            elapsed = time.perf_counter() - started
+            if metrics is not None:
+                metrics.record_scheduler_control_synchronization(
+                    seconds=elapsed,
+                    nbytes=value.numel() * value.element_size(),
+                )
+        else:
+            host = value
+        return tuple(int(item) for item in host.tolist())
+
+    def record_queues() -> None:
+        if metrics is None:
+            return
+        for name, queue in queues.items():
+            metrics.record_queue(
+                name,
+                depth=queue.host_count,
+                oldest_age=float(queue.oldest_age(scheduler_step)),
+            )
+
+    def offspring_for(nodes: Tensor) -> tuple[Tensor, int]:
+        rows = nodes.to(torch.int64)
+        states = buffer.state_ref[rows]
+        beta = _validate_beta(backend.beta_fn(states), nodes.numel(), device)
+        base = torch.floor(beta)
+        fraction = beta - base
+        paths = arena.gather_many(("path_key",), rows)["path_key"]
+        keys = logical_rng_keys(
+            seed=logical_seed,
+            iteration=iteration,
+            trajectory=torch.full_like(paths, tree_address),
+            path=paths,
+            draw=0,
+            purpose=DrawPurpose.ROUND,
+        )
+        offspring = (
+            base + (logical_uniform(keys) < fraction).to(torch.float32)
+        ).to(torch.int64)
+        total = read_control(offspring.sum().reshape(1))[0]
+        if total <= 0:
+            raise RuntimeError("branched intensity produced no child")
+        buffer.require_child_capacity(total)
+        arena.require_capacity(total)
+        return offspring, total
+
+    def expand(nodes: Tensor, family: str | None) -> Tensor:
+        rows = nodes.to(torch.int64)
+        states = buffer.state_ref[rows]
+        reaches = reach_rows[rows]
+        offspring, total = offspring_for(nodes)
+        parent_positions = torch.repeat_interleave(
+            torch.arange(nodes.numel(), device=device),
+            offspring,
+            output_size=total,
+        )
+        parents = nodes[parent_positions].to(torch.int32)
+        child_states = states[parent_positions]
+        child_reach = reaches[parent_positions]
+        prefix = torch.cat(
+            (torch.zeros(1, dtype=torch.int64, device=device), offspring.cumsum(0)[:-1])
+        )
+        ordinal = torch.arange(total, device=device) - prefix[parent_positions] + 1
+        parent_paths = arena.gather_many(("path_key",), rows)["path_key"]
+        expanded_paths = parent_paths[parent_positions]
+        posterior_keys = logical_rng_keys(
+            seed=logical_seed,
+            iteration=iteration,
+            trajectory=torch.full_like(expanded_paths, tree_address),
+            path=expanded_paths,
+            draw=ordinal,
+            purpose=DrawPurpose.POSTERIOR,
+        )
+        profiles = _sample_profiles_logical(
+            backend, child_states, child_reach, posterior_keys, gen
+        )
+        output = None
+        child_output = None
+        if family is not None:
+            forward = getattr(backend, "policy_forward_family", None)
+            output = (
+                actual_cost_forward(bundle.model, family, states, reaches)
+                if queue_packing == "actual_cost_greedy"
+                and callable(actual_cost_forward)
+                else forward(bundle.model, family, states, reaches)
+                if callable(forward)
+                else backend.policy_forward(bundle.model, states, reaches)
+            )
+            child_output = _index_policy_output(output, parent_positions)
+        event_keys = logical_rng_keys(
+            seed=logical_seed,
+            iteration=iteration,
+            trajectory=torch.full_like(expanded_paths, tree_address),
+            path=expanded_paths,
+            draw=ordinal,
+            purpose=(DrawPurpose.ACTION if family is not None else DrawPurpose.CHANCE),
+        )
+        events = _sample_events_logical(
+            backend,
+            child_states,
+            profiles,
+            child_output,
+            bundle.policy_adapter,
+            event_keys,
+            gen,
+        )
+        if family is None:
+            step_batch = getattr(backend, "step_chance_batch", backend.step)
+        else:
+            step_batch = getattr(backend, "step_player_batch", backend.step)
+        next_states = step_batch(child_states, events)
+        next_reach = backend.reach_update(
+            child_reach, child_states, events, child_output
+        )
+        next_owner = backend.classify(next_states).to(torch.int32)
+        first_edge = buffer.edge_count
+        weights = offspring[parent_positions].reciprocal().to(torch.float32)
+        children = buffer.append_children(
+            parents, next_states, next_owner, events.public_id, weights
+        )
+        child_handles = arena.allocate(total)
+        if device.type == "cuda":
+            torch._assert_async(
+                (child_handles == children.to(torch.int64)).all(),
+                "branched occurrence and child handles diverged",
+            )
+        elif not torch.equal(child_handles, children.to(torch.int64)):
+            raise RuntimeError("branched occurrence and child handles diverged")
+        arena.scatter_many(
+            child_handles,
+            {"path_key": child_path_keys(expanded_paths, ordinal)},
+        )
+        reach_rows[children.to(torch.int64)] = next_reach
+        if family is not None:
+            assert output is not None and child_output is not None
+            legal_ids, legal_mask = backend.legal_events(child_states)
+            edge_logp = _selected_policy_logp(
+                bundle.policy_adapter,
+                child_output,
+                events.public_id[:, None],
+                legal_ids,
+                legal_mask,
+            ).detach()[:, 0]
+            policy_edge_ids.append(
+                torch.arange(
+                    first_edge,
+                    first_edge + total,
+                    dtype=torch.int64,
+                    device=device,
+                )
+            )
+            policy_edge_logp.append(edge_logp)
+            policy_node_ids.append(nodes.to(torch.int32))
+            policy_node_values.append(output.v.detach().float())
+            DeviceFifoRing.mark_done(arena, rows)
+        return children
+
+    def chance_close(frontier: Tensor) -> None:
+        nonlocal scheduler_step
+        frontier = frontier.to(torch.int32)
+        chance_steps = 0
+        while frontier.numel():
+            scheduler_step += 1
+            rows = frontier.to(torch.int64)
+            owners = buffer.owner[rows]
+            states = buffer.state_ref[rows]
+            family_ids = _queued_family_ids(backend, states)
+            chance_route, leaf_route, invalid_route = -1, -2, -3
+            player = (owners >= 0) & (owners < p_max)
+            route = torch.where(
+                owners == CHANCE,
+                torch.full_like(family_ids, chance_route),
+                torch.where(
+                    (owners == TERMINAL) | (owners == PRETERM),
+                    torch.full_like(family_ids, leaf_route),
+                    torch.where(
+                        player,
+                        family_ids,
+                        torch.full_like(family_ids, invalid_route),
+                    ),
+                ),
+            )
+            partition = stable_partition_masked(
+                frontier.to(torch.int64),
+                route,
+                (*family_values, chance_route, leaf_route),
+            )
+            counts = read_control(partition.selected_count)
+            for index, (name, count) in enumerate(
+                zip(family_names, counts[: len(family_names)], strict=True)
+            ):
+                if count:
+                    queues[name].enqueue(
+                        partition.candidate_handles[index, :count],
+                        arena=arena,
+                        logical_time=scheduler_step,
+                    )
+            record_queues()
+            chance_count = counts[-2]
+            if chance_count == 0:
+                return
+            chance_steps += 1
+            if chance_steps > int(backend.max_rollout_steps):
+                raise RuntimeError("chance-only segment exceeded max_rollout_steps")
+            chance_nodes = partition.candidate_handles[-2, :chance_count].to(torch.int32)
+            frontier = expand(chance_nodes, None)
+
+    chance_close(root_nodes)
+    progress_limit = node_budget * (int(backend.max_rollout_steps) + 2)
+    while any(queue.host_count for queue in queues.values()):
+        scheduler_step += 1
+        if scheduler_step > progress_limit:
+            raise RuntimeError("queued branched scheduler exceeded its progress bound")
+        nonempty = [name for name in family_names if queues[name].host_count]
+        upstream = min(family_priorities[family_names.index(name)] for name in nonempty)
+        eligible = [
+            name
+            for name in nonempty
+            if family_priorities[family_names.index(name)] == upstream
+        ]
+        family = max(
+            eligible,
+            key=lambda name: (
+                queues[name].host_count,
+                queues[name].oldest_age(scheduler_step),
+                -family_names.index(name),
+            ),
+        )
+        queue = queues[family]
+        configured_rows = int(
+            getattr(rollout_cfg, "queue_batch_rows", None) or queue.host_count
+        )
+        count = min(queue.host_count, configured_rows)
+        nodes = queue.dequeue(count, arena=arena).to(torch.int32)
+        record_queues()
+        chance_close(expand(nodes, family))
+
+    tree = buffer.finalize()
+    tree.validate()
+    all_nodes = torch.arange(buffer.node_count, dtype=torch.int32, device=device)
+    if rollout_cfg.reach_storage == "full":
+        reach_nodes = all_nodes
+    elif rollout_cfg.reach_storage == "decisions_only":
+        stored = ((tree.owner >= 0) & (tree.owner < p_max)) | (
+            (tree.owner == TERMINAL) | (tree.owner == PRETERM)
+        )
+        reach_nodes = all_nodes[stored]
+    else:
+        reach_nodes = root_nodes
+    reach_cache = ReachCache(
+        rollout_cfg.reach_storage,
+        reach_rows[reach_nodes.to(torch.int64)],
+        reach_nodes,
+    )
+    decision_nodes = ((tree.owner >= 0) & (tree.owner < p_max)).nonzero().squeeze(1)
+    if decision_nodes.numel():
+        counts = tree.child_ptr[decision_nodes + 1] - tree.child_ptr[decision_nodes]
+        width = int(counts.max())
+        logp_child = torch.full(
+            (decision_nodes.numel(), width, x_max),
+            -torch.inf,
+            dtype=torch.float32,
+            device=device,
+        )
+        edge_ids = torch.cat(policy_edge_ids).to(torch.int64)
+        edge_logp = torch.cat(policy_edge_logp).to(torch.float32)
+        parents = buffer.edge_parent[edge_ids].to(torch.int64)
+        node_to_row = torch.full(
+            (buffer.node_count,), -1, dtype=torch.int64, device=device
+        )
+        node_to_row[decision_nodes] = torch.arange(decision_nodes.numel(), device=device)
+        # Append-order edge ids are not CSR positions under FIFO scheduling:
+        # another family may expand a later node first. DeviceTreeBuffer stores
+        # each edge's stable parent-local ordinal explicitly for this mapping.
+        columns = buffer.edge_ordinal[edge_ids].to(torch.int64)
+        logp_child[node_to_row[parents], columns] = edge_logp
+        cached_nodes = torch.cat(policy_node_ids).to(torch.int32)
+        cached_values = torch.cat(policy_node_values).to(torch.float32)
+        order = torch.argsort(cached_nodes.to(torch.int64))
+        if not torch.equal(cached_nodes[order], decision_nodes):
+            raise RuntimeError("queued branched rollout omitted a decision cache row")
+        old_v = cached_values[order]
+    else:
+        logp_child = torch.empty((0, 0, x_max), dtype=torch.float32, device=device)
+        old_v = torch.empty((0, x_max), dtype=torch.float32, device=device)
+    return tree, reach_cache, PolicyCache(
+        decision_nodes.to(torch.int32), logp_child, old_v
+    )
+
 
 
 def _validate_beta(beta: Tensor, count: int, device: torch.device) -> Tensor:
@@ -50,18 +423,6 @@ def _validate_beta(beta: Tensor, count: int, device: torch.device) -> Tensor:
         raise ValueError("rollout beta must be finite and at least one")
     return beta
 
-
-def _offspring_counts(beta: Tensor, gen: torch.Generator) -> Tensor:
-    """Randomized-round fp32 intensities to int64 offspring counts ``[B]``."""
-
-    base = torch.floor(beta)
-    fraction = beta - base
-    # Integer intensities are deterministic and consume no unnecessary random draw.
-    fractional = fraction > 0
-    extra = torch.zeros_like(base)
-    if bool(fractional.any()):
-        extra[fractional] = torch.bernoulli(fraction[fractional], generator=gen)
-    return (base + extra).to(torch.int64)  # [B]
 
 
 def _index_policy_output(output: Any, rows: Tensor) -> Any:
@@ -86,235 +447,3 @@ def _index_policy_output(output: Any, rows: Tensor) -> Any:
         return [_index_policy_output(value, rows) for value in output]
     # Immutable metadata may be shared by all gathered rows.
     return output
-
-
-def _sample_branched_labeled(
-    bundle: GameBundle,
-    cfg: RolloutConfig,
-    gen: torch.Generator,
-) -> tuple[TreeBatch, ReachCache, PolicyCache]:
-    """Sample one fixed-intensity labeled public tree on the backend device.
-
-    The returned tree contains ``N`` nodes and ``C`` duplicate-preserving edges;
-    reach rows are ``[N_stored,P,X_max]`` and cached decision rows are
-    ``[N_d,K_max,X_max]``.
-    """
-
-    backend = bundle.rollout_backend
-    rollout_cfg = getattr(cfg, "rollout", cfg)
-    device = torch.device(backend.device)
-    if torch.device(gen.device) != device:
-        raise ValueError("rollout generator must be created on the backend device")
-    beta_mode = getattr(rollout_cfg, "beta_mode", "fixed")
-    if beta_mode not in {"sequential", "fixed"}:
-        raise ValueError("legacy beta_mode must be 'sequential' or 'fixed'")
-    if rollout_cfg.reach_storage not in {"full", "decisions_only", "recompute"}:
-        raise ValueError("unknown reach_storage mode")
-    n_trees = int(rollout_cfg.n_trees)
-    node_budget = int(rollout_cfg.node_budget)
-    if n_trees != 1 or node_budget <= 0:
-        raise ValueError(
-            "branched rollout requires n_trees=1 per rank and a positive node_budget"
-        )
-
-    p_max = int(backend.n_players)
-    x_sizes = tuple(int(value) for value in backend.x_sizes)
-    x_max = max(x_sizes)
-    roots = backend.root_states(n_trees)
-    if roots.shape != (n_trees,) or roots.dtype != torch.int32 or roots.device != device:
-        raise ValueError("root_states must return device-local int32 [n_trees]")
-    root_owner = backend.classify(roots).to(torch.int32)  # [G]
-    buffer = DeviceTreeBuffer(n_trees, node_budget, p_max, device)
-    root_nodes = buffer.add_roots(roots, root_owner)  # [G]
-
-    root_reach = torch.zeros(
-        (n_trees, p_max, x_max), dtype=torch.float32, device=device
-    )  # [G,P,X]
-    for player, size in enumerate(x_sizes):
-        root_reach[:, player, size:] = -torch.inf
-    reach_rows: Tensor | None = None
-    if rollout_cfg.reach_storage != "recompute":
-        reach_rows = torch.empty(
-            (buffer.node_capacity, p_max, x_max), dtype=torch.float32, device=device
-        )  # [capacity,P,X]
-        reach_rows[:n_trees] = root_reach
-    policy_edge_ids: list[Tensor] = []
-    policy_edge_logp: list[Tensor] = []
-    policy_node_ids: list[Tensor] = []
-    policy_node_values: list[Tensor] = []
-
-    frontier_nodes = root_nodes
-    frontier_states = roots
-    frontier_owner = root_owner
-    frontier_reach = root_reach
-    for _ in range(int(backend.max_rollout_steps)):
-        live = (frontier_owner != TERMINAL) & (frontier_owner != PRETERM)
-        if not bool(live.any()):
-            break
-        active_nodes = frontier_nodes[live]  # [A]
-        active_states = frontier_states[live]  # [A]
-        active_owner = frontier_owner[live]  # [A]
-        active_reach = frontier_reach[live]  # [A,P,X]
-        active_count = active_nodes.numel()
-
-        if beta_mode == "sequential":
-            beta = torch.ones(active_count, dtype=torch.float32, device=device)  # [A]
-        else:
-            beta = _validate_beta(backend.beta_fn(active_states), active_count, device)
-        offspring = _offspring_counts(beta, gen)  # [A]
-        parent_positions = torch.repeat_interleave(
-            torch.arange(active_count, device=device), offspring
-        )  # [C_new]
-        parents = active_nodes[parent_positions]  # [C_new]
-        states = active_states[parent_positions]  # [C_new]
-        reaches = active_reach[parent_positions]  # [C_new,P,X]
-        owners = active_owner[parent_positions]  # [C_new]
-        child_count = parents.numel()
-        profiles = backend.sample_profiles(states, reaches, gen)  # [C_new,P]
-
-        player_positions = ((owners >= 0) & (owners < p_max)).nonzero().squeeze(1)
-        chance_positions = (owners == CHANCE).nonzero().squeeze(1)
-        event_parts: list[tuple[Tensor, EventBatch]] = []
-        next_reach = torch.empty_like(reaches)  # [C_new,P,X]
-        player_logp: Tensor | None = None
-        player_output: Any | None = None
-
-        if player_positions.numel() != 0:
-            decision_parent_positions = (
-                (active_owner >= 0) & (active_owner < p_max)
-            ).nonzero().squeeze(1)  # [Nd_wave]
-            unique_player_states = active_states[decision_parent_positions]  # [Nd_wave]
-            unique_player_reach = active_reach[decision_parent_positions]  # [Nd_wave,P,X]
-            child_parent_positions = parent_positions[player_positions]  # [Cp]
-            child_output_rows = torch.searchsorted(
-                decision_parent_positions, child_parent_positions
-            )  # [Cp]
-            player_states = states[player_positions]  # [Cp]
-            player_reach = reaches[player_positions]  # [Cp,P,X]
-            with torch.no_grad():
-                player_output = backend.policy_forward(
-                    bundle.model, unique_player_states, unique_player_reach
-                )
-                child_player_output = _index_policy_output(
-                    player_output, child_output_rows
-                )
-                player_events = backend.sample_events(
-                    player_states,
-                    profiles[player_positions],
-                    child_player_output,
-                    bundle.policy_adapter,
-                    gen,
-                )
-                next_reach[player_positions] = backend.reach_update(
-                    player_reach, player_states, player_events, child_player_output
-                )
-                legal_ids, legal_mask = backend.legal_events(player_states)
-                from pbg.core.rollout import _selected_policy_logp
-
-                player_logp = _selected_policy_logp(
-                    bundle.policy_adapter,
-                    child_player_output,
-                    player_events.public_id[:, None],
-                    legal_ids,
-                    legal_mask,
-                ).detach()[:, 0]  # [Cp,X]
-            event_parts.append((player_positions, player_events))
-
-        if chance_positions.numel() != 0:
-            chance_states = states[chance_positions]  # [Cc]
-            chance_events = backend.sample_events(
-                chance_states,
-                profiles[chance_positions],
-                None,
-                bundle.policy_adapter,
-                gen,
-            )
-            next_reach[chance_positions] = backend.reach_update(
-                reaches[chance_positions], chance_states, chance_events, None
-            )
-            event_parts.append((chance_positions, chance_events))
-
-        if player_positions.numel() + chance_positions.numel() != child_count:
-            raise RuntimeError("backend classified a live state with an invalid owner")
-        events = _combine_event_rows(child_count, event_parts, device)
-        next_states = backend.step(states, events)  # [C_new]
-        next_owner = backend.classify(next_states).to(torch.int32)  # [C_new]
-        weights = offspring[parent_positions].reciprocal().to(torch.float32)  # [C_new]
-        first_edge = buffer.edge_count
-        child_nodes = buffer.append_children(
-            parents, next_states, next_owner, events.public_id, weights
-        )  # [C_new]
-        if reach_rows is not None:
-            reach_rows[child_nodes.to(torch.int64)] = next_reach
-
-        if player_positions.numel() != 0:
-            assert player_logp is not None and player_output is not None
-            edge_rows = torch.arange(
-                first_edge, first_edge + child_count, dtype=torch.int64, device=device
-            )  # [C_new]
-            policy_edge_ids.append(edge_rows[player_positions])
-            policy_edge_logp.append(player_logp)
-            policy_node_ids.append(active_nodes[decision_parent_positions].to(torch.int32))
-            policy_node_values.append(player_output.v.detach().float())
-
-        frontier_nodes = child_nodes
-        frontier_states = next_states
-        frontier_owner = next_owner
-        frontier_reach = next_reach
-
-    live_frontier = (frontier_owner != TERMINAL) & (frontier_owner != PRETERM)
-    if bool(live_frontier.any()):
-        raise RuntimeError(
-            "rollout_backend.max_rollout_steps is too small; live frontier remains"
-        )
-
-    tree = buffer.finalize()
-    all_nodes = torch.arange(buffer.node_count, dtype=torch.int32, device=device)  # [N]
-    if rollout_cfg.reach_storage == "full":
-        reach_nodes = all_nodes
-    elif rollout_cfg.reach_storage == "decisions_only":
-        stored = ((tree.owner >= 0) & (tree.owner < p_max)) | (
-            (tree.owner == TERMINAL) | (tree.owner == PRETERM)
-        )
-        reach_nodes = all_nodes[stored]
-    else:
-        reach_nodes = root_nodes
-    reach_cache = ReachCache(
-        mode=rollout_cfg.reach_storage,
-        log_r=root_reach if reach_rows is None else reach_rows[reach_nodes.to(torch.int64)],
-        node_index=root_nodes if reach_rows is None else reach_nodes,
-    )
-
-    decision_nodes = ((tree.owner >= 0) & (tree.owner < p_max)).nonzero().squeeze(1)
-    if decision_nodes.numel() != 0:
-        counts = tree.child_ptr[decision_nodes + 1] - tree.child_ptr[decision_nodes]  # [Nd]
-        width = int(counts.max())
-        logp_child = torch.full(
-            (decision_nodes.numel(), width, x_max),
-            -torch.inf,
-            dtype=torch.float32,
-            device=device,
-        )  # [Nd,K_max,X]
-        edge_ids = torch.cat(policy_edge_ids).to(torch.int64)  # [Cd]
-        edge_logp = torch.cat(policy_edge_logp).to(torch.float32)  # [Cd,X]
-        edge_parent = buffer.edge_parent[edge_ids].to(torch.int64)  # [Cd]
-        parent_ids = edge_parent
-        node_to_row = torch.full(
-            (buffer.node_count,), -1, dtype=torch.int64, device=device
-        )  # [N]
-        node_to_row[decision_nodes] = torch.arange(decision_nodes.numel(), device=device)
-        columns = edge_ids - tree.child_ptr[parent_ids].to(torch.int64)  # [Cd]
-        logp_child[node_to_row[parent_ids], columns] = edge_logp
-        cached_nodes = torch.cat(policy_node_ids).to(torch.int32)
-        cached_values = torch.cat(policy_node_values).to(torch.float32)
-        if not torch.equal(cached_nodes, decision_nodes):
-            raise RuntimeError("branched rollout omitted a player decision cache row")
-        v_old = cached_values  # [Nd,X]
-    else:
-        logp_child = torch.empty((0, 0, x_max), dtype=torch.float32, device=device)
-        v_old = torch.empty((0, x_max), dtype=torch.float32, device=device)
-    return tree, reach_cache, PolicyCache(
-        node_ids=decision_nodes.to(torch.int32),
-        old_logp_child=logp_child,
-        old_v=v_old,
-    )

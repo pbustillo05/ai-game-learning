@@ -14,8 +14,7 @@ from torch import Tensor, nn
 
 from pbg.core.branching import (
     _index_policy_output,
-    _offspring_counts,
-    _sample_branched_labeled,
+    sample_branched_tree,
 )
 from pbg.core.config import ConfigError, load_config
 from pbg.core.game import EventBatch, GameBundle, TERMINAL
@@ -66,9 +65,16 @@ class _LabeledBackend:
         self.beta = beta
         self.two_levels = two_levels
         self.forward_batch_sizes: list[int] = []
+        self.actual_cost_batch_sizes: list[int] = []
 
     def root_states(self, n: int) -> Tensor:
         return torch.zeros(n, dtype=torch.int32)
+
+    def sequential_start_states(self, count: int) -> Tensor:
+        return self.root_states(count)
+
+    def branched_root_state(self) -> Tensor:
+        return self.root_states(1)
 
     def classify(self, states: Tensor) -> Tensor:
         terminal_at = 2 if self.two_levels else 1
@@ -85,6 +91,17 @@ class _LabeledBackend:
         del reach
         self.forward_batch_sizes.append(int(states.numel()))
         return model(states)
+
+    def policy_forward_family_actual_cost(
+        self,
+        model: nn.Module,
+        family: str,
+        states: Tensor,
+        reach: Tensor,
+    ) -> _Output:
+        assert family == "default"
+        self.actual_cost_batch_sizes.append(int(states.numel()))
+        return self.policy_forward(model, states, reach)
 
     def sample_profiles(
         self, states: Tensor, reach: Tensor, gen: torch.Generator
@@ -133,18 +150,9 @@ def _cfg(n_trees: int, beta: float, budget: int = 32) -> SimpleNamespace:
 
 def _sample(backend: _LabeledBackend, cfg: SimpleNamespace, seed: int = 1):
     bundle = GameBundle(_Model(), backend, _Adapter(), None)
-    return _sample_branched_labeled(bundle, cfg, torch.Generator().manual_seed(seed))
-
-
-def test_integer_and_fractional_randomized_rounding() -> None:
-    integer = _offspring_counts(torch.full((4096,), 3.0), torch.Generator().manual_seed(1))
-    assert torch.equal(integer, torch.full_like(integer, 3))
-    fractional = _offspring_counts(
-        torch.full((20_000,), 2.25), torch.Generator().manual_seed(2)
+    return sample_branched_tree(
+        bundle, cfg, torch.Generator().manual_seed(seed)
     )
-    assert set(fractional.tolist()) == {2, 3}
-    # Binomial sd is 61.2; tolerance is >4.8 sd (H0 failure probability < 2e-6).
-    assert abs(int((fractional == 3).sum()) - 5_000) < 300
 
 
 def test_equal_labeled_siblings_remain_distinct_with_uniform_weights() -> None:
@@ -179,6 +187,52 @@ def test_duplicate_siblings_expand_independently_without_label_sorting() -> None
         assert torch.cat(descendants).unique().numel() == 4
 
 
+def test_branched_uses_one_root_and_preserves_duplicate_children() -> None:
+    backend = _LabeledBackend(2.0, two_levels=True)
+    tree, _, policy = _sample(backend, _cfg(1, 2.0), 7)
+    tree.validate()
+    roots = (tree.parent == -1).nonzero().squeeze(1)
+    assert roots.tolist() == [0]
+    first = tree.child_node[tree.child_ptr[0] : tree.child_ptr[1]]
+    assert first.numel() == 2
+    descendants = [
+        tree.child_node[tree.child_ptr[node] : tree.child_ptr[node + 1]]
+        for node in first
+    ]
+    assert all(children.numel() == 2 for children in descendants)
+    assert torch.cat(descendants).unique().numel() == 4
+    assert backend.forward_batch_sizes == [1, 2]
+    assert policy.old_logp_child.shape == (3, 2, 1)
+
+
+def test_branched_dispatches_actual_cost_family_blocks() -> None:
+    backend = _LabeledBackend(2.0, two_levels=True)
+    cfg = _cfg(1, 2.0)
+    cfg.queue_packing = "actual_cost_greedy"
+    tree, _, policy = _sample(backend, cfg, 7)
+
+    tree.validate()
+    assert backend.actual_cost_batch_sizes == [1, 2]
+    assert backend.forward_batch_sizes == [1, 2]
+    assert policy.old_logp_child.shape == (3, 2, 1)
+
+
+def test_root_fractional_rounding_is_keyed_and_repeatable() -> None:
+    first, _, _ = _sample(_LabeledBackend(1.5), _cfg(1, 1.5), 19)
+    second, _, _ = _sample(_LabeledBackend(1.5), _cfg(1, 1.5), 19)
+    first_count = int(first.child_ptr[1] - first.child_ptr[0])
+    second_count = int(second.child_ptr[1] - second.child_ptr[0])
+    assert first_count in {1, 2}
+    assert second_count == first_count
+
+
+def test_branched_overflow_is_transactional() -> None:
+    backend = _LabeledBackend(4.0)
+    with pytest.raises((MemoryError, RuntimeError), match="capacity|overflow"):
+        _sample(backend, _cfg(1, 4.0, budget=1))
+    assert backend.forward_batch_sizes == []
+
+
 def test_policy_output_row_expansion_matches_explicit_sibling_forward() -> None:
     model = _Model()
     parent_states = torch.tensor([0, 1, 2], dtype=torch.int32)
@@ -190,13 +244,8 @@ def test_policy_output_row_expansion_matches_explicit_sibling_forward() -> None:
     assert torch.equal(gathered.v, repeated.v)
 
 
-def test_overflow_raises_instead_of_clamping_or_returning_partial_tree() -> None:
-    with pytest.raises(RuntimeError, match=r"requested nodes=.*capacity nodes="):
-        _sample(_LabeledBackend(4.0), _cfg(1, 4.0, budget=1))
-
-
 def test_branched_sampler_rejects_multiple_root_replicas() -> None:
-    with pytest.raises(ValueError, match="n_trees=1 per rank"):
+    with pytest.raises(ValueError, match="one root"):
         _sample(_LabeledBackend(2.0), _cfg(2, 2.0))
 
 
@@ -213,16 +262,15 @@ def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> 
     with pytest.raises(ConfigError, match="finite value at least one"):
         load_config(path)
     raw["rollout"]["beta"] = {"default": 2.0}
-    raw["rollout"]["n_trees"] = 2
+    raw["rollout"]["sequential_starts"] = 2
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match="exactly one sampled tree per rank"):
+    with pytest.raises(ConfigError, match="exactly one root per rank"):
         load_config(path)
 
 
 def test_labeled_hot_path_has_no_explicit_host_transfers_or_label_sort() -> None:
     banned = {"cpu", "numpy", "tolist", "item", "sort", "argsort"}
     for function in (
-        _sample_branched_labeled,
         DeviceTreeBuffer.append_children,
         DeviceTreeBuffer.finalize,
         _selected_policy_logp,

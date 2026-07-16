@@ -5,7 +5,7 @@ game:
     stack_bb: 100.0
     rank_count: 13
 rollout:
-  n_trees: 1  # Exactly one sampled branching tree per rank.
+  sequential_starts: 1  # Branched mode creates exactly one root per rank.
   beta:
     default: 1.0
     preflop: 1.0
@@ -32,7 +32,7 @@ training:
   mode: branched_rao_blackwell
   iters: 10000
   gd_steps_per_iter: 32
-  minibatch_size: 2  # Legacy combined preset; use configs/train/nlhe6.yaml + hardware profile.
+  minibatch_size: 6  # Covers every potentially nonempty poker execution family.
   lr: 0.0003
   adam_betas: [0.9, 0.999]
   grad_clip: 1.0

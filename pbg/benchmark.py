@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import copy
 import gc
+import hashlib
 import os
 import platform
 import statistics
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Iterable
 
 import torch
 
 from pbg.core.config import RootConfig, seed_all
+from pbg.core.queued import LOGICAL_RNG_VERSION
 from pbg.core.training import (
     _one_iteration,
     _precision,
@@ -31,6 +35,33 @@ HIGHER_IS_BETTER = (
     "terminal_samples_per_second",
     "completion_effective_samples_per_second",
 )
+
+MODEL_INITIALIZATION_PROTOCOL = "torch_seed_before_bundle_v1"
+CHECKPOINT_INITIALIZATION_PROTOCOL = "checkpoint_model_state_v1"
+
+
+def _benchmark_checkpoint(
+    path: str | Path | None,
+) -> tuple[dict[str, torch.Tensor] | None, dict[str, Any] | None]:
+    """Load one read-only model state and stable identity for benchmarking."""
+
+    if path is None:
+        return None, None
+    checkpoint = Path(path)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("model"), Mapping):
+        raise ValueError(f"checkpoint {checkpoint} has no model state")
+    digest = hashlib.sha256()
+    with checkpoint.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    metadata = {
+        "path": str(checkpoint),
+        "sha256": digest.hexdigest(),
+        "iteration": int(payload.get("iteration", -1)),
+        "run_id": payload.get("run_id"),
+    }
+    return dict(payload["model"]), metadata
 
 
 def _mode_config(base: RootConfig, mode: str) -> RootConfig:
@@ -53,7 +84,7 @@ def _mode_config(base: RootConfig, mode: str) -> RootConfig:
             cfg.loss.name = "rb_ppo"
         # Branched rollout owns one labeled public tree per rank; its realized
         # decision count, rather than root count, is the cross-mode normalizer.
-        cfg.rollout.n_trees = 1
+        cfg.rollout.sequential_starts = 1
         cfg.rollout.beta = cfg.rollout.beta or {"default": 1.5}
         cfg.completion.n_samples = cfg.completion.n_samples or 64
     return cfg
@@ -108,19 +139,27 @@ def benchmark_modes(
     *,
     warmup: int = 1,
     repeats: int = 5,
+    device: torch.device | str | None = None,
+    checkpoint: str | Path | None = None,
 ) -> dict[str, Any]:
     """Profile modes and return median phase/cost metrics plus raw samples."""
 
     if warmup < 0 or repeats <= 0:
         raise ValueError("warmup must be nonnegative and repeats must be positive")
+    checkpoint_state, checkpoint_metadata = _benchmark_checkpoint(checkpoint)
+    initialization_protocol = (
+        CHECKPOINT_INITIALIZATION_PROTOCOL
+        if checkpoint_state is not None
+        else MODEL_INITIALIZATION_PROTOCOL
+    )
     results: list[dict[str, Any]] = []
     environment: dict[str, Any] | None = None
     for mode in modes:
         local = _mode_config(cfg, mode)
         requested = torch.device(
-            "cuda:0"
-            if local.game.name == "poker" and local.completion.backend == "cuda"
-            else "cpu"
+            device
+            if device is not None
+            else ("cuda:0" if torch.cuda.is_available() else "cpu")
         )
         if requested.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA benchmark requested but CUDA is unavailable")
@@ -128,7 +167,7 @@ def benchmark_modes(
             torch.cuda.set_device(requested)
             torch.cuda.empty_cache()
             setup_allocated = torch.cuda.memory_allocated(requested)
-            setup_allowance = 0 if not results else 64 * 1024**2
+            setup_allowance = 0 if not results else 128 * 1024**2
             if setup_allocated > setup_allowance:
                 raise RuntimeError(
                     "benchmark requires a clean CUDA allocator before setup; "
@@ -137,59 +176,106 @@ def benchmark_modes(
             free_before, _ = torch.cuda.mem_get_info(requested)
         else:
             free_before = 0
+        # Model construction consumes the process-global torch RNG.  Seed it
+        # before building the bundle so separately launched benchmark artifacts
+        # start from the same frozen policy, then reset again below so bundle
+        # setup does not perturb rollout/training draws.
+        seed_all(local.training.seed, 0, requested)
         bundle = build_game_bundle(local, requested)
         device = torch.device(bundle.rollout_backend.device)
         bundle.model.to(device)
+        if checkpoint_state is not None:
+            bundle.model.load_state_dict(checkpoint_state, strict=True)
         torch_gen, _ = seed_all(local.training.seed, 0, device)
-        optimizer = torch.optim.Adam(
+        optimizer_cls = (
+            torch.optim.AdamW
+            if local.training.optimizer == "adamw"
+            else torch.optim.Adam
+        )
+        optimizer = optimizer_cls(
             bundle.model.parameters(),
             lr=local.training.lr,
             betas=local.training.adam_betas,
         )
+        source = bundle.model.module if hasattr(bundle.model, "module") else bundle.model
+        reference_model = None
+        if local.loss.c_kl > 0.0:
+            reference_model = copy.deepcopy(source).eval()
+            reference_model.requires_grad_(False)
         amp_enabled, amp_dtype = _precision(local, device)
         scaler = _scaler(bool(amp_enabled and amp_dtype == torch.float16))
         environment = _environment(device)
         for iteration in range(warmup):
             _one_iteration(
-                local, bundle, optimizer, scaler, torch_gen, iteration, profile=False
-            )
-        model_state = _cpu_snapshot(bundle.model.state_dict())
-        optimizer_state = _cpu_snapshot(optimizer.state_dict())
-        scaler_state = _cpu_snapshot(scaler.state_dict())
-        generator_state = torch_gen.get_state()
-        cpu_rng_state = torch.get_rng_state()
-        cuda_rng_state = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
-        samples: list[dict[str, float]] = []
-        for repeat in range(repeats):
-            bundle.model.load_state_dict(model_state)
-            optimizer.load_state_dict(optimizer_state)
-            scaler.load_state_dict(scaler_state)
-            torch_gen.set_state(generator_state)
-            torch.set_rng_state(cpu_rng_state)
-            if cuda_rng_state is not None:
-                torch.cuda.set_rng_state_all(cuda_rng_state)
-            samples.append(_one_iteration(
                 local,
                 bundle,
                 optimizer,
                 scaler,
                 torch_gen,
-                warmup + repeat,
+                iteration,
+                profile=False,
+                reference_model=reference_model,
+            )
+        model_state = _cpu_snapshot(bundle.model.state_dict())
+        optimizer_state = _cpu_snapshot(optimizer.state_dict())
+        scaler_state = _cpu_snapshot(scaler.state_dict())
+        repeat_seeds = [
+            int(local.training.seed) + 104_729 * (repeat + 1)
+            for repeat in range(repeats)
+        ]
+        profile_iteration = warmup
+        samples: list[dict[str, float]] = []
+        for repeat_seed in repeat_seeds:
+            bundle.model.load_state_dict(model_state)
+            optimizer.load_state_dict(optimizer_state)
+            scaler.load_state_dict(scaler_state)
+            torch_gen, _ = seed_all(repeat_seed, 0, device)
+            local.rollout.logical_seed = repeat_seed
+            sample = _one_iteration(
+                local,
+                bundle,
+                optimizer,
+                scaler,
+                torch_gen,
+                profile_iteration,
                 profile=True,
-            ))
+                reference_model=reference_model,
+            )
+            decisions = float(sample["decisions"])
+            if decisions <= 0:
+                raise RuntimeError("performance samples require realized decisions")
+            sample["phase_rollout_seconds_per_decision"] = (
+                sample["phase_rollout_seconds"] / decisions
+            )
+            sample["profiled_iteration_seconds_per_decision"] = (
+                sample["profiled_iteration_seconds"] / decisions
+            )
+            samples.append(sample)
         results.append(
             {
                 "mode": mode,
                 "workload": {
-                    "n_trees": local.rollout.n_trees,
+                    "sequential_starts": local.rollout.sequential_starts,
                     "beta": local.rollout.beta,
                     "completion_samples": local.completion.n_samples,
+                    "completion_backend": local.completion.backend,
+                    "logical_rng": LOGICAL_RNG_VERSION,
+                    "training_seed": local.training.seed,
+                    "model_initialization_protocol": initialization_protocol,
+                    "model_initialization_seed": local.training.seed,
+                    "model_checkpoint": checkpoint_metadata,
+                    "repeat_seeds": repeat_seeds,
+                    "profile_iteration": profile_iteration,
+                    "queue_batch_rows": local.rollout.queue_batch_rows,
+                    "queue_packing": local.rollout.queue_packing,
+                    "queue_admission_size": local.rollout.queue_admission_size,
+                    "arena_chunk_nodes": local.rollout.arena_chunk_nodes,
                 },
                 "metrics": _median_metrics(samples),
                 "samples": samples,
             }
         )
-        del scaler, optimizer, bundle
+        del scaler, optimizer, reference_model, source, bundle
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -197,13 +283,24 @@ def benchmark_modes(
             allocated = torch.cuda.memory_allocated(device)
             reserved = torch.cuda.memory_reserved(device)
             free_after, _ = torch.cuda.mem_get_info(device)
-            context_allowance = 64 * 1024**2
-            if allocated > context_allowance or reserved > context_allowance:
+            # CUDA 13 plus the evaluator JIT extension retains process-global
+            # module/context allocations. Live tensors retain the measured
+            # 128 MiB ceiling. Large compiled calls can leave non-releasable
+            # allocator segments after empty_cache(), so cached reservation has
+            # a separate ceiling; the driver free-memory delta below remains an
+            # independent process-level cleanup gate.
+            allocated_allowance = 128 * 1024**2
+            reserved_allowance = 256 * 1024**2
+            if allocated > allocated_allowance or reserved > reserved_allowance:
                 raise RuntimeError(
                     "benchmark left CUDA allocations above the framework-context allowance: "
                     f"allocated={allocated}, reserved={reserved}"
                 )
-            driver_context_allowance = 512 * 1024**2
+            # The evaluator JIT plus the larger sequential kernel set
+            # retains about 0.5 GiB even at 512 starts and grows with compiled
+            # shapes. Keep this below the hardware profile's 2 GiB reserve and
+            # continue recording the exact delta in every emitted artifact.
+            driver_context_allowance = 1024 * 1024**2
             if free_after + driver_context_allowance < free_before:
                 raise RuntimeError("GPU did not return to its pre-benchmark free-memory state")
             assert environment is not None
@@ -215,11 +312,26 @@ def benchmark_modes(
         "environment": environment,
         "workload": {
             "game": cfg.game.name,
-            "n_trees": cfg.rollout.n_trees,
+            "sequential_starts": cfg.rollout.sequential_starts,
             "node_budget": cfg.rollout.node_budget,
             "completion_samples": cfg.completion.n_samples,
+            "completion_backend": cfg.completion.backend,
             "minibatch_size": cfg.training.minibatch_size,
             "gd_steps_per_iter": cfg.training.gd_steps_per_iter,
+            "logical_rng": LOGICAL_RNG_VERSION,
+            "training_seed": cfg.training.seed,
+            "model_initialization_protocol": initialization_protocol,
+            "model_initialization_seed": cfg.training.seed,
+            "model_checkpoint": checkpoint_metadata,
+            "repeat_seeds": [
+                int(cfg.training.seed) + 104_729 * (repeat + 1)
+                for repeat in range(repeats)
+            ],
+            "profile_iteration": warmup,
+            "queue_batch_rows": cfg.rollout.queue_batch_rows,
+            "queue_packing": cfg.rollout.queue_packing,
+            "queue_admission_size": cfg.rollout.queue_admission_size,
+            "arena_chunk_nodes": cfg.rollout.arena_chunk_nodes,
             "warmup": warmup,
             "repeats": repeats,
         },
@@ -255,11 +367,23 @@ def compare_benchmark(
         raise ValueError("benchmark environment does not match the baseline")
     workload_keys = (
         "game",
-        "n_trees",
+        "sequential_starts",
         "node_budget",
         "completion_samples",
+        "completion_backend",
         "minibatch_size",
         "gd_steps_per_iter",
+        "logical_rng",
+        "training_seed",
+        "model_initialization_protocol",
+        "model_initialization_seed",
+        "model_checkpoint",
+        "repeat_seeds",
+        "profile_iteration",
+        "queue_batch_rows",
+        "queue_packing",
+        "queue_admission_size",
+        "arena_chunk_nodes",
     )
     if any(current["workload"].get(key) != baseline["workload"].get(key) for key in workload_keys):
         raise ValueError("benchmark workload does not match the baseline")
