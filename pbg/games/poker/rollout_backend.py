@@ -38,6 +38,7 @@ from pbg.games.poker.folded import (
 from pbg.games.poker.mc import PokerGPURejectionSampler, PokerGPUShowdownEvaluator
 from pbg.games.poker.model_inputs import DeviceHistoryMaterializer
 from pbg.games.poker.partition_cache import DevicePartitionSummaryCache
+from pbg.games.poker.policy_planning import plan_policy_batches as _plan_policy_batches
 from pbg.games.poker.model.postflop import PostflopMasks
 from pbg.games.poker.model.preflop import (
     PackedPublicHistory,
@@ -1042,83 +1043,16 @@ class PokerRolloutBackend:
         if post_model is None:
             return [(torch.arange(states.numel(), device=states.device), "")]
         token_count, family = self._policy_work_rows(model, states)
-        max_tokens = (
-            profile.training_max_tokens
-            if phase == "training"
-            else profile.inference_max_tokens
-        )
-        max_pairs = (
-            profile.training_max_token_pairs
-            if phase == "training"
-            else profile.inference_max_token_pairs
-        )
-        control = torch.stack((token_count, family), dim=1)
-        if control.device.type == "cuda":
-            started = time.perf_counter()
-            host_control = control.to(device="cpu")
-            self.execution_metrics.record_scheduler_control_synchronization(
-                seconds=time.perf_counter() - started,
-                nbytes=control.numel() * control.element_size(),
+        return [
+            (plan.positions, plan.family)
+            for plan in _plan_policy_batches(
+                token_count,
+                family,
+                phase=phase,
+                profile=profile,
+                metrics=self.execution_metrics,
             )
-        else:
-            host_control = control
-        host_rows = host_control.tolist()
-        host_order = sorted(
-            range(states.numel()),
-            key=lambda position: (
-                int(host_rows[position][1]),
-                int(host_rows[position][0]),
-                position,
-            ),
-        )
-        token_order = torch.argsort(token_count, stable=True)
-        device_order = token_order[
-            torch.argsort(family[token_order], stable=True)
         ]
-
-        plans: list[tuple[int, int, int, int]] = []
-        start = 0
-        count = 0
-        current_family = -1
-        current_max = 0
-        for ordered_index, position in enumerate(host_order):
-            length, family_id = (int(value) for value in host_rows[position])
-            if length > max_tokens or length * length > max_pairs:
-                raise MemoryError(
-                    f"one policy sequence needs {length} tokens/{length * length} "
-                    f"token pairs, beyond hardware profile {profile.name!r}"
-                )
-            family_changed = count > 0 and family_id != current_family
-            candidate_max = max(current_max, length)
-            candidate_count = count + 1
-            capacity_exceeded = count > 0 and (
-                candidate_count * candidate_max > max_tokens
-                or candidate_count * candidate_max * candidate_max > max_pairs
-            )
-            if family_changed or capacity_exceeded:
-                plans.append((start, count, current_family, current_max))
-                start = ordered_index
-                count = 0
-                current_max = 0
-            count += 1
-            current_family = family_id
-            current_max = max(current_max, length)
-        if count:
-            plans.append((start, count, current_family, current_max))
-
-        result: list[tuple[Tensor, str]] = []
-        for start, count, family_id, maximum in plans:
-            positions = device_order.narrow(0, start, count)
-            family_name = "pre" if family_id == 0 else f"post_{family_id}"
-            result.append((positions, family_name))
-            self.execution_metrics.record_policy_pack(
-                phase,
-                family_name,
-                rows=int(positions.numel()),
-                padded_tokens=int(positions.numel()) * maximum,
-                padded_token_pairs=int(positions.numel()) * maximum * maximum,
-            )
-        return result
 
     def plan_policy_batches(
         self, model: nn.Module, states: Tensor, phase: str
