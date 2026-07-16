@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -22,6 +22,10 @@ from pbg.games.poker.mc import (
     _allocate_seeds,
 )
 from pbg.games.poker.model.postflop import PostflopNet
+from pbg.games.poker.model.capacity import (
+    max_policy_sequence_tokens,
+    max_public_history_tokens,
+)
 from pbg.games.poker.model.preflop import PokerModelConfig, PreflopNet
 from pbg.games.poker.model.primitives import MHA
 from pbg.games.poker.rollout_backend import PokerRolloutBackend
@@ -304,6 +308,61 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
         )
 
 
+def _resolved_model_config(
+    cfg: RootConfig, poker_cfg: PokerConfig
+) -> PokerModelConfig:
+    """Return a model config with the lossless history capacity resolved."""
+
+    model_cfg = PokerModelConfig.from_dict(cfg.model)
+    if model_cfg.max_players < poker_cfg.n_players:
+        raise ValueError(
+            "root.model.max_players: must cover every configured poker seat"
+        )
+    required_history = max_public_history_tokens(
+        poker_cfg.n_players, poker_cfg.stack_bb
+    )
+    if (
+        "max_history_tokens" in cfg.model
+        and model_cfg.max_history_tokens < required_history
+    ):
+        raise ValueError(
+            "root.model.max_history_tokens: explicitly configured capacity "
+            f"{model_cfg.max_history_tokens} is smaller than the lossless "
+            f"(P,S) requirement {required_history}"
+        )
+    if "max_history_tokens" not in cfg.model:
+        model_cfg = replace(model_cfg, max_history_tokens=required_history)
+    return model_cfg
+
+
+def _validate_attention_capacity(
+    cfg: RootConfig, poker_cfg: PokerConfig, model_cfg: PokerModelConfig
+) -> None:
+    profile = cfg.hardware
+    if profile is None:
+        return
+    width = max_policy_sequence_tokens(
+        n_players=poker_cfg.n_players,
+        stack_bb=poker_cfg.stack_bb,
+        rank_count=poker_cfg.rank_count,
+        k_act=model_cfg.k_act,
+    )
+    pairs = width * width
+    for phase in ("training", "inference"):
+        token_limit = getattr(profile, f"{phase}_max_tokens")
+        pair_limit = getattr(profile, f"{phase}_max_token_pairs")
+        if width > token_limit:
+            raise ValueError(
+                f"hardware.{phase}_max_tokens: {token_limit} cannot accommodate "
+                f"the worst legal one-row sequence ({width})"
+            )
+        if pairs > pair_limit:
+            raise ValueError(
+                f"hardware.{phase}_max_token_pairs: {pair_limit} cannot accommodate "
+                f"the worst legal one-row sequence ({pairs} pairs)"
+            )
+
+
 def validate_config(cfg: RootConfig) -> None:
     """Validate poker-owned game and model mappings without building them."""
 
@@ -313,9 +372,19 @@ def validate_config(cfg: RootConfig) -> None:
             stack_bb=cfg.game.stack_bb,
             rank_count=cfg.game.rank_count,
         )
-        PokerModelConfig.from_dict(cfg.model)
+        model_cfg = _resolved_model_config(cfg, poker_cfg)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"root poker configuration: {exc}") from exc
+        message = str(exc)
+        if message.startswith("root.model."):
+            raise ValueError(message) from exc
+        field = (
+            "n_players" if "n_players" in message
+            else "stack_bb" if "stack_bb" in message
+            else "rank_count" if "rank_count" in message
+            else "rank_count" if "compact deck" in message
+            else "configuration"
+        )
+        raise ValueError(f"root.game.{field}: {message}") from exc
     # Active poker has one preflop family plus post_A for every possible live
     # count A=2..P, hence P potentially nonempty learner strata.
     if cfg.training.minibatch_size < poker_cfg.n_players:
@@ -323,6 +392,7 @@ def validate_config(cfg: RootConfig) -> None:
             "root.training.minibatch_size: must cover every potentially nonempty "
             f"poker execution family ({poker_cfg.n_players})"
         )
+    _validate_attention_capacity(cfg, poker_cfg, model_cfg)
 
 
 def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
@@ -333,9 +403,8 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         stack_bb=cfg.game.stack_bb,
         rank_count=cfg.game.rank_count,
     )
-    model_cfg = PokerModelConfig.from_dict(cfg.model)
-    if model_cfg.max_players < engine_cfg.n_players:
-        raise ValueError("model.max_players must cover every configured poker seat")
+    model_cfg = _resolved_model_config(cfg, engine_cfg)
+    _validate_attention_capacity(cfg, engine_cfg, model_cfg)
     model = PokerModelBundle(PreflopNet(model_cfg), PostflopNet(model_cfg)).to(device)
     if cfg.hardware is not None:
         for module in model.modules():
@@ -371,6 +440,7 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         profile_sampler=profiles,
         partition_adapter=partition,
         evaluator_backend=cfg.completion.backend,
+        max_rollout_steps=model_cfg.max_history_tokens,
     )
     backend.execution_profile = cfg.hardware
     backend.rollout_memory_plan = plan
