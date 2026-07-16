@@ -195,8 +195,9 @@ V̂vec=**R**, and Û=‖**R**‖₂² exactly once P̂ has been obtained.
 ## 7. BranchedValue — backward propagation
 
 Inputs: labeled stored tree 𝐒; leaf `CompletionStats`; frozen actor-type
-value heads V^{θ_k}(x_p,σ); horizon λ ∈ [0,1]. The initial implementation
-defers public moment heads.
+value heads V^{θ_k}(x_p,σ); horizon λ ∈ [0,1]. Optional public moment output
+heads can be instantiated, but this reducer emits no targets for them and no
+registered production loss or branching controller consumes them.
 
 Per-node working state is posterior mass `P̂ [P,X]` and posterior-weighted
 return mass `M̂ [P,X]`. Conditional values are formed only when emitted.
@@ -232,8 +233,9 @@ for σ in reverse topological order (children before parents), σ not a leaf:
   target branch. It does not make the conditional ratio finite-sample unbiased.
 - No auxiliary estimator channels or unused moment targets are active.
 
-Complexity: one O(|𝐒| · P_max · X_max) pass; poker X_max = 1326 → keep P̂/M̂ in fp32 on
-GPU, stream by tree if memory-bound.
+Complexity: one O(|𝐒| · P_max · X_max) pass; poker
+$X_{\max}=\binom{4R}{2}\le1326$ → keep P̂/M̂ in fp32 on GPU, stream by tree if
+memory-bound.
 
 ---
 
@@ -320,12 +322,15 @@ Entropy follows `entropy_schedule`; all type sums are explicitly masked.
   for versioned evaluator outputs. The learning model may transform supplied
   hand/card-indexed fields, but this repository contains no Φ/α_B/β_B/Λ_B,
   removal-set, or disjoint-assignment implementation.
-- **Model.** Two nets (169-class preflop / combo-row postflop), pre-LN trunk,
+- **Model.** Two nets ($R^2$-class preflop / $\binom{4R}{2}$-combo-row
+  postflop), pre-LN trunk,
   key-side reach prior added un-tempered, learned transforms of evaluator-supplied
   partition fields, factored type × DLogisticTick raise head,
-  actor-row V head. Public moment heads and the suit-consistency loss are
+  actor-row V head. Optional public moment output heads exist structurally but
+  have no registered target, loss, or controller; the suit-consistency loss is
   deferred. Compact H_B tokenization is the default (CONTRACTS §5-P7).
-- **Preflop gauge symmetry.** Preflop net is class-native (169); deterministic
+- **Preflop gauge symmetry.** Preflop net is class-native ($R^2$ classes; 169
+  for $R=13$); deterministic
   combo-to-class aggregation may live in `cards.py`/`ranges.py` because it is a
   representation map, not a private-state law.
 - **Private poker math.** Completion/equity coefficients, exact joint profiles,

@@ -11,8 +11,8 @@ Read the pages in this order:
 - [Core algorithms](core_algorithms.md) describes normal, sequential
   Rao--Blackwell, and branched Rao--Blackwell rollout and optimization.
 - [Poker implementation](poker.md) covers tensor NLHE navigation, the two poker
-  networks, policy batch packing, evaluator calls, and the important places
-  where CUDA execution still synchronizes with Python.
+  networks, policy batch packing, evaluator calls, and the single declared
+  mixed-row scheduler-control transfer.
 - [`../archive/synthetic_games/`](../archive/synthetic_games/) preserves the
   retired Kuhn/Leduc/synthetic implementation as an inert historical snapshot.
 - [File reference](file_reference.md) maps the implementation and validation

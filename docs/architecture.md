@@ -66,8 +66,10 @@ State references are opaque device `int32` handles. `DeviceTreeBuffer` retains
 parent-major CSR topology, tree id, owner, depths, state handle, path weight,
 child label, and empirical edge mass. Capacity overflow never truncates.
 
-Poker public state is a preallocated structure of arrays with parent-linked
-history. Reach is fp32 unnormalized log likelihood
+Poker public state is a preallocated structure of arrays with one history event
+and a binary-lifting ancestor row per state. Model input gathers chronological
+history in one batched device operation at the preflighted lossless width.
+Reach is fp32 unnormalized log likelihood
 `[row, player, private_type]`; actor actions add selected log likelihood and
 board events mask conflicting hands.
 
@@ -109,9 +111,11 @@ configured interval, evaluated without gradients, and checkpointed.
 ## Device movement and memory
 
 Public state, topology, reaches, events, model/evaluator inputs and outputs,
-targets, and learner tensors stay on the owning CUDA device. Declared scheduler
-control transfers are measured; undeclared synchronization is separately
-counted and forbidden by acceptance gates.
+targets, and learner tensors stay on the owning CUDA device. Folded summaries
+use a fixed device-indexed cache and masked evaluator rows. Declared scheduler
+control transfers—including the one fixed mixed-row policy-planning block—are
+measured; undeclared synchronization is separately counted and forbidden by
+acceptance gates.
 
 The NLHE bundle preflights rollout storage. Training adds execution, completion,
 target, and optimizer plans. Hardware profiles cap attention work, memory

@@ -1375,18 +1375,21 @@ The fixed-intensity PPO v1 returns $\widehat{A}$ and does not store $\widehat Q$
 
 \section{Poker: a Perfect Example}
 
-We focus on $6$-max Texas Hold'em cash poker, no ante, straddle or rake, with exactly $100$ big blinds per player.
-We don't simplify the game any further: all legal actions in the fixed chip denomination are allowed.
+We focus on configurable equal-stack Texas Hold'em cash poker: $P\in\{2,\ldots,6\}$ players,
+$S\in[8,128]$ big blinds per player in half-big-blind increments, and the highest
+$R\in\{4,\ldots,13\}$ ranks with four suits. Let $D=4R$ and require $2P+5<D$.
+There is no ante, straddle, or rake, and all legal actions in the fixed chip
+denomination are allowed.
 Below are a few core variables:
 \begin{equation*}[rCl]
-  |\mathcal{P}| &=& 6\\
-  \mathcal{P} &=& \{\texttt{sb, bb, utg, hij, lo, btn}\}\\
-  \mathcal{D} &=& \{0,\ldots, 51\}\\ %deck
-  \mathcal{X}_p &=& \mathcal{H} = \binom{\mathcal{D}}{2}\\
+  |\mathcal{P}| &=& P\\
+  \mathcal{P} &=& \{0,\ldots,P-1\}\\
+  \mathcal{D}_R &=& \{52-D,\ldots, 51\}\\ % evaluator-facing suffix deck
+  \mathcal{X}_p &=& \mathcal{H}_R = \binom{\mathcal{D}_R}{2}\\
   \mu &=& \mathsf{Unif}\left(\{x \in \mathcal{X} \mid x_p\cap x_q=\varnothing\textnormal{ for }p\ne q\}\right)\\
-  \mathsf{B}(\sigma) &\in& \binom{\mathcal{D}}{0}\textnormal{ or }\binom{\mathcal{D}}{3}\textnormal{ or }\binom{\mathcal{D}}{4}\textnormal{ or }\binom{\mathcal{D}}{5}\\ %current board
+  \mathsf{B}(\sigma) &\in& \binom{\mathcal{D}_R}{0}\textnormal{ or }\binom{\mathcal{D}_R}{3}\textnormal{ or }\binom{\mathcal{D}_R}{4}\textnormal{ or }\binom{\mathcal{D}_R}{5}\\ %current board
   \mathsf{C}(x,\sigma) &=& \left(\bigcup_p x_p\right)\cup \mathsf{B}(\sigma)\\ %used cards
-  \chi(\cdot \mid x, \sigma) &=& \mathsf{Unif}\left(\binom{\mathcal{D} \setminus \mathsf{C}(x,\sigma)}{k(\sigma)}\right),
+  \chi(\cdot \mid x, \sigma) &=& \mathsf{Unif}\left(\binom{\mathcal{D}_R \setminus \mathsf{C}(x,\sigma)}{k(\sigma)}\right),
   \qquad
   k(\sigma)=\begin{cases}[l"l]3&\textnormal{at the flop},\\1&\textnormal{at the turn or river}.\end{cases}
 \end{equation*}
@@ -1396,7 +1399,8 @@ Several specificities impact our implementation:
   \item We feed the model \textbf{redundant} information by feeding it both the public state $\sigma$ and the Bayesian-updated ranges $\mathfrak{r}$.
   
   \item The game of poker has a strong \textbf{preflop gauge symmetry}: any suit permutation should leave the strategy invariant.
-  Instead of $1326$ possible private player states, there are $169$.
+  Instead of $\binom{4R}{2}$ possible private player states, there are $R^2$
+  classes (1326 and 169 respectively for the full deck).
   We exploit this by having a separate model for preflop and postflop, making it impossible for the model to not pick actions invariants under this transformation preflop.
   Optionally, we can also exploit this symmetry in the Monte Carlo estimators (see below) by storing the $4!$ suit permutations of each sampled private state and board into the accumulated statistics (this can be considered if possible with minimal wrap divergence).
   
@@ -1434,7 +1438,12 @@ Several specificities impact our implementation:
   \[
     \mathcal L_{\tt clip}[\widehat A^\lambda]+\mathcal L_{\tt H} + \mathcal L_{\tt KL} + \mathcal L_{\tt V}[\widehat V^\lambda] + \mathcal L^{W,S}[\widehat W,\widehat S^\lambda]
   \]
-  The implementation companion's fixed-intensity PPO v1 uses only the clipped policy, actor-type value, and entropy terms. Reference-policy KL and the public $W/S$ heads and losses are deferred research extensions, as are \texttt{NeuRD} and stored all-action $Q$ targets.
+  The implementation companion's fixed-intensity PPO v1 uses the clipped policy,
+  actor-type value, entropy, and optional exact legal-action reference-policy KL
+  terms. Optional public $W/S$ output heads exist structurally, but the production
+  reducer emits no targets for them and no registered loss or branching controller
+  consumes them. Public $W/S$ losses and control, \texttt{NeuRD}, and stored
+  all-action $Q$ targets remain deferred research extensions.
 
   \item Ideally, the implemtation should be clearly modular: it will be used for poker, but must be easily adaptable to other PBGs.
 \end{enumerate}

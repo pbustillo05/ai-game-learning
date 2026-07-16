@@ -19,9 +19,12 @@ $$
 $$
 
 The preflop and postflop networks do not share weights. They share the same
-MHA-style sequence architecture, but the preflop model runs on 169 canonical
-hand classes and the postflop model runs on hands
-$\mathcal H=\binom{\mathcal D}{2}$, $|\mathcal H|=1326$. Only $\theta$ is
+MHA-style sequence architecture. For a run with the highest $R\in\{4,\ldots,13\}$
+ranks, let $D=4R$, let $\mathcal D_R=\{52-D,\ldots,51\}$ be the evaluator-facing
+suffix deck, and let $\mathcal H_R=\binom{\mathcal D_R}{2}$. The preflop model
+runs on $R^2$ canonical hand classes and the postflop model runs on the
+$|\mathcal H_R|=\binom{D}{2}$ hands. The full-deck case has 169 classes and
+1326 hands. Only $\theta$ is
 learned; there are no strategy, regret, or average-policy tables. The
 architecture follows:
 
@@ -37,7 +40,7 @@ architecture follows:
 
 Let $\sigma$ be the public trajectory, $p_\star=o(\sigma)$ the acting player,
 $\mathfrak r$ the Bayesian-updated ranges, and
-$\mathcal K=\mathcal H/S_4$ the 169 preflop hand classes.
+$\mathcal K_R=\mathcal H_R/S_4$ the $R^2$ preflop hand classes.
 The overall $F_\theta$ dispatches to the preflop or postflop network according
 to the street of $\sigma$.
 
@@ -45,11 +48,11 @@ Preflop:
 
 $$
 F^{\mathrm{pre}}_{\theta_{\mathrm{pre}}}
-\bigl(\sigma,p_\star,\{\mathfrak r_{p,k}\}_{p\in\mathcal P,\ k\in\mathcal K}\bigr)
+\bigl(\sigma,p_\star,\{\mathfrak r_{p,k}\}_{p\in\mathcal P,\ k\in\mathcal K_R}\bigr)
 =
 \Big(
 \{k\mapsto(\pi^{\mathrm{pre}}_{\theta_{\mathrm{pre}}}(\cdot\mid k,\sigma),
-V^{\mathrm{pre}}_{\theta_{\mathrm{pre}}}(k,\sigma))\}_{k\in\mathcal K},
+V^{\mathrm{pre}}_{\theta_{\mathrm{pre}}}(k,\sigma))\}_{k\in\mathcal K_R},
 \ \text{optional } \mathbf V^{\mathrm{pre}}_{\theta_{\mathrm{pre}}}(\sigma),
 \ \text{optional } U^{\mathrm{pre}}_{\theta_{\mathrm{pre}}}(\sigma)
 \Big).
@@ -60,12 +63,12 @@ Postflop:
 $$
 F^{\mathrm{post}}_{\theta_{\mathrm{post}}}
 \bigl(\sigma,p_\star,
-\{\mathfrak r_{q,h}\}_{q\in\mathcal P_{\mathrm{live}}(\sigma),\ h\in\mathcal H},
+\{\mathfrak r_{q,h}\}_{q\in\mathcal P_{\mathrm{live}}(\sigma),\ h\in\mathcal H_R},
 \mathcal F_\sigma\bigr)
 =
 \Big(
 \{h\mapsto(\pi^{\mathrm{post}}_{\theta_{\mathrm{post}}}(\cdot\mid h,\sigma),
-V^{\mathrm{post}}_{\theta_{\mathrm{post}}}(h,\sigma))\}_{h\in\mathcal H},
+V^{\mathrm{post}}_{\theta_{\mathrm{post}}}(h,\sigma))\}_{h\in\mathcal H_R},
 \ \text{optional } \mathbf V^{\mathrm{post}}_{\theta_{\mathrm{post}}}(\sigma),
 \ \text{optional } U^{\mathrm{post}}_{\theta_{\mathrm{post}}}(\sigma)
 \Big).
@@ -75,9 +78,10 @@ The model never receives the dealt private hand as a selected input. It
 computes one policy row for every actor hand class preflop or actor hand
 postflop. The action policy is factored into an action-type distribution and a
 conditional raise-size distribution. Board-impossible hands and illegal actions
-are masked outside the model. The optional public moment heads are global
-training/evaluation auxiliaries: $\mathbf V^\theta(\sigma)$ has one scalar per
-live player, and $U^\theta(\sigma)$ is a single public scalar.
+are masked outside the model. Optional public moment output heads exist
+structurally: $\mathbf V^\theta(\sigma)$ has one scalar per live player, and
+$U^\theta(\sigma)$ is a single public scalar. The production reducer emits no
+targets for them and no registered loss or branching controller consumes them.
 
 ## Layer Notation
 
@@ -102,9 +106,9 @@ pretraining path.
 
 Preflop consumes class ranges
 $\mathfrak r_{p,k}\in[0,1]$ for every seated player $p$ and class
-$k\in\mathcal K$. Postflop consumes hand ranges
+$k\in\mathcal K_R$. Postflop consumes hand ranges
 $\mathfrak r_{q,h}\in[0,1]$ only for live players
-$q\in\mathcal P_{\mathrm{live}}(\sigma)$ and hands $h\in\mathcal H$.
+$q\in\mathcal P_{\mathrm{live}}(\sigma)$ and hands $h\in\mathcal H_R$.
 Normalized ranges mask board-impossible hands and normalize over each player's
 available hands; raw ranges remain row features.
 
@@ -126,13 +130,13 @@ by the caller only on street or fold events:
 
 All folder conditioning on removed cards happens through
 $\Lambda_B,\beta_B$ evaluated at the actual board; nothing downstream
-renormalizes on hypothesis-dependent sets. The initial rules target is cash
-chip-EV, 2–9 players, no rake, no straddles, no antes. Legality masks and
+renormalizes on hypothesis-dependent sets. The active rules target is cash
+chip-EV, 2–6 players, no rake, no straddles, no antes. Legality masks and
 integer raise ticks are applied outside the model.
 
 ## Suit Symmetry
 
-**Preflop**: the trunk runs natively on the 169 canonical classes
+**Preflop**: the trunk runs natively on the $R^2$ canonical classes
 $(p,k)$, so policy and value are class-indexed by construction.
 **Postflop**: do not canonicalize suits before tokenization; the model consumes
 the actual board, ranges, and folded statistics in their original card ids.
@@ -142,7 +146,7 @@ same model, inverse-permutes the row-indexed outputs, and penalizes disagreement
 with the unpermuted outputs.
 
 Class-level geometry preflop: replace the two-hot indicator
-$\mathbf 1_h\in\{0,1\}^{52}$ by the orbit-averaged card-distribution vector
+$\mathbf 1_h\in\{0,1\}^{D}$ by the orbit-averaged card-distribution vector
 $\bar{\mathbf 1}_k=\tfrac1{n_k}\sum_{h:\kappa(h)=k}\mathbf 1_h$
 ($n_k\in\{4,6,12\}$); overlap geometry becomes its expectation over class
 orbits, and class tokens additionally carry $n_k$ and exact
@@ -151,21 +155,23 @@ within/cross-class expected-overlap scalars as features.
 ## Tokens
 
 Token set: player hand/class rows, public tokens, and the actor's action-anchor
-tokens. Preflop uses $169$ class rows for every seated player. Postflop uses
-$|\mathcal H|=1326$ combo rows for every live player by default; board-impossible
+tokens. Preflop uses $R^2$ class rows for every seated player. Postflop uses
+$|\mathcal H_R|=\binom{D}{2}$ combo rows for every live player by default;
+board-impossible
 rows have zero/masked range mass and receive no loss.
 
 Postflop may optionally use only the board-compatible combo rows
 
 $$
-H_B=\binom{52-|B|}{2},
+H_B=\binom{D-|B|}{2},
 $$
 
-so $H_B=1176$ on the flop, $1128$ on the turn, and $1081$ on the river. This
+so for $D=52$, $H_B=1176$ on the flop, $1128$ on the turn, and $1081$ on the
+river. This
 reduces attention dot products, but creates street/board-dependent ragged
 shapes that may complicate batching. If used, gather `valid_combo_ids(B)` before
 the trunk, carry `compact_to_combo` / `combo_to_compact` metadata, and scatter
-actor outputs back to $\mathcal H$ rows after readout.
+actor outputs back to $\mathcal H_R$ rows after readout.
 
 **Card and combo embeddings** (unchanged):
 $c_v=\rho_{\operatorname{rank}(v)}+\sigma_{\operatorname{suit}(v)}$,
@@ -177,7 +183,7 @@ feature vector is
 
 $$
 \phi^{\rm geo}_h=\Big[\mathbf 1_h,\ \big\{\operatorname{sign-split}\big(\sqrt{|\lambda_j|}\,\langle b_j,\mathbf 1_h\rangle,\ \lambda_j\big)\big\}_{j\le r_\beta}\Big]
-\in\mathbb R^{52+2r_\beta},
+\in\mathbb R^{D+2r_\beta},
 $$
 
 (the two-hot indicator and the signed $\beta_B$-factor coordinates: positive-
@@ -196,7 +202,7 @@ $$
 
 where $P_v=\sum_k w_k(v)E_k$ is the **folded per-card pressure** channel
 ($E_k=\operatorname{FFN}_{\rm fold0}([\log
-F_k,\text{line}_k])$, cost $O(52K)$ per node), which preserves *which* cards
+F_k,\text{line}_k])$, cost $O(DK)$ per node), which preserves *which* cards
 are folder-blocked and by what kind of line, beyond the scalar $\Lambda_B$
 already inside $\log\tilde{\mathfrak r}^{\prime}$; the trailing $\mathbf 1$ is
 a constant feature so key projections can realize pure additive biases;
@@ -289,7 +295,7 @@ terms.
 The exact mass path carries unnormalized disjointness-restricted sums and the
 identical-combo channel from the incidence identities in
 `docs/theory/folder_impact.md`, at
-$O(52)$ per query via card accumulators. Per layer, it runs over tokenized range
+$O(D)$ per query via card accumulators. Per layer, it runs over tokenized range
 players: all seated players preflop and live players postflop.
 Below, $h,g$ denote postflop hands; preflop uses the orbit-averaged class-row
 analogue.
@@ -314,7 +320,7 @@ $$
 fed into the row FFN as part of $\psi^\ell$.
 For postflop hand rows these are exact by the inclusion–exclusion identities of
 `docs/theory/folder_impact.md`; $O^{=}$ is the only exact identical-combo channel in the
-model. Cost $O(L|\mathcal H|d)$ postflop per layer, or $O(LH_Bd)$ under optional
+model. Cost $O(L|\mathcal H_R|d)$ postflop per layer, or $O(LH_Bd)$ under optional
 compact tokenization.
 
 ## Readout
@@ -345,7 +351,7 @@ For actor row $\xi$ ($\xi=k$ preflop or $\xi=h$ postflop), non-raise features
 $z^T_{\xi,t}$ and raise-mode features $z^R_{\xi,m}$ are formed from
 $[\operatorname{LN}x^{L}_{p_\star,\xi},\operatorname{LN}a^{L}_{p_\star,\cdot},
 \chi_\xi,g^L]$. Policy and value heads are evaluated on actor rows. Optional
-postflop compact tokenization scatters outputs back to full $\mathcal H$ ids.
+postflop compact tokenization scatters outputs back to full $\mathcal H_R$ ids.
 
 ## Continuous Policy Head
 

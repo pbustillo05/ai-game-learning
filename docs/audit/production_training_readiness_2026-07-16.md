@@ -1,9 +1,13 @@
 # Production training readiness — 2026-07-16
 
-Status: **one production rollout implementation accepted locally** for normal,
+> **Superseded evidence snapshot.** This document records promotion evidence at
+> its original revision; it is not the current release verdict. The active gate
+> is [`release_gate_2026-07-16/`](release_gate_2026-07-16/).
+
+Status at recorded revision: **one production rollout implementation accepted locally** for normal,
 sequential Rao--Blackwell (RB), and branched RB NLHE. The former wavefront and
-executor-selection surfaces have been removed. This file is the current
-dashboard; promotion comparisons and their legacy names are archived under
+executor-selection surfaces have been removed. This file is a historical
+evidence dashboard; promotion comparisons and their legacy names are archived under
 `archive/family_scheduler_promotion/`.
 
 ## Fixed production contract

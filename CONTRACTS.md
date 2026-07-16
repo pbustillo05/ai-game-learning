@@ -194,6 +194,10 @@ Numeric hot-path tensors remain on their owning device. Declared fixed-size
 scheduler control synchronization and transfers are counted separately;
 undeclared synchronization is a contract failure. Empty families, single-child
 paths, and uneven rank work must complete without collective mismatch.
+CUDA history materialization uses the lossless preflighted bound and a batched
+device gather. Folded summaries use a memory-planned device-indexed cache with
+masked evaluator rows. Mixed-family physical planning may transfer one fixed,
+counted control block; it may not introduce row-dependent host decisions.
 
 ## Checkpoint and resume
 

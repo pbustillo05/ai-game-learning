@@ -85,6 +85,10 @@ integration, completion, unequal distributed mass, finite gradients,
 checkpoint/resume, and GPU memory safety. CUDA and sibling-dependent tests skip
 when prerequisites are unavailable.
 
+These are engineering and estimator-correctness checks. They do not establish
+exploitability, approximate-best-response performance, or strategic improvement;
+the bounded BR trend probe remains intentionally outside this release gate.
+
 ## Documentation
 
 - [`CONTRACTS.md`](CONTRACTS.md) — active runtime/configuration invariants.

@@ -31,8 +31,10 @@ externally supplied winner shares.
 
 Production uses `PokerRolloutBackend` and `PokerTensorStateStore`. State handles
 are device `int32` row indices into a preallocated structure of arrays. Each
-successor stores fixed public fields and one parent-linked history event; model
-input reconstructs chronological public history from those links.
+successor stores fixed public fields, one history event, and a binary-lifting
+ancestor row. Model input gathers complete chronological histories in one
+batched device operation. CUDA uses the preflighted lossless `(P,S)` history
+bound as a fixed padded width and does not read a realized length on the host.
 
 The backend accepts mixed rows, classifies them into `pre` or `post_A`, builds
 family-specific model input, and scatters transition/output rows back to caller
@@ -46,8 +48,11 @@ mask every conflicting combo. Gauge normalization happens only at model or
 evaluator boundaries.
 
 Fold successors retain board-at-fold, public line features, and a partition
-dependency key. The sibling's folded-player partition summary is cached until a
-fold or street change invalidates it. CPU `RangeState` and `PokerGame` remain
+dependency key. The sibling's folded-player partition summary lives in a fixed,
+memory-planned device-indexed cache until a fold or street change invalidates
+it. Hit rows cross the evaluator facade with a false row mask and merge on the
+device; no Python cache key or hit decision is required. CPU `RangeState` and
+`PokerGame` remain
 active support for navigation and duplicate-deal evaluation; tensor training
 uses the backend's dense/compact reach objects.
 
