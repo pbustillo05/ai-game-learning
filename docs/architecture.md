@@ -1,174 +1,235 @@
 # Architecture
 
-## Purpose
+## What the repository implements
 
-`pbg` is a research framework for policy-gradient self-play in finite
-public-action Bayesian games: games whose actions and chance events are public,
-while each player has a hidden type. Synthetic card games provide small exact
-oracles. No-limit hold'em provides the large, GPU-oriented target domain.
+`pbg` trains policies for finite public-action Bayesian games. A public state is
+shared, each player has a hidden private type, and observed actions update an
+unnormalized private-type likelihood. Synthetic games provide small exact
+oracles; six-player no-limit hold'em is the GPU target.
 
-The current training path is the corrected C08–C11 implementation:
-device-resident rollout, duplicate-preserving fixed-intensity branching,
-posterior-moment backward propagation, and a minimal posterior-weighted PPO
-objective. Older P08–P11 behavior survives only where tests need compatibility
-or historical comparison.
+There are three implemented training pipelines:
 
-## Dependency direction
+| `training.mode` | Rollout | Target | Loss |
+|---|---|---|---|
+| `normal` | one sampled private profile and one path per trajectory | sampled scalar lambda return | `ppo` |
+| `rao_blackwell` | one sampled profile/path per trajectory, cut at fold/showdown leaves | posterior mass and conditional value over every actor type | `rb_ppo` |
+| `branched_rao_blackwell` | one duplicate-preserving sampled tree per rank | posterior-moment reduction with sibling baselines | `rb_ppo` |
 
-The repository has three implementation layers:
+Normal and sequential RB can stream a logical trajectory set through resident
+chunks. Branched RB always owns one sampled tree per rank and cannot be chunked.
 
-1. `pbg/core` defines game-neutral protocols and algorithms. It knows about
-   public state handles, owners, events, reach tensors, tree topology, posterior
-   statistics, and policy/value outputs. It does not know poker rules or
-   synthetic-game rules.
-2. `pbg/games/synthetic` and `pbg/games/poker` implement the protocols. Each
-   game factory returns a `GameBundle(model, rollout_backend, policy_adapter,
-   completion_backend)`.
-3. `pbg/eval` loads checkpoints through game-owned construction and implements
-   read-only evaluation.
+## Package boundaries
 
-`pbg/core/training.py` resolves game factories by import string. This prevents a
-static core-to-game dependency and makes package import direction testable.
+The dependency direction is deliberate:
 
-Poker has one additional boundary. This repository owns public navigation,
-action policies, reach likelihoods, pot amounts, and chip-EV assembly. The
-sibling `poker_gpu_evaluator.pbg` facade owns all private poker combinatorics:
-collision-conditioned joint profiles, folded-card partition summaries,
-completion/equity estimates, and fixed-showdown winner shares. Local adapters
-validate version, representation, shape, dtype, device, and semantics but do
-not reproduce those algorithms.
+1. `pbg/core` defines opaque state/event protocols, rollout, topology, reach
+   caches, completion DTOs, targets, minibatching, losses, and training.
+2. `pbg/games/poker` implements those protocols and returns one
+   `GameBundle(model, rollout_backend, policy_adapter, completion_backend)`.
+3. `pbg/eval` constructs poker models from checkpoints and performs read-only
+   duplicate-deal evaluation.
 
-## Runtime pipeline
+`pbg/core/training.py` imports a selected game factory by string. Core modules
+therefore do not statically import the game package.
 
-One training iteration performs the following phases:
+Poker has another hard boundary. This repository owns public betting state,
+public chance navigation, action policy, likelihood reaches, pot strata, and
+payoff assembly. `poker_gpu_evaluator.pbg` owns collision-conditioned joint
+profiles, folded-card partition summaries, completion/equity, and fixed-profile
+winner shares. Local adapters validate the facade version, combo map, tensor
+shape, dtype, device, and result semantics. There is no local fallback for that
+private-card mathematics.
 
-1. Deep-copy the current model into a frozen rollout model.
-2. Ask the selected rollout backend for root state handles and initialize
-   padded log-reach rows `[tree, player, private_type]`.
-3. Build sequential trajectories or one fixed-intensity labeled sampled tree
-   per rank. Cache frozen value rows and selected-event log probabilities.
-4. Release the frozen model. Complete leaves through the game-owned backend in
-   byte-limited microbatches.
-5. Feed each completion microbatch into the backward `P/M` reduction frontier.
-   Completed siblings emit targets and are replaced by one parent summary.
-6. Build a device-resident categorical table over player nodes using sampled-tree path mass.
-7. Repeatedly sample aligned decision rows, re-evaluate the current model, and
-   optimize the clipped posterior-weighted policy, value, and entropy loss.
-8. Append metrics and periodically write an atomic checkpoint containing the
-   model, optimizer, scaler, configuration, and all RNG state.
+## One iteration as it actually runs
 
-The frozen rollout policy makes PPO ratios well-defined and keeps target
-construction outside autograd. Every cache uses the same stable decision-row
-order; mismatches fail before optimization.
+The non-chunked lifetime is:
 
-## Core data model
+```text
+trainable model
+    -> device-to-device frozen snapshot
+    -> rollout: topology + state store + reach + old policy/value cache
+    -> normal: settle sampled rewards and build scalar targets, then delete snapshot
+       RB: delete snapshot, then completion and posterior target construction
+    -> compact iteration data
+    -> delete rollout topology/full reach
+    -> one or more logical minibatches
+       -> one or more hardware-bounded physical forwards/backwards
+       -> one optimizer step per logical minibatch
+```
 
-### Public state and event handles
+Normal rollout settles the carried private profile directly and skips completion.
+Sequential/branched RB completes leaves in microbatches of at most 256 rows and
+feeds them into the posterior-moment reduction.
 
-Backends expose states as opaque device-local `int32` handles. The core never
-decodes them. An `EventBatch` contains an `int32 public_id` plus game-owned
-payload tensors, such as poker chance cards. This keeps the generic sampler
-free from domain branching and allows the poker backend to retain tensor-native
-state.
+When `rollout.trajectory_chunk_size < rollout.n_trees`, `_one_iteration` makes
+one frozen snapshot and repeats the following loop:
 
-Owner codes are shared: nonnegative integers are players, `CHANCE = -1`,
-`TERMINAL = -2`, and `PRETERM = -3`. A pre-terminal state has no further player
-decision; completion owns its remaining chance/reward resolution.
+```text
+roll out one resident chunk
+construct targets for that chunk
+optimize every configured minibatch/epoch for that chunk
+release the chunk
+continue with the next chunk using the original frozen snapshot
+```
 
-### Stored trees
+This is not a global replay buffer. In particular, all logical trajectories are
+not rolled out before optimization starts. `ppo_epochs` shuffles without
+replacement inside each resident chunk; it gives exact row coverage per chunk,
+not one global permutation of all trajectories. The trainable model changes
+between chunks, while rollout probabilities for every chunk still come from the
+same snapshot. The snapshot also remains resident during chunk optimization.
 
-`TreeBatch` is a shared CSR topology container. Sequential modes place a batch
-of independent trajectories in it; branched RB places exactly one sampled tree
-per rank/GPU in it. Node arrays store parent, logical-tree id, owner, depths,
-state handle, and accumulated path weight. CSR arrays
-`child_ptr`, `child_node`, `child_event`, and `nu` store outgoing edges. Equal
-public event labels are allowed on distinct child edges and are intentionally
-not deduplicated.
+The legacy path, used when `ppo_epochs` is absent, performs
+`gd_steps_per_iter` with-replacement samples of `minibatch_size` rows.
 
-`DeviceTreeBuffer` preallocates `n_trajectories * node_budget` rows in sequential
-modes and exactly `node_budget` rows for the one branched tree. It appends
-parent-major child batches with tensor prefix operations. Overflow is a loud
-error; it never truncates a trajectory/tree or changes the offspring law.
+## Rollout execution model
 
-### Reach and frozen-policy caches
+### Sequential modes
 
-Reach is stored as unnormalized log likelihood by player and private type. The
-three storage modes trade memory for replay:
+`_sample_trees_sequential` holds one active state, reach row, and private
+profile per live trajectory. It advances all active trajectories by one public
+transition in a synchronized frontier wave:
 
-- `full` stores every node.
-- `decisions_only` stores player and leaf rows.
-- `recompute` stores roots and reconstructs requested rows by replaying cached
-  public-edge likelihoods.
+1. separate current rows into player and chance states;
+2. send all current player rows to one backend `policy_forward` call;
+3. sample one action per player row and update the acting player's reach;
+4. sample chance events and compatibility-mask reaches;
+5. apply all successor transitions and append one child per active row.
 
-`PolicyCache` stores node ids, frozen values, and one all-private-type selected
-log-probability row per sampled abstract child. It is aligned with
-`NodeTargets`, including duplicate child labels.
+The active set shrinks as trajectories finish. Different streets can coexist in
+one wave, but a trajectory cannot produce its next decision until the current
+wave has completed.
 
-### Completion and targets
+### Branched mode
 
-`BatchedCompletionStats` is the game-neutral leaf boundary. Its learning fields
-are posterior mass `p_hat`, conditional private-type values `v_hat`, public
-value vectors, squared-return statistic, and effective sample size. Optional
-fields preserve evaluator diagnostics without coupling core code to poker.
+`_sample_branched_labeled` advances one breadth frontier. Every active node draws
+a randomized-rounded offspring count. Policy/value is evaluated once per unique
+player parent; policy output is gathered for its abstract children, which draw
+independent posterior profiles and events. Duplicate public labels remain
+separate edges. The next wave contains all children that were just created.
 
-`NodeTargets` is aligned to player-decision nodes and contains parent posterior,
-child posterior, direct advantages, value targets, child labels/masks/counts,
-and optional Q or auxiliary tensors.
+Both samplers therefore batch the current ready frontier. Neither sampler owns
+persistent preflop/postflop ready queues, high/low watermarks, or asynchronous
+queue drains across waves. Poker's backend partitions only the rows supplied by
+the current call. See the [efficiency audit](audit/rollout_efficiency_2026-07-15.md)
+for the consequence.
 
-The previous completion result and its selected reaches are unreachable before
-the next completion call. The frontier moves upward until only the root of the
-branched tree remains; it never allocates a whole-tree `[N,P,X]` moment arena.
+## Public state and topology
 
-## Design choices
+Owner codes are shared: players are nonnegative, `CHANCE = -1`,
+`TERMINAL = -2`, and `PRETERM = -3`. A pre-terminal row has no more learned
+decisions; completion owns its missing chance/reward resolution.
 
-### Integrate private types in the loss
+Backends expose opaque device-local `int32` state handles. `EventBatch` contains
+an `int32 public_id [B]` and optional same-device payloads such as dealt cards.
+Core code never decodes state handles.
 
-One model forward pass emits policy and value rows for every possible private
-type of the acting player. Training sums over those rows using posterior mass
-instead of sampling one actor type for the gradient. This is the central
-Rao–Blackwellization step.
+`DeviceTreeBuffer` preallocates:
 
-### Preserve sampled labels, including duplicates
+- `n_trajectories * node_budget` node rows in sequential modes; or
+- exactly `node_budget` rows for the one branched tree.
 
-Fixed branching draws independent events. Two draws may produce the same
-public action but still represent independent abstract children with independent
-descendants and completion draws. Merging them would change the estimator and
-its leave-one-branch baseline.
+It appends parent-major children into a CSR `TreeBatch`. Nodes retain parent,
+tree id, owner, depths, state handle, and path weight; edges retain child node,
+public event, and edge mass. Capacity errors are checked before successor
+expansion and never truncate a path or tree.
 
-### Propagate linear moments, conditionalize at emission
+Poker separately preallocates a structure-of-arrays public state store with the
+same node capacity. Each successor copies fixed-width public tensors and stores
+one parent-linked history record rather than a full history prefix.
 
-The backward pass averages posterior mass `P` and posterior-weighted return mass
-`M = P V`. It does not directly average conditional values. Ratios `M/P` are
-formed only when targets are emitted, with exact zero behavior for empty mass.
-This preserves unbiased linear quantities under sampled branching.
+## Reach and retained model inputs
 
-### Prefer explicit ownership over fallback implementations
+Reach is fp32 unnormalized log likelihood `[row, player, private_type]`. Padded
+types are `-inf`. The rollout cache modes are:
 
-There is no local poker evaluator fallback. A missing, incompatible, or
-partially successful sibling operation raises a typed error. This avoids silent
-CPU transfers and prevents two implementations of sensitive poker mathematics
-from drifting apart.
+- `full`: retain every node reach;
+- `decisions_only`: retain decisions and leaves; and
+- `recompute`: retain roots and reconstruct requested rows by replaying cached
+  selected-action log probabilities and chance compatibility.
 
-### Device residency is contractual
+`recompute` reduces persistent rollout storage, but the current replay in
+`ReachCache.rows_for` is a Python recursive traversal with device scalar reads.
+It materializes a dense memo arena for each call. It is not a fused GPU replay.
 
-The current rollout path is designed to keep topology, public state, reaches,
-events, profiles, and evaluator inputs on one device. Hot-path tests scan for
-explicit host transfers. CPU remains supported as an oracle and integration
-mode; CUDA uses the same tensor state transition path.
+After targets are built, `DecisionReachCache` retains exactly the reaches needed
+to reproduce optimization inputs. Games may compact this payload. Poker
+currently sets `requires_full_decision_reach = True`, because folded-seat ranges
+still affect preflop tokens and reach-derived features. Consequently poker keeps
+dense `[decision, P, 1326]` fp32 reaches through optimization; the available
+live-seat compactor is intentionally bypassed.
 
-### Determinism is explicit
+`PolicyCache` is aligned with decision targets. Sequential rows store one
+selected-event all-type log-probability vector and one all-type value vector.
+Branched rows store one selected-event vector per abstract child. Values and
+log-probabilities are fp32 even when model execution uses autocast.
 
-Configuration loading is strict. Torch and NumPy generators are explicit and
-rank-local. `training.reproducibility` selects `strict` deterministic kernels,
-`seeded` nondeterministic kernels without autotuning, or `throughput` kernels
-with cuDNN benchmarking and TF32 enabled. Every profile retains exact seeds and
-checkpoints explicit generator plus process RNG state for every DDP rank. DDP
-ranks sample locally and synchronize gradients only.
+## Completion and target lifetime
 
-## Current scope and deliberate omissions
+`BatchedCompletionStats` carries posterior mass, conditional private-type
+values, public values, squared-return statistics, effective sample size, and
+optional diagnostics. `for_learning()` drops diagnostics not consumed by the
+loss.
 
-The shipped objective is only `rb_ppo`. Reference-policy KL, NeuRD/R-NaD,
-learned Neyman allocation, and public moment losses are deferred. `MomentHeads`
-and generic auxiliary propagation hooks exist as research extensions but are
-not wired into the default training path. Q targets are transient unless a
-caller explicitly requests `emit_q=True`.
+RB completion is streamed into `streamed_branched_value`. The reduction tracks
+posterior mass `P` and posterior-weighted return mass `M=P*V`; it emits decision
+targets once all children of a parent are present, then replaces those children
+with one parent summary. A whole-tree `[N,P,X]` moment arena is not retained.
+
+Before optimization, RB data is reduced to targets, the frozen policy cache, a
+decision sampling table, state handles, and decision reaches. Normal data is
+reduced to state/reach rows plus sampled actor type, action, scalar old outputs,
+advantage, and value target.
+
+## Logical and physical minibatches
+
+`training.minibatch_size` is a logical number of decision rows. Poker attention
+cannot necessarily execute all of them together. `plan_policy_batches` greedily
+packs the logical rows under the hardware profile's padded-token and
+padded-token-pair ceilings. The loss is summed over each physical sub-batch and
+divided by the logical row count. Gradients accumulate across all physical
+sub-batches, then one clip and one Adam/AdamW step occurs.
+
+When `loss.c_kl > 0`, a separately frozen reference model is refreshed every
+`training.kl_ref_interval` iterations. Each physical training batch performs an
+additional no-grad reference forward and adds exact legal-action
+`KL(current || reference)`.
+
+## Device movement and synchronization
+
+Poker topology, states, reaches, events, model inputs/outputs, evaluator inputs,
+targets, and minibatches remain on one CUDA device. There is no intended bulk
+CPU staging in the rollout/training phases. DDP ranks sample locally and
+all-reduce gradients; rank zero copies data to host only for metrics and
+checkpoints.
+
+Device residency does not mean the hot path is fully asynchronous. Current
+Python scheduling reads CUDA values to choose batch families, padded history
+widths, fold branches, partition-cache keys, and termination. The most visible
+sync points are `.tolist()`, `.item()`, `.cpu()` and tensor-to-`bool` branches in
+the poker planner, history builder, partition cache, and generic rollout loops.
+The current no-host-sync tests cover isolated alias/compact-map/attention
+primitives, not this end-to-end scheduler.
+
+## Memory safety and observability
+
+Poker construction has a rollout byte estimate and training adds a structural
+phase estimate. CUDA runs reserve 2 GiB and cap planned use at 82% on the local
+2080 Ti profile. The first iteration records synchronized per-phase time and
+allocated/reserved peaks; a 25% margin over measured reserved memory must fit
+the configured safe limit.
+
+The sequential estimates currently scale transient reaches and policy cache by
+`n_trajectories * node_budget`, even though a sequential frontier has at most one
+live row per trajectory and policy caches allocate only realized decisions.
+This is safe but can reject useful resident trajectory counts. It is a planner
+limitation, not evidence that the corresponding memory is allocated at runtime.
+
+## Deliberate scope
+
+Implemented objectives are scalar `ppo` for normal mode and posterior-weighted
+`rb_ppo` for both RB modes, with MSE or clipped value loss, entropy scheduling,
+and optional reference KL. Learned branching intensity, NeuRD/R-NaD updates,
+public moment losses, and learned completion allocation are not wired into the
+training path. Moment heads and auxiliary target hooks exist as research
+extensions; Q targets are retained only when a selected loss requests them.

@@ -1,42 +1,44 @@
 # Implementation documentation
 
-This directory documents the repository as it exists now. The implementation
-prompts in `../archive/prompts/` are retained as development history; they are
-not a setup or execution sequence.
+These pages describe the current working implementation. Historical prompts in
+`../archive/prompts/` explain how the repository evolved, but they are not an
+execution plan and should not be used as an implementation reference.
 
-Start here:
+Read the pages in this order:
 
-- [Architecture](architecture.md) explains package boundaries, runtime data
-  flow, ownership, and the main design decisions.
-- [Core algorithms](core_algorithms.md) describes rollout, labeled branching,
-  reach tracking, completion, posterior-moment propagation, minibatching, and
-  the RB-PPO loss.
-- [Synthetic games](synthetic_games.md) covers the configurable finite game
-  family, exact solvers, neural model, and completion backend.
-- [Poker implementation](poker.md) covers public NLHE navigation, range
-  bookkeeping, the preflop/postflop models, GPU rollout, and the external
-  evaluator boundary.
+- [Architecture](architecture.md) defines package ownership, the actual
+  iteration/chunk lifecycle, device residency, and the main retained objects.
+- [Core algorithms](core_algorithms.md) describes normal, sequential
+  Rao--Blackwell, and branched Rao--Blackwell rollout and optimization.
+- [Poker implementation](poker.md) covers tensor NLHE navigation, the two poker
+  networks, policy batch packing, evaluator calls, and the important places
+  where CUDA execution still synchronizes with Python.
+- [`../archive/synthetic_games/`](../archive/synthetic_games/) preserves the
+  retired Kuhn/Leduc/synthetic implementation as an inert historical snapshot.
+- [File reference](file_reference.md) maps the implementation and validation
+  files to their current responsibilities.
 - [Training, evaluation, and configuration](training_and_evaluation.md) covers
-  configuration, checkpoints, DDP, exploitability, duplicate-deal arenas, and
-  the shipped presets.
-- [File reference](file_reference.md) gives a purpose and status for every
-  tracked file in the repository, including tests and historical prompts.
-- [Audit](audit/README.md) records repository-readiness findings, validation
-  probes, and resolved items.
+  commands, presets, checkpoints, DDP, and evaluation. It is maintained as a
+  separate operational guide.
 
-The mathematical and interface authorities remain:
+The current performance assessment is [Rollout and training efficiency audit,
+2026-07-15](audit/rollout_efficiency_2026-07-15.md). Its most important finding
+is that poker forwards are GPU-batched, but rollout does **not** implement the
+requested persistent preflop and postflop ready queues. It packs only the
+currently active frontier wave. The audit quantifies the resulting fragmentation
+and the overly conservative sequential memory preflight.
 
-- [`theory/core_math.tex`](theory/core_math.tex) — mathematical source of
-  truth.
-- [`../NOTATION.md`](../NOTATION.md) — mapping from the mathematics to code.
-- [`../CONTRACTS.md`](../CONTRACTS.md) — frozen interfaces and invariants.
-- [`../archive/POKER_GPU_EVALUATOR_IO.md`](../archive/POKER_GPU_EVALUATOR_IO.md) — binding
-  contract with the sibling poker evaluator.
+The binding authorities are:
 
-Two existing research documents have narrower scopes:
+- [`theory/core_math.tex`](theory/core_math.tex) for the mathematics;
+- [`../NOTATION.md`](../NOTATION.md) for math-to-code names and shapes;
+- [`../CONTRACTS.md`](../CONTRACTS.md) for interfaces and invariants; and
+- [`../archive/POKER_GPU_EVALUATOR_IO.md`](../archive/POKER_GPU_EVALUATOR_IO.md)
+  for the sibling poker-evaluator boundary.
 
-- [Poker Player Model](MHA_model.md) specifies the poker network in more
-  mathematical detail.
-- [Card Removal from Folded Ranges](theory/folder_impact.md) is background mathematics
-  owned by the evaluator side of the repository boundary. It is not a local
-  implementation specification.
+Two theory documents have narrower scopes:
+
+- [Poker player model](theory/MHA_model.md) specifies the preflop/postflop
+  architecture and attention equations in detail.
+- [Card removal from folded ranges](theory/folder_impact.md) is evaluator-owned
+  background mathematics, not a local implementation specification.
