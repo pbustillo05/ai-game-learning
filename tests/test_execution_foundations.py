@@ -527,7 +527,7 @@ def test_cuda_queue_arena_and_rng_execute_transactionally() -> None:
     fresh = ChunkedOccurrenceArena(3, 3, device)
     fresh_handles = fresh.allocate(3)
     small_queue = DeviceWorkQueue(2, device)
-    with pytest.raises(MemoryError, match="work queue overflow"):
+    with pytest.raises(MemoryError, match="insertion-order overflow"):
         small_queue.enqueue(fresh_handles, arena=fresh)
     torch.cuda.synchronize(device)
     assert small_queue.host_count == 0
