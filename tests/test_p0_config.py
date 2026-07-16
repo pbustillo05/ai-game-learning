@@ -231,6 +231,88 @@ def test_behavioral_profile_enums_are_strict(
         load_config(path)
 
 
+@pytest.mark.parametrize(
+    ("section", "field", "value", "pattern"),
+    [
+        ("rollout", "node_budget", 0, r"root\.rollout\.node_budget"),
+        ("loss", "lam", -0.01, r"root\.loss\.lam"),
+        ("loss", "lam", 1.01, r"root\.loss\.lam"),
+        ("loss", "clip_eps", 0.0, r"root\.loss\.clip_eps"),
+        ("loss", "clip_eps", 1.01, r"root\.loss\.clip_eps"),
+        ("loss", "clip_eps_v", float("nan"), r"root\.loss\.clip_eps_v"),
+        ("loss", "c_v", -0.01, r"root\.loss\.c_v"),
+        ("loss", "c_h", float("inf"), r"root\.loss\.c_h"),
+        ("loss", "c_kl", -0.01, r"root\.loss\.c_kl"),
+        ("training", "iters", 0, r"root\.training\.iters"),
+        ("training", "gd_steps_per_iter", 0, r"root\.training\.gd_steps_per_iter"),
+        ("training", "minibatch_size", 0, r"root\.training\.minibatch_size"),
+        ("training", "lr", -1.0, r"root\.training\.lr"),
+        ("training", "grad_clip", 0.0, r"root\.training\.grad_clip"),
+        ("training", "checkpoint_every", 0, r"root\.training\.checkpoint_every"),
+        ("training", "seed", -1, r"root\.training\.seed"),
+        ("training", "out_dir", "", r"root\.training\.out_dir"),
+        ("model", "d_model", 0, r"root\.model\.d_model"),
+        ("model", "s_min", float("nan"), r"root\.model\.s_min"),
+        ("model", "folder_beta_rank", 53, r"root\.model\.folder_beta_rank"),
+    ],
+)
+def test_all_scientific_numeric_boundaries_reject_with_dotted_paths(
+    tmp_path: Path, section: str, field: str, value, pattern: str
+) -> None:
+    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
+    raw[section][field] = value
+    path = tmp_path / f"bad_{section}_{field}.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match=pattern):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("betas", "pattern"),
+    [
+        ((-0.01, 0.999), r"root\.training\.adam_betas\[0\]"),
+        ((0.9, 1.0), r"root\.training\.adam_betas\[1\]"),
+        ((0.9, float("nan")), r"root\.training\.adam_betas\[1\]"),
+    ],
+)
+def test_adam_beta_boundaries_are_finite_and_dotted(
+    tmp_path: Path, betas: tuple[float, float], pattern: str
+) -> None:
+    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
+    raw["training"]["adam_betas"] = list(betas)
+    path = tmp_path / "bad_betas.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match=pattern):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("worker_count", -1),
+        ("checkpoint_every", 0),
+        ("reserve_vram_gib", float("nan")),
+        ("max_memory_fraction", float("inf")),
+        ("min_vram_gib", 0.0),
+        ("max_vram_gib", -1.0),
+    ],
+)
+def test_hardware_numeric_boundaries_reject_with_dotted_paths(
+    tmp_path: Path, field: str, value
+) -> None:
+    profile = yaml.safe_load(
+        (ROOT / "configs" / "hardware" / "local_3x2080ti.yaml").read_text()
+    )
+    profile[field] = value
+    profile_path = tmp_path / "bad_hardware.yaml"
+    profile_path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    with pytest.raises(ConfigError, match=rf"hardware\.{field}"):
+        load_config(
+            ROOT / "configs" / "train" / "nlhe6.yaml",
+            hardware_profile=profile_path,
+        )
+
+
 def test_metrics_logger_appends_json_lines(tmp_path: Path) -> None:
     logger = MetricsLogger(tmp_path)
     logger.log(4, {"loss": 1.5})

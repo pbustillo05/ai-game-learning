@@ -222,7 +222,15 @@ def _parse_dataclass(cls: type[_ConfigT], value: Any, path: str) -> _ConfigT:
 
 
 def _validate_config(cfg: RootConfig) -> None:
-    """Validate game-independent frozen enumerations."""
+    """Validate all game-independent values in the frozen schema."""
+
+    def positive(path: str, value: float) -> None:
+        if not math.isfinite(value) or value <= 0:
+            raise ConfigError(f"{path}: expected a finite positive value")
+
+    def nonnegative(path: str, value: float) -> None:
+        if not math.isfinite(value) or value < 0:
+            raise ConfigError(f"{path}: expected a finite nonnegative value")
 
     if cfg.completion.backend not in {"auto", "cpu", "cuda"}:
         raise ConfigError(
@@ -255,6 +263,8 @@ def _validate_config(cfg: RootConfig) -> None:
         )
     if cfg.rollout.sequential_starts <= 0:
         raise ConfigError("root.rollout.sequential_starts: expected a positive integer")
+    if cfg.rollout.node_budget <= 0:
+        raise ConfigError("root.rollout.node_budget: expected a positive integer")
     if cfg.rollout.reach_storage not in {"full", "decisions_only", "recompute"}:
         raise ConfigError(
             "root.rollout.reach_storage: expected 'full', 'decisions_only', or 'recompute'"
@@ -272,8 +282,33 @@ def _validate_config(cfg: RootConfig) -> None:
         raise ConfigError("root.loss.entropy_schedule: expected 'const' or 'linear_decay'")
     if cfg.loss.value_loss not in {"mse", "clipped"}:
         raise ConfigError("root.loss.value_loss: expected 'mse' or 'clipped'")
-    if not math.isfinite(cfg.loss.c_kl) or cfg.loss.c_kl < 0.0:
-        raise ConfigError("root.loss.c_kl: expected a finite nonnegative value")
+    if not math.isfinite(cfg.loss.lam) or not 0.0 <= cfg.loss.lam <= 1.0:
+        raise ConfigError("root.loss.lam: expected a finite value in [0,1]")
+    if not math.isfinite(cfg.loss.clip_eps) or not 0.0 < cfg.loss.clip_eps <= 1.0:
+        raise ConfigError("root.loss.clip_eps: expected a finite value in (0,1]")
+    positive("root.loss.clip_eps_v", cfg.loss.clip_eps_v)
+    nonnegative("root.loss.c_v", cfg.loss.c_v)
+    nonnegative("root.loss.c_h", cfg.loss.c_h)
+    nonnegative("root.loss.c_kl", cfg.loss.c_kl)
+    if cfg.training.iters <= 0:
+        raise ConfigError("root.training.iters: expected a positive integer")
+    if cfg.training.gd_steps_per_iter <= 0:
+        raise ConfigError("root.training.gd_steps_per_iter: expected a positive integer")
+    if cfg.training.minibatch_size <= 0:
+        raise ConfigError("root.training.minibatch_size: expected a positive integer")
+    positive("root.training.lr", cfg.training.lr)
+    for index, beta in enumerate(cfg.training.adam_betas):
+        if not math.isfinite(beta) or not 0.0 <= beta < 1.0:
+            raise ConfigError(
+                f"root.training.adam_betas[{index}]: expected a finite value in [0,1)"
+            )
+    positive("root.training.grad_clip", cfg.training.grad_clip)
+    if cfg.training.seed < 0:
+        raise ConfigError("root.training.seed: expected a nonnegative integer")
+    if cfg.training.checkpoint_every <= 0:
+        raise ConfigError("root.training.checkpoint_every: expected a positive integer")
+    if not cfg.training.out_dir.strip():
+        raise ConfigError("root.training.out_dir: expected a nonempty path")
     if isinstance(cfg.training.kl_ref_interval, bool) or cfg.training.kl_ref_interval <= 0:
         raise ConfigError("root.training.kl_ref_interval: expected a positive integer")
     if cfg.training.optimizer not in {"adam", "adamw"}:
@@ -330,7 +365,7 @@ def _validate_config(cfg: RootConfig) -> None:
             )
         if profile.precision not in {"fp16", "bf16", "fp32"}:
             raise ConfigError("hardware.precision: expected 'fp16', 'bf16', or 'fp32'")
-        positive = {
+        positive_integers = {
             "query_chunk_size": profile.query_chunk_size,
             "training_max_tokens": profile.training_max_tokens,
             "training_max_token_pairs": profile.training_max_token_pairs,
@@ -338,13 +373,36 @@ def _validate_config(cfg: RootConfig) -> None:
             "inference_max_token_pairs": profile.inference_max_token_pairs,
             "max_devices": profile.max_devices,
         }
-        for name, value in positive.items():
+        for name, value in positive_integers.items():
             if isinstance(value, bool) or value <= 0:
                 raise ConfigError(f"hardware.{name}: expected a positive integer")
-        if not 0.0 < profile.max_memory_fraction <= 1.0:
-            raise ConfigError("hardware.max_memory_fraction: expected a value in (0,1]")
-        if profile.reserve_vram_gib < 0.0:
-            raise ConfigError("hardware.reserve_vram_gib: expected a nonnegative value")
+        if not math.isfinite(profile.max_memory_fraction) or not 0.0 < profile.max_memory_fraction <= 1.0:
+            raise ConfigError("hardware.max_memory_fraction: expected a finite value in (0,1]")
+        nonnegative("hardware.reserve_vram_gib", profile.reserve_vram_gib)
+        if profile.worker_count < 0:
+            raise ConfigError("hardware.worker_count: expected a nonnegative integer")
+        if profile.checkpoint_every is not None and profile.checkpoint_every <= 0:
+            raise ConfigError("hardware.checkpoint_every: expected a positive integer or null")
+        if profile.expected_compute_capability is not None:
+            major, minor = profile.expected_compute_capability
+            if major <= 0 or minor < 0:
+                raise ConfigError(
+                    "hardware.expected_compute_capability: expected [positive major, nonnegative minor]"
+                )
+        for name in ("min_vram_gib", "max_vram_gib"):
+            value = getattr(profile, name)
+            if value is not None:
+                positive(f"hardware.{name}", value)
+        if (
+            profile.min_vram_gib is not None
+            and profile.max_vram_gib is not None
+            and profile.min_vram_gib > profile.max_vram_gib
+        ):
+            raise ConfigError(
+                "hardware.min_vram_gib: must not exceed hardware.max_vram_gib"
+            )
+        if not profile.name.strip():
+            raise ConfigError("hardware.name: expected a nonempty name")
         if profile.scheduler == "slurm" and profile.slurm is None:
             raise ConfigError("hardware.slurm: required when scheduler is 'slurm'")
 

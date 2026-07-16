@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+import math
 from typing import Any, Mapping
 
 import torch
@@ -46,6 +47,28 @@ class PokerModelConfig:
     eps: float = 1e-8
 
     def __post_init__(self) -> None:
+        integer_fields = (
+            "d_model", "n_heads", "n_layers_pre", "n_layers_post", "m_raise",
+            "k_act", "n_buckets_line", "max_players", "class_embedding_dim",
+            "evaluator_summary_dim", "max_history_tokens", "folder_beta_rank",
+            "folder_line_dim",
+        )
+        for name in integer_fields:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer")
+        if self.ffn_hidden is not None and (
+            isinstance(self.ffn_hidden, bool) or not isinstance(self.ffn_hidden, int)
+        ):
+            raise TypeError("ffn_hidden must be an integer when supplied")
+        if type(self.use_moment_heads) is not bool:
+            raise TypeError("use_moment_heads must be bool")
+        for name in ("s_min", "eps"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"{name} must be numeric")
+        if not math.isfinite(self.s_min) or not math.isfinite(self.eps):
+            raise ValueError("s_min and eps must be finite")
         if self.d_model <= 0 or self.n_heads <= 0 or self.d_model % self.n_heads:
             raise ValueError("d_model must be positive and divisible by n_heads")
         if self.n_layers_pre <= 0 or self.n_layers_post <= 0 or self.m_raise <= 0:
@@ -54,6 +77,8 @@ class PokerModelConfig:
             raise ValueError("k_act must equal 3 + m_raise")
         if self.s_min <= 0.0 or self.eps <= 0.0:
             raise ValueError("s_min and eps must be positive")
+        if self.n_buckets_line <= 0:
+            raise ValueError("n_buckets_line must be positive")
         if not 2 <= self.max_players <= 9:
             raise ValueError("max_players must be in [2,9]")
         if self.class_embedding_dim <= 0 or self.evaluator_summary_dim < 0:
@@ -74,13 +99,25 @@ class PokerModelConfig:
         data = dict(values or {})
         if "p_max" in data:
             if "max_players" in data:
-                raise ValueError("specify only one of p_max and max_players")
+                raise ValueError(
+                    "root.model.max_players: specify only one of p_max and max_players"
+                )
             data["max_players"] = data.pop("p_max")
         allowed = {field.name for field in fields(cls)}
         unknown = sorted(set(data) - allowed)
         if unknown:
-            raise ValueError(f"unknown poker model configuration key: {unknown[0]}")
-        return cls(**data)
+            raise ValueError(
+                f"root.model.{unknown[0]}: unknown poker model configuration key"
+            )
+        try:
+            return cls(**data)
+        except (TypeError, ValueError) as exc:
+            message = str(exc)
+            mentioned = [name for name in allowed if name in message]
+            field = (
+                min(mentioned, key=message.index) if mentioned else "configuration"
+            )
+            raise ValueError(f"root.model.{field}: {message}") from exc
 
 
 @dataclass
