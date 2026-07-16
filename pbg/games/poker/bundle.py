@@ -124,7 +124,7 @@ def _preflight_cuda_rollout(plan: PokerRolloutMemoryPlan, device: torch.device) 
 
 
 def _reach_rows(reach: Any) -> Tensor:
-    """Return game-neutral log reach rows ``[B,P,1326]``."""
+    """Return game-neutral log reach rows ``[B,P,H]``."""
 
     if isinstance(reach, Tensor):
         return reach
@@ -153,7 +153,7 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
         n_samples: int,
         gen: torch.Generator,
     ) -> BatchedCompletionStats:
-        """Return fp32 completion rows ``[B,P,1326]`` without host tensor copies."""
+        """Return fp32 completion rows ``[B,P,H]`` without host tensor copies."""
 
         return self._complete_impl(
             game, tree, node_ids, reach, n_samples, gen=gen, keys=None
@@ -191,8 +191,11 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
             raise ValueError("n_samples must be a positive integer")
         rows = _reach_rows(reach)
         state_refs = tree.state_ref[node_ids.to(tree.state_ref.device).long()]
-        if rows.shape != (node_ids.numel(), game.n_players, 1326):
-            raise ValueError("reach rows must have shape [B,P,1326]")
+        n_hands = DeckGeometry(self.rank_count).n_hands
+        if rows.shape != (node_ids.numel(), game.n_players, n_hands):
+            raise ValueError(
+                f"reach rows must have shape [B,P,{n_hands}]"
+            )
         batch, players = rows.shape[:2]
         device = rows.device
         if keys is not None and (
@@ -203,7 +206,9 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
             raise ValueError("completion keys must be device-local int64 [B]")
         if keys is None and gen is None:
             raise RuntimeError("mutable poker completion requires a generator")
-        p_hat = torch.zeros((batch, players, 1326), dtype=torch.float32, device=device)
+        p_hat = torch.zeros(
+            (batch, players, n_hands), dtype=torch.float32, device=device
+        )
         v_hat = torch.zeros_like(p_hat)
         vvec_hat = torch.zeros((batch, players), dtype=torch.float32, device=device)
         u_hat = torch.zeros(batch, dtype=torch.float32, device=device)
@@ -282,7 +287,9 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
             if metrics is not None:
                 metrics.record_evaluator(rows=int(terminal.numel()))
             counts = torch.zeros(
-                (terminal.numel(), players, 1326), dtype=torch.float32, device=device
+                (terminal.numel(), players, n_hands),
+                dtype=torch.float32,
+                device=device,
             )  # [Bt,P,H]
             index = profiles.permute(0, 2, 1).to(torch.int64)  # [Bt,P,S]
             counts.scatter_add_(2, index, torch.ones_like(index, dtype=torch.float32))
@@ -317,6 +324,11 @@ def _resolved_model_config(
     if model_cfg.max_players < poker_cfg.n_players:
         raise ValueError(
             "root.model.max_players: must cover every configured poker seat"
+        )
+    if model_cfg.folder_beta_rank > poker_cfg.geometry.n_cards:
+        raise ValueError(
+            "root.model.folder_beta_rank: cannot exceed the active compact "
+            f"deck size ({poker_cfg.geometry.n_cards})"
         )
     required_history = max_public_history_tokens(
         poker_cfg.n_players, poker_cfg.stack_bb
@@ -405,7 +417,10 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     )
     model_cfg = _resolved_model_config(cfg, engine_cfg)
     _validate_attention_capacity(cfg, engine_cfg, model_cfg)
-    model = PokerModelBundle(PreflopNet(model_cfg), PostflopNet(model_cfg)).to(device)
+    model = PokerModelBundle(
+        PreflopNet(model_cfg, engine_cfg.geometry),
+        PostflopNet(model_cfg, engine_cfg.geometry),
+    ).to(device)
     if cfg.hardware is not None:
         for module in model.modules():
             if isinstance(module, MHA):

@@ -14,7 +14,7 @@ from typing import Sequence
 import torch
 from torch import Tensor
 
-from pbg.games.poker.cards import N_CLASSES, N_HANDS, board_conflict_mask
+from pbg.games.poker.cards import DeckGeometry
 
 LINE_META_SIZE = 8
 """Width of public fold-line metadata; fields after the caller's data are zero padded."""
@@ -53,6 +53,7 @@ class RangeState:
         n_slots: int,
         n_players: int,
         device: torch.device | str | None = None,
+        rank_count: int = 13,
     ) -> None:
         if isinstance(n_slots, bool) or not isinstance(n_slots, int) or n_slots < 0:
             raise ValueError("n_slots must be a nonnegative integer")
@@ -63,8 +64,11 @@ class RangeState:
         ):
             raise ValueError("n_players must be a positive integer")
         self.n_players = n_players
+        self.geometry = DeckGeometry(rank_count)
+        self.n_hands = self.geometry.n_hands
+        self.n_classes = self.geometry.n_classes
         self.log_r = torch.zeros(
-            (n_slots, n_players, N_HANDS), dtype=torch.float32, device=device
+            (n_slots, n_players, self.n_hands), dtype=torch.float32, device=device
         )
         self.live = torch.ones(
             (n_slots, n_players), dtype=torch.bool, device=self.log_r.device
@@ -80,22 +84,11 @@ class RangeState:
         self._row_max = torch.zeros(
             (n_slots, n_players), dtype=torch.float32, device=self.log_r.device
         )
-        combo_cards = torch.triu_indices(
-            52, 52, offset=1, device=self.log_r.device
-        )  # [2,H]
-        rank_a = combo_cards[0].div(4, rounding_mode="floor")
-        suit_a = combo_cards[0] % 4
-        rank_b = combo_cards[1].div(4, rounding_mode="floor")
-        suit_b = combo_cards[1] % 4
-        high_pos = 12 - torch.maximum(rank_a, rank_b)
-        low_pos = 12 - torch.minimum(rank_a, rank_b)
-        pair = rank_a == rank_b
-        suited = suit_a == suit_b
-        self._class_of_hand = torch.where(
-            pair | suited,
-            high_pos * 13 + low_pos,
-            low_pos * 13 + high_pos,
-        ).to(torch.long)  # [H]
+        self._class_of_hand = torch.tensor(
+            self.geometry.class_of_combo,
+            dtype=torch.long,
+            device=self.log_r.device,
+        )
 
     @property
     def n_slots(self) -> int:
@@ -192,8 +185,10 @@ class RangeState:
         if event.shape != slot_ids.shape:
             raise ValueError("event_ids must have the same shape as slots")
         self._require_unique_pairs(slot_ids, player_ids)
-        if policy_log_rows.shape[1] != N_HANDS:
-            raise ValueError("policy_log_rows must have 1326 hand rows")
+        if policy_log_rows.shape[1] != self.n_hands:
+            raise ValueError(
+                f"policy_log_rows must have {self.n_hands} compact hand rows"
+            )
         if not policy_log_rows.is_floating_point():
             raise TypeError("policy_log_rows must have a floating dtype")
         if policy_log_rows.device != self.log_r.device:
@@ -253,10 +248,10 @@ class RangeState:
             raise ValueError("new_cards and range state must share a device")
         cards_i16 = cards.to(torch.int16)
         valid_cards = (cards_i16 == -1) | (
-            (cards_i16 >= 0) & (cards_i16 < 52)
+            (cards_i16 >= self.geometry.first_card) & (cards_i16 < 52)
         )
         if not bool(valid_cards.all()):
-            raise ValueError("new_cards must contain card ids in [0,52) or -1")
+            raise ValueError("new_cards must contain active-deck card ids or -1")
 
         current = self.board[slot_ids].to(torch.int16)  # [B,5]
         for row in range(slot_ids.numel()):
@@ -270,7 +265,7 @@ class RangeState:
             current[row].fill_(-1)
             current[row, : combined.numel()] = combined
         self.board[slot_ids] = current.to(torch.int8)
-        conflict = board_conflict_mask(self.board[slot_ids])  # [B,H]
+        conflict = self.geometry.board_conflict_mask(self.board[slot_ids])  # [B,H]
         rows = self.log_r[slot_ids]  # [B,P,H]
         self.log_r[slot_ids] = rows.masked_fill(conflict[:, None, :], -torch.inf)
         all_players = torch.arange(self.n_players, device=self.log_r.device)
@@ -331,11 +326,11 @@ class RangeState:
             raise ValueError("a reach row has no possible hand")
         normalized = torch.softmax(rows, dim=2, dtype=torch.float32)  # [B,P,H]
         result = torch.zeros(
-            (slot_ids.numel(), self.n_players, N_CLASSES),
+            (slot_ids.numel(), self.n_players, self.n_classes),
             dtype=torch.float32,
             device=self.log_r.device,
         )
-        class_ids = self._class_of_hand.view(1, 1, N_HANDS).expand(
+        class_ids = self._class_of_hand.view(1, 1, self.n_hands).expand(
             slot_ids.numel(), self.n_players, -1
         )  # [B,P,H]
         result.scatter_add_(2, class_ids, normalized)

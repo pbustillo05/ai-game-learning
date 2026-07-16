@@ -109,6 +109,12 @@ class DeckGeometry:
     categories: CategoryProfile = field(init=False)
     _combo_index: Mapping[tuple[int, int], int] = field(init=False, repr=False)
 
+    def __deepcopy__(self, memo: dict[int, object]) -> DeckGeometry:
+        """Return this immutable value object during model snapshot copies."""
+
+        memo[id(self)] = self
+        return self
+
     def __post_init__(self) -> None:
         r = self.rank_count
         if isinstance(r, bool) or not isinstance(r, int):
@@ -233,16 +239,21 @@ def hand_cards(h: int) -> tuple[int, int]:
     return _HAND_CARDS[h]
 
 
-def validate_evaluator_combo_cards(combo_cards: Tensor) -> None:
-    """Require the sibling facade to use this repository's frozen combo map."""
+def validate_evaluator_combo_cards(
+    combo_cards: Tensor, rank_count: int = 13
+) -> None:
+    """Require the sibling facade to use the matching compact combo map."""
 
+    geometry = DeckGeometry(rank_count)
     if not isinstance(combo_cards, Tensor):
-        raise RuntimeError("poker_gpu_evaluator.pbg.COMBO_CARDS must be a torch.Tensor")
-    if combo_cards.shape != (N_HANDS, 2) or combo_cards.dtype != torch.uint8:
+        raise RuntimeError("poker_gpu_evaluator.pbg combo_cards must be a torch.Tensor")
+    if combo_cards.shape != (geometry.n_hands, 2) or combo_cards.dtype != torch.uint8:
         raise RuntimeError(
-            "poker_gpu_evaluator.pbg.COMBO_CARDS must be uint8 [1326,2]"
+            "poker_gpu_evaluator.pbg combo_cards has the wrong compact shape or dtype"
         )
-    expected = torch.tensor(_HAND_CARDS, dtype=torch.uint8, device=combo_cards.device)
+    expected = torch.tensor(
+        geometry.combo_cards, dtype=torch.uint8, device=combo_cards.device
+    )
     if not torch.equal(combo_cards, expected):
         raise RuntimeError(
             "poker_gpu_evaluator.pbg.COMBO_CARDS is incompatible with the local "
@@ -343,6 +354,8 @@ def sample_uniform_complement(
     unavailable_cards: Tensor,
     n_cards: Tensor,
     gen: torch.Generator,
+    *,
+    rank_count: int = 13,
 ) -> Tensor:
     """Sample ordered, uniform draws without replacement from each complement.
 
@@ -361,16 +374,20 @@ def sample_uniform_complement(
         raise ValueError("inputs must be on one device")
     if not isinstance(gen, torch.Generator):
         raise TypeError("gen must be a torch.Generator")
+    geometry = DeckGeometry(rank_count)
     valid = unavailable_cards >= 0
-    if not bool(((unavailable_cards < N_CARDS) | ~valid).all()):
-        raise ValueError("unavailable cards must be in [0,52) or -1")
+    active = (unavailable_cards >= geometry.first_card) & (
+        unavailable_cards < N_CARDS
+    )
+    if not bool((active | ~valid).all()):
+        raise ValueError("unavailable cards must be active-deck ids or -1")
     if not bool((n_cards >= 0).all()):
         raise ValueError("n_cards must be nonnegative")
     for row, mask in zip(unavailable_cards, valid, strict=True):
         cards = row[mask]
         if cards.numel() != torch.unique(cards).numel():
             raise ValueError("unavailable cards must not contain duplicates")
-    available_count = N_CARDS - valid.sum(dim=1)
+    available_count = geometry.n_cards - valid.sum(dim=1)
     if not bool((n_cards <= available_count).all()):
         raise ValueError("requested draw is larger than the card complement")
 
@@ -382,15 +399,24 @@ def sample_uniform_complement(
     if max_draw == 0:
         return result
 
-    blocked = torch.zeros((batch, N_CARDS), dtype=torch.bool, device=result.device)
+    blocked = torch.zeros(
+        (batch, geometry.n_cards), dtype=torch.bool, device=result.device
+    )
     if valid.any():
         row_ids = torch.arange(batch, device=result.device)[:, None].expand_as(valid)
-        blocked[row_ids[valid], unavailable_cards[valid].to(torch.long)] = True
+        blocked[
+            row_ids[valid],
+            unavailable_cards[valid].to(torch.long) - geometry.first_card,
+        ] = True
     # Sorting independent continuous keys is a uniform random permutation of
     # each row's complement, hence every ordered prefix has the required law.
-    keys = torch.rand((batch, N_CARDS), generator=gen, device=result.device)
+    keys = torch.rand(
+        (batch, geometry.n_cards), generator=gen, device=result.device
+    )
     keys.masked_fill_(blocked, float("inf"))
-    draws = torch.argsort(keys, dim=1)[:, :max_draw].to(torch.int16)
+    draws = (
+        torch.argsort(keys, dim=1)[:, :max_draw] + geometry.first_card
+    ).to(torch.int16)
     keep = torch.arange(max_draw, device=result.device)[None, :] < n_cards[:, None]
     result[keep] = draws[keep]
     return result

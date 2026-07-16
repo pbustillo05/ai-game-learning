@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import torch
 from torch import Tensor, nn
 
-from pbg.games.poker.cards import N_CLASSES, class_of_hand, class_size
+from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.model.heads import MomentHeads, RaiseMixtureHead, TypeHead, ValueHead
 from pbg.games.poker.model.incidence import IncidenceResidual
 from pbg.games.poker.model.primitives import FFN, LN, MHA
@@ -183,11 +183,11 @@ class PreflopMasks:
     """Optional row metadata and masks for a preflop batch."""
 
     seat_mask: Tensor | None = None  # bool [B,P]
-    class_mask: Tensor | None = None  # bool [B,P,169]
+    class_mask: Tensor | None = None  # bool [B,P,K]
     status: Tensor | None = None  # int [B,P]
-    class_ids: Tensor | None = None  # int [169] or [B,169]
-    class_embeddings: Tensor | None = None  # float [169,Dc] or [B,169,Dc]
-    evaluator_summary: Tensor | None = None  # float [B,P,169,S]
+    class_ids: Tensor | None = None  # int [K] or [B,K]
+    class_embeddings: Tensor | None = None  # float [K,Dc] or [B,K,Dc]
+    evaluator_summary: Tensor | None = None  # float [B,P,K,S]
 
 
 @dataclass
@@ -195,7 +195,7 @@ class PolicyOutput:
     """Poker model output with class rows along dimension one."""
 
     raw: dict[str, Tensor]
-    v: Tensor  # [B,169]
+    v: Tensor  # [B,K]
     vvec: Tensor | None = None  # [B,P_max]
     u: Tensor | None = None  # [B]
 
@@ -213,15 +213,25 @@ def _mask_value(masks: PreflopMasks | Mapping[str, Tensor] | Tensor | None, name
 class PreflopNet(nn.Module):
     """Pre-LN transformer over all seated-player preflop class rows."""
 
-    def __init__(self, cfg: PokerModelConfig | Mapping[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        cfg: PokerModelConfig | Mapping[str, Any] | None = None,
+        geometry: DeckGeometry | int = 13,
+    ) -> None:
         super().__init__()
         self.cfg = cfg if isinstance(cfg, PokerModelConfig) else PokerModelConfig.from_dict(cfg)
+        self.geometry = (
+            geometry if isinstance(geometry, DeckGeometry) else DeckGeometry(geometry)
+        )
+        self.n_cards = self.geometry.n_cards
+        self.n_hands = self.geometry.n_hands
+        self.n_classes = self.geometry.n_classes
         c = self.cfg
         d = c.d_model
         dc = c.class_embedding_dim
 
-        self.class_embedding = nn.Embedding(N_CLASSES, dc)
-        class_geometry_dim = 54
+        self.class_embedding = nn.Embedding(self.n_classes, dc)
+        class_geometry_dim = self.n_cards + 2
         self.class_row_affine = nn.Linear(dc + 4 + class_geometry_dim, d)
         self.seat_embedding = nn.Embedding(c.max_players, d)
         self.status_embedding = nn.Embedding(3, d)
@@ -263,30 +273,37 @@ class PreflopNet(nn.Module):
         self.value_head = ValueHead(readout_dim, feature_dim=d, hidden=c.ffn_hidden)
         self.moment_heads = MomentHeads(2 * d, d, c.ffn_hidden) if c.use_moment_heads else None
 
-        sizes = torch.tensor([class_size(k) for k in range(N_CLASSES)], dtype=torch.float32)
-        self.register_buffer("class_sizes", sizes, persistent=True)
-        combo_cards = torch.triu_indices(52, 52, offset=1).T
-        combo_class = torch.tensor(
-            [class_of_hand(hand) for hand in range(combo_cards.shape[0])], dtype=torch.long
+        sizes = torch.tensor(
+            [len(members) for members in self.geometry.class_memberships],
+            dtype=torch.float32,
         )
-        orbit = torch.zeros((N_CLASSES, 52), dtype=torch.float32)
+        self.register_buffer("class_sizes", sizes, persistent=True)
+        combo_cards = torch.tensor(self.geometry.combo_cards, dtype=torch.long)
+        combo_ordinals = combo_cards - self.geometry.first_card
+        combo_class = torch.tensor(self.geometry.class_of_combo, dtype=torch.long)
+        orbit = torch.zeros((self.n_classes, self.n_cards), dtype=torch.float32)
         orbit.index_put_(
-            (combo_class[:, None].expand(-1, 2).reshape(-1), combo_cards.reshape(-1)),
+            (
+                combo_class[:, None].expand(-1, 2).reshape(-1),
+                combo_ordinals.reshape(-1),
+            ),
             torch.ones(combo_cards.numel(), dtype=torch.float32),
             accumulate=True,
         )
         orbit = orbit / sizes[:, None]
         overlap = orbit @ orbit.T
         within = overlap.diagonal()
-        cross = (overlap.sum(1) - within) / (N_CLASSES - 1)
+        cross = (overlap.sum(1) - within) / (self.n_classes - 1)
         self.register_buffer("class_card_geometry", orbit, persistent=True)
         self.register_buffer(
             "class_overlap_scalars", torch.stack((within, cross), dim=1), persistent=True
         )
 
     def _validate_public(self, pub: PokerPublicBatch, class_ranges: Tensor) -> tuple[int, int]:
-        if class_ranges.ndim != 3 or class_ranges.shape[-1] != N_CLASSES:
-            raise ValueError("class_ranges must have shape [B,P,169]")
+        if class_ranges.ndim != 3 or class_ranges.shape[-1] != self.n_classes:
+            raise ValueError(
+                f"class_ranges must have shape [B,P,{self.n_classes}]"
+            )
         if not class_ranges.is_floating_point():
             raise TypeError("class_ranges must be floating point")
         batch, players = class_ranges.shape[:2]
@@ -373,7 +390,7 @@ class PreflopNet(nn.Module):
         if class_mask is None:
             class_mask = torch.ones_like(class_ranges, dtype=torch.bool)
         if class_mask.shape != class_ranges.shape or class_mask.dtype != torch.bool:
-            raise TypeError("class_mask must be bool [B,P,169]")
+            raise TypeError("class_mask must be bool with the class-range shape")
         class_mask = class_mask & seat_mask[:, :, None]
 
         status = _mask_value(masks, "status")
@@ -391,21 +408,23 @@ class PreflopNet(nn.Module):
 
         class_ids = _mask_value(masks, "class_ids")
         if class_ids is None:
-            class_ids = torch.arange(N_CLASSES, device=device)[None, :].expand(batch, -1)
+            class_ids = torch.arange(self.n_classes, device=device)[None, :].expand(batch, -1)
         elif class_ids.ndim == 1:
             class_ids = class_ids[None, :].expand(batch, -1)
         class_ids = class_ids.to(device=device, dtype=torch.long)
-        if class_ids.shape != (batch, N_CLASSES):
-            raise ValueError("class_ids must have shape [169] or [B,169]")
+        if class_ids.shape != (batch, self.n_classes):
+            raise ValueError(
+                f"class_ids must have shape [{self.n_classes}] or [B,{self.n_classes}]"
+            )
         _require_device(
-            ((class_ids >= 0) & (class_ids < N_CLASSES)).all(),
-            "class_ids must have shape [169] or [B,169]",
+            ((class_ids >= 0) & (class_ids < self.n_classes)).all(),
+            "class_ids are outside compact class geometry",
         )
 
         supplied_embedding = _mask_value(masks, "class_embeddings")
         if supplied_embedding is not None:
             embedding_shape = supplied_embedding.shape
-            expected = (N_CLASSES, self.cfg.class_embedding_dim)
+            expected = (self.n_classes, self.cfg.class_embedding_dim)
             batched_expected = (batch,) + expected
             if embedding_shape not in (expected, batched_expected):
                 raise ValueError("class_embeddings has the wrong shape")
@@ -416,7 +435,7 @@ class PreflopNet(nn.Module):
                 raise ValueError("evaluator_summary_dim must be configured to supply a summary")
         else:
             if summary is None or summary.shape != class_ranges.shape + (self.cfg.evaluator_summary_dim,):
-                raise ValueError("evaluator_summary must have shape [B,P,169,S]")
+                raise ValueError("evaluator_summary must have shape [B,P,K,S]")
 
         button = pub.button
         seat_ids = torch.arange(players, device=device)[None, :].expand(batch, -1)
@@ -518,7 +537,7 @@ class PreflopNet(nn.Module):
     ) -> PolicyOutput:
         """Return policy parameters and values for every actor class row.
 
-        ``class_ranges`` is float ``[B,P,169]``. ``actor_seat`` defaults to
+        ``class_ranges`` is float ``[B,P,K]``. ``actor_seat`` defaults to
         ``pub.to_act``. Masks may be :class:`PreflopMasks`, a mapping, or a
         bool seat mask directly.
         """
@@ -563,13 +582,13 @@ class PreflopNet(nn.Module):
         row = row + self.status_embedding(status)[:, :, None, :]
         actor_flag = torch.arange(players, device=row.device)[None, :] == actor[:, None]
         row = row + self.actor_embedding(actor_flag.long())[:, :, None, :]
-        row_flat = row.reshape(batch, players * N_CLASSES, d)
+        row_flat = row.reshape(batch, players * self.n_classes, d)
 
         public_token, public_mask = self._public_tokens(pub, seat_mask, relative_seats)
         actor_relative = relative_seats.gather(1, actor[:, None]).squeeze(1)
         anchors = self.anchor_tokens[None, :, :] + self.anchor_seat_embedding(actor_relative)[:, None, :]
         token = torch.cat((row_flat, public_token, anchors), dim=1)
-        row_mask_flat = class_mask.reshape(batch, players * N_CLASSES)
+        row_mask_flat = class_mask.reshape(batch, players * self.n_classes)
         key_mask = torch.cat(
             (row_mask_flat, public_mask, torch.ones((batch, c.k_act), dtype=torch.bool, device=row.device)), dim=1
         )
@@ -577,8 +596,8 @@ class PreflopNet(nn.Module):
         masked_range = class_ranges * class_mask.to(class_ranges.dtype)
         normalized = masked_range / masked_range.sum(dim=-1, keepdim=True).clamp_min(c.eps)
         key_bias = torch.zeros(token.shape[:2], dtype=torch.float32, device=token.device)
-        key_bias[:, : players * N_CLASSES] = torch.log(normalized.clamp_min(c.eps)).reshape(
-            batch, players * N_CLASSES
+        key_bias[:, : players * self.n_classes] = torch.log(normalized.clamp_min(c.eps)).reshape(
+            batch, players * self.n_classes
         ).float()
 
         side_class = torch.cat(
@@ -595,8 +614,8 @@ class PreflopNet(nn.Module):
             self.layer_norms, self.attentions, self.incidence_residuals,
             self.layer_ffns, strict=True
         ):
-            row_state = x[:, : players * N_CLASSES].reshape(
-                batch, players, N_CLASSES, d
+            row_state = x[:, : players * self.n_classes].reshape(
+                batch, players, self.n_classes, d
             )
             j, overlap_card, overlap_equal, _ = incidence(
                 row_state,
@@ -617,14 +636,16 @@ class PreflopNet(nn.Module):
                 dtype=side_rows.dtype,
                 device=token.device,
             )
-            side[:, : players * N_CLASSES] = side_rows.reshape(
-                batch, players * N_CLASSES, -1
+            side[:, : players * self.n_classes] = side_rows.reshape(
+                batch, players * self.n_classes, -1
             )
             x = x_hat + layer_ffn(torch.cat((layer_norm(x_hat), side), dim=-1))
 
         final = self.final_norm(x)
-        final_rows = final[:, : players * N_CLASSES].reshape(batch, players, N_CLASSES, d)
-        final_public = final[:, players * N_CLASSES : -c.k_act]
+        final_rows = final[:, : players * self.n_classes].reshape(
+            batch, players, self.n_classes, d
+        )
+        final_public = final[:, players * self.n_classes : -c.k_act]
         final_anchors = final[:, -c.k_act :]
         public_valid = public_mask.to(final_public.dtype)
         public_mean = (final_public * public_valid[..., None]).sum(dim=1) / public_valid.sum(dim=1, keepdim=True)
@@ -660,9 +681,9 @@ class PreflopNet(nn.Module):
         readout = torch.cat(
             (
                 actor_rows,
-                final_anchors.reshape(batch, 1, c.k_act * d).expand(-1, N_CLASSES, -1),
+                final_anchors.reshape(batch, 1, c.k_act * d).expand(-1, self.n_classes, -1),
                 class_emb,
-                global_feature[:, None, :].expand(-1, N_CLASSES, -1),
+                global_feature[:, None, :].expand(-1, self.n_classes, -1),
             ), dim=-1,
         )
         z_type = self.type_features(readout)

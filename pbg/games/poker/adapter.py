@@ -8,7 +8,7 @@ from typing import Any, Mapping
 import torch
 from torch import Tensor, nn
 
-from pbg.games.poker.cards import N_CLASSES, N_HANDS, class_of_hand, sample_uniform_complement
+from pbg.games.poker.cards import sample_uniform_complement
 from pbg.games.poker.engine import (
     ALL_IN,
     CHECK_CALL,
@@ -71,15 +71,21 @@ class PokerPolicyAdapter:
             raise ValueError("profiles and actor must have shapes [B,P] and [B]")
         actor = actor.to(device=profiles.device, dtype=torch.long)
         combo = profiles.gather(1, actor[:, None]).squeeze(1).long()
+        raw_widths = {value.shape[1] for value in raw.values() if value.ndim >= 2}
+        if len(raw_widths) != 1:
+            raise ValueError("raw policy fields must share one compact hand width")
+        n_hands = next(iter(raw_widths))
         _require_device(
-            ((combo >= 0) & (combo < N_HANDS)).all(),
+            ((combo >= 0) & (combo < n_hands)).all(),
             "the stipulated actor combo is invalid",
         )
         batch_ids = torch.arange(profiles.shape[0], device=profiles.device)
         selected: dict[str, Tensor] = {}
         for name, value in raw.items():
-            if value.shape[:2] != (profiles.shape[0], N_HANDS):
-                raise ValueError(f"raw field {name} must begin [B,1326]")
+            if value.shape[:2] != (profiles.shape[0], n_hands):
+                raise ValueError(
+                    f"raw field {name} must begin [B,{n_hands}]"
+                )
             selected[name] = value[batch_ids.to(value.device), combo.to(value.device)]
         return selected
 
@@ -301,9 +307,16 @@ class PokerModelBundle(nn.Module):
 
     def __init__(self, preflop: PreflopNet, postflop: PostflopNet) -> None:
         super().__init__()
+        if preflop.geometry != postflop.geometry:
+            raise ValueError("preflop and postflop models must share deck geometry")
         self.preflop = preflop
         self.postflop = postflop
-        combo_class = torch.tensor([class_of_hand(hand) for hand in range(N_HANDS)], dtype=torch.long)
+        self.geometry = preflop.geometry
+        self.n_hands = self.geometry.n_hands
+        self.n_classes = self.geometry.n_classes
+        combo_class = torch.tensor(
+            self.geometry.class_of_combo, dtype=torch.long
+        )
         self.register_buffer("combo_class", combo_class, persistent=True)
 
     @staticmethod
@@ -351,7 +364,7 @@ class PokerModelBundle(nn.Module):
         self, pub: PokerPublicBatch, class_ranges: Tensor, actor_seat: Tensor | None = None,
         masks: PreflopMasks | None = None,
     ) -> PolicyOutput:
-        """Run preflop and lift its 169 class rows to 1326 combo rows."""
+        """Run preflop and lift its compact class rows to compact combo rows."""
 
         output = self.preflop(pub, class_ranges, actor_seat, masks)
         return PolicyOutput(
@@ -373,8 +386,10 @@ class PokerModelBundle(nn.Module):
     ) -> PolicyOutput:
         """Route a combo-range batch and return uniformly combo-indexed rows."""
 
-        if ranges.ndim != 3 or ranges.shape[-1] != N_HANDS:
-            raise ValueError("bundle ranges must have shape [B,P,1326]")
+        if ranges.ndim != 3 or ranges.shape[-1] != self.n_hands:
+            raise ValueError(
+                f"bundle ranges must have shape [B,P,{self.n_hands}]"
+            )
         batch = ranges.shape[0]
         actor = pub.to_act if actor_seat is None else actor_seat
         pre_rows = (pub.street == 0).nonzero(as_tuple=False).squeeze(1)
@@ -382,7 +397,11 @@ class PokerModelBundle(nn.Module):
         outputs: dict[int, PolicyOutput] = {}
         if pre_rows.numel():
             selected = ranges[pre_rows]
-            class_ranges = torch.zeros(selected.shape[:2] + (N_CLASSES,), dtype=selected.dtype, device=selected.device)
+            class_ranges = torch.zeros(
+                selected.shape[:2] + (self.n_classes,),
+                dtype=selected.dtype,
+                device=selected.device,
+            )
             ids = self.combo_class.view(1, 1, -1).expand_as(selected)
             class_ranges.scatter_add_(2, ids, selected)
             lifted = self.forward_preflop(
@@ -430,14 +449,26 @@ class PokerGame:
     ) -> None:
         self.engine = engine
         self.n_players = engine.n_players
-        self.x_sizes = (N_HANDS,) * self.n_players
-        self.profile_sampler = profile_sampler or PokerGPURejectionSampler()
-        self.showdown_evaluator = showdown_evaluator or PokerGPUShowdownEvaluator()
-        self.partition_adapter = partition_adapter or PokerGPUPartitionAdapter()
+        self.geometry = engine.cfg.geometry
+        self.n_hands = self.geometry.n_hands
+        self.x_sizes = (self.n_hands,) * self.n_players
+        self.profile_sampler = profile_sampler or PokerGPURejectionSampler(
+            rank_count=self.geometry.rank_count
+        )
+        self.showdown_evaluator = showdown_evaluator or PokerGPUShowdownEvaluator(
+            rank_count=self.geometry.rank_count
+        )
+        self.partition_adapter = partition_adapter or PokerGPUPartitionAdapter(
+            rank_count=self.geometry.rank_count
+        )
         self.summary_cache: dict[object, Any] = {}
-        self.ranges = RangeState(0, self.n_players)
+        self.ranges = RangeState(
+            0, self.n_players, rank_count=self.geometry.rank_count
+        )
         self.range_state = self.ranges
-        self._combo_cards = torch.triu_indices(52, 52, offset=1).T.to(torch.int16)
+        self._combo_cards = torch.tensor(
+            self.geometry.combo_cards, dtype=torch.int16
+        )
 
     def initial_states(self, g: int) -> Tensor:
         return self.engine.initial_states(g)
@@ -445,7 +476,12 @@ class PokerGame:
     def reset_ranges(self, n_slots: int, device: torch.device | str | None = None) -> RangeState:
         """Allocate the action-likelihood slots owned by this public game."""
 
-        self.ranges = RangeState(n_slots, self.n_players, device)
+        self.ranges = RangeState(
+            n_slots,
+            self.n_players,
+            device,
+            rank_count=self.geometry.rank_count,
+        )
         self.range_state = self.ranges
         return self.ranges
 
@@ -482,7 +518,11 @@ class PokerGame:
 
     def sample_mu(self, g: int, gen: torch.Generator) -> Tensor:
         refs = self.initial_states(g)
-        reach = torch.zeros((g, self.n_players, N_HANDS), dtype=torch.float32, device=refs.device)
+        reach = torch.zeros(
+            (g, self.n_players, self.n_hands),
+            dtype=torch.float32,
+            device=refs.device,
+        )
         return self.sample_profiles(refs, reach, 1, gen)[:, 0]
 
     def sample_chance_cards(self, state_refs: Tensor, profiles: Tensor, gen: torch.Generator) -> Tensor:
@@ -501,7 +541,12 @@ class PokerGame:
             [3 if self.engine.states.street[ref] == 0 else 1 for ref in refs],
             dtype=torch.int32, device=state_refs.device,
         )
-        return sample_uniform_complement(unavailable, counts, gen)
+        return sample_uniform_complement(
+            unavailable,
+            counts,
+            gen,
+            rank_count=self.geometry.rank_count,
+        )
 
     def draw_chance(self, state_refs: Tensor, profiles: Tensor, gen: torch.Generator) -> ChanceDraw:
         cards = self.sample_chance_cards(state_refs, profiles, gen)

@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import math
+import json
+from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
+from pbg.config import load_config
+from pbg.runtime import train
 from pbg.games.poker.cards import DeckGeometry, category_profile
+from pbg.core.game import EventBatch
 from pbg.games.poker.engine import PokerConfig
+from pbg.games.poker.engine import CHECK_CALL
+from pbg.games.poker.folded import FoldSnapshotBatch, PokerGPUPartitionAdapter
 from pbg.games.poker.bundle import estimate_rollout_memory
+from pbg.games.poker.adapter import PokerModelBundle
+from pbg.games.poker.model.postflop import PostflopNet
+from pbg.games.poker.model.preflop import PokerModelConfig, PreflopNet
 from pbg.games.poker.rollout_backend import PokerRolloutBackend
 
 
@@ -115,6 +126,30 @@ def test_supported_configuration_corners(players: int, stack: float, ranks: int)
 
 
 @pytest.mark.parametrize(
+    "players,rank_count",
+    [
+        (players, rank_count)
+        for rank_count in range(4, 14)
+        for players in range(2, 7)
+        if 2 * players + 5 < 4 * rank_count
+    ],
+)
+def test_every_legal_player_and_rank_count_pair_builds_compact_rollout_state(
+    players: int, rank_count: int
+) -> None:
+    config = PokerConfig(n_players=players, stack_bb=8, rank_count=rank_count)
+    geometry = config.geometry
+    backend = PokerRolloutBackend(config, 2, "cpu")
+    state = backend.sequential_start_states(1)
+
+    assert state.shape == (1,)
+    assert backend.n_cards == geometry.n_cards
+    assert backend.n_hands == geometry.n_hands
+    assert backend.n_classes == geometry.n_classes
+    assert backend.x_sizes == (geometry.n_hands,) * players
+
+
+@pytest.mark.parametrize(
     "values,match",
     [
         ({"n_players": 1}, "n_players"),
@@ -145,6 +180,189 @@ def test_rollout_memory_uses_compact_private_width() -> None:
     assert short.frontier_reach_bytes * 1326 == full.frontier_reach_bytes * 120
 
 
-def test_reduced_deck_rollout_fails_loudly_until_model_width_is_migrated() -> None:
-    with pytest.raises(RuntimeError, match="variable hand width"):
-        PokerRolloutBackend(PokerConfig(n_players=2, stack_bb=8, rank_count=4), 4, "cpu")
+@pytest.mark.parametrize("rank_count", range(4, 14))
+def test_every_rank_count_runs_preflop_and_postflop_policy_boundaries(
+    rank_count: int,
+) -> None:
+    game_cfg = PokerConfig(n_players=2, stack_bb=8, rank_count=rank_count)
+    geometry = game_cfg.geometry
+    backend = PokerRolloutBackend(game_cfg, 16, "cpu")
+    model_cfg = PokerModelConfig(
+        d_model=4,
+        n_heads=1,
+        n_layers_pre=1,
+        n_layers_post=1,
+        m_raise=1,
+        k_act=4,
+        max_players=2,
+        class_embedding_dim=2,
+        ffn_hidden=4,
+        folder_beta_rank=min(4, geometry.n_cards),
+    )
+    model = PokerModelBundle(
+        PreflopNet(model_cfg, geometry),
+        PostflopNet(model_cfg, geometry),
+    ).eval()
+    state = backend.sequential_start_states(1)
+    reach = torch.zeros((1, 2, geometry.n_hands), dtype=torch.float32)
+    with torch.no_grad():
+        preflop = backend.policy_forward(model, state, reach)
+    assert preflop.v.shape == (1, geometry.n_hands)
+    assert all(
+        value.shape[:2] == (1, geometry.n_hands)
+        for value in preflop.raw.values()
+    )
+
+    for _ in range(2):
+        state = backend.step(
+            state,
+            EventBatch(torch.tensor([CHECK_CALL], dtype=torch.int32)),
+        )
+    cards = torch.tensor([geometry.active_cards[:3]], dtype=torch.int16)
+    parent = state
+    state = backend.step(
+        state,
+        EventBatch(torch.zeros(1, dtype=torch.int32), {"cards": cards}),
+    )
+    reach = backend.replay_chance_reach(reach, parent, state)
+    with torch.no_grad():
+        postflop = backend.policy_forward(model, state, reach)
+    assert postflop.v.shape == (1, geometry.n_hands)
+    assert all(
+        value.shape[:2] == (1, geometry.n_hands)
+        for value in postflop.raw.values()
+    )
+
+
+@pytest.mark.parametrize("rank_count", range(4, 14))
+def test_every_rank_count_runs_folded_partition_boundary(rank_count: int) -> None:
+    pytest.importorskip("poker_gpu_evaluator.pbg")
+    geometry = DeckGeometry(rank_count)
+    board = torch.tensor(
+        [[*geometry.active_cards[:3], -1, -1]], dtype=torch.int16
+    )
+    fold_board = torch.tensor(
+        [[[*geometry.active_cards[:3], 255, 255]]], dtype=torch.uint8
+    )
+    live = torch.ones((1, 2, geometry.n_hands), dtype=torch.float32)
+    folded = FoldSnapshotBatch(
+        reach_weights=torch.ones((1, 1, geometry.n_hands), dtype=torch.float32),
+        board_at_fold=fold_board,
+        line_meta=torch.zeros((1, 1, 3), dtype=torch.float32),
+        folder_mask=torch.ones((1, 1), dtype=torch.bool),
+        seat_ids=torch.tensor([[1]], dtype=torch.int64),
+    )
+
+    summary = PokerGPUPartitionAdapter(
+        beta_rank=min(4, geometry.n_cards), rank_count=rank_count
+    ).summarize(
+        board_cards=board,
+        live_range_weights=live,
+        folded=folded,
+    )
+
+    assert summary.fields["single_card_log_ratio"].shape == (1, geometry.n_cards)
+    assert summary.fields["pair_card_log_ratio"].shape == (
+        1,
+        geometry.n_cards,
+        geometry.n_cards,
+    )
+    assert summary.fields["folder_card_marginal"].shape == (
+        1,
+        1,
+        geometry.n_cards,
+    )
+    assert summary.fields["output_valid"].tolist() == [True]
+
+
+@pytest.mark.parametrize("rank_count", range(4, 14))
+def test_every_rank_count_completes_a_boundary_training_iteration(
+    rank_count: int, tmp_path: Path
+) -> None:
+    root = Path(__file__).parents[1]
+    raw = yaml.safe_load(
+        (root / "configs" / "acceptance" / "nlhe_hu_normal.yaml").read_text()
+    )
+    raw["game"]["rank_count"] = rank_count
+    raw["rollout"].update(
+        {
+            "sequential_starts": 2,
+            "node_budget": 32,
+            "family_batch_rows": 2,
+            "max_active_trajectories": 2,
+            "arena_chunk_nodes": 32,
+        }
+    )
+    raw["completion"]["backend"] = "cpu"
+    raw["model"] = {
+        "d_model": 4,
+        "n_heads": 1,
+        "n_layers_pre": 1,
+        "n_layers_post": 1,
+        "m_raise": 1,
+        "k_act": 4,
+        "max_players": 2,
+        "class_embedding_dim": 2,
+        "ffn_hidden": 4,
+        "folder_beta_rank": 4,
+    }
+    raw["training"]["minibatch_size"] = 2
+    raw["training"]["out_dir"] = str(tmp_path / f"rank_{rank_count}")
+    path = tmp_path / f"rank_{rank_count}.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    cfg = load_config(path)
+    train(cfg)
+    records = [
+        json.loads(line)
+        for line in (Path(cfg.training.out_dir) / "metrics.jsonl").read_text().splitlines()
+    ]
+    assert len(records) == 1
+    assert math.isfinite(records[0]["loss"])
+    assert records[0]["optimizer_steps"] == 1.0
+
+
+@pytest.mark.parametrize("rank_count", range(4, 14))
+def test_every_rank_count_completes_a_rao_blackwell_training_iteration(
+    rank_count: int, tmp_path: Path
+) -> None:
+    root = Path(__file__).parents[1]
+    raw = yaml.safe_load(
+        (root / "configs" / "acceptance" / "nlhe_hu_sequential_rb.yaml").read_text()
+    )
+    raw["game"]["rank_count"] = rank_count
+    raw["rollout"].update(
+        {
+            "sequential_starts": 2,
+            "node_budget": 32,
+            "family_batch_rows": 2,
+            "max_active_trajectories": 2,
+            "arena_chunk_nodes": 32,
+        }
+    )
+    raw["completion"].update({"backend": "cpu", "n_samples": 2})
+    raw["model"] = {
+        "d_model": 4,
+        "n_heads": 1,
+        "n_layers_pre": 1,
+        "n_layers_post": 1,
+        "m_raise": 1,
+        "k_act": 4,
+        "max_players": 2,
+        "class_embedding_dim": 2,
+        "ffn_hidden": 4,
+        "folder_beta_rank": 4,
+    }
+    raw["training"]["minibatch_size"] = 2
+    raw["training"]["out_dir"] = str(tmp_path / f"rb_rank_{rank_count}")
+    path = tmp_path / f"rb_rank_{rank_count}.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    cfg = load_config(path)
+    train(cfg)
+    record = json.loads(
+        (Path(cfg.training.out_dir) / "metrics.jsonl").read_text().splitlines()[0]
+    )
+    assert math.isfinite(record["loss"])
+    assert record["optimizer_steps"] == 1.0
+    assert record["completion_mean_n_eff"] > 1.99

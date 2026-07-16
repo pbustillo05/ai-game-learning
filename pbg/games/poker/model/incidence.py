@@ -36,7 +36,7 @@ class IncidenceResidual(nn.Module):
         """Return ``j, O_card, O_equal, O_own`` with shape ``[B,P,R,D]``.
 
         ``card_incidence`` is the two-hot postflop map or orbit-averaged
-        preflop map ``[B,R,52]``/``[R,52]``. ``identical_scale`` is one for
+        preflop map ``[B,R,D]``/``[R,D]``. ``identical_scale`` is one for
         combo rows and ``1/n_k`` for class-orbit rows.
         """
 
@@ -45,8 +45,12 @@ class IncidenceResidual(nn.Module):
         batch, _, row_count, _ = rows.shape
         if card_incidence.ndim == 2:
             card_incidence = card_incidence[None].expand(batch, -1, -1)
-        if card_incidence.shape != (batch, row_count, 52):
-            raise ValueError("card_incidence must have shape [R,52] or [B,R,52]")
+        if (
+            card_incidence.ndim != 3
+            or card_incidence.shape[:2] != (batch, row_count)
+            or card_incidence.shape[2] <= 0
+        ):
+            raise ValueError("card_incidence must have shape [R,D] or [B,R,D]")
         if identical_scale.ndim == 1:
             identical_scale = identical_scale[None].expand(batch, -1)
         if identical_scale.shape != (batch, row_count):

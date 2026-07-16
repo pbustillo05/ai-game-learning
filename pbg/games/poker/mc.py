@@ -15,10 +15,9 @@ import torch
 from torch import Tensor
 
 from pbg.core.completion import BatchedCompletionStats, ReachView
-from pbg.games.poker.cards import validate_evaluator_combo_cards
+from pbg.games.poker.cards import DeckGeometry, validate_evaluator_combo_cards
 from pbg.games.poker.engine import FOLDED, NLHEEngine
 
-N_COMBOS = 1326
 PAD_CARD = 255
 EXPECTED_API_VERSION = "pbg-v3"
 
@@ -67,13 +66,13 @@ class ShowdownResult:
     metadata: Mapping[str, object]
 
 
-def _load_operation(name: str) -> Callable[..., Any]:
+def _load_operation(name: str, rank_count: int) -> Callable[..., Any]:
     """Import and version-check one stable facade operation, lazily."""
 
     try:
         facade = importlib.import_module("poker_gpu_evaluator.pbg")
         api_version = facade.API_VERSION
-        combo_cards = facade.combo_cards(13)
+        combo_cards = facade.combo_cards(rank_count)
         operation = getattr(facade, name)
     except (ImportError, ModuleNotFoundError, AttributeError) as exc:
         raise RuntimeError(
@@ -85,11 +84,11 @@ def _load_operation(name: str) -> Callable[..., Any]:
             "incompatible poker_gpu_evaluator facade: expected API_VERSION "
             f"{EXPECTED_API_VERSION!r}, got {api_version!r}; update the sibling package"
         )
-    validate_evaluator_combo_cards(combo_cards)
+    validate_evaluator_combo_cards(combo_cards, rank_count)
     return operation
 
 
-def _normalize_board(board_cards: Tensor) -> Tensor:
+def _normalize_board(board_cards: Tensor, rank_count: int = 13) -> Tensor:
     if not isinstance(board_cards, Tensor):
         raise TypeError("board_cards must be a torch.Tensor")
     if board_cards.ndim != 2 or board_cards.shape[1] != 5:
@@ -102,8 +101,11 @@ def _normalize_board(board_cards: Tensor) -> Tensor:
         torch.int64,
     ):
         raise TypeError("board_cards must have an integer dtype")
+    geometry = DeckGeometry(rank_count)
     padding = (board_cards == -1) | (board_cards == PAD_CARD)  # [B,5]
-    valid = padding | ((board_cards >= 0) & (board_cards < 52))  # [B,5]
+    valid = padding | (
+        (board_cards >= geometry.first_card) & (board_cards < 52)
+    )  # [B,5]
     if not bool(valid.all()):
         raise ValueError("board_cards must contain card ids in [0,52), -1, or 255")
     after_padding = padding.to(torch.int32).cumsum(dim=1) > 0  # [B,5]
@@ -156,11 +158,14 @@ def _allocate_seeds(batch_size: int, gen: torch.Generator) -> Tensor:
     return torch.empty((batch_size,), dtype=torch.int64, device=device).random_(generator=gen)
 
 
-def _linear_reach(log_rows: Tensor, dealt_mask: Tensor) -> Tensor:
+def _linear_reach(
+    log_rows: Tensor, dealt_mask: Tensor, rank_count: int = 13
+) -> Tensor:
     if not isinstance(log_rows, Tensor):
         raise TypeError("reach rows must be a torch.Tensor")
-    if log_rows.ndim != 3 or log_rows.shape[2] != N_COMBOS:
-        raise ValueError("reach rows must have shape [B,P,1326]")
+    n_hands = DeckGeometry(rank_count).n_hands
+    if log_rows.ndim != 3 or log_rows.shape[2] != n_hands:
+        raise ValueError(f"reach rows must have shape [B,P,{n_hands}]")
     if log_rows.dtype != torch.float32:
         raise TypeError("reach rows must have dtype torch.float32")
     if dealt_mask.shape != log_rows.shape[:2] or dealt_mask.dtype != torch.bool:
@@ -174,7 +179,7 @@ def _linear_reach(log_rows: Tensor, dealt_mask: Tensor) -> Tensor:
         raise ValueError("every dealt reach row must have positive finite support")
     shifted = log_rows - torch.where(dealt_mask, row_max, torch.zeros_like(row_max))[:, :, None]
     weights = torch.where(dealt_mask[:, :, None], shifted.exp(), torch.zeros_like(shifted))
-    return weights.to(torch.float32).contiguous()  # [B,P,1326]
+    return weights.to(torch.float32).contiguous()  # [B,P,H]
 
 
 def _reach_rows(reach: ReachView | Tensor | Any) -> Tensor:
@@ -213,7 +218,7 @@ class PokerGPUCompletion:
 
     def _operation(self) -> Callable[..., Any]:
         if self._complete is None:
-            self._complete = _load_operation("complete")
+            self._complete = _load_operation("complete", self.rank_count)
         return self._complete
 
     def complete(
@@ -276,7 +281,7 @@ class PokerGPUCompletion:
         boards = torch.tensor(
             [engine.states.board[ref] for ref in refs], dtype=torch.int16, device=rows.device
         )
-        board_cards = _normalize_board(boards)
+        board_cards = _normalize_board(boards, self.rank_count)
         dealt_mask = torch.zeros((batch_size, p_max), dtype=torch.bool, device=rows.device)
         dealt_mask[:, : engine.n_players] = True
         contender_mask = torch.zeros_like(dealt_mask)
@@ -286,7 +291,7 @@ class PokerGPUCompletion:
                 dtype=torch.bool,
                 device=rows.device,
             )
-        range_weights = _linear_reach(rows, dealt_mask)
+        range_weights = _linear_reach(rows, dealt_mask, self.rank_count)
         strata = engine.pot_strata(state_refs)
         k = strata.stratum_amount.shape[1]
         stratum_players = torch.zeros(
@@ -323,23 +328,23 @@ class PokerGPUCompletion:
             metrics.record_evaluator(rows=batch_size)
         return self._validate_result(result, batch_size, p_max, k, rows.device)
 
-    @staticmethod
     def _validate_result(
-        result: Any, batch_size: int, p_max: int, k: int, device: torch.device
+        self, result: Any, batch_size: int, p_max: int, k: int, device: torch.device
     ) -> BatchedCompletionStats:
         op = "complete"
-        p_hat = _require_tensor(result, "p_hat", (batch_size, p_max, N_COMBOS), torch.float32, device, op)
-        v_hat = _require_tensor(result, "v_hat", (batch_size, p_max, N_COMBOS), torch.float32, device, op)
+        n_hands = DeckGeometry(self.rank_count).n_hands
+        p_hat = _require_tensor(result, "p_hat", (batch_size, p_max, n_hands), torch.float32, device, op)
+        v_hat = _require_tensor(result, "v_hat", (batch_size, p_max, n_hands), torch.float32, device, op)
         vvec_hat = _require_tensor(result, "vvec_hat", (batch_size, p_max), torch.float32, device, op)
         u_hat = _require_tensor(result, "u_hat", (batch_size,), torch.float32, device, op)
         n_eff = _require_tensor(result, "n_eff", (batch_size,), torch.float32, device, op)
         equity_share = _require_tensor(
-            result, "equity_share", (batch_size, p_max, N_COMBOS, k), torch.float32, device, op
+            result, "equity_share", (batch_size, p_max, n_hands, k), torch.float32, device, op
         )
-        output_valid = _require_tensor(result, "output_valid", (batch_size, p_max, N_COMBOS), torch.bool, device, op)
+        output_valid = _require_tensor(result, "output_valid", (batch_size, p_max, n_hands), torch.bool, device, op)
         sample_count = _require_tensor(result, "sample_count", (batch_size,), torch.int64, device, op)
         estimator_stddev = _require_tensor(
-            result, "estimator_stddev", (batch_size, p_max, N_COMBOS), torch.float32, device, op
+            result, "estimator_stddev", (batch_size, p_max, n_hands), torch.float32, device, op
         )
         metadata = _validate_metadata(getattr(result, "metadata", None), op)
         return BatchedCompletionStats(
@@ -379,7 +384,7 @@ class PokerGPURejectionSampler:
 
     def _operation(self) -> Callable[..., Any]:
         if self._sample is None:
-            self._sample = _load_operation("sample_joint_profiles")
+            self._sample = _load_operation("sample_joint_profiles", self.rank_count)
         return self._sample
 
     def sample(
@@ -392,7 +397,7 @@ class PokerGPURejectionSampler:
     ) -> Tensor:
         if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
             raise ValueError("n must be a positive integer")
-        board_cards = _normalize_board(board)
+        board_cards = _normalize_board(board, self.rank_count)
         if dealt_mask.dtype != torch.bool or dealt_mask.ndim != 2:
             raise TypeError("dealt_mask must be bool [B,P]")
         batch_size = dealt_mask.shape[0]
@@ -418,10 +423,14 @@ class PokerGPURejectionSampler:
 
         if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
             raise ValueError("n must be a positive integer")
-        board_cards = board if board_is_normalized else _normalize_board(board)
+        board_cards = (
+            board
+            if board_is_normalized
+            else _normalize_board(board, self.rank_count)
+        )
         if dealt_mask.dtype != torch.bool or dealt_mask.ndim != 2:
             raise TypeError("dealt_mask must be bool [B,P]")
-        range_weights = _linear_reach(reach_rows, dealt_mask)
+        range_weights = _linear_reach(reach_rows, dealt_mask, self.rank_count)
         batch_size, p_max = dealt_mask.shape
         if board_cards.shape[0] != batch_size or board_cards.device != reach_rows.device:
             raise ValueError("board, reach rows, and dealt_mask must share B and device")
@@ -476,7 +485,7 @@ class PokerGPUShowdownEvaluator:
 
     def _operation(self) -> Callable[..., Any]:
         if self._evaluate is None:
-            self._evaluate = _load_operation("evaluate_showdowns")
+            self._evaluate = _load_operation("evaluate_showdowns", self.rank_count)
         return self._evaluate
 
     def evaluate(
@@ -487,7 +496,7 @@ class PokerGPUShowdownEvaluator:
         active_mask: Tensor,
         stratum_players: Tensor,
     ) -> ShowdownResult:
-        board = _normalize_board(board_cards)
+        board = _normalize_board(board_cards, self.rank_count)
         if bool((board == PAD_CARD).any()):
             raise ValueError("fixed showdown requires a final five-card board")
         if combo_ids.dtype != torch.int32 or combo_ids.ndim != 2:

@@ -18,7 +18,6 @@ from pbg.core.execution import (
     logical_categorical_from_valid_probability,
     logical_uniform,
 )
-from pbg.games.poker.cards import N_CLASSES, N_HANDS
 from pbg.games.poker.engine import (
     ALL_IN,
     CHECK_CALL,
@@ -61,7 +60,7 @@ class CompactPokerDecisionReach:
 
     row_ptr: Tensor  # int64 [D+1]
     seat_ids: Tensor  # int64 [T]
-    log_r: Tensor  # float32 [T,1326]
+    log_r: Tensor  # float32 [T,H]
     n_rows: int
 
 
@@ -100,14 +99,14 @@ class PokerRolloutBackend:
         partition_adapter: PokerGPUPartitionAdapter | Any | None = None,
         evaluator_backend: str = "auto",
     ) -> None:
-        if cfg.rank_count != 13:
-            raise RuntimeError(
-                "compact-deck model tensors are not yet migrated to variable hand width"
-            )
         self.cfg = cfg
+        self.geometry = cfg.geometry
         self.device = torch.device(device)
         self.n_players = cfg.n_players
-        self.x_sizes = (N_HANDS,) * cfg.n_players
+        self.n_cards = self.geometry.n_cards
+        self.n_hands = self.geometry.n_hands
+        self.n_classes = self.geometry.n_classes
+        self.x_sizes = (self.n_hands,) * cfg.n_players
         self.n_ticks = cfg.n_ticks
         self.e_max = RAISE_OFFSET + cfg.n_ticks
         self.raise_unit_values = (
@@ -139,17 +138,16 @@ class PokerRolloutBackend:
         self.partition_adapter = partition_adapter or PokerGPUPartitionAdapter(
             rank_count=cfg.rank_count
         )
-        combo_cards = torch.triu_indices(52, 52, offset=1, device=self.device).T
-        self.combo_cards = combo_cards.to(torch.int16)  # [H,2]
-        a, b = combo_cards[:, 0], combo_cards[:, 1]
-        rank_a, rank_b = a // 4, b // 4
-        high_pos = 12 - torch.maximum(rank_a, rank_b)
-        low_pos = 12 - torch.minimum(rank_a, rank_b)
-        self.combo_class = torch.where(
-            (rank_a == rank_b) | ((a % 4) == (b % 4)),
-            high_pos * 13 + low_pos,
-            low_pos * 13 + high_pos,
-        ).to(torch.int64)  # [H]
+        self.combo_cards = torch.tensor(
+            self.geometry.combo_cards,
+            dtype=torch.int16,
+            device=self.device,
+        )
+        self.combo_class = torch.tensor(
+            self.geometry.class_of_combo,
+            dtype=torch.int64,
+            device=self.device,
+        )
         self.batch_size_histograms: dict[str, list[int]] = {
             "preflop": [],
             **{f"postflop_{live}": [] for live in range(2, cfg.n_players + 1)},
@@ -551,7 +549,16 @@ class PokerRolloutBackend:
         expected = torch.where(flop, 3, 1)
         real = cards >= 0
         torch._assert((real.sum(1) == expected).all(), "wrong number of chance cards")
-        torch._assert(((cards < 52) | (~real)).all(), "chance card outside deck")
+        torch._assert(
+            (
+                (
+                    (cards >= self.geometry.first_card)
+                    & (cards < 52)
+                )
+                | (~real)
+            ).all(),
+            "chance card outside deck",
+        )
         sorted_cards = torch.sort(cards.masked_fill(~real, 127), dim=1).values.to(torch.int16)
         sorted_cards = sorted_cards.masked_fill(~real, -1)
         self.states.board[rows[flop], :3] = sorted_cards[flop, :3]
@@ -725,26 +732,36 @@ class PokerRolloutBackend:
             unavailable = torch.cat((board, private), dim=1)
             valid = unavailable >= 0
             blocked = torch.zeros(
-                (board.shape[0], 52), dtype=torch.bool, device=self.device
+                (board.shape[0], self.n_cards),
+                dtype=torch.bool,
+                device=self.device,
             )
             batch = torch.arange(board.shape[0], device=self.device)[:, None].expand_as(valid)
-            blocked[batch[valid], unavailable[valid].to(torch.int64)] = True
+            blocked[
+                batch[valid],
+                unavailable[valid].to(torch.int64) - self.geometry.first_card,
+            ] = True
             if keys is None:
                 if gen is None:
                     raise RuntimeError("sampled terminal reward requires an RNG source")
                 scores = torch.rand(
-                    (board.shape[0], 52), generator=gen, device=self.device
+                    (board.shape[0], self.n_cards),
+                    generator=gen,
+                    device=self.device,
                 )
             else:
                 showdown_keys = keys[showdown]
                 card_ordinals = torch.arange(
-                    1, 53, dtype=torch.int64, device=self.device
+                    1, self.n_cards + 1, dtype=torch.int64, device=self.device
                 )
                 scores = logical_uniform(
                     child_path_keys(showdown_keys[:, None], card_ordinals[None, :])
                 )
             scores = scores.masked_fill(blocked, torch.inf)
-            runout = torch.argsort(scores, dim=1)[:, :5].to(torch.int16)
+            runout = (
+                torch.argsort(scores, dim=1)[:, :5]
+                + self.geometry.first_card
+            ).to(torch.int16)
             missing = board < 0
             missing_rank = (missing.to(torch.int64).cumsum(1) - 1).clamp_min(0)
             complete_board = torch.where(
@@ -800,12 +817,25 @@ class PokerRolloutBackend:
         private = self.combo_cards[profiles.to(torch.int64)].reshape(states.shape[0], -1)
         unavailable = torch.cat((board, private), dim=1)  # [B,5+2P]
         valid = unavailable >= 0
-        blocked = torch.zeros((states.shape[0], 52), dtype=torch.bool, device=self.device)
+        blocked = torch.zeros(
+            (states.shape[0], self.n_cards),
+            dtype=torch.bool,
+            device=self.device,
+        )
         batch_rows = torch.arange(states.shape[0], device=self.device)[:, None].expand_as(valid)
-        blocked[batch_rows[valid], unavailable[valid].to(torch.int64)] = True
-        keys = torch.rand((states.shape[0], 52), generator=gen, device=self.device)
+        blocked[
+            batch_rows[valid],
+            unavailable[valid].to(torch.int64) - self.geometry.first_card,
+        ] = True
+        keys = torch.rand(
+            (states.shape[0], self.n_cards),
+            generator=gen,
+            device=self.device,
+        )
         keys.masked_fill_(blocked, torch.inf)
-        draw = torch.argsort(keys, dim=1)[:, :3].to(torch.int16)  # [B,3]
+        draw = (
+            torch.argsort(keys, dim=1)[:, :3] + self.geometry.first_card
+        ).to(torch.int16)  # [B,3]
         count = torch.where(self.states.street[rows] == 0, 3, 1)
         keep = torch.arange(3, device=self.device)[None, :] < count[:, None]
         cards = draw.masked_fill(~keep, -1)  # [B,3]
@@ -846,13 +876,24 @@ class PokerRolloutBackend:
         private = self.combo_cards[profiles.to(torch.int64)].reshape(states.shape[0], -1)
         unavailable = torch.cat((board, private), dim=1)
         valid = unavailable >= 0
-        blocked = torch.zeros((states.shape[0], 52), dtype=torch.bool, device=self.device)
+        blocked = torch.zeros(
+            (states.shape[0], self.n_cards),
+            dtype=torch.bool,
+            device=self.device,
+        )
         batch_rows = torch.arange(states.shape[0], device=self.device)[:, None].expand_as(valid)
-        blocked[batch_rows[valid], unavailable[valid].to(torch.int64)] = True
-        card_ordinals = torch.arange(1, 53, dtype=torch.int64, device=self.device)
+        blocked[
+            batch_rows[valid],
+            unavailable[valid].to(torch.int64) - self.geometry.first_card,
+        ] = True
+        card_ordinals = torch.arange(
+            1, self.n_cards + 1, dtype=torch.int64, device=self.device
+        )
         card_keys = child_path_keys(keys[:, None], card_ordinals[None, :])
         scores = logical_uniform(card_keys).masked_fill(blocked, torch.inf)
-        draw = torch.argsort(scores, dim=1)[:, :3].to(torch.int16)
+        draw = (
+            torch.argsort(scores, dim=1)[:, :3] + self.geometry.first_card
+        ).to(torch.int16)
         count = torch.where(self.states.street[rows] == 0, 3, 1)
         keep = torch.arange(3, device=self.device)[None, :] < count[:, None]
         cards = draw.masked_fill(~keep, -1)
@@ -914,9 +955,9 @@ class PokerRolloutBackend:
         self._validate_handles(parent_states)
         self._validate_handles(child_states)
         if reach.ndim != 3 or reach.shape != (
-            parent_states.shape[0], self.n_players, N_HANDS
+            parent_states.shape[0], self.n_players, self.n_hands
         ):
-            raise ValueError("reach must have shape [B,P,1326]")
+            raise ValueError("reach has the wrong compact hand width")
         if parent_states.shape != child_states.shape:
             raise ValueError("parent_states and child_states must have matching shapes")
         child_board = self.states.board[child_states.to(torch.int64)]  # [B,5]
@@ -1099,16 +1140,23 @@ class PokerRolloutBackend:
         live = (self.states.status[rows] != FOLDED).sum(1).to(torch.int64)
         history = self.states.history_length[rows].to(torch.int64)
         scalar_count = 3 * self.n_players + 13 + self.e_max + self.n_ticks
-        pre_tokens = self.n_players * N_CLASSES + scalar_count + 1 + history + k_act
-        combo_count = torch.where(
-            street == 1,
-            torch.full_like(street, 1176),
-            torch.where(
-                street == 2,
-                torch.full_like(street, 1128),
-                torch.full_like(street, 1081),
-            ),
+        pre_tokens = (
+            self.n_players * self.n_classes
+            + scalar_count
+            + 1
+            + history
+            + k_act
         )
+        combo_count = torch.tensor(
+            [
+                self.n_hands,
+                math.comb(self.n_cards - 3, 2),
+                math.comb(self.n_cards - 4, 2),
+                math.comb(self.n_cards - 5, 2),
+            ],
+            dtype=torch.int64,
+            device=self.device,
+        )[street.clamp(0, 3)]
         post_tokens = live * combo_count + scalar_count + 6 + history + k_act
         return (
             torch.where(street == 0, pre_tokens, post_tokens),
@@ -1136,11 +1184,23 @@ class PokerRolloutBackend:
         live = (self.states.status[rows] != FOLDED).sum(1).to(torch.int64)
         history = self.states.history_length[rows].to(torch.int64)
         scalar_count = 3 * self.n_players + 13 + self.e_max + self.n_ticks
-        pre_tokens = self.n_players * N_CLASSES + scalar_count + 1 + history + k_act
+        pre_tokens = (
+            self.n_players * self.n_classes
+            + scalar_count
+            + 1
+            + history
+            + k_act
+        )
         # post_A deliberately mixes flop/turn/river in one invocation. Its
         # compact tensor is therefore padded to the flop width for every row;
         # only the realized history component varies within the family.
-        post_tokens = live * math.comb(49, 2) + scalar_count + 6 + history + k_act
+        post_tokens = (
+            live * math.comb(self.n_cards - 3, 2)
+            + scalar_count
+            + 6
+            + history
+            + k_act
+        )
         tokens = torch.where(street == 0, pre_tokens, post_tokens)
         return tokens, torch.zeros_like(tokens)
 
@@ -1192,8 +1252,8 @@ class PokerRolloutBackend:
         self._validate_handles(states)
         if states.ndim != 1 or states.numel() == 0:
             raise ValueError("a family policy call requires a nonempty state vector")
-        if reach.shape != (states.shape[0], self.n_players, N_HANDS):
-            raise ValueError("reach must have shape [B,P,1326]")
+        if reach.shape != (states.shape[0], self.n_players, self.n_hands):
+            raise ValueError("reach has the wrong compact hand width")
         rows = states.to(torch.int64)
         street = self.states.street[rows]
         live = (self.states.status[rows] != FOLDED).sum(1)
@@ -1221,7 +1281,7 @@ class PokerRolloutBackend:
         positions = torch.arange(states.numel(), device=self.device)
         if family == "pre":
             class_ranges = torch.zeros(
-                (states.numel(), self.n_players, N_CLASSES),
+                (states.numel(), self.n_players, self.n_classes),
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -1229,7 +1289,7 @@ class PokerRolloutBackend:
             class_ranges.scatter_add_(2, class_ids, weights)
             masks = PreflopMasks(seat_mask=pub.seat_mask, status=pub.status)
             output = frozen_model.forward_preflop(pub, class_ranges, pub.to_act, masks)
-            if output.v.shape[1] == N_CLASSES:
+            if output.v.shape[1] == self.n_classes:
                 output = PolicyOutput(
                     raw={
                         name: value[:, self.combo_class]
@@ -1271,7 +1331,7 @@ class PokerRolloutBackend:
                 live_seat_ids=live_seat_ids,
                 # Flop has the widest compatible set. Turn/river rows are
                 # padded and masked inside this same post_A invocation.
-                compact_size=math.comb(49, 2),
+                compact_size=math.comb(self.n_cards - 3, 2),
             )
             output = frozen_model.forward_postflop(pub, weights, pub.to_act, masks)
             self.batch_size_histograms[f"postflop_{expected_live}"].append(
@@ -1396,7 +1456,7 @@ class PokerRolloutBackend:
         scalar_count = 3 * self.n_players + 13 + self.e_max + self.n_ticks
         if family == "pre":
             return (
-                self.n_players * N_CLASSES
+                self.n_players * self.n_classes
                 + scalar_count
                 + 1
                 + self.max_rollout_steps
@@ -1404,7 +1464,7 @@ class PokerRolloutBackend:
             )
         live = int(family.removeprefix("post_"))
         return (
-            live * math.comb(49, 2)
+            live * math.comb(self.n_cards - 3, 2)
             + scalar_count
             + 6
             + self.max_rollout_steps
@@ -1417,8 +1477,8 @@ class PokerRolloutBackend:
         """Discard folded full ranges after their final rollout/completion use."""
 
         self._validate_handles(states)
-        if reach.shape != (states.numel(), self.n_players, N_HANDS):
-            raise ValueError("reach must have shape [D,P,1326]")
+        if reach.shape != (states.numel(), self.n_players, self.n_hands):
+            raise ValueError("reach has the wrong compact hand width")
         rows = states.to(device=self.device, dtype=torch.int64)
         live = self.states.status[rows] != FOLDED  # [D,P]
         counts = live.sum(1, dtype=torch.int64)
@@ -1460,7 +1520,7 @@ class PokerRolloutBackend:
         offsets = torch.arange(batch_rows.numel(), device=self.device) - output_starts
         source = repeated_starts + offsets
         result = torch.full(
-            (rows.numel(), self.n_players, N_HANDS),
+            (rows.numel(), self.n_players, self.n_hands),
             -torch.inf,
             dtype=torch.float32,
             device=self.device,
@@ -1474,8 +1534,8 @@ class PokerRolloutBackend:
         """Route one already-budgeted street-family policy batch."""
 
         self._validate_handles(states)
-        if reach.shape != (states.shape[0], self.n_players, N_HANDS):
-            raise ValueError("reach must have shape [B,P,1326]")
+        if reach.shape != (states.shape[0], self.n_players, self.n_hands):
+            raise ValueError("reach has the wrong compact hand width")
         finite = torch.isfinite(reach)
         gauge = reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
         weights = torch.exp(reach - gauge).masked_fill(~finite, 0.0)  # [B,P,H]
@@ -1488,7 +1548,7 @@ class PokerRolloutBackend:
         if preflop.numel():
             selected = weights[preflop]
             class_ranges = torch.zeros(
-                (preflop.shape[0], self.n_players, N_CLASSES),
+                (preflop.shape[0], self.n_players, self.n_classes),
                 dtype=torch.float32, device=self.device,
             )  # [Bp,P,K]
             class_ids = self.combo_class[None, None, :].expand_as(selected)
@@ -1501,7 +1561,7 @@ class PokerRolloutBackend:
             output = frozen_model.forward_preflop(
                 pre_pub, class_ranges, pre_pub.to_act, masks
             )
-            if output.v.shape[1] == N_CLASSES:
+            if output.v.shape[1] == self.n_classes:
                 output = PolicyOutput(
                     raw={name: value[:, self.combo_class] for name, value in output.raw.items()},
                     v=output.v[:, self.combo_class], vvec=output.vvec, u=output.u,
@@ -1528,7 +1588,9 @@ class PokerRolloutBackend:
             post_street = self.states.street[rows[post]]
             n_live = (self.states.status[rows[post]] != FOLDED).sum(1)
             for street in range(1, RIVER + 1):
-                compact_size = math.comb(52 - (street + 2), 2)
+                compact_size = math.comb(
+                    self.n_cards - (street + 2), 2
+                )
                 for live in range(2, self.n_players + 1):
                     positions = post[(post_street == street) & (n_live == live)]
                     if positions.numel() == 0:
@@ -1629,7 +1691,7 @@ class PokerRolloutBackend:
         folded_mask = status == FOLDED
         order = torch.argsort(folded_mask.to(torch.int32), dim=1)
         ordered = weights.gather(
-            1, order[:, :, None].expand(-1, -1, N_HANDS)
+            1, order[:, :, None].expand(-1, -1, self.n_hands)
         )  # [B,P,H]
         live_weights = ordered[:, :n_live].contiguous()  # [B,L,H]
         folded_weights = ordered[:, n_live:].contiguous()  # [B,F,H]
@@ -1692,14 +1754,14 @@ class PokerRolloutBackend:
         """Build device-local tensors for the public sibling completion facade.
 
         ``states`` is int32 ``[B]`` and ``reach`` is log reach
-        float32 ``[B,P,1326]``.  Returned fields match the tensor arguments of
+        float32 ``[B,P,H]``.  Returned fields match the tensor arguments of
         ``poker_gpu_evaluator.pbg.complete`` except for caller-owned seed and
         completion configuration.
         """
 
         self._validate_handles(states)
-        if reach.shape != (states.shape[0], self.n_players, N_HANDS):
-            raise ValueError("reach must have shape [B,P,1326]")
+        if reach.shape != (states.shape[0], self.n_players, self.n_hands):
+            raise ValueError("reach has the wrong compact hand width")
         rows = states.to(torch.int64)
         dealt = torch.ones(
             (states.shape[0], self.n_players), dtype=torch.bool, device=self.device

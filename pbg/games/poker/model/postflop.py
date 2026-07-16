@@ -8,7 +8,7 @@ from typing import Mapping
 import torch
 from torch import Tensor, nn
 
-from pbg.games.poker.cards import N_HANDS
+from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.folded import PartitionSummaryBatch
 from pbg.games.poker.model.heads import MomentHeads, RaiseMixtureHead, TypeHead, ValueHead
 from pbg.games.poker.model.incidence import (
@@ -27,8 +27,8 @@ from pbg.games.poker.model.primitives import FFN, LN, MHA
 class PostflopMasks:
     """Representation-boundary inputs for compact postflop tokenization.
 
-    ``compatibility`` is the required public bool map ``[B,1326]``.
-    ``combo_mask`` may further mask player rows as bool ``[B,P,1326]``.
+    ``compatibility`` is the required public bool map ``[B,H]``.
+    ``combo_mask`` may further mask player rows as bool ``[B,P,H]``.
     Evaluator summaries may be a ready row tensor or an opaque field mapping;
     fields are only gathered, flattened, concatenated, and learned-projected.
     """
@@ -109,17 +109,22 @@ def _summary_fields(
 
 
 def suit_row_permutation(
-    permutation: tuple[int, int, int, int], device: torch.device | str | None = None
+    permutation: tuple[int, int, int, int],
+    device: torch.device | str | None = None,
+    *,
+    rank_count: int = 13,
 ) -> Tensor:
     """Return the old-to-new combo-row map for a suit relabeling."""
 
     if tuple(sorted(permutation)) != (0, 1, 2, 3):
         raise ValueError("permutation must contain each suit exactly once")
-    cards = torch.triu_indices(52, 52, offset=1).T
+    geometry = DeckGeometry(rank_count)
+    cards = torch.tensor(geometry.combo_cards, dtype=torch.long)
     mapped = (cards // 4) * 4 + torch.tensor(permutation)[cards % 4]
-    low, high = mapped.min(dim=1).values, mapped.max(dim=1).values
-    # Lexicographic triangular-row offset, purely a representation transform.
-    row = low * 51 - low * (low - 1) // 2 + (high - low - 1)
+    row = torch.tensor(
+        [geometry.hand_index(int(a), int(b)) for a, b in mapped],
+        dtype=torch.long,
+    )
     return row.to(device=device, dtype=torch.long)
 
 
@@ -129,10 +134,13 @@ def permute_suit_representation(
     permutation: tuple[int, int, int, int],
     *,
     row_dim: int = 1,
+    rank_count: int = 13,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Relabel board ids and fixed-width combo-row tensors consistently."""
 
-    row_map = suit_row_permutation(permutation, board.device)
+    row_map = suit_row_permutation(
+        permutation, board.device, rank_count=rank_count
+    )
     valid = board >= 0
     mapped_board = board.clone()
     mapped_board[valid] = (board[valid] // 4) * 4 + torch.tensor(
@@ -149,12 +157,25 @@ class PostflopNet(nn.Module):
 
     requires_partition_summary = True
 
-    def __init__(self, cfg: PokerModelConfig | Mapping[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        cfg: PokerModelConfig | Mapping[str, object] | None = None,
+        geometry: DeckGeometry | int = 13,
+    ) -> None:
         super().__init__()
         self.cfg = cfg if isinstance(cfg, PokerModelConfig) else PokerModelConfig.from_dict(cfg)
+        self.geometry = (
+            geometry if isinstance(geometry, DeckGeometry) else DeckGeometry(geometry)
+        )
+        self.n_cards = self.geometry.n_cards
+        self.n_hands = self.geometry.n_hands
         c = self.cfg
+        if c.folder_beta_rank > self.n_cards:
+            raise ValueError(
+                "folder_beta_rank cannot exceed the active compact deck size"
+            )
         d, dc = c.d_model, c.class_embedding_dim
-        geo_dim = 52 + 2 * c.folder_beta_rank
+        geo_dim = self.n_cards + 2 * c.folder_beta_rank
         self.rank_embedding = nn.Embedding(13, dc)
         self.suit_embedding = nn.Embedding(4, dc)
         self.combo_features = FFN(3 * dc, dc, c.ffn_hidden)
@@ -163,7 +184,7 @@ class PostflopNet(nn.Module):
             3 + dc + geo_dim + d + 1 + (dc if self.summary_projection else 0), d
         )
         self.folder_context = FFN(1 + c.folder_line_dim, d, c.ffn_hidden)
-        self.tight_delta_projection = nn.Linear(52, d, bias=False)
+        self.tight_delta_projection = nn.Linear(self.n_cards, d, bias=False)
         self.tight_contraction_projection = nn.Linear(1, d, bias=False)
         self.seat_embedding = nn.Embedding(c.max_players, d)
         self.status_embedding = nn.Embedding(3, d)
@@ -203,9 +224,12 @@ class PostflopNet(nn.Module):
         self.raise_head = RaiseMixtureHead(d, c.m_raise, c.s_min)
         self.value_head = ValueHead(readout_dim, feature_dim=d, hidden=c.ffn_hidden)
         self.moment_heads = MomentHeads(2 * d, d, c.ffn_hidden) if c.use_moment_heads else None
-        self.register_buffer("combo_cards", torch.triu_indices(52, 52, offset=1).T, persistent=True)
-        two_hot = torch.zeros((N_HANDS, 52), dtype=torch.float32)
-        two_hot.scatter_(1, self.combo_cards.cpu(), 1.0)
+        combo_cards = torch.tensor(self.geometry.combo_cards, dtype=torch.long)
+        self.register_buffer("combo_cards", combo_cards, persistent=True)
+        combo_ordinals = combo_cards - self.geometry.first_card
+        self.register_buffer("combo_ordinals", combo_ordinals, persistent=True)
+        two_hot = torch.zeros((self.n_hands, self.n_cards), dtype=torch.float32)
+        two_hot.scatter_(1, combo_ordinals, 1.0)
         self.register_buffer("combo_two_hot", two_hot, persistent=True)
 
     def _folded_geometry(
@@ -219,7 +243,7 @@ class PostflopNet(nn.Module):
         batch, compact = mapping.batch_size, mapping.compact_size
         device = mapping.compact_to_full.device
         combo_ids = mapping.compact_to_full
-        cards = self.combo_cards[combo_ids]
+        cards = self.combo_ordinals[combo_ids]
         geometry = self.combo_two_hot[combo_ids].to(dtype)
         fields: Mapping[str, Tensor] | None
         if isinstance(summary, PartitionSummaryBatch) or hasattr(summary, "fields"):
@@ -234,13 +258,15 @@ class PostflopNet(nn.Module):
         if alpha is None:
             lambda_hand = torch.zeros((batch, compact), dtype=dtype, device=device)
         else:
-            if alpha.shape != (batch, 52):
-                raise ValueError("single_card_log_ratio must have shape [B,52]")
+            if alpha.shape != (batch, self.n_cards):
+                raise ValueError(
+                    f"single_card_log_ratio must have shape [B,{self.n_cards}]"
+                )
             alpha = alpha.to(device=device, dtype=dtype)
             lambda_hand = alpha.gather(1, cards[..., 0]) + alpha.gather(1, cards[..., 1])
         if beta is not None:
-            if beta.shape != (batch, 52, 52):
-                raise ValueError("pair_card_log_ratio must have shape [B,52,52]")
+            if beta.shape != (batch, self.n_cards, self.n_cards):
+                raise ValueError("pair_card_log_ratio has the wrong deck width")
             beta = beta.to(device=device, dtype=torch.float32)
             batch_ids = torch.arange(batch, device=device)[:, None]
             lambda_hand = lambda_hand + beta[
@@ -256,7 +282,9 @@ class PostflopNet(nn.Module):
                     raise ValueError("beta eigenvalue/vector fields must be supplied together")
                 if supplied_value.shape[0] != batch or supplied_value.shape[1] < rank:
                     raise ValueError("beta_eigenvalue has insufficient rank")
-                if supplied_vector.shape != (batch, 52, supplied_value.shape[1]):
+                if supplied_vector.shape != (
+                    batch, self.n_cards, supplied_value.shape[1]
+                ):
                     raise ValueError("beta_eigenvector has the wrong shape")
                 selected_value = supplied_value[:, :rank].to(device=device, dtype=torch.float32)
                 selected_vector = supplied_vector[:, :, :rank].to(device=device, dtype=torch.float32)
@@ -266,7 +294,7 @@ class PostflopNet(nn.Module):
                 indices = torch.topk(eigenvalue.abs(), k=rank, dim=1).indices
                 selected_value = eigenvalue.gather(1, indices)
                 selected_vector = eigenvector.gather(
-                    2, indices[:, None, :].expand(-1, 52, -1)
+                    2, indices[:, None, :].expand(-1, self.n_cards, -1)
                 )
             else:
                 selected_value = None
@@ -288,7 +316,12 @@ class PostflopNet(nn.Module):
                 raise TypeError("output_valid must be bool [B]")
             lambda_hand = lambda_hand.masked_fill(~valid[:, None], 0.0)
             geometry = torch.cat(
-                (geometry[..., :52], geometry[..., 52:].masked_fill(~valid[:, None, None], 0.0)),
+                (
+                    geometry[..., : self.n_cards],
+                    geometry[..., self.n_cards :].masked_fill(
+                        ~valid[:, None, None], 0.0
+                    ),
+                ),
                 dim=-1,
             )
         lambda_hand = lambda_hand.masked_fill(~mapping.valid, 0.0)
@@ -327,11 +360,14 @@ class PostflopNet(nn.Module):
         card_marginal = fields.get("folder_card_marginal")
         supplied_delta = fields.get("folder_delta")
         if card_marginal is None and (
-            single is None or single.shape != (batch, folder_count, 52)
+            single is None
+            or single.shape != (batch, folder_count, self.n_cards)
         ):
             raise ValueError("folder card marginals or single-card ratios are required")
-        if card_marginal is not None and card_marginal.shape != (batch, folder_count, 52):
-            raise ValueError("folder_card_marginal must have shape [B,F,52]")
+        if card_marginal is not None and card_marginal.shape != (
+            batch, folder_count, self.n_cards
+        ):
+            raise ValueError("folder_card_marginal has the wrong deck width")
         if line is None or line.shape != (batch, folder_count, self.cfg.folder_line_dim):
             raise ValueError("folder_line_meta has the wrong shape")
         if mask is None or mask.shape != (batch, folder_count) or mask.dtype != torch.bool:
@@ -356,7 +392,7 @@ class PostflopNet(nn.Module):
             else card_marginal.to(device=device, dtype=dtype)
         ) * mask[..., None]
         card_pressure = torch.einsum("bfc,bfd->bcd", unnormalized, context)
-        cards = self.combo_cards[mapping.compact_to_full]
+        cards = self.combo_ordinals[mapping.compact_to_full]
         pressure = card_pressure.gather(
             1, cards[..., 0, None].expand(-1, -1, self.cfg.d_model)
         ) + card_pressure.gather(
@@ -373,15 +409,22 @@ class PostflopNet(nn.Module):
                 safe_seat[..., None].expand(-1, -1, self.cfg.d_model),
                 context + folder_pool,
             )
+        board_ordinal = (board - self.geometry.first_card).clamp(
+            0, self.n_cards - 1
+        ).long()
         board_indicator = torch.nn.functional.one_hot(
-            board.clamp(0, 51).long(), 52
+            board_ordinal, self.n_cards
         ).bool() & (board >= 0)[..., None]
         available = ~board_indicator.any(1)
         real_count = (board >= 0).sum(1)
-        uniform = available.to(dtype) * (2.0 / (52 - real_count).to(dtype))[:, None]
+        uniform = available.to(dtype) * (
+            2.0 / (self.n_cards - real_count).to(dtype)
+        )[:, None]
         if supplied_delta is not None:
-            if supplied_delta.shape != (batch, folder_count, 52):
-                raise ValueError("folder_delta must have shape [B,F,52]")
+            if supplied_delta.shape != (
+                batch, folder_count, self.n_cards
+            ):
+                raise ValueError("folder_delta has the wrong deck width")
             delta = supplied_delta.to(device=device, dtype=dtype) * mask[..., None]
         else:
             delta = (marginal - uniform[:, None, :]) * mask[..., None]
@@ -409,11 +452,11 @@ class PostflopNet(nn.Module):
     def _combo_embedding(self, ids: Tensor, supplied: Tensor | None, dtype: torch.dtype) -> Tensor:
         batch, compact = ids.shape
         if supplied is not None:
-            expected = (N_HANDS, self.cfg.class_embedding_dim)
+            expected = (self.n_hands, self.cfg.class_embedding_dim)
             if supplied.shape == expected:
                 supplied = supplied[None].expand(batch, -1, -1)
             if supplied.shape != (batch,) + expected:
-                raise ValueError("combo_embeddings must have shape [1326,Dc] or [B,1326,Dc]")
+                raise ValueError("combo_embeddings has the wrong compact hand width")
             return supplied.to(device=ids.device, dtype=dtype).gather(
                 1, ids[..., None].expand(-1, -1, supplied.shape[-1])
             )
@@ -424,13 +467,24 @@ class PostflopNet(nn.Module):
     def _validate(
         self, pub: PokerPublicBatch, ranges: Tensor, actor_seat: Tensor | None, masks: PostflopMasks
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, CompactMap]:
-        if ranges.ndim != 3 or ranges.shape[-1] != N_HANDS or not ranges.is_floating_point():
-            raise ValueError("combo_ranges must be floating point [B,P,1326]")
+        if (
+            ranges.ndim != 3
+            or ranges.shape[-1] != self.n_hands
+            or not ranges.is_floating_point()
+        ):
+            raise ValueError(
+                f"combo_ranges must be floating point [B,P,{self.n_hands}]"
+            )
         batch, players = ranges.shape[:2]
         if players > self.cfg.max_players:
             raise ValueError("combo_ranges has more seats than max_players")
-        if masks.compatibility.shape != (batch, N_HANDS) or masks.compatibility.dtype != torch.bool:
-            raise TypeError("compatibility must be bool [B,1326]")
+        if (
+            masks.compatibility.shape != (batch, self.n_hands)
+            or masks.compatibility.dtype != torch.bool
+        ):
+            raise TypeError(
+                f"compatibility must be bool [B,{self.n_hands}]"
+            )
         if masks.compatibility.device != ranges.device:
             raise ValueError("compatibility and ranges must share a device")
         actor = pub.to_act if actor_seat is None else actor_seat
@@ -465,7 +519,7 @@ class PostflopNet(nn.Module):
         if combo_mask is None:
             combo_mask = masks.compatibility[:, None, :].expand(-1, players, -1)
         if combo_mask.shape != ranges.shape or combo_mask.dtype != torch.bool:
-            raise TypeError("combo_mask must be bool [B,P,1326]")
+            raise TypeError("combo_mask must be bool with the range shape")
         combo_mask = combo_mask & masks.compatibility[:, None, :] & seat_mask[:, :, None]
         _require_device(
             combo_mask[
@@ -696,7 +750,7 @@ class PostflopNet(nn.Module):
         key_mask = torch.cat((row_mask, public_mask, torch.ones((batch, c.k_act), dtype=torch.bool, device=row.device)), dim=1)
         key_bias = torch.zeros(token.shape[:2], dtype=torch.float32, device=token.device)
         key_bias[:, :row_flat.shape[1]] = corrected_log_reach.reshape(batch, -1).float()
-        beta_square = expanded_geometry[..., 52:].square()
+        beta_square = expanded_geometry[..., self.n_cards :].square()
         side_parts = [
             expanded_combo, compact_ranges[..., None], log_range[..., None],
             corrected_log_reach[..., None], expanded_geometry, beta_square,
@@ -720,7 +774,7 @@ class PostflopNet(nn.Module):
             j, overlap_card, overlap_equal, _ = incidence(
                 row_state,
                 incidence_mass,
-                folded_geometry[..., :52],
+                folded_geometry[..., : self.n_cards],
                 identical_scale,
             )
             normalized_x = norm(x)
