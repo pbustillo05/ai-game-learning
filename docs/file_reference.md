@@ -27,17 +27,26 @@
 - `minibatch.py` — aligned RB row sampling and gathering.
 - `losses.py` — PPO/RB-PPO, value, entropy, reference KL, and metrics.
 - `distributed.py` — exact decision-mass scaling helpers.
+- `optimization.py` — flat gradient SUM, common finite decision, clipping,
+  optimizer mutation, and scaler transition.
+- `checkpointing.py` — atomic payloads, per-rank RNG, scientific identity, and
+  metrics-prefix validation.
 - `observability.py` — execution, transfer, synchronization, evaluator, and
   memory counters.
-- `training.py` — iteration construction, learner, AMP/gradient `SUM`, memory
-  preflight, checkpoint/resume, and metrics.
+- `training.py` — iteration/learner orchestration, precision contexts, memory
+  preflight, and metrics.
 - `logging_util.py` — JSONL and optional W&B support.
 
 ## NLHE package
 
 - `cards.py` — compact deck/combo/class geometry and masks.
 - `engine.py` — independent CPU public NLHE navigation and pot accounting.
-- `tensor_state.py` — preallocated device public-state storage.
+- `tensor_state.py` — preallocated device public-state and binary-lift history
+  storage.
+- `model_inputs.py` — bounded batched device history materialization.
+- `partition_cache.py` — fixed device-indexed folded-summary cache.
+- `policy_planning.py` — hardware-bounded family packing and declared scheduler
+  control transfer.
 - `rollout_backend.py` — tensor transitions, family inputs/forwards, reach
   updates, sampling, beta, terminal rewards, and evaluator inputs.
 - `ranges.py` — CPU/evaluation reach and fold snapshot support.

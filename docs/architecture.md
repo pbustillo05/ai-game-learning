@@ -117,6 +117,10 @@ control transfers—including the one fixed mixed-row policy-planning block—ar
 measured; undeclared synchronization is separately counted and forbidden by
 acceptance gates.
 
+The hardware profile's precision applies consistently to frozen rollout-policy,
+identity-replay, and learner forwards. Completion and posterior/value reduction
+remain fp32 outside autocast.
+
 The NLHE bundle preflights rollout storage. Training adds execution, completion,
 target, and optimizer plans. Hardware profiles cap attention work, memory
 fraction, and reserve. First-iteration calibration reports allocated/reserved
