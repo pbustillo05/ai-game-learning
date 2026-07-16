@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from pbg.core.losses import l_clip, ppo, l_v, l_v_clip, rb_ppo
+from pbg.core.losses import _entropy_coefficient, l_clip, ppo, l_v, l_v_clip, rb_ppo
 from pbg.core.minibatch import MinibatchSample
 from pbg.core.normal import NormalMinibatch
 from pbg.core.values import NodeTargets
@@ -185,3 +186,67 @@ def test_normal_and_rb_modes_use_the_same_exact_kl_term() -> None:
         rtol=0,
     )
     torch.testing.assert_close(normal_gradient, rb_gradient, atol=1e-12, rtol=0)
+
+
+@torch.no_grad()
+def test_linear_entropy_schedule_uses_training_horizon_in_both_composites() -> None:
+    logits, adapter, _, rb_sample, loss_cfg = _fixture()
+    loss_cfg.c_v = 0.0
+    loss_cfg.c_h = 0.01
+    loss_cfg.entropy_schedule = "linear_decay"
+    root_cfg = SimpleNamespace(
+        loss=loss_cfg,
+        training=SimpleNamespace(iters=100),
+    )
+    rb_sample.targets.a_hat.zero_()
+    rb_output = PolicyOutput(logits, rb_sample.old_v)
+
+    actor_type = torch.tensor([0], dtype=torch.int64)
+    normal_sample = NormalMinibatch(
+        state_refs=torch.tensor([0], dtype=torch.int32),
+        reach=torch.zeros((1, 1, 2)),
+        actor_type=actor_type,
+        event=torch.tensor([0], dtype=torch.int32),
+        old_logp=adapter.log_prob(
+            rb_output,
+            torch.tensor([[0]], dtype=torch.int32),
+            rb_sample.legal_event_ids,
+            rb_sample.legal_event_mask,
+        )[0, 0, 0][None],
+        old_v=rb_output.v[:, 0],
+        advantage=torch.zeros(1, dtype=logits.dtype),
+        v_target=rb_output.v[:, 0],
+        legal_event_ids=rb_sample.legal_event_ids,
+        legal_event_mask=rb_sample.legal_event_mask,
+    )
+
+    for iteration, expected in ((0, 0.01), (50, 0.005), (100, 0.0)):
+        assert _entropy_coefficient(root_cfg, iteration) == pytest.approx(expected)
+        _, rb_metrics = rb_ppo(
+            rb_output,
+            rb_sample,
+            rb_sample,
+            adapter,
+            root_cfg,
+            iteration=iteration,
+        )
+        _, normal_metrics = ppo(
+            rb_output,
+            normal_sample,
+            normal_sample,
+            adapter,
+            root_cfg,
+            iteration=iteration,
+        )
+        assert rb_metrics["entropy_loss"] == pytest.approx(
+            -expected * rb_metrics["entropy"]
+        )
+        assert normal_metrics["entropy_loss"] == pytest.approx(
+            -expected * normal_metrics["entropy"]
+        )
+
+
+def test_linear_entropy_schedule_never_guesses_a_horizon() -> None:
+    cfg = SimpleNamespace(c_h=0.01, entropy_schedule="linear_decay")
+    with pytest.raises(ValueError, match="training.iters"):
+        _entropy_coefficient(cfg, 0)
