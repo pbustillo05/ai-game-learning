@@ -132,8 +132,3 @@ def test_unequal_rank_flat_sum_matches_concatenated_rollout_oracle(tmp_path) -> 
         reduced = json.loads((tmp_path / f"gradient_{rank}.json").read_text())
         assert reduced["weight"] == pytest.approx(float(oracle.weight.grad.squeeze()), abs=0)
         assert reduced["bias"] == pytest.approx(float(oracle.bias.grad.squeeze()), abs=0)
-
-
-@pytest.mark.skip(reason="multi-node acceptance run; not a fixed CI performance assertion")
-def test_one_rank_and_two_rank_kuhn_curves_improve_comparably() -> None:
-    """Run via torchrun on the target node and compare sample-scaled curves."""
