@@ -2,18 +2,18 @@
 
 ## Summary
 
-| ID | Severity | Finding | Release effect |
+| ID | Severity | Initial finding | Final status |
 |---|---|---|---|
-| B-01 | Release blocker | Production rejects every reduced deck | Advertised `(P,S,R)` domain is false |
-| B-02 | Release blocker | Legal histories exceed model capacity | Shipped deep/multiplayer configs can fail mid-rollout |
-| B-03 | Release blocker | Nonfinite decision does not gate optimizer | FP32/BF16 can step with nonfinite gradients |
-| B-04 | Release blocker | Linear entropy decay reads the wrong config field | Exposed loss schedule is mathematically wrong |
-| B-05 | Release blocker | Strict config omits critical value validation | Invalid science/optimizer configs pass loading |
-| M-01 | Major | Hot-path host reads and Python loops are unaccounted | Residency/observability contract is not met |
-| M-02 | Major | CUDA hardware profile is not required by Python API | Safety contract can be bypassed |
-| M-03 | Moderate | Active documentation contradicts implementation | Existing readiness and feature claims are stale |
-| M-04 | Moderate | Core production modules are oversized | Change risk is concentrated in two files |
-| M-05 | Moderate | No approximate best-response release probe | Strategy quality is not a release acceptance signal |
+| B-01 | Release blocker | Production rejected every reduced deck | Resolved `5c3c5ef` |
+| B-02 | Release blocker | Legal histories exceeded model capacity | Resolved `666ccf8` |
+| B-03 | Release blocker | Nonfinite decision did not gate optimizer | Resolved `1cae1e2` |
+| B-04 | Release blocker | Linear entropy decay read the wrong config field | Resolved `8175b70` |
+| B-05 | Release blocker | Strict config omitted critical value validation | Resolved `6155287` |
+| M-01 | Major | Hot-path host reads and Python loops were unaccounted | Resolved `6659205` |
+| M-02 | Major | CUDA hardware profile was not required by Python API | Resolved `c6f8eec` |
+| M-03 | Moderate | Active documentation contradicted implementation | Resolved `3e22e0f` |
+| M-04 | Moderate | Core production modules were oversized | Resolved `cd355c0` |
+| M-05 | Moderate | No approximate best-response release probe | Owner-deferred; excluded from this gate |
 
 ## B-01: reduced decks are not implemented end to end
 
@@ -24,9 +24,8 @@ completion, showdown, and folded-player summaries. Compact IDs remain local
 while evaluator-facing card IDs retain the sibling `pbg-v3` suffix-deck
 contract. Tests exercise every `R=4,...,13`, every legal `(P,R)` pair,
 preflop/postflop/folded evaluator boundaries, and one-iteration normal and
-Rao--Blackwell training for every rank count. The compact suite passes 123
-tests, and the broad CPU regression passes 335 tests with one unrelated
-version-conditional skip.
+Rao--Blackwell training for every rank count. The final complete CUDA/DDP suite
+passes 382 tests with one unrelated version-conditional skip.
 
 **Contract.** `AGENTS.md`, `README.md`, `CONTRACTS.md`, and `docs/poker.md` all
 advertise `rank_count` in 4--13, subject to `2P+5 < 4R`. The run is supposed to
@@ -65,7 +64,7 @@ not essential for v1, but it changes the user's stated required scope.
 
 ## B-02: legal histories exceed the model's positional capacity
 
-**Repair status (2026-07-16): resolved in the working repair series.** The
+**Repair status (2026-07-16): resolved in commit `666ccf8`.** The
 lossless capacity is derived as
 `ceil(SP + 3P - S + 1) + 3`, is installed in both networks and the state-store
 bound when omitted, and is rejected with `root.model.max_history_tokens` when
@@ -117,7 +116,7 @@ uses that maximum.
 
 ## B-03: finite-gradient result is observed but not enforced
 
-**Repair status (2026-07-16): resolved in the working repair series.** The
+**Repair status (2026-07-16): resolved in commit `1cae1e2`.** The
 common reduced-buffer decision now solely controls unscale, clipping, and the
 optimizer step. A rejected FP16 step applies one explicit common scale backoff;
 disabled scalers retain unit scale. Metrics report applied and nonfinite-skipped
@@ -155,7 +154,7 @@ two-rank injected-inf tests that compare parameters and scaler state.
 
 ## B-04: `linear_decay` entropy decays over one iteration
 
-**Repair status (2026-07-16): resolved in the working repair series.** Linear
+**Repair status (2026-07-16): resolved in commit `8175b70`.** Linear
 decay now reads `cfg.training.iters`, starts at `c_h` for zero-based iteration
 0, reaches zero at `training.iters`, and rejects loss-like direct calls that do
 not provide an explicit positive horizon. Focused tests exercise iteration 0,
@@ -183,7 +182,7 @@ iteration 0/midpoint/final tests for both composites.
 
 ## B-05: strict configuration is not value-strict
 
-**Repair status (2026-07-16): resolved in the working repair series.** The
+**Repair status (2026-07-16): resolved in commit `6155287`.** The
 loader now rejects nonfinite, sign-invalid, interval-invalid, and zero-work
 values across rollout, loss, training, model, and hardware fields with dotted
 paths. Tests cover every listed counterexample plus PPO/value epsilons,
@@ -220,7 +219,7 @@ profile requirements. Add one dotted-path rejection test per boundary.
 
 ## M-01: hot-path host work violates residency and observability claims
 
-**Repair status (2026-07-16): resolved in the working repair series.** Public
+**Repair status (2026-07-16): resolved in commit `6659205`.** Public
 history packing now uses a logarithmic binary-lift ancestor table and one
 batched device gather; CUDA tensors use the preflighted lossless bound without
 reading a realized device length. Folded summaries now live in a fixed,
@@ -268,7 +267,7 @@ sync-debug coverage to full preflop/postflop policy forward construction.
 
 ## M-02: the Python training API can launch CUDA without a hardware profile
 
-**Repair status (2026-07-16): resolved in the working repair series.**
+**Repair status (2026-07-16): resolved in commit `c6f8eec`.**
 `run_training` rejects a selected CUDA device before reproducibility setup or
 bundle construction when `cfg.hardware` is absent. A Python-API regression test
 proves the bundle builder is not reached.
@@ -284,7 +283,7 @@ runtime check so library callers cannot bypass memory/token limits.
 
 ## M-03: active documents contain stale or contradictory claims
 
-**Repair status (2026-07-16): resolved in the working repair series.** The
+**Repair status (2026-07-16): resolved in commit `3e22e0f`.** The
 active theory now parameterizes cards, combos, and canonical classes by
 $D=4R$, $\binom{D}{2}$, and $R^2$ while retaining full-deck values only as
 examples. `core_math.tex`, `NOTATION.md`, and the model document agree that
@@ -312,7 +311,7 @@ be edited to declare success before matching tests exist.
 
 ## M-04: change risk is concentrated in oversized modules
 
-**Repair status (2026-07-16): resolved in the working repair series.** Common
+**Repair status (2026-07-16): resolved in commit `cd355c0`.** Common
 reduced-gradient synchronization and finite-step control now
 live in `pbg/core/optimization.py`; device history materialization and folded
 summary caching now live in `pbg/games/poker/model_inputs.py` and

@@ -2,51 +2,48 @@
 
 ## Mathematical verdict
 
-The implemented **fixed-intensity PPO subset** is substantially faithful to the
-constructive estimator mathematics in `docs/theory/core_math.tex`. This is not a
-confirmation of every theorem or research extension in that note. Its own audit,
-`docs/theory/core_math_audit.md`, classifies the document as a research draft
-whose named-method and convergence claims still need assumptions and proofs.
+The implemented fixed-intensity PPO subset is conformant with the constructive
+estimator mathematics in `docs/theory/core_math.tex`. This does not promote the
+note's unproved named-method or convergence claims; the qualifications in
+`docs/theory/core_math_audit.md` remain in force.
 
-The production implementation does not implement NeuRD, R-NaD/DeepNash,
-adaptive variance-guided branching, public-moment losses, all-action Q losses,
-or suit consistency. Those are correctly outside the fixed v1 estimator, though
-the reference-KL and optional-head documentation has become stale.
+The active theory and notation now consistently distinguish implemented
+features from research extensions:
+
+- exact legal-action `KL(new || reference)` and immutable periodic reference
+  snapshots are implemented;
+- optional public moment output heads exist structurally, but no production
+  reducer target, loss, or branching controller consumes them;
+- NeuRD, R-NaD/DeepNash, adaptive variance-guided branching, public-moment
+  losses, stored all-action Q targets, and suit consistency remain deferred.
 
 ## Core estimator trace
 
-| Mathematical requirement | Implementation | Assessment |
+| Mathematical requirement | Production implementation | Final assessment |
 |---|---|---|
-| Curried policy emits all actor private types | Preflop outputs 169 class rows then lifts to combos; postflop outputs every compatible actor combo and scatters to 1326 | Conformant for full deck |
-| Public likelihood reach updated for every action/chance | `pbg/core/rollout.py`, `branching.py`, poker backend likelihood updates and board masks | Conformant |
-| Sequential rollout has one sampled profile/path per start | family scheduler retains one active occurrence/profile for each start | Conformant |
-| Normal player-clock lambda return | backward owner-depth recurrence in `pbg/core/normal.py:134-152` | Conformant |
-| RB stops at pre-terminal public leaves and completes under posterior | sibling completion adapters and streamed completion in training | Conformant |
-| Preserve posterior mass `P` and moment `M=P V` before division | `pbg/core/values.py` fp32 frontier and `conditionalize` | Conformant |
-| Parent is uniform child mixture | child `P/M` are summed and divided by child count | Conformant |
-| Child Q is `M_child/P_child` | `values.emit`, lines 123-126 | Conformant |
-| Node V is `M_parent/P_parent` | `values.emit`, lines 128-133 | Conformant |
-| Leave-one-out sibling baseline | parent total times count minus selected child; conditionalize; lambda mix with one cached old V | Conformant |
-| Single child baseline is cached old V | `multi` mask leaves baseline as old V | Conformant |
-| Bootstrap only on the owner clock | reducer updates owner row with `lambda M + (1-lambda) P V_old` | Conformant |
-| One distinguished branched root | `branched_root_state`, one-root `DeviceTreeBuffer` per rank | Conformant |
-| Root uses ordinary randomized rounding | root enters the same `offspring_for` path as other non-preterminal nodes | Conformant |
-| `floor(beta)+Bernoulli(frac(beta))`, beta at least one | `pbg/core/branching.py:143-165,404-411` | Conformant |
-| Independently addressed temporary profiles per abstract child | logical child/profile keys include rank-tree and abstract path/ordinal | Conformant |
-| Duplicate event labels remain distinct children | stable parent-local edge ordinal and duplicate-preserving CSR | Conformant |
-| Branched terminal/decision path law uses product `1/N` | `tree.path_weight`, alias sampling, family/local/global mass | Conformant |
-| Pool trees/ranks by total decision mass, not equal rank means | asynchronous/global SUM mass and local/global objective scale | Conformant |
-| Flat gradient all-reduce uses SUM with no world division | `_sync_scaled_gradients` | Conformant until finite-step gate |
-| Common nonfinite result controls the update | boolean is calculated but ignored by the optimizer path | **Nonconformant; B-03** |
+| Curried policy emits every actor private type | $R^2$ preflop classes lift to $\binom{4R}{2}$ combos; postflop compatible rows scatter to the same full width | Conformant for every legal R |
+| Public likelihood reach updates on actions/chance | sequential/branched rollout plus poker reach update and board mask | Conformant |
+| Sequential mode samples one profile/path per start | one active occurrence/profile per global start | Conformant |
+| Normal player-clock lambda return | owner-depth backward recurrence | Conformant |
+| RB completes pre-terminal leaves under the posterior | sibling completion facade and streamed reducer | Conformant |
+| Preserve posterior mass $P$ and moment $M=PV$ before division | fp32 streamed frontier and guarded conditionalization | Conformant |
+| Parent is uniform child mixture | child $P/M$ sums divided by labeled child count | Conformant |
+| Leave-one-out sibling baseline | total-minus-child conditionalization, then lambda mix | Conformant |
+| Single-child baseline is cached old V | explicit single-child mask | Conformant |
+| Bootstrap only on owner clock | owner row alone receives lambda bootstrap | Conformant |
+| One distinguished branched root | one root/tree per rank | Conformant |
+| Root uses ordinary randomized rounding | root enters the same offspring path as every other branchable node | Conformant |
+| Duplicate labels remain distinct children | stable parent-local ordinal and duplicate-preserving CSR | Conformant |
+| Path law uses product of $1/N$ | stored path weight drives tree/rank objective mass | Conformant |
+| Unequal ranks pool by decision mass | local/global ratio plus one flat fp32 gradient SUM | Conformant |
+| Common nonfinite result controls update | extracted finite-step controller gates clip, step, and scaler transition | Conformant; B-03 resolved |
 
-The implementation also respects the important warning against generating a
-whole branch family from one shared true private profile. Branched children get
-separate posterior-predictive logical draws, preserving the sibling-independence
-assumption used by the leave-one-out baseline.
+Branched children use independently addressed posterior-predictive private draws;
+one shared true profile is never reused across a sibling family.
 
 ## Loss-law trace
 
-For `rb_ppo`, code matches the production equation in `NOTATION.md`:
+For `rb_ppo`, production implements
 
 $$
 \frac1B\sum_b\left[
@@ -57,97 +54,60 @@ $$
 \right].
 $$
 
-`pbg/core/losses.py:137-209` uses child posterior mass divided by child count
-for policy terms and parent posterior mass for value, entropy, and optional
-reference KL. Duplicate abstract children remain separate columns. The normal
-composite selects the sampled actor combo and applies the ordinary PPO clipped
-surrogate and scalar lambda target.
+Child posterior mass weights policy terms; parent posterior mass weights value,
+entropy, and optional reference KL. Duplicate abstract children remain separate
+columns. Normal `ppo` selects the sampled actor combo and uses its scalar
+player-clock return. MSE/clipped values, constant/corrected linear entropy, and
+reference KL are all covered by tests. Numeric domains now fail at configuration
+load, and the reduced finite decision is the sole optimizer gate.
 
-The fixed loss equations are correct apart from the `linear_decay` coefficient
-lookup in B-04. Invalid lambda and coefficient ranges can also enter through the
-validation gap in B-05.
+## Model architecture trace
 
-## Model architecture verdict
+The configured suffix deck has $D=4R$ cards, $H=\binom{D}{2}$ private combos, and
+$K=R^2$ canonical preflop classes. Full-deck constants 52/1326/169 are examples,
+not tensor contracts.
 
-For the full 52-card deck, the two networks substantially follow
-`docs/theory/MHA_model.md`.
-
-| Architecture requirement | Code evidence | Assessment |
+| Architecture requirement | Production implementation | Final assessment |
 |---|---|---|
-| One weight-only object with nonshared pre/post nets | `PokerModelBundle`, `PreflopNet`, `PostflopNet` | Conformant |
-| 169 native preflop classes | class aggregation and `N_CLASSES=169` | Conformant for `R=13` |
-| Compatible postflop combo rows for live players | `build_compact_map`, live-seat gather, full scatter | Conformant for `R=13` |
-| Folded players absent from postflop attention rows | status/live-seat masks and compaction | Conformant |
-| Public, exact arithmetic, line/history, seat/status inputs | `PokerPublicBatch`, packed history and public token builders | Conformant, subject to B-02 |
-| Button-relative seats | relative-seat conversion before embeddings/readout | Conformant |
-| Pre-LN residual transformer | per-layer LN, MHA residual, incidence/FFN residual | Conformant |
-| Learned positive per-head content temperature | `MHA.temperature` | Conformant |
-| Key-side log-reach bias is not temperature-scaled | `MHA.forward_biased` adds bias after content scaling | Conformant |
-| Exact incidence residual including equal-combo channel | `IncidenceResidual` and numerical reconstruction tests | Conformant |
-| Factorized passive/call/raise plus DLogisticTick and all-in atom | `TypeHead`, `RaiseMixtureHead`, policy adapter legal normalization | Conformant |
-| One actor-private-type V, no learned per-action Q heads | `ValueHead` on actor row | Conformant |
-| Optional global player-vector and squared-moment heads | `MomentHeads` behind `use_moment_heads` | Structurally present, not trained by any registered loss |
-| Suit-consistency auxiliary | no implementation | Deferred as documented in `MHA_model.md` |
-| Variable compact deck geometry | model document itself fixes 52/1326/169; product docs generalize R | **Not implemented; B-01** |
+| Nonshared pre/post weight object | `PokerModelBundle`, `PreflopNet`, `PostflopNet` | Conformant |
+| Variable canonical preflop rows | geometry-derived class aggregation and class-native trunk | Conformant for R=4..13 |
+| Compatible live-player postflop rows | geometry-derived compact map and full scatter | Conformant for R=4..13 |
+| Folded players absent from attention rows | live-seat masks and folder summaries | Conformant |
+| Lossless public history | geometry-derived capacity plus binary-lift device gather | Conformant for all P/S boundaries |
+| Button-relative seats and exact public arithmetic | poker public batch construction | Conformant |
+| Pre-LN reach-biased MHA | learned positive temperature; untempered key-side reach prior | Conformant |
+| Exact incidence residual | card accumulators plus identical-combo channel | Conformant |
+| Factored passive/call/raise policy | DLogisticTick mixture plus all-in atom and legal normalization | Conformant |
+| Actor-private-type V, no learned action Q | actor row value head | Conformant |
+| Optional public moments | `MomentHeads` behind configuration, no production target/loss/control | Structural only, documented accurately |
+
+Frozen rollout-policy inference and learner inference now share the configured
+autocast precision. A 20-update resume probe found and fixed the former
+FP32-versus-FP16 mismatch; post-fix launch/resume identity errors remain within
+the declared tolerance.
 
 ## Folded-player statistics
 
-The folded-player architecture is genuinely connected, not a placeholder.
+The sibling evaluator remains the only owner of folded-card partition math.
+Poker stores fold-time public dependencies and sends masked rows to the sibling
+facade. Returned unary corrections, signed pair factors, folder mass/card/seat/
+line fields, and optional tight-folder terms feed corrected reach, attention
+geometry, pressure channels, and folded-seat summaries. Only live players have
+postflop hand rows.
 
-### Ownership and production flow
+The repaired cache is fixed-size, memory-planned, and device-indexed. Cache-hit
+rows cross the facade under a false evaluator mask and merge on device; no
+Python row key or hit decision is used. Tests cover one and multiple folders,
+semantic feature influence, reuse, and fold/street invalidation.
 
-1. Poker rollout stores each fold's board, reach row, seat, line metadata, and a
-   partition dependency key.
-2. Postflop routing groups rows by street and number of live players.
-3. Because `PostflopNet.requires_partition_summary = True`, the rollout backend
-   calls `PokerGPUPartitionAdapter.partition_folders` for dependency-distinct
-   rows.
-4. The adapter validates versioned fields returned by the sibling evaluator. No
-   local collision posterior, partition ratio, or showdown implementation is
-   substituted.
-5. `PostflopNet._folded_geometry` consumes unary hand corrections and signed
-   pair-kernel factors. `_folder_context` consumes per-folder log mass, single
-   card/card-marginal pressure, optional tight delta, seat identity, validity,
-   and public line metadata.
-6. Those features affect corrected log reach, row geometry, pressure channels,
-   tight-folder products, and folded-seat readout summaries.
-7. Only live players contribute hand rows to attention. Folded seats are restored
-   to the seat summary through folder features.
+## Deliberately absent capabilities
 
-This is exactly the relevant architecture for `P>2`: in heads-up a fold ends the
-hand, so there is no postflop continuation with a folded observer; with three or
-more players, one or more folded seats can continue to influence the live-hand
-posterior.
+- NeuRD and R-NaD/DeepNash;
+- adaptive/Neyman branching intensity and intensity loss;
+- public moment targets/losses/control;
+- stored all-action Q targets or per-action value heads;
+- suit-consistency, MMD, and sampled-KL losses;
+- exploitability or approximate-best-response evaluation.
 
-### Tests
-
-- `tests/test_p7_postflop.py:176-204` changes a semantic per-folder card field and
-  verifies the network output changes.
-- `tests/test_p7_postflop.py:207-226` verifies a folded seat creates no postflop
-  attention row.
-- `tests/test_p13a_gpu_rollout.py:442-465` uses a three-player state and verifies
-  partition reuse across an action and invalidation on a fold.
-- Folder/partition adapter tests validate exact field shapes, validity, device,
-  and evaluator provenance.
-
-### Qualification
-
-The cache currently reaches the correct semantic result but its Python/device
-boundary is a performance and observability defect (M-01). Preflop intentionally
-retains all seated ranges, including folded seats, because the preflop network
-can afford all class rows; evaluator folder statistics begin postflop, matching
-`core_math.tex:1420-1425` and `MHA_model.md`.
-
-## Mathematical features that are not production capabilities
-
-- NeuRD and the synchronous R-NaD/DeepNash analogues;
-- adaptive/Neyman branching intensity and any intensity loss;
-- public `W/S/U/V-vector` target losses;
-- stored all-action Q targets or learned per-action value heads;
-- suit-consistency loss;
-- MMD or sampled-KL losses;
-- an exploitability or approximate-best-response solver.
-
-Their absence is acceptable only because the fixed v1 boundary explicitly
-defers them. The docs should consistently separate an optional untrained output
-head from an implemented loss/control feature.
+The last item is M-05 and is explicitly outside this repair scope. Therefore
+none of the engineering evidence is a strategy-quality claim.

@@ -71,13 +71,20 @@ The review used five passes:
 
 ## Limits of the evidence
 
-The successful live training matrix used heads-up, 8 bb, full-deck acceptance
-workloads to stay conservative on shared RTX 2080 Ti hardware. Existing tests and
-prior audit evidence cover six-player execution and boundary rule arithmetic,
-but this audit did not attempt an exhaustive run of every `(P,S,R)` tuple. Such a
-claim is currently impossible because the code rejects every `R != 13` tuple and
-because legal long histories exceed the default model capacity.
+The final live mode/distribution matrix uses conservative heads-up 8 bb
+workloads; a separate 6-player 10 bb, 128-start, 20-update checkpoint run covers
+the realistic multiplayer path. Exhaustive training of every `(P,S,R)` tuple is
+not claimed. Instead, every `R=4,...,13`, every legal `(P,R)` combination, all
+player/stack history boundaries, evaluator boundaries, and representative
+one-iteration training paths are covered programmatically.
 
-Only GPUs 1 and 2 were used. GPU 0 had an existing 2.9 GiB process and was left
-untouched. No large training or performance-tuning run was attempted after the
-release blockers were established.
+GPU occupancy changed during the audit. Every CUDA phase was preceded by
+`nvidia-smi`; devices were selected explicitly, and an unrelated process was
+left untouched whenever present. No OOM occurred. The final test devices
+returned to their 9/19 MiB display-only baselines.
+
+No approximate best response, exploitability estimate, or strategy-quality
+trend was run. M-05 is explicitly excluded from this engineering gate, so the
+evidence says nothing about strategic usefulness or convergence. This audit
+also does not establish an H100 performance baseline; the Quest profile still
+requires deployment calibration.

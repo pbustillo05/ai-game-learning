@@ -1,105 +1,92 @@
 # File-by-file inventory
 
-## Root Markdown
+## Root and active documentation
 
-| File | Role | Audit result |
-|---|---|---|
-| `AGENTS.md` | repository scope, tree convention, game domain, GPU hygiene | authoritative operational constraints followed; its max-history formula exposes B-02; advertised R domain conflicts with B-01 |
-| `CONTRACTS.md` | active implementation contract | tree, estimator, ownership, checkpoint, and mode contracts mostly match; config strictness, deck domain, finite-step, profile, and sync claims do not |
-| `HARDWARE.md` | local/Quest execution procedure and profiles | profile separation and GPU procedure match; Python API can bypass required CUDA profile |
-| `IMPLEMENTATION_NOTES.md` | historical implementation ledger | clearly labeled historical; not used as current acceptance; no active code imported from recorded retired paths |
-| `NOTATION.md` | implementation-facing estimator/loss notation | fixed estimator and `rb_ppo` mapping are accurate; moment-head and reference-KL status has stale wording |
-| `README.md` | production overview and commands | architecture and commands are accurate for full deck; 4--13 ranks and strict-production claims overstate implementation |
-
-## Project documentation
-
-| File/group | Audit result |
+| File | Final audit result |
 |---|---|
-| `docs/README.md` | accurate index; should point readers to this newer no-go audit |
-| `docs/architecture.md` | accurately describes one scheduler, P/M reducer, global mass, and package ownership; finite-update and no-undeclared-sync claims are not met |
-| `docs/core_algorithms.md` | accurate description of the active three modes and fixed estimator subset |
-| `docs/file_reference.md` | package/file ownership map matches reachable source; no active retired game omitted |
-| `docs/poker.md` | rule/evaluator/folder/model description is accurate for R=13; compact-deck production support is false; history limit is undocumented |
-| `docs/training_and_evaluation.md` | CLI, modes, checkpoints, benchmark, and arena descriptions are substantially accurate; relies on incomplete strict validation and does not disclose domain blockers |
-| `docs/audit/README.md` and older audit files | useful cleanup/performance history, but previous production-accepted conclusion is superseded by this report |
-| `docs/todo/BR_probe.md` | correctly identifies missing approximate-BR acceptance |
-| `docs/todo/control_branching_size.md` | correctly identifies adaptive branch-size control as research, not shipped behavior |
+| `AGENTS.md` | authoritative game/tree/GPU constraints; all repaired code follows them |
+| `CONTRACTS.md` | game domain, finite update, hardware profile, residency, checkpoint, and validation claims now match production |
+| `HARDWARE.md` | local/Quest procedure and conservative GPU hygiene remain valid |
+| `IMPLEMENTATION_NOTES.md` | historical ledger only; current readiness lives here |
+| `NOTATION.md` | dynamic private width, reference KL, and structural-only moment-head status are accurate |
+| `README.md` | production surface is accurate and explicitly excludes strategy-quality claims |
+| `docs/README.md` | accurate active-document index and declared mixed-row control boundary |
+| `docs/architecture.md` | scheduler, P/M reducer, global mass, binary-lift history, cache, and device movement match code |
+| `docs/core_algorithms.md` | accurate three-mode fixed estimator subset |
+| `docs/file_reference.md` | package ownership remains accurate |
+| `docs/poker.md` | dynamic geometry, exact history, folded cache, model, and evaluator boundaries match code |
+| `docs/training_and_evaluation.md` | CLI, profiles, checkpoint/resume, benchmark, and arena behavior match production |
+| older readiness audit | explicitly superseded evidence snapshot |
+| `docs/todo/BR_probe.md` | correctly records excluded M-05 work |
 
-## Theory documentation
+## Theory
 
-| File/group | Audit result |
+| File/group | Final audit result |
 |---|---|
-| `docs/theory/core_math.tex` | fixed public-game/RB/branching construction maps well to code; named-method/convergence limits remain as recorded in its audit; poker section fixes a 52-card 6-max example and contains stale reference-KL status |
-| `docs/theory/core_math_audit.md` | candidly and correctly bounds the mathematical confidence; its moderate open findings remain unresolved |
-| `docs/theory/MHA_model.md` | substantially implemented for the full 52-card deck, including folder statistics; optional heads are not backed by losses; product-level reduced-deck generalization is absent |
-| `docs/theory/folder_impact.md` | mathematical background and evaluator ownership are respected; local code consumes supplied fields instead of reimplementing private partition laws |
-| `docs/theory/pseudocode/family_scheduled_rollout.tex` | scheduler, family, logical RNG, actual-cost, and one-root semantics trace to code |
-| `docs/theory/pseudocode/distributed_update.tex` | mass scaling and gradient SUM trace to code; explicit finite-decision step is violated by B-03 |
-| `docs/theory/preamble/` | document build support only; no runtime contract issue |
-| `docs/references/` | 138 vendored third-party provenance files; not active implementation requirements |
+| `docs/theory/core_math.tex` | configurable P/S/R poker example; implemented reference KL and deferred public-moment loss/control are distinguished |
+| `docs/theory/core_math_audit.md` | research-proof qualifications remain applicable |
+| `docs/theory/MHA_model.md` | parameterized by $D=4R$, $H=\binom{D}{2}$, and $K=R^2$; optional heads accurately bounded |
+| `docs/theory/folder_impact.md` | evaluator-owned background mathematics; local code consumes supplied fields only |
+| rollout/distributed pseudocode | one-root scheduler, mass scaling, SUM reduction, and finite gate trace to code |
+| `docs/references/` | vendored provenance, not active implementation requirements |
 
-## `pbg` package
+## Composition, CLI, benchmark, and evaluation
 
-### Composition, CLI, benchmark, and evaluation
-
-| Module | Audit result |
+| Module | Final audit result |
 |---|---|
-| `pbg/config.py` | thin public export; correct |
-| `pbg/runtime.py` | direct NLHE composition confirms sole active game; library CUDA path does not require a profile |
-| `pbg/cli/train.py` | correct CLI and default local profile; existing-output protection works |
-| `pbg/cli/benchmark.py` | production benchmark entry point; mode constraints match core |
-| `pbg/benchmark.py` | benchmarks the same implementation and supports checkpoint identity/performance comparison; not a strategic evaluator |
-| `pbg/eval/arena.py` | read-only duplicate-deal CPU public navigation plus sibling showdown; explicitly not approximate BR |
+| `pbg/config.py`, `pbg/runtime.py` | strict NLHE composition; CUDA library launch requires a profile |
+| `pbg/cli/train.py` | profile-aware production entry point and existing-output protection |
+| `pbg/cli/benchmark.py`, `pbg/benchmark.py` | benchmark the sole implementation; no strategy-quality implication |
+| `pbg/eval/arena.py` | read-only duplicate-deal comparison, explicitly not approximate BR |
 
-### Generic core
+## Generic core
 
-| Module | Audit result |
+| Module | Final audit result |
 |---|---|
-| `pbg/core/game.py` | clean protocols/owner constants; no poker import |
-| `pbg/core/config.py` | strict recursive schema and many cross-field checks; incomplete numeric/domain validation is B-05 |
-| `pbg/core/tree.py` | duplicate-preserving host/device tree, path weights, replay; topology invariants well tested |
-| `pbg/core/execution.py` | bounded arena/queues, logical RNG, transactional planning; complex but coherent |
-| `pbg/core/rollout.py` | shared sequential family scheduler, reach/profile/event logic; conforms to sequential laws |
-| `pbg/core/branching.py` | one-root randomized-rounded duplicate-preserving branch sampler; conforms to fixed beta math |
-| `pbg/core/normal.py` | sampled settlement and player-clock lambda return; correct if lambda is valid |
-| `pbg/core/completion.py` | typed fp32 posterior/moment validation and streaming contracts; correct |
-| `pbg/core/values.py` | streamed P/M frontier, conditionalization, sibling baselines, owner bootstrap; faithful and well tested |
-| `pbg/core/losses.py` | only `ppo`/`rb_ppo`; reductions match notation; entropy schedule bug B-04 |
-| `pbg/core/minibatch.py` | aligned normal/RB logical gather and masks; correct |
-| `pbg/core/distributed.py` | weighted SUM helpers; correct, though main training owns the flat reduction |
-| `pbg/core/training.py` | integrates all modes, memory, optimizer, reference, checkpoint, DDP; finite gate B-03 and oversized responsibility M-04 |
-| `pbg/core/observability.py` | useful complete counters; cannot detect uninstrumented host syncs in M-01 |
-| `pbg/core/logging_util.py` | atomic/simple logging support; no issue found |
+| `pbg/core/game.py` | clean generic protocols and owner codes |
+| `pbg/core/config.py` | recursive type/value/cross-field validation with dotted errors |
+| `pbg/core/tree.py` | duplicate-preserving topology, path weights, exact reach replay, and decision caches |
+| `pbg/core/execution.py` | bounded arena/queues, logical RNG, and transactional admission |
+| `pbg/core/rollout.py` | shared sequential family scheduler and sampled-profile law |
+| `pbg/core/branching.py` | one-root randomized-rounded duplicate-preserving branching |
+| `pbg/core/normal.py` | sampled settlement and player-clock lambda return |
+| `pbg/core/completion.py` | typed fp32 posterior/moment streaming contract |
+| `pbg/core/values.py` | streamed P/M frontier and owner-clock bootstrap |
+| `pbg/core/losses.py` | `ppo`/`rb_ppo`, corrected entropy horizon, values, entropy, and reference KL |
+| `pbg/core/minibatch.py` | aligned logical normal/RB gather and masks |
+| `pbg/core/distributed.py` | weighted SUM helpers |
+| `pbg/core/optimization.py` | common gradient reduction, finite decision, clip/step/scaler lifecycle |
+| `pbg/core/checkpointing.py` | atomic payload, per-rank RNG, identity, and metrics-prefix lifecycle |
+| `pbg/core/training.py` | orchestration; rollout and learner precision now agree; extracted lifecycles reduce responsibility |
+| `pbg/core/observability.py` | complete transfer/sync/evaluator/model counters |
+| `pbg/core/logging_util.py` | atomic/simple logging support |
 
-### Poker rules, evaluator, and runtime
+## Poker rules, evaluator, runtime, and model
 
-| Module | Audit result |
+| Module | Final audit result |
 |---|---|
-| `pbg/games/poker/cards.py` | correct compact `DeckGeometry`, class/combo maps, and full-deck compatibility constants |
-| `pbg/games/poker/engine.py` | independent public NLHE oracle and config validation; rule arithmetic tested against tensor backend |
-| `pbg/games/poker/tensor_state.py` | preallocated public state/history structure; capacity larger than model history cap |
-| `pbg/games/poker/ranges.py` | CPU/reference likelihood range state and compatibility; active support only |
-| `pbg/games/poker/adapter.py` | legal factored policy probability, entropy, KL, event mapping, model bundle; no local private evaluator fallback |
-| `pbg/games/poker/mc.py` | strict sibling sampling/completion/showdown facade; validates API/device/shape/numerics |
-| `pbg/games/poker/folded.py` | typed sibling partition/folder DTO and validation; ownership boundary is respected |
-| `pbg/games/poker/bundle.py` | model/evaluator/backend construction and memory preflight; does not reject deck-width/history mismatches early |
-| `pbg/games/poker/rollout_backend.py` | full public tensor navigation and model routing; explicit R=13 blocker, hot-path history/folder host work, oversized module |
-
-### Poker model
-
-| Module | Audit result |
-|---|---|
-| `model/primitives.py` | LN, FFN, reach-biased temperature MHA with flex/chunked-dense execution; focused CUDA test passes |
-| `model/incidence.py` | exact compact maps and incidence residual; numerical identities tested |
-| `model/heads.py` | type, DLogisticTick mixture/all-in, value, optional moments; legal normalization owned by adapter |
-| `model/preflop.py` | class-native pre-LN model over all seated ranges; fixed 169/52 geometry and 256 history default |
-| `model/postflop.py` | compact live-combo model, evaluator folder features, folded-seat readout, fixed 1326/52 geometry and same history cap |
+| `cards.py` | variable `DeckGeometry`, suffix-deck mapping, combo/class/category tables |
+| `engine.py` | independent public NLHE oracle and strict game validation |
+| `tensor_state.py` | preallocated public state plus binary-lifting history ancestors |
+| `ranges.py` | CPU/reference likelihood support |
+| `adapter.py` | legal factored policy probability, entropy, KL, and bundle dispatch |
+| `mc.py` | strict read-only sibling sampling/completion/showdown facade for every R |
+| `folded.py` | typed masked sibling partition/folder boundary |
+| `bundle.py` | dynamic construction, lossless history, hardware/model preflight, memory plan |
+| `model_inputs.py` | bounded batched device history materialization |
+| `partition_cache.py` | fixed memory-planned device-indexed folded-summary cache |
+| `policy_planning.py` | host-declared bounded physical policy packing and one counted control block |
+| `rollout_backend.py` | dynamic public tensor navigation and family routing; no compact-deck blocker or Python cache |
+| `model/primitives.py` | LN/FFN/reach-biased MHA with bounded attention execution |
+| `model/incidence.py` | geometry-derived exact incidence residual |
+| `model/heads.py` | factored type/raise/value and optional structural moment outputs |
+| `model/preflop.py` | $R^2$ class-native trunk with lossless history width |
+| `model/postflop.py` | geometry-derived compact live combos and evaluator folder features |
 
 ## Organization conclusion
 
-The high-level organization is good and should be preserved: generic math/core,
-poker implementation, evaluator boundary, evaluation, and composition are cleanly
-separated. The most important organization improvement is targeted extraction
-from `training.py` and `rollout_backend.py` after the release fixes, not a broad
-rewrite. There is no obvious dead active game, alternate executor, or local hand
-evaluator to remove.
+The active package boundary is clean: generic core does not import poker,
+poker does not duplicate evaluator math, and composition is explicit. M-04's
+targeted extraction is complete; a broad rewrite is neither required nor
+desirable. No active retired game, alternate executor, local hand evaluator, or
+unreachable production selector remains.

@@ -1,36 +1,23 @@
 # Validation evidence
 
-## Environment and GPU hygiene
+## Environment and hygiene
 
-- Revision: `dde65f6d470cd4d890ec1b19293c22e83139cc24`
-- Python: shared `/home/pablob/.venvs/poker` through `tools/poker-python`
-- CUDA/PyTorch: checked CUDA 13 environment used by the repository wrapper
-- Evaluator: installed sibling API asserted as `pbg-v3`
-- GPUs: three RTX 2080 Ti devices
+- Validated revision: `5c10366ffaa330eeab5af73a6761b50874100246`
+- Python: `/home/pablob/.venvs/poker` through `tools/poker-python`
+- Evaluator: installed read-only sibling `poker_gpu_evaluator.pbg`, API `pbg-v3`
+- Hardware: three RTX 2080 Ti devices, CUDA 13 environment
+- Hardware profile: `configs/hardware/local_3x2080ti.yaml`
 
-Before CUDA work, GPU 0 had an unrelated 2,908 MiB process. It was not selected
-or touched. GPU 1 was at 9 MiB and GPU 2 at 19 MiB. Single-device work used only
-GPU 1; distributed work used GPUs 1 and 2. Final state returned to exactly 9 and
-19 MiB with zero utilization. No OOM occurred.
+Every CUDA phase was preceded by `nvidia-smi` and used explicit
+`CUDA_VISIBLE_DEVICES`. When an unrelated 182 MiB compute process appeared on
+GPU 0, it was left untouched and work moved to GPUs 1/2. No OOM occurred. At
+the final check, the test devices were back at their display-only 9/19 MiB
+baselines with zero utilization and no owned compute process.
 
-## Static and configuration checks
+## Automated regression
 
-| Check | Result |
-|---|---|
-| `python -m compileall -q pbg tests` | pass |
-| Import-direction/retired-game tests | included in full pass |
-| Load every non-hardware YAML with local profile | 23 loaded, 0 failed |
-| Root/project Markdown local-link scan | no genuine missing local target |
-| `ruff check pbg tests` | not run: `ruff` is not installed in the shared venv |
-
-The configuration probe intentionally mutated a valid parsed config and called
-the same `_validate_config` function. It demonstrated that zero node budget,
-lambda 2, zero iterations, zero update steps, negative learning rate, negative
-clip norm, and zero checkpoint interval are all accepted.
-
-## Complete automated suite
-
-Command, with CUDA restricted to the idle device:
+Complete post-fix command, with CUDA confined to an idle device and socket
+permissions available for the DDP tests:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 ./tools/poker-python -m pytest -q
@@ -39,121 +26,128 @@ CUDA_VISIBLE_DEVICES=1 ./tools/poker-python -m pytest -q
 Result:
 
 ```text
-226 passed, 1 skipped, 1 warning in 14.00s
+382 passed, 1 skipped, 1 warning in 49.38s
 ```
 
-The warning states that PyTorch synchronization debug mode is a prototype and
-does not detect all synchronizing operations. That qualification matters to
-M-01: the focused sync-debug test cannot substantiate the stronger whole-runtime
-claim.
+The skip is version-conditional. The warning is PyTorch's standard notice that
+synchronization debug mode is a prototype. The tested full-policy path itself
+reports zero undeclared host synchronizations.
 
-The one skipped test required a prerequisite outside the one-visible-GPU full
-suite context. Distributed behavior was exercised separately on two visible
-GPUs.
-
-## Targeted evaluator/model checks
-
-Before the complete run, a focused set covering host-sync primitives,
-completion moments, folded-player logic, postflop architecture, execution
-foundations, and real GPU rollout produced:
+A focused CUDA/evaluator/geometry gate also passed:
 
 ```text
-69 passed, 10 skipped in 4.73s
+158 passed, 1 warning in 25.97s
 ```
 
-The skips in that sandboxed invocation were expected CUDA/prerequisite skips;
-the complete escalated suite later ran with CUDA available.
+It covers real sibling calls, CUDA rollout, full policy input construction,
+sync debug, and all compact-deck tests. A CUDA-hidden run had 367 passes and 13
+expected skips; its only three failures were sandbox-denied Gloo sockets, and
+all three passed in the escalated complete suite.
 
-The socket-dependent DDP test file was also run in an environment permitting
-local process-group sockets:
+## Geometry and boundary coverage
 
-```text
-3 passed in 5.22s
-```
+- Every `R=4,...,13` passes geometry, preflop/postflop models, evaluator mapping,
+  masked folded summaries, chance, completion, and showdown checks.
+- Every legal `(P,R)` pair satisfying `2P+5<4R` is enumerated.
+- One-iteration normal and RB training coverage spans every rank count.
+- `P=2,...,6` at `S=8` and `S=128` attains the exact legal player-node bound;
+  the derived capacity plus three separators passes model packing.
+- Histories beyond 256 are exercised for 3--6 players.
+- One- and multiple-folder continuation, semantic folder influence, cache hit,
+  fold invalidation, and street invalidation pass.
 
-## Real single-GPU training matrix
+## Final one-GPU matrix
 
-Temporary audit configs cloned the repository's one-iteration heads-up 8 bb,
-`R=13`, small-model acceptance settings and wrote only to `/tmp`. Each command
-used the production CLI/runtime and sibling evaluator on GPU 1.
+Temporary configs clone the repository's heads-up 8 bb acceptance settings and
+write only to `/tmp`. Each mode uses the production CLI/runtime and sibling
+evaluator.
 
-| Mode | Result | Decisions | Optimizer steps | Peak reserved |
-|---|---|---:|---:|---:|
-| normal | pass, finite checkpoint/metrics | 56 | 1 | 396,361,728 B |
-| sequential RB | pass, finite checkpoint/metrics | 47 | 1 | 469,762,048 B |
-| branched RB | pass, finite checkpoint/metrics | 11 | 1 | 419,430,400 B |
+| Mode | Decisions | Identity max logp error | Optimizer | Peak reserved | Result |
+|---|---:|---:|---:|---:|---|
+| normal | 41 | $3.86\times10^{-5}$ | 1 applied | 455,081,984 B | pass |
+| sequential RB | 42 | 0.0011735 | 1 applied | 442,499,072 B | pass |
+| branched RB | 11 | 0.0004773 | 1 applied | 415,236,096 B | pass |
 
-All reported `reduced_gradients_finite: 1.0`, old-policy identity within the AMP
-tolerance, nonzero decision mass, one optimizer step, and a checkpoint at
-iteration 1. These passes demonstrate the ordinary finite path; they do not test
-the injected-nonfinite branch missing in B-03.
+Every mode reports finite reduced gradients, a checkpoint at iteration 1, and
+zero undeclared synchronization. Branched mode sampled one distinguished tree,
+used fractional beta 1.5, and observed two children at a node.
 
-## Real two-GPU training matrix
+## Final unequal-work two-GPU matrix
 
-The same three temporary configs were launched through two ranks with
-`CUDA_VISIBLE_DEVICES=1,2`. All completed with exit code zero.
+Commands used two visible devices and `torch.distributed.run --nproc-per-node=2`.
 
-| Mode | Global decision mass | Rank-0 objective scale | Optimizer steps | Collective calls | Collective bytes |
-|---|---:|---:|---:|---:|---:|
-| normal | 42.0 | 0.5238096 | 1 | 2 | 7,589,136 |
-| sequential RB | 46.0 | 0.4565217 | 1 | 2 | 7,589,136 |
-| branched RB | 8.5048828 | 0.5878976 | 1 | 2 | 7,589,136 |
+| Mode | Rank-0 local mass | Global mass | Rank-0 scale | Collectives/bytes | Result |
+|---|---:|---:|---:|---:|---|
+| normal | 23 | 41 | 0.5609756 | 2 / 7,467,280 | pass |
+| sequential RB | 29 | 56 | 0.5178571 | 2 / 7,467,280 | pass |
+| branched RB | 3.5 | 7.75 | 0.4516129 | 2 / 7,467,280 | pass |
 
-Each reported finite reduced gradients. The unequal objective scales show that
-the run exercised global-mass normalization rather than trivial equal-rank
-averaging.
+All three runs applied one finite flat-SUM update, wrote checkpoints, and
+reported zero undeclared synchronization. Scales differ from 0.5, demonstrating
+that the test exercised unequal mass rather than equal-rank averaging. The
+17-start sequential quota also exercises the 9/8 world-size split.
 
-## Boundary probes that fail the release contract
+## Checkpoint/resume soaks
 
-### Reduced deck
+Each mode ran a two-rank 25-update workload with checkpoints every five
+iterations. The metrics file was restored to the exact checkpoint-20 prefix and
+resumed through 25 under a compatible hardware profile whose query chunk changed
+from 128 to 96.
 
-Constructing the production backend with an otherwise legal
-`PokerConfig(n_players=2, stack_bb=8, rank_count=12)` produced:
+| Mode | Metrics history | Finite/applied updates | Profiled peak reserved | Resume artifact |
+|---|---|---:|---:|---|
+| normal | exact 0--24 | 25 / 25 | 429,916,160 B | `hardware_resume_0000020.json` + checkpoint 25 |
+| sequential RB | exact 0--24 | 25 / 25 | 390,070,272 B | same |
+| branched RB | exact 0--24 | 25 / 25 | 415,236,096 B | same |
 
-```text
-RuntimeError: compact-deck model tensors are not yet migrated to variable hand width
-```
+Every record has a finite reduced gradient, no nonfinite skip, and zero
+undeclared synchronization. Execution-reserved accounting was constant across
+the normal and sequential soaks and zero-residual for the branched scheduler.
 
-This is also an explicit expected-failure unit test for `R=4`.
+The first sequential resume attempt exposed an additional release defect: the
+frozen rollout policy ran in FP32 while identity/learner forwards used FP16.
+After 20 updates this produced a 0.03547 log-probability mismatch and failed the
+identity gate. Commit `5c10366` applies the configured precision consistently to
+behavior and learner policy inference while keeping completion/value reduction
+in fp32. The same checkpoint-20 resume then passed. The identity failure path
+now raises a normal diagnostic exception instead of poisoning the CUDA context.
 
-### Entropy decay
+## Realistic six-player checkpoint gate
 
-For `training.iters=100`, `loss.c_h=0.01`, and iteration 50, the coefficient was:
+After the tiny gates, the repository's 6-player 10 bb normal workload ran on one
+RTX 2080 Ti with 128 starts, a 96-wide/two-layer model, AdamW, clipped values,
+active reference KL, and checkpoint interval 20.
 
-```text
-0.0
-```
+| Measure | Result |
+|---|---:|
+| Iterations | exact 0--19 |
+| Finite/applied optimizer updates | 20 / 20 |
+| Profiled-iteration decisions | 1,038 |
+| Reference KL range | 0 to 0.0753732 |
+| Undeclared synchronizations | 0 |
+| Calibrated peak reserved | 3,913,285,632 B |
+| Calibrated safe limit | 9,199,091,712 B |
+| Final checkpoint | 79 MiB at iteration 20 |
 
-The documented linear schedule implies `0.005`.
+The 3.91 GiB peak retained more than 5.2 GiB of headroom under the profile's
+safe limit.
 
-### History capacity
+## Loss/update coverage
 
-The failure is established by exact static bounds rather than a large adversarial
-rollout: the documented maximum `SP+3P-S+1` is 519 for the shipped 6-player
-100 bb preset and 659 at 6-player 128 bb, while both network validators reject
-history width above 256. All values are deterministic configuration/source
-constants.
+The complete suite additionally covers:
 
-## What the evidence does and does not establish
+- `ppo` and both RB uses of `rb_ppo` with MSE and clipped values;
+- constant and linear entropy at start/midpoint/endpoint;
+- reference KL refresh, checkpoint, and resume;
+- Adam and AdamW;
+- one-rank FP16/BF16/FP32 plus disabled AMP;
+- injected finite and nonfinite gradients, including unequal two-rank injection;
+- parameter/scaler immutability on rejected updates; and
+- dotted-path rejection for every audited invalid numeric boundary.
 
-Established:
+## Evidence boundary
 
-- the full-deck ordinary path is operational in every training mode;
-- real sibling sampling/completion/folder/showdown boundaries execute;
-- two-rank NCCL training performs globally scaled SUM updates;
-- checkpoints and metrics are produced;
-- the tested workloads stay well inside RTX 2080 Ti memory;
-- GPUs return cleanly to idle.
-
-Not established:
-
-- any `R < 13` production training;
-- lossless execution of every legal deep multiplayer trajectory;
-- safe nonfinite behavior in FP32/BF16/AMP-disabled modes;
-- correct `linear_decay` entropy;
-- exhaustive `(P,S,R)` execution;
-- large-run throughput or memory stability after the newly found hot-path issues;
-- strategic quality, exploitability improvement, or convergence.
-
-The successful tests therefore support a strong full-deck prototype, not the
-advertised general production release.
+This evidence establishes the repaired execution, estimator, safety, and
+checkpoint contracts. It does not establish exploitability, approximate-best-
+response performance, strategic improvement, or convergence. M-05 remains
+explicitly outside this release scope.

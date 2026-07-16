@@ -2,85 +2,85 @@
 
 Audit date: 2026-07-16
 
-Audited revision: `dde65f6d470cd4d890ec1b19293c22e83139cc24`
+Initial audited revision: `dde65f6d470cd4d890ec1b19293c22e83139cc24`
+
+Validated repair revision: `5c10366ffaa330eeab5af73a6761b50874100246`
 
 ## Verdict
 
-**NO-GO for the requested production shipment.**
+**GO for an engineering/estimator-correctness release of the fixed-intensity
+trainer.**
 
-The fixed full-deck implementation has a strong, well-tested core. Normal,
-sequential Rao--Blackwell (RB), and branched RB each completed real CUDA
-training and two-rank distributed training in this audit. The implemented
-fixed-intensity estimator is substantially faithful to the relevant mathematics
-in `docs/theory/core_math.tex`, and the poker networks substantially implement
-`docs/theory/MHA_model.md`, including evaluator-supplied folded-player statistics
-after a fold in games with more than two players.
+All release blockers and all major/moderate findings in this report are resolved
+except M-05, which the repository owner explicitly excluded from this repair
+scope. Normal, sequential Rao--Blackwell (RB), and branched RB pass the repaired
+one- and two-GPU matrix, 25-update checkpoint/resume soaks, and the complete
+automated suite. A realistic 6-player checkpoint gate also passes.
 
-The repository nevertheless does not satisfy its advertised production
-contract:
+This is deliberately not a strategy-quality verdict. The release has no
+approximate-best-response or exploitability probe, so it must not be described
+as demonstrating strategic improvement, convergence, or a useful poker policy.
 
-1. Every reduced deck, `rank_count != 13`, is explicitly rejected by the
-   production rollout backend. The documented `R in {4,...,13}` domain is not
-   implemented end to end.
-2. Public-history embeddings default to 256 tokens, but legal configured games
-   can have far longer histories. The shipped 6-player 100 bb preset can reach a
-   documented maximum of 519 player nodes; the 6-player 128 bb boundary reaches
-   659. The model raises once history exceeds 256.
-3. The common distributed finite-gradient result is computed but does not gate
-   clipping or the optimizer step. This is unsafe when the FP16 scaler is
-   disabled, including FP32 and BF16 execution.
-4. `linear_decay` entropy uses the nonexistent `cfg.train` field and therefore
-   decays against one iteration instead of `cfg.training.iters`.
-5. Configuration loading is type-strict but not value-strict for several
-   scientific and optimizer fields. Invalid values documented as parse-time
-   errors are accepted and fail late, behave incorrectly, or silently do no
-   work.
-6. Device-residency and synchronization claims are stronger than the code and
-   tests. History packing and folded-summary caching perform unaccounted
-   device-to-host scalar/vector reads and Python-side work in model hot paths.
+## Resolved production contract
 
-These are implementation defects and contract gaps, not requests for later
-optimization. They should be closed before a production run is called
-supported.
+- Every legal `rank_count` from 4 through 13 is carried end to end through
+  geometry, both models, rollout, evaluator adapters, completion, showdown, and
+  folded summaries.
+- Lossless public-history capacity is derived from `(P,S)`, cross-checked with
+  hardware token limits, and tested at all player/stack boundaries.
+- The common reduced-gradient finite decision gates clipping, parameter update,
+  and loss-scale transition in FP16, BF16, and FP32.
+- Linear entropy decay uses `training.iters`; numeric and cross-field
+  configuration validation fails early with dotted paths.
+- CUDA library launches require a hardware profile.
+- CUDA history input and folded-summary caching stay device resident; the one
+  mixed-row scheduler control block is declared and counted.
+- Frozen behavior rollout and learner inference use the same configured
+  precision, including after checkpoint resume.
+- Reference KL is implemented. Optional public moment output heads are
+  structural only and have no registered target, loss, or branching controller.
+- Cohesive optimization, checkpoint, model-input, cache, and policy-planning
+  lifecycles have been extracted from the two oversized modules.
 
-## What is confirmed now
+## Final evidence summary
 
-- NLHE is the only active game. There is no active game registry or importable
-  Kuhn/Leduc/synthetic implementation.
-- The active game exposes the intended public configuration fields `n_players`,
-  `stack_bb`, and `rank_count`; `PokerConfig` correctly enforces player, stack,
-  half-big-blind, rank, and card-capacity bounds.
-- Full-deck (`R=13`) normal, sequential RB, and branched RB training execute on
-  one GPU and two GPUs.
-- Branched mode has one distinguished root per rank, applies ordinary
-  randomized rounding at that root, and preserves duplicate labeled children.
-- Posterior mass/moment reduction, leave-one-out sibling baselines, owner-clock
-  lambda bootstrap, path-mass sampling, and distributed gradient SUM match the
-  implemented fixed-intensity mathematical design.
-- The two-network poker model has class-native preflop rows, compact compatible
-  postflop live-player rows, pre-LN reach-biased MHA, exact incidence residuals,
-  factorized type/raise heads, and actor-private-type values.
-- Postflop folded players have no attention rows. The sibling evaluator supplies
-  unary/pairwise partition corrections and per-folder mass, card, seat, and line
-  statistics; the model consumes them and tests show that changing them changes
-  output.
-- The only registered composite losses are `ppo` for normal mode and `rb_ppo`
-  for both RB modes. Both can use MSE or clipped value loss, exact legal entropy,
-  and optional exact legal-action `KL(new || reference)`.
-- The complete test suite passed on an idle RTX 2080 Ti, and direct one- and
-  two-GPU training smokes produced finite metrics and checkpoints.
+| Gate | Result |
+|---|---|
+| Complete suite on real CUDA + socket-enabled DDP | 382 passed, 1 version-conditional skip |
+| Every `R=4,...,13` and every legal `(P,R)` | passed |
+| One GPU, all three modes | finite update + checkpoint in every mode |
+| Two GPUs, all three modes | unequal rank mass + finite flat SUM update in every mode |
+| Two-rank checkpoint/resume | exact 0--24 history in every mode under a changed compatible profile |
+| Realistic 6-player normal gate | 20 finite updates, active reference KL, checkpoint at 20 |
+| Peak for realistic gate | 3.91 GiB reserved versus 9.20 GiB calibrated safe limit |
+| Final GPU hygiene | test devices returned to 9/19 MiB idle baselines; no owned process remained |
+
+Detailed commands and metrics are in [validation evidence](05_validation_evidence.md).
+
+## Repair commits
+
+| Finding/work | Commit |
+|---|---|
+| B-04 entropy horizon | `8175b70` |
+| B-03 finite-step gate | `1cae1e2` |
+| B-05 strict values | `6155287` |
+| B-02 history capacity | `666ccf8` |
+| M-02 CUDA profile gate | `c6f8eec` |
+| B-01 every compact deck | `5c3c5ef` |
+| M-01 device-resident inputs/cache | `6659205` |
+| M-04 lifecycle extraction | `cd355c0` |
+| M-03 active documentation | `3e22e0f` |
+| Resume-discovered precision mismatch | `5c10366` |
 
 ## Report set
 
 - [Scope and method](01_scope_and_method.md)
-- [Findings and required fixes](02_findings.md)
+- [Findings and repairs](02_findings.md)
 - [Mathematics and model traceability](03_math_and_model_traceability.md)
 - [Runtime, configuration, and losses](04_runtime_configuration_and_losses.md)
 - [Validation evidence](05_validation_evidence.md)
 - [File-by-file inventory](06_file_inventory.md)
 - [Release checklist](07_release_checklist.md)
 
-This report supersedes the release conclusion in the older sibling audit
-`docs/audit/production_training_readiness_2026-07-16.md`. That audit remains
-useful performance evidence, but it did not detect the configuration-domain and
-optimizer-gating defects above.
+The older `production_training_readiness_2026-07-16.md` is retained only as a
+superseded evidence snapshot. This report is the current release decision.

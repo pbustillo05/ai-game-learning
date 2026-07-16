@@ -18,9 +18,9 @@
 - [x] Require a hardware profile for any CUDA launch, including Python API use.
 - [x] Remove or account for full-policy hot-path host synchronization. Extend
   sync-debug/instrumentation tests to history packing and folder-summary caching.
-- [ ] Rerun the full suite, all three one-GPU acceptance modes, and all three
+- [x] Rerun the full suite, all three one-GPU acceptance modes, and all three
   unequal-work two-rank modes after the fixes.
-- [ ] Update README/contracts/poker/theory status and supersede the old accepted
+- [x] Update README/contracts/poker/theory status and supersede the old accepted
   readiness claim only after the corrected tests pass.
 
 ## Minimum acceptance matrix after repair
@@ -32,35 +32,35 @@
   subject to `2P+5 < 4R`; if full-deck-only v1 is chosen, test parse-time
   rejection of every other R.
 - [x] Long legal minimum-raise histories beyond 256 at 3--6 players.
-- [ ] Folded-player continuation with one and multiple folders.
+- [x] Folded-player continuation with one and multiple folders.
 
 ### Modes and distribution
 
-- [ ] normal, sequential RB, and branched RB on one GPU;
-- [ ] all three on two GPUs with unequal local decision mass;
-- [ ] branched root beta fractional rounding and duplicate children;
-- [ ] sequential global-start quota boundary at world size;
-- [ ] checkpoint/resume for each mode and a changed compatible hardware profile.
+- [x] normal, sequential RB, and branched RB on one GPU;
+- [x] all three on two GPUs with unequal local decision mass;
+- [x] branched root beta fractional rounding and duplicate children;
+- [x] sequential global-start quota boundary at world size;
+- [x] checkpoint/resume for each mode and a changed compatible hardware profile.
 
 ### Loss/update
 
-- [ ] `ppo` with MSE and clipped values;
-- [ ] `rb_ppo` in both RB modes with MSE and clipped values;
+- [x] `ppo` with MSE and clipped values;
+- [x] `rb_ppo` in both RB modes with MSE and clipped values;
 - [x] constant and corrected linear entropy schedules;
-- [ ] optional reference KL across refresh and resume;
-- [ ] Adam and AdamW;
+- [x] optional reference KL across refresh and resume;
+- [x] Adam and AdamW;
 - [x] injected finite/nonfinite gradients in FP16, BF16, and FP32;
 - [x] rejection tests for every invalid numeric boundary.
 
 ### Safety and performance
 
-- [ ] idle-device check and explicit device targeting;
+- [x] idle-device check and explicit device targeting;
 - [x] preflight against worst legal history and model token pairs;
 - [x] zero unaccounted synchronization in full policy construction, or a revised
   explicit bounded-control contract with exact counters;
-- [ ] no post-run GPU memory/process residue;
-- [ ] short soak proving bounded reserved memory;
-- [ ] one realistic six-player checkpoint run after tiny gates pass.
+- [x] no post-run GPU memory/process residue;
+- [x] short soak proving bounded reserved memory;
+- [x] one realistic six-player checkpoint run after tiny gates pass.
 
 ## Recommended immediately after the minimal release
 
@@ -77,8 +77,10 @@
 
 ## Ship decision rule
 
-Do not change this audit's verdict based only on passing the existing suite: the
-suite currently expects reduced-deck failure and does not cover the maximum
-history or disabled-scaler nonfinite cases. Shipment becomes reasonable when all
-required items above have implementation tests and the live one-/two-GPU matrix
-passes on the corrected revision.
+All required items and the minimum acceptance matrix pass on repaired revision
+`5c10366`. The engineering/estimator-correctness release gate is therefore GO.
+The unchecked approximate-BR item is M-05, explicitly excluded by the repository
+owner. Until it exists, shipment must not make a strategy-quality,
+exploitability, improvement, or convergence claim. The remaining unchecked
+performance-baseline and moment-head decisions are follow-up research/operations
+work rather than blockers for this bounded release.
