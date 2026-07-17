@@ -49,6 +49,9 @@ ENV/
 *.vrb
 docs/latex/*.pdf
 
+# Local paper PDFs, LaTeX source archives, and cloned reference repositories.
+/docs/references/
+
 # Training runs, checkpoints, and experiment tracking
 /runs/
 /outputs/
