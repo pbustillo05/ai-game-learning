@@ -21,7 +21,7 @@ def _result(speed: float, seconds: float, target_bytes: float) -> dict:
         },
         "workload": {
             "game": "poker",
-            "sequential_starts": 64,
+            "roots_per_gpu": 64,
             "node_budget": 128,
             "completion_samples": 32,
             "completion_backend": "cpu",

@@ -171,10 +171,10 @@ def test_configuration_rejects_out_of_contract_values(
 
 def test_rollout_memory_uses_compact_private_width() -> None:
     short = estimate_rollout_memory(
-        root_count=2, node_budget=8, n_players=2, reach_storage="full", rank_count=4
+        root_count=2, node_budget=8, n_players=2, rank_count=4
     )
     full = estimate_rollout_memory(
-        root_count=2, node_budget=8, n_players=2, reach_storage="full", rank_count=13
+        root_count=2, node_budget=8, n_players=2, rank_count=13
     )
     assert short.reach_cache_bytes * 1326 == full.reach_cache_bytes * 120
     assert short.frontier_reach_bytes * 1326 == full.frontier_reach_bytes * 120
@@ -303,7 +303,7 @@ def test_every_rank_count_completes_a_boundary_training_iteration(
     raw["game"]["rank_count"] = rank_count
     raw["rollout"].update(
         {
-            "sequential_starts": 2,
+            "sequential_roots_per_gpu_initial": 2,
             "node_budget": 32,
             "family_batch_rows": 2,
             "max_active_trajectories": 2,
@@ -350,7 +350,7 @@ def test_every_rank_count_completes_a_rao_blackwell_training_iteration(
     raw["game"]["rank_count"] = rank_count
     raw["rollout"].update(
         {
-            "sequential_starts": 2,
+            "sequential_roots_per_gpu_initial": 2,
             "node_budget": 32,
             "family_batch_rows": 2,
             "max_active_trajectories": 2,

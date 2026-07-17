@@ -3,7 +3,7 @@ game:
   stack_bb: 8.0
   rank_count: 13
 rollout:
-  sequential_starts: 1
+  sequential_roots_per_gpu_initial: 1
   beta:
     default: 1.0
     preflop: 1.0
@@ -14,7 +14,6 @@ rollout:
     chance_to_turn: 1.25
     chance_to_river: 1.25
   node_budget: 256
-  reach_storage: recompute
 completion:
   n_samples: 8
   backend: cuda

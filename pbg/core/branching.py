@@ -10,6 +10,7 @@ from torch import Tensor
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, GameBundle
 from pbg.core.tree import (
+    DecisionReachCache,
     DeviceTreeBuffer,
     PolicyCache,
     ReachCache,
@@ -55,10 +56,8 @@ def sample_branched_tree(
     device = torch.device(backend.device)
     if torch.device(gen.device) != device:
         raise ValueError("rollout generator must be created on the backend device")
-    if int(rollout_cfg.sequential_starts) != 1 or int(rollout_cfg.node_budget) <= 0:
+    if int(rollout_cfg.roots_per_gpu) != 1 or int(rollout_cfg.node_budget) <= 0:
         raise ValueError("family-scheduled branched rollout requires one root and a positive budget")
-    if rollout_cfg.reach_storage not in {"full", "decisions_only", "recompute"}:
-        raise ValueError("unknown reach_storage mode")
 
     p_max = int(backend.n_players)
     x_sizes = tuple(int(value) for value in backend.x_sizes)
@@ -112,6 +111,9 @@ def sample_branched_tree(
     policy_edge_logp: list[Tensor] = []
     policy_node_ids: list[Tensor] = []
     policy_node_values: list[Tensor] = []
+    policy_node_reaches: list[Tensor] = []
+    leaf_node_ids: list[Tensor] = []
+    leaf_reaches: list[Tensor] = []
 
     def read_control(value: Tensor) -> tuple[int, ...]:
         if value.ndim != 1 or value.dtype != torch.int64:
@@ -199,6 +201,7 @@ def sample_branched_tree(
         if family is not None:
             output = actual_cost_forward(bundle.model, family, states, reaches)
             child_output = _index_policy_output(output, parent_positions)
+            policy_node_reaches.append(reaches.detach().clone())
         event_keys = logical_rng_keys(
             seed=logical_seed,
             iteration=iteration,
@@ -308,6 +311,13 @@ def sample_branched_tree(
                         logical_time=scheduler_step,
                     )
             record_queues()
+            stopped = counts[-1]
+            if stopped:
+                stopped_nodes = partition.candidate_handles[-1, :stopped].to(torch.int32)
+                leaf_node_ids.append(stopped_nodes)
+                leaf_reaches.append(
+                    reach_rows[stopped_nodes.to(torch.int64)].detach().clone()
+                )
             chance_count = counts[-2]
             if chance_count == 0:
                 return
@@ -349,21 +359,18 @@ def sample_branched_tree(
 
     tree = buffer.finalize()
     tree.validate()
-    all_nodes = torch.arange(buffer.node_count, dtype=torch.int32, device=device)
-    if rollout_cfg.reach_storage == "full":
-        reach_nodes = all_nodes
-    elif rollout_cfg.reach_storage == "decisions_only":
-        stored = ((tree.owner >= 0) & (tree.owner < p_max)) | (
-            (tree.owner == TERMINAL) | (tree.owner == PRETERM)
-        )
-        reach_nodes = all_nodes[stored]
+    if leaf_node_ids:
+        reach_nodes = torch.cat(leaf_node_ids).to(torch.int32)
+        retained_leaf_reach = torch.cat(leaf_reaches).float()
+        leaf_order = torch.argsort(reach_nodes.to(torch.int64))
+        reach_nodes = reach_nodes[leaf_order]
+        retained_leaf_reach = retained_leaf_reach[leaf_order]
     else:
-        reach_nodes = root_nodes
-    reach_cache = ReachCache(
-        rollout_cfg.reach_storage,
-        reach_rows[reach_nodes.to(torch.int64)],
-        reach_nodes,
-    )
+        reach_nodes = torch.empty(0, dtype=torch.int32, device=device)
+        retained_leaf_reach = torch.empty(
+            (0, p_max, x_max), dtype=torch.float32, device=device
+        )
+    reach_cache = ReachCache("sealed", retained_leaf_reach, reach_nodes)
     decision_nodes = ((tree.owner >= 0) & (tree.owner < p_max)).nonzero().squeeze(1)
     if decision_nodes.numel():
         counts = tree.child_ptr[decision_nodes + 1] - tree.child_ptr[decision_nodes]
@@ -388,15 +395,29 @@ def sample_branched_tree(
         logp_child[node_to_row[parents], columns] = edge_logp
         cached_nodes = torch.cat(policy_node_ids).to(torch.int32)
         cached_values = torch.cat(policy_node_values).to(torch.float32)
+        cached_reaches = torch.cat(policy_node_reaches).to(torch.float32)
         order = torch.argsort(cached_nodes.to(torch.int64))
         if not torch.equal(cached_nodes[order], decision_nodes):
             raise RuntimeError("family-scheduled branched rollout omitted a decision cache row")
         old_v = cached_values[order]
+        decision_rows = cached_reaches[order]
     else:
         logp_child = torch.empty((0, 0, x_max), dtype=torch.float32, device=device)
         old_v = torch.empty((0, x_max), dtype=torch.float32, device=device)
+        decision_rows = torch.empty(
+            (0, p_max, x_max), dtype=torch.float32, device=device
+        )
+    state_refs = tree.state_ref[decision_nodes].to(torch.int32)
+    owners = tree.owner[decision_nodes].to(torch.int32)
+    decision_reach = DecisionReachCache.from_rows(
+        decision_nodes.to(torch.int32),
+        state_refs,
+        decision_rows,
+        backend,
+        owners,
+    )
     return tree, reach_cache, PolicyCache(
-        decision_nodes.to(torch.int32), logp_child, old_v
+        decision_nodes.to(torch.int32), logp_child, old_v, decision_reach
     )
 
 

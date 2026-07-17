@@ -116,7 +116,7 @@ def build_normal_dataset_from_sampled(
         terminal_reward = bundle.rollout_backend.sampled_terminal_reward(
             tree.state_ref[leaf], leaf_profiles, gen
         ).float()
-    start_count = int(cfg.rollout.sequential_starts)
+    start_count = int(cfg.rollout.roots_per_gpu)
     reward_by_tree = torch.empty(
         (start_count, p_max), dtype=torch.float32, device=device
     )
@@ -151,19 +151,10 @@ def build_normal_dataset_from_sampled(
             + (1.0 - float(cfg.loss.lam)) * old_v[selected]
         )
 
-    reach_rows = reach_cache.rows_for(
-        tree,
-        decisions.to(torch.int32),
-        bundle.rollout_backend,
-        policy_cache,
-    ).float()
-    state_refs = tree.state_ref[decisions].to(torch.int32)
-    decision_reach = DecisionReachCache.from_rows(
-        decisions.to(torch.int32),
-        state_refs,
-        reach_rows,
-        bundle.rollout_backend,
-    )
+    if policy_cache.decision_reach is None:
+        raise RuntimeError("rollout did not retain natural decision inputs")
+    decision_reach = policy_cache.decision_reach
+    state_refs = decision_reach.state_refs
     return NormalDataset(
         state_refs=state_refs,
         reach=decision_reach,

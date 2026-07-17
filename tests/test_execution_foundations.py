@@ -37,7 +37,7 @@ from pbg.core.training import (
     _analytical_memory_plan,
     _alias_table,
     _sample_alias,
-    _sequential_start_quotas,
+    _rank_local_config,
     _sync_scaled_gradients,
     _validate_memory_calibration,
 )
@@ -65,11 +65,10 @@ def test_sequential_memory_plan_uses_realized_single_child_width() -> None:
     cfg = SimpleNamespace(
         training=SimpleNamespace(mode="rao_blackwell"),
         rollout=SimpleNamespace(
-            sequential_starts=10,
+            roots_per_gpu=10,
             node_budget=43,
             family_batch_rows=64,
             max_active_trajectories=64,
-            reach_storage="recompute",
         ),
     )
 
@@ -281,11 +280,14 @@ def test_nonfinite_common_decision_controls_fp16_scaler_transition() -> None:
     assert torch.equal(model.weight, before)
 
 
-def test_global_sequential_starts_partition_into_contiguous_rank_quotas() -> None:
-    assert _sequential_start_quotas(10, 3) == (4, 3, 3)
-    assert _sequential_start_quotas(3, 3) == (1, 1, 1)
-    with pytest.raises(ValueError, match="at least one start per rank"):
-        _sequential_start_quotas(2, 3)
+def test_sequential_roots_are_a_common_per_gpu_width() -> None:
+    cfg = SimpleNamespace(
+        training=SimpleNamespace(mode="rao_blackwell"),
+        rollout=SimpleNamespace(roots_per_gpu=10),
+    )
+    ranks = [_rank_local_config(cfg, rank, 3) for rank in range(3)]
+    assert [item.rollout.roots_per_gpu for item in ranks] == [10, 10, 10]
+    assert all(item.rollout.trajectory_rank_counts == (10, 10, 10) for item in ranks)
 
 
 def test_arena_allocation_is_chunked_exact_and_overflow_is_transactional() -> None:

@@ -27,7 +27,7 @@ def main() -> None:
     parser.add_argument("--mode", action="append", choices=MODES, dest="modes")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument("--sequential-starts", type=int, default=None)
+    parser.add_argument("--roots-per-gpu", type=int, default=None)
     parser.add_argument("--node-budget", type=int, default=None)
     parser.add_argument("--family-batch-rows", type=int, default=None)
     parser.add_argument("--max-active-trajectories", type=int, default=None)
@@ -44,8 +44,8 @@ def main() -> None:
     parser.add_argument("--allow-environment-mismatch", action="store_true")
     args = parser.parse_args()
     cfg = load_config(args.config, hardware_profile=args.hardware_profile)
-    if args.sequential_starts is not None:
-        cfg.rollout.sequential_starts = args.sequential_starts
+    if args.roots_per_gpu is not None:
+        cfg.rollout.roots_per_gpu = args.roots_per_gpu
     if args.node_budget is not None:
         cfg.rollout.node_budget = args.node_budget
     if args.family_batch_rows is not None:

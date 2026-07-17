@@ -30,7 +30,7 @@ def _probe_config(tmp_path: Path):
     raw["completion"]["backend"] = "cpu"
     raw["completion"]["n_samples"] = 4
     raw["rollout"].update(
-        sequential_starts=4,
+        sequential_roots_per_gpu_initial=4,
         node_budget=32,
         family_batch_rows=4,
         max_active_trajectories=4,

@@ -3,7 +3,7 @@ game:
   stack_bb: 100.0
   rank_count: 13
 rollout:
-  sequential_starts: 1  # Branched mode creates exactly one root per rank.
+  sequential_roots_per_gpu_initial: 1  # Branched mode creates exactly one root per rank.
   beta:
     default: 1.0
     preflop: 1.0
@@ -14,7 +14,6 @@ rollout:
     chance_to_turn: 1.5
     chance_to_river: 1.5
   node_budget: 4096  # Preserves the former total per-rank node ceiling.
-  reach_storage: recompute
 completion:
   n_samples: 256  # Safe bootstrap; tune after evaluator-memory measurement.
   backend: cuda

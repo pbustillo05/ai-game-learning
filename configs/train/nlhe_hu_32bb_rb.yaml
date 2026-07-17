@@ -11,11 +11,10 @@ rollout:
   # hardware profile's 8.57 GiB safe limit.
   # Two-rank launch: 2,048 starts/GPU initially. The controller can take the
   # full +25% step to the tested 2,560 starts/GPU ceiling after iteration 1.
-  sequential_starts: 4096
+  sequential_roots_per_gpu_initial: 2048
   beta: null
   # Exact HU 32 bb bound: 39 player nodes + 3 chance nodes + 1 terminal leaf.
   node_budget: 43
-  reach_storage: recompute
   # At 2,048 starts/GPU, 64-row families completed three iterations and cut
   # rollout time from 42.2 s (32 rows) to 33.6 s (64 rows).
   family_batch_rows: 64
@@ -24,25 +23,19 @@ rollout:
   # Corrected hard rollout bound is 1.06 GiB/GPU; measured accounting high
   # water was 0.92 GiB/GPU. This leaves about 0.44 GiB accounting headroom.
   execution_memory_bytes: 1610612736
-  target_decisions_per_gpu: 8000
-  min_sequential_starts_per_gpu: 512
+  sequential_roots_per_gpu_minimum: 512
   # 4,096/GPU reserved 7.70 GiB even at the minimum active count; its 25%
   # The 2,560/GPU probe realized 7,994 rank-max decisions and a later resumed
   # iteration measured an 8.03 GB allocator peak. The companion 12-hour
   # hardware profile accepts that measured tier while retaining a 25% gate.
-  max_sequential_starts_per_gpu: 2560
-  decisions_per_start_ema_alpha: 0.2
-  max_start_change_fraction: 0.25
+  sequential_roots_per_gpu_maximum: 2560
   # Policy-conditioned memory forecasts are updated on every successful
   # iteration and censored pre-optimizer retry. Positive surprises widen
   # immediately; tightening requires a fresh calibration window after drift.
-  memory_forecast_window: 128
-  memory_forecast_half_life: 32.0
-  memory_forecast_min_observations: 40
-  memory_soft_exceedance_rate: 0.025
-  memory_max_start_increase_fraction: 0.10
-  memory_retry_backoff_fraction: 0.20
-  memory_max_rollout_retries: 2
+  memory_calibration_window: 128
+  memory_growth_fraction: 0.10
+  memory_growth_delay: 40
+  memory_prediction_z: 3.0
 
 completion:
   n_samples: 1024

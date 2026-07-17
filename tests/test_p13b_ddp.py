@@ -120,8 +120,8 @@ def test_ddp_keeps_tree_and_batch_values_per_rank() -> None:
     cfg = load_config("configs/train/nlhe6.yaml")
     one_rank = copy.deepcopy(cfg)
     two_rank = copy.deepcopy(cfg)
-    assert one_rank.rollout.sequential_starts == 1
-    assert two_rank.rollout.sequential_starts == one_rank.rollout.sequential_starts
+    assert one_rank.rollout.roots_per_gpu == 1
+    assert two_rank.rollout.roots_per_gpu == one_rank.rollout.roots_per_gpu
     assert two_rank.training.minibatch_size == one_rank.training.minibatch_size
 
 

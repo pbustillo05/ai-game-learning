@@ -3,10 +3,9 @@ game:
   stack_bb: 10.0
   rank_count: 13
 rollout:
-  sequential_starts: 512
+  sequential_roots_per_gpu_initial: 512
   beta: null
   node_budget: 128
-  reach_storage: recompute
   # q bounds one family drain/model launch. Admission controls the resident
   # trajectory pool separately; keep all configured starts eligible to fill
   # queues across public depths.

@@ -3,10 +3,9 @@ game:
   stack_bb: 32.0
   rank_count: 13
 rollout:
-  sequential_starts: 1024
+  sequential_roots_per_gpu_initial: 1024
   beta: null
   node_budget: 64
-  reach_storage: recompute
   # q=128 is faster for sequential RB, but reached 7.45 GB reserved at 1,024
   # starts. Keep the reproducible all-mode workload inside the 25% VRAM margin.
   family_batch_rows: 64

@@ -34,19 +34,17 @@ the rollout snapshot unnecessarily.
 
 Start with [`training.py`](../../pbg/core/training.py), in this order:
 
-1. `SequentialWorkController` and `_rank_local_config` — how global sequential
-   work is partitioned across ranks and how optimizer work is adapted to the
-   realized decision count.
-2. `_IterationData` — the deliberate retention set crossing the rollout,
+1. `SequentialMemoryController` and `_rank_local_config` — how a phase-wise
+   memory proof selects one common root width per GPU before any draws.
+2. `TrainingStorage` and `_IterationData` — the deliberate retention set crossing the rollout,
    target, and optimization phases.
 3. `_analytical_memory_plan`, `_memory_limit`,
    `_validate_memory_preflight`, and `_profiled_call` — the clearest statement
    of what the implementation believes is resident at each phase, including
    parameters, topology, reaches, policy cache, targets, completion workspace,
    optimizer state, gradient synchronization, and reference-model copies.
-4. `_build_iteration_data` — the actual phase transition: frozen old-policy
-   snapshot, rollout, deletion of the frozen bundle when it is no longer
-   needed, completion microbatches, streamed value reduction, and target/cache
+4. `_build_iteration_data` — the actual phase transition: synchronous read-only
+   old-policy rollout, completion microbatches, streamed value reduction, and target/cache
    retention.
 5. `_one_iteration` — minibatch reuse, gradient accumulation, distributed
    objective scaling, finite-gradient gating, and optimizer stepping.
@@ -119,11 +117,9 @@ Focus on this execution loop:
    append children, update reach, and mark occurrences done.
 7. Continue until all starts are admitted and all queues drain.
 
-Read `reach_storage` branches carefully. `full` retains reach rows for every
-node; `decisions_only` retains compact rows needed by learning; `recompute`
-uses one overwritten working row per trajectory and reconstructs decision
-reaches later. This is one of the most consequential memory/compute tradeoffs
-in the core.
+Sequential rollout owns one overwritten working reach row per live trajectory.
+It commits exact reach rows only at player decisions and stopped leaves, then
+releases the working row. There is no selectable replay or all-node reach mode.
 
 The default `family_batch_rows`, `max_active_trajectories`,
 `arena_chunk_nodes`, and `node_budget` are not innocuous tuning constants:

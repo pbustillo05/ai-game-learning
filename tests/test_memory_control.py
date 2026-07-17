@@ -9,8 +9,15 @@ from pbg.core.checkpointing import (
     config_dict_fingerprint,
     matches_legacy_run_fingerprint,
 )
-from pbg.core.memory_control import PolicyMemoryForecaster, unique_tensor_bytes
-from pbg.core.training import SequentialWorkController
+from pbg.core.memory_control import (
+    MEMORY_PHASES,
+    PhaseMemoryForecaster,
+    PhaseMemoryModel,
+    PhaseMemoryObservation,
+    SequentialMemoryController,
+    PolicyMemoryForecaster,
+    unique_tensor_bytes,
+)
 
 
 @dataclass
@@ -30,13 +37,12 @@ def test_legacy_checkpoint_without_probe_accepts_current_null_probe() -> None:
     current = {
         "training": {},
         "rollout": {
-            "memory_forecast_window": 128,
-            "memory_forecast_half_life": 32.0,
-            "memory_forecast_min_observations": 40,
-            "memory_soft_exceedance_rate": 0.025,
-            "memory_max_start_increase_fraction": 0.10,
-            "memory_retry_backoff_fraction": 0.20,
-            "memory_max_rollout_retries": 2,
+            "sequential_roots_per_gpu_minimum": 1,
+            "sequential_roots_per_gpu_maximum": 8,
+            "memory_calibration_window": 32,
+            "memory_growth_fraction": 0.10,
+            "memory_growth_delay": 8,
+            "memory_prediction_z": 3.0,
         },
         "probe": None,
     }
@@ -166,43 +172,34 @@ def test_restart_rate_enters_one_calibration_epoch_and_requires_clean_data() -> 
 
 
 def test_memory_commit_is_transactional_and_safety_decrease_is_unrestricted() -> None:
-    controller = SequentialWorkController(
-        current_starts_per_gpu=20,
-        memory_forecaster=PolicyMemoryForecaster(
-            window=8, half_life=4.0, minimum_observations=4
-        ),
-    )
-    controller.stage_rollout(
-        local_decisions=100,
-        rank_max_decisions=100,
-        rank_max_decisions_per_start=5.0,
-        target_decisions=200,
-        minimum_starts=5,
-        maximum_starts=40,
-        ema_alpha=1.0,
-        target_reuse=3.0,
-        minibatch_size=8,
-    )
-    assert controller.current_starts_per_gpu == 20
-    controller.memory_forecaster.observe(
-        starts=20,
-        peak_reserved_bytes=20_000,
-        end_reserved_bytes=1_000,
-        metrics={"nodes": 200},
-        ceiling_bytes=6_000,
-    )
-    result = controller.commit_memory_observation(
-        metrics={
-            "iteration_peak_reserved_bytes": 20_000,
-            "iteration_end_reserved_bytes": 1_000,
-            "nodes": 200,
+    forecaster = PhaseMemoryForecaster(
+        {
+            phase: PhaseMemoryModel(1_000, {"schema": 100})
+            for phase in MEMORY_PHASES
         },
-        ceiling_bytes=6_000,
-        minimum_starts=5,
-        maximum_starts=40,
-        maximum_increase_fraction=0.10,
+        window=4,
     )
-    assert controller.current_starts_per_gpu < 20
-    assert "memory" in result["sequential_start_clamp_reason"]
-    restored = SequentialWorkController.from_state_dict(controller.state_dict())
+    controller = SequentialMemoryController(
+        minimum_roots_per_gpu=5,
+        maximum_roots_per_gpu=40,
+        current_roots_per_gpu=20,
+        device_bytes=6_000,
+        guard_bytes=1_000,
+        forecaster=forecaster,
+        growth_fraction=0.10,
+        growth_delay=2,
+    )
+    observations = {
+        phase: PhaseMemoryObservation(
+            roots_per_gpu=20,
+            fixed_bytes=1_000,
+            variable_bytes={"schema": 8_000},
+            predicted_peak_bytes=3_000,
+            actual_peak_bytes=9_000,
+        )
+        for phase in MEMORY_PHASES
+    }
+    controller.observe_success(observations)
+    assert controller.choose_root_width() == 10
+    restored = SequentialMemoryController.from_state_dict(controller.state_dict())
     assert restored.state_dict() == controller.state_dict()

@@ -11,7 +11,8 @@ from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
 import math
-from typing import Iterable, Mapping
+from contextlib import contextmanager
+from typing import Iterable, Iterator, Mapping
 
 import torch
 from torch import Tensor
@@ -67,6 +68,74 @@ class ByteAccountant:
             )
         self._reservations[label] = int(nbytes)
         self.high_water_bytes = max(self.high_water_bytes, proposed)
+
+    def reserve_many(self, reservations: Mapping[str, int]) -> None:
+        """Atomically reserve a group of uniquely labelled byte extents.
+
+        The complete transaction is checked before any label is installed.
+        This is the accounting boundary used immediately before a group of
+        CUDA allocations whose lifetimes overlap (most notably sealing).
+        """
+
+        if not reservations:
+            raise ValueError("a byte transaction requires at least one reservation")
+        labels = tuple(reservations)
+        if any(not label for label in labels) or len(set(labels)) != len(labels):
+            raise ValueError("byte reservation labels must be nonempty and unique")
+        duplicate = next((label for label in labels if label in self._reservations), None)
+        if duplicate is not None:
+            raise ValueError(f"byte reservation label already exists: {duplicate!r}")
+        values = tuple(reservations.values())
+        if any(isinstance(value, bool) or value < 0 for value in values):
+            raise ValueError("reserved bytes must be nonnegative integers")
+        added = sum(int(value) for value in values)
+        proposed = self.reserved_bytes + added
+        if proposed > self.limit_bytes:
+            raise MemoryError(
+                "byte budget exceeded: "
+                f"requested={added}, reserved={self.reserved_bytes}, "
+                f"limit={self.limit_bytes}"
+            )
+        self._reservations.update(
+            {label: int(value) for label, value in reservations.items()}
+        )
+        self.high_water_bytes = max(self.high_water_bytes, proposed)
+
+    def release_many(self, labels: Iterable[str]) -> int:
+        """Release a group after validating that every label is owned."""
+
+        selected = tuple(labels)
+        if len(set(selected)) != len(selected):
+            raise ValueError("release labels must be unique")
+        missing = next((label for label in selected if label not in self._reservations), None)
+        if missing is not None:
+            raise KeyError(f"unknown byte reservation {missing!r}")
+        return sum(self._reservations.pop(label) for label in selected)
+
+    @contextmanager
+    def transaction(self, reservations: Mapping[str, int]) -> Iterator[None]:
+        """Reserve a group and roll it back if the protected allocation fails."""
+
+        labels = tuple(reservations)
+        self.reserve_many(reservations)
+        try:
+            yield
+        except BaseException:
+            self.release_many(labels)
+            raise
+
+    def reservation(self, label: str) -> int:
+        """Return one owned reservation for ledger validation."""
+
+        try:
+            return self._reservations[label]
+        except KeyError as exc:
+            raise KeyError(f"unknown byte reservation {label!r}") from exc
+
+    def snapshot(self) -> dict[str, int]:
+        """Return a detached diagnostic view of all live reservations."""
+
+        return dict(self._reservations)
 
     def release(self, label: str) -> int:
         """Release and return one exact reservation."""

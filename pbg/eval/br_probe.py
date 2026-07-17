@@ -151,7 +151,7 @@ def evaluate_br_probe(
         device
         or ("cuda:0" if torch.cuda.is_available() else "cpu")
     )
-    cfg.rollout.sequential_starts = min(batch_size, n_hands)
+    cfg.rollout.roots_per_gpu = min(batch_size, n_hands)
     bundle = build_bundle(cfg, requested)
     bundle.model.load_state_dict(probe_payload["model"])
     bundle.model.eval()
@@ -167,7 +167,7 @@ def evaluate_br_probe(
         count = min(batch_size, n_hands - first)
         ids = torch.arange(first, first + count, device=requested, dtype=torch.int64)
         seats = torch.remainder(ids // players, players).to(torch.int32)
-        cfg.rollout.sequential_starts = count
+        cfg.rollout.roots_per_gpu = count
         cfg.rollout.trajectory_start_index = first
         cfg.rollout.probe_seats = seats
         mixed = sample_trees_sequential(bundle, cfg, gen, iteration=0)

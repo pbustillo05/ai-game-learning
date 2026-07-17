@@ -3,10 +3,9 @@ game:
   stack_bb: 8.0
   rank_count: 13
 rollout:
-  sequential_starts: 17
+  sequential_roots_per_gpu_initial: 17
   beta: null
   node_budget: 64
-  reach_storage: recompute
   family_batch_rows: 8
   max_active_trajectories: 8
   arena_chunk_nodes: 64

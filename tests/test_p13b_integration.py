@@ -38,11 +38,10 @@ def _small_poker_cfg(tmp_path: Path):
     cfg.game.n_players = 2
     cfg.game.stack_bb = 8.0
     cfg.game.rank_count = 13
-    cfg.rollout.sequential_starts = 2
+    cfg.rollout.roots_per_gpu = 2
     cfg.rollout.node_budget = 64
     cfg.training.mode = "rao_blackwell"
     cfg.rollout.beta = None
-    cfg.rollout.reach_storage = "full"
     cfg.completion.n_samples = 8
     cfg.completion.backend = "cpu"
     cfg.model = {
@@ -84,43 +83,35 @@ def test_all_first_run_presets_load_strictly_without_deferred_settings() -> None
         assert not (_keys(raw) & DEFERRED)
     nlhe = loaded["nlhe6_h100.yaml"]
     assert nlhe.game.n_players == 6
-    assert nlhe.rollout.sequential_starts == 1 and nlhe.rollout.node_budget == 4096
+    assert nlhe.rollout.roots_per_gpu == 1 and nlhe.rollout.node_budget == 4096
     assert nlhe.training.minibatch_size == 6
     assert nlhe.completion.backend == "cuda"
     assert nlhe.training.iters == 10_000 and nlhe.training.checkpoint_every == 100
 
-def test_poker_rollout_memory_plan_bounds_recompute_and_full_storage() -> None:
+def test_poker_rollout_memory_plan_bounds_sequential_and_branched_storage() -> None:
     safe = estimate_rollout_memory(
-        root_count=8, node_budget=512, n_players=6, reach_storage="recompute"
+        root_count=8, node_budget=512, n_players=6, sequential=True
     )
-    legacy = estimate_rollout_memory(
-        root_count=256, node_budget=8192, n_players=6, reach_storage="recompute"
+    wide_sequential = estimate_rollout_memory(
+        root_count=256, node_budget=8192, n_players=6, sequential=True
     )
     full = estimate_rollout_memory(
-        root_count=256, node_budget=8192, n_players=6, reach_storage="full"
+        root_count=256, node_budget=8192, n_players=6
     )
     gib = 1024**3
     assert safe.capacity == 4096
     assert safe.peak_bytes < gib
-    assert legacy.frontier_reach_bytes > 100 * gib
+    assert wide_sequential.frontier_reach_bytes == 2 * 256 * 6 * 1326 * 4
     assert full.reach_cache_bytes > 60 * gib
 
-    execution = estimate_rollout_memory(
-        root_count=256,
-        node_budget=8192,
-        n_players=6,
-        reach_storage="recompute",
-        sequential_recompute_live_rows=True,
-    )
-    assert execution.frontier_reach_bytes == 2 * 256 * 6 * 1326 * 4
-    assert execution.frontier_reach_bytes < legacy.frontier_reach_bytes
+    assert wide_sequential.frontier_reach_bytes < full.frontier_reach_bytes
 
 
 def test_h100_bootstrap_bundle_constructs_without_capacity_sized_history() -> None:
     cfg = load_config(ROOT / "configs" / "nlhe6_h100.yaml")
     bundle = build_game_bundle(cfg, torch.device("cpu"))
     backend = bundle.rollout_backend
-    assert backend.rollout_memory_plan.peak_bytes == 306_333_580
+    assert backend.rollout_memory_plan.peak_bytes == 436_652_860
     assert "action_history" not in vars(backend.states)
     assert backend.states.history_parent.shape == (4_096,)
     assert backend.states.history_jump.shape == (4_096, 10)

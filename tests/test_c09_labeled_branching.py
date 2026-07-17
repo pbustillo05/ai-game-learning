@@ -140,9 +140,8 @@ class _LabeledBackend:
 
 def _cfg(root_count: int, beta: float, budget: int = 32) -> SimpleNamespace:
     return SimpleNamespace(
-        sequential_starts=root_count,
+        roots_per_gpu=root_count,
         node_budget=budget,
-        reach_storage="full",
     )
 
 
@@ -259,7 +258,7 @@ def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> 
     with pytest.raises(ConfigError, match="finite value at least one"):
         load_config(path)
     raw["rollout"]["beta"] = {"default": 2.0}
-    raw["rollout"]["sequential_starts"] = 2
+    raw["rollout"]["sequential_roots_per_gpu_initial"] = 2
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ConfigError, match="exactly one root per rank"):
         load_config(path)

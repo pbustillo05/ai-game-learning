@@ -153,7 +153,7 @@ def test_production_execution_config_is_explicit_and_strict(
     raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
     raw["training"]["mode"] = "rao_blackwell"
     raw["rollout"]["beta"] = None
-    raw["rollout"]["sequential_starts"] = 10
+    raw["rollout"]["sequential_roots_per_gpu_initial"] = 10
     raw["rollout"].update(
         {
             "family_batch_rows": 8,

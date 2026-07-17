@@ -1,193 +1,83 @@
 from __future__ import annotations
 
-import json
-import math
-import os
-from pathlib import Path
-
 import pytest
 import torch
-import torch.distributed as dist
 
 from pbg.config import load_config
-from pbg.core.training import SequentialWorkController
-
-
-def _observe(
-    controller: SequentialWorkController,
-    decisions: int,
-    *,
-    target: int = 100,
-    minimum: int = 5,
-    maximum: int = 40,
-    alpha: float = 0.5,
-    change: float = 0.25,
-) -> tuple[int, dict[str, float | str]]:
-    return controller.observe_rollout(
-        local_decisions=decisions,
-        rank_max_decisions=decisions,
-        rank_max_decisions_per_start=(
-            decisions / controller.current_starts_per_gpu
-        ),
-        target_decisions=target,
-        minimum_starts=minimum,
-        maximum_starts=maximum,
-        ema_alpha=alpha,
-        maximum_change_fraction=change,
-        target_reuse=3.0,
-        minibatch_size=8,
-    )
-
-
-def test_adaptive_ema_upward_downward_and_step_math() -> None:
-    controller = SequentialWorkController(10)
-    steps, first = _observe(controller, 50)
-    assert controller.ema_decisions_per_start == 5.0
-    assert controller.current_starts_per_gpu == 12  # rate-limited toward 20
-    assert first["sequential_start_clamp_reason"] == "change_up"
-    assert steps == math.ceil(3.0 * 50 / 8)
-    _, second = _observe(controller, 120)
-    assert controller.ema_decisions_per_start == 7.5
-    assert controller.current_starts_per_gpu == 13
-    assert second["decisions_per_start_ema"] == 7.5
-
-
-def test_adaptive_bounds_and_both_change_directions() -> None:
-    low = SequentialWorkController(20)
-    _, low_metrics = _observe(low, 2_000, minimum=18, maximum=40)
-    assert low.current_starts_per_gpu == 18
-    assert low_metrics["sequential_start_clamp_reason"] == "minimum"
-
-    high = SequentialWorkController(20)
-    _, high_metrics = _observe(high, 20, minimum=5, maximum=22)
-    assert high.current_starts_per_gpu == 22
-    assert high_metrics["sequential_start_clamp_reason"] == "maximum"
-
-    downward = SequentialWorkController(20)
-    _, down_metrics = _observe(downward, 400, minimum=5, maximum=40)
-    assert downward.current_starts_per_gpu == 15
-    assert down_metrics["sequential_start_clamp_reason"] == "change_down"
-
-
-@pytest.mark.parametrize(
-    ("local", "rank_max", "rate"),
-    ((0, 1, 1.0), (1, 0, 1.0), (1, 1, 0.0), (1, 1, float("nan"))),
+from pbg.core.memory_control import (
+    MEMORY_PHASES,
+    PhaseMemoryForecaster,
+    PhaseMemoryModel,
+    SequentialMemoryController,
 )
-def test_adaptive_rejects_zero_or_invalid_observations(
-    local: int, rank_max: int, rate: float
-) -> None:
-    with pytest.raises(ValueError, match="positive decision counts"):
-        SequentialWorkController(10).observe_rollout(
-            local_decisions=local,
-            rank_max_decisions=rank_max,
-            rank_max_decisions_per_start=rate,
-            target_decisions=100,
-            minimum_starts=5,
-            maximum_starts=40,
-            ema_alpha=0.2,
-            maximum_change_fraction=0.25,
-            target_reuse=3.0,
-            minibatch_size=8,
-        )
 
 
-def test_candidate_enables_complete_adaptive_contract_and_legacy_is_fixed() -> None:
+def _controller() -> SequentialMemoryController:
+    forecaster = PhaseMemoryForecaster(
+        {
+            phase: PhaseMemoryModel(100, {"schema": 10})
+            for phase in MEMORY_PHASES
+        },
+        window=4,
+    )
+    return SequentialMemoryController(
+        minimum_roots_per_gpu=2,
+        maximum_roots_per_gpu=40,
+        current_roots_per_gpu=8,
+        device_bytes=600,
+        guard_bytes=100,
+        forecaster=forecaster,
+        growth_fraction=0.25,
+        growth_delay=2,
+    )
+
+
+def test_repository_configs_use_explicit_per_gpu_root_contract() -> None:
     adaptive = load_config("configs/train/nlhe_hu_32bb_rb.yaml")
-    assert adaptive.rollout.target_decisions_per_gpu == 8000
+    assert adaptive.rollout.sequential_roots_per_gpu_initial == 2_048
+    assert adaptive.rollout.sequential_roots_per_gpu_minimum == 512
+    assert adaptive.rollout.sequential_roots_per_gpu_maximum == 2_560
     assert adaptive.training.target_node_reuse == 3.0
-    legacy = load_config("configs/acceptance/nlhe_hu_sequential_rb.yaml")
-    assert legacy.rollout.target_decisions_per_gpu is None
-    assert legacy.training.target_node_reuse is None
+
+    fixed = load_config("configs/acceptance/nlhe_hu_sequential_rb.yaml")
+    assert fixed.rollout.sequential_roots_per_gpu_initial == 17
+    assert fixed.rollout.sequential_roots_per_gpu_minimum == 17
+    assert fixed.rollout.sequential_roots_per_gpu_maximum == 17
 
 
-def _distributed_controller_worker(
-    rank: int, world: int, rendezvous: str, output_dir: str
-) -> None:
-    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
-    dist.init_process_group(
-        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world
+def test_obsolete_global_and_decision_target_fields_are_rejected(tmp_path) -> None:
+    source = tmp_path / "obsolete.yaml"
+    source.write_text(
+        """
+game: {name: poker, n_players: 2, stack_bb: 8, rank_count: 4}
+rollout:
+  sequential_starts: 8
+  target_decisions_per_gpu: 100
+  beta: null
+  node_budget: 100
+completion: {n_samples: 2, backend: cpu}
+model: {}
+loss:
+  {name: ppo_value_entropy, lam: 1.0, clip_eps: 0.2, clip_eps_v: 0.2,
+   c_v: 0.5, c_h: 0.01, entropy_schedule: const}
+training:
+  {mode: normal, iters: 1, gd_steps_per_iter: 1, minibatch_size: 1,
+   lr: 0.001, adam_betas: [0.9, 0.999], grad_clip: 1.0, amp: false,
+   seed: 1, checkpoint_every: 1, out_dir: /tmp/pbg}
+""",
+        encoding="utf-8",
     )
-    try:
-        per_rank = ((40, 90, 55, 120), (60, 70, 100, 80))[rank]
-
-        def run(
-            controller: SequentialWorkController,
-            generator: torch.Generator,
-            first: int,
-            stop: int,
-        ) -> tuple[list[dict[str, float | str]], list[float]]:
-            metrics = []
-            draws = []
-            for index in range(first, stop):
-                local = per_rank[index]
-                control = torch.tensor(
-                    [local, local / controller.current_starts_per_gpu],
-                    dtype=torch.float64,
-                )
-                dist.all_reduce(control, op=dist.ReduceOp.MAX)
-                steps, record = controller.observe_rollout(
-                    local_decisions=local,
-                    rank_max_decisions=int(control[0]),
-                    rank_max_decisions_per_start=float(control[1]),
-                    target_decisions=80,
-                    minimum_starts=4,
-                    maximum_starts=20,
-                    ema_alpha=0.25,
-                    maximum_change_fraction=0.25,
-                    target_reuse=3.0,
-                    minibatch_size=8,
-                )
-                record["steps"] = float(steps)
-                metrics.append(record)
-                draws.append(float(torch.rand((), generator=generator)))
-            return metrics, draws
-
-        full_controller = SequentialWorkController(8)
-        full_gen = torch.Generator().manual_seed(100 + rank)
-        full_metrics, full_draws = run(full_controller, full_gen, 0, 4)
-
-        resumed_controller = SequentialWorkController(8)
-        resumed_gen = torch.Generator().manual_seed(100 + rank)
-        prefix_metrics, prefix_draws = run(resumed_controller, resumed_gen, 0, 2)
-        saved_controller = resumed_controller.state_dict()
-        saved_rng = resumed_gen.get_state()
-        resumed_controller = SequentialWorkController.from_state_dict(saved_controller)
-        resumed_gen = torch.Generator()
-        resumed_gen.set_state(saved_rng)
-        suffix_metrics, suffix_draws = run(resumed_controller, resumed_gen, 2, 4)
-
-        Path(output_dir, f"adaptive_rank_{rank}.json").write_text(
-            json.dumps(
-                {
-                    "full_metrics": full_metrics,
-                    "resumed_metrics": prefix_metrics + suffix_metrics,
-                    "full_draws": full_draws,
-                    "resumed_draws": prefix_draws + suffix_draws,
-                }
-            ),
-            encoding="utf-8",
-        )
-    finally:
-        dist.destroy_process_group()
+    with pytest.raises(Exception, match="unknown configuration key"):
+        load_config(source)
 
 
-def test_two_rank_controller_agrees_and_resume_preserves_metrics_and_rng(
-    tmp_path: Path,
-) -> None:
-    world = 2
-    torch.multiprocessing.spawn(
-        _distributed_controller_worker,
-        args=(world, str(tmp_path / "rendezvous"), str(tmp_path)),
-        nprocs=world,
-        join=True,
-    )
-    rows = [
-        json.loads((tmp_path / f"adaptive_rank_{rank}.json").read_text())
-        for rank in range(world)
-    ]
-    for row in rows:
-        assert row["full_metrics"] == row["resumed_metrics"]
-        assert row["full_draws"] == row["resumed_draws"]
-    for iteration in range(4):
-        assert rows[0]["full_metrics"][iteration]["steps"] == rows[1]["full_metrics"][iteration]["steps"]
-        assert rows[0]["full_metrics"][iteration]["sequential_starts_per_gpu_next"] == rows[1]["full_metrics"][iteration]["sequential_starts_per_gpu_next"]
+def test_rank_minimum_is_common_per_gpu_width_and_state_roundtrips() -> None:
+    controller = _controller()
+    # Local safe width is 40; the rank minimum is seven. Growth remains
+    # disabled on cold start, so the frozen width stays eight until evidence.
+    assert controller.local_safe_width() == 40
+    assert controller.choose_root_width(
+        rank_safe_widths=torch.tensor([40, 7, 30])
+    ) == 7
+    restored = SequentialMemoryController.from_state_dict(controller.state_dict())
+    assert restored.state_dict() == controller.state_dict()

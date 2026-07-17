@@ -19,10 +19,11 @@ game:
   stack_bb: 10.0
   rank_count: 13
 rollout:
-  sequential_starts: 1536
+  sequential_roots_per_gpu_initial: 1536
+  sequential_roots_per_gpu_minimum: 512
+  sequential_roots_per_gpu_maximum: 2048
   beta: null
   node_budget: 64
-  reach_storage: recompute
   family_batch_rows: 128
   max_active_trajectories: 1536
   arena_chunk_nodes: 4096
@@ -34,12 +35,14 @@ contracts. `training.mode` is `normal`, `rao_blackwell`, or
 `branched_rao_blackwell`. Normal mode requires `ppo`, `completion.n_samples:
 null`, and `rollout.beta: null`. Sequential RB requires `rb_ppo`, positive
 completion samples, and `beta: null`. Branched RB uses `rb_ppo`, positive
-completion samples, `sequential_starts: 1`, and a beta mapping containing a
+completion samples, all three sequential-root fields set to `1`, and a beta mapping containing a
 finite `default >= 1`.
 
-In sequential modes, `sequential_starts` is a global count partitioned into
-contiguous rank quotas. Branched mode always creates one distinguished root per
-rank. Completion and backward reduction stream inside a fixed rollout; removed
+In sequential modes, the controller selects one common per-GPU root width from
+the phase-wise memory budget before any current-iteration draw. Unsafe evidence
+decreases it immediately; successful evidence widens it only after the configured
+delay. Branched mode always creates one distinguished root per rank. Completion
+and backward reduction stream inside a fixed rollout; removed
 keys such as `executor`, `n_trees`, `trajectory_chunk_size`, and
 `queue_packing` are rejected rather than ignored.
 

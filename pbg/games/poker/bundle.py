@@ -65,39 +65,32 @@ def estimate_rollout_memory(
     root_count: int,
     node_budget: int,
     n_players: int,
-    reach_storage: str,
+    sequential: bool = False,
     rank_count: int = 13,
-    sequential_recompute_live_rows: bool = False,
     max_history_tokens: int = 1,
     folder_beta_rank: int = 16,
     partition_cache_materialized: bool = True,
 ) -> PokerRolloutMemoryPlan:
     """Estimate worst-case rollout bytes before allocating a poker backend.
 
-    The general estimate intentionally counts two capacity-sized reach
+    The branched estimate intentionally counts two capacity-sized reach
     frontiers: a branched wave can retain active rows while constructing its
-    successors. Sequential execution in recompute mode is tighter: exactly one
+    successors. Sequential execution is tighter: exactly one
     live occurrence exists per trajectory and execution allocates root and
     overwriteable working reaches with ``root_count`` rows each. It excludes model,
     completion, optimizer, and autograd allocations, so the CUDA preflight
     leaves half of currently free device memory for those phases.
     """
 
-    if reach_storage not in {"full", "decisions_only", "recompute"}:
-        raise ValueError("unknown reach storage mode")
     if root_count < 0 or node_budget <= 0 or n_players <= 0:
         raise ValueError("invalid rollout memory-plan dimensions")
-    if sequential_recompute_live_rows and reach_storage != "recompute":
-        raise ValueError("sequential live-row planning requires recompute storage")
     capacity = root_count * node_budget
     edge_capacity = capacity - root_count
     node_bytes = capacity * (6 * 4 + n_players * 4)
     edge_bytes = edge_capacity * 4 * 4
     n_hands = DeckGeometry(rank_count).n_hands
     reach_row_bytes = n_players * n_hands * 4
-    reach_cache = (
-        root_count if reach_storage == "recompute" else capacity
-    ) * reach_row_bytes
+    reach_cache = (root_count if sequential else capacity) * reach_row_bytes
     return PokerRolloutMemoryPlan(
         capacity=capacity,
         state_bytes=PokerTensorStateStore.storage_nbytes(
@@ -107,7 +100,7 @@ def estimate_rollout_memory(
         reach_cache_bytes=reach_cache,
         frontier_reach_bytes=(
             2 * root_count * reach_row_bytes
-            if sequential_recompute_live_rows
+            if sequential
             else 2 * capacity * reach_row_bytes
         ),
         # Selected policy likelihoods and values are retained only for realized
@@ -163,7 +156,7 @@ def _preflight_cuda_rollout(
             f"{plan.peak_bytes / gib:.2f} GiB, exceeding the usable rollout limit "
             f"{limit / gib:.2f} GiB on {device} (free {free_bytes / gib:.2f} GiB, "
             f"total {total_bytes / gib:.2f} GiB); "
-            "reduce rollout.sequential_starts/node_budget or use a smaller storage plan"
+            "reduce rollout sequential roots per GPU/node_budget or use a smaller storage plan"
         )
 
 
@@ -611,19 +604,15 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     partition = PokerGPUPartitionAdapter(
         beta_rank=model_cfg.folder_beta_rank, rank_count=engine_cfg.rank_count
     )
-    resident_trees = cfg.rollout.sequential_starts
+    resident_trees = cfg.rollout.roots_per_gpu
     raises_per_street = math.ceil(engine_cfg.stack_bb / engine_cfg.bb) + 1
     state_history_steps = 4 * engine_cfg.n_players * (raises_per_street + 1) + 3
     plan = estimate_rollout_memory(
         root_count=resident_trees,
         node_budget=cfg.rollout.node_budget,
         n_players=engine_cfg.n_players,
-        reach_storage=cfg.rollout.reach_storage,
+        sequential=cfg.training.mode != "branched_rao_blackwell",
         rank_count=engine_cfg.rank_count,
-        sequential_recompute_live_rows=(
-            cfg.training.mode != "branched_rao_blackwell"
-            and cfg.rollout.reach_storage == "recompute"
-        ),
         # This sizes the state store's binary-lift history, whose allocation is
         # governed by the backend rollout-step bound rather than model tokens.
         max_history_tokens=state_history_steps,

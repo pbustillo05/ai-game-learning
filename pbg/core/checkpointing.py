@@ -173,15 +173,17 @@ def compatible_scientific_configs(
         if result.get("probe") is not None:
             result["probe"].pop("target_checkpoint", None)
         rollout = result.get("rollout", {})
-        # Memory forecasting is execution control, and these defaults were
-        # introduced after existing scientific checkpoints were written.
-        rollout.setdefault("memory_forecast_window", 128)
-        rollout.setdefault("memory_forecast_half_life", 32.0)
-        rollout.setdefault("memory_forecast_min_observations", 40)
-        rollout.setdefault("memory_soft_exceedance_rate", 0.025)
-        rollout.setdefault("memory_max_start_increase_fraction", 0.10)
-        rollout.setdefault("memory_retry_backoff_fraction", 0.20)
-        rollout.setdefault("memory_max_rollout_retries", 2)
+        # Width bounds and calibration are execution controls.  They do not
+        # change the estimator represented by a scientific checkpoint.
+        for key in (
+            "sequential_roots_per_gpu_minimum",
+            "sequential_roots_per_gpu_maximum",
+            "memory_calibration_window",
+            "memory_growth_fraction",
+            "memory_growth_delay",
+            "memory_prediction_z",
+        ):
+            rollout.pop(key, None)
         return result
 
     return normalized(left) == normalized(right)

@@ -84,7 +84,7 @@ def _mode_config(base: RootConfig, mode: str) -> RootConfig:
             cfg.loss.name = "rb_ppo"
         # Branched rollout owns one labeled public tree per rank; its realized
         # decision count, rather than root count, is the cross-mode normalizer.
-        cfg.rollout.sequential_starts = 1
+        cfg.rollout.roots_per_gpu = 1
         cfg.rollout.beta = cfg.rollout.beta or {"default": 1.5}
         cfg.completion.n_samples = cfg.completion.n_samples or 64
     return cfg
@@ -255,7 +255,7 @@ def benchmark_modes(
             {
                 "mode": mode,
                 "workload": {
-                    "sequential_starts": local.rollout.sequential_starts,
+                    "roots_per_gpu": local.rollout.roots_per_gpu,
                     "beta": local.rollout.beta,
                     "completion_samples": local.completion.n_samples,
                     "completion_backend": local.completion.backend,
@@ -311,7 +311,7 @@ def benchmark_modes(
         "environment": environment,
         "workload": {
             "game": "nlhe",
-            "sequential_starts": cfg.rollout.sequential_starts,
+            "roots_per_gpu": cfg.rollout.roots_per_gpu,
             "node_budget": cfg.rollout.node_budget,
             "completion_samples": cfg.completion.n_samples,
             "completion_backend": cfg.completion.backend,
@@ -365,7 +365,7 @@ def compare_benchmark(
         raise ValueError("benchmark environment does not match the baseline")
     workload_keys = (
         "game",
-        "sequential_starts",
+        "roots_per_gpu",
         "node_budget",
         "completion_samples",
         "completion_backend",

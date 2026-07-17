@@ -550,7 +550,7 @@ def test_core_sampler_accumulates_many_trees_before_model_forward() -> None:
     backend = _backend(cfg, capacity=2048, profile_sampler=profiles)
     model = _RecordingModel()
     rollout = SimpleNamespace(
-        sequential_starts=16, node_budget=64, reach_storage="full"
+        roots_per_gpu=16, node_budget=64
     )
     tree, reach, policy = sample_trees_sequential(
         GameBundle(model, backend, PokerPolicyAdapter(cfg.n_ticks), None),
@@ -573,9 +573,8 @@ def test_poker_family_scheduled_sequential_rollout_closes_chance_segments() -> N
     backend = _backend(cfg, capacity=1024, profile_sampler=profiles)
     model = _AlwaysCheckModel()
     rollout = SimpleNamespace(
-        sequential_starts=8,
+        roots_per_gpu=8,
         node_budget=64,
-                reach_storage="full",
         family_batch_rows=4,
         max_active_trajectories=8,
         arena_chunk_nodes=32,
@@ -589,7 +588,9 @@ def test_poker_family_scheduled_sequential_rollout_closes_chance_segments() -> N
     )
     tree.validate()
     assert int(((tree.owner == TERMINAL) | (tree.owner == PRETERM)).sum()) == 8
-    assert reach.log_r.shape[0] == tree.parent.numel()
+    assert reach.log_r.shape[0] == 8
+    assert policy.decision_reach is not None
+    assert policy.decision_reach.node_ids.numel() == policy.node_ids.numel()
     assert policy.node_ids.numel() > 0
     assert bool((backend.states.street[tree.state_ref.long()] > 0).any())
     assert all(batch > 1 for _, batch, _ in model.calls)
@@ -719,9 +720,8 @@ def _real_execution_poker_sample(
     )
     model = _AlwaysCheckModel()
     rollout = SimpleNamespace(
-        sequential_starts=4,
+        roots_per_gpu=4,
         node_budget=64,
-                reach_storage="recompute",
         family_batch_rows=batch_rows,
         max_active_trajectories=admission,
         arena_chunk_nodes=16,
@@ -749,7 +749,10 @@ def _assert_real_execution_poker_sample(cfg, backend, model, sampled) -> None:
     chance = tree.owner == CHANCE
     assert bool(((tree.child_ptr[1:] - tree.child_ptr[:-1])[chance] == 1).all())
 
-    rows = reach.rows_for(tree, policy.node_ids, backend, policy)
+    assert policy.decision_reach is not None
+    rows = policy.decision_reach.gather(
+        torch.arange(policy.node_ids.numel(), device=policy.node_ids.device), backend
+    )
     states = tree.state_ref[policy.node_ids.to(torch.int64)]
     with torch.no_grad():
         current = backend.policy_forward(model, states, rows)
@@ -777,7 +780,7 @@ def test_real_sibling_execution_poker_cpu_is_logically_addressed_and_collision_f
 
     normal_cfg = SimpleNamespace(
         rollout=SimpleNamespace(
-            sequential_starts=4,
+            roots_per_gpu=4,
             logical_seed=741,
         ),
         loss=SimpleNamespace(lam=0.95),
@@ -838,15 +841,15 @@ def test_real_sibling_execution_poker_tiny_cuda() -> None:
         ("branched_rao_blackwell", {"default": 1.0, "preflop": 2.0}),
     ),
 )
-def test_poker_recompute_replays_postflop_reach_exactly(
+def test_poker_last_consumer_reaches_are_schedule_repeatable(
     mode: str, beta_table: dict[str, float]
 ) -> None:
-    """Full and replayed poker reaches agree through flop, turn, and river."""
+    """Leaf and decision reaches are written once and repeat exactly."""
 
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
     model = _AlwaysCheckModel()
     common = dict(
-        sequential_starts=1 if mode == "branched_rao_blackwell" else 2,
+        roots_per_gpu=1 if mode == "branched_rao_blackwell" else 2,
         node_budget=128 if mode == "branched_rao_blackwell" else 64,
     )
     full_backend = _backend(cfg, capacity=256, beta_table=beta_table)
@@ -858,19 +861,23 @@ def test_poker_recompute_replays_postflop_reach_exactly(
     )
     full_tree, full_reach, full_policy = sampler(
         GameBundle(model, full_backend, PokerPolicyAdapter(cfg.n_ticks), None),
-        SimpleNamespace(**common, reach_storage="full"),
+        SimpleNamespace(**common),
         torch.Generator().manual_seed(731),
     )
     replay_tree, replay_reach, replay_policy = sampler(
         GameBundle(model, replay_backend, PokerPolicyAdapter(cfg.n_ticks), None),
-        SimpleNamespace(**common, reach_storage="recompute"),
+        SimpleNamespace(**common),
         torch.Generator().manual_seed(731),
     )
     for field in ("parent", "child_ptr", "child_node", "child_event", "owner", "state_ref"):
         assert torch.equal(getattr(replay_tree, field), getattr(full_tree, field))
-    node_ids = torch.arange(full_tree.parent.numel(), dtype=torch.int32)
-    expected = full_reach.rows_for(full_tree, node_ids, full_backend, full_policy)
-    actual = replay_reach.rows_for(replay_tree, node_ids, replay_backend, replay_policy)
+    assert torch.equal(replay_reach.node_index, full_reach.node_index)
+    assert torch.equal(replay_reach.log_r, full_reach.log_r)
+    assert full_policy.decision_reach is not None
+    assert replay_policy.decision_reach is not None
+    decision_rows = torch.arange(full_policy.node_ids.numel())
+    expected = full_policy.decision_reach.gather(decision_rows, full_backend)
+    actual = replay_policy.decision_reach.gather(decision_rows, replay_backend)
     assert torch.equal(actual, expected)
 
     streets = replay_backend.states.street[replay_tree.state_ref.long()]
@@ -888,10 +895,10 @@ def test_poker_recompute_replays_postflop_reach_exactly(
         assert has_duplicate_label
 
 
-def test_poker_recompute_replays_fold_reach_exactly() -> None:
+def test_poker_fold_reaches_are_retained_only_at_last_consumers() -> None:
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
     rollout = SimpleNamespace(
-        sequential_starts=2, node_budget=8, reach_storage="full"
+        roots_per_gpu=2, node_budget=8
     )
     full_backend = _backend(cfg, capacity=32)
     replay_backend = _backend(cfg, capacity=32)
@@ -903,13 +910,18 @@ def test_poker_recompute_replays_fold_reach_exactly() -> None:
     )
     replay_tree, replay_reach, replay_policy = sample_trees_sequential(
         GameBundle(model, replay_backend, PokerPolicyAdapter(cfg.n_ticks), None),
-        SimpleNamespace(**dict(vars(rollout), reach_storage="recompute")),
+        SimpleNamespace(**dict(vars(rollout))),
         torch.Generator().manual_seed(732),
     )
-    node_ids = torch.arange(full_tree.parent.numel(), dtype=torch.int32)
-    expected = full_reach.rows_for(full_tree, node_ids, full_backend, full_policy)
-    actual = replay_reach.rows_for(replay_tree, node_ids, replay_backend, replay_policy)
-    assert torch.equal(actual, expected)
+    assert torch.equal(replay_reach.node_index, full_reach.node_index)
+    assert torch.equal(replay_reach.log_r, full_reach.log_r)
+    assert full_policy.decision_reach is not None
+    assert replay_policy.decision_reach is not None
+    rows = torch.arange(full_policy.node_ids.numel())
+    assert torch.equal(
+        full_policy.decision_reach.gather(rows, full_backend),
+        replay_policy.decision_reach.gather(rows, replay_backend),
+    )
     assert bool((replay_tree.child_event == FOLD).any())
 
 

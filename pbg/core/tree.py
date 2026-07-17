@@ -1,4 +1,4 @@
-"""Stored rollout trees, reach/policy caches, and decision alias tables."""
+"""Legacy rollout trees, sealed leaf rows, and decision compatibility views."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from pbg.core.game import CHANCE, PRETERM, PROBE_FOLD, TERMINAL, EventBatch
+from pbg.core.game import CHANCE, PRETERM, PROBE_FOLD, TERMINAL
 
 
 @dataclass
@@ -594,6 +594,7 @@ class PolicyCache:
     node_ids: Tensor  # int32 [Nd]
     old_logp_child: Tensor  # float32 [Nd,E,X]
     old_v: Tensor  # float32 [Nd,X]
+    decision_reach: Any | None = None  # zero-copy-compatible natural input owner
 
     def __post_init__(self) -> None:
         if self.node_ids.ndim != 1 or self.node_ids.dtype != torch.int32:
@@ -606,45 +607,9 @@ class PolicyCache:
             raise ValueError("PolicyCache floating tensors must be fp32")
 
 
-def _replay_reach_update(
-    game: Any,
-    row: Tensor,
-    state_ref: Tensor,
-    child_state_ref: Tensor,
-    event: Tensor,
-    owner: int,
-    taken_logp: Tensor | None,
-) -> Tensor:
-    """Replay one public edge from cached selected-action likelihoods."""
-
-    if owner >= 0:
-        if taken_logp is None:
-            raise ValueError("player reach replay requires cached log-probabilities")
-        result = row.clone()
-        width = min(result.shape[-1], taken_logp.numel())
-        result[owner, :width] += taken_logp[:width].to(result.device, result.dtype)
-        return result
-
-    # A game may reconstruct chance information from its successor state.  Poker
-    # uses this to recover dealt board cards without retaining poker-specific
-    # edge payloads in TreeBatch.
-    replay_chance = getattr(game, "replay_chance_reach", None)
-    if callable(replay_chance):
-        updated = replay_chance(row[None], state_ref, child_state_ref)
-        return updated[0]
-
-    # Generic rollout backends already expose the typed EventBatch boundary.
-    # In particular, do not manufacture a policy tensor indexed by public_id:
-    # chance labels need not be compact action indices.
-    updated = game.reach_update(
-        row[None], state_ref, EventBatch(public_id=event), None
-    )
-    return updated[0]
-
-
 @dataclass
 class ReachCache:
-    """Mode-dependent log-reach storage with transparent replay."""
+    """Exact last-consumer leaf reach rows; no discarded path can be replayed."""
 
     mode: str
     log_r: Tensor
@@ -657,63 +622,19 @@ class ReachCache:
         game: Any,
         policy_cache: PolicyCache,
     ) -> Tensor:
-        """Return log-reach rows for arbitrary stored-tree nodes."""
+        """Return directly stored rows for arbitrary sealed leaf ids."""
 
-        if self.mode not in {"full", "decisions_only", "recompute"}:
-            raise ValueError(f"unknown reach-cache mode {self.mode!r}")
+        if self.mode not in {"sealed", "decisions_only"}:
+            raise ValueError(f"unknown sealed reach mode {self.mode!r}")
         requested = node_ids.to(device=self.node_index.device, dtype=torch.int64)
         stored_ids = self.node_index.to(torch.int64)
         positions = torch.searchsorted(stored_ids, requested)
         present = positions < stored_ids.numel()
         if stored_ids.numel():
             present &= stored_ids[positions.clamp_max(stored_ids.numel() - 1)] == requested
-        if self.mode != "recompute":
-            if not bool(present.all()):
-                raise KeyError("one or more requested reach rows are not stored")
-            return self.log_r[positions.to(self.log_r.device)]
-
-        n = int(tree.parent.numel())
-        memo = torch.empty((n, *self.log_r.shape[1:]), dtype=self.log_r.dtype, device=self.log_r.device)
-        known = torch.zeros(n, dtype=torch.bool, device=self.log_r.device)
-        memo[stored_ids.to(self.log_r.device)] = self.log_r
-        known[stored_ids.to(self.log_r.device)] = True
-        policy_ids = policy_cache.node_ids.to(torch.int64)
-
-        def compute(node: int) -> Tensor:
-            if bool(known[node]):
-                return memo[node]
-            parent = int(tree.parent[node])
-            if parent < 0:
-                raise KeyError(f"root node {node} is absent from recompute cache")
-            edge_start, edge_stop = int(tree.child_ptr[parent]), int(tree.child_ptr[parent + 1])
-            matches = [
-                edge for edge in range(edge_start, edge_stop) if int(tree.child_node[edge]) == node
-            ]
-            if len(matches) != 1:
-                raise ValueError("tree CSR does not contain exactly one parent edge")
-            edge = matches[0]
-            taken = None
-            owner = int(tree.owner[parent])
-            if owner >= 0:
-                cache_row = int(torch.searchsorted(policy_ids, torch.tensor(parent, device=policy_ids.device)))
-                if cache_row >= policy_ids.numel() or int(policy_ids[cache_row]) != parent:
-                    raise KeyError(f"player node {parent} is absent from PolicyCache")
-                child_slot = edge - edge_start
-                taken = policy_cache.old_logp_child[cache_row, child_slot]
-            value = _replay_reach_update(
-                game,
-                compute(parent),
-                tree.state_ref[parent : parent + 1],
-                tree.state_ref[node : node + 1],
-                tree.child_event[edge : edge + 1],
-                owner,
-                taken,
-            )
-            memo[node] = value
-            known[node] = True
-            return value
-
-        return torch.stack([compute(int(node)) for node in requested.tolist()], dim=0)
+        if not bool(present.all()):
+            raise KeyError("one or more requested leaf reach rows are not sealed")
+        return self.log_r[positions.to(self.log_r.device)]
 
 
 @dataclass
@@ -754,23 +675,6 @@ class DecisionReachCache:
             payload=payload,
             owners=None if owners is None else owners.to(torch.int32),
         )
-
-    @classmethod
-    def from_reach_cache(
-        cls,
-        tree: TreeBatch,
-        reach: ReachCache,
-        policy: PolicyCache,
-        game: Any,
-    ) -> "DecisionReachCache":
-        """Materialize decision rows once, compact them, and release tree reaches."""
-
-        node_ids = policy.node_ids.to(torch.int32)
-        tree_rows = node_ids.to(device=tree.state_ref.device, dtype=torch.int64)
-        state_refs = tree.state_ref[tree_rows].to(torch.int32)
-        rows = reach.rows_for(tree, node_ids, game, policy).float()
-        owners = tree.owner[tree_rows].to(torch.int32)
-        return cls.from_rows(node_ids, state_refs, rows, game, owners)
 
     def gather(self, rows: Tensor, game: Any) -> Tensor:
         """Expand sampled decision rows to the backend's dense policy boundary."""

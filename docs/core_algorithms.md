@@ -6,8 +6,8 @@ code.
 
 | Mode | Start topology | Completion | Loss |
 |---|---|---|---|
-| `normal` | global independent starts, partitioned across ranks | sampled private profiles settle terminal trajectories | `ppo` |
-| `rao_blackwell` | global independent starts, partitioned across ranks | sibling-evaluator posterior at each pre-terminal leaf | `rb_ppo` |
+| `normal` | common per-GPU independent roots | sampled private profiles settle terminal trajectories | `ppo` |
+| `rao_blackwell` | common per-GPU independent roots | sibling-evaluator posterior at each pre-terminal leaf | `rb_ppo` |
 | `branched_rao_blackwell` | one distinguished root/tree per rank | sibling-evaluator posterior at every sampled leaf | `rb_ppo` |
 
 ## Family-scheduled rollout
@@ -31,9 +31,9 @@ before mutation. Node, queue, arena, or byte overflow fails loudly.
 
 ## Sequential modes
 
-`rollout.sequential_starts` is global. `_rank_local_config` assigns contiguous
-rank quotas and a global trajectory prefix, keeping logical addresses disjoint
-even when quotas differ.
+`rollout.sequential_roots_per_gpu_initial` and its minimum/maximum bounds are
+explicitly per GPU. Every rank freezes the same memory-feasible width before
+the iteration's draws; the rank id keeps logical addresses disjoint.
 
 Each trajectory samples one collision-free private profile. Player events and
 chance cards are drawn through purpose-separated logical keys. A normal rollout
@@ -41,9 +41,17 @@ continues to a sampled terminal reward and produces compact scalar decision
 rows. A sequential-RB rollout stops at a pre-terminal leaf and retains its
 single-child public path for posterior completion.
 
-With `reach_storage: recompute`, only live trajectory reaches and retained
-decision rows persist. Replay reconstructs requested decision reaches without
-changing the sampled trajectory.
+Only one mutable reach row per live sequential trajectory exists. A player's
+exact reach is committed to its decision row when the policy forward consumes
+it, and the stopped-leaf reach is committed once for completion. No path or
+policy replay reconstructs discarded reach state.
+
+The data-plane contracts live in `partition.py`, `storage.py`, `topology.py`,
+and `targets.py`. Chunked schema-owned arenas seal into exact contiguous
+rollout columns; streaming target builders then freeze an immutable
+`TrainingStorage`. Natural poker model rows are 169-wide preflop and 1326-wide
+postflop for the full deck, while RB posterior/target rows remain in the exact
+1326-hand domain.
 
 ## Branched Rao--Blackwell mode
 
