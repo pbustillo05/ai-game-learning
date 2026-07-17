@@ -147,6 +147,11 @@ class PokerRolloutBackend:
         self.partition_adapter = partition_adapter or PokerGPUPartitionAdapter(
             rank_count=cfg.rank_count
         )
+        initial_beta = int(getattr(self.partition_adapter, "beta_rank", 16))
+        self._partition_services = {
+            initial_beta: (self.partition_adapter, self.partition_summary_cache)
+        }
+        self._partition_materialized = {initial_beta: False}
         self.combo_cards = torch.tensor(
             self.geometry.combo_cards,
             dtype=torch.int16,
@@ -209,7 +214,8 @@ class PokerRolloutBackend:
 
         n = buttons.shape[0]
         self.states.reset()
-        self.partition_summary_cache.reset()
+        for _, cache in self._partition_services.values():
+            cache.reset()
         handles = self.states.allocate_all(n)  # [B]
         rows = handles.to(torch.int64)
         if self.n_players == 2:
@@ -295,6 +301,17 @@ class PokerRolloutBackend:
         ).to(torch.int32)  # [B]
 
     owner_of = classify
+
+    def probe_fold_mask(self, states: Tensor, seats: Tensor) -> Tensor:
+        """Return rows where the selected probe seat has folded."""
+
+        self._validate_handles(states)
+        if seats.shape != states.shape or seats.device != self.device:
+            raise ValueError("probe seats must be device-local [B]")
+        rows = states.to(torch.int64)
+        return self.states.status[
+            rows, seats.to(torch.int64)
+        ] == FOLDED
 
     def is_terminal(self, states: Tensor) -> Tensor:
         """Return fold-terminal flags ``[B]``."""
@@ -1169,9 +1186,61 @@ class PokerRolloutBackend:
             padded_token_pairs=rows * maximum * maximum,
         )
 
+    def _select_partition_service(self, model: nn.Module) -> None:
+        """Select a model-compatible folded-player summary cache lazily."""
+
+        source = model.module if hasattr(model, "module") else model
+        post = getattr(source, "postflop", None)
+        beta = int(getattr(getattr(post, "cfg", None), "folder_beta_rank", 16))
+        service = self._partition_services.get(beta)
+        if service is None:
+            service = (
+                PokerGPUPartitionAdapter(
+                    beta_rank=beta, rank_count=self.cfg.rank_count
+                ),
+                DevicePartitionSummaryCache(
+                    self.states.capacity,
+                    max(0, self.n_players - 2),
+                    self.device,
+                ),
+            )
+            self._partition_services[beta] = service
+        self.partition_adapter, self.partition_summary_cache = service
+
+    def register_policy_model(self, model: nn.Module) -> None:
+        """Register one policy's folded-summary geometry for memory planning."""
+
+        self._select_partition_service(model)
+        source = model.module if hasattr(model, "module") else model
+        post = getattr(source, "postflop", None)
+        cfg = getattr(post, "cfg", None)
+        beta = int(getattr(cfg, "folder_beta_rank", 16))
+        materialized = int(getattr(cfg, "evaluator_summary_dim", 0)) > 0
+        self._partition_materialized[beta] = (
+            self._partition_materialized.get(beta, False) or materialized
+        )
+
+    def partition_cache_memory_bound(self) -> int:
+        """Return the bound for every registered model-compatible cache."""
+
+        total = 0
+        for beta, materialized in self._partition_materialized.items():
+            total += (
+                DevicePartitionSummaryCache.storage_nbytes(
+                    self.states.capacity,
+                    n_cards=self.geometry.n_cards,
+                    beta_rank=beta,
+                    max_folders=max(0, self.n_players - 2),
+                )
+                if materialized
+                else self.states.capacity
+            )
+        return total
+
     def policy_forward(self, frozen_model: nn.Module, states: Tensor, reach: Tensor) -> PolicyOutput:
         """Route and bounded-batch policy calls, returning combo rows ``[B,H]``."""
 
+        self.register_policy_model(frozen_model)
         if not torch.is_grad_enabled() and self.execution_profile is not None:
             plans = self._planned_policy_batches(
                 frozen_model, states, "inference"
@@ -1200,6 +1269,8 @@ class PokerRolloutBackend:
         reach: Tensor,
     ) -> PolicyOutput:
         """Execute one already-routed family, allowing mixed postflop streets."""
+
+        self._select_partition_service(frozen_model)
 
         self._validate_handles(states)
         if states.ndim != 1 or states.numel() == 0:

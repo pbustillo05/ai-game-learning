@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
 import json
 import math
@@ -47,12 +48,13 @@ from pbg.core.optimization import (
     sync_scaled_gradients as _sync_scaled_gradients,
 )
 from pbg.core.rollout import (
+    ProbeRollout,
     sample_trees,
     sample_trees_sequential,
     sequential_leaf_logical_rng_keys,
 )
 from pbg.core.execution import LOGICAL_RNG_VERSION, DrawPurpose
-from pbg.core.tree import DecisionReachCache, build_decision_alias
+from pbg.core.tree import AliasTable, DecisionReachCache, build_decision_alias
 from pbg.core.values import HeadEvals, streamed_branched_value
 
 
@@ -460,6 +462,10 @@ def _add_distributed_metric_summaries(
         "grad_clip_scale",
         "completion_mean_estimator_stddev",
         "completion_max_estimator_stddev",
+        "trajectories",
+        "completion_samples",
+        "minibatches",
+        "optimizer_steps",
     )
     present = torch.tensor(
         [name in metrics for name in names], dtype=torch.float64, device=device
@@ -481,6 +487,7 @@ def _add_distributed_metric_summaries(
             continue
         metrics[f"{name}_rank_mean"] = float(total[index] / count[index])
         metrics[f"{name}_rank_max"] = float(maximum[index])
+        metrics[f"{name}_rank_sum"] = float(total[index])
 
 
 @dataclass
@@ -594,6 +601,14 @@ def _analytical_memory_plan(
     parameter = sum(
         value.numel() * value.element_size() for value in model.parameters()
     )
+    opponent_parameter = (
+        0
+        if bundle.opponent_model is None
+        else sum(
+            value.numel() * value.element_size()
+            for value in bundle.opponent_model.parameters()
+        )
+    )
     backend = bundle.rollout_backend
     players = int(backend.n_players)
     types = max(int(value) for value in backend.x_sizes)
@@ -630,10 +645,16 @@ def _analytical_memory_plan(
     optimizer_and_grad = 3 * parameter  # grad + two fp32 Adam moments
     rollout_snapshot = parameter
     reference = parameter if has_reference else 0
+    partition_bound_fn = getattr(backend, "partition_cache_memory_bound", None)
+    partition_cache = (
+        int(partition_bound_fn()) if callable(partition_bound_fn) else 0
+    )
     rollout_phase = (
         parameter
+        + opponent_parameter
         + rollout_snapshot
         + reference
+        + partition_cache
         + topology
         + rollout_reach
         + rollout_transient_reach
@@ -641,8 +662,10 @@ def _analytical_memory_plan(
     )
     optimization_phase = (
         parameter
+        + opponent_parameter
         + optimizer_and_grad
         + reference
+        + partition_cache
         + decision_reach
         + policy_cache
         + rb_targets
@@ -650,6 +673,8 @@ def _analytical_memory_plan(
     )
     return {
         "memory_plan_parameter_bytes": parameter,
+        "memory_plan_opponent_parameter_bytes": opponent_parameter,
+        "memory_plan_partition_cache_bytes": partition_cache,
         "memory_plan_topology_bytes": topology,
         "memory_plan_rollout_reach_bytes": rollout_reach,
         "memory_plan_transient_reach_bytes": rollout_transient_reach,
@@ -786,6 +811,8 @@ def _build_iteration_data(
         rollout_backend=bundle.rollout_backend,
         policy_adapter=bundle.policy_adapter,
         completion_backend=bundle.completion_backend,
+        opponent_model=bundle.opponent_model,
+        probe_target=bundle.probe_target,
     )
     normal = cfg.training.mode == "normal"
 
@@ -873,13 +900,24 @@ def _build_iteration_data(
                 profile_metrics=profile_metrics,
             )
 
-        tree, reach_cache, policy_cache = _profiled_call(
+        rb_sample = _profiled_call(
             profile_metrics,
             "rollout",
             device,
             profile,
             sample_rb_rollout,
         )
+        probe_rollout = rb_sample if isinstance(rb_sample, ProbeRollout) else None
+        if probe_rollout is None:
+            tree, reach_cache, policy_cache = rb_sample
+            probe_seats = None
+            prebuilt_decision_reach = None
+        else:
+            tree = probe_rollout.tree
+            reach_cache = probe_rollout.leaf_reach
+            policy_cache = probe_rollout.policy
+            probe_seats = probe_rollout.seats
+            prebuilt_decision_reach = probe_rollout.decision_reach
         decision_weight = tree.path_weight[
             policy_cache.node_ids.to(tree.path_weight.device, dtype=torch.int64)
         ].detach().to(torch.float64)
@@ -903,6 +941,9 @@ def _build_iteration_data(
             bundle, int(leaf_ids.numel()), workspace_bytes
         )
         keyed_completion = getattr(bundle.completion_backend, "complete_keyed", None)
+        selected_keyed_completion = getattr(
+            bundle.completion_backend, "complete_selected_keyed", None
+        )
         completion_keys = None
         if callable(keyed_completion) and cfg.training.mode == "rao_blackwell":
             completion_keys = sequential_leaf_logical_rng_keys(
@@ -927,6 +968,23 @@ def _build_iteration_data(
 
                 def complete_selected():
                     if completion_keys is not None:
+                        if probe_seats is not None:
+                            if not callable(selected_keyed_completion):
+                                raise TypeError(
+                                    "probe completion backend lacks complete_selected_keyed"
+                                )
+                            selected_trees = tree.tree_id[
+                                selected.to(tree.tree_id.device, dtype=torch.int64)
+                            ].to(torch.int64)
+                            return selected_keyed_completion(
+                                bundle.rollout_backend,
+                                tree,
+                                selected,
+                                leaf_reach,
+                                cfg.completion.n_samples,
+                                completion_keys[first : first + selected.numel()],
+                                probe_seats[selected_trees],
+                            )
                         return keyed_completion(
                             bundle.rollout_backend,
                             tree,
@@ -993,6 +1051,7 @@ def _build_iteration_data(
                 completion_batch_rows=completion_rows,
                 emit_q="q_hat" in spec.required_targets,
                 max_workspace_bytes=workspace_bytes,
+                decision_players_by_tree=probe_seats,
             ),
         )
         if execution_metrics is not None:
@@ -1014,9 +1073,17 @@ def _build_iteration_data(
             device,
             profile,
             lambda: (
-                build_decision_alias(tree),
-                DecisionReachCache.from_reach_cache(
-                    tree, reach_cache, policy_cache, bundle.rollout_backend
+                (
+                    AliasTable.build(decision_weight)
+                    if prebuilt_decision_reach is not None
+                    else build_decision_alias(tree)
+                ),
+                (
+                    prebuilt_decision_reach
+                    if prebuilt_decision_reach is not None
+                    else DecisionReachCache.from_reach_cache(
+                        tree, reach_cache, policy_cache, bundle.rollout_backend
+                    )
                 ),
             ),
         )
@@ -1032,6 +1099,9 @@ def _build_iteration_data(
                 "nodes": float(tree.owner.numel()),
                 "leaves": float(leaf_ids.numel()),
                 "decisions": float(decisions),
+                "completion_samples": float(
+                    leaf_ids.numel() * int(cfg.completion.n_samples)
+                ),
                 "offspring_mean": float(offspring.float().mean()),
                 "offspring_max": float(offspring.max()),
             }
@@ -1260,6 +1330,7 @@ def _one_iteration(
 
     model.train()
     optimization_start = None
+    minibatch_count = 0
     if profile:
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -1302,6 +1373,7 @@ def _one_iteration(
             ]
         if not sample_specs:
             raise ValueError("cannot optimize an empty fixed rollout")
+        minibatch_count += len(sample_specs)
         effective_total = 0
         previous_gradient_energy = 0.0
         trainable_count = max(
@@ -1463,6 +1535,7 @@ def _one_iteration(
                 values["optimizer_step_applied"]
                 for _, _, values in optimization_records
             ),
+            "minibatches": float(minibatch_count),
             "optimized_decision_rows": float(
                 sum(rows for _, rows, _ in optimization_records)
             ),
@@ -1488,6 +1561,7 @@ def _one_iteration(
         "leaves",
         "decisions",
         "terminal_samples",
+        "completion_samples",
         "retained_target_bytes",
         "completion_effective_samples",
     }
@@ -1552,6 +1626,8 @@ def run_training(
     cfg: RootConfig,
     *,
     bundle_builder: Callable[[RootConfig, torch.device], GameBundle],
+    target_model_builder: Callable[[dict[str, Any], torch.device, Any | None], nn.Module]
+    | None = None,
     resume_from: str | Path | None = None,
 ) -> None:
     """Train from scratch or resume an identity-checked complete run."""
@@ -1572,6 +1648,46 @@ def run_training(
             "CUDA training requires an explicit hardware profile with token, "
             "memory, and device limits"
         )
+    target_payload: dict[str, Any] | None = None
+    probe_target: dict[str, Any] | None = None
+    if cfg.probe is not None:
+        if target_model_builder is None:
+            raise RuntimeError("probe training requires a target-model builder")
+        target_path = Path(cfg.probe.target_checkpoint)
+        digest = hashlib.sha256()
+        with target_path.open("rb") as stream:
+            for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        actual_sha256 = digest.hexdigest()
+        if (
+            cfg.probe.target_sha256 is not None
+            and cfg.probe.target_sha256 != actual_sha256
+        ):
+            raise RuntimeError(
+                "probe target checkpoint SHA-256 does not match configuration"
+            )
+        cfg.probe.target_sha256 = actual_sha256
+        target_payload = torch.load(
+            target_path, map_location="cpu", weights_only=False
+        )
+        if not isinstance(target_payload, dict) or not isinstance(
+            target_payload.get("config"), dict
+        ) or "model" not in target_payload:
+            raise RuntimeError("probe target is not a PBG model checkpoint")
+        target_game = target_payload["config"].get("game")
+        expected_game = {
+            "n_players": cfg.game.n_players,
+            "stack_bb": cfg.game.stack_bb,
+            "rank_count": cfg.game.rank_count,
+        }
+        if target_game != expected_game:
+            raise RuntimeError("probe and target checkpoints must use identical (P,S,R)")
+        probe_target = {
+            "sha256": actual_sha256,
+            "path": str(target_path),
+            "run_id": target_payload.get("run_id"),
+            "iteration": int(target_payload.get("iteration", -1)),
+        }
     _configure_reproducibility(cfg.training.reproducibility)
     local_cfg = _rank_local_config(cfg, rank, world)
     _hardware_metadata(cfg, requested, world)
@@ -1585,12 +1701,37 @@ def run_training(
     if torch_gen.device != device:
         torch_gen, np_gen = seed_all(cfg.training.seed, rank, device)
     bundle.model.to(device)
+    if target_payload is not None:
+        assert target_model_builder is not None and cfg.probe is not None
+        opponent = target_model_builder(
+            target_payload["config"], device, cfg.hardware
+        )
+        opponent.load_state_dict(target_payload["model"])
+        opponent.eval().requires_grad_(False)
+        bundle.opponent_model = opponent
+        register_policy_model = getattr(
+            bundle.rollout_backend, "register_policy_model", None
+        )
+        if callable(register_policy_model):
+            register_policy_model(opponent)
+            register_policy_model(bundle.model)
+        bundle.probe_target = probe_target
+        if cfg.probe.initialization == "target":
+            try:
+                bundle.model.load_state_dict(target_payload["model"])
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "probe initialization 'target' requires identical architectures"
+                ) from exc
     if world > 1:
         if not dist.is_initialized():
             dist.init_process_group("nccl" if device.type == "cuda" else "gloo")
         # Each rank owns a plain model replica. Gradients are accumulated under
         # the exact local objective scale and reduced once through the explicit
         # flat SUM path; DDP's equal-rank averaging is intentionally not used.
+        if cfg.probe is not None and cfg.probe.initialization == "random":
+            for value in bundle.model.state_dict().values():
+                dist.broadcast(value, src=0)
     optimizer_cls = (
         torch.optim.AdamW
         if cfg.training.optimizer == "adamw"
@@ -1613,6 +1754,12 @@ def run_training(
     start_iteration = 0
     run_id: str | None = None
     resume_path = None if resume_from is None else Path(resume_from)
+    logical_work = {
+        "trajectories": 0,
+        "completion_samples": 0,
+        "minibatches": 0,
+        "optimizer_steps": 0,
+    }
 
     if resume_path is not None:
         if resume_path.parent.resolve() != out_dir.resolve():
@@ -1628,6 +1775,20 @@ def run_training(
             rank=rank,
             reference_model=reference_model,
         )
+        stored_logical_work = checkpoint_metadata.get("logical_work")
+        if stored_logical_work is not None:
+            if set(stored_logical_work) != set(logical_work):
+                raise RuntimeError("checkpoint has malformed logical-work counters")
+            logical_work = {
+                key: int(stored_logical_work[key]) for key in logical_work
+            }
+        if cfg.probe is not None:
+            stored_target = checkpoint_metadata.get("probe_target")
+            if (
+                stored_target is None
+                or stored_target.get("sha256") != cfg.probe.target_sha256
+            ):
+                raise RuntimeError("resume probe target hash does not match checkpoint")
         if checkpoint_metadata["cfg_dict"] != _scientific_config(cfg):
             raise RuntimeError("resume configuration does not match the checkpoint")
         start_iteration = int(checkpoint_metadata["iter"])
@@ -1662,6 +1823,7 @@ def run_training(
                         "run_id": run_id,
                         "config_sha256": _config_fingerprint(cfg),
                         "world_size": world,
+                        "probe_target": probe_target,
                     },
                     indent=2,
                     sort_keys=True,
@@ -1724,6 +1886,18 @@ def run_training(
         if reference_iteration is not None:
             metrics["reference_iteration"] = float(reference_iteration)
         _add_distributed_metric_summaries(metrics, device, world)
+        for name in logical_work:
+            distributed_key = (
+                f"{name}_rank_max"
+                if name == "optimizer_steps"
+                else f"{name}_rank_sum"
+            )
+            value = metrics.get(
+                distributed_key if world > 1 else name,
+                0.0,
+            )
+            logical_work[name] += int(round(value))
+            metrics[f"cumulative_{name}"] = float(logical_work[name])
         checkpoint_every = (
             cfg.training.checkpoint_every
             if cfg.hardware is None or cfg.hardware.checkpoint_every is None
@@ -1766,6 +1940,8 @@ def run_training(
                 rank_rng_states=rank_rng_states,
                 reference_model=reference_model,
                 reference_iteration=reference_iteration,
+                probe_target=probe_target,
+                logical_work=logical_work,
             )
     if world > 1 and dist.is_initialized():
         dist.barrier()

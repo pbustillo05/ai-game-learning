@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch, GameBundle
+from pbg.core.game import CHANCE, PRETERM, PROBE_FOLD, TERMINAL, EventBatch, GameBundle
 from pbg.core.execution import (
     DONE,
     ChunkedOccurrenceArena,
@@ -21,7 +22,19 @@ from pbg.core.execution import (
     logical_rng_keys,
     stable_partition_masked,
 )
-from pbg.core.tree import DeviceTreeBuffer, PolicyCache, ReachCache, TreeBatch
+from pbg.core.tree import DecisionReachCache, DeviceTreeBuffer, PolicyCache, ReachCache, TreeBatch
+
+
+@dataclass
+class ProbeRollout:
+    """Sequential mixed-policy data retained only for the exploiter."""
+
+    tree: TreeBatch
+    leaf_reach: ReachCache
+    policy: PolicyCache
+    decision_reach: DecisionReachCache
+    seats: Tensor
+    root_profiles: Tensor
 
 
 def _selected_policy_logp(
@@ -279,7 +292,7 @@ def _sample_trees_sequential(
     iteration: int = 0,
 ) -> tuple[TreeBatch, ReachCache, PolicyCache] | tuple[
     TreeBatch, ReachCache, PolicyCache, Tensor
-]:
+] | ProbeRollout:
     """Sample sequential paths with persistent family work queue ready queues.
 
     The model scheduler may change batch boundaries without changing private,
@@ -345,6 +358,28 @@ def _sample_trees_sequential(
         dtype=torch.int64,
         device=device,
     )
+    probe_enabled = bundle.opponent_model is not None
+    probe_seats = None
+    if probe_enabled:
+        configured_seats = getattr(rollout_cfg, "probe_seats", None)
+        if configured_seats is not None:
+            probe_seats = torch.as_tensor(
+                configured_seats, dtype=torch.int32, device=device
+            )
+            if probe_seats.shape != (start_count,) or bool(
+                ((probe_seats < 0) | (probe_seats >= p_max)).any()
+            ):
+                raise ValueError("rollout.probe_seats must select one valid seat per start")
+        else:
+            seat_keys = logical_rng_keys(
+                seed=_logical_seed(cfg, gen),
+                iteration=iteration,
+                trajectory=trajectory_ids,
+                path=torch.zeros_like(trajectory_ids),
+                draw=0,
+                purpose=DrawPurpose.PROBE_SEAT,
+            )
+            probe_seats = torch.remainder(seat_keys, p_max).to(torch.int32)
     arena.scatter_many(
         root_handles,
         {
@@ -399,6 +434,8 @@ def _sample_trees_sequential(
     policy_nodes: list[Tensor] = []
     policy_logp: list[Tensor] = []
     policy_values: list[Tensor] = []
+    probe_reach_nodes: list[Tensor] = []
+    probe_reach_rows: list[Tensor] = []
     scheduler_steps = 0
     active_starts = 0
     if metrics is not None:
@@ -507,7 +544,7 @@ def _sample_trees_sequential(
                 owners == CHANCE,
                 torch.full_like(family_ids, chance_route),
                 torch.where(
-                    (owners == TERMINAL) | (owners == PRETERM),
+                    (owners == TERMINAL) | (owners == PRETERM) | (owners == PROBE_FOLD),
                     torch.full_like(family_ids, leaf_route),
                     torch.where(
                         player,
@@ -673,49 +710,100 @@ def _sample_trees_sequential(
         reaches = reach_rows_for(batch_nodes)
         tree_ids = buffer.tree_id[batch_rows_index].to(torch.int64)
         profiles = root_profiles[tree_ids]
+        address = arena.gather_many(
+            ("trajectory_id", "path_key"), batch_rows_index
+        )
+        keys = logical_rng_keys(
+            seed=logical_seed,
+            iteration=iteration,
+            trajectory=address["trajectory_id"],
+            path=address["path_key"],
+            draw=1,
+            purpose=DrawPurpose.ACTION,
+        )
+        if probe_enabled:
+            assert probe_seats is not None
+            owners = buffer.owner[batch_rows_index]
+            is_probe = owners == probe_seats[tree_ids]
+            role_parts = (
+                (is_probe.nonzero(as_tuple=False).squeeze(1), bundle.model, True),
+                ((~is_probe).nonzero(as_tuple=False).squeeze(1), bundle.opponent_model, False),
+            )
+        else:
+            role_parts = (
+                (torch.arange(count, device=device), bundle.model, True),
+            )
+        next_states = torch.empty_like(states)
+        next_reach = torch.empty_like(reaches)
+        event_ids = torch.empty(count, dtype=torch.int32, device=device)
+        event_payload: dict[str, Tensor] = {}
         with torch.no_grad():
-            output = actual_cost_forward(
-                bundle.model, selected_family, states, reaches
-            )
-            address = arena.gather_many(
-                ("trajectory_id", "path_key"), batch_rows_index
-            )
-            keys = logical_rng_keys(
-                seed=logical_seed,
-                iteration=iteration,
-                trajectory=address["trajectory_id"],
-                path=address["path_key"],
-                draw=1,
-                purpose=DrawPurpose.ACTION,
-            )
-            events = _sample_events_logical(
-                backend,
-                states,
-                profiles,
-                output,
-                bundle.policy_adapter,
-                keys,
-                gen,
-            )
-            step_player = getattr(backend, "step_player_batch", backend.step)
-            next_states = step_player(states, events)
-            next_reach = backend.reach_update(reaches, states, events, output)
+            for positions, role_model, retain in role_parts:
+                if positions.numel() == 0:
+                    continue
+                if role_model is None:
+                    raise RuntimeError("mixed-policy rollout is missing its opponent model")
+                output = actual_cost_forward(
+                    role_model,
+                    selected_family,
+                    states[positions],
+                    reaches[positions],
+                )
+                role_events = _sample_events_logical(
+                    backend,
+                    states[positions],
+                    profiles[positions],
+                    output,
+                    bundle.policy_adapter,
+                    keys[positions],
+                    gen,
+                )
+                step_player = getattr(backend, "step_player_batch", backend.step)
+                next_states[positions] = step_player(states[positions], role_events)
+                next_reach[positions] = backend.reach_update(
+                    reaches[positions], states[positions], role_events, output
+                )
+                event_ids[positions] = role_events.public_id
+                for name, value in role_events.payload.items():
+                    destination = event_payload.get(name)
+                    if destination is None:
+                        destination = torch.empty(
+                            (count, *value.shape[1:]),
+                            dtype=value.dtype,
+                            device=value.device,
+                        )
+                        event_payload[name] = destination
+                    destination[positions] = value
+                if retain:
+                    legal_ids, legal_mask = backend.legal_events(states[positions])
+                    policy_nodes.append(batch_nodes[positions])
+                    policy_logp.append(
+                        _selected_policy_logp(
+                            bundle.policy_adapter,
+                            output,
+                            role_events.public_id[:, None],
+                            legal_ids,
+                            legal_mask,
+                        ).detach()
+                    )
+                    policy_values.append(output.v.detach().float())
+                    if probe_enabled:
+                        probe_reach_nodes.append(batch_nodes[positions])
+                        probe_reach_rows.append(reaches[positions].detach().clone())
+        events = EventBatch(public_id=event_ids, payload=event_payload)
         next_owner = backend.classify(next_states).to(torch.int32)
+        if probe_enabled:
+            cutoff_fn = getattr(backend, "probe_fold_mask", None)
+            if not callable(cutoff_fn):
+                raise TypeError("probe rollout backend must implement probe_fold_mask")
+            assert probe_seats is not None
+            cutoff = cutoff_fn(next_states, probe_seats[tree_ids]) & is_probe
+            next_owner = torch.where(
+                cutoff, torch.full_like(next_owner, PROBE_FOLD), next_owner
+            )
         children = append_children(
             batch_nodes, next_states, next_owner, events, next_reach
         )
-        legal_ids, legal_mask = backend.legal_events(states)
-        policy_nodes.append(batch_nodes)
-        policy_logp.append(
-            _selected_policy_logp(
-                bundle.policy_adapter,
-                output,
-                events.public_id[:, None],
-                legal_ids,
-                legal_mask,
-            ).detach()
-        )
-        policy_values.append(output.v.detach().float())
         DeviceWorkQueue.mark_done(arena, batch_nodes.to(torch.int64))
         chance_close(children)
 
@@ -725,7 +813,21 @@ def _sample_trees_sequential(
             "family-scheduled rollout terminated with incomplete trajectory admission/accounting"
         )
     all_nodes = torch.arange(buffer.node_count, dtype=torch.int32, device=device)
-    if rollout_cfg.reach_storage == "full":
+    if probe_enabled:
+        leaf_nodes = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero(
+            as_tuple=False
+        ).squeeze(1).to(torch.int32)
+        leaf_rows = leaf_nodes.to(torch.int64)
+        if rollout_cfg.reach_storage == "recompute":
+            leaf_storage_rows = tree.tree_id[leaf_rows].to(torch.int64)
+        else:
+            leaf_storage_rows = leaf_rows
+        reach_cache = ReachCache(
+            "decisions_only",
+            working_reach[leaf_storage_rows].detach().clone(),
+            leaf_nodes,
+        )
+    elif rollout_cfg.reach_storage == "full":
         reach_nodes = all_nodes
         retained_reach = working_reach[: buffer.node_count]
     elif rollout_cfg.reach_storage == "decisions_only":
@@ -737,7 +839,8 @@ def _sample_trees_sequential(
     else:
         reach_nodes = root_nodes
         retained_reach = root_reach
-    reach_cache = ReachCache(rollout_cfg.reach_storage, retained_reach, reach_nodes)
+    if not probe_enabled:
+        reach_cache = ReachCache(rollout_cfg.reach_storage, retained_reach, reach_nodes)
     if policy_nodes:
         node_ids = torch.cat(policy_nodes).to(torch.int32)
         old_logp = torch.cat(policy_logp).float()
@@ -748,7 +851,35 @@ def _sample_trees_sequential(
         node_ids = torch.empty(0, dtype=torch.int32, device=device)
         old_logp = torch.empty((0, 1, x_max), dtype=torch.float32, device=device)
         old_v = torch.empty((0, x_max), dtype=torch.float32, device=device)
-    result = (tree, reach_cache, PolicyCache(node_ids, old_logp, old_v))
+    policy = PolicyCache(node_ids, old_logp, old_v)
+    if probe_enabled:
+        if probe_reach_nodes:
+            decision_nodes = torch.cat(probe_reach_nodes).to(torch.int32)
+            decision_rows = torch.cat(probe_reach_rows).float()
+            decision_order = torch.argsort(decision_nodes.to(torch.int64))
+            decision_nodes = decision_nodes[decision_order]
+            decision_rows = decision_rows[decision_order]
+        else:
+            decision_nodes = torch.empty(0, dtype=torch.int32, device=device)
+            decision_rows = torch.empty(
+                (0, p_max, x_max), dtype=torch.float32, device=device
+            )
+        if not torch.equal(decision_nodes, policy.node_ids):
+            raise RuntimeError("probe policy and decision-reach rows are misaligned")
+        state_refs = tree.state_ref[decision_nodes.to(torch.int64)].to(torch.int32)
+        owners = tree.owner[decision_nodes.to(torch.int64)].to(torch.int32)
+        decision_reach = DecisionReachCache.from_rows(
+            decision_nodes,
+            state_refs,
+            decision_rows,
+            backend,
+            owners,
+        )
+        assert probe_seats is not None
+        return ProbeRollout(
+            tree, reach_cache, policy, decision_reach, probe_seats, root_profiles
+        )
+    result = (tree, reach_cache, policy)
     if return_profiles:
         return (*result, root_profiles)
     return result
@@ -763,7 +894,7 @@ def sample_trees_sequential(
     iteration: int = 0,
 ) -> tuple[TreeBatch, ReachCache, PolicyCache] | tuple[
     TreeBatch, ReachCache, PolicyCache, Tensor
-]:
+] | ProbeRollout:
     """Sample family-scheduled sequential trajectories."""
 
     return _sample_trees_sequential(
@@ -781,7 +912,7 @@ def sample_trees(
     gen: torch.Generator,
     *,
     iteration: int = 0,
-) -> tuple[TreeBatch, ReachCache, PolicyCache]:
+) -> tuple[TreeBatch, ReachCache, PolicyCache] | ProbeRollout:
     """Sample trajectories for sequential RB or one tree for branched RB."""
 
     training = getattr(cfg, "training", None)

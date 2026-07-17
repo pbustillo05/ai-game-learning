@@ -1,4 +1,4 @@
-NOT YET ADDRESSED - TO KEEP
+IMPLEMENTED FOR SEQUENTIAL RAO--BLACKWELL; retained as the original design sketch.
 
 We need to implement a modification of the training algorithm to train a BR probe to measure exploitability. In all likeliness, we need:
 - to use Rao-Blackwell sequential

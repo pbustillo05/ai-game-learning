@@ -112,6 +112,40 @@ seat. Fold chip rewards are public, while folded-card posteriors and every
 showdown remain evaluator-owned. Reports include paired bb/100 confidence
 intervals and per-seat results.
 
+## Sequential best-response probes
+
+An optional top-level `probe` block turns sequential Rao--Blackwell training
+into a shared-seat approximate best response against one frozen checkpoint:
+
+```yaml
+probe:
+  target_checkpoint: runs/target/ckpt_0000100.pt
+  target_sha256: null       # optional pin; resolved and stored at launch
+  initialization: random    # or target for identical architectures
+```
+
+The target must have identical `(n_players, stack_bb, rank_count)`. Its model
+size and factorized action-head size may differ. Probe checkpoints record the
+resolved target SHA-256; resume and evaluation reject changed target contents,
+while allowing the target file to be moved.
+
+Evaluate one or more probe checkpoints with paired GPU rollouts (heads-up
+example):
+
+```bash
+pbg-br-eval --probe runs/probe/ckpt_0000100.pt \
+  --hardware-profile local_3x2080ti --hands 10000 --batch-size 100
+```
+
+`--hands` and `--batch-size` must be multiples of $P^2$ so exploiter seats and
+button positions are exactly balanced. The headline mean unilateral gain is
+an approximate exploitability lower bound; the report also includes its paired
+confidence interval, per-seat gains, and approximate NashConv.
+It also records paired evaluation work and wall time plus the probe
+checkpoint's cumulative logical trajectories, completion samples, minibatches,
+and optimizer steps. If omitted, `--batch-size` is chosen automatically as a
+multiple of $P^2$ no larger than 256.
+
 ## Validation
 
 Run the CPU suite from the repository root:

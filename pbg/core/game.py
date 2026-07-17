@@ -13,6 +13,7 @@ from pbg.core.completion import MCCompletion
 CHANCE = -1
 TERMINAL = -2
 PRETERM = -3
+PROBE_FOLD = -4
 
 StateBatch = Tensor
 
@@ -125,3 +126,5 @@ class GameBundle:
     rollout_backend: RolloutBackend
     policy_adapter: Any
     completion_backend: MCCompletion | None
+    opponent_model: nn.Module | None = None
+    probe_target: dict[str, Any] | None = None

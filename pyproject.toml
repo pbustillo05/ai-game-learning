@@ -13,6 +13,7 @@ dependencies = ["numpy", "pyyaml", "pytest", "torch>=2.2"]
 [project.scripts]
 pbg-train = "pbg.cli.train:main"
 pbg-benchmark = "pbg.cli.benchmark:main"
+pbg-br-eval = "pbg.cli.br_eval:main"
 
 # Development prerequisite for poker boundaries (kept out of package deps):
 # pip install -e ../poker-gpu-evaluator

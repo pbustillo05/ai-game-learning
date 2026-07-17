@@ -10,7 +10,7 @@ from torch import Tensor
 
 from pbg.core.completion import BatchedCompletionStats
 from pbg.core.config import RootConfig
-from pbg.core.game import PRETERM, GameBundle
+from pbg.core.game import PRETERM, PROBE_FOLD, GameBundle
 from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.engine import PokerConfig
@@ -185,6 +185,84 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
 
         return self._complete_impl(
             game, tree, node_ids, reach, n_samples, gen=None, keys=keys
+        )
+
+    def complete_selected_keyed(
+        self,
+        game: Any,
+        tree: Any,
+        node_ids: Tensor,
+        reach: Any,
+        n_samples: int,
+        keys: Tensor,
+        players: Tensor,
+    ) -> BatchedCompletionStats:
+        """Complete only one selected player's posterior/value per leaf."""
+
+        rows = _reach_rows(reach)
+        if players.shape != node_ids.shape or players.device != rows.device:
+            raise ValueError("selected completion players must be device-local [B]")
+        p_hat = torch.zeros_like(rows, dtype=torch.float32)
+        v_hat = torch.zeros_like(p_hat)
+        owners = tree.owner[node_ids.to(tree.owner.device, dtype=torch.int64)]
+        cutoff_mask = owners == PROBE_FOLD
+        ordinary_mask = ~cutoff_mask
+
+        if bool(ordinary_mask.any()):
+            positions = ordinary_mask.nonzero(as_tuple=False).squeeze(1)
+            completed = self._complete_impl(
+                game,
+                tree,
+                node_ids[positions],
+                rows[positions],
+                n_samples,
+                gen=None,
+                keys=keys[positions],
+            )
+            selected = players[positions].to(torch.int64)
+            target_rows = torch.arange(positions.numel(), device=rows.device)
+            p_hat[positions, selected] = completed.p_hat[target_rows, selected]
+            v_hat[positions, selected] = completed.v_hat[target_rows, selected]
+
+        if bool(cutoff_mask.any()):
+            positions = cutoff_mask.nonzero(as_tuple=False).squeeze(1)
+            state_refs = tree.state_ref[
+                node_ids[positions].to(tree.state_ref.device, dtype=torch.int64)
+            ]
+            selected_reach = rows[positions]
+            dealt = torch.ones(
+                (positions.numel(), game.n_players),
+                dtype=torch.bool,
+                device=rows.device,
+            )
+            profiles = game.profile_sampler.sample_seeded(
+                selected_reach,
+                game.states.board[state_refs.to(torch.int64)],
+                dealt,
+                n_samples,
+                keys[positions].contiguous(),
+            )
+            selected = players[positions].to(torch.int64)
+            combos = profiles.gather(
+                2, selected[:, None, None].expand(-1, n_samples, 1)
+            ).squeeze(2).to(torch.int64)
+            counts = torch.zeros(
+                (positions.numel(), rows.shape[2]),
+                dtype=torch.float32,
+                device=rows.device,
+            )
+            counts.scatter_add_(1, combos, torch.ones_like(combos, dtype=torch.float32))
+            posterior = counts / float(n_samples)
+            payoff = -game.states.committed_total[
+                state_refs.to(torch.int64), selected
+            ].to(torch.float32)
+            p_hat[positions, selected] = posterior
+            v_hat[positions, selected] = payoff[:, None] * (posterior > 0)
+
+        return BatchedCompletionStats(
+            p_hat=p_hat,
+            v_hat=v_hat,
+            metadata={"backend": self.backend, "selected_player": True},
         )
 
     def _complete_impl(
@@ -420,6 +498,60 @@ def validate_config(cfg: RootConfig) -> None:
     _validate_attention_capacity(cfg, poker_cfg, model_cfg)
 
 
+def build_model_from_config(
+    scientific: dict[str, Any], device: torch.device, hardware: Any | None = None
+) -> PokerModelBundle:
+    """Construct only a poker model from checkpoint scientific configuration."""
+
+    game = scientific.get("game")
+    model = scientific.get("model")
+    if not isinstance(game, dict) or not isinstance(model, dict):
+        raise ValueError("target checkpoint must contain game and model configuration")
+    engine_cfg = PokerConfig(
+        n_players=game["n_players"],
+        stack_bb=game["stack_bb"],
+        rank_count=game["rank_count"],
+    )
+    model_cfg = PokerModelConfig.from_dict(model)
+    if model_cfg.max_players < engine_cfg.n_players:
+        raise ValueError("target model does not cover every configured poker seat")
+    if model_cfg.folder_beta_rank > engine_cfg.geometry.n_cards:
+        raise ValueError("target folder beta rank exceeds the active compact deck")
+    required = max_public_history_tokens(engine_cfg.n_players, engine_cfg.stack_bb)
+    if "max_history_tokens" not in model:
+        model_cfg = replace(model_cfg, max_history_tokens=required)
+    if model_cfg.max_history_tokens < required:
+        raise ValueError("target model history capacity is smaller than its game bound")
+    if hardware is not None:
+        width = max_policy_sequence_tokens(
+            n_players=engine_cfg.n_players,
+            stack_bb=engine_cfg.stack_bb,
+            rank_count=engine_cfg.rank_count,
+            k_act=model_cfg.k_act,
+        )
+        pairs = width * width
+        for phase in ("training", "inference"):
+            if width > getattr(hardware, f"{phase}_max_tokens"):
+                raise ValueError(
+                    f"target model exceeds hardware.{phase}_max_tokens"
+                )
+            if pairs > getattr(hardware, f"{phase}_max_token_pairs"):
+                raise ValueError(
+                    f"target model exceeds hardware.{phase}_max_token_pairs"
+                )
+    result = PokerModelBundle(
+        PreflopNet(model_cfg, engine_cfg.geometry),
+        PostflopNet(model_cfg, engine_cfg.geometry),
+    ).to(device)
+    if hardware is not None:
+        for module in result.modules():
+            if isinstance(module, MHA):
+                module.configure_execution(
+                    hardware.attention_backend, hardware.query_chunk_size
+                )
+    return result
+
+
 def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     """Construct one owning poker model and its device-resident backends."""
 
@@ -474,6 +606,7 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     )
     backend.execution_profile = cfg.hardware
     backend.rollout_memory_plan = plan
+    backend.register_policy_model(model)
     completion = (
         None
         if cfg.training.mode == "normal"

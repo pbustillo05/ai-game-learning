@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
+from pbg.core.game import CHANCE, PRETERM, PROBE_FOLD, TERMINAL, EventBatch
 
 
 @dataclass
@@ -81,11 +81,11 @@ class TreeBatch:
             leaf = start == stop
             node_owner = int(self.owner[node])
             if leaf:
-                if node_owner not in (TERMINAL, PRETERM):
-                    raise ValueError("every leaf must be TERMINAL or PRETERM")
+                if node_owner not in (TERMINAL, PRETERM, PROBE_FOLD):
+                    raise ValueError("every leaf must be TERMINAL, PRETERM, or PROBE_FOLD")
             else:
-                if node_owner in (TERMINAL, PRETERM):
-                    raise ValueError("TERMINAL/PRETERM nodes cannot have children")
+                if node_owner in (TERMINAL, PRETERM, PROBE_FOLD):
+                    raise ValueError("leaf-coded nodes cannot have children")
                 if not torch.isclose(
                     self.nu[start:stop].sum(),
                     torch.ones((), dtype=self.nu.dtype, device=self.nu.device),

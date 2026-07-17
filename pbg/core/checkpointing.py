@@ -31,20 +31,22 @@ def save_checkpoint(
     rank_rng_states: list[dict[str, Any]] | None = None,
     reference_model: nn.Module | None = None,
     reference_iteration: int | None = None,
+    probe_target: dict[str, Any] | None = None,
+    logical_work: dict[str, int] | None = None,
 ) -> None:
     """Atomically store model, optimizer, scaler, config, and explicit RNG state."""
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     raw_model = model.module if hasattr(model, "module") else model
-    scientific_config = asdict(cfg)
-    hardware_profile = scientific_config.pop("hardware", None)
+    stored_config = scientific_config(cfg)
+    hardware_profile = asdict(cfg).get("hardware")
     payload = {
         "model": raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
         "iteration": int(iteration),
-        "config": scientific_config,
+        "config": stored_config,
         "hardware_profile": hardware_profile,
         "torch_generator": torch_gen.get_state(),
         "numpy_generator": np_gen.bit_generator.state,
@@ -56,6 +58,8 @@ def save_checkpoint(
             None if reference_model is None else reference_model.state_dict()
         ),
         "reference_iteration": reference_iteration,
+        "probe_target": copy.deepcopy(probe_target),
+        "logical_work": copy.deepcopy(logical_work),
     }
     temporary = target.with_suffix(target.suffix + ".tmp")
     torch.save(payload, temporary)
@@ -116,6 +120,8 @@ def load_checkpoint(
         "cfg_dict": payload["config"],
         "run_id": payload.get("run_id"),
         "reference_iteration": payload.get("reference_iteration"),
+        "probe_target": copy.deepcopy(payload.get("probe_target")),
+        "logical_work": copy.deepcopy(payload.get("logical_work")),
     }
 
 
@@ -139,6 +145,9 @@ def scientific_config(cfg: RootConfig) -> dict[str, Any]:
 
     result = asdict(cfg)
     result.pop("hardware", None)
+    if result.get("probe") is not None:
+        # The content hash is scientific identity; the filesystem location is not.
+        result["probe"].pop("target_checkpoint", None)
     return result
 
 

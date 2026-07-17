@@ -715,6 +715,7 @@ class DrawPurpose(IntEnum):
     CHANCE = 5
     COMPLETION = 6
     LEARNER = 7
+    PROBE_SEAT = 8
 
 
 _MASK63 = (1 << 63) - 1

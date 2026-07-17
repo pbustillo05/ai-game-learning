@@ -92,6 +92,15 @@ class TrainingConfig:
 
 
 @dataclass
+class ProbeConfig:
+    """Train one shared approximate best response against a fixed checkpoint."""
+
+    target_checkpoint: str
+    target_sha256: str | None = None
+    initialization: str = "random"
+
+
+@dataclass
 class HardwareProfileConfig:
     """Execution-only limits selected independently of scientific settings."""
 
@@ -125,6 +134,7 @@ class RootConfig:
     model: dict[str, Any]
     loss: LossConfig
     training: TrainingConfig
+    probe: ProbeConfig | None = None
     hardware: HardwareProfileConfig | None = None
 
 _ConfigT = TypeVar("_ConfigT")
@@ -242,6 +252,24 @@ def _validate_config(cfg: RootConfig) -> None:
             "root.training.mode: expected 'normal', 'rao_blackwell', or "
             "'branched_rao_blackwell'"
         )
+    if cfg.probe is not None:
+        if cfg.training.mode != "rao_blackwell":
+            raise ConfigError(
+                "root.probe: best-response probes require training.mode 'rao_blackwell'"
+            )
+        if not cfg.probe.target_checkpoint.strip():
+            raise ConfigError("root.probe.target_checkpoint: expected a nonempty path")
+        if cfg.probe.initialization not in {"random", "target"}:
+            raise ConfigError(
+                "root.probe.initialization: expected 'random' or 'target'"
+            )
+        if cfg.probe.target_sha256 is not None:
+            digest = cfg.probe.target_sha256.lower()
+            if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+                raise ConfigError(
+                    "root.probe.target_sha256: expected 64 lowercase hexadecimal characters"
+                )
+            cfg.probe.target_sha256 = digest
     if cfg.training.mode == "branched_rao_blackwell":
         if cfg.rollout.beta is None or "default" not in cfg.rollout.beta:
             raise ConfigError(
@@ -445,6 +473,23 @@ def parse_config(
         profile_raw = _load_yaml(profile_path, "hardware profile")
         cfg.hardware = _parse_dataclass(
             HardwareProfileConfig, profile_raw, "hardware"
+        )
+    _validate_config(cfg)
+    return cfg
+
+
+def parse_config_mapping(
+    raw: dict[str, Any], *, hardware_profile: str | Path | None = None
+) -> RootConfig:
+    """Parse an in-memory scientific configuration, such as a checkpoint payload."""
+
+    cfg = _parse_dataclass(RootConfig, raw, "root")
+    if hardware_profile is not None:
+        profile_path = _hardware_path(hardware_profile)
+        cfg.hardware = _parse_dataclass(
+            HardwareProfileConfig,
+            _load_yaml(profile_path, "hardware profile"),
+            "hardware",
         )
     _validate_config(cfg)
     return cfg

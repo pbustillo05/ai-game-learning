@@ -162,6 +162,7 @@ def _layout_from_shape(
     heads: HeadEvals,
     lam: float,
     game: Any,
+    decision_players_by_tree: Tensor | None = None,
 ) -> _Layout:
     """Validate topology and construct layout without allocating leaf values."""
 
@@ -192,6 +193,15 @@ def _layout_from_shape(
 
     owner = tree.owner.to(torch.int64)
     decision_nodes = ((owner >= 0) & (owner < n_players)).nonzero(as_tuple=False).squeeze(1)
+    if decision_players_by_tree is not None:
+        roots = int((tree.parent < 0).sum())
+        selected = decision_players_by_tree.to(device=device, dtype=torch.int64)
+        if selected.shape != (roots,) or bool(
+            ((selected < 0) | (selected >= n_players)).any()
+        ):
+            raise ValueError("decision_players_by_tree must select one player per tree")
+        tree_rows = tree.tree_id[decision_nodes].to(torch.int64)
+        decision_nodes = decision_nodes[owner[decision_nodes] == selected[tree_rows]]
     nd = int(decision_nodes.numel())
     if (
         heads.node_ids.ndim != 1
@@ -491,6 +501,7 @@ def streamed_branched_value(
     completion_batch_rows: int,
     emit_q: bool = False,
     max_workspace_bytes: int = 1 << 30,
+    decision_players_by_tree: Tensor | None = None,
 ) -> NodeTargets:
     """Construct targets while completion batches feed a ``P/M`` frontier."""
 
@@ -511,6 +522,7 @@ def streamed_branched_value(
         heads,
         lam,
         game,
+        decision_players_by_tree,
     )
     if layout.n:
         _, actual_counts = tree.tree_id.to(torch.int64).unique(return_counts=True)
