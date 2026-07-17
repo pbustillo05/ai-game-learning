@@ -4,7 +4,11 @@ from dataclasses import dataclass
 
 import torch
 
-from pbg.core.checkpointing import compatible_scientific_configs
+from pbg.core.checkpointing import (
+    compatible_scientific_configs,
+    config_dict_fingerprint,
+    matches_legacy_run_fingerprint,
+)
 from pbg.core.memory_control import PolicyMemoryForecaster, unique_tensor_bytes
 from pbg.core.training import SequentialWorkController
 
@@ -37,6 +41,24 @@ def test_legacy_checkpoint_without_probe_accepts_current_null_probe() -> None:
         "probe": None,
     }
     assert compatible_scientific_configs(legacy, current)
+
+
+def test_legacy_run_fingerprint_allows_only_checkpoint_cadence_drift() -> None:
+    original = {
+        "game": {"n_players": 2},
+        "training": {"iters": 100, "checkpoint_every": 10, "lr": 1e-4},
+    }
+    resumed = {
+        "game": {"n_players": 2},
+        "training": {"iters": 100, "checkpoint_every": 5, "lr": 1e-4},
+    }
+    recorded = config_dict_fingerprint(original)
+    assert matches_legacy_run_fingerprint(recorded, resumed)
+    changed_science = {
+        **resumed,
+        "training": {**resumed["training"], "lr": 2e-4},
+    }
+    assert not matches_legacy_run_fingerprint(recorded, changed_science)
 
 
 def test_policy_forecast_roundtrip_and_policy_conditioned_scaling() -> None:

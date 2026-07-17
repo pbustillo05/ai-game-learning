@@ -27,6 +27,7 @@ from pbg.core.checkpointing import (
     _config_fingerprint,
     compatible_scientific_configs,
     legacy_config_fingerprint,
+    matches_legacy_run_fingerprint,
     _scientific_config,
     _validate_metrics_prefix,
     load_checkpoint,
@@ -2724,7 +2725,9 @@ def run_training(
                 _config_fingerprint(cfg),
                 legacy_config_fingerprint(cfg),
                 config_dict_fingerprint(checkpoint_metadata["cfg_dict"]),
-            }:
+            } and not matches_legacy_run_fingerprint(
+                recorded_fingerprint, checkpoint_metadata["cfg_dict"]
+            ):
                 raise RuntimeError("run configuration fingerprint does not match")
             if run_record.get("world_size") != world:
                 raise RuntimeError("resume requires the original DDP world size")

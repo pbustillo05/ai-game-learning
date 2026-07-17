@@ -203,6 +203,38 @@ def config_dict_fingerprint(config: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def matches_legacy_run_fingerprint(
+    recorded: str | None, checkpoint_config: dict[str, Any]
+) -> bool:
+    """Match an old run manifest while allowing only checkpoint cadence drift.
+
+    Old manifests hashed ``training.checkpoint_every`` even though it controls
+    persistence rather than the scientific trajectory.  A later checkpoint
+    may therefore be scientifically compatible but carry a different cadence.
+    Recover the original manifest hash by exhaustively trying the finite set of
+    positive cadences within the configured training horizon.  No other field
+    is relaxed.
+    """
+
+    if not isinstance(recorded, str) or len(recorded) != 64:
+        return False
+    if config_dict_fingerprint(checkpoint_config) == recorded:
+        return True
+    training = checkpoint_config.get("training")
+    if not isinstance(training, dict):
+        return False
+    iterations = training.get("iters")
+    if isinstance(iterations, bool) or not isinstance(iterations, int):
+        return False
+    candidate = copy.deepcopy(checkpoint_config)
+    candidate_training = candidate["training"]
+    for cadence in range(1, iterations + 1):
+        candidate_training["checkpoint_every"] = cadence
+        if config_dict_fingerprint(candidate) == recorded:
+            return True
+    return False
+
+
 def config_fingerprint(cfg: RootConfig) -> str:
     """Return the stable SHA-256 identity of the scientific configuration."""
 
