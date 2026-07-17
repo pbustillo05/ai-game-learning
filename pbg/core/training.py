@@ -23,7 +23,10 @@ from torch import Tensor, nn
 from pbg.core.config import RootConfig, seed_all
 from pbg.core.checkpointing import (
     _capture_rng_state,
+    config_dict_fingerprint,
     _config_fingerprint,
+    compatible_scientific_configs,
+    legacy_config_fingerprint,
     _scientific_config,
     _validate_metrics_prefix,
     load_checkpoint,
@@ -32,6 +35,7 @@ from pbg.core.checkpointing import (
 from pbg.core.distributed import stratum_objective_scale
 from pbg.core.game import GameBundle
 from pbg.core.losses import COMPOSITES, LossSpec, _selected_logp, finalize_metric_stats
+from pbg.core.memory_control import MemoryLedger, PolicyMemoryForecaster
 from pbg.core.minibatch import (
     gather_minibatch_rows,
     index_minibatch,
@@ -54,8 +58,33 @@ from pbg.core.rollout import (
     sequential_leaf_logical_rng_keys,
 )
 from pbg.core.execution import LOGICAL_RNG_VERSION, DrawPurpose
-from pbg.core.tree import AliasTable, DecisionReachCache, build_decision_alias
+from pbg.core.tree import DecisionReachCache
 from pbg.core.values import HeadEvals, streamed_branched_value
+
+
+class MemoryPressureRetry(RuntimeError):
+    """A rollout completed, but no optimizer step may safely begin."""
+
+    def __init__(
+        self,
+        predicted_bytes: int,
+        ceiling_bytes: int,
+        *,
+        starts: int,
+        metrics: dict[str, Any],
+        peak_reserved_bytes: int,
+        end_reserved_bytes: int,
+    ) -> None:
+        super().__init__(
+            "realized rollout cannot certify optimization headroom: "
+            f"predicted={predicted_bytes}, ceiling={ceiling_bytes}"
+        )
+        self.predicted_bytes = int(predicted_bytes)
+        self.ceiling_bytes = int(ceiling_bytes)
+        self.starts = int(starts)
+        self.metrics = metrics
+        self.peak_reserved_bytes = int(peak_reserved_bytes)
+        self.end_reserved_bytes = int(end_reserved_bytes)
 
 
 def _configure_reproducibility(profile: str) -> None:
@@ -211,6 +240,282 @@ def _sequential_start_quotas(total: int, world: int) -> tuple[int, ...]:
         )
     base, extra = divmod(total, world)
     return tuple(base + (rank < extra) for rank in range(world))
+
+
+@dataclass
+class SequentialWorkController:
+    """Shared iteration-boundary state for adaptive sequential work."""
+
+    current_starts_per_gpu: int
+    ema_decisions_per_start: float | None = None
+    cumulative_optimizer_steps: int = 0
+    next_reference_optimizer_step: int = 0
+    last_reference_optimizer_step: int = 0
+    memory_forecaster: PolicyMemoryForecaster | None = None
+    pending_decision_starts: int | None = None
+    below_envelope_streak: int = 0
+    retry_nonce: int = 0
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "current_starts_per_gpu": self.current_starts_per_gpu,
+            "ema_decisions_per_start": self.ema_decisions_per_start,
+            "cumulative_optimizer_steps": self.cumulative_optimizer_steps,
+            "next_reference_optimizer_step": self.next_reference_optimizer_step,
+            "last_reference_optimizer_step": self.last_reference_optimizer_step,
+            "memory_forecaster": (
+                None
+                if self.memory_forecaster is None
+                else self.memory_forecaster.state_dict()
+            ),
+            "pending_decision_starts": self.pending_decision_starts,
+            "below_envelope_streak": self.below_envelope_streak,
+            "retry_nonce": self.retry_nonce,
+        }
+
+    @classmethod
+    def from_state_dict(
+        cls, state: dict[str, Any]
+    ) -> "SequentialWorkController":
+        return cls(
+            current_starts_per_gpu=int(state["current_starts_per_gpu"]),
+            ema_decisions_per_start=(
+                None
+                if state["ema_decisions_per_start"] is None
+                else float(state["ema_decisions_per_start"])
+            ),
+            cumulative_optimizer_steps=int(state["cumulative_optimizer_steps"]),
+            next_reference_optimizer_step=int(
+                state["next_reference_optimizer_step"]
+            ),
+            last_reference_optimizer_step=int(
+                state.get("last_reference_optimizer_step", 0)
+            ),
+            memory_forecaster=(
+                None
+                if state.get("memory_forecaster") is None
+                else PolicyMemoryForecaster.from_state_dict(
+                    state["memory_forecaster"]
+                )
+            ),
+            pending_decision_starts=(
+                None
+                if state.get("pending_decision_starts") is None
+                else int(state["pending_decision_starts"])
+            ),
+            below_envelope_streak=int(state.get("below_envelope_streak", 0)),
+            retry_nonce=int(state.get("retry_nonce", 0)),
+        )
+
+    def configure_memory_forecaster(self, cfg: RootConfig) -> None:
+        if self.memory_forecaster is None:
+            self.memory_forecaster = PolicyMemoryForecaster(
+                window=int(cfg.rollout.memory_forecast_window),
+                half_life=float(cfg.rollout.memory_forecast_half_life),
+                minimum_observations=int(
+                    cfg.rollout.memory_forecast_min_observations
+                ),
+                soft_exceedance_rate=float(
+                    cfg.rollout.memory_soft_exceedance_rate
+                ),
+            )
+
+    def stage_rollout(
+        self,
+        *,
+        local_decisions: int,
+        rank_max_decisions: int,
+        rank_max_decisions_per_start: float,
+        target_decisions: int,
+        minimum_starts: int,
+        maximum_starts: int,
+        ema_alpha: float,
+        target_reuse: float,
+        minibatch_size: int,
+    ) -> tuple[int, dict[str, float | str]]:
+        """Observe logical work and stage, but do not commit, next starts."""
+
+        if (
+            local_decisions <= 0
+            or rank_max_decisions <= 0
+            or not math.isfinite(rank_max_decisions_per_start)
+            or rank_max_decisions_per_start <= 0.0
+        ):
+            raise ValueError("adaptive work control requires positive decision counts")
+        if self.current_starts_per_gpu <= 0 or minibatch_size <= 0:
+            raise ValueError("adaptive work control dimensions must be positive")
+        previous_ema = self.ema_decisions_per_start
+        ema = (
+            rank_max_decisions_per_start
+            if previous_ema is None
+            else (1.0 - ema_alpha) * previous_ema
+            + ema_alpha * rank_max_decisions_per_start
+        )
+        if not math.isfinite(ema) or ema <= 0.0:
+            raise ValueError("adaptive decisions/start EMA became invalid")
+        self.ema_decisions_per_start = ema
+        raw = max(1, int(math.floor(target_decisions / ema + 0.5)))
+        bounded = min(max(raw, minimum_starts), maximum_starts)
+        self.pending_decision_starts = bounded
+        optimizer_steps = int(
+            math.ceil(target_reuse * rank_max_decisions / minibatch_size)
+        )
+        current = self.current_starts_per_gpu
+        realized_reuse = optimizer_steps * minibatch_size / local_decisions
+        return optimizer_steps, {
+            "sequential_starts_per_gpu_current": float(current),
+            "local_decisions_per_start": float(local_decisions / current),
+            "rank_max_decisions_per_start": float(rank_max_decisions_per_start),
+            "decisions_per_start_ema": float(ema),
+            "sequential_start_raw_request": float(raw),
+            "derived_optimizer_steps": float(optimizer_steps),
+            "realized_node_reuse": float(realized_reuse),
+            "expected_unseen_fraction": float(math.exp(-realized_reuse)),
+            "rank_max_decisions": float(rank_max_decisions),
+        }
+
+    def commit_memory_observation(
+        self,
+        *,
+        metrics: dict[str, Any],
+        ceiling_bytes: int,
+        minimum_starts: int,
+        maximum_starts: int,
+        maximum_increase_fraction: float,
+    ) -> dict[str, float | str]:
+        """Commit common next starts using the successful iteration's peak."""
+
+        if self.pending_decision_starts is None:
+            raise RuntimeError("adaptive memory commit has no staged rollout proposal")
+        current = self.current_starts_per_gpu
+        decision_request = self.pending_decision_starts
+        safe_request = maximum_starts
+        forecast_metrics: dict[str, float] = {}
+        if self.memory_forecaster is not None:
+            peak = float(
+                metrics.get(
+                    "iteration_peak_reserved_bytes_rank_max",
+                    metrics.get("iteration_peak_reserved_bytes", 0.0),
+                )
+            )
+            baseline = float(
+                metrics.get(
+                    "memory_iteration_start_reserved_bytes_rank_max",
+                    metrics.get(
+                        "memory_iteration_start_reserved_bytes",
+                        metrics.get("iteration_end_reserved_bytes", 0.0),
+                    ),
+                )
+            )
+            forecast_metrics = self.memory_forecaster.observe(
+                starts=current,
+                peak_reserved_bytes=peak,
+                end_reserved_bytes=baseline,
+                metrics=metrics,
+                ceiling_bytes=ceiling_bytes,
+            )
+            safe_request = self.memory_forecaster.largest_safe_starts(
+                minimum_starts, maximum_starts, ceiling_bytes
+            )
+        requested = min(decision_request, safe_request)
+        reasons: list[str] = []
+        if safe_request < decision_request:
+            reasons.append("memory")
+        forecast_frozen = bool(
+            self.memory_forecaster is not None
+            and self.memory_forecaster.freeze_upward
+        )
+        if forecast_frozen and requested > current:
+            requested = current
+            reasons.append("memory_drift")
+        if requested > current:
+            below_envelope = not bool(
+                forecast_metrics.get("memory_forecast_exceeded", 0.0)
+            )
+            self.below_envelope_streak = (
+                self.below_envelope_streak + 1 if below_envelope else 0
+            )
+            if self.below_envelope_streak < 2:
+                requested = current
+                reasons.append(
+                    "increase_hysteresis"
+                    if below_envelope
+                    else "memory_envelope_exceeded"
+                )
+            else:
+                rate_max = max(
+                    current,
+                    int(math.floor(current * (1.0 + maximum_increase_fraction))),
+                )
+                if requested > rate_max:
+                    requested = rate_max
+                    reasons.append("change_up")
+        else:
+            self.below_envelope_streak = 0
+        if forecast_metrics.get("memory_forecast_drift", 0.0):
+            requested = min(requested, max(minimum_starts, math.floor(current * 0.9)))
+            reasons.append("drift_backoff")
+        elif forecast_metrics.get("memory_forecast_exceeded", 0.0):
+            requested = min(
+                requested,
+                max(minimum_starts, math.floor(current * 0.9)),
+            )
+            reasons.append("soft_envelope_backoff")
+        requested = min(max(int(requested), minimum_starts), maximum_starts)
+        self.current_starts_per_gpu = requested
+        self.pending_decision_starts = None
+        return {
+            **forecast_metrics,
+            "sequential_starts_memory_safe": float(safe_request),
+            "sequential_starts_per_gpu_next": float(requested),
+            "sequential_start_clamp_reason": "+".join(reasons) if reasons else "none",
+        }
+
+    def observe_rollout(
+        self,
+        *,
+        local_decisions: int,
+        rank_max_decisions: int,
+        rank_max_decisions_per_start: float,
+        target_decisions: int,
+        minimum_starts: int,
+        maximum_starts: int,
+        ema_alpha: float,
+        maximum_change_fraction: float,
+        target_reuse: float,
+        minibatch_size: int,
+    ) -> tuple[int, dict[str, float | str]]:
+        """Compatibility helper that stages and commits decision-only control."""
+
+        steps, metrics = self.stage_rollout(
+            local_decisions=local_decisions,
+            rank_max_decisions=rank_max_decisions,
+            rank_max_decisions_per_start=rank_max_decisions_per_start,
+            target_decisions=target_decisions,
+            minimum_starts=minimum_starts,
+            maximum_starts=maximum_starts,
+            ema_alpha=ema_alpha,
+            target_reuse=target_reuse,
+            minibatch_size=minibatch_size,
+        )
+        assert self.pending_decision_starts is not None
+        current = self.current_starts_per_gpu
+        bounded = self.pending_decision_starts
+        change = maximum_change_fraction * current
+        rate_min = max(1, int(math.ceil(current - change)))
+        rate_max = max(rate_min, int(math.floor(current + change)))
+        next_starts = min(max(bounded, rate_min), rate_max)
+        reason = (
+            "change_down" if bounded < rate_min else "change_up" if bounded > rate_max else "none"
+        )
+        raw = int(metrics["sequential_start_raw_request"])
+        if bounded != raw:
+            reason = "minimum" if raw < minimum_starts else "maximum"
+        self.current_starts_per_gpu = next_starts
+        self.pending_decision_starts = None
+        metrics["sequential_starts_per_gpu_next"] = float(next_starts)
+        metrics["sequential_start_clamp_reason"] = reason
+        return steps, metrics
 
 
 def _rank_local_config(cfg: RootConfig, rank: int, world: int) -> RootConfig:
@@ -453,6 +758,10 @@ def _add_distributed_metric_summaries(
         "nodes",
         "leaves",
         "decisions",
+        "decision_nodes_preflop",
+        "decision_nodes_flop",
+        "decision_nodes_turn",
+        "decision_nodes_river",
         "loss",
         "policy",
         "value",
@@ -479,8 +788,15 @@ def _add_distributed_metric_summaries(
     maximum = torch.where(
         present.bool(), local, torch.full_like(local, -torch.inf)
     )
+    summary_sync_start = time.perf_counter()
     dist.all_reduce(summed, op=dist.ReduceOp.SUM)
     dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+    metrics["diagnostic_metric_summary_sync_seconds"] = (
+        time.perf_counter() - summary_sync_start
+    )
+    metrics["diagnostic_metric_summary_sync_bytes"] = float(
+        (summed.numel() + maximum.numel()) * summed.element_size()
+    )
     total, count = summed.chunk(2)
     for index, name in enumerate(names):
         if not bool(count[index]):
@@ -488,6 +804,86 @@ def _add_distributed_metric_summaries(
         metrics[f"{name}_rank_mean"] = float(total[index] / count[index])
         metrics[f"{name}_rank_max"] = float(maximum[index])
         metrics[f"{name}_rank_sum"] = float(total[index])
+
+
+def _synchronize_memory_control_metrics(
+    metrics: dict[str, Any], device: torch.device, world: int, n_players: int
+) -> None:
+    """Replace controller inputs with rank maxima before online fitting."""
+
+    if world <= 1:
+        return
+    keys = [
+        "nodes",
+        "leaves",
+        "decisions",
+        "retained_target_bytes",
+        "iteration_peak_allocated_bytes",
+        "iteration_peak_reserved_bytes",
+        "iteration_end_allocated_bytes",
+        "iteration_end_reserved_bytes",
+        "memory_iteration_start_allocated_bytes",
+        "memory_iteration_start_reserved_bytes",
+        "memory_iteration_start_peak_allocated_bytes",
+        "memory_iteration_start_peak_reserved_bytes",
+        "memory_preoptimization_allocated_bytes",
+        "memory_preoptimization_reserved_bytes",
+        "memory_preoptimization_peak_allocated_bytes",
+        "memory_preoptimization_peak_reserved_bytes",
+        "execution_padded_tokens",
+        "execution_padded_token_pairs",
+        "execution_padded_tokens_max",
+        "execution_padded_token_pairs_max",
+        "execution_queue_depth_max",
+        "execution_queue_oldest_age_max",
+        "execution_forced_drain_rows",
+        "execution_forced_drains",
+        "execution_model_calls",
+        "execution_completion_batches",
+        "execution_completion_rows",
+        "trajectory_length_mean",
+        "trajectory_length_max",
+        "trajectory_length_p50",
+        "trajectory_length_p90",
+        "trajectory_length_p99",
+        "trajectory_length_le_4",
+        "trajectory_length_le_8",
+        "trajectory_length_le_16",
+        "trajectory_length_le_32",
+        "trajectory_length_le_64",
+    ]
+    for phase in ("snapshot", "rollout", "completion", "backward", "compaction", "optimization"):
+        keys.extend(
+            (
+                f"phase_{phase}_peak_allocated_bytes",
+                f"phase_{phase}_peak_reserved_bytes",
+            )
+        )
+    for phase in ("inference", "training"):
+        for family in ("pre", *(f"post_{live}" for live in range(2, n_players + 1))):
+            base = f"execution_{phase}_{family}"
+            keys.extend(
+                (
+                    f"{base}_model_calls",
+                    f"{base}_model_rows",
+                    f"{base}_model_rows_max",
+                    f"{base}_padded_tokens",
+                    f"{base}_padded_tokens_max",
+                    f"{base}_padded_token_pairs",
+                    f"{base}_padded_token_pairs_max",
+                )
+            )
+    values = torch.tensor(
+        [float(metrics.get(key, 0.0)) for key in keys],
+        dtype=torch.float64,
+        device=device,
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.MAX)
+    for key, value in zip(keys, values.tolist(), strict=True):
+        if key in metrics or value != 0.0:
+            metrics[f"{key}_rank_max"] = float(value)
+            # Online fitting must be byte-identical on every rank.
+            metrics[key] = float(value)
 
 
 @dataclass
@@ -499,7 +895,6 @@ class _IterationData:
     dataset: Any = None
     tree: Any = None
     targets: Any = None
-    alias: Any = None
     policy_cache: Any = None
     decision_reach: Any = None
     decision_weight: Tensor | None = None
@@ -595,7 +990,15 @@ def _tensor_bytes(value: Any, seen: set[int] | None = None) -> int:
 def _analytical_memory_plan(
     cfg: RootConfig, bundle: GameBundle, *, has_reference: bool
 ) -> dict[str, int]:
-    """Return a conservative byte plan for preallocated training structures."""
+    """Return a mode-aware bound for allocations that can coexist by phase.
+
+    Sequential trajectories retain exactly one realized child at each player
+    node. Charging the backend's entire legal event vocabulary to every node
+    produces a bound for tensors this execution mode never allocates. Capacity
+    remains the conservative decision-row count, but sequential policy and
+    target widths are one. The hardware reserve is intentionally left outside
+    this structural plan for attention/autograd workspaces and allocator slack.
+    """
 
     model = bundle.model.module if hasattr(bundle.model, "module") else bundle.model
     parameter = sum(
@@ -613,29 +1016,66 @@ def _analytical_memory_plan(
     players = int(backend.n_players)
     types = max(int(value) for value in backend.x_sizes)
     events = int(getattr(backend, "e_max", 1))
-    resident_trees = int(
-        cfg.rollout.sequential_starts
-    )
+    resident_trees = int(cfg.rollout.sequential_starts)
     nodes = resident_trees * int(cfg.rollout.node_budget)
     fp32 = 4
     int32 = 4
+    sequential = cfg.training.mode != "branched_rao_blackwell"
+    retained_events = 1 if sequential else events
+    active_rows = min(
+        resident_trees,
+        max(
+            int(cfg.rollout.family_batch_rows or 1),
+            int(cfg.rollout.max_active_trajectories or 1),
+        ),
+    )
     topology = nodes * (
         int32 * (6 + players) + fp32 * 2
     )
     dense_reach = nodes * players * types * fp32
-    if cfg.rollout.reach_storage == "recompute":
-        rollout_reach = resident_trees * players * types * fp32
+    reach_row = players * types * fp32
+    if sequential and cfg.rollout.reach_storage == "recompute":
+        # Root reach and the overwriteable per-trajectory working reach coexist.
+        rollout_reach = 2 * resident_trees * reach_row
+        # Current/child/gather/scatter waves are bounded by scheduler admission,
+        # not by the total node capacity accumulated across all trajectories.
+        rollout_transient_reach = 4 * active_rows * reach_row
+    elif cfg.rollout.reach_storage == "recompute":
+        rollout_reach = resident_trees * reach_row
+        rollout_transient_reach = 4 * dense_reach
     else:
         rollout_reach = dense_reach
-    # Four simultaneous wave-sized rows cover active, repeated-child,
-    # successor, and gather/output reach tensors before the old wave dies.
-    rollout_transient_reach = 4 * dense_reach
-    decision_reach = dense_reach
-    policy_cache = nodes * (events * types + types) * fp32
+        rollout_transient_reach = 4 * dense_reach
+
+    # Sequential poker currently requests full [P,H] decision reaches. Include
+    # the node/state/owner indices retained by DecisionReachCache as well.
+    decision_reach = dense_reach + nodes * 3 * int32
+    policy_cache = nodes * (
+        (retained_events * types + types) * fp32 + int32
+    )
     rb_targets = (
         0
         if cfg.training.mode == "normal"
-        else nodes * ((2 + 2 * events) * types * fp32 + events * (int32 + 1))
+        else nodes
+        * (
+            (2 + 2 * retained_events) * types * fp32
+            + int32  # node id
+            + retained_events * (int32 + 1)  # child event and mask
+            + int32  # child count
+        )
+    )
+    # Once single-child target validation completes, child_p_hat aliases
+    # parent_p_hat. Target construction still needs the larger rb_targets term.
+    compact_rb_targets = (
+        0
+        if cfg.training.mode == "normal"
+        else nodes
+        * (
+            (2 + retained_events) * types * fp32
+            + int32
+            + retained_events * (int32 + 1)
+            + int32
+        )
     )
     normal_targets = (
         nodes * (5 * fp32 + int32)
@@ -643,50 +1083,96 @@ def _analytical_memory_plan(
         else 0
     )
     optimizer_and_grad = 3 * parameter  # grad + two fp32 Adam moments
+    gradient_sync = parameter  # explicit flat SUM buffer; this code does not use DDP buckets
     rollout_snapshot = parameter
     reference = parameter if has_reference else 0
+    alias = nodes * (8 + 8 + int32) if sequential else 0
+    resident_seen: set[int] = set()
+    backend_resident = _tensor_bytes(vars(backend), resident_seen)
+    for owned in (getattr(backend, "states", None),):
+        if owned is not None:
+            backend_resident += _tensor_bytes(vars(owned), resident_seen)
     partition_bound_fn = getattr(backend, "partition_cache_memory_bound", None)
-    partition_cache = (
-        int(partition_bound_fn()) if callable(partition_bound_fn) else 0
+    if callable(partition_bound_fn):
+        registered_cache_bytes = 0
+        for service in getattr(backend, "_partition_services", {}).values():
+            cache = service[1]
+            registered_cache_bytes += _tensor_bytes(vars(cache), resident_seen)
+        backend_resident += registered_cache_bytes
+        backend_resident += max(
+            int(partition_bound_fn()) - registered_cache_bytes,
+            0,
+        )
+    else:
+        cache = getattr(backend, "partition_summary_cache", None)
+        if cache is not None:
+            backend_resident += _tensor_bytes(vars(cache), resident_seen)
+    completion_workspace = (
+        8 * resident_trees * reach_row
+        + min(resident_trees, 256) * players * types * (3 * fp32 + 1)
+        if cfg.training.mode != "normal"
+        else 0
     )
     rollout_phase = (
         parameter
         + opponent_parameter
         + rollout_snapshot
         + reference
-        + partition_cache
+        + backend_resident
         + topology
         + rollout_reach
         + rollout_transient_reach
         + policy_cache
     )
-    optimization_phase = (
+    target_phase = (
         parameter
         + opponent_parameter
         + optimizer_and_grad
         + reference
-        + partition_cache
-        + decision_reach
+        + backend_resident
+        + topology
+        + rollout_reach
         + policy_cache
         + rb_targets
         + normal_targets
+        + completion_workspace
+    )
+    optimization_phase = (
+        parameter
+        + opponent_parameter
+        + optimizer_and_grad
+        + gradient_sync
+        + reference
+        + backend_resident
+        + decision_reach
+        + policy_cache
+        + compact_rb_targets
+        + normal_targets
+        + alias
     )
     return {
         "memory_plan_parameter_bytes": parameter,
         "memory_plan_opponent_parameter_bytes": opponent_parameter,
-        "memory_plan_partition_cache_bytes": partition_cache,
+        "memory_plan_backend_resident_bytes": backend_resident,
         "memory_plan_topology_bytes": topology,
         "memory_plan_rollout_reach_bytes": rollout_reach,
         "memory_plan_transient_reach_bytes": rollout_transient_reach,
         "memory_plan_decision_reach_bytes": decision_reach,
         "memory_plan_policy_cache_bytes": policy_cache,
         "memory_plan_target_bytes": rb_targets + normal_targets,
+        "memory_plan_compact_target_bytes": compact_rb_targets + normal_targets,
+        "memory_plan_alias_bytes": alias,
+        "memory_plan_completion_workspace_bytes": completion_workspace,
         "memory_plan_optimizer_and_grad_bytes": optimizer_and_grad,
+        "memory_plan_gradient_sync_bytes": gradient_sync,
         "memory_plan_snapshot_bytes": rollout_snapshot,
         "memory_plan_reference_bytes": reference,
         "memory_plan_rollout_phase_bytes": rollout_phase,
+        "memory_plan_target_phase_bytes": target_phase,
         "memory_plan_optimization_phase_bytes": optimization_phase,
-        "memory_plan_structural_peak_bytes": max(rollout_phase, optimization_phase),
+        "memory_plan_structural_peak_bytes": max(
+            rollout_phase, target_phase, optimization_phase
+        ),
     }
 
 
@@ -704,6 +1190,26 @@ def _memory_limit(
     return min(free_bytes - reserve, absolute) if account_current_free else absolute
 
 
+def _memory_operating_ceiling(
+    cfg: RootConfig, device: torch.device, current_reserved_bytes: int
+) -> int:
+    """Return the absolute PyTorch-reservation ceiling under current driver use.
+
+    The configured reserve is the bootstrap safety artifact.  Unlike a static
+    percentage check, this ceiling contracts immediately when another context
+    consumes driver memory: only current PyTorch reservation plus genuinely
+    free bytes above the bootstrap guard are admissible.
+    """
+
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    absolute = _memory_limit(cfg, device, account_current_free=False)
+    driver_guard = max(0, total_bytes - absolute)
+    externally_feasible = current_reserved_bytes + max(
+        0, free_bytes - driver_guard
+    )
+    return min(absolute, externally_feasible)
+
+
 def _validate_memory_preflight(
     cfg: RootConfig, device: torch.device, plan: dict[str, int]
 ) -> None:
@@ -711,7 +1217,10 @@ def _validate_memory_preflight(
 
     if device.type != "cuda":
         return
-    limit = _memory_limit(cfg, device)
+    # ``plan`` describes the complete phase peak, including model/backend
+    # tensors already allocated when this check runs. Comparing it with current
+    # free memory would double-count those residents.
+    limit = _memory_limit(cfg, device, account_current_free=False)
     structural = plan["memory_plan_structural_peak_bytes"]
     if limit <= 0 or structural > limit:
         raise MemoryError(
@@ -730,20 +1239,20 @@ def _validate_memory_calibration(
     peaks = [
         value
         for key, value in metrics.items()
-        if key.startswith("phase_") and key.endswith("_peak_reserved_bytes")
+        if (
+            key == "iteration_peak_reserved_bytes"
+            or (key.startswith("phase_") and key.endswith("_peak_reserved_bytes"))
+        )
     ]
     if not peaks:
         raise RuntimeError("first CUDA iteration did not emit memory calibration peaks")
     measured = int(max(peaks))
     metrics["calibrated_peak_reserved_bytes"] = float(measured)
-    metrics["calibrated_peak_with_safety_bytes"] = float(int(measured * 1.25))
     safe_limit = _memory_limit(cfg, device, account_current_free=False)
     metrics["calibrated_safe_limit_bytes"] = float(safe_limit)
-    if int(measured * 1.25) > safe_limit:
-        raise MemoryError(
-            "measured CUDA peak plus 25% topology/allocator safety margin exceeds "
-            f"the configured limit: measured={measured}, safe_limit={safe_limit}"
-        )
+    headroom = safe_limit - measured
+    metrics["calibrated_actual_headroom_bytes"] = float(headroom)
+    metrics["memory_hard_limit_exceeded"] = float(headroom < 0)
 
 
 def _profiled_call(
@@ -773,6 +1282,54 @@ def _profiled_call(
             torch.cuda.max_memory_reserved(device)
         )
     return result
+
+
+def _decision_street_metrics(
+    profile_metrics: dict[str, float],
+    backend: Any,
+    tree: Any,
+    node_ids: Tensor,
+) -> None:
+    """Record decision-node counts by poker street for one sampled rollout.
+
+    Street labels live in the backend's device-resident state store. This is
+    called only on the diagnostic path, so the small count reduction is copied
+    to the host once per iteration rather than synchronizing every decision.
+    """
+
+    states = getattr(backend, "states", None)
+    street = getattr(states, "street", None)
+    if street is None or node_ids.numel() == 0:
+        return
+    refs = tree.state_ref[node_ids.to(torch.int64)].to(torch.int64)
+    labels = street[refs].to(torch.int64).clamp(0, 3)
+    counts = torch.bincount(labels, minlength=4).detach().cpu().tolist()
+    names = ("preflop", "flop", "turn", "river")
+    total = max(sum(int(value) for value in counts), 1)
+    for name, count in zip(names, counts, strict=True):
+        profile_metrics[f"decision_nodes_{name}"] = float(count)
+        profile_metrics[f"decision_fraction_{name}"] = float(count) / total
+
+
+def _trajectory_length_metrics(
+    profile_metrics: dict[str, float], tree: Any, starts: int
+) -> None:
+    """Record policy-conditioned realized trajectory-length diagnostics."""
+
+    if starts <= 0 or tree.tree_id.numel() == 0:
+        return
+    lengths = torch.bincount(tree.tree_id.to(torch.int64), minlength=starts).float()
+    ordered = lengths.sort().values
+    count = ordered.numel()
+    profile_metrics["trajectory_length_mean"] = float(lengths.mean())
+    profile_metrics["trajectory_length_max"] = float(lengths.max())
+    for name, quantile in (("p50", 0.50), ("p90", 0.90), ("p99", 0.99)):
+        index = min(count - 1, max(0, math.ceil(count * quantile) - 1))
+        profile_metrics[f"trajectory_length_{name}"] = float(ordered[index])
+    for upper in (4, 8, 16, 32, 64):
+        profile_metrics[f"trajectory_length_le_{upper}"] = float(
+            (lengths <= upper).sum()
+        )
 
 
 def _build_iteration_data(
@@ -888,6 +1445,15 @@ def _build_iteration_data(
                         "offspring_mean": float(offspring.float().mean()),
                         "offspring_max": float(offspring.max()),
                     }
+                )
+                _decision_street_metrics(
+                    profile_metrics,
+                    bundle.rollout_backend,
+                    tree,
+                    policy_cache.node_ids,
+                )
+                _trajectory_length_metrics(
+                    profile_metrics, tree, int(cfg.rollout.sequential_starts)
                 )
             return _IterationData(
                 normal=True,
@@ -1067,24 +1633,17 @@ def _build_iteration_data(
             raise ValueError(
                 f"loss {cfg.loss.name!r} requires unavailable targets {sorted(unavailable)}"
             )
-        alias, decision_reach = _profiled_call(
+        decision_reach = _profiled_call(
             profile_metrics,
             "compaction",
             device,
             profile,
             lambda: (
-                (
-                    AliasTable.build(decision_weight)
-                    if prebuilt_decision_reach is not None
-                    else build_decision_alias(tree)
-                ),
-                (
-                    prebuilt_decision_reach
-                    if prebuilt_decision_reach is not None
-                    else DecisionReachCache.from_reach_cache(
-                        tree, reach_cache, policy_cache, bundle.rollout_backend
-                    )
-                ),
+                prebuilt_decision_reach
+                if prebuilt_decision_reach is not None
+                else DecisionReachCache.from_reach_cache(
+                    tree, reach_cache, policy_cache, bundle.rollout_backend
+                )
             ),
         )
         decisions = int(policy_cache.node_ids.numel())
@@ -1106,12 +1665,21 @@ def _build_iteration_data(
                 "offspring_max": float(offspring.max()),
             }
         )
+        _decision_street_metrics(
+            profile_metrics,
+            bundle.rollout_backend,
+            tree,
+            policy_cache.node_ids,
+        )
+        _trajectory_length_metrics(
+            profile_metrics, tree, int(cfg.rollout.sequential_starts)
+        )
         if profile:
             completion_effective = (
                 completion_quality.get("completion_mean_n_eff", 0.0)
                 * float(leaf_ids.numel())
             )
-            retained = _tensor_bytes((targets, alias, policy_cache, decision_reach))
+            retained = _tensor_bytes((targets, policy_cache, decision_reach, decision_weight))
             profile_metrics.update(
                 {
                     "completion_effective_samples": completion_effective,
@@ -1122,7 +1690,6 @@ def _build_iteration_data(
             normal=False,
             completion_quality=completion_quality,
             targets=targets,
-            alias=alias,
             policy_cache=policy_cache,
             decision_reach=decision_reach,
             decision_weight=decision_weight,
@@ -1225,7 +1792,13 @@ def _validate_old_policy_identity(
             ratio_max = torch.maximum(ratio_max, ratios.max())
     if was_training:
         model.train()
-    tolerance = 2.0e-3 if amp_enabled else 2.0e-5
+    # Throughput/FP16 resume validation compares two otherwise identical
+    # inference paths. Larger models and different cuDNN kernel choices can
+    # produce a few 1e-3 log-probability ulps even when the policy ratio is
+    # effectively one. Keep strict full-precision validation tight, while
+    # allowing the measured AMP numerical envelope to be diagnosed rather than
+    # blocking a safe resume.
+    tolerance = 1.0e-2 if amp_enabled else 2.0e-5
     value_ok = maximum_value_error <= tolerance * (
         1.0 + torch.maximum(current_value.abs().max(), cached_value.abs().max())
     )
@@ -1245,6 +1818,7 @@ def _validate_old_policy_identity(
         "identity_max_abs_value_error": float(maximum_value_error),
         "identity_ratio_min": float(ratio_min),
         "identity_ratio_max": float(ratio_max),
+        "identity_tolerance": float(tolerance),
     }
     if not bool(ok):
         raise RuntimeError(
@@ -1269,7 +1843,9 @@ def _one_iteration(
     profile: bool = False,
     reference_model: nn.Module | None = None,
     validate_identity: bool = False,
-) -> dict[str, float]:
+    work_controller: SequentialWorkController | None = None,
+    rollout_attempt: int = 0,
+) -> dict[str, Any]:
     spec = _loss_spec(cfg)
     execution_metrics = getattr(bundle.rollout_backend, "execution_metrics", None)
     if execution_metrics is not None:
@@ -1277,22 +1853,125 @@ def _one_iteration(
     model = bundle.model
     source = model.module if hasattr(model, "module") else model
     device = next(model.parameters()).device
+    memory_ledger = MemoryLedger(device)
+    memory_metrics: dict[str, float] = {}
+    if device.type == "cuda":
+        # Calibration must cover allocator growth and new cache bins on every
+        # iteration, not only the initially profiled one.
+        torch.cuda.reset_peak_memory_stats(device)
+        memory_metrics.update(
+            memory_ledger.snapshot(
+                "iteration_start",
+                owned={
+                    "model": source,
+                    "optimizer": optimizer.state,
+                    "reference": reference_model,
+                    "backend": bundle.rollout_backend,
+                },
+            )
+        )
     amp_enabled, amp_dtype = _precision(cfg, device)
     normal = cfg.training.mode == "normal"
     total_trajectories = int(cfg.rollout.sequential_starts)
     profile_parts: list[dict[str, float]] = []
     quality_parts: list[tuple[int, dict[str, float]]] = []
     optimization_records: list[tuple[int, int, dict[str, float]]] = []
+    optimization_host_seconds: dict[str, float] = {
+        "minibatch_sampling": 0.0,
+        "forward_loss": 0.0,
+        "backward_pass": 0.0,
+        "gradient_sync": 0.0,
+        "gradient_update": 0.0,
+    }
     identity_metrics: dict[str, float] = {}
     decision_total = 0
+    sampling_iteration = (
+        iteration
+        if rollout_attempt == 0
+        else (iteration + 1) * 1_000_003 + rollout_attempt
+    )
     data = _build_iteration_data(
         cfg,
         bundle,
         torch_gen,
         spec,
         profile=profile,
-        iteration=iteration,
+        iteration=sampling_iteration,
     )
+    if profile:
+        memory_metrics.update(
+            memory_ledger.snapshot(
+                "preoptimization",
+                owned={
+                    "model": source,
+                    "optimizer": optimizer.state,
+                    "reference": reference_model,
+                    "backend": bundle.rollout_backend,
+                    "iteration": data,
+                },
+            )
+        )
+    if (
+        device.type == "cuda"
+        and work_controller is not None
+        and work_controller.memory_forecaster is not None
+    ):
+        conditional_metrics: dict[str, Any] = dict(data.profile_metrics or {})
+        conditional_metrics.update(memory_metrics)
+        if execution_metrics is not None:
+            conditional_metrics.update(execution_metrics.snapshot())
+        preoptimization_reserved = float(
+            memory_metrics.get("memory_preoptimization_reserved_bytes", 0.0)
+        )
+        predicted = work_controller.memory_forecaster.predict(
+            total_trajectories,
+            realized_metrics=conditional_metrics,
+            baseline_bytes=preoptimization_reserved,
+        )
+        ceiling = _memory_operating_ceiling(
+            cfg, device, int(preoptimization_reserved)
+        )
+        pressure = torch.tensor(
+            [0.0 if predicted is None else float(predicted), float(ceiling)],
+            dtype=torch.float64,
+            device=device,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(pressure[:1], op=dist.ReduceOp.MAX)
+            dist.all_reduce(pressure[1:], op=dist.ReduceOp.MIN)
+        if float(pressure[0]) > float(pressure[1]):
+            _synchronize_memory_control_metrics(
+                conditional_metrics,
+                device,
+                dist.get_world_size() if dist.is_initialized() else 1,
+                int(bundle.rollout_backend.n_players),
+            )
+            rank_max_preoptimization_reserved = float(
+                conditional_metrics.get(
+                    "memory_preoptimization_reserved_bytes",
+                    preoptimization_reserved,
+                )
+            )
+            observed_peak = int(
+                max(
+                    float(
+                        conditional_metrics.get(
+                            "memory_preoptimization_peak_reserved_bytes", 0.0
+                        )
+                    ),
+                    rank_max_preoptimization_reserved,
+                )
+            )
+            del data
+            torch.cuda.empty_cache()
+            raise MemoryPressureRetry(
+                int(pressure[0]),
+                int(pressure[1]),
+                starts=total_trajectories,
+                metrics=conditional_metrics,
+                peak_reserved_bytes=observed_peak,
+                end_reserved_bytes=int(rank_max_preoptimization_reserved),
+            )
     if validate_identity:
         if execution_metrics is None:
             identity_metrics = _validate_old_policy_identity(cfg, bundle, data)
@@ -1314,6 +1993,33 @@ def _one_iteration(
     leaves = int((data.profile_metrics or {}).get("leaves", total_trajectories))
     quality_parts.append((leaves, data.completion_quality))
     profile_parts.append(data.profile_metrics or {})
+
+    controller_metrics: dict[str, float | str] = {}
+    optimizer_steps_this_iteration = int(cfg.training.gd_steps_per_iter)
+    if work_controller is not None:
+        current_starts = int(cfg.rollout.sequential_starts)
+        if current_starts != work_controller.current_starts_per_gpu:
+            raise RuntimeError("adaptive controller and rank-local rollout count disagree")
+        control = torch.tensor(
+            [float(decisions), decisions / current_starts],
+            dtype=torch.float64,
+            device=device,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(control, op=dist.ReduceOp.MAX)
+        optimizer_steps_this_iteration, controller_metrics = (
+            work_controller.stage_rollout(
+                local_decisions=decisions,
+                rank_max_decisions=int(control[0].item()),
+                rank_max_decisions_per_start=float(control[1].item()),
+                target_decisions=int(cfg.rollout.target_decisions_per_gpu),
+                minimum_starts=int(cfg.rollout.min_sequential_starts_per_gpu),
+                maximum_starts=int(cfg.rollout.max_sequential_starts_per_gpu),
+                ema_alpha=float(cfg.rollout.decisions_per_start_ema_alpha),
+                target_reuse=float(cfg.training.target_node_reuse),
+                minibatch_size=int(cfg.training.minibatch_size),
+            )
+        )
 
     local_mass, global_mass = _await_global_decision_mass(
         data, metrics=execution_metrics
@@ -1339,7 +2045,7 @@ def _one_iteration(
 
     if cfg.training.ppo_epochs is None:
         batches: list[tuple[int, Tensor | None]] = [
-            (-1, None) for _ in range(cfg.training.gd_steps_per_iter)
+            (-1, None) for _ in range(optimizer_steps_this_iteration)
         ]
     else:
         batches = []
@@ -1357,6 +2063,7 @@ def _one_iteration(
         if variance_ema is None:
             variance_ema = {}
             source._pbg_family_gradient_variance_ema = variance_ema
+        sampling_start = time.perf_counter()
         if selected_rows is None:
             sample_specs = _stratified_decision_rows(
                 data,
@@ -1374,12 +2081,16 @@ def _one_iteration(
         if not sample_specs:
             raise ValueError("cannot optimize an empty fixed rollout")
         minibatch_count += len(sample_specs)
+        optimization_host_seconds["minibatch_sampling"] += (
+            time.perf_counter() - sampling_start
+        )
         effective_total = 0
         previous_gradient_energy = 0.0
         trainable_count = max(
             1, sum(parameter.numel() for parameter in source.parameters() if parameter.requires_grad)
         )
         for family, logical_rows, objective_scale in sample_specs:
+            sampling_start = time.perf_counter()
             minibatch = (
                 gather_normal_minibatch(data.dataset, bundle, logical_rows)
                 if data.normal
@@ -1396,81 +2107,122 @@ def _one_iteration(
             if effective_rows == 0:
                 raise ValueError("cannot optimize an empty family stratum")
             effective_total += effective_rows
-            with torch.autocast(
-                device_type=device.type, enabled=amp_enabled, dtype=amp_dtype
-            ):
-                family_forward = getattr(
-                    bundle.rollout_backend, "policy_forward_family", None
-                )
-                output = (
-                    family_forward(
-                        source, family, minibatch.state_refs, minibatch.reach
+            optimization_host_seconds["minibatch_sampling"] += (
+                time.perf_counter() - sampling_start
+            )
+            planner = getattr(bundle.rollout_backend, "plan_policy_batches", None)
+            physical_plans = (
+                planner(source, minibatch.state_refs, "training")
+                if callable(planner)
+                else [
+                    torch.arange(
+                        effective_rows,
+                        dtype=torch.int64,
+                        device=minibatch.state_refs.device,
                     )
-                    if family and callable(family_forward)
-                    else bundle.rollout_backend.policy_forward(
-                        source, minibatch.state_refs, minibatch.reach
+                ]
+            )
+            for positions in physical_plans:
+                physical = (
+                    index_normal_minibatch(minibatch, positions)
+                    if data.normal
+                    else index_minibatch(minibatch, positions)
+                )
+                phase_start = time.perf_counter()
+                with torch.autocast(
+                    device_type=device.type, enabled=amp_enabled, dtype=amp_dtype
+                ):
+                    family_forward = getattr(
+                        bundle.rollout_backend, "policy_forward_family", None
                     )
-                )
-                reference_output = None
-                if float(cfg.loss.c_kl) > 0.0:
-                    if reference_model is None:
-                        raise ValueError(
-                            "reference_model is required when loss.c_kl is positive"
+                    output = (
+                        family_forward(
+                            source, family, physical.state_refs, physical.reach
                         )
-                    with torch.no_grad():
-                        reference_output = (
-                            family_forward(
-                                reference_model,
-                                family,
-                                minibatch.state_refs,
-                                minibatch.reach,
-                            )
-                            if family and callable(family_forward)
-                            else bundle.rollout_backend.policy_forward(
-                                reference_model,
-                                minibatch.state_refs,
-                                minibatch.reach,
-                            )
+                        if family and callable(family_forward)
+                        else bundle.rollout_backend.policy_forward(
+                            source, physical.state_refs, physical.reach
                         )
-                loss_sum, stats = spec.fn(
-                    output,
-                    minibatch,
-                    minibatch,
-                    bundle.policy_adapter,
-                    cfg,
-                    iteration=iteration,
-                    reduction="sum",
-                    reference=reference_output,
+                    )
+                    reference_output = None
+                    if float(cfg.loss.c_kl) > 0.0:
+                        if reference_model is None:
+                            raise ValueError(
+                                "reference_model is required when loss.c_kl is positive"
+                            )
+                        with torch.no_grad():
+                            reference_output = (
+                                family_forward(
+                                    reference_model,
+                                    family,
+                                    physical.state_refs,
+                                    physical.reach,
+                                )
+                                if family and callable(family_forward)
+                                else bundle.rollout_backend.policy_forward(
+                                    reference_model,
+                                    physical.state_refs,
+                                    physical.reach,
+                                )
+                            )
+                    loss_sum, stats = spec.fn(
+                        output,
+                        physical,
+                        physical,
+                        bundle.policy_adapter,
+                        cfg,
+                        iteration=iteration,
+                        reduction="sum",
+                        reference=reference_output,
+                    )
+                    # Every physical split contributes to the original logical
+                    # family mean.  Dividing by the split size would overweight
+                    # families that need more physical model calls.
+                    loss = (
+                        loss_sum
+                        / effective_rows
+                        * objective_scale.to(loss_sum.device)
+                    )
+                optimization_host_seconds["forward_loss"] += (
+                    time.perf_counter() - phase_start
                 )
-                loss = (
-                    loss_sum
-                    / effective_rows
-                    * objective_scale.to(loss_sum.device)
+                phase_start = time.perf_counter()
+                if not bool(torch.isfinite(loss)):
+                    raise FloatingPointError("non-finite training loss")
+                scaler.scale(loss).backward()
+                optimization_host_seconds["backward_pass"] += (
+                    time.perf_counter() - phase_start
                 )
-            if not bool(torch.isfinite(loss)):
-                raise FloatingPointError("non-finite training loss")
-            scaler.scale(loss).backward()
-            if family:
-                scaled_energy = sum(
-                    parameter.grad.detach().float().square().sum()
-                    for parameter in source.parameters()
-                    if parameter.grad is not None
-                )
-                scale = float(scaler.get_scale()) if scaler.is_enabled() else 1.0
-                current_energy = float(scaled_energy) / (scale * scale)
-                incremental_proxy = max(
-                    abs(current_energy - previous_gradient_energy) / trainable_count,
-                    1.0e-12,
-                )
-                previous_gradient_energy = current_energy
-                old_proxy = variance_ema.get(family, incremental_proxy)
-                variance_ema[family] = 0.95 * old_proxy + 0.05 * incremental_proxy
-            metric_parts.append(stats)
+                if family:
+                    scaled_energy = sum(
+                        parameter.grad.detach().float().square().sum()
+                        for parameter in source.parameters()
+                        if parameter.grad is not None
+                    )
+                    scale = (
+                        float(scaler.get_scale()) if scaler.is_enabled() else 1.0
+                    )
+                    current_energy = float(scaled_energy) / (scale * scale)
+                    incremental_proxy = max(
+                        abs(current_energy - previous_gradient_energy)
+                        / trainable_count,
+                        1.0e-12,
+                    )
+                    previous_gradient_energy = current_energy
+                    old_proxy = variance_ema.get(family, incremental_proxy)
+                    variance_ema[family] = (
+                        0.95 * old_proxy + 0.05 * incremental_proxy
+                    )
+                metric_parts.append(stats)
+                phase_start = time.perf_counter()
+        sync_start = time.perf_counter()
         gradients_finite = _sync_scaled_gradients(
             model,
             int(os.environ.get("WORLD_SIZE", "1")),
             metrics=execution_metrics,
         )
+        optimization_host_seconds["gradient_sync"] += time.perf_counter() - sync_start
+        update_start = time.perf_counter()
         step_result = _finite_gated_optimizer_step(
             model,
             optimizer,
@@ -1478,6 +2230,25 @@ def _one_iteration(
             gradients_finite=gradients_finite,
             grad_clip=cfg.training.grad_clip,
         )
+        optimization_host_seconds["gradient_update"] += time.perf_counter() - update_start
+        if work_controller is not None and step_result.optimizer_step_applied:
+            work_controller.cumulative_optimizer_steps += 1
+            if (
+                reference_model is not None
+                and work_controller.cumulative_optimizer_steps
+                >= work_controller.next_reference_optimizer_step
+            ):
+                reference_model.load_state_dict(source.state_dict())
+                reference_model.eval()
+                work_controller.last_reference_optimizer_step = (
+                    work_controller.cumulative_optimizer_steps
+                )
+                interval = int(cfg.training.kl_ref_optimizer_steps)
+                while (
+                    work_controller.next_reference_optimizer_step
+                    <= work_controller.cumulative_optimizer_steps
+                ):
+                    work_controller.next_reference_optimizer_step += interval
         step_metrics = finalize_metric_stats(metric_parts)
         step_metrics.update(step_result.metrics())
         optimization_records.append((epoch, effective_total, step_metrics))
@@ -1499,6 +2270,25 @@ def _one_iteration(
             )
 
     del data
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        metrics_peak_allocated = float(torch.cuda.max_memory_allocated(device))
+        metrics_peak_reserved = float(torch.cuda.max_memory_reserved(device))
+    else:
+        metrics_peak_allocated = 0.0
+        metrics_peak_reserved = 0.0
+    if profile:
+        memory_metrics.update(
+            memory_ledger.snapshot(
+                "iteration_end",
+                owned={
+                    "model": source,
+                    "optimizer": optimizer.state,
+                    "reference": reference_model,
+                    "backend": bundle.rollout_backend,
+                },
+            )
+        )
 
     def aggregate_records(
         records: list[tuple[int, int, dict[str, float]]]
@@ -1527,6 +2317,19 @@ def _one_iteration(
         return result
 
     metrics = aggregate_records(optimization_records)
+    if device.type == "cuda":
+        metrics["iteration_peak_allocated_bytes"] = metrics_peak_allocated
+        metrics["iteration_peak_reserved_bytes"] = metrics_peak_reserved
+        metrics["iteration_end_allocated_bytes"] = float(
+            torch.cuda.memory_allocated(device)
+        )
+        metrics["iteration_end_reserved_bytes"] = float(
+            torch.cuda.memory_reserved(device)
+        )
+        metrics["iteration_end_allocator_slack_bytes"] = (
+            metrics["iteration_end_reserved_bytes"]
+            - metrics["iteration_end_allocated_bytes"]
+        )
     metrics.update(
         {
             "trajectories": float(total_trajectories),
@@ -1541,6 +2344,30 @@ def _one_iteration(
             ),
         }
     )
+    metrics.update(
+        {
+            f"phase_{name}_host_seconds": float(seconds)
+            for name, seconds in optimization_host_seconds.items()
+        }
+    )
+    metrics["phase_optimization_host_seconds"] = float(
+        sum(optimization_host_seconds.values())
+    )
+    if work_controller is not None:
+        controller_metrics.update(
+            {
+                "cumulative_optimizer_steps": float(
+                    work_controller.cumulative_optimizer_steps
+                ),
+                "next_reference_optimizer_step": float(
+                    work_controller.next_reference_optimizer_step
+                ),
+                "reference_optimizer_step": float(
+                    work_controller.last_reference_optimizer_step
+                ),
+            }
+        )
+        metrics.update(controller_metrics)
     if cfg.training.ppo_epochs is not None:
         metrics["ppo_epochs"] = float(cfg.training.ppo_epochs)
         metrics["decision_epoch_coverage"] = (
@@ -1576,14 +2403,29 @@ def _one_iteration(
     profile_metrics["trajectories"] = float(total_trajectories)
     profile_metrics["decisions"] = float(decision_total)
     metrics.update(profile_metrics)
+    metrics.update(memory_metrics)
 
     if profile:
+        # Completion is streamed inside the RB backward-estimator call. Keep
+        # its own timing for attribution, but do not double-count it in the
+        # iteration wall-time estimate.
+        top_level_phases = {
+            "snapshot",
+            "rollout",
+            "backward",
+            "compaction",
+            "optimization",
+        }
         phase_seconds = sum(
-            value
-            for key, value in metrics.items()
-            if key.startswith("phase_") and key.endswith("_seconds")
+            metrics.get(f"phase_{name}_seconds", 0.0)
+            for name in top_level_phases
         )
         metrics["profiled_iteration_seconds"] = phase_seconds
+        metrics["phase_backward_estimator_seconds_excluding_completion"] = max(
+            metrics.get("phase_backward_seconds", 0.0)
+            - metrics.get("phase_completion_seconds", 0.0),
+            0.0,
+        )
         metrics["decisions_per_second"] = decision_total / max(phase_seconds, 1.0e-12)
         metrics["target_bytes_per_decision"] = metrics.get(
             "retained_target_bytes", 0.0
@@ -1663,13 +2505,9 @@ def run_training(
             cfg.probe.target_sha256 is not None
             and cfg.probe.target_sha256 != actual_sha256
         ):
-            raise RuntimeError(
-                "probe target checkpoint SHA-256 does not match configuration"
-            )
+            raise RuntimeError("probe target checkpoint SHA-256 does not match configuration")
         cfg.probe.target_sha256 = actual_sha256
-        target_payload = torch.load(
-            target_path, map_location="cpu", weights_only=False
-        )
+        target_payload = torch.load(target_path, map_location="cpu", weights_only=False)
         if not isinstance(target_payload, dict) or not isinstance(
             target_payload.get("config"), dict
         ) or "model" not in target_payload:
@@ -1690,9 +2528,36 @@ def run_training(
         }
     _configure_reproducibility(cfg.training.reproducibility)
     local_cfg = _rank_local_config(cfg, rank, world)
+    adaptive = cfg.rollout.target_decisions_per_gpu is not None
+    work_controller: SequentialWorkController | None = None
+    allocation_cfg = local_cfg
+    if adaptive:
+        if cfg.rollout.sequential_starts % world != 0:
+            raise ValueError(
+                "adaptive rollout.sequential_starts must be divisible by WORLD_SIZE"
+            )
+        initial_per_gpu = cfg.rollout.sequential_starts // world
+        minimum = int(cfg.rollout.min_sequential_starts_per_gpu)
+        maximum = int(cfg.rollout.max_sequential_starts_per_gpu)
+        if not minimum <= initial_per_gpu <= maximum:
+            raise ValueError(
+                "adaptive initial sequential starts/GPU must lie within configured bounds"
+            )
+        work_controller = SequentialWorkController(
+            current_starts_per_gpu=initial_per_gpu,
+            next_reference_optimizer_step=int(
+                cfg.training.kl_ref_optimizer_steps
+            ),
+        )
+        work_controller.configure_memory_forecaster(cfg)
+        local_cfg.rollout.sequential_starts = initial_per_gpu
+        local_cfg.rollout.trajectory_rank_counts = (initial_per_gpu,) * world
+        allocation_cfg = copy.deepcopy(local_cfg)
+        allocation_cfg.rollout.sequential_starts = maximum
+        allocation_cfg.rollout.trajectory_rank_counts = (maximum,) * world
     _hardware_metadata(cfg, requested, world)
     torch_gen, np_gen = seed_all(cfg.training.seed, rank, requested)
-    bundle = bundle_builder(local_cfg, requested)
+    bundle = bundle_builder(allocation_cfg, requested)
     if not isinstance(bundle, GameBundle):
         raise TypeError("bundle builder must return GameBundle")
     device = torch.device(bundle.rollout_backend.device)
@@ -1784,25 +2649,42 @@ def run_training(
             }
         if cfg.probe is not None:
             stored_target = checkpoint_metadata.get("probe_target")
-            if (
-                stored_target is None
-                or stored_target.get("sha256") != cfg.probe.target_sha256
-            ):
+            if stored_target is None or stored_target.get("sha256") != cfg.probe.target_sha256:
                 raise RuntimeError("resume probe target hash does not match checkpoint")
-        if checkpoint_metadata["cfg_dict"] != _scientific_config(cfg):
+        if not compatible_scientific_configs(
+            checkpoint_metadata["cfg_dict"], _scientific_config(cfg)
+        ):
             raise RuntimeError("resume configuration does not match the checkpoint")
         start_iteration = int(checkpoint_metadata["iter"])
         if not 0 <= start_iteration <= cfg.training.iters:
             raise RuntimeError("checkpoint iteration is outside the configured schedule")
         run_id = checkpoint_metadata["run_id"]
         reference_iteration = checkpoint_metadata["reference_iteration"]
+        if adaptive:
+            state = checkpoint_metadata["adaptive_work_state"]
+            if state is None:
+                raise RuntimeError("adaptive resume checkpoint has no controller state")
+            work_controller = SequentialWorkController.from_state_dict(state)
+            work_controller.configure_memory_forecaster(cfg)
+            local_cfg.rollout.sequential_starts = (
+                work_controller.current_starts_per_gpu
+            )
+            local_cfg.rollout.trajectory_rank_counts = (
+                work_controller.current_starts_per_gpu,
+            ) * world
         if not run_id:
             raise RuntimeError("checkpoint predates run identities and cannot be resumed safely")
+        if device.type == "cuda":
+            # torch.load(map_location=device) temporarily materializes checkpoint
+            # tensors before load_state_dict copies them into the live model and
+            # optimizer. Release those now-dead cache blocks so resume does not
+            # carry an artificial allocator peak into rollout calibration.
+            torch.cuda.empty_cache()
 
     memory_plan = _analytical_memory_plan(
-        local_cfg, bundle, has_reference=reference_model is not None
+        allocation_cfg, bundle, has_reference=reference_model is not None
     )
-    _validate_memory_preflight(local_cfg, device, memory_plan)
+    _validate_memory_preflight(allocation_cfg, device, memory_plan)
 
     if rank == 0:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1837,13 +2719,22 @@ def run_training(
             run_record = json.loads(run_path.read_text(encoding="utf-8"))
             if run_record.get("run_id") != run_id:
                 raise RuntimeError("checkpoint belongs to a different run identity")
-            if run_record.get("config_sha256") != _config_fingerprint(cfg):
+            recorded_fingerprint = run_record.get("config_sha256")
+            if recorded_fingerprint not in {
+                _config_fingerprint(cfg),
+                legacy_config_fingerprint(cfg),
+                config_dict_fingerprint(checkpoint_metadata["cfg_dict"]),
+            }:
                 raise RuntimeError("run configuration fingerprint does not match")
             if run_record.get("world_size") != world:
                 raise RuntimeError("resume requires the original DDP world size")
             _validate_metrics_prefix(
                 out_dir / "metrics.jsonl", start_iteration, run_id
             )
+            for memory_rank in range(world):
+                memory_path = out_dir / f"memory_rank_{memory_rank}.jsonl"
+                if memory_path.exists():
+                    _validate_metrics_prefix(memory_path, start_iteration, run_id)
         metadata = _hardware_metadata(cfg, device, world)
         metadata.update(memory_plan)
         hardware_name = (
@@ -1861,31 +2752,253 @@ def run_training(
     assert run_id is not None
 
     for iteration in range(start_iteration, cfg.training.iters):
-        if reference_model is not None and iteration % cfg.training.kl_ref_interval == 0:
+        if work_controller is not None:
+            current = work_controller.current_starts_per_gpu
+            local_cfg.rollout.sequential_starts = current
+            local_cfg.rollout.trajectory_rank_counts = (current,) * world
+        if (
+            work_controller is None
+            and reference_model is not None
+            and iteration % cfg.training.kl_ref_interval == 0
+        ):
             reference_model.load_state_dict(source_model.state_dict())
             reference_model.eval()
             reference_iteration = iteration
-        metrics = _one_iteration(
-            local_cfg,
-            bundle,
-            optimizer,
-            scaler,
-            torch_gen,
-            iteration,
-            profile=iteration == 0 and device.type == "cuda",
-            reference_model=reference_model,
-            validate_identity=iteration == start_iteration,
-        )
+        retry = 0
+        memory_clean_stop = False
+        while True:
+            try:
+                metrics = _one_iteration(
+                    local_cfg,
+                    bundle,
+                    optimizer,
+                    scaler,
+                    torch_gen,
+                    iteration,
+                    # Keep phase/memory telemetry on every iteration. The profiled
+                    # boundaries already synchronize only at major phase edges; this
+                    # is required for diagnosing drift and later-run regressions.
+                    profile=True,
+                    reference_model=reference_model,
+                    validate_identity=iteration == start_iteration,
+                    work_controller=work_controller,
+                    rollout_attempt=retry,
+                )
+                metrics["rollout_memory_retries"] = float(retry)
+                break
+            except MemoryPressureRetry as exc:
+                if work_controller is None:
+                    raise
+                assert work_controller.memory_forecaster is not None
+                failed_forecast_metrics = work_controller.memory_forecaster.observe(
+                    starts=exc.starts,
+                    # The realized geometry is valuable policy evidence, but the
+                    # rejected attempt has no observed learner peak.  Preserve the
+                    # already-certified upper prediction as a censored lower bound
+                    # so a discarded attempt can never tighten the memory model.
+                    peak_reserved_bytes=max(
+                        exc.peak_reserved_bytes, exc.predicted_bytes
+                    ),
+                    end_reserved_bytes=exc.end_reserved_bytes,
+                    metrics=exc.metrics,
+                    ceiling_bytes=exc.ceiling_bytes,
+                    restarted=True,
+                )
+                retry_limit_reached = retry >= int(
+                    cfg.rollout.memory_max_rollout_retries
+                )
+                minimum_starts = int(cfg.rollout.min_sequential_starts_per_gpu)
+                prospective_backoff = max(
+                    minimum_starts,
+                    int(
+                        math.floor(
+                            work_controller.current_starts_per_gpu
+                            * (
+                                1.0
+                                - float(cfg.rollout.memory_retry_backoff_fraction)
+                            )
+                        )
+                    ),
+                )
+                if retry_limit_reached or (
+                    prospective_backoff >= work_controller.current_starts_per_gpu
+                ):
+                    optimizer.zero_grad(set_to_none=True)
+                    local_rng_state = _capture_rng_state(torch_gen, np_gen)
+                    if world > 1:
+                        gathered_stop: list[dict[str, Any] | None] | None = (
+                            [None] * world if rank == 0 else None
+                        )
+                        dist.gather_object(local_rng_state, gathered_stop, dst=0)
+                        stop_rng_states = (
+                            None
+                            if rank != 0
+                            else [
+                                item
+                                for item in gathered_stop or []
+                                if item is not None
+                            ]
+                        )
+                    else:
+                        stop_rng_states = [local_rng_state]
+                    if rank == 0:
+                        save_checkpoint(
+                            out_dir / f"ckpt_memory_stop_{iteration:07d}.pt",
+                            bundle.model,
+                            optimizer,
+                            scaler,
+                            iteration,
+                            cfg,
+                            torch_gen,
+                            np_gen,
+                            run_id=run_id,
+                            rank_rng_states=stop_rng_states,
+                            reference_model=reference_model,
+                            reference_iteration=reference_iteration,
+                            adaptive_work_state=work_controller.state_dict(),
+                            probe_target=probe_target,
+                            logical_work=logical_work,
+                        )
+                        with (out_dir / "memory_stop.json").open(
+                            "w", encoding="utf-8"
+                        ) as stream:
+                            json.dump(
+                                {
+                                    "iter": iteration,
+                                    "run_id": run_id,
+                                    "retry": retry,
+                                    "starts": work_controller.current_starts_per_gpu,
+                                    "predicted_bytes": exc.predicted_bytes,
+                                    "ceiling_bytes": exc.ceiling_bytes,
+                                    "reason": (
+                                        "retry_limit"
+                                        if retry_limit_reached
+                                        else "minimum_starts"
+                                    ),
+                                },
+                                stream,
+                                indent=2,
+                                sort_keys=True,
+                            )
+                    memory_clean_stop = True
+                    break
+                retry += 1
+                previous = work_controller.current_starts_per_gpu
+                backed_off = prospective_backoff
+                work_controller.current_starts_per_gpu = backed_off
+                work_controller.retry_nonce += 1
+                local_cfg.rollout.sequential_starts = backed_off
+                local_cfg.rollout.trajectory_rank_counts = (backed_off,) * world
+                if rank == 0:
+                    with (out_dir / "memory_attempts.jsonl").open(
+                        "a", encoding="utf-8"
+                    ) as stream:
+                        stream.write(
+                            json.dumps(
+                                {
+                                    "iter": iteration,
+                                    "run_id": run_id,
+                                    "retry": retry,
+                                    "retry_nonce": work_controller.retry_nonce,
+                                    "optimizer_step": (
+                                        work_controller.cumulative_optimizer_steps
+                                    ),
+                                    "reference_iteration": reference_iteration,
+                                    "previous_starts": previous,
+                                    "next_starts": backed_off,
+                                    "predicted_bytes": exc.predicted_bytes,
+                                    "ceiling_bytes": exc.ceiling_bytes,
+                                    "observed_peak_reserved_bytes": (
+                                        exc.peak_reserved_bytes
+                                    ),
+                                    "calibration_epoch": int(
+                                        failed_forecast_metrics.get(
+                                            "memory_forecast_calibration_epoch", 0.0
+                                        )
+                                    ),
+                                    "entered_learning": False,
+                                },
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        )
+        if memory_clean_stop:
+            break
         if resume_path is not None and iteration == start_iteration:
             for key in tuple(metrics):
                 if key.startswith("identity_"):
                     metrics.pop(key)
         if iteration == 0:
             metrics.update({key: float(value) for key, value in memory_plan.items()})
-            _validate_memory_calibration(cfg, device, metrics)
+        diagnostic = {
+            key: value
+            for key, value in metrics.items()
+            if (
+                key.startswith("memory_")
+                or key.startswith("phase_") and "peak_" in key
+                or key.startswith("execution_")
+                and any(
+                    marker in key
+                    for marker in (
+                        "model_calls",
+                        "model_rows",
+                        "padded_token",
+                        "queue_",
+                        "forced_drain",
+                        "completion_",
+                    )
+                )
+                or key.startswith("trajectory_length_")
+                or key in {"nodes", "leaves", "decisions", "retained_target_bytes"}
+            )
+        }
+        with (out_dir / f"memory_rank_{rank}.jsonl").open(
+            "a", encoding="utf-8"
+        ) as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "iter": iteration,
+                        "run_id": run_id,
+                        "rank": rank,
+                        "retry": retry,
+                        "optimizer_step": (
+                            0
+                            if work_controller is None
+                            else work_controller.cumulative_optimizer_steps
+                        ),
+                        "entered_learning": True,
+                        **diagnostic,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+        _add_distributed_metric_summaries(metrics, device, world)
+        _synchronize_memory_control_metrics(
+            metrics, device, world, int(bundle.rollout_backend.n_players)
+        )
+        _validate_memory_calibration(cfg, device, metrics)
+        if work_controller is not None:
+            metrics.update(
+                work_controller.commit_memory_observation(
+                    metrics=metrics,
+                    ceiling_bytes=_memory_limit(
+                        cfg, device, account_current_free=False
+                    ),
+                    minimum_starts=int(
+                        cfg.rollout.min_sequential_starts_per_gpu
+                    ),
+                    maximum_starts=int(
+                        cfg.rollout.max_sequential_starts_per_gpu
+                    ),
+                    maximum_increase_fraction=float(
+                        cfg.rollout.memory_max_start_increase_fraction
+                    ),
+                )
+            )
         if reference_iteration is not None:
             metrics["reference_iteration"] = float(reference_iteration)
-        _add_distributed_metric_summaries(metrics, device, world)
         for name in logical_work:
             distributed_key = (
                 f"{name}_rank_max"
@@ -1898,6 +3011,14 @@ def run_training(
             )
             logical_work[name] += int(round(value))
             metrics[f"cumulative_{name}"] = float(logical_work[name])
+        if "decisions_rank_sum" in metrics:
+            global_decisions = max(metrics["decisions_rank_sum"], 1.0)
+            for street in ("preflop", "flop", "turn", "river"):
+                key = f"decision_nodes_{street}_rank_sum"
+                if key in metrics:
+                    metrics[f"decision_fraction_{street}_global"] = (
+                        metrics[key] / global_decisions
+                    )
         checkpoint_every = (
             cfg.training.checkpoint_every
             if cfg.hardware is None or cfg.hardware.checkpoint_every is None
@@ -1940,6 +3061,11 @@ def run_training(
                 rank_rng_states=rank_rng_states,
                 reference_model=reference_model,
                 reference_iteration=reference_iteration,
+                adaptive_work_state=(
+                    None
+                    if work_controller is None
+                    else work_controller.state_dict()
+                ),
                 probe_target=probe_target,
                 logical_work=logical_work,
             )

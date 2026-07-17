@@ -45,6 +45,18 @@ class RolloutConfig:
     max_active_trajectories: int | None = None
     arena_chunk_nodes: int | None = None
     execution_memory_bytes: int | None = None
+    target_decisions_per_gpu: int | None = None
+    min_sequential_starts_per_gpu: int | None = None
+    max_sequential_starts_per_gpu: int | None = None
+    decisions_per_start_ema_alpha: float | None = None
+    max_start_change_fraction: float | None = None
+    memory_forecast_window: int = 128
+    memory_forecast_half_life: float = 32.0
+    memory_forecast_min_observations: int = 40
+    memory_soft_exceedance_rate: float = 0.025
+    memory_max_start_increase_fraction: float = 0.10
+    memory_retry_backoff_fraction: float = 0.20
+    memory_max_rollout_retries: int = 2
 
 
 @dataclass
@@ -89,6 +101,8 @@ class TrainingConfig:
     kl_ref_interval: int = 1
     optimizer: str = "adam"
     ppo_epochs: int | None = None
+    target_node_reuse: float | None = None
+    kl_ref_optimizer_steps: int | None = None
 
 
 @dataclass
@@ -291,6 +305,98 @@ def _validate_config(cfg: RootConfig) -> None:
         )
     if cfg.rollout.sequential_starts <= 0:
         raise ConfigError("root.rollout.sequential_starts: expected a positive integer")
+    adaptive_values = {
+        "root.rollout.target_decisions_per_gpu": cfg.rollout.target_decisions_per_gpu,
+        "root.rollout.min_sequential_starts_per_gpu": cfg.rollout.min_sequential_starts_per_gpu,
+        "root.rollout.max_sequential_starts_per_gpu": cfg.rollout.max_sequential_starts_per_gpu,
+        "root.rollout.decisions_per_start_ema_alpha": cfg.rollout.decisions_per_start_ema_alpha,
+        "root.rollout.max_start_change_fraction": cfg.rollout.max_start_change_fraction,
+        "root.training.target_node_reuse": cfg.training.target_node_reuse,
+        "root.training.kl_ref_optimizer_steps": cfg.training.kl_ref_optimizer_steps,
+    }
+    adaptive_enabled = any(value is not None for value in adaptive_values.values())
+    if adaptive_enabled and any(value is None for value in adaptive_values.values()):
+        missing = next(path for path, value in adaptive_values.items() if value is None)
+        raise ConfigError(
+            f"{missing}: all adaptive sequential work-control settings are required together"
+        )
+    if adaptive_enabled:
+        if cfg.training.mode not in {"normal", "rao_blackwell"}:
+            raise ConfigError(
+                "root.rollout.target_decisions_per_gpu: adaptive work control is "
+                "only valid in sequential modes"
+            )
+        for path in (
+            "root.rollout.target_decisions_per_gpu",
+            "root.rollout.min_sequential_starts_per_gpu",
+            "root.rollout.max_sequential_starts_per_gpu",
+            "root.training.kl_ref_optimizer_steps",
+        ):
+            value = adaptive_values[path]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ConfigError(f"{path}: expected a positive integer")
+        minimum = cfg.rollout.min_sequential_starts_per_gpu
+        maximum = cfg.rollout.max_sequential_starts_per_gpu
+        assert minimum is not None and maximum is not None
+        if minimum > maximum:
+            raise ConfigError(
+                "root.rollout.min_sequential_starts_per_gpu: must not exceed the maximum"
+            )
+        alpha = cfg.rollout.decisions_per_start_ema_alpha
+        if alpha is None or not math.isfinite(alpha) or not 0.0 < alpha <= 1.0:
+            raise ConfigError(
+                "root.rollout.decisions_per_start_ema_alpha: expected a finite value in (0,1]"
+            )
+        change = cfg.rollout.max_start_change_fraction
+        if change is None or not math.isfinite(change) or not 0.0 < change <= 1.0:
+            raise ConfigError(
+                "root.rollout.max_start_change_fraction: expected a finite value in (0,1]"
+            )
+        reuse = cfg.training.target_node_reuse
+        if reuse is None or not math.isfinite(reuse) or reuse <= 0.0:
+            raise ConfigError(
+                "root.training.target_node_reuse: expected a finite positive value"
+            )
+        for path, value in (
+            ("root.rollout.memory_forecast_window", cfg.rollout.memory_forecast_window),
+            (
+                "root.rollout.memory_forecast_min_observations",
+                cfg.rollout.memory_forecast_min_observations,
+            ),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ConfigError(f"{path}: expected a positive integer")
+        if cfg.rollout.memory_forecast_min_observations > cfg.rollout.memory_forecast_window:
+            raise ConfigError(
+                "root.rollout.memory_forecast_min_observations: must not exceed "
+                "memory_forecast_window"
+            )
+        half_life = cfg.rollout.memory_forecast_half_life
+        if not math.isfinite(half_life) or half_life <= 0.0:
+            raise ConfigError(
+                "root.rollout.memory_forecast_half_life: expected a finite positive value"
+            )
+        for path, value in (
+            (
+                "root.rollout.memory_soft_exceedance_rate",
+                cfg.rollout.memory_soft_exceedance_rate,
+            ),
+            (
+                "root.rollout.memory_max_start_increase_fraction",
+                cfg.rollout.memory_max_start_increase_fraction,
+            ),
+            (
+                "root.rollout.memory_retry_backoff_fraction",
+                cfg.rollout.memory_retry_backoff_fraction,
+            ),
+        ):
+            if not math.isfinite(value) or not 0.0 < value < 1.0:
+                raise ConfigError(f"{path}: expected a finite value in (0,1)")
+        retries = cfg.rollout.memory_max_rollout_retries
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+            raise ConfigError(
+                "root.rollout.memory_max_rollout_retries: expected a nonnegative integer"
+            )
     if cfg.rollout.node_budget <= 0:
         raise ConfigError("root.rollout.node_budget: expected a positive integer")
     if cfg.rollout.reach_storage not in {"full", "decisions_only", "recompute"}:
@@ -355,6 +461,10 @@ def _validate_config(cfg: RootConfig) -> None:
             raise ConfigError(
                 "root.training.ppo_epochs: shuffled epochs currently support only "
                 "normal and sequential Rao--Blackwell training"
+            )
+        if adaptive_enabled:
+            raise ConfigError(
+                "root.training.ppo_epochs: incompatible with adaptive target_node_reuse"
             )
     if cfg.training.reproducibility not in {"strict", "seeded", "throughput"}:
         raise ConfigError(

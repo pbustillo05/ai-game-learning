@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,12 +34,68 @@ from pbg.core.execution import (
     stable_partition_masked,
 )
 from pbg.core.training import (
+    _analytical_memory_plan,
     _alias_table,
     _sample_alias,
     _sequential_start_quotas,
     _sync_scaled_gradients,
+    _validate_memory_calibration,
 )
+from pbg.core.game import GameBundle
 from pbg.core.optimization import finite_gated_optimizer_step
+
+
+def test_sequential_memory_plan_uses_realized_single_child_width() -> None:
+    model = torch.nn.Linear(3, 2)
+    backend = SimpleNamespace(
+        n_players=2,
+        x_sizes=(1326, 1326),
+        e_max=66,
+        states=SimpleNamespace(storage=torch.empty(17, dtype=torch.uint8)),
+        partition_summary_cache=SimpleNamespace(
+            valid=torch.empty(43, dtype=torch.bool)
+        ),
+    )
+    bundle = GameBundle(
+        model=model,
+        rollout_backend=backend,
+        policy_adapter=SimpleNamespace(),
+        completion_backend=SimpleNamespace(),
+    )
+    cfg = SimpleNamespace(
+        training=SimpleNamespace(mode="rao_blackwell"),
+        rollout=SimpleNamespace(
+            sequential_starts=10,
+            node_budget=43,
+            family_batch_rows=64,
+            max_active_trajectories=64,
+            reach_storage="recompute",
+        ),
+    )
+
+    plan = _analytical_memory_plan(cfg, bundle, has_reference=True)
+    nodes = 10 * 43
+    assert plan["memory_plan_policy_cache_bytes"] == nodes * (2 * 1326 * 4 + 4)
+    assert plan["memory_plan_target_bytes"] == nodes * (4 * 1326 * 4 + 13)
+    assert plan["memory_plan_compact_target_bytes"] == nodes * (3 * 1326 * 4 + 13)
+    assert plan["memory_plan_transient_reach_bytes"] == 4 * 10 * 2 * 1326 * 4
+    assert plan["memory_plan_backend_resident_bytes"] == 60
+    # The old generic calculation padded every row to all 66 legal events.
+    old_policy = nodes * (66 * 1326 + 1326) * 4
+    assert plan["memory_plan_policy_cache_bytes"] * 20 < old_policy
+
+
+def test_memory_calibration_reports_actual_hard_headroom_without_synthetic_margin(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "pbg.core.training._memory_limit",
+        lambda cfg, device, account_current_free=False: 1_000,
+    )
+    metrics = {"iteration_peak_reserved_bytes": 801.0}
+    _validate_memory_calibration(SimpleNamespace(), torch.device("cuda"), metrics)
+    assert metrics["calibrated_actual_headroom_bytes"] == 199.0
+    assert metrics["memory_hard_limit_exceeded"] == 0.0
 
 
 def test_global_mass_objective_uses_exact_unequal_rank_mass() -> None:

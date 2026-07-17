@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ def save_checkpoint(
     rank_rng_states: list[dict[str, Any]] | None = None,
     reference_model: nn.Module | None = None,
     reference_iteration: int | None = None,
+    adaptive_work_state: dict[str, Any] | None = None,
     probe_target: dict[str, Any] | None = None,
     logical_work: dict[str, int] | None = None,
 ) -> None:
@@ -58,6 +60,7 @@ def save_checkpoint(
             None if reference_model is None else reference_model.state_dict()
         ),
         "reference_iteration": reference_iteration,
+        "adaptive_work_state": adaptive_work_state,
         "probe_target": copy.deepcopy(probe_target),
         "logical_work": copy.deepcopy(logical_work),
     }
@@ -120,6 +123,7 @@ def load_checkpoint(
         "cfg_dict": payload["config"],
         "run_id": payload.get("run_id"),
         "reference_iteration": payload.get("reference_iteration"),
+        "adaptive_work_state": payload.get("adaptive_work_state"),
         "probe_target": copy.deepcopy(payload.get("probe_target")),
         "logical_work": copy.deepcopy(payload.get("logical_work")),
     }
@@ -141,14 +145,62 @@ def capture_rng_state(
 
 
 def scientific_config(cfg: RootConfig) -> dict[str, Any]:
-    """Return checkpoint-compatible configuration, excluding hardware."""
+    """Return scientific configuration, excluding hardware and log cadence."""
 
     result = asdict(cfg)
     result.pop("hardware", None)
+    # Checkpoint frequency changes persistence policy, not the estimator,
+    # model, optimizer, or RNG trajectory. It must not invalidate resume.
+    result["training"].pop("checkpoint_every", None)
     if result.get("probe") is not None:
         # The content hash is scientific identity; the filesystem location is not.
         result["probe"].pop("target_checkpoint", None)
     return result
+
+
+def compatible_scientific_configs(
+    left: dict[str, Any], right: dict[str, Any]
+) -> bool:
+    """Compare current/legacy checkpoint configs ignoring log cadence."""
+
+    def normalized(value: dict[str, Any]) -> dict[str, Any]:
+        result = copy.deepcopy(value)
+        result.pop("hardware", None)
+        # Checkpoints written before probe training existed omit the key;
+        # absence is equivalent to the current schema's explicit null.
+        result.setdefault("probe", None)
+        result.get("training", {}).pop("checkpoint_every", None)
+        if result.get("probe") is not None:
+            result["probe"].pop("target_checkpoint", None)
+        rollout = result.get("rollout", {})
+        # Memory forecasting is execution control, and these defaults were
+        # introduced after existing scientific checkpoints were written.
+        rollout.setdefault("memory_forecast_window", 128)
+        rollout.setdefault("memory_forecast_half_life", 32.0)
+        rollout.setdefault("memory_forecast_min_observations", 40)
+        rollout.setdefault("memory_soft_exceedance_rate", 0.025)
+        rollout.setdefault("memory_max_start_increase_fraction", 0.10)
+        rollout.setdefault("memory_retry_backoff_fraction", 0.20)
+        rollout.setdefault("memory_max_rollout_retries", 2)
+        return result
+
+    return normalized(left) == normalized(right)
+
+
+def legacy_config_fingerprint(cfg: RootConfig) -> str:
+    """Return the pre-cadence-separation fingerprint for old run manifests."""
+
+    result = asdict(cfg)
+    result.pop("hardware", None)
+    encoded = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def config_dict_fingerprint(config: dict[str, Any]) -> str:
+    """Fingerprint a stored legacy scientific-config dictionary."""
+
+    encoded = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def config_fingerprint(cfg: RootConfig) -> str:
@@ -161,22 +213,24 @@ def config_fingerprint(cfg: RootConfig) -> str:
 
 
 def validate_metrics_prefix(path: Path, completed: int, run_id: str) -> None:
-    """Require a gap-free metrics prefix before appending a resumed run."""
+    """Validate and trim metrics newer than the selected resume checkpoint."""
 
     if not path.exists():
         raise RuntimeError("resume requires the existing metrics.jsonl")
-    records = [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    raw_lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    records = [json.loads(line) for line in raw_lines]
     iterations = [record.get("iter") for record in records]
-    if iterations != list(range(completed)):
+    if len(records) < completed or iterations[:completed] != list(range(completed)):
         raise RuntimeError(
             "metrics.jsonl is not the exact gap-free prefix required by the checkpoint"
         )
-    if any(record.get("run_id") != run_id for record in records):
+    if any(record.get("run_id") != run_id for record in records[:completed]):
         raise RuntimeError("metrics.jsonl belongs to a different run identity")
+    if len(records) > completed:
+        backup = path.with_name(f"{path.name}.before_resume_{completed:07d}.bak")
+        if not backup.exists():
+            shutil.copy2(path, backup)
+        path.write_text("\n".join(raw_lines[:completed]) + ("\n" if completed else ""), encoding="utf-8")
 
 
 # Compatibility aliases retained for existing internal imports while callers

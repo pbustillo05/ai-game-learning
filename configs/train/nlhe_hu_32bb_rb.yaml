@@ -33,6 +33,16 @@ rollout:
   max_sequential_starts_per_gpu: 2560
   decisions_per_start_ema_alpha: 0.2
   max_start_change_fraction: 0.25
+  # Policy-conditioned memory forecasts are updated on every successful
+  # iteration and censored pre-optimizer retry. Positive surprises widen
+  # immediately; tightening requires a fresh calibration window after drift.
+  memory_forecast_window: 128
+  memory_forecast_half_life: 32.0
+  memory_forecast_min_observations: 40
+  memory_soft_exceedance_rate: 0.025
+  memory_max_start_increase_fraction: 0.10
+  memory_retry_backoff_fraction: 0.20
+  memory_max_rollout_retries: 2
 
 completion:
   n_samples: 1024
