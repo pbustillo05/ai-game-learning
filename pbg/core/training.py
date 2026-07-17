@@ -1740,6 +1740,7 @@ def _validate_old_policy_identity(
     )
     maximum_logp_error = torch.zeros((), device=device)
     maximum_value_error = torch.zeros((), device=device)
+    maximum_value_scale = torch.zeros((), device=device)
     ratio_min = torch.full((), torch.inf, device=device)
     ratio_max = torch.zeros((), device=device)
     with torch.no_grad():
@@ -1789,21 +1790,34 @@ def _validate_old_policy_identity(
             maximum_value_error = torch.maximum(
                 maximum_value_error, (current_value - cached_value).abs().max()
             )
+            maximum_value_scale = torch.maximum(
+                maximum_value_scale,
+                torch.maximum(
+                    current_value.abs().max(), cached_value.abs().max()
+                ),
+            )
             ratio_min = torch.minimum(ratio_min, ratios.min())
             ratio_max = torch.maximum(ratio_max, ratios.max())
     if was_training:
         model.train()
-    # Throughput/FP16 resume validation compares two otherwise identical
-    # inference paths. Larger models and different cuDNN kernel choices can
-    # produce a few 1e-3 log-probability ulps even when the policy ratio is
-    # effectively one. Keep strict full-precision validation tight, while
-    # allowing the measured AMP numerical envelope to be diagnosed rather than
-    # blocking a safe resume.
-    tolerance = 1.0e-2 if amp_enabled else 2.0e-5
-    value_ok = maximum_value_error <= tolerance * (
-        1.0 + torch.maximum(current_value.abs().max(), cached_value.abs().max())
+    if dist.is_initialized():
+        dist.all_reduce(maximum_logp_error, op=dist.ReduceOp.MAX)
+        dist.all_reduce(maximum_value_error, op=dist.ReduceOp.MAX)
+        dist.all_reduce(maximum_value_scale, op=dist.ReduceOp.MAX)
+        dist.all_reduce(ratio_min, op=dist.ReduceOp.MIN)
+        dist.all_reduce(ratio_max, op=dist.ReduceOp.MAX)
+    # Rollout queues and this exhaustive validation can partition identical
+    # inputs into different physical batch shapes. FP16 attention/reductions
+    # are shape-dependent; require identity to within a 2% policy ratio rather
+    # than expecting bitwise equality. This remains one tenth of the configured
+    # 20% PPO clipping interval for the production run. Full precision remains
+    # tight enough to expose input/cache misalignment directly.
+    logp_tolerance = 2.0e-2 if amp_enabled else 2.0e-5
+    value_tolerance = 1.0e-2 if amp_enabled else 2.0e-5
+    value_ok = maximum_value_error <= value_tolerance * (
+        1.0 + maximum_value_scale
     )
-    logp_ok = maximum_logp_error <= tolerance
+    logp_ok = maximum_logp_error <= logp_tolerance
     unclipped = (ratio_min >= 1.0 - float(cfg.loss.clip_eps)) & (
         ratio_max <= 1.0 + float(cfg.loss.clip_eps)
     )
@@ -1819,7 +1833,8 @@ def _validate_old_policy_identity(
         "identity_max_abs_value_error": float(maximum_value_error),
         "identity_ratio_min": float(ratio_min),
         "identity_ratio_max": float(ratio_max),
-        "identity_tolerance": float(tolerance),
+        "identity_logp_tolerance": float(logp_tolerance),
+        "identity_value_tolerance": float(value_tolerance),
     }
     if not bool(ok):
         raise RuntimeError(
@@ -1828,7 +1843,8 @@ def _validate_old_policy_identity(
             f"max_abs_value_error={diagnostics['identity_max_abs_value_error']:.8g}, "
             f"ratio_min={diagnostics['identity_ratio_min']:.8g}, "
             f"ratio_max={diagnostics['identity_ratio_max']:.8g}, "
-            f"tolerance={tolerance:.8g}"
+            f"logp_tolerance={logp_tolerance:.8g}, "
+            f"value_tolerance={value_tolerance:.8g}"
         )
     return diagnostics
 
