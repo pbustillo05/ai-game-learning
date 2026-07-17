@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 from typing import Any
 
 import torch
@@ -69,6 +70,7 @@ def estimate_rollout_memory(
     sequential_recompute_live_rows: bool = False,
     max_history_tokens: int = 1,
     folder_beta_rank: int = 16,
+    partition_cache_materialized: bool = True,
 ) -> PokerRolloutMemoryPlan:
     """Estimate worst-case rollout bytes before allocating a poker backend.
 
@@ -111,27 +113,56 @@ def estimate_rollout_memory(
         # Selected policy likelihoods and values are retained only for realized
         # player edges/nodes, but this remains a safe capacity bound.
         policy_cache_bytes=(edge_capacity + capacity) * n_hands * 4,
-        partition_cache_bytes=DevicePartitionSummaryCache.storage_nbytes(
-            capacity,
-            n_cards=4 * rank_count,
-            beta_rank=folder_beta_rank,
-            max_folders=max(0, n_players - 2),
+        partition_cache_bytes=(
+            DevicePartitionSummaryCache.storage_nbytes(
+                capacity,
+                n_cards=4 * rank_count,
+                beta_rank=folder_beta_rank,
+                max_folders=max(0, n_players - 2),
+            )
+            if partition_cache_materialized
+            # The cache always allocates its device validity bitmap. Its large
+            # evaluator-owned fields are lazy and must not be charged when the
+            # configured model never consumes partition summaries.
+            else capacity
         ),
     )
 
 
-def _preflight_cuda_rollout(plan: PokerRolloutMemoryPlan, device: torch.device) -> None:
-    """Reject a rollout plan that would crowd out model/optimizer allocations."""
+def _preflight_cuda_rollout(
+    plan: PokerRolloutMemoryPlan,
+    device: torch.device,
+    *,
+    reserve_vram_gib: float | None = None,
+    max_memory_fraction: float | None = None,
+) -> None:
+    """Reject a rollout whose own complete bound exceeds usable free VRAM.
+
+    The former ``free // 2`` comparison was an arbitrary phase split: it
+    rejected valid sequential layouts while providing no bound for learner
+    activations. Training performs its separate all-phase preflight after the
+    bundle exists. This gate now answers only whether the rollout allocation
+    described by ``plan`` fits while preserving the configured device reserve.
+    """
 
     if device.type != "cuda":
         return
     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-    if plan.peak_bytes > free_bytes // 2:
+    if reserve_vram_gib is None or max_memory_fraction is None:
+        limit = int(free_bytes * 0.85)
+    else:
+        reserve = int(float(reserve_vram_gib) * 1024**3)
+        limit = min(
+            free_bytes - reserve,
+            int(total_bytes * float(max_memory_fraction)),
+        )
+    if limit <= 0 or plan.peak_bytes > limit:
         gib = 1024**3
         raise MemoryError(
             "poker rollout plan requires "
-            f"{plan.peak_bytes / gib:.2f} GiB, exceeding half of the currently free "
-            f"{free_bytes / gib:.2f} GiB on {device} (total {total_bytes / gib:.2f} GiB); "
+            f"{plan.peak_bytes / gib:.2f} GiB, exceeding the usable rollout limit "
+            f"{limit / gib:.2f} GiB on {device} (free {free_bytes / gib:.2f} GiB, "
+            f"total {total_bytes / gib:.2f} GiB); "
             "reduce rollout.sequential_starts/node_budget or use a smaller storage plan"
         )
 
@@ -200,6 +231,7 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
         """Complete only one selected player's posterior/value per leaf."""
 
         rows = _reach_rows(reach)
+        batch = int(node_ids.numel())
         if players.shape != node_ids.shape or players.device != rows.device:
             raise ValueError("selected completion players must be device-local [B]")
         p_hat = torch.zeros_like(rows, dtype=torch.float32)
@@ -580,6 +612,8 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         beta_rank=model_cfg.folder_beta_rank, rank_count=engine_cfg.rank_count
     )
     resident_trees = cfg.rollout.sequential_starts
+    raises_per_street = math.ceil(engine_cfg.stack_bb / engine_cfg.bb) + 1
+    state_history_steps = 4 * engine_cfg.n_players * (raises_per_street + 1) + 3
     plan = estimate_rollout_memory(
         root_count=resident_trees,
         node_budget=cfg.rollout.node_budget,
@@ -590,10 +624,22 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
             cfg.training.mode != "branched_rao_blackwell"
             and cfg.rollout.reach_storage == "recompute"
         ),
-        max_history_tokens=model_cfg.max_history_tokens,
+        # This sizes the state store's binary-lift history, whose allocation is
+        # governed by the backend rollout-step bound rather than model tokens.
+        max_history_tokens=state_history_steps,
         folder_beta_rank=model_cfg.folder_beta_rank,
+        partition_cache_materialized=model_cfg.evaluator_summary_dim > 0,
     )
-    _preflight_cuda_rollout(plan, device)
+    _preflight_cuda_rollout(
+        plan,
+        device,
+        reserve_vram_gib=(
+            None if cfg.hardware is None else cfg.hardware.reserve_vram_gib
+        ),
+        max_memory_fraction=(
+            None if cfg.hardware is None else cfg.hardware.max_memory_fraction
+        ),
+    )
     backend = PokerRolloutBackend(
         engine_cfg,
         plan.capacity,

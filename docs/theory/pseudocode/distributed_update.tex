@@ -20,170 +20,232 @@
 \pagestyle{empty}
 \setlength{\parindent}{0pt}
 \setlength{\parskip}{0pt}
-\setlength{\algomargin}{1.0em}
+\setlength{\algomargin}{1em}
 \SetAlFnt{\footnotesize}
 \SetAlCapFnt{\footnotesize\bfseries}
 \SetAlCapNameFnt{\footnotesize\bfseries}
 \SetAlCapSkip{0.35em}
 \SetKwInput{KwDef}{Definitions}
-\newcommand{\BackwardTargets}{\operatorname{\texttt{BackwardTargets}}}
+\newcommand{\Obj}[1]{\texttt{#1}}
 \newcommand{\ModeLoss}{\operatorname{\texttt{ModeLoss}}}
-\newcommand{\Alias}{\operatorname{\texttt{Alias}}}
+\newcommand{\IAllGather}{\operatorname{\texttt{IAllGather}}}
 \newcommand{\AllReduceSum}{\operatorname{\texttt{AllReduceSum}}}
-\newcommand{\IAllReduceSum}{\operatorname{\texttt{IAllReduceSum}}}
 \newcommand{\Await}{\operatorname{\texttt{Await}}}
-\newcommand{\OptimizerStep}{\operatorname{\texttt{OptimizerStep}}}
+\newcommand{\Release}{\operatorname{\texttt{Release}}}
 
 \begin{document}
 
 \begin{algorithm}[H]
-\caption{$\theta_{k+1}\gets
-\texttt{DistributedFixedRolloutUpdate}
-(\theta_k,((\mathfrak R_g,\mathcal D_g,\mathcal L_g))_{g\in\mathcal G},\mathsf m)$}
+\caption{$\theta_{k+1}\gets\Obj{DistributedFixedRolloutUpdate}
+(\theta_k,(\Obj{TrainingStorage}_g)_g,\mathsf m)$}
 \label{alg:distributed-fixed-rollout-update}
 \DontPrintSemicolon
-\tcc{Targets, old-policy outputs, topology, and the empirical decision law stay frozen; only $\theta$ changes.}
-\tcc{In branched-RB, $\mathfrak R_g$ is the one rollout tree on GPU $g$; sequential records contain trajectory starts.}
-\KwParam{finite PBG; rollout profile $\pi=\pi^{\theta_k}$;
-$\mathsf m\in\{\mathsf{normal},\mathsf{RB},\mathsf{branched\text{-}RB}\}$;
-fixed GPU-local rollout outputs from \texttt{MultiGPUQueuedRollout}; GPU set $\mathcal G$}
-\KwParam{execution-family priority poset $(\mathcal M,\leq_{\mathcal M})$ and
-public routing map $\kappa$; mode-correct per-decision loss
-$\ModeLoss_{\mathsf m}$; batches are keyed only by $m\in\mathcal M$}
-\KwHyper{$K$, common number of synchronous optimizer steps;
-calibrated family execution-cost curves $C_{g,m}(b)$ and admissible integer
-bounds/quanta for logical stratum sizes $B_{g,m}$, with $B_{g,m}\geq1$ whenever
-the stratum has positive mass; common predicted per-GPU time budgets $T_g$;
-optimizer, common AMP loss scale, and global gradient-clipping rule; optional
-frozen-reference cache}
-\KwDef{$\mathcal D_{g,m}\gets
-\{\mathsf s\in\mathcal D_g:\kappa(\ell_g(\mathsf s))=m\}$;
-for a player-decision occurrence $\mathsf s$,
+\KwParam{immutable GPU-local stores produced by the matching target builder;
+opaque $(\Obj{PartitionSpec}_m)_{m\in\mathcal M}$;
+$\mathsf m\in\{\mathsf{normal},\mathsf{seqRB},\mathsf{branchRB}\}$}
+\KwParam{the production-v1 loss family: clipped PPO policy surrogate, value
+regression with optional value clipping, entropy, and legal-action KL to an
+optional frozen reference $\pi^{\theta_{\rm ref(k)}}$; synchronous optimizer,
+AMP rule, global clipping rule, and $K$ optimizer steps.  $Q$-losses,
+RNaD/NeuRD, $W/S$ auxiliaries, and adaptive branching intensity are outside v1}
+\KwHyper{per-partition measured statistical-batch time curves
+$C_{g,m}(B;\mathcal C)$;
+finite calibrated physical shape sets $\mathcal B_{g,m}$; hard training and
+reference-build transient-byte predictors $W_{g,m}(J;\mathcal C)$ and
+$W^{\rm refbuild}_{g,m}(J;\mathcal C)$; time budgets $T_g$; lagged cheap variance
+proxies $\widehat\sigma^2_{g,m}$; usable bytes $M_{\rm device}$ and unused guard
+$M_{\rm guard}$, with $M_{\rm hard}=M_{\rm device}-M_{\rm guard}$}
+\KwDef{$\mathcal D_{g,m}=\{0,\ldots,D_{g,m}-1\}$ and
 \[
-  \omega_g(\mathsf s)\gets
-  \begin{cases}[l"l]
-    1,
-      & \mathsf m\in\{\mathsf{normal},\mathsf{RB}\},\\
-    \displaystyle\prod_{\mathsf r\prec\mathsf s}\frac{1}{N_g(\mathsf r)},
-      & \mathsf m=\mathsf{branched\text{-}RB}
-  \end{cases}
-\]}
-\KwDef{$Z_{g,m}\gets\sum_{\mathsf s\in\mathcal D_{g,m}}\omega_g(\mathsf s)$,
-$Z_g\gets\sum_m Z_{g,m}$,
-$Z\gets\sum_g Z_g$, and, when $Z_{g,m}>0$,
-\[
-  q_{g,m}(\mathsf s)\gets
-  \frac{\omega_g(\mathsf s)}{Z_{g,m}},
-  \qquad
-  \alpha_{g,m}\gets\frac{Z_{g,m}}{Z}.
-\]}
-\KwDef{$\ModeLoss_{\mathsf m}(\theta;\mathsf s,\mathcal O_g)$ is the corresponding
-loss of \texttt{core\_math}: posterior sums are inside the RB losses and, in branched-RB,
-\[
-  \ModeLoss_{\mathsf{branched\text{-}RB}}(\theta;\mathsf s,\mathcal O_g)
-  =\frac{1}{N_g(\mathsf s)}
-    \sum_{\mathsf a\in\mathfrak E_{\mathsf s}}\mathcal L^\pi_{g,\mathsf s,\mathsf a}(\theta)
-   +\mathcal L^{\mathsf{node}}_{g,\mathsf s}(\theta),
+ \log\omega_{g,m,d}=
+ \begin{cases}[l"l]
+   0,&\mathsf m\ne\mathsf{branchRB},\\
+   -\sum_{s\prec(m,d)}\log N(s),&\mathsf m=\mathsf{branchRB};
+ \end{cases}\quad
+ \log Z_{g,m}=\operatorname{logsumexp}_{d\in\mathcal D_{g,m}}
+ \log\omega_{g,m,d}.
 \]
-where $\mathcal L^\pi$ includes the edge target and
-$\widehat{\mathbb P}(x_p\mid\mathsf s\mathsf a)$ weight, while
-$\mathcal L^{\mathsf{node}}$ contains the enabled value, entropy, and reference-KL
-terms with $\widehat{\mathbb P}(x_p\mid\mathsf s)$ weight.  The rollout intensity
-$\beta$ is an external black box and has no head, target, or loss in this algorithm}
-\KwDef{$\widehat\sigma_{g,m}^2$ is a frozen lagged estimate of
-$\operatorname{trCov}_{q_{g,m}}[\nabla_\theta\ModeLoss_{\mathsf m}]$, or a
-configured cheap proxy calibrated against it; it affects only learner work
-allocation, never the objective or rollout law}
-\KwOut{identical updated parameters $\theta_{k+1}$ and optimizer state on every GPU}
-
-\ForEach{$g\in\mathcal G$ \textbf{as soon as its local rollout completes}}{
-  Compute $(\omega_g(\mathsf s))_{\mathsf s\in\mathcal D_g}$ and
-  $(Z_{g,m})_{m\in\mathcal M}$ in one pass over the local rollout records\;
-}
-$Z^\star\gets\IAllReduceSum_g(Z_g)$ without a preceding barrier\;
-
-\ForEach{$g\in\mathcal G$ \textbf{in parallel}}{
-  Stream terminal rewards or pre-terminal completion microbatches through the
-  mode-correct backward reduction frontier and construct the fixed compact
-  struct-of-arrays target table
-  $\mathcal O_g\gets\BackwardTargets_{\mathsf m}
-  (\mathfrak R_g,\mathcal D_g,\mathcal L_g;V^{\theta_k})$, laid out by $m$ but
-  never by street
-  \tcc*[r]{completed child summaries are contracted immediately}
-  \ForEach{$m\in\mathcal M:Z_{g,m}>0$}{
-    $Q_{g,m}\gets\Alias((\omega_g(\mathsf s))_{\mathsf s\in\mathcal D_{g,m}})$\;
-  }
-  If reference KL is enabled and its byte plan fits, evaluate the frozen
-  reference once per distinct retained input, in family-only calls, and attach
-  the exact sufficient reference outputs to $\mathcal O_g$; otherwise retain the
-  inputs needed to recompute those exact outputs inside each physical family call\;
-  Release leaf reaches, completion workspaces, reduction-frontier summaries,
-  frozen-rollout transients, and topology not owned by the compact target table\;
-}
-$Z\gets\Await(Z^\star)$ and assert $Z>0$\;
-Choose integer $B_{g,m}$ under a common per-GPU time budget by minimizing the
-lagged variance proxy
+The target finalizer stores $\log Z_{g,m}$ and the normalized alias law below, then
+releases the temporary $\log\omega$ rows}
+\KwDef{For $\log Z_{g,m}>-\infty$,
+$q_{g,m}(d)=e^{\log\omega_{g,m,d}-\log Z_{g,m}}$ and
+$\alpha_{g,m}=e^{\log Z_{g,m}-\log Z}$, where
+$\log Z=\operatorname{logsumexp}_{g,m}\log Z_{g,m}$}
+\KwDef{$\mathcal X_m$ is the exact loss domain, $\mathcal Y_m$ the natural
+model-row domain, and $\varphi_m:\mathcal X_m\to\mathcal Y_m$ the fixed
+architecture lookup.  Current, old, and reference quantities at exact state
+$x$ are read directly from model row $\varphi_m(x)$}
+\KwDef{$M_g^{(0)}$ is resident optimization storage excluding optional
+reference caches and one physical-subspan transient, but including immutable
+training storage, model/reference/optimizer state, the flat gradient buffer,
+collective workspace, and one preallocated int32 index buffer sized to the
+largest statistical count allowed by $T_g$.  For cache set $\mathcal C$ define
 \[
-  \sum_{m:Z_{g,m}>0}
-  \frac{(Z_{g,m}/Z)^2\widehat\sigma_{g,m}^2}{B_{g,m}}
-  \quad\textnormal{subject to}\quad
-  \sum_m C_{g,m}(B_{g,m})\leq T_g.
+ M_g^{\rm base}(\mathcal C)=M_g^{(0)}+\sum_{m\in\mathcal C}R_{g,m},\qquad
+ A_g(\mathcal C)=M_{\rm hard}-M_g^{\rm base}(\mathcal C).
 \]
-Use $B_{g,m}\propto Z_{g,m}\widehat\sigma_{g,m}/\sqrt{c_{g,m}}$, where
-$c_{g,m}$ is the calibrated local linear slope of $C_{g,m}$, only as the
-linear-cost warm start; then round/search over efficient family batch quanta\;
-$\theta\gets\theta_k$ on every GPU\;
+$W_{g,m}(J;\mathcal C)$ bounds only the simultaneously live input/target
+gathers, branched action spans, cached-output gathers or uncached reference
+forward, current forward/backward activations, exact-loss reductions, AMP
+temporaries, and backend workspace for decision-index subspan $J$}
+\KwDef{$W^{\rm refbuild}_{g,m}(J;\mathcal C)$ bounds the simultaneously live
+input gather, frozen-reference forward/output, cache scatter, and backend
+workspace while building partition $m$.  Resident bytes for the entire final
+cache set are already charged in $M_g^{\rm base}(\mathcal C)$, making the
+admission test conservative during partial construction; the maximum over an
+empty cache set is defined as zero}
+\KwDef{$\Obj{PhysicalPlan}_{g,m}(I,A;\mathcal C)$ preserves the order of index
+vector $I$ and returns subspans $J$ using a small warmed set
+$\mathcal B_{g,m}$ plus an exact tail.  Every $J$ satisfies
+$W_{g,m}(J;\mathcal C)\leq A$; fail if a singleton cannot fit.  One reusable
+staging arena serves every partition, and calibrated $W$ uses allocator-reserved
+high-water bytes, not merely live tensor bytes}
+\KwDef{Activation checkpointing is off by default.  It may be a separately
+calibrated member of $\mathcal B_{g,m}$ only if its recomputation is included in
+$C_{g,m}$ and it improves measured end-to-end spots/second, or if it is required
+to admit even one decision under the hard byte bound}
+\KwDef{$\widehat\sigma_{g,m}=1$ until observations exist.  Any update is a
+lagged EMA of cheap scalar loss/advantage/residual statistics already produced
+by physical subspans; it never computes per-example parameter gradients or
+copies a full gradient buffer}
+\KwOut{identical $\theta_{k+1}$ and optimizer state on every GPU}
+
+\ForEach{$g\in\mathcal G$ \textbf{as soon as its target builder finishes}}{
+  Read $(\log Z_{g,m},\Obj{AliasTable}_{g,m})_m$; verify their decision domains
+  and launch $\mathcal Z^\star\gets\IAllGather((\log Z_{g,m})_m)$ in the common
+  collective order without an explicit preceding barrier;
+  Assert $\Obj{TrainingStorage}_g$ contains no topology, leaf reach, completion
+  result, frontier, rollout queue/state, or mutable occurrence;
+}
+
+\ForEach{$g\in\mathcal G$ \textbf{in parallel while the reduction progresses}}{
+  First prove that the uncached singleton path fits; otherwise checkpoint and
+  stop cleanly without resampling the rollout.  For each $m$, measure retained
+  reference-output bytes $R_{g,m}$ and predict total learner time, including
+  cache construction and any physical-plan changes.  Select a subset
+  \[
+    \mathcal C_g\in\operatorname*{arg\,min}_{C\subseteq\mathcal M}
+      \widehat C_g^{\rm total}(C)
+    \quad\textnormal{s.t.}\quad
+      M_g^{\rm base}(C)+
+      \max\left\{
+      \max_{m,d:\,\log Z_{g,m}>-\infty}W_{g,m}(\{d\};C),
+      \max_{m\in C,J}W^{\rm refbuild}_{g,m}(J;C)
+      \right\}
+      \leq M_{\rm hard},
+  \]
+  where the finite search always includes $C=\varnothing$.  Transactionally
+  reserve all cache destinations before the first build forward.  For
+  $m\in\mathcal C_g$, evaluate the frozen reference once on every distinct
+  retained input using bounded partition-$m$ physical subspans, scatter its
+  natural $\mathcal Y_m$-row outputs, and release each build subspan immediately.
+  If reservation or a calibrated build contract fails, release every partial
+  cache and use $C=\varnothing$ without changing targets or random draws.  For
+  $m\notin\mathcal C_g$, recompute the reference only for the sampled subspan;
+}
+$\mathcal Z\gets\Await(\mathcal Z^\star)$; compute $\log Z$ by log-sum-exp and
+assert $\log Z>-\infty$;
+
+Choose arbitrary integers $B_{g,m}\geq1$ for every positive-mass stratum by
+minimizing
+\[
+  \sum_{m:\log Z_{g,m}>-\infty}
+  \frac{\alpha_{g,m}^2\widehat\sigma_{g,m}^2}{B_{g,m}}
+  \quad\textnormal{s.t.}\quad
+  \sum_m C_{g,m}(B_{g,m};\mathcal C_g)\leq T_g,
+\]
+using $B_{g,m}\propto
+\alpha_{g,m}\widehat\sigma_{g,m}/\sqrt{c_{g,m}}$ only as an integer-search warm
+start.  $B_{g,m}$ is a statistical sample count: it is not rounded to 32 or to
+any physical shape quantum; $C_{g,m}$ includes the measured subspan plan,
+tail, and launch overhead;
+On every GPU allocate one fp32 flat SUM buffer $G_g$ in fixed parameter order;
+bind every parameter's gradient directly to its corresponding view in $G_g$
+\tcc*[r]{no per-step flatten/copy buffer}
+$\theta\gets\theta_k$;
 
 \For{$t=0,\ldots,K-1$}{
   \ForEach{$g\in\mathcal G$ \textbf{in parallel}}{
-    \ForEach{$m\in\mathcal M:Z_{g,m}>0$}{
-      Sample
-      $(\mathsf S_{g,m,b})_{b=1}^{B_{g,m}}
-      \stackrel{\mathsf{iid}}{\sim}q_{g,m}$ using $Q_{g,m}$\;
+    Zero $G_g$ once;
+    \ForEach{$m:\log Z_{g,m}>-\infty$}{
+      Draw only the integer index vector
+      $I_{g,m}=(D_{g,m,b})_{b=1}^{B_{g,m}}\stackrel{\rm iid}{\sim}q_{g,m}$
+      from its fixed alias table (implicit uniform in sequential modes);
+      $\mathcal J_{g,m}\gets
+      \Obj{PhysicalPlan}_{g,m}(I_{g,m},A_g(\mathcal C_g);\mathcal C_g)$;
+      \ForEach{$J\in\mathcal J_{g,m}$}{
+        Gather only $J$'s aligned partition inputs, decision targets/posterior
+        references, branched action spans when present, and cached reference rows;
+        if $m\notin\mathcal C_g$, evaluate the frozen reference on $J$ under
+        no-grad and retain its output only through this loss;
+        evaluate the current model and immediately backward, with no retained
+        graph, the common-AMP-scale contribution
+        \[
+          \frac{\alpha_{g,m}}{B_{g,m}}
+          \sum_{d\in J}\ModeLoss_{\mathsf m}
+          (\theta;(m,d),\Obj{TrainingStorage}_g)
+        \]
+        directly into the gradient views; update only cheap scalar proxy
+        statistics; release the graph, all gathers, uncached reference output,
+        loss reductions, and subspan staging before the next $J$;
+      }
+      Release $I_{g,m}$; never gather all $B_{g,m}$ rows, normalize a physical
+      subspan, globally sort decisions, inspect the meaning of $m$, or permute
+      exact private-state rows;
     }
-    Set the rank-local stratified loss
-    \[
-      \widehat l_{g,t}(\theta)
-      \gets
-      \sum_{m:Z_{g,m}>0}
-      \alpha_{g,m}\frac{1}{B_{g,m}}
-      \sum_{b=1}^{B_{g,m}}
-      \ModeLoss_{\mathsf m}
-      (\theta;\mathsf S_{g,m,b},\mathcal O_g).
-    \]
-    Keep $\mathcal O_g$ GPU-resident and gather it only by device index tensors.
-    Group the sampled logical decisions only by $m$, coalesce equal current-model
-    inputs while retaining their loss multiplicities, pad and mask mixed public
-    stages inside maximum-feasible family-$m$ physical forward/backward
-    microbatches without subdividing by street, and accumulate the exactly scaled
-    physical loss sums into
-    $G_{g,t}\gets\nabla_\theta\widehat l_{g,t}(\theta)$ without an optimizer step;
-    never average a physical microbatch independently\;
-    Flatten the common-scale fp32 gradients in fixed parameter order into one
-    preallocated buffer, inserting zeros for absent parameters\;
   }
-  $G_t\gets\AllReduceSum_g(G_{g,t})$ on the flat buffers, with no division by
-  $|\mathcal G|$\;
-  Derive the identical nonfinite decision locally from the reduced flat buffer
-  (no second collective), unscale once, apply the common global clipping rule,
-  and set $\theta\gets\OptimizerStep(\theta,G_t)$ and the next loss scale
-  identically on every GPU\;
+  $G\gets\AllReduceSum((G_g)_g)$ with no division by $|\mathcal G|$;
+  derive the identical nonfinite decision from $G$, unscale once, apply the
+  common global clipping rule once, and perform the identical optimizer/loss-scale
+  transition on every GPU;
 }
-$\theta_{k+1}\gets\theta$\;
+$\theta_{k+1}\gets\theta$; release reference caches and all training stores;
 
-\tcc{No path weight is multiplied into a sampled loss: it is already represented by the alias law and $\alpha_{g,m}$.}
-\tcc{Conditionally on the fixed distributed rollout, for every current $\theta$,}
+\tcc{No sampled loss is multiplied by $\omega$ again.  For every current
+$\theta$, conditionally on the fixed distributed rollout,}
 \[
-  \mathbb E(G_t\mid(\mathfrak R_g)_g,\theta)
-  =\nabla_\theta
-  \sum_{g\in\mathcal G}\sum_{\mathsf s\in\mathcal D_g}
-  \frac{\omega_g(\mathsf s)}{Z}
-  \ModeLoss_{\mathsf m}(\theta;\mathsf s,\mathcal O_g).
+ \mathbb E[G\mid(\Obj{TrainingStorage}_g)_g,\theta]
+ =\nabla_\theta\sum_{g,m,d}
+ e^{\log\omega_{g,m,d}-\log Z}
+ \ModeLoss_{\mathsf m}(\theta;(m,d),\Obj{TrainingStorage}_g).
 \]
-\tcc{The flat SUM reduction is intentional: $\alpha_{g,m}=Z_{g,m}/Z$ already
-supplies the exact global normalization, so neither rank-local means nor DDP's
-default equal-rank averaging may be introduced.}
-\Return{$\theta_{k+1}$}\;
+\Return{$\theta_{k+1}$};
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\ModeLoss_{\mathsf m}(\theta;(m,d),\Obj{TrainingStorage})$:
+exact storage-to-math map}
+\label{alg:mode-loss-map}
+\DontPrintSemicolon
+Forward the sampled partition input under $\theta$ on $\mathcal Y_m$.
+For every exact loss state $x\in\mathcal X_m$, index current, old, and optional
+reference outputs at $\varphi_m(x)$; retain no duplicate $X_m$-wide model output;
+\uIf{$\mathsf m=\mathsf{normal}$}{
+  Set $\widehat V=\mathtt{lambdaReturn}[d]$ and
+  $\widehat A=\mathtt{lambdaReturn}[d]-\mathtt{oldV}[d]$ at the stored realized
+  type/event; evaluate the production-v1 normal-mode loss;
+}
+\uElseIf{$\mathsf m=\mathsf{seqRB}$}{
+  Read $w(-)=\Obj{SequentialPosteriorPool}[\mathtt{posteriorRef}[d]]$ and
+  $U(-)=\mathtt{lambdaReturn}[d]$; set $V(-)=U(-)$ and
+  $A(x)=U(x)-\mathtt{oldV}[d,\varphi_m(x)]$; return the exact sum
+  $\sum_{x\in X_m}w(x)\mathcal L_x$ of the sequential RB surrogate;
+}
+\Else{
+  Let $[a_0,a_1)$ be $d$'s action span and
+  $w_d(-)=(a_1-a_0)^{-1}\sum_{a=a_0}^{a_1-1}\mathtt{childPosterior}[a]$;
+  evaluate the node value/entropy/reference terms with $w_d$ and
+  $\mathtt{valueHat}[d]$, plus
+  \[
+    \frac{1}{a_1-a_0}\sum_{a=a_0}^{a_1-1}
+    \sum_{x\in X_m}\mathtt{childPosterior}[a,x]\,
+      \mathcal L^\pi_x(\mathtt{advantageHat}[a,x]).
+  \]
+}
+\tcc{PPO/value clipping, posterior sums, entropy, legal-action reference KL,
+and their production-v1 coefficients are exactly those in
+\texttt{core\_math.tex}.  The fixed
+$\varphi_m$ lookup is part of the model architecture, not a storage transform.}
 \end{algorithm}
 
 \end{document}

@@ -1,0 +1,189 @@
+\documentclass[10pt,varwidth=190mm,border=1mm]{standalone}
+\makeatletter
+\IfFileExists{preamble/preamble.tex}{
+  \def\theoryroot{}
+}{
+  \IfFileExists{../preamble/preamble.tex}{
+    \def\theoryroot{../}
+  }{
+    \IfFileExists{docs/theory/preamble/preamble.tex}{
+      \def\theoryroot{docs/theory/}
+    }{
+      \PackageError{backward_targets}{Cannot locate docs/theory/preamble/preamble.tex}{}
+    }
+  }
+}
+\edef\input@path{{\theoryroot}}
+\makeatother
+\input{\theoryroot preamble/preamble}
+
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0pt}
+\setlength{\algomargin}{1em}
+\SetAlFnt{\footnotesize}
+\SetAlCapFnt{\footnotesize\bfseries}
+\SetAlCapNameFnt{\footnotesize\bfseries}
+\SetAlCapSkip{0.35em}
+\SetKwInput{KwDef}{Definitions}
+\newcommand{\Obj}[1]{\texttt{#1}}
+\newcommand{\Release}{\operatorname{\texttt{Release}}}
+\newcommand{\Complete}{\operatorname{\texttt{Complete}}}
+\newcommand{\Cond}{\operatorname{Cond}}
+
+\begin{document}
+
+\begin{algorithm}[H]
+\caption{$\Obj{TrainingStorage}\gets
+\Obj{BuildNormalTargets}(\Obj{RolloutStorage},\lambda)$}
+\label{alg:normal-streaming-targets}
+\DontPrintSemicolon
+\KwIn{$\Obj{SequentialDecisionCSR}$ with
+$\mathtt{trajectoryPtr}[G+1]$, stable $(m,d)$ rows, and one terminal-reward leaf
+per trajectory; scalar old outputs written by rollout}
+\KwOut{one scalar $\mathtt{lambdaReturn}[d]$ per decision}
+Allocate scalar $\mathtt{lambdaReturn}_m[D_m]$ and exactly-once validity bits;
+\ForEach{bounded trajectory batch $I$ \textbf{on device}}{
+  $g_{i,p}\gets\Obj{LeafTable}[\mathtt{leafRow}[i]].R_p$ for
+  $(i,p)\in I\times\mathcal P$;
+  Reverse segmented-scan
+  $j\in[\mathtt{trajectoryPtr}[i],\mathtt{trajectoryPtr}[i+1])$:
+  \[
+    (m,d)\gets\mathtt{decisionAddress}[j],\quad p\gets\mathtt{owner}[m,d],
+    \quad \mathtt{lambdaReturn}_m[d]\gets g_{i,p},\quad
+    g_{i,p}\gets\lambda g_{i,p}+(1-\lambda)\mathtt{oldV}_m[d].
+  \]
+}
+\tcc{$\widehat V_d=\mathtt{lambdaReturn}[d]$ and
+$\widehat A_d=\mathtt{lambdaReturn}[d]-\mathtt{oldV}[d]$ are views/expressions in
+the loss, never retained tensors.  Chance transitions do not advance a player clock.}
+Assert every decision was written once and the recurrence equals
+\texttt{core\_math.tex}, Eq.~\textnormal{(sequential-$\lambda$-return)};
+\Return{$\Obj{FinalizeTrainingStorage}(\Obj{RolloutStorage})$};
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\Obj{TrainingStorage}\gets
+\Obj{BuildSequentialRBTargets}(\Obj{RolloutStorage},\lambda)$}
+\label{alg:sequential-rb-streaming-targets}
+\DontPrintSemicolon
+\KwIn{$\Obj{SequentialDecisionCSR}$; RB leaves containing exact generated
+reaches and immutable completion inputs; old values stored on natural model rows}
+\KwDef{$\Cond(m,w)=m/w$ elementwise for $w>0$, with exactly the registered
+zero-mass convention from \texttt{core\_math.tex}; $X_m$ is the exact private
+state width, $Y_m$ the model-row width, and
+$v^{\rm old}_{m,d}(x)=\mathtt{oldV}_m[d,\varphi_m(x)]$}
+\KwOut{one exact $\mathtt{lambdaReturn}_m[d,X_m]$ per
+decision and one shared completion posterior row per $(\textnormal{trajectory},p)$}
+Allocate $\mathtt{lambdaReturn}_m[D_m,X_m]$, an append-only
+$\Obj{SequentialPosteriorPool}$, int32 $\mathtt{posteriorRef}_m[D_m]$, and
+exactly-once validity bits;
+\ForEach{bounded trajectory/leaf microbatch $I$ \textbf{on device}}{
+  $C_I\gets\Complete(\Obj{LeafTable}[\mathtt{leafRow}[I]])$;
+  Extract only $w_{i,p}=\widehat{\mathbb P}(-_p\mid\Tau_i^{\mathsf{pre-c}})$ and
+  $v_{i,p}=\widehat V_p(-_p,\Tau_i^{\mathsf{pre-c}})$; set
+  $m_{i,p}\gets w_{i,p}\odot v_{i,p}$; aggregate scalar diagnostics and
+  $\Release(C_I.\textnormal{equity/share/stddev/valid/other outputs})$;
+  Append each required $w_{i,p}$ once to $\Obj{SequentialPosteriorPool}$;
+  Reverse segmented-scan the decisions of each $i\in I$:
+  \[
+    \begin{gathered}
+      (m,d)\gets\mathtt{decisionAddress}[j],\qquad p\gets\mathtt{owner}[m,d],
+      \qquad v^{\rm old}(x)\gets\mathtt{oldV}_m[d,\varphi_m(x)],\\
+      \mathtt{posteriorRef}_m[d]\gets\operatorname{row}(i,p),\qquad
+      \mathtt{lambdaReturn}_m[d]\gets\Cond(m_{i,p},w_{i,p}),\\
+      m_{i,p}\gets\lambda m_{i,p}+(1-\lambda)w_{i,p}\odot v^{\rm old}.
+    \end{gathered}
+  \]
+  $\Release(v_{i,p},m_{i,p},\textnormal{completion and indexed-row scratch})$;
+  retain only the appended $w_{i,p}$ rows;
+}
+\tcc{For every decision, the parent and unique sampled-child posterior are the
+same referenced row.  The loss treats $\mathtt{lambdaReturn}$ as its value
+target and derives advantage by subtracting
+$\mathtt{oldV}_m[d,\varphi_m(x)]$.  V1 exposes no separate $Q$ target or loss.}
+Assert exact equality to Eq.~\textnormal{(Rao--Blackwell-$\lambda$-return)} and
+the sequential RB surrogate in \texttt{core\_math.tex}; no target/private-state
+aggregation is permitted;
+\Return{$\Obj{FinalizeTrainingStorage}(\Obj{RolloutStorage})$};
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\Obj{TrainingStorage}\gets
+\Obj{BuildBranchedRBTargets}(\Obj{RolloutStorage},\lambda)$}
+\label{alg:branched-rb-bounded-targets}
+\DontPrintSemicolon
+\KwIn{one rooted $\Obj{BranchedTreeSpan}$; partition tables; RB leaves}
+\KwDef{For node $s$, its children are the contiguous span
+$[c_s,c_s+n_s)$; at a player node the same order is its action CSR span
+$[a_s,a_s+n_s)$.  A frontier slot is
+$((w_{s,p},m_{s,p})_{p\in\mathcal P})$}
+\KwOut{exact $\mathtt{valueHat}_m[D_m,X_m]$ and, per sampled player edge,
+$\mathtt{childPosterior}_m[A_m,X_m]$,
+$\mathtt{advantageHat}_m[A_m,X_m]$}
+Compute a deterministic depth-first, postorder-compatible leaf schedule.
+Simulate only ready counters to obtain the exact peak live-slot count $F_\star$;
+allocate a fixed $F_\star$ slot arena, node-to-slot map, and ready counters
+\tcc*[r]{no list growth, concatenation, or all-node $[N,P,X]$ memo}
+\ForEach{bounded next leaf microbatch $B$ in that schedule}{
+  $C_B\gets\Complete(\Obj{LeafTable}[B])$; insert
+  $w_{t,p}=\widehat{\mathbb P}(-_p\mid t)$ and
+  $m_{t,p}=w_{t,p}\odot\widehat V_p(-_p,t)$ into reserved slots;
+  aggregate scalar diagnostics and release every other completion result;
+  \While{the ready queue is nonempty}{
+    Gather a maximum-feasible stable batch of ready parents;
+    \ForEach{ready parent $s$ with child slots $u=1,\ldots,n$}{
+      $S_{w,p}\gets\sum_{u=1}^n w_{u,p}$,
+      $S_{m,p}\gets\sum_{u=1}^n m_{u,p}$,
+      $w_{s,p}\gets S_{w,p}/n$, and $m_{s,p}\gets S_{m,p}/n$;
+      \uIf{$s$ is a player decision with address $(m,d)$ and owner $p$}{
+        $v^{\rm old}(x)\gets\mathtt{oldV}_m[d,\varphi_m(x)]$;
+        $\mathtt{valueHat}_m[d]\gets\Cond(S_{m,p},S_{w,p})$;
+        \For{$u=1,\ldots,n$}{
+          $U_u\gets\Cond(m_{u,p},w_{u,p})$;
+          $B_u\gets v^{\rm old}$ if $n=1$, otherwise
+          $B_u\gets\lambda\Cond(S_{m,p}-m_{u,p},S_{w,p}-w_{u,p})
+          +(1-\lambda)v^{\rm old}$;
+          write $\mathtt{childPosterior}[a_s+u-1]\gets w_{u,p}$,
+          $\mathtt{advantageHat}[a_s+u-1]\gets U_u-B_u$;
+        }
+        $m_{s,p}\gets\lambda m_{s,p}+(1-\lambda)w_{s,p}\odot v^{\rm old}$;
+        \tcc*[r]{only the owner moment advances its decision clock}
+      }
+      Release all $n$ child slots and insert only the contracted parent slot;
+      increment its parent's ready counter;
+    }
+  }
+}
+Assert the arena contains only $\varnothing$, every leaf/target was written
+once, and $\varnothing$ received no special multiplicity;
+\tcc{The node posterior used by value/entropy/reference-KL losses is not stored:
+$\widehat P_d=n_d^{-1}\sum_{a=a_d}^{a_d+n_d-1}
+\mathtt{childPosterior}[a]$ is derived in the loss gather.}
+Assert the outputs and propagated moments equal
+\texttt{core\_math.tex}, Eqs.~\textnormal{(branched-backward-updates)} and
+\textnormal{(branched-targets)} after projecting to the fixed-intensity PPO v1
+value and advantage arguments; the optional $Q$ target is deliberately deferred;
+\Return{$\Obj{FinalizeTrainingStorage}(\Obj{RolloutStorage})$};
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\Obj{TrainingStorage}\gets
+\Obj{FinalizeTrainingStorage}(\Obj{RolloutStorage})$}
+\label{alg:finalize-training-storage}
+\DontPrintSemicolon
+Validate row domains, action spans, posterior references, and exactly-once writes;
+For each nonempty partition $m$, retain fp64
+$\log Z_m=\operatorname{logsumexp}_{d\in m}\log\omega_d$ and construct one
+alias sampler with probabilities $\exp(\log\omega_d-\log Z_m)$; use an
+allocation-free uniform sampler in sequential modes;
+Release topology nodes, leaf reaches/inputs, completion/frontier arenas,
+ready counters, public-state handles, child links, and all validity/scratch
+storage; freeze the remaining aligned partition blocks;
+\tcc{Postcondition: the only iteration-owned survivor contains model inputs,
+natural old model rows, exact targets/posteriors, fixed sampling metadata,
+and no object from which a discarded reach must be recomputed.}
+\Return{immutable $\Obj{TrainingStorage}$};
+\end{algorithm}
+
+\end{document}

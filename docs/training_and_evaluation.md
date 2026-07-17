@@ -49,6 +49,65 @@ checkpoint's scientific identity.
 
 ## Training and resume
 
+For every shared-server run, use the repository launcher. It preserves stdout
+and stderr, records start/end GPU snapshots and exit status, and can run in a
+detached `tmux` session:
+
+```bash
+tools/run-training.sh \
+  --config configs/train/nlhe_hu_32bb_sequential_rb_candidate.yaml \
+  --hardware-profile configs/hardware/local_2x2080ti_12h.yaml \
+  --run-dir runs/nlhe_hu_32bb_sequential_rb \
+  --gpus 0,1 --resume runs/nlhe_hu_32bb_sequential_rb/ckpt_0000010.pt \
+  --tmux
+```
+
+The launcher writes timestamped stdout, stderr, combined-output, and command
+files, plus `status.json`, `gpu_start.csv`/`gpu_end.csv`, and sampled
+`gpu_telemetry_*.csv` (temperature, utilization, memory, and power) in the run
+directory. This preserves separate evidence for every resume attempt. The
+status records the final exit code and any signal forwarded to `torchrun`.
+Check a detached run after reconnecting with:
+
+```bash
+tools/run-status.sh runs/nlhe_hu_32bb_sequential_rb
+tmux attach -t pbg-nlhe_hu_32bb_sequential_rb
+```
+
+The candidate sequential-RB run checkpoints every 5 iterations. The
+checkpoint includes the distributed RNG and adaptive-work state needed for
+safe resume. If a selected checkpoint predates metrics already flushed after
+it, resume trims that uncheckpointed suffix and preserves it as
+`metrics.jsonl.before_resume_*.bak`.
+
+## Training diagnostics
+
+Every training iteration records major phase wall time and CUDA peak memory
+for snapshot, rollout, completion, backward estimator, compaction, and the
+full optimization phase. The optimization phase also records host-side time
+for minibatch sampling, forward/loss computation, backward propagation,
+gradient synchronization, and the optimizer update. These subphase timings
+are intentionally marked `*_host_seconds`: CUDA launches are asynchronous, so
+making each subphase GPU-exact would require synchronization at every
+minibatch and would materially distort throughput.
+
+In Rao--Blackwell modes, completion is streamed inside the backward-estimator
+phase. `profiled_iteration_seconds` therefore uses top-level phases only and
+does not double-count completion;
+`phase_backward_estimator_seconds_excluding_completion` provides the derived
+attribution.
+
+For poker rollouts, `decision_nodes_{preflop,flop,turn,river}` and the matching
+`decision_fraction_*` fields describe the decision-node mix. In distributed
+runs, use the `*_global` fractions and `*_rank_sum` counts. Existing
+`execution_*` fields report evaluator calls, transfers, collective bytes and
+time, queue pressure, synchronization, padded inference work, and execution
+memory. `diagnostic_metric_summary_sync_*` additionally covers the small
+cross-rank all-reduces used to produce global diagnostic summaries. Together
+with the launcher GPU telemetry, these are intended to
+separate game-tree mix, estimator quality, model cost, communication cost, and
+hardware saturation.
+
 ```bash
 pbg-train --config configs/train/nlhe6.yaml \
   --hardware-profile local_3x2080ti

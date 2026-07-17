@@ -71,9 +71,21 @@ Every active scientific YAML uses direct `game.n_players`, `stack_bb`, and
 
 - `docs/theory/core_math.tex` — mathematical abstraction.
 - `docs/theory/MHA_model.md` — poker network design.
-- `docs/theory/pseudocode/family_scheduled_rollout.tex` — sole rollout
-  algorithm.
-- `docs/theory/pseudocode/distributed_update.tex` — distributed learner law.
+- `docs/theory/pseudocode/storage_lifecycle.tex` — authoritative storage
+  object, field, indexing, ownership, lifetime, and phase-specific memory
+  contract.
+- `docs/theory/pseudocode/family_scheduled_rollout.tex` — rollout allocation,
+  routing, write, topology-finalization, and rollout-workspace release law.
+- `docs/theory/pseudocode/backward_targets.tex` — normal, sequential-RB, and
+  branched-RB target construction, compaction, and release algorithms.
+- `docs/theory/pseudocode/distributed_update.tex` — partition-local sampling,
+  aligned minibatch materialization, distributed update, and final storage
+  release law.
+
+Together these four sources (and their tracked PDFs) are the decision-complete
+implementation specification: storage ownership is defined once in
+`storage_lifecycle.tex`, while the other three documents govern consecutive
+lifecycle phases and must use its exact future Python object names.
 - `docs/core_algorithms.md` — implementation mapping for all three modes.
 - `docs/poker.md` — NLHE/evaluator/model details.
 - `docs/training_and_evaluation.md` — operational guide.

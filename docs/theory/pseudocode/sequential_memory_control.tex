@@ -1,0 +1,129 @@
+\documentclass[10pt,varwidth=190mm,border=1mm]{standalone}
+\makeatletter
+\IfFileExists{preamble/preamble.tex}{
+  \def\theoryroot{}
+}{
+  \IfFileExists{../preamble/preamble.tex}{
+    \def\theoryroot{../}
+  }{
+    \IfFileExists{docs/theory/preamble/preamble.tex}{
+      \def\theoryroot{docs/theory/}
+    }{
+      \PackageError{sequential_memory_control}{Cannot locate docs/theory/preamble/preamble.tex}{}
+    }
+  }
+}
+\edef\input@path{{\theoryroot}}
+\makeatother
+\input{\theoryroot preamble/preamble}
+
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0pt}
+\setlength{\algomargin}{1em}
+\SetAlFnt{\footnotesize}
+\SetAlCapFnt{\footnotesize\bfseries}
+\SetAlCapNameFnt{\footnotesize\bfseries}
+\SetAlCapSkip{0.35em}
+\SetKwInput{KwDef}{Definitions}
+\newcommand{\Obj}[1]{\texttt{#1}}
+\newcommand{\AllReduceMin}{\operatorname{\texttt{AllReduceMin}}}
+
+\begin{document}
+
+\begin{algorithm}[H]
+\caption{$G_k\gets
+\Obj{ChooseSequentialRootWidth}(\Obj{WidthState}_{k-1})$}
+\label{alg:sequential-memory-root-width}
+\DontPrintSemicolon
+\KwIn{normal or sequential-RB mode; configured integers
+$1\leq G_{\min}\leq G_{\max}$; device set $\mathcal G$; checkpointed
+controller state from completed iterations only}
+\KwHyper{per-device capacity $M_{{\rm device},g}$, unused guard
+$M_{{\rm guard},g}$, growth fraction $\rho\in(0,1)$, successful-iteration
+growth delay $h$, one-sided prediction level $z$, and calibration window $W$}
+\KwDef{$G$ is the common number of new root trajectories per GPU for one
+iteration, so the distributed iteration contains $|\mathcal G|G$ roots.
+The hard ceiling is
+$M_{{\rm hard},g}=M_{{\rm device},g}-M_{{\rm guard},g}$}
+\KwDef{For phase
+$\phi\in\{\mathsf{rollout},\mathsf{seal},\mathsf{targets},
+\mathsf{optimization}\}$, $\widehat M^+_{g,\phi,k}(G)$ is a monotone
+upper prediction formed from the exact byte formulas and reserved capacities
+of \texttt{storage\_lifecycle.tex}.  Variable counts per root use lagged
+one-sided estimates
+$\widehat\mu+z\widehat s$ for decisions, leaves, occurrences, summary-anchor
+bytes, chunk slack, seal destinations/scratch, posterior rows, and physical
+workspace.  Fixed model/optimizer/collective bytes are measured directly.
+Positive residuals widen the bound immediately; a bound may tighten only
+after $W$ successful observations}
+\KwDef{The optional reference cache is excluded from this feasibility proof.
+Optimization must always admit the uncached reference path; a cache may be
+added later only by the hard transactional test in
+\Obj{DistributedFixedRolloutUpdate} from
+\texttt{distributed\_update.tex}}
+\KwOut{one width fixed before any current-iteration random draw, or a clean
+pre-rollout stop if even $G_{\min}$ is unsafe}
+
+\ForEach{$g\in\mathcal G$ \textbf{in parallel}}{
+  Refresh immutable schema bytes, allocator/backend calibration, and the
+  current usable device ceiling; read no statistic from iteration $k$;
+  \uIf{no completed calibration is available}{
+    Evaluate $G_{\min}$ with the declared analytic per-root worst-case geometry
+    and conservative singleton workspaces; set $\widetilde G_g\gets G_{\min}$
+    only if every phase fits, otherwise set it to zero; initialize
+    $G_{k-1}\gets G_{\min}$ and mark growth disabled;
+  }
+  \Else{
+    By integer monotone search compute
+    \[
+      \widetilde G_g\gets\max\left\{G\in[G_{\min},G_{\max}]:
+      \max_\phi\widehat M^+_{g,\phi,k}(G)
+      \leq M_{{\rm hard},g}\right\};
+    \]
+    if this set is empty, set $\widetilde G_g\gets0$;
+  }
+}
+$G^{\rm safe}\gets\AllReduceMin_g\widetilde G_g$
+\tcc*[r]{identical work width and collective order on every rank}
+\If{$G^{\rm safe}<G_{\min}$}{checkpoint and stop before roots, queues, or
+rollout storage are allocated}
+\uIf{$G^{\rm safe}<G_{k-1}$}{
+  $G_k\gets G^{\rm safe}$
+  \tcc*[r]{unsafe evidence causes an immediate decrease}
+}
+\uElseIf{the preceding $h$ completed iterations were below their predicted
+phase ceilings and growth is enabled}{
+  $G_k\gets\min\{G^{\rm safe},G_{\max},
+  \max(G_{k-1}+1,\lfloor(1+\rho)G_{k-1}\rfloor)\}$;
+}
+\Else{$G_k\gets G_{k-1}$;}
+Freeze $G_k$ in the iteration manifest and address roots by $(g,i)$,
+$0\leq i<G_k$; no later admission decision may change this set;
+\Return{$G_k$};
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\Obj{WidthState}_k\gets
+\Obj{ObserveSequentialMemory}(G_k,\Obj{IterationLedger}_k)$}
+\label{alg:observe-sequential-memory}
+\DontPrintSemicolon
+\KwIn{a fully successful synchronized iteration; exact logical counts,
+allocated capacities, allocator-reserved and NVML phase high-water marks,
+physical-plan variants, and backend workspace observations from every GPU}
+\KwOut{checkpointable state used only for iteration $k+1$ and later}
+For each GPU and phase, validate the ledger against the immutable storage
+schema; missing, nonfinite, or inconsistent accounting is unsafe evidence;
+Update per-root count/byte estimators and one-sided residual envelopes.  Apply
+upward surprises immediately; age out an upper observation only after at least
+$W$ later successful observations preserve coverage;
+Record which phase and field constrained the next width, the predicted and
+observed peaks, guard headroom, controller version, and $G_k$;
+Checkpoint the state atomically with the training checkpoint;
+\tcc{Never discard, truncate, reroll, or retry an iteration to make its
+realized geometry fit.  A runtime singleton/admission failure is a clean
+checkpointed stop and conservative next-run evidence, not a new random draw.}
+\Return{$\Obj{WidthState}_k$};
+\end{algorithm}
+
+\end{document}
