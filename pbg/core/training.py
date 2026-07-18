@@ -57,6 +57,7 @@ from pbg.core.normal import (
     sample_normal_minibatch,
 )
 from pbg.core.optimization import (
+    FlatGradientBuffer,
     finite_gated_optimizer_step as _finite_gated_optimizer_step,
     sync_scaled_gradients as _sync_scaled_gradients,
 )
@@ -1322,7 +1323,7 @@ def _build_iteration_data(
                 bundle.rollout_backend,
                 configured_node_budget=cfg.rollout.node_budget,
                 completion_batch_rows=completion_rows,
-                emit_q="q_hat" in spec.required_targets,
+                emit_q=False,
                 max_workspace_bytes=workspace_bytes,
                 decision_players_by_tree=probe_seats,
             ),
@@ -1665,6 +1666,8 @@ def _one_iteration(
         )
 
     model.train()
+    flat_gradient = FlatGradientBuffer(source)
+    source._pbg_direct_flat_gradient_buffer = flat_gradient
     optimization_start = None
     minibatch_count = 0
     if profile:
@@ -1687,7 +1690,7 @@ def _one_iteration(
                 )
 
     for epoch, selected_rows in batches:
-        optimizer.zero_grad(set_to_none=True)
+        flat_gradient.zero_()
         metric_parts: list[dict[str, Tensor]] = []
         variance_ema = getattr(source, "_pbg_family_gradient_variance_ema", None)
         if variance_ema is None:
@@ -1850,6 +1853,7 @@ def _one_iteration(
             model,
             int(os.environ.get("WORLD_SIZE", "1")),
             metrics=execution_metrics,
+            flat_buffer=flat_gradient,
         )
         optimization_host_seconds["gradient_sync"] += time.perf_counter() - sync_start
         update_start = time.perf_counter()

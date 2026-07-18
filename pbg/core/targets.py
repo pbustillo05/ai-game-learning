@@ -103,6 +103,11 @@ def _sampling_metadata(
     for partition_id, block in rollout.partitions.items():
         rows = block.decisions.rows
         if rows == 0:
+            log_z[partition_id] = torch.tensor(
+                -torch.inf,
+                dtype=torch.float64,
+                device=next(iter(block.decisions.columns.values())).device,
+            )
             continue
         if branched:
             log_weight = _column(block.decisions, "log_weight", "logWeight").double()

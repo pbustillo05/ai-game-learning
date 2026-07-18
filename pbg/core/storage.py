@@ -595,6 +595,20 @@ class SamplingMetadata:
         for value in self.log_z.values():
             if value.numel() != 1 or value.dtype != torch.float64:
                 raise ValueError("each partition log Z must be one fp64 scalar")
+            if bool(torch.isnan(value)) or bool(torch.isposinf(value)):
+                raise ValueError("partition log Z must be finite or negative infinity")
+        if set(self.alias_probability) != set(self.alias_index):
+            raise ValueError("alias probability/index tables must have identical keys")
+        for key in self.alias_probability:
+            probability = self.alias_probability[key]
+            alias = self.alias_index[key]
+            if (
+                probability.ndim != 1
+                or probability.dtype != torch.float64
+                or alias.shape != probability.shape
+                or alias.dtype != torch.int32
+            ):
+                raise ValueError("Walker alias tables must be fp64/int32 aligned vectors")
 
 
 @dataclass(frozen=True)

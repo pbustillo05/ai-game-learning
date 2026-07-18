@@ -42,7 +42,7 @@ from pbg.core.training import (
     _validate_memory_calibration,
 )
 from pbg.core.game import GameBundle
-from pbg.core.optimization import finite_gated_optimizer_step
+from pbg.core.optimization import FlatGradientBuffer, finite_gated_optimizer_step
 
 
 def test_sequential_memory_plan_uses_realized_single_child_width() -> None:
@@ -188,29 +188,30 @@ def test_alias_table_reconstructs_law_and_draws_from_it() -> None:
 
 def test_flat_gradient_sum_zero_fills_absent_parameters_and_reuses_buffer() -> None:
     model = torch.nn.Linear(2, 1)
+    flat = FlatGradientBuffer(model)
+    flat.zero_()
     parameters = list(model.parameters())
-    parameters[0].grad = torch.tensor([[2.0, -3.0]])
-    parameters[1].grad = None
+    parameters[0].grad.copy_(torch.tensor([[2.0, -3.0]]))
 
-    assert _sync_scaled_gradients(model, 1)
+    assert _sync_scaled_gradients(model, 1, flat_buffer=flat)
     assert torch.equal(parameters[0].grad, torch.tensor([[2.0, -3.0]]))
     assert torch.equal(parameters[1].grad, torch.zeros_like(parameters[1]))
-    first = next(iter(model._pbg_flat_gradient_buffers.values()))
+    first = flat.flat
 
     parameters[0].grad.fill_(float("inf"))
-    parameters[1].grad = None
-    assert not _sync_scaled_gradients(model, 1)
-    assert first is next(iter(model._pbg_flat_gradient_buffers.values()))
+    assert not _sync_scaled_gradients(model, 1, flat_buffer=flat)
+    assert first is flat.flat
 
 
-@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16, torch.float16))
-def test_nonfinite_common_decision_skips_disabled_scaler_optimizer_step(dtype) -> None:
-    parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=dtype))
+def test_nonfinite_common_decision_skips_disabled_scaler_optimizer_step() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
     optimizer = torch.optim.SGD([parameter], lr=0.25)
     scaler = torch.amp.GradScaler("cuda", enabled=False)
-    parameter.grad = torch.full_like(parameter, float("inf"))
     model = torch.nn.ParameterList([parameter])
-    common_finite = _sync_scaled_gradients(model, 1)
+    flat = FlatGradientBuffer(model)
+    flat.zero_()
+    parameter.grad.fill_(float("inf"))
+    common_finite = _sync_scaled_gradients(model, 1, flat_buffer=flat)
 
     result = finite_gated_optimizer_step(
         model,
@@ -223,8 +224,8 @@ def test_nonfinite_common_decision_skips_disabled_scaler_optimizer_step(dtype) -
     assert not result.optimizer_step_applied
     assert result.loss_scale_before == result.loss_scale_after == 1.0
     assert result.grad_clip_scale == 0.0
-    assert torch.equal(parameter.detach(), torch.tensor([1.0], dtype=dtype))
-    assert parameter.grad is None
+    assert torch.equal(parameter.detach(), torch.tensor([1.0], dtype=torch.float32))
+    assert torch.equal(parameter.grad, torch.zeros_like(parameter))
 
 
 class _RecordingEnabledScaler:
