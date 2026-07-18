@@ -15,7 +15,7 @@ fi
 
 if [[ -f "$run_dir/metrics.jsonl" ]]; then
   echo "--- latest metric ---"
-  tail -n 1 "$run_dir/metrics.jsonl" | jq '{iter,optimizer_steps,loss,sequential_starts_per_gpu_current,sequential_starts_per_gpu_next,iteration_peak_reserved_bytes}'
+  tail -n 1 "$run_dir/metrics.jsonl" | jq '{iter,optimizer_steps,loss,sequential_roots_per_gpu_current,sequential_roots_per_gpu_next,iteration_peak_reserved_bytes}'
 fi
 
 echo "--- GPU state ---"

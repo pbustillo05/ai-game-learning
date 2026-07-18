@@ -29,9 +29,10 @@ def poker_partition_specs(
     """Build ``pre`` plus fixed-width ``post_A`` partitions.
 
     Partition ids are stable: preflop is zero and ``post_A`` is ``A-1``.
-    Names remain diagnostics only.  Public inputs are represented as opaque
-    immutable byte rows here; poker's model-input owner supplies their schema-
-    conforming encoding.
+    Names remain diagnostics only. Public state is retained as one immutable
+    int32 handle into the iteration's read-only tensor-state store. Range rows
+    are stored only on the model's natural domain. Postflop folded summaries
+    are addressed by an immutable dependency anchor and are never inlined.
     """
 
     if not 2 <= n_players <= 6:
@@ -43,9 +44,7 @@ def poker_partition_specs(
 
     def input_schema(partition_id: int, live: int, model_width: int) -> TensorSchema:
         fields = [
-            TensorFieldSchema(
-                "public", torch.uint8, (max(1, int(widths.get(partition_id, 1))),)
-            ),
+            TensorFieldSchema("state_ref", torch.int32, fill=-1, alignment=4),
             TensorFieldSchema(
                 "range_weights", torch.float32, (live, model_width), alignment=16
             ),

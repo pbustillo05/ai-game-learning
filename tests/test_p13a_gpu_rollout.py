@@ -815,8 +815,7 @@ def test_real_sibling_execution_poker_cpu_is_logically_addressed_and_collision_f
         "event",
         "old_logp",
         "old_v",
-        "advantage",
-        "v_target",
+        "lambda_return",
     ):
         torch.testing.assert_close(
             getattr(datasets[0], field)[canonical_orders[0]],

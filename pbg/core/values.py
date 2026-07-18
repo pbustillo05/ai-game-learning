@@ -31,8 +31,8 @@ class HeadEvals:
 class NodeTargets:
     """Posterior targets aligned with stored player-decision nodes.
 
-    The padded dimensions are ``[Nd,E,X]``.  ``q_hat`` is absent unless the
-    caller requests it.
+    This compatibility producer is consumed immediately by the sealed-store
+    boundary. Production v1 has no separately retained Q target.
     """
 
     node_ids: Tensor  # int32 [Nd]
@@ -43,7 +43,6 @@ class NodeTargets:
     child_event_row: Tensor  # int32 [Nd,E]
     child_mask: Tensor  # bool [Nd,E]
     child_count: Tensor  # int32 [Nd]
-    q_hat: Tensor | None = None  # float32 [Nd,E,X]
 
 
 @dataclass
@@ -143,8 +142,6 @@ def emit(
     baseline = repeated_old_v.clone()
     baseline[multi] = float(lam) * sibling[multi] + (1.0 - float(lam)) * repeated_old_v[multi]
     result.a_hat[edge_rows, child_slots] = q_value - baseline
-    if result.q_hat is not None:
-        result.q_hat[edge_rows, child_slots] = q_value
 
 
 def _reject_low_precision(name: str, value: Tensor) -> None:
@@ -245,7 +242,7 @@ def _layout_from_shape(
     )
 
 
-def _empty_targets(layout: _Layout, emit_q: bool) -> NodeTargets:
+def _empty_targets(layout: _Layout) -> NodeTargets:
     nd, e_max, x_max = int(layout.decision_nodes.numel()), layout.e_max, layout.x_max
     zeros = lambda *shape: torch.zeros(shape, dtype=torch.float32, device=layout.device)
     return NodeTargets(
@@ -257,7 +254,6 @@ def _empty_targets(layout: _Layout, emit_q: bool) -> NodeTargets:
         child_event_row=torch.full((nd, e_max), -1, dtype=torch.int32, device=layout.device),
         child_mask=torch.zeros((nd, e_max), dtype=torch.bool, device=layout.device),
         child_count=layout.child_count_all[layout.decision_nodes].to(torch.int32),
-        q_hat=zeros(nd, e_max, x_max) if emit_q else None,
     )
 
 
@@ -291,7 +287,6 @@ def _compact_single_child_posterior(result: NodeTargets) -> None:
 def _frontier_memory_plan_from_shape(
     tree: TreeBatch,
     layout: _Layout,
-    emit_q: bool,
     leaf_input_bytes: int,
 ) -> BackwardFrontierMemoryPlan:
     """Plan a full or incrementally supplied completion/value phase."""
@@ -305,8 +300,6 @@ def _frontier_memory_plan_from_shape(
         layout.x_max,
     )
     target_float_values = nd * x_max * (2 + 2 * e_max)
-    if emit_q:
-        target_float_values += nd * e_max * x_max
     target_bytes = (
         target_float_values * 4
         + nd * 4  # node ids
@@ -499,7 +492,6 @@ def streamed_branched_value(
     *,
     configured_node_budget: int,
     completion_batch_rows: int,
-    emit_q: bool = False,
     max_workspace_bytes: int = 1 << 30,
     decision_players_by_tree: Tensor | None = None,
 ) -> NodeTargets:
@@ -536,9 +528,7 @@ def streamed_branched_value(
         * layout.x_max
         * (3 * 4 + 1)
     )
-    plan = _frontier_memory_plan_from_shape(
-        tree, layout, bool(emit_q), completion_bytes
-    )
+    plan = _frontier_memory_plan_from_shape(tree, layout, completion_bytes)
     if plan.peak_bytes > max_workspace_bytes:
         gib = 1024**3
         raise MemoryError(
@@ -546,7 +536,7 @@ def streamed_branched_value(
             f"{plan.peak_bytes / gib:.3f} GiB, exceeding the configured "
             f"{max_workspace_bytes / gib:.3f} GiB byte budget"
         )
-    result = _empty_targets(layout, bool(emit_q))
+    result = _empty_targets(layout)
     _edge_metadata(result, tree, layout)
     if layout.n:
         _reduce_streamed_leaf_batches(

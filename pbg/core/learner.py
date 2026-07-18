@@ -612,9 +612,6 @@ def mode_loss(
     rows = rows.to(dtype=torch.int64, device=next(iter(partition.columns.values())).device)
     phi = spec.phi(device=rows.device)
     legal_ids, legal_mask = _legal(partition, rows)
-    selected_logp, entropy, reference_kl = _policy_terms(
-        output, reference, legal_ids, legal_mask, adapter, phi
-    )
     c_v = float(getattr(loss_cfg, "c_v"))
     c_kl = float(getattr(loss_cfg, "c_kl", 0.0))
     eps = float(getattr(loss_cfg, "clip_eps"))
@@ -622,15 +619,6 @@ def mode_loss(
     clipped_value = getattr(loss_cfg, "value_loss", "mse") == "clipped"
     eps_v = float(getattr(loss_cfg, "clip_eps_v"))
     natural_value = output.v
-    exact_value = _exact_rows(natural_value, phi)
-
-    def value_elements(target: Tensor, old_natural: Tensor) -> Tensor:
-        old = _exact_rows(old_natural, phi)
-        plain = (exact_value - target).square()
-        if clipped_value:
-            clipped = old + (exact_value - old).clamp(-eps_v, eps_v)
-            plain = torch.maximum(plain, (clipped - target).square())
-        return c_v * plain
 
     columns = partition.columns
     if mode == "normal":
@@ -651,13 +639,37 @@ def mode_loss(
             v_clipped = old_value + (current_value - old_value).clamp(-eps_v, eps_v)
             plain_value = torch.maximum(plain_value, (v_clipped - target).square())
         value = c_v * plain_value
-        selected_entropy = entropy[batch, exact_type]
-        selected_kl = reference_kl[batch, exact_type]
+        natural_entropy = adapter.entropy(output, legal_ids, legal_mask)
+        selected_entropy = natural_entropy[batch, model_type]
+        if reference is None:
+            selected_kl = torch.zeros_like(selected_entropy)
+        else:
+            try:
+                natural_kl = adapter.kl(
+                    output, reference, legal_ids, legal_mask
+                )
+            except TypeError:
+                natural_kl = adapter.kl(output, reference)
+            selected_kl = natural_kl[batch, model_type]
         entropy_loss = -entropy_coefficient * selected_entropy
         kl_loss = c_kl * selected_kl
         per_decision = policy + value + entropy_loss + kl_loss
         weight = torch.ones_like(per_decision)
-    elif mode == "sequential_rb":
+    else:
+        selected_logp, entropy, reference_kl = _policy_terms(
+            output, reference, legal_ids, legal_mask, adapter, phi
+        )
+        exact_value = _exact_rows(natural_value, phi)
+
+        def value_elements(target: Tensor, old_natural: Tensor) -> Tensor:
+            old = _exact_rows(old_natural, phi)
+            plain = (exact_value - target).square()
+            if clipped_value:
+                clipped = old + (exact_value - old).clamp(-eps_v, eps_v)
+                plain = torch.maximum(plain, (clipped - target).square())
+            return c_v * plain
+
+    if mode == "sequential_rb":
         if storage.posterior_pool is None:
             raise ValueError("sequential RB requires its posterior pool")
         posterior_ref = _column(columns, "posterior_ref")[rows].long()
@@ -730,7 +742,7 @@ def mode_loss(
         entropy_loss = (weight * (-entropy_coefficient * entropy)).sum(1)
         kl_loss = (weight * (c_kl * reference_kl)).sum(1)
         per_decision = policy + value + entropy_loss + kl_loss
-    else:
+    elif mode != "normal":
         raise ValueError(f"unsupported production-v1 mode {mode!r}")
 
     stats = MappingProxyType(
@@ -762,6 +774,8 @@ class DistributedLearnerConfig:
     hard_bytes: int | None = None
     resident_base_bytes: int = 0
     reference_candidates: tuple[ReferenceCacheCandidate, ...] = ()
+    amp_enabled: bool = False
+    amp_dtype: torch.dtype = torch.float16
 
     def __post_init__(self) -> None:
         counts = {int(key): int(value) for key, value in self.statistical_counts.items()}
@@ -816,6 +830,20 @@ class DistributedFixedRolloutUpdate:
             key: PhysicalPlanner(value) for key, value in config.physical_shapes.items()
         }
 
+    def _forward_partition(
+        self,
+        spec: PartitionSpec,
+        model: nn.Module,
+        inputs: Mapping[str, Tensor],
+    ) -> Any:
+        device = next(model.parameters()).device
+        with torch.autocast(
+            device_type=device.type,
+            enabled=self.config.amp_enabled,
+            dtype=self.config.amp_dtype,
+        ):
+            return _forward(spec, model, inputs)
+
     def _cache_choice(self) -> ReferenceCacheChoice:
         hard = (
             self.config.resident_base_bytes
@@ -861,7 +889,7 @@ class DistributedFixedRolloutUpdate:
                 partition = storage.partitions[partition_id]
                 one = torch.zeros(1, dtype=torch.int64, device=self.index_buffer.tensor.device)
                 with torch.no_grad():
-                    probes[partition_id] = _forward(
+                    probes[partition_id] = self._forward_partition(
                         self.partitions[partition_id],
                         self.reference_model,
                         _gather_inputs(partition, one),
@@ -887,7 +915,7 @@ class DistributedFixedRolloutUpdate:
                 for span in planner.plan(all_rows, self.config.available_transient_bytes):
                     rows = span.select(all_rows).long()
                     with torch.no_grad():
-                        output = _forward(
+                        output = self._forward_partition(
                             self.partitions[partition_id],
                             self.reference_model,
                             _gather_inputs(partition, rows),
@@ -947,7 +975,7 @@ class DistributedFixedRolloutUpdate:
                 if not partition.inputs.rows:
                     continue
                 with torch.no_grad():
-                    singleton_output = _forward(
+                    singleton_output = self._forward_partition(
                         self.partitions[partition_id],
                         self.reference_model,
                         _gather_inputs(partition, singleton_rows),
@@ -970,12 +998,16 @@ class DistributedFixedRolloutUpdate:
         tail_total = 0
         model_rows = 0
         reference_rows = int(metrics.get("reference_cache_build_rows", 0.0))
-        objective_mass = 0.0
+        objective_mass = torch.zeros(
+            (), dtype=torch.float32, device=self.index_buffer.tensor.device
+        )
         subspan_histogram: dict[int, int] = {}
         partition_sampled: dict[int, int] = {}
         partition_model_rows: dict[int, int] = {}
         partition_reference_rows: dict[int, int] = {}
         activation_checkpointed = 0
+        objective_terms: dict[str, Tensor] = {}
+        ratio_maximum: Tensor | None = None
         if self.index_buffer.tensor.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.index_buffer.tensor.device)
         for _ in range(optimizer_steps):
@@ -998,7 +1030,9 @@ class DistributedFixedRolloutUpdate:
                         partition.inputs.rows, count, generator
                     )
                 alpha = alphas[rank, position].to(torch.float32)
-                objective_mass += float(alpha)
+                # Keep stratum mass device-resident. Converting each alpha to
+                # Python here serialized every partition behind prior kernels.
+                objective_mass = objective_mass + alpha.detach()
                 planner = self._planners[partition_id]
                 spans = planner.plan(indices, self.config.available_transient_bytes)
                 sampled_total += count
@@ -1020,7 +1054,7 @@ class DistributedFixedRolloutUpdate:
                             reference_output = _output_rows(caches[partition_id], rows)
                         else:
                             with torch.no_grad():
-                                reference_output = _forward(
+                                reference_output = self._forward_partition(
                                     partition_spec, self.reference_model, inputs
                                 )
                             reference_rows += rows.numel()
@@ -1028,22 +1062,45 @@ class DistributedFixedRolloutUpdate:
                                 partition_reference_rows.get(partition_id, 0)
                                 + rows.numel()
                             )
-                    output = _forward(partition_spec, self.model, inputs)
+                    output = self._forward_partition(
+                        partition_spec, self.model, inputs
+                    )
                     model_rows += rows.numel()
                     partition_model_rows[partition_id] = (
                         partition_model_rows.get(partition_id, 0) + rows.numel()
                     )
-                    result = mode_loss(
-                        storage.mode,
-                        partition_spec,
-                        storage,
-                        partition,
-                        rows,
-                        output,
-                        self.adapter,
-                        self.loss_cfg,
-                        iteration=iteration,
-                        reference=reference_output,
+                    with torch.autocast(
+                        device_type=self.index_buffer.tensor.device.type,
+                        enabled=self.config.amp_enabled,
+                        dtype=self.config.amp_dtype,
+                    ):
+                        result = mode_loss(
+                            storage.mode,
+                            partition_spec,
+                            storage,
+                            partition,
+                            rows,
+                            output,
+                            self.adapter,
+                            self.loss_cfg,
+                            iteration=iteration,
+                            reference=reference_output,
+                        )
+                    normalization = alpha.to(result.per_decision) / count
+                    for name in (
+                        "loss_sum",
+                        "policy_sum",
+                        "value_sum",
+                        "entropy_loss_sum",
+                        "reference_kl_sum",
+                    ):
+                        term = normalization * result.stats[name]
+                        objective_terms[name] = objective_terms.get(name, term.new_zeros(())) + term
+                    current_ratio = result.stats["ratio_max"].detach()
+                    ratio_maximum = (
+                        current_ratio
+                        if ratio_maximum is None
+                        else torch.maximum(ratio_maximum, current_ratio)
                     )
                     contribution = alpha.to(result.per_decision) / count * result.per_decision.sum()
                     self.scaler.scale(contribution).backward()
@@ -1088,6 +1145,21 @@ class DistributedFixedRolloutUpdate:
             )
         for rows, count in subspan_histogram.items():
             metrics[f"physical_subspan_rows_{rows}"] = float(count)
+        metric_names = {
+            "loss_sum": "loss",
+            "policy_sum": "policy",
+            "value_sum": "value",
+            "entropy_loss_sum": "entropy_loss",
+            "reference_kl_sum": "reference_kl",
+        }
+        for source_name, target_name in metric_names.items():
+            metrics[target_name] = float(objective_terms.get(source_name, torch.zeros(())))
+        metrics["ratio_max"] = (
+            0.0 if ratio_maximum is None else float(ratio_maximum)
+        )
+        if steps:
+            for name, value in steps[-1].metrics().items():
+                metrics[name] = float(value)
         if self.index_buffer.tensor.device.type == "cuda":
             metrics["training_peak_allocated_bytes"] = float(
                 torch.cuda.max_memory_allocated(self.index_buffer.tensor.device)

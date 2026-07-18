@@ -24,8 +24,7 @@ class NormalDataset:
     event: Tensor  # int32 [D]
     old_logp: Tensor  # float32 [D]
     old_v: Tensor  # float32 [D]
-    advantage: Tensor  # float32 [D]
-    v_target: Tensor  # float32 [D]
+    lambda_return: Tensor  # float32 [D]
 
     def __len__(self) -> int:
         return int(self.state_refs.numel())
@@ -89,8 +88,7 @@ def build_normal_dataset_from_sampled(
             event=torch.empty(0, dtype=torch.int32, device=device),
             old_logp=torch.empty(0, dtype=torch.float32, device=device),
             old_v=torch.empty(0, dtype=torch.float32, device=device),
-            advantage=torch.empty(0, dtype=torch.float32, device=device),
-            v_target=torch.empty(0, dtype=torch.float32, device=device),
+            lambda_return=torch.empty(0, dtype=torch.float32, device=device),
         )
 
     leaf = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero(as_tuple=False).squeeze(1)
@@ -162,8 +160,7 @@ def build_normal_dataset_from_sampled(
         event=event,
         old_logp=old_logp.detach().float(),
         old_v=old_v.detach().float(),
-        advantage=(q_target - old_v).detach().float(),
-        v_target=q_target.detach().float(),
+        lambda_return=q_target.detach().float(),
     )
 
 
@@ -195,15 +192,17 @@ def gather_normal_minibatch(
     rows = rows.to(device=dataset.state_refs.device, dtype=torch.int64)
     states = dataset.state_refs[rows]
     legal_ids, legal_mask = bundle.rollout_backend.legal_events(states)
+    target = dataset.lambda_return[rows]
+    old_value = dataset.old_v[rows]
     return NormalMinibatch(
         state_refs=states,
         reach=dataset.reach.gather(rows, bundle.rollout_backend),
         actor_type=dataset.actor_type[rows],
         event=dataset.event[rows],
         old_logp=dataset.old_logp[rows],
-        old_v=dataset.old_v[rows],
-        advantage=dataset.advantage[rows],
-        v_target=dataset.v_target[rows],
+        old_v=old_value,
+        advantage=target - old_value,
+        v_target=target,
         legal_event_ids=legal_ids,
         legal_event_mask=legal_mask,
     )

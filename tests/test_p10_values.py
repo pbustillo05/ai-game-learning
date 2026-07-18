@@ -63,7 +63,7 @@ def _run(lam: float, **kwargs) -> NodeTargets:
     leaves = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero().squeeze(1)
     return streamed_branched_value(
         tree, leaves, [(leaves.to(torch.int32), stats)], None, heads, lam, _Game(),
-        configured_node_budget=5, completion_batch_rows=leaves.numel(), emit_q=True,
+        configured_node_budget=5, completion_batch_rows=leaves.numel(),
         **kwargs,
     )
 
@@ -77,20 +77,20 @@ def test_values_module_is_the_corrected_public_api_and_masks_padding() -> None:
         targets.parent_p_hat[:, 2],
         torch.where(actors == 0, 0.0, targets.parent_p_hat[:, 2]),
     )
-    assert targets.q_hat is not None
+    assert not hasattr(targets, "q_hat")
     padding = (~targets.child_mask[:, :, None]).expand_as(targets.a_hat)
     assert torch.equal(targets.a_hat.masked_select(padding), torch.zeros(3))
 
 
 @pytest.mark.parametrize("lam", [0.0, 0.5, 0.95, 1.0])
-def test_lambda_boundaries_are_finite_and_q_is_opt_in(lam: float) -> None:
+def test_lambda_boundaries_are_finite_without_q_storage(lam: float) -> None:
     tree, stats, heads = _fixture()
     leaves = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero().squeeze(1)
     targets = streamed_branched_value(
         tree, leaves, [(leaves.to(torch.int32), stats)], None, heads, lam, _Game(),
         configured_node_budget=5, completion_batch_rows=leaves.numel(),
     )
-    assert targets.q_hat is None
+    assert not hasattr(targets, "q_hat")
     assert torch.isfinite(targets.a_hat).all()
     assert torch.isfinite(targets.v_hat).all()
 
@@ -119,9 +119,8 @@ def test_streamed_leaf_batches_match_single_completion_batch() -> None:
         _Game(),
         configured_node_budget=5,
         completion_batch_rows=1,
-        emit_q=True,
     )
-    for field in ("parent_p_hat", "child_p_hat", "a_hat", "v_hat", "q_hat"):
+    for field in ("parent_p_hat", "child_p_hat", "a_hat", "v_hat"):
         assert torch.equal(getattr(base, field), getattr(chunked, field))
 
 

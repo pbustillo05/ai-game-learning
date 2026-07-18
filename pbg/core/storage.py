@@ -18,6 +18,10 @@ from torch import Tensor
 from pbg.core.execution import ByteAccountant
 
 
+ROLLOUT_STORAGE_SCHEMA_VERSION = "pbg-rollout-storage-v1"
+TRAINING_STORAGE_SCHEMA_VERSION = "pbg-training-storage-v1"
+
+
 def _dtype_size(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
@@ -503,10 +507,13 @@ class RolloutStorage:
     topology: Any
     leaves: SealedTensorBlock
     seal_metrics: Mapping[str, SealMetrics] = field(default_factory=dict)
+    schema_version: str = ROLLOUT_STORAGE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         if self.mode not in {"normal", "sequential_rb", "branched_rb"}:
             raise ValueError("unknown rollout storage mode")
+        if self.schema_version != ROLLOUT_STORAGE_SCHEMA_VERSION:
+            raise ValueError("unsupported rollout storage schema version")
         partitions = {int(key): value for key, value in self.partitions.items()}
         if any(key != value.partition_id for key, value in partitions.items()):
             raise ValueError("partition block keys must equal stable partition ids")
@@ -619,6 +626,7 @@ class TrainingStorage:
     partitions: Mapping[int, TrainingPartition]
     sampling: SamplingMetadata
     posterior_pool: SequentialPosteriorPool | None = None
+    schema_version: str = TRAINING_STORAGE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -626,6 +634,8 @@ class TrainingStorage:
             "partitions",
             MappingProxyType({int(key): value for key, value in self.partitions.items()}),
         )
+        if self.schema_version != TRAINING_STORAGE_SCHEMA_VERSION:
+            raise ValueError("unsupported training storage schema version")
         if self.mode == "sequential_rb" and self.posterior_pool is None:
             raise ValueError("sequential RB training storage requires a posterior pool")
         if self.mode != "sequential_rb" and self.posterior_pool is not None:

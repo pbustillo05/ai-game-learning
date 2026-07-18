@@ -219,12 +219,11 @@ def test_every_rank_count_runs_preflop_and_postflop_policy_boundaries(
             EventBatch(torch.tensor([CHECK_CALL], dtype=torch.int32)),
         )
     cards = torch.tensor([geometry.active_cards[:3]], dtype=torch.int16)
-    parent = state
-    state = backend.step(
-        state,
-        EventBatch(torch.zeros(1, dtype=torch.int32), {"cards": cards}),
+    chance_event = EventBatch(
+        torch.zeros(1, dtype=torch.int32), {"cards": cards}
     )
-    reach = backend.replay_chance_reach(reach, parent, state)
+    reach = backend.reach_update(reach, state, chance_event, None)
+    state = backend.step(state, chance_event)
     with torch.no_grad():
         postflop = backend.policy_forward(model, state, reach)
     assert postflop.v.shape == (1, geometry.n_hands)

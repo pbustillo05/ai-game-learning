@@ -148,6 +148,11 @@ class PokerRolloutBackend:
             rank_count=cfg.rank_count
         )
         initial_beta = int(getattr(self.partition_adapter, "beta_rank", 16))
+        self._fallback_partition_service = (
+            (self.partition_adapter, self.partition_summary_cache)
+            if not hasattr(self.partition_adapter, "beta_rank")
+            else None
+        )
         self._partition_services = {
             initial_beta: (self.partition_adapter, self.partition_summary_cache)
         }
@@ -925,34 +930,6 @@ class PokerRolloutBackend:
         ).any(3).any(2)  # [B,H]
         return result.masked_fill(conflict[:, None, :], -torch.inf)
 
-    def replay_chance_reach(
-        self, reach: Tensor, parent_states: Tensor, child_states: Tensor
-    ) -> Tensor:
-        """Replay a dealt-board compatibility update from successor state data.
-
-        ``TreeBatch`` deliberately stores compact public labels only.  The poker
-        state store already retains each child board, so replay can apply the
-        exact same hand-conflict mask as the rollout without retaining a
-        poker-specific ``EventBatch.payload[\"cards\"]`` on every tree edge.
-        Reapplying already-known parent board cards is idempotent.
-        """
-
-        self._validate_handles(parent_states)
-        self._validate_handles(child_states)
-        if reach.ndim != 3 or reach.shape != (
-            parent_states.shape[0], self.n_players, self.n_hands
-        ):
-            raise ValueError("reach has the wrong compact hand width")
-        if parent_states.shape != child_states.shape:
-            raise ValueError("parent_states and child_states must have matching shapes")
-        child_board = self.states.board[child_states.to(torch.int64)]  # [B,5]
-        real = child_board >= 0
-        conflict = (
-            (self.combo_cards[None, :, :, None] == child_board[:, None, None, :])
-            & real[:, None, None, :]
-        ).any(3).any(2)  # [B,H]
-        return reach.masked_fill(conflict[:, None, :], -torch.inf)
-
     def encode_public(self, states: Tensor) -> PokerPublicBatch:
         """Construct model public inputs from handles ``[B]``."""
 
@@ -1127,6 +1104,33 @@ class PokerRolloutBackend:
         live = (self.states.status[rows] != FOLDED).sum(1).to(torch.int64)
         return torch.where(street == 0, torch.zeros_like(live), live)
 
+    def training_partition_specs(self):
+        """Return poker-owned natural-width partitions for generic training."""
+
+        from pbg.games.poker.partitions import poker_partition_specs
+
+        def router(states: Any) -> int | Tensor:
+            routed = self.rollout_family_ids(states)
+            if isinstance(routed, Tensor):
+                return torch.where(routed == 0, routed, routed - 1).to(torch.int64)
+            value = int(routed)
+            return 0 if value == 0 else value - 1
+
+        forwards = {
+            partition_id: (
+                lambda model, inputs, partition_id=partition_id: self.policy_forward_partition(
+                    model, partition_id, inputs
+                )
+            )
+            for partition_id in range(self.n_players)
+        }
+        return poker_partition_specs(
+            rank_count=self.cfg.rank_count,
+            n_players=self.n_players,
+            router=router,
+            forwards=forwards,
+        )
+
     def rollout_row_cost(
         self, model: nn.Module, states: Tensor
     ) -> tuple[Tensor, Tensor]:
@@ -1193,6 +1197,9 @@ class PokerRolloutBackend:
         post = getattr(source, "postflop", None)
         beta = int(getattr(getattr(post, "cfg", None), "folder_beta_rank", 16))
         service = self._partition_services.get(beta)
+        if service is None and self._fallback_partition_service is not None:
+            service = self._fallback_partition_service
+            self._partition_services[beta] = service
         if service is None:
             service = (
                 PokerGPUPartitionAdapter(
@@ -1375,6 +1382,100 @@ class PokerRolloutBackend:
         )
         return output
 
+    def policy_forward_partition(
+        self,
+        frozen_model: nn.Module,
+        partition_id: int,
+        inputs: Mapping[str, Tensor],
+    ) -> PolicyOutput:
+        """Forward one sealed natural-width learner partition.
+
+        Preflop stays on ``K=R**2`` rows. Postflop stores only live ``[A,H]``
+        ranges and reads evaluator-owned folded summaries through the immutable
+        dependency anchor populated during rollout.
+        """
+
+        states = inputs.get("state_ref")
+        natural = inputs.get("range_weights")
+        if not isinstance(states, Tensor) or not isinstance(natural, Tensor):
+            raise TypeError("sealed poker inputs require state_ref and range_weights")
+        states = states.to(device=self.device, dtype=torch.int32)
+        rows = states.to(torch.int64)
+        pub = self.encode_public(states)
+        if partition_id == 0:
+            expected = (states.numel(), self.n_players, self.n_classes)
+            if tuple(natural.shape) != expected:
+                raise ValueError(f"preflop natural ranges must have shape {expected}")
+            if not bool((self.states.street[rows] == 0).all()):
+                raise ValueError("preflop partition contains a postflop state")
+            source = frozen_model.module if hasattr(frozen_model, "module") else frozen_model
+            output = source.preflop(
+                pub,
+                natural.to(torch.float32),
+                pub.to_act,
+                PreflopMasks(seat_mask=pub.seat_mask, status=pub.status),
+            )
+            if output.v.shape[1] != self.n_classes:
+                raise ValueError("preflop learner forward expanded its natural domain")
+            family = "pre"
+        else:
+            live = int(partition_id) + 1
+            expected = (states.numel(), live, self.n_hands)
+            if tuple(natural.shape) != expected:
+                raise ValueError(f"postflop natural ranges must have shape {expected}")
+            status = self.states.status[rows]
+            actual_live = (status != FOLDED).sum(1)
+            if not bool(((self.states.street[rows] != 0) & (actual_live == live)).all()):
+                raise ValueError("postflop partition router/domain mismatch")
+            live_seat_ids = torch.where(
+                status != FOLDED,
+                torch.arange(self.n_players, device=self.device)[None],
+                self.n_players,
+            ).sort(1).values[:, :live]
+            weights = torch.ones(
+                (states.numel(), self.n_players, self.n_hands),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            batch = torch.arange(states.numel(), device=self.device)[:, None]
+            weights[batch, live_seat_ids] = natural.to(torch.float32)
+            source = frozen_model.module if hasattr(frozen_model, "module") else frozen_model
+            post_model = getattr(source, "postflop", None)
+            consumes_partition = bool(
+                getattr(
+                    post_model,
+                    "requires_partition_summary",
+                    getattr(getattr(post_model, "cfg", None), "evaluator_summary_dim", 0) > 0,
+                )
+            )
+            summary = (
+                self._partition_summary(states, pub.board, weights, status, live)
+                if consumes_partition
+                else None
+            )
+            masks = PostflopMasks(
+                compatibility=self._compatibility(pub.board),
+                seat_mask=pub.seat_mask,
+                combo_mask=weights > 0,
+                status=pub.status,
+                evaluator_summary=summary,
+                live_seat_ids=live_seat_ids,
+                compact_size=math.comb(self.n_cards - 3, 2),
+            )
+            output = frozen_model.forward_postflop(pub, weights, pub.to_act, masks)
+            if output.v.shape[1] != self.n_hands:
+                raise ValueError("postflop learner forward changed the canonical domain")
+            family = f"post_{live}"
+        width = self._family_maximum_width(frozen_model, family)
+        self.execution_metrics.record_model_call(
+            "training" if torch.is_grad_enabled() else "inference",
+            family,
+            states.numel(),
+            padded_tokens=states.numel() * width,
+            padded_token_pairs=states.numel() * width * width,
+        )
+        return output
+
     def policy_forward_family_actual_cost(
         self,
         frozen_model: nn.Module,
@@ -1492,6 +1593,35 @@ class PokerRolloutBackend:
             + self.max_rollout_steps
             + k_act
         )
+
+    def training_transient_bytes(
+        self, model: nn.Module, family: str, rows: int, *, amp: bool
+    ) -> int:
+        """Conservative activation/workspace bound for one learner subspan."""
+
+        if isinstance(rows, bool) or rows <= 0:
+            raise ValueError("training workspace rows must be positive")
+        source = model.module if hasattr(model, "module") else model
+        branch = source.preflop if family == "pre" else source.postflop
+        cfg = branch.cfg
+        tokens = self._family_maximum_width(source, family)
+        layers = int(cfg.n_layers_pre if family == "pre" else cfg.n_layers_post)
+        scalar_bytes = 2 if amp else 4
+        # Per layer: attention scores/probabilities plus Q/K/V/output,
+        # residual/normalization and FFN saved activations. The 3/2 guard also
+        # covers gathered inputs, loss tensors, and allocator bin rounding.
+        attention = 2 * int(cfg.n_heads) * tokens * tokens * 4
+        ffn_hidden = int(cfg.ffn_hidden or (4 * cfg.d_model))
+        features = tokens * (
+            12 * int(cfg.d_model) + 4 * ffn_hidden
+        ) * scalar_bytes
+        per_row = layers * (attention + features)
+        natural = (
+            self.n_players * self.n_classes
+            if family == "pre"
+            else (int(family.removeprefix("post_")) * self.n_hands)
+        ) * 4
+        return math.ceil(rows * (per_row + natural) * 1.5)
 
     def compact_decision_reach(
         self, states: Tensor, reach: Tensor

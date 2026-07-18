@@ -95,8 +95,6 @@ class TrainingConfig:
     kl_ref_interval: int = 1
     optimizer: str = "adam"
     ppo_epochs: int | None = None
-    target_node_reuse: float | None = None
-    kl_ref_optimizer_steps: int | None = None
 
 
 @dataclass
@@ -321,10 +319,6 @@ def _validate_config(cfg: RootConfig) -> None:
         raise ConfigError("root.rollout.memory_growth_fraction: expected a value in (0,1)")
     if not math.isfinite(cfg.rollout.memory_prediction_z) or cfg.rollout.memory_prediction_z <= 0:
         raise ConfigError("root.rollout.memory_prediction_z: expected a finite positive value")
-    if cfg.training.target_node_reuse is not None and (
-        not math.isfinite(cfg.training.target_node_reuse) or cfg.training.target_node_reuse <= 0
-    ):
-        raise ConfigError("root.training.target_node_reuse: expected a finite positive value")
     if cfg.rollout.node_budget <= 0:
         raise ConfigError("root.rollout.node_budget: expected a positive integer")
     for name in (

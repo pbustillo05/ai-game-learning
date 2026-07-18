@@ -28,14 +28,19 @@ from pbg.core.checkpointing import (
     compatible_scientific_configs,
     legacy_config_fingerprint,
     matches_legacy_run_fingerprint,
+    inspect_checkpoint,
     _scientific_config,
     _validate_metrics_prefix,
     load_checkpoint,
     save_checkpoint,
 )
-from pbg.core.distributed import stratum_objective_scale
 from pbg.core.game import GameBundle
-from pbg.core.losses import COMPOSITES, LossSpec, _selected_logp, finalize_metric_stats
+from pbg.core.learner import (
+    DistributedFixedRolloutUpdate,
+    DistributedLearnerConfig,
+    PhysicalShape,
+)
+from pbg.core.losses import COMPOSITES, LossSpec, _selected_logp
 from pbg.core.memory_control import (
     MEMORY_PHASES,
     MemoryAdmissionStop,
@@ -48,19 +53,20 @@ from pbg.core.memory_control import (
 from pbg.core.minibatch import (
     gather_minibatch_rows,
     index_minibatch,
-    sample_minibatch,
 )
 from pbg.core.normal import (
     build_normal_dataset_from_sampled,
     gather_normal_minibatch,
     index_normal_minibatch,
-    sample_normal_minibatch,
 )
-from pbg.core.optimization import (
-    FlatGradientBuffer,
-    finite_gated_optimizer_step as _finite_gated_optimizer_step,
-    sync_scaled_gradients as _sync_scaled_gradients,
+from pbg.core.storage import (
+    SamplingMetadata,
+    SealedTensorBlock,
+    SequentialPosteriorPool,
+    TrainingPartition,
+    TrainingStorage,
 )
+from pbg.core.targets import _walker_alias
 from pbg.core.rollout import (
     ProbeRollout,
     sample_trees,
@@ -227,218 +233,6 @@ def _rank_local_config(cfg: RootConfig, rank: int, world: int) -> RootConfig:
     return local
 
 
-def _alias_table(
-    probability: Tensor, *, metrics: Any | None = None
-) -> tuple[Tensor, Tensor]:
-    """Construct a device-resident Walker alias table for one stratum law."""
-
-    if probability.ndim != 1 or probability.numel() == 0:
-        raise ValueError("alias probability must be a nonempty vector")
-    if not bool(torch.isfinite(probability).all()) or bool((probability < 0).any()):
-        raise ValueError("alias probabilities must be finite and nonnegative")
-    probability = probability / probability.sum()
-    count = probability.numel()
-    scaled_tensor = probability * count
-    scaled = scaled_tensor.tolist()
-    if metrics is not None and probability.device.type == "cuda":
-        metrics.record_transfer("d2h", nbytes=scaled_tensor.numel() * 8)
-    threshold_values = [1.0] * count
-    alias_values = list(range(count))
-    small = [index for index, value in enumerate(scaled) if value < 1.0]
-    large = [index for index, value in enumerate(scaled) if value >= 1.0]
-    while small and large:
-        low = small.pop()
-        high = large.pop()
-        threshold_values[low] = scaled[low]
-        alias_values[low] = high
-        scaled[high] -= 1.0 - scaled[low]
-        (small if scaled[high] < 1.0 else large).append(high)
-    threshold = torch.tensor(
-        threshold_values, dtype=torch.float64, device=probability.device
-    )
-    alias = torch.tensor(alias_values, dtype=torch.int64, device=probability.device)
-    if metrics is not None and probability.device.type == "cuda":
-        metrics.record_transfer(
-            "h2d",
-            nbytes=(
-                threshold.numel() * threshold.element_size()
-                + alias.numel() * alias.element_size()
-            ),
-        )
-    return threshold, alias
-
-
-def _sample_alias(
-    threshold: Tensor,
-    alias: Tensor,
-    count: int,
-    gen: torch.Generator,
-) -> Tensor:
-    """Draw iid alias-table indices without host-dependent scheduling state."""
-
-    columns = torch.randint(
-        threshold.numel(), (count,), device=threshold.device, generator=gen
-    )
-    uniforms = torch.rand(count, dtype=torch.float64, device=threshold.device, generator=gen)
-    return torch.where(uniforms < threshold[columns], columns, alias[columns])
-
-
-def _decision_mass(data: _IterationData, device: torch.device) -> Tensor:
-    """Return local fixed-rollout decision mass before any normalization."""
-
-    if data.normal:
-        return torch.tensor(float(len(data.dataset)), dtype=torch.float64, device=device)
-    if data.decision_weight is None:
-        raise ValueError("RB iteration data is missing decision weights")
-    return data.decision_weight.to(device=device, dtype=torch.float64).sum()
-
-
-def _global_decision_mass(
-    local_mass: Tensor,
-    *,
-    metrics: Any | None = None,
-) -> Tensor:
-    """SUM decision mass across ranks, preserving the global empirical law."""
-
-    if local_mass.numel() != 1 or local_mass.dtype != torch.float64:
-        raise ValueError("local decision mass must be one float64 scalar")
-    total = local_mass.clone()
-    if dist.is_available() and dist.is_initialized():
-        started = time.perf_counter()
-        dist.all_reduce(total, op=dist.ReduceOp.SUM)
-        if metrics is not None:
-            metrics.record_collective(
-                nbytes=total.numel() * total.element_size(),
-                seconds=time.perf_counter() - started,
-            )
-    if not bool(total > 0):
-        raise ValueError("global decision mass must be positive")
-    return total
-
-
-def _begin_global_decision_mass(
-    local_mass: Tensor,
-) -> tuple[Tensor, Any, float | None]:
-    """Launch the global Z SUM so target construction can overlap it."""
-
-    if local_mass.numel() != 1 or local_mass.dtype != torch.float64:
-        raise ValueError("local decision mass must be one float64 scalar")
-    total = local_mass.clone()
-    if dist.is_available() and dist.is_initialized():
-        started = time.perf_counter()
-        work = dist.all_reduce(total, op=dist.ReduceOp.SUM, async_op=True)
-        return total, work, started
-    return total, None, None
-
-
-def _await_global_decision_mass(
-    data: _IterationData, *, metrics: Any | None = None
-) -> tuple[Tensor, Tensor]:
-    """Finish an overlapped Z SUM and return ``(local_Z, global_Z)``."""
-
-    local = data.local_decision_mass
-    total = data.global_mass_buffer
-    if local is None or total is None:
-        raise ValueError("iteration data is missing its decision-mass reduction")
-    if data.global_mass_work is not None:
-        wait_started = time.perf_counter()
-        data.global_mass_work.wait()
-        finished = time.perf_counter()
-        if metrics is not None:
-            metrics.record_collective(
-                nbytes=total.numel() * total.element_size(),
-                seconds=finished - float(data.global_mass_started),
-                exposed_seconds=finished - wait_started,
-            )
-    if not bool(total > 0):
-        raise ValueError("global decision mass must be positive")
-    return local, total
-
-
-def _stratified_decision_rows(
-    data: _IterationData,
-    bundle: GameBundle,
-    model: nn.Module,
-    logical_budget: int,
-    global_mass: Tensor,
-    gen: torch.Generator,
-    variance_ema: dict[str, float] | None = None,
-) -> list[tuple[str, Tensor, Tensor]]:
-    """Sample rank/family strata and return ``(family, rows, alpha)``."""
-
-    if isinstance(logical_budget, bool) or logical_budget <= 0:
-        raise ValueError("logical learner budget must be positive")
-    if data.normal:
-        state_refs = data.dataset.state_refs
-        weights = torch.ones(
-            state_refs.numel(), dtype=torch.float64, device=state_refs.device
-        )
-    else:
-        state_refs = data.decision_reach.state_refs
-        if data.decision_weight is None:
-            raise ValueError("RB iteration data is missing decision weights")
-        weights = data.decision_weight.to(
-            device=state_refs.device, dtype=torch.float64
-        )
-    if state_refs.numel() == 0:
-        return []
-    backend = bundle.rollout_backend
-    family_ids = backend.rollout_family_ids(
-        state_refs.to(backend.device)
-    ).to(state_refs.device)
-    names = tuple(getattr(backend, "execution_families", ("default",)))
-    values = tuple(getattr(backend, "execution_family_values", range(len(names))))
-    strata: list[tuple[str, Tensor, Tensor, float]] = []
-    for name, value in zip(names, values, strict=True):
-        rows = (family_ids == int(value)).nonzero(as_tuple=False).squeeze(1)
-        if rows.numel() == 0:
-            continue
-        mass = weights[rows].sum()
-        if not bool(mass > 0):
-            continue
-        maximum_width = getattr(backend, "_family_maximum_width", None)
-        cost = (
-            float(maximum_width(model, name)) ** 2
-            if callable(maximum_width)
-            else 1.0
-        )
-        # The lagged EMA is a cheap backend-independent trace-gradient-energy
-        # proxy. It affects logical work allocation only, never the objective.
-        variance = 1.0 if variance_ema is None else variance_ema.get(name, 1.0)
-        sigma = math.sqrt(max(variance, 1.0e-12))
-        score = float(mass) * sigma / math.sqrt(max(cost, 1.0))
-        strata.append((name, rows, mass, score))
-    if not strata:
-        return []
-    if logical_budget < len(strata):
-        raise ValueError(
-            "training.minibatch_size must cover every nonempty execution family"
-        )
-    remaining = logical_budget - len(strata)
-    total_score = sum(item[3] for item in strata)
-    raw = [remaining * item[3] / total_score for item in strata]
-    extra = [math.floor(value) for value in raw]
-    leftover = remaining - sum(extra)
-    order = sorted(
-        range(len(strata)),
-        key=lambda index: (raw[index] - extra[index], -index),
-        reverse=True,
-    )
-    for index in order[:leftover]:
-        extra[index] += 1
-    result: list[tuple[str, Tensor, Tensor]] = []
-    for (name, rows, mass, _), addition in zip(strata, extra, strict=True):
-        count = 1 + addition
-        probability = weights[rows] / mass
-        threshold, alias = _alias_table(
-            probability, metrics=getattr(backend, "execution_metrics", None)
-        )
-        sampled = rows[_sample_alias(threshold, alias, count, gen)]
-        alpha = stratum_objective_scale(
-            mass, global_mass.to(mass.device)
-        ).to(torch.float32)
-        result.append((name, sampled, alpha))
-    return result
 
 
 def _add_distributed_metric_summaries(
@@ -581,8 +375,8 @@ def _synchronize_memory_control_metrics(
 
 
 @dataclass
-class _IterationData:
-    """Objects intentionally retained across rollout and optimization phases."""
+class _RolloutSealInput:
+    """Short-lived rollout owners consumed exactly once by storage sealing."""
 
     normal: bool
     completion_quality: dict[str, float]
@@ -592,10 +386,8 @@ class _IterationData:
     policy_cache: Any = None
     decision_reach: Any = None
     decision_weight: Tensor | None = None
-    local_decision_mass: Tensor | None = None
-    global_mass_buffer: Tensor | None = None
-    global_mass_work: Any = None
-    global_mass_started: float | None = None
+    trajectory_id: Tensor | None = None
+    owner: Tensor | None = None
     profile_metrics: dict[str, float] | None = None
 
 
@@ -1053,7 +845,7 @@ def _build_iteration_data(
     profile: bool = False,
     frozen_model: nn.Module | None = None,
     iteration: int = 0,
-) -> _IterationData:
+) -> _RolloutSealInput:
     """Build compact training data in a frame that owns all frozen transients.
 
     Rollout and target construction are synchronous, so the live model is put
@@ -1114,14 +906,6 @@ def _build_iteration_data(
                 sample_normal_rollout,
             )
             sampled_tree, _, sampled_policy, _ = sampled
-            local_mass = torch.tensor(
-                float(sampled_policy.node_ids.numel()),
-                dtype=torch.float64,
-                device=device,
-            )
-            global_mass, global_work, global_started = _begin_global_decision_mass(
-                local_mass
-            )
             dataset = _profiled_call(
                 profile_metrics,
                 "backward",
@@ -1166,14 +950,10 @@ def _build_iteration_data(
                 _trajectory_length_metrics(
                     profile_metrics, tree, int(cfg.rollout.roots_per_gpu)
                 )
-            return _IterationData(
+            return _RolloutSealInput(
                 normal=True,
                 completion_quality={},
                 dataset=dataset,
-                local_decision_mass=local_mass,
-                global_mass_buffer=global_mass,
-                global_mass_work=global_work,
-                global_mass_started=global_started,
                 profile_metrics=profile_metrics,
             )
 
@@ -1198,10 +978,6 @@ def _build_iteration_data(
         decision_weight = tree.path_weight[
             policy_cache.node_ids.to(tree.path_weight.device, dtype=torch.int64)
         ].detach().to(torch.float64)
-        local_mass = decision_weight.sum()
-        global_mass, global_work, global_started = _begin_global_decision_mass(
-            local_mass
-        )
         # The rollout view has no consumer in completion or target reduction.
         del frozen_bundle
         leaf_ids = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero(
@@ -1323,7 +1099,6 @@ def _build_iteration_data(
                 bundle.rollout_backend,
                 configured_node_budget=cfg.rollout.node_budget,
                 completion_batch_rows=completion_rows,
-                emit_q=False,
                 max_workspace_bytes=workspace_bytes,
                 decision_players_by_tree=probe_seats,
             ),
@@ -1394,25 +1169,264 @@ def _build_iteration_data(
                     "retained_target_bytes": float(retained),
                 }
             )
-        return _IterationData(
+        return _RolloutSealInput(
             normal=False,
             completion_quality=completion_quality,
             targets=targets,
             policy_cache=policy_cache,
             decision_reach=decision_reach,
             decision_weight=decision_weight,
-            local_decision_mass=local_mass,
-            global_mass_buffer=global_mass,
-            global_mass_work=global_work,
-            global_mass_started=global_started,
+            trajectory_id=tree.tree_id[
+                policy_cache.node_ids.to(tree.tree_id.device, dtype=torch.int64)
+            ].detach().to(torch.int32),
+            owner=(
+                decision_reach.owners.detach().to(torch.int32)
+                if decision_reach.owners is not None
+                else tree.owner[
+                    policy_cache.node_ids.to(tree.owner.device, dtype=torch.int64)
+                ].detach().to(torch.int32)
+            ),
             profile_metrics=profile_metrics,
         )
+
+
+def _natural_partition_set(cfg: RootConfig, bundle: GameBundle):
+    """Obtain the game-owned opaque partition boundary for the learner."""
+
+    backend = bundle.rollout_backend
+    factory = getattr(backend, "training_partition_specs", None)
+    if not callable(factory):
+        raise TypeError("rollout backend does not expose training partition specs")
+    return factory()
+
+
+def _sealed_input_block(spec: Any, columns: Mapping[str, Tensor]) -> SealedTensorBlock:
+    rows = next(iter(columns.values())).shape[0]
+    block = SealedTensorBlock(
+        spec.input_schema,
+        columns,
+        rows,
+        spec.input_schema.capacity_bytes(rows, chunks=int(rows > 0)),
+    )
+    block.assert_exact_payload()
+    return block
+
+
+def _compress_preflop_rows(value: Tensor, backend: Any) -> Tensor:
+    """Project an old combo-indexed model row back to its native class rows."""
+
+    if value.shape[-1] == backend.n_classes:
+        return value.detach()
+    if value.shape[-1] != backend.n_hands:
+        raise ValueError("old poker output has neither natural nor exact width")
+    combo_class = backend.combo_class.to(torch.int64)
+    representatives = torch.stack(
+        [(combo_class == index).nonzero(as_tuple=False)[0, 0] for index in range(backend.n_classes)]
+    )
+    result = value.index_select(-1, representatives).detach()
+    # Rollout currently samples exact hands from a class-row policy. This hard
+    # gate prevents a lossy quotient if that architectural invariant changes.
+    lifted = result.index_select(-1, combo_class)
+    if not bool(torch.allclose(value, lifted, atol=2e-5, rtol=2e-5)):
+        raise RuntimeError("preflop old outputs are not constant on canonical classes")
+    return result
+
+
+def _seal_iteration_training_storage(
+    cfg: RootConfig,
+    bundle: GameBundle,
+    data: _RolloutSealInput,
+) -> tuple[TrainingStorage, Any]:
+    """Seal the completed rollout/targets into the sole learner-owned store.
+
+    This is the one-way migration boundary for the established rollout
+    scheduler. The returned storage contains no tree, reach cache, topology,
+    completion object, or padded action axis.
+    """
+
+    backend = bundle.rollout_backend
+    partitions = _natural_partition_set(cfg, bundle)
+    if data.normal:
+        source = data.dataset
+        state_refs = source.state_refs
+        reach_cache = source.reach
+        owner = source.actor_type.to(torch.int32)
+    else:
+        source = None
+        if data.decision_reach is None or data.owner is None:
+            raise RuntimeError("RB rollout omitted compact decision ownership")
+        state_refs = data.decision_reach.state_refs
+        reach_cache = data.decision_reach
+        owner = data.owner
+    if not isinstance(reach_cache.payload, Tensor):
+        raise RuntimeError("production sealing requires tensor-owned decision inputs")
+    log_reach = reach_cache.payload.detach().to(torch.float32)
+    if log_reach.shape != (state_refs.numel(), backend.n_players, backend.n_hands):
+        raise ValueError("decision input owner has an unexpected poker domain")
+    finite = torch.isfinite(log_reach)
+    gauge = log_reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
+    weights = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
+    family = backend.rollout_family_ids(state_refs.to(backend.device)).to(state_refs.device)
+    partition_id = torch.where(family == 0, family, family - 1).to(torch.int64)
+    legal_ids, legal_mask = backend.legal_events(state_refs.to(backend.device))
+    legal_ids = legal_ids.to(state_refs.device, dtype=torch.int32)
+    legal_mask = legal_mask.to(state_refs.device, dtype=torch.bool)
+
+    training: dict[int, TrainingPartition] = {}
+    log_z: dict[int, Tensor] = {}
+    alias_probability: dict[int, Tensor] = {}
+    alias_index: dict[int, Tensor] = {}
+
+    posterior_pool = None
+    posterior_ref = None
+    if not data.normal and cfg.training.mode == "rao_blackwell":
+        if data.trajectory_id is None:
+            raise RuntimeError("sequential RB sealing requires trajectory addresses")
+        pairs = torch.stack((data.trajectory_id, owner), 1)
+        unique_pairs, inverse = torch.unique(pairs, dim=0, sorted=True, return_inverse=True)
+        first_by_pair: dict[tuple[int, int], int] = {}
+        pair_rows = pairs.detach().cpu().tolist()
+        for row, raw_pair in enumerate(pair_rows):
+            pair = (int(raw_pair[0]), int(raw_pair[1]))
+            first_by_pair.setdefault(pair, row)
+        first_rows = [
+            first_by_pair[tuple(map(int, pair))]
+            for pair in unique_pairs.detach().cpu().tolist()
+        ]
+        selected = torch.tensor(first_rows, dtype=torch.int64, device=state_refs.device)
+        posterior = data.targets.parent_p_hat[selected].detach().to(torch.float32)
+        posterior_pool = SequentialPosteriorPool(
+            posterior,
+            unique_pairs[:, 0].to(torch.int32),
+            unique_pairs[:, 1].to(torch.int32),
+        )
+        posterior_ref = inverse.to(torch.int32)
+
+    for spec in partitions.specs:
+        rows = (partition_id == spec.partition_id).nonzero(as_tuple=False).squeeze(1)
+        if rows.numel() == 0:
+            continue
+        states = state_refs[rows].detach().to(torch.int32)
+        if spec.partition_id == 0:
+            natural_ranges = torch.zeros(
+                (rows.numel(), backend.n_players, backend.n_classes),
+                dtype=torch.float32,
+                device=state_refs.device,
+            )
+            class_ids = backend.combo_class[None, None, :].expand_as(weights[rows])
+            natural_ranges.scatter_add_(2, class_ids, weights[rows])
+        else:
+            live = spec.partition_id + 1
+            status = backend.states.status[states.to(torch.int64)]
+            live_seats = torch.where(
+                status != 1,
+                torch.arange(backend.n_players, device=state_refs.device)[None],
+                backend.n_players,
+            ).sort(1).values[:, :live]
+            natural_ranges = weights[rows][
+                torch.arange(rows.numel(), device=state_refs.device)[:, None], live_seats
+            ].contiguous()
+        input_columns: dict[str, Tensor] = {
+            "state_ref": states,
+            "range_weights": natural_ranges.detach(),
+        }
+        if "summary_anchor" in {field.name for field in spec.input_schema.fields}:
+            anchors = backend.states.partition_cache_key[states.to(torch.int64)]
+            input_columns["summary_anchor"] = torch.where(
+                anchors >= 0, anchors, states
+            ).detach().to(torch.int32)
+        inputs = _sealed_input_block(spec, input_columns)
+        columns: dict[str, Tensor] = {
+            "owner": owner[rows].detach().to(torch.int32),
+            "legal_event_ids": legal_ids[rows].detach(),
+            "legal_event_mask": legal_mask[rows].detach(),
+        }
+        actions = None
+        if data.normal:
+            columns.update(
+                {
+                    "realized_type": source.actor_type[rows].detach().to(torch.int32),
+                    "event": source.event[rows].detach().to(torch.int32),
+                    "old_log_prob": source.old_logp[rows].detach().to(torch.float32),
+                    "old_value": source.old_v[rows].detach().to(torch.float32),
+                    "lambda_return": source.lambda_return[rows].detach().to(torch.float32),
+                }
+            )
+        elif cfg.training.mode == "rao_blackwell":
+            if not bool((data.targets.child_count[rows] == 1).all()):
+                raise RuntimeError("sequential RB decision has non-unit multiplicity")
+            old_value = data.policy_cache.old_v[rows]
+            old_logp = data.policy_cache.old_logp_child[rows, 0]
+            if spec.partition_id == 0:
+                old_value = _compress_preflop_rows(old_value, backend)
+                old_logp = _compress_preflop_rows(old_logp, backend)
+            columns.update(
+                {
+                    "event": data.targets.child_event_row[rows, 0].detach().to(torch.int32),
+                    "posterior_ref": posterior_ref[rows].detach(),
+                    "old_log_prob": old_logp.detach().to(torch.float32),
+                    "old_value": old_value.detach().to(torch.float32),
+                    "lambda_return": data.targets.v_hat[rows].detach().to(torch.float32),
+                }
+            )
+        else:
+            old_value = data.policy_cache.old_v[rows]
+            if spec.partition_id == 0:
+                old_value = _compress_preflop_rows(old_value, backend)
+            columns.update(
+                {
+                    "old_value": old_value.detach().to(torch.float32),
+                    "value_hat": data.targets.v_hat[rows].detach().to(torch.float32),
+                }
+            )
+            counts = data.targets.child_count[rows].to(torch.int64)
+            flat_mask = data.targets.child_mask[rows].reshape(-1)
+            old_logp = data.policy_cache.old_logp_child[rows].reshape(-1, backend.n_hands)[flat_mask]
+            if spec.partition_id == 0:
+                old_logp = _compress_preflop_rows(old_logp, backend)
+            actions = {
+                "action_ptr": torch.cat(
+                    (
+                        torch.zeros(1, dtype=torch.int32, device=rows.device),
+                        counts.cumsum(0).to(torch.int32),
+                    )
+                ),
+                "event": data.targets.child_event_row[rows].reshape(-1)[flat_mask].detach().to(torch.int32),
+                "old_log_prob": old_logp.detach().to(torch.float32),
+                "child_posterior": data.targets.child_p_hat[rows].reshape(-1, backend.n_hands)[flat_mask].detach().to(torch.float32),
+                "advantage_hat": data.targets.a_hat[rows].reshape(-1, backend.n_hands)[flat_mask].detach().to(torch.float32),
+            }
+        training[spec.partition_id] = TrainingPartition(
+            spec.partition_id, inputs, columns, actions
+        )
+        if cfg.training.mode == "branched_rao_blackwell":
+            partition_weights = data.decision_weight[rows].detach().to(torch.float64)
+            log_z[spec.partition_id] = torch.log(partition_weights).logsumexp(0)
+            probability, alias = _walker_alias(partition_weights)
+            alias_probability[spec.partition_id] = probability
+            alias_index[spec.partition_id] = alias
+        else:
+            log_z[spec.partition_id] = torch.tensor(
+                math.log(rows.numel()), dtype=torch.float64, device=rows.device
+            )
+    mode = {
+        "normal": "normal",
+        "rao_blackwell": "sequential_rb",
+        "branched_rao_blackwell": "branched_rb",
+    }[cfg.training.mode]
+    storage = TrainingStorage(
+        mode,
+        training,
+        SamplingMetadata(log_z, alias_probability, alias_index),
+        posterior_pool,
+    )
+    return storage, partitions
 
 
 def _validate_old_policy_identity(
     cfg: RootConfig,
     bundle: GameBundle,
-    data: _IterationData,
+    data: _RolloutSealInput,
 ) -> dict[str, float]:
     """Gate the first update on exact rollout/optimization model inputs.
 
@@ -1593,20 +1607,8 @@ def _one_iteration(
             )
         )
     amp_enabled, amp_dtype = _precision(cfg, device)
-    normal = cfg.training.mode == "normal"
     total_trajectories = int(cfg.rollout.roots_per_gpu)
-    profile_parts: list[dict[str, float]] = []
-    quality_parts: list[tuple[int, dict[str, float]]] = []
-    optimization_records: list[tuple[int, int, dict[str, float]]] = []
-    optimization_host_seconds: dict[str, float] = {
-        "minibatch_sampling": 0.0,
-        "forward_loss": 0.0,
-        "backward_pass": 0.0,
-        "gradient_sync": 0.0,
-        "gradient_update": 0.0,
-    }
     identity_metrics: dict[str, float] = {}
-    decision_total = 0
     data = _build_iteration_data(
         cfg,
         bundle,
@@ -1639,430 +1641,241 @@ def _one_iteration(
                 identity_metrics = _validate_old_policy_identity(
                     cfg, bundle, data
                 )
+        if device.type == "cuda":
+            # The launch/resume identity gate is not learner work. Drain its
+            # kernels here so they cannot be charged to the following sealed
+            # storage or optimization phase timer.
+            torch.cuda.synchronize(device)
 
     decisions = (
         len(data.dataset)
         if data.normal
         else int(data.targets.node_ids.numel())
     )
-    decision_total += decisions
     leaves = int((data.profile_metrics or {}).get("leaves", total_trajectories))
-    quality_parts.append((leaves, data.completion_quality))
-    profile_parts.append(data.profile_metrics or {})
 
     optimizer_steps_this_iteration = int(cfg.training.gd_steps_per_iter)
 
-    local_mass, global_mass = _await_global_decision_mass(
-        data, metrics=execution_metrics
-    )
-    rank_objective_scale = stratum_objective_scale(
-        local_mass, global_mass
-    ).to(torch.float32)
+    if profile and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    seal_started = time.perf_counter()
+    storage, partition_specs = _seal_iteration_training_storage(cfg, bundle, data)
+    if profile and device.type == "cuda":
+        torch.cuda.synchronize(device)
+    seal_seconds = time.perf_counter() - seal_started
+    retained_bytes = storage.tensor_storage_bytes()
     if data.profile_metrics is not None:
-        data.profile_metrics["local_decision_mass"] = float(local_mass)
-        data.profile_metrics["global_decision_mass"] = float(global_mass)
-        data.profile_metrics["rank_objective_scale"] = float(
-            rank_objective_scale
+        for partition_id, partition in storage.partitions.items():
+            partition_bytes = partition.inputs.tensor_storage_bytes + sum(
+                value.numel() * value.element_size()
+                for value in partition.columns.values()
+            )
+            if partition.action_columns is not None:
+                partition_bytes += sum(
+                    value.numel() * value.element_size()
+                    for value in partition.action_columns.values()
+                )
+            data.profile_metrics.update(
+                {
+                    f"training_partition_{partition_id}_rows": float(
+                        partition.inputs.rows
+                    ),
+                    f"training_partition_{partition_id}_bytes": float(
+                        partition_bytes
+                    ),
+                    f"training_partition_{partition_id}_input_bytes": float(
+                        partition.inputs.tensor_storage_bytes
+                    ),
+                }
+            )
+        data.profile_metrics.update(
+            {
+                "phase_seal_seconds": seal_seconds,
+                "retained_target_bytes": float(retained_bytes),
+                "training_storage_schema_version": 1.0,
+                "preflop_model_width": float(bundle.rollout_backend.n_classes),
+                "postflop_model_width": float(bundle.rollout_backend.n_hands),
+                "rb_exact_width": float(bundle.rollout_backend.n_hands),
+            }
         )
-
-    model.train()
-    flat_gradient = FlatGradientBuffer(source)
-    source._pbg_direct_flat_gradient_buffer = flat_gradient
-    optimization_start = None
-    minibatch_count = 0
-    if profile:
         if device.type == "cuda":
-            torch.cuda.synchronize(device)
-            torch.cuda.reset_peak_memory_stats(device)
-        optimization_start = time.perf_counter()
-
-    if cfg.training.ppo_epochs is None:
-        batches: list[tuple[int, Tensor | None]] = [
-            (-1, None) for _ in range(optimizer_steps_this_iteration)
-        ]
-    else:
-        batches = []
-        for epoch in range(cfg.training.ppo_epochs):
-            permutation = torch.randperm(decisions, generator=torch_gen, device=device)
-            for first in range(0, decisions, cfg.training.minibatch_size):
-                batches.append(
-                    (epoch, permutation[first : first + cfg.training.minibatch_size])
-                )
-
-    for epoch, selected_rows in batches:
-        flat_gradient.zero_()
-        metric_parts: list[dict[str, Tensor]] = []
-        variance_ema = getattr(source, "_pbg_family_gradient_variance_ema", None)
-        if variance_ema is None:
-            variance_ema = {}
-            source._pbg_family_gradient_variance_ema = variance_ema
-        sampling_start = time.perf_counter()
-        if selected_rows is None:
-            sample_specs = _stratified_decision_rows(
-                data,
-                bundle,
-                source,
-                cfg.training.minibatch_size,
-                global_mass,
-                torch_gen,
-                variance_ema,
+            data.profile_metrics.update(
+                {
+                    "phase_seal_peak_allocated_bytes": float(
+                        torch.cuda.max_memory_allocated(device)
+                    ),
+                    "phase_seal_peak_reserved_bytes": float(
+                        torch.cuda.max_memory_reserved(device)
+                    ),
+                }
             )
-        else:
-            sample_specs = [
-                ("", selected_rows, rank_objective_scale)
-            ]
-        if not sample_specs:
-            raise ValueError("cannot optimize an empty fixed rollout")
-        minibatch_count += len(sample_specs)
-        optimization_host_seconds["minibatch_sampling"] += (
-            time.perf_counter() - sampling_start
-        )
-        effective_total = 0
-        previous_gradient_energy = 0.0
-        trainable_count = max(
-            1, sum(parameter.numel() for parameter in source.parameters() if parameter.requires_grad)
-        )
-        for family, logical_rows, objective_scale in sample_specs:
-            sampling_start = time.perf_counter()
-            minibatch = (
-                gather_normal_minibatch(data.dataset, bundle, logical_rows)
-                if data.normal
-                else gather_minibatch_rows(
-                    data.tree,
-                    data.targets,
-                    data.policy_cache,
-                    data.decision_reach,
-                    bundle,
-                    logical_rows,
-                )
-            )
-            effective_rows = int(minibatch.state_refs.numel())
-            if effective_rows == 0:
-                raise ValueError("cannot optimize an empty family stratum")
-            effective_total += effective_rows
-            optimization_host_seconds["minibatch_sampling"] += (
-                time.perf_counter() - sampling_start
-            )
-            planner = getattr(bundle.rollout_backend, "plan_policy_batches", None)
-            physical_plans = (
-                planner(source, minibatch.state_refs, "training")
-                if callable(planner)
-                else [
-                    torch.arange(
-                        effective_rows,
-                        dtype=torch.int64,
-                        device=minibatch.state_refs.device,
-                    )
+        # The target builder is the profiled backward-estimator phase. Expose
+        # the design name as an explicit alias in release/soak telemetry.
+        for suffix in ("seconds", "peak_allocated_bytes", "peak_reserved_bytes"):
+            source_key = f"phase_backward_{suffix}"
+            if source_key in data.profile_metrics:
+                data.profile_metrics[f"phase_targets_{suffix}"] = data.profile_metrics[
+                    source_key
                 ]
-            )
-            for positions in physical_plans:
-                physical = (
-                    index_normal_minibatch(minibatch, positions)
-                    if data.normal
-                    else index_minibatch(minibatch, positions)
-                )
-                phase_start = time.perf_counter()
-                with torch.autocast(
-                    device_type=device.type, enabled=amp_enabled, dtype=amp_dtype
-                ):
-                    family_forward = getattr(
-                        bundle.rollout_backend, "policy_forward_family", None
-                    )
-                    output = (
-                        family_forward(
-                            source, family, physical.state_refs, physical.reach
-                        )
-                        if family and callable(family_forward)
-                        else bundle.rollout_backend.policy_forward(
-                            source, physical.state_refs, physical.reach
-                        )
-                    )
-                    reference_output = None
-                    if float(cfg.loss.c_kl) > 0.0:
-                        if reference_model is None:
-                            raise ValueError(
-                                "reference_model is required when loss.c_kl is positive"
-                            )
-                        with torch.no_grad():
-                            reference_output = (
-                                family_forward(
-                                    reference_model,
-                                    family,
-                                    physical.state_refs,
-                                    physical.reach,
-                                )
-                                if family and callable(family_forward)
-                                else bundle.rollout_backend.policy_forward(
-                                    reference_model,
-                                    physical.state_refs,
-                                    physical.reach,
-                                )
-                            )
-                    loss_sum, stats = spec.fn(
-                        output,
-                        physical,
-                        physical,
-                        bundle.policy_adapter,
-                        cfg,
-                        iteration=iteration,
-                        reduction="sum",
-                        reference=reference_output,
-                    )
-                    # Every physical split contributes to the original logical
-                    # family mean.  Dividing by the split size would overweight
-                    # families that need more physical model calls.
-                    loss = (
-                        loss_sum
-                        / effective_rows
-                        * objective_scale.to(loss_sum.device)
-                    )
-                optimization_host_seconds["forward_loss"] += (
-                    time.perf_counter() - phase_start
-                )
-                phase_start = time.perf_counter()
-                if not bool(torch.isfinite(loss)):
-                    raise FloatingPointError("non-finite training loss")
-                scaler.scale(loss).backward()
-                optimization_host_seconds["backward_pass"] += (
-                    time.perf_counter() - phase_start
-                )
-                if family:
-                    scaled_energy = sum(
-                        parameter.grad.detach().float().square().sum()
-                        for parameter in source.parameters()
-                        if parameter.grad is not None
-                    )
-                    scale = (
-                        float(scaler.get_scale()) if scaler.is_enabled() else 1.0
-                    )
-                    current_energy = float(scaled_energy) / (scale * scale)
-                    incremental_proxy = max(
-                        abs(current_energy - previous_gradient_energy)
-                        / trainable_count,
-                        1.0e-12,
-                    )
-                    previous_gradient_energy = current_energy
-                    old_proxy = variance_ema.get(family, incremental_proxy)
-                    variance_ema[family] = (
-                        0.95 * old_proxy + 0.05 * incremental_proxy
-                    )
-                metric_parts.append(stats)
-                phase_start = time.perf_counter()
-        sync_start = time.perf_counter()
-        gradients_finite = _sync_scaled_gradients(
-            model,
-            int(os.environ.get("WORLD_SIZE", "1")),
-            metrics=execution_metrics,
-            flat_buffer=flat_gradient,
-        )
-        optimization_host_seconds["gradient_sync"] += time.perf_counter() - sync_start
-        update_start = time.perf_counter()
-        step_result = _finite_gated_optimizer_step(
-            model,
-            optimizer,
-            scaler,
-            gradients_finite=gradients_finite,
-            grad_clip=cfg.training.grad_clip,
-        )
-        optimization_host_seconds["gradient_update"] += time.perf_counter() - update_start
-        step_metrics = finalize_metric_stats(metric_parts)
-        step_metrics.update(step_result.metrics())
-        optimization_records.append((epoch, effective_total, step_metrics))
-
-    if profile:
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        assert optimization_start is not None
-        iteration_profile = profile_parts[-1]
-        iteration_profile["phase_optimization_seconds"] = (
-            time.perf_counter() - optimization_start
-        )
-        if device.type == "cuda":
-            iteration_profile["phase_optimization_peak_allocated_bytes"] = float(
-                torch.cuda.max_memory_allocated(device)
-            )
-            iteration_profile["phase_optimization_peak_reserved_bytes"] = float(
-                torch.cuda.max_memory_reserved(device)
-            )
-
+    # The sealed store is now the sole iteration owner crossing into learning.
+    completion_quality = data.completion_quality
+    iteration_profile = data.profile_metrics or {}
     del data
+
+    active_ids = tuple(sorted(storage.partitions))
+    if not active_ids:
+        raise ValueError("cannot optimize an empty fixed rollout")
+    base, extra = divmod(cfg.training.minibatch_size, len(active_ids))
+    if base == 0:
+        raise ValueError(
+            "training.minibatch_size must cover every nonempty execution partition"
+        )
+    statistical_counts = {
+        partition_id: base + int(position < extra)
+        for position, partition_id in enumerate(active_ids)
+    }
+    available_transient = _value_workspace_budget(cfg, device)
+    physical_shapes: dict[int, tuple[PhysicalShape, ...]] = {}
+    for partition_id in active_ids:
+        family_name = "pre" if partition_id == 0 else f"post_{partition_id + 1}"
+        configured = int(cfg.rollout.family_batch_rows or statistical_counts[partition_id])
+        row_cap = max(1, min(configured, statistical_counts[partition_id]))
+        if cfg.hardware is not None:
+            width = int(bundle.rollout_backend._family_maximum_width(source, family_name))
+            token_cap = cfg.hardware.training_max_tokens // max(width, 1)
+            pair_cap = cfg.hardware.training_max_token_pairs // max(width * width, 1)
+            row_cap = max(1, min(row_cap, token_cap, pair_cap))
+        predictor = getattr(bundle.rollout_backend, "training_transient_bytes", None)
+        if not callable(predictor):
+            raise TypeError("rollout backend lacks a learner workspace contract")
+        while row_cap > 1 and predictor(
+            source, family_name, row_cap, amp=amp_enabled
+        ) > available_transient:
+            row_cap = max(1, row_cap // 2)
+        transient_bytes = predictor(
+            source, family_name, row_cap, amp=amp_enabled
+        )
+        iteration_profile[
+            f"partition_{partition_id}_physical_rows"
+        ] = float(row_cap)
+        iteration_profile[
+            f"partition_{partition_id}_predicted_transient_bytes"
+        ] = float(transient_bytes)
+        physical_shapes[partition_id] = (
+            PhysicalShape(row_cap, transient_bytes),
+        )
+    learner_cfg = DistributedLearnerConfig(
+        statistical_counts=statistical_counts,
+        physical_shapes=physical_shapes,
+        available_transient_bytes=available_transient,
+        resident_base_bytes=retained_bytes,
+        amp_enabled=amp_enabled,
+        amp_dtype=amp_dtype,
+    )
+    model.train()
+    if profile and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    optimization_started = time.perf_counter()
+    learner = DistributedFixedRolloutUpdate(
+        source,
+        optimizer,
+        scaler,
+        partition_specs,
+        bundle.policy_adapter,
+        cfg.loss,
+        learner_cfg,
+        reference_model=reference_model,
+    )
+    if cfg.training.ppo_epochs is None:
+        update_steps = optimizer_steps_this_iteration
+    else:
+        update_steps = cfg.training.ppo_epochs * math.ceil(
+            decisions / cfg.training.minibatch_size
+        )
+    update = learner(
+        storage,
+        torch_gen,
+        optimizer_steps=update_steps,
+        iteration=iteration,
+        grad_clip=cfg.training.grad_clip,
+    )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-        metrics_peak_allocated = float(torch.cuda.max_memory_allocated(device))
-        metrics_peak_reserved = float(torch.cuda.max_memory_reserved(device))
-    else:
-        metrics_peak_allocated = 0.0
-        metrics_peak_reserved = 0.0
-    if profile:
-        memory_metrics.update(
-            memory_ledger.snapshot(
-                "iteration_end",
-                owned={
-                    "model": source,
-                    "optimizer": optimizer.state,
-                    "reference": reference_model,
-                    "backend": bundle.rollout_backend,
-                },
-            )
-        )
-
-    def aggregate_records(
-        records: list[tuple[int, int, dict[str, float]]]
-    ) -> dict[str, float]:
-        if not records:
-            return {}
-        result: dict[str, float] = {}
-        keys = {key for _, _, values in records for key in values}
-        maximum_keys = {"ratio_max", "grad_norm_pre_clip"}
-        minimum_keys = {"grad_clip_scale"}
-        for key in keys:
-            present = [
-                (rows, values[key])
-                for _, rows, values in records
-                if key in values
-            ]
-            if key in maximum_keys:
-                result[key] = max(value for _, value in present)
-            elif key in minimum_keys:
-                result[key] = min(value for _, value in present)
-            else:
-                denominator = sum(rows for rows, _ in present)
-                result[key] = sum(rows * value for rows, value in present) / max(
-                    denominator, 1
-                )
-        return result
-
-    metrics = aggregate_records(optimization_records)
+    optimization_seconds = time.perf_counter() - optimization_started
+    metrics = dict(update.metrics)
+    metrics.update(iteration_profile)
+    metrics.update(memory_metrics)
+    metrics.update(
+        {
+            "trajectories": float(total_trajectories),
+            "decisions": float(decisions),
+            "optimizer_steps": sum(
+                float(step.optimizer_step_applied) for step in update.steps
+            ),
+            "minibatches": float(metrics.get("physical_subspans", 0.0)),
+            "optimized_decision_rows": float(metrics.get("statistical_rows", 0.0)),
+            "phase_optimization_seconds": optimization_seconds,
+            "phase_optimization_host_seconds": optimization_seconds,
+            "profiled_iteration_seconds": sum(
+                float(iteration_profile.get(f"phase_{name}_seconds", 0.0))
+                for name in ("snapshot", "rollout", "backward", "compaction", "seal")
+            ) + optimization_seconds,
+            "target_bytes_per_decision": retained_bytes / max(decisions, 1),
+        }
+    )
+    metrics["decisions_per_second"] = decisions / max(
+        metrics["profiled_iteration_seconds"], 1.0e-12
+    )
+    metrics.update(_merge_completion_quality([(leaves, completion_quality)]))
+    metrics.update(identity_metrics)
     if device.type == "cuda":
-        metrics["iteration_peak_allocated_bytes"] = metrics_peak_allocated
-        metrics["iteration_peak_reserved_bytes"] = metrics_peak_reserved
-        metrics["iteration_end_allocated_bytes"] = float(
-            torch.cuda.memory_allocated(device)
+        metrics["phase_optimization_peak_allocated_bytes"] = float(
+            metrics.get("training_peak_allocated_bytes", 0.0)
         )
-        metrics["iteration_end_reserved_bytes"] = float(
-            torch.cuda.memory_reserved(device)
+        metrics["phase_optimization_peak_reserved_bytes"] = float(
+            metrics.get("training_peak_reserved_bytes", 0.0)
+        )
+        allocated_peaks = [
+            float(value)
+            for key, value in metrics.items()
+            if key.startswith("phase_") and key.endswith("_peak_allocated_bytes")
+        ]
+        reserved_peaks = [
+            float(value)
+            for key, value in metrics.items()
+            if key.startswith("phase_") and key.endswith("_peak_reserved_bytes")
+        ]
+        metrics.update(
+            {
+                "iteration_peak_allocated_bytes": max(allocated_peaks),
+                "iteration_peak_reserved_bytes": max(reserved_peaks),
+                "iteration_end_allocated_bytes": float(torch.cuda.memory_allocated(device)),
+                "iteration_end_reserved_bytes": float(torch.cuda.memory_reserved(device)),
+            }
         )
         metrics["iteration_end_allocator_slack_bytes"] = (
             metrics["iteration_end_reserved_bytes"]
             - metrics["iteration_end_allocated_bytes"]
         )
-    metrics.update(
-        {
-            "trajectories": float(total_trajectories),
-            "decisions": float(decision_total),
-            "optimizer_steps": sum(
-                values["optimizer_step_applied"]
-                for _, _, values in optimization_records
-            ),
-            "minibatches": float(minibatch_count),
-            "optimized_decision_rows": float(
-                sum(rows for _, rows, _ in optimization_records)
-            ),
-        }
-    )
-    metrics.update(
-        {
-            f"phase_{name}_host_seconds": float(seconds)
-            for name, seconds in optimization_host_seconds.items()
-        }
-    )
-    metrics["phase_optimization_host_seconds"] = float(
-        sum(optimization_host_seconds.values())
-    )
-    if cfg.training.ppo_epochs is not None:
-        metrics["ppo_epochs"] = float(cfg.training.ppo_epochs)
-        metrics["decision_epoch_coverage"] = (
-            sum(rows for _, rows, _ in optimization_records)
-            / max(decision_total * cfg.training.ppo_epochs, 1)
-        )
-        for epoch in range(cfg.training.ppo_epochs):
-            epoch_records = [
-                record for record in optimization_records if record[0] == epoch
-            ]
-            for key, value in aggregate_records(epoch_records).items():
-                metrics[f"ppo_epoch_{epoch}_{key}"] = value
-
-    profile_metrics: dict[str, float] = {}
-    sum_keys = {
-        "trajectories",
-        "nodes",
-        "leaves",
-        "decisions",
-        "terminal_samples",
-        "completion_samples",
-        "retained_target_bytes",
-        "completion_effective_samples",
-    }
-    for part in profile_parts:
-        for key, value in part.items():
-            if key in sum_keys or key.endswith("_seconds"):
-                profile_metrics[key] = profile_metrics.get(key, 0.0) + value
-            elif "peak_" in key or key == "offspring_max":
-                profile_metrics[key] = max(profile_metrics.get(key, 0.0), value)
-            elif key not in profile_metrics:
-                profile_metrics[key] = value
-    profile_metrics["trajectories"] = float(total_trajectories)
-    profile_metrics["decisions"] = float(decision_total)
-    metrics.update(profile_metrics)
-    metrics.update(memory_metrics)
-
-    if profile:
-        # Completion is streamed inside the RB backward-estimator call. Keep
-        # its own timing for attribution, but do not double-count it in the
-        # iteration wall-time estimate.
-        top_level_phases = {
-            "snapshot",
-            "rollout",
-            "backward",
-            "compaction",
-            "optimization",
-        }
-        phase_seconds = sum(
-            metrics.get(f"phase_{name}_seconds", 0.0)
-            for name in top_level_phases
-        )
-        metrics["profiled_iteration_seconds"] = phase_seconds
-        metrics["phase_backward_estimator_seconds_excluding_completion"] = max(
-            metrics.get("phase_backward_seconds", 0.0)
-            - metrics.get("phase_completion_seconds", 0.0),
-            0.0,
-        )
-        metrics["decisions_per_second"] = decision_total / max(phase_seconds, 1.0e-12)
-        metrics["target_bytes_per_decision"] = metrics.get(
-            "retained_target_bytes", 0.0
-        ) / max(decision_total, 1)
-        completion_seconds = metrics.get("phase_completion_seconds", 0.0)
-        if completion_seconds:
-            metrics["completion_effective_samples_per_second"] = metrics.get(
-                "completion_effective_samples", 0.0
-            ) / completion_seconds
-        rollout_seconds = metrics.get("phase_rollout_seconds", 0.0)
-        if rollout_seconds and normal:
-            metrics["terminal_samples_per_second"] = total_trajectories / rollout_seconds
-
-    metrics.update(_merge_completion_quality(quality_parts))
-    metrics.update(identity_metrics)
     if execution_metrics is not None:
-        execution_snapshot = execution_metrics.snapshot()
-        metrics.update(execution_snapshot)
+        snapshot = execution_metrics.snapshot()
+        metrics.update(snapshot)
         totals = execution_metrics.totals()
         metrics["policy_physical_batches"] = float(totals.get("model_calls", 0))
-        metrics["policy_planned_batches"] = float(
-            totals.get("policy_pack_calls", 0)
-        )
-        metrics["policy_total_padded_tokens"] = float(
-            totals.get("padded_tokens", 0)
-        )
+        metrics["policy_planned_batches"] = float(totals.get("policy_pack_calls", 0))
+        metrics["policy_total_padded_tokens"] = float(totals.get("padded_tokens", 0))
         metrics["policy_total_padded_token_pairs"] = float(
             totals.get("padded_token_pairs", 0)
         )
-        metrics["policy_max_padded_tokens"] = execution_snapshot[
-            "execution_padded_tokens_max"
-        ]
-        metrics["policy_max_padded_token_pairs"] = execution_snapshot[
+        metrics["policy_max_padded_tokens"] = snapshot["execution_padded_tokens_max"]
+        metrics["policy_max_padded_token_pairs"] = snapshot[
             "execution_padded_token_pairs_max"
         ]
+    del learner, storage
     return metrics
+
 
 
 def run_training(
@@ -2091,6 +1904,10 @@ def run_training(
             "CUDA training requires an explicit hardware profile with token, "
             "memory, and device limits"
         )
+    if resume_from is not None:
+        # Metadata-only CPU validation precedes bundle/model/optimizer CUDA
+        # allocation and rejects incompatible partial state deterministically.
+        inspect_checkpoint(resume_from)
     target_payload: dict[str, Any] | None = None
     probe_target: dict[str, Any] | None = None
     if cfg.probe is not None:
@@ -2531,10 +2348,14 @@ def run_training(
                 )
             )
             actual_keys = {
-                "rollout": "phase_rollout_peak_reserved_bytes",
-                "seal": "memory_preoptimization_peak_reserved_bytes",
-                "targets": "phase_backward_peak_reserved_bytes",
-                "optimization": "phase_optimization_peak_reserved_bytes",
+                # Allocated phase peaks are ownership/shape evidence and are
+                # invariant to allocator-bin history across checkpoint resume.
+                # Reserved/NVML peaks remain hard-guard diagnostics, but must
+                # not perturb the deterministic next-root decision.
+                "rollout": "phase_rollout_peak_allocated_bytes",
+                "seal": "phase_seal_peak_allocated_bytes",
+                "targets": "phase_backward_peak_allocated_bytes",
+                "optimization": "phase_optimization_peak_allocated_bytes",
             }
             phase_observations = {}
             for phase in MEMORY_PHASES:

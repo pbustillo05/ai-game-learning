@@ -25,15 +25,15 @@ never implement a fallback hand evaluator.
 
 ```text
 trainable model
-  -> frozen rollout snapshot
+  -> read-only synchronous rollout policy
   -> family-scheduled rollout
-       topology + public state + live/retained reaches + old policy/value
+       append-only occurrences + natural partition inputs + old policy/value
   -> normal: sampled terminal settlement and compact scalar targets
      RB: streamed evaluator completion into the P/M value frontier
-  -> release rollout-only storage
-  -> family-stratified logical learner rows
-  -> hardware-bounded physical forward/backward calls
-  -> global finite decision, gradient clip, one optimizer step
+  -> exact seal into immutable TrainingStorage; release topology/reaches
+  -> index-only stratified draws by global log mass
+  -> bounded gather/forward/backward/release subspans
+  -> flat-gradient SUM, common finite gate, clip, optimizer step
 ```
 
 All completion and target batches belong to one fixed rollout. No trajectory
@@ -73,11 +73,12 @@ Reach is fp32 unnormalized log likelihood
 `[row, player, private_type]`; actor actions add selected log likelihood and
 board events mask conflicting hands.
 
-Storage modes are `full`, `decisions_only`, and `recompute`. Replay reconstructs
-requested rows from cached selected policy likelihoods and chance compatibility.
-After target construction, `DecisionReachCache` retains only optimization rows.
+There is no selectable reach-storage mode or production reach replay. A
+generated decision input and stopped-leaf reach are written once for their last
+consumer. The seal boundary creates exact partition destinations; optimization
+retains no topology, mutable occurrence, completion row, or all-node reach memo.
 
-`PolicyCache` aligns frozen log probabilities and values with target decisions.
+Natural old log probabilities and values align with sealed partition rows.
 The first update after launch/resume recomputes these quantities and gates
 optimization on exact old-policy identity.
 
@@ -95,15 +96,15 @@ siblings with their parent summary. The byte plan is checked before allocation.
 
 ## Logical and physical learner work
 
-`training.minibatch_size` is logical decision exposure. Poker groups rows by
-model family and packs physical forwards beneath hardware token and token-pair
-ceilings. Loss numerators accumulate across physical calls before one logical
-normalization and optimizer step.
+`training.minibatch_size` is statistical decision exposure. Each nonempty
+partition receives an arbitrary positive count; physical shapes are separately
+bounded beneath hardware token and token-pair ceilings. One exact tail is
+allowed and retains the original stratum normalization.
 
-Normal/sequential decisions have mass one; branched decisions use stored
-`path_weight`. Family samplers use local mass and scale by local/global decision
-mass. Ranks sum one flat fp32 gradient buffer without DDP averaging. This is
-exact for unequal rank topology and work.
+Normal/sequential decisions have mass one; branched decisions use a Walker
+sampler built from fixed path weights. Fp64 log masses are exchanged in common
+order and each local stratum is scaled by its exact global mass. Ranks SUM one
+flat fp32 gradient buffer without DDP averaging.
 
 When reference KL is enabled, an immutable reference model is refreshed on its
 configured interval, evaluated without gradients, and checkpointed.

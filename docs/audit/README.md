@@ -2,6 +2,10 @@
 
 Active audit documents describe the sole production NLHE implementation:
 
+- [`migration_cleanup_gpu_acceptance_20260717.md`](migration_cleanup_gpu_acceptance_20260717.md)
+  records the final migration, schema/checkpoint hardening, full-deck shape
+  gates, throughput measurements, and current CPU/GPU release verdict.
+
 - [`distributed_learner_reference_cache_20260717.md`](distributed_learner_reference_cache_20260717.md)
   records phase-2 bounded learner, direct flat-SUM gradient, reference-cache,
   CPU/distributed, and GPU acceptance evidence.

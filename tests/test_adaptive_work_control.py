@@ -37,7 +37,6 @@ def test_repository_configs_use_explicit_per_gpu_root_contract() -> None:
     assert adaptive.rollout.sequential_roots_per_gpu_initial == 2_048
     assert adaptive.rollout.sequential_roots_per_gpu_minimum == 512
     assert adaptive.rollout.sequential_roots_per_gpu_maximum == 2_560
-    assert adaptive.training.target_node_reuse == 3.0
 
     fixed = load_config("configs/acceptance/nlhe_hu_sequential_rb.yaml")
     assert fixed.rollout.sequential_roots_per_gpu_initial == 17

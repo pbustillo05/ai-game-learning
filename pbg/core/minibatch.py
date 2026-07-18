@@ -63,8 +63,6 @@ def _gather_targets(targets: NodeTargets, rows: Tensor) -> NodeTargets:
         child_event_row=targets.child_event_row[rows],
         child_mask=targets.child_mask[rows],
         child_count=targets.child_count[rows],
-        # Production-v1 has no Q target/loss consumer.
-        q_hat=None,
     )
 
 

@@ -30,7 +30,7 @@ rollout:
   # hardware profile accepts that measured tier while retaining a 25% gate.
   sequential_roots_per_gpu_maximum: 2560
   # Policy-conditioned memory forecasts are updated on every successful
-  # iteration and censored pre-optimizer retry. Positive surprises widen
+  # iteration and clean pre-draw admission stop. Positive surprises widen
   # immediately; tightening requires a fresh calibration window after drift.
   memory_calibration_window: 128
   memory_growth_fraction: 0.10
@@ -85,8 +85,6 @@ training:
   # 537 rollouts * 298 optimizer steps = 160,026 steps per fixed reference,
   # preserving the original approximately 160k-step reference cadence.
   kl_ref_interval: 537
-  target_node_reuse: 3.0
-  kl_ref_optimizer_steps: 160000
 
 loss:
   name: rb_ppo

@@ -32,7 +32,7 @@ def _stats(p_hat: torch.Tensor, v_hat: torch.Tensor, **metadata):
     )
 
 
-def _targets(tree, stats, heads, lam, *, emit_q=False, max_workspace_bytes=1 << 30):
+def _targets(tree, stats, heads, lam, *, max_workspace_bytes=1 << 30):
     leaves = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero().squeeze(1)
     return streamed_branched_value(
         tree,
@@ -44,7 +44,6 @@ def _targets(tree, stats, heads, lam, *, emit_q=False, max_workspace_bytes=1 << 
         _Game(),
         configured_node_budget=3,
         completion_batch_rows=max(1, int(leaves.numel())),
-        emit_q=emit_q,
         max_workspace_bytes=max_workspace_bytes,
     )
 
@@ -102,13 +101,13 @@ def _posterior_shift_fixture():
 
 def test_posterior_moment_aggregation_and_leave_one_out() -> None:
     tree, stats, heads = _posterior_shift_fixture()
-    target = _targets(tree, stats, heads, 0.5, emit_q=True)
+    target = _targets(tree, stats, heads, 0.5)
 
     # Directly averaging the two conditional leaf values would give [1,4].
     assert torch.equal(target.parent_p_hat, torch.tensor([[0.5, 0.5]]))
     assert torch.equal(target.v_hat, torch.tensor([[2.0, 8.0]]))
     assert torch.equal(target.child_p_hat[0], torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
-    assert torch.equal(target.q_hat[0], torch.tensor([[2.0, 0.0], [0.0, 8.0]]))
+    assert not hasattr(target, "q_hat")
     assert torch.equal(target.a_hat[0], torch.tensor([[-3.0, -9.0], [-6.0, 3.0]]))
     assert torch.equal(target.child_event_row, torch.tensor([[7, 7]], dtype=torch.int32))
     assert torch.equal(target.child_mask, torch.tensor([[True, True]]))
@@ -124,7 +123,7 @@ def test_single_child_baseline_is_old_value(lam: float) -> None:
     stats = _stats(torch.tensor([[[0.25, 0.75]]]), torch.tensor([[[4.0, -2.0]]]))
     heads = HeadEvals(torch.tensor([root], dtype=torch.int32), torch.tensor([[1.0, 3.0]]))
     target = _targets(tree, stats, heads, lam)
-    assert target.q_hat is None
+    assert not hasattr(target, "q_hat")
     assert torch.allclose(target.a_hat[0, 0], torch.tensor([3.0, -5.0]))
     assert torch.allclose(target.v_hat[0], torch.tensor([4.0, -2.0]))
     assert (

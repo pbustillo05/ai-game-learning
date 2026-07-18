@@ -77,16 +77,19 @@ tools/run-status.sh runs/nlhe_hu_32bb_sequential_rb
 tmux attach -t pbg-nlhe_hu_32bb_sequential_rb
 ```
 
-The candidate sequential-RB run checkpoints every 5 iterations. The
-checkpoint includes the distributed RNG and adaptive-work state needed for
-safe resume. If a selected checkpoint predates metrics already flushed after
+The candidate sequential-RB run checkpoints every 5 iterations. The v3
+checkpoint includes storage/controller schema metadata, distributed logical
+RNG state, optimizer/reference schedule, loss scale, and memory-root controller
+state needed for deterministic resume. A recent unversioned v2 checkpoint is
+migrated as metadata only; incompatible or partial state is rejected on CPU
+before GPU allocation. If a selected checkpoint predates metrics already flushed after
 it, resume trims that uncheckpointed suffix and preserves it as
 `metrics.jsonl.before_resume_*.bak`.
 
 ## Training diagnostics
 
 Every training iteration records major phase wall time and CUDA peak memory
-for snapshot, rollout, completion, backward estimator, compaction, and the
+for rollout, seal, completion, backward estimator, and the
 full optimization phase. The optimization phase also records host-side time
 for minibatch sampling, forward/loss computation, backward propagation,
 gradient synchronization, and the optimizer update. These subphase timings
@@ -129,7 +132,7 @@ at least one sequential start. The learner globally sums decision mass and one
 flat gradient buffer, so unequal rank work is expected and supported.
 
 Rank zero writes `run.json`, append-only `metrics.jsonl`, and atomic
-checkpoints. A checkpoint includes the model, optimizer, scaler, completed
+checkpoints. A versioned checkpoint includes the model, optimizer, scaler, completed
 iteration, scientific configuration, run id, explicit RNG state for every
 rank, and reference-policy state when KL is active. Resume checks configuration,
 world size, run identity, location, iteration schedule, and exact metrics

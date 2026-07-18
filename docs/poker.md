@@ -94,11 +94,11 @@ The action policy combines passive/call/raise logits with a discretized logistic
 raise mixture and all-in atom. Legal-event masks are applied before sampling,
 log probability, entropy, and KL.
 
-Preflop scatters combo reach into class rows, builds private/public/history/action
-tokens, applies reach-biased attention and incidence residuals, then lifts actor
-class outputs to combo rows. Postflop compacts board-compatible live-player
-combos, includes folded summaries and public/history tokens, and scatters output
-back to the fixed combo interface.
+Preflop model storage and learner forwards remain on $R^2$ class rows (169 for
+$R=13$); exact RB posterior/return loops use all $\binom{4R}{2}$ hands (1326 at
+full deck) through the fixed quotient. Postflop storage and forwards remain on
+the canonical dense hand domain, including board-blocked zero rows. No street-
+specific postflop partition or structural-zero packing is used.
 
 The hardware profile selects attention backend, query chunk, precision, and
 token/token-pair caps. Family cost planning uses actual padded model work and
@@ -112,12 +112,11 @@ networks, configures attention, creates evaluator adapters, preflights rollout
 memory, and allocates the tensor backend. Normal mode has no multi-sample
 completion backend; both RB modes use tensor-native evaluator completion.
 
-The memory plan includes public state, topology, retained reaches, live
-frontiers, policy cache, occurrence arena, queues, staging, completion, target
-frontier, and model/optimizer reserve. Sequential `recompute` plans against
-live trajectories and retained decisions; branched plans against the one-tree
-node budget. CUDA construction rejects a plan that crowds out the configured
-reserve before serious allocation.
+The four-phase memory plan separately predicts rollout, source/destination seal
+overlap, targets, and uncached optimization. Optional reference caches are
+admitted only after the uncached singleton path fits. Sequential width is a
+common per-GPU root count chosen before draws; there is no retry, reroll, reach
+replay, or decision-throughput root target.
 
 ## Validation
 

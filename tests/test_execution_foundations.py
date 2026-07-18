@@ -35,14 +35,17 @@ from pbg.core.execution import (
 )
 from pbg.core.training import (
     _analytical_memory_plan,
-    _alias_table,
-    _sample_alias,
     _rank_local_config,
-    _sync_scaled_gradients,
     _validate_memory_calibration,
 )
+from pbg.core.learner import ReusableIndexBuffer
+from pbg.core.targets import _walker_alias
 from pbg.core.game import GameBundle
-from pbg.core.optimization import FlatGradientBuffer, finite_gated_optimizer_step
+from pbg.core.optimization import (
+    FlatGradientBuffer,
+    finite_gated_optimizer_step,
+    sync_scaled_gradients,
+)
 
 
 def test_sequential_memory_plan_uses_realized_single_child_width() -> None:
@@ -173,7 +176,7 @@ def test_declared_control_sync_and_transfers_are_accounted_separately() -> None:
 
 def test_alias_table_reconstructs_law_and_draws_from_it() -> None:
     probability = torch.tensor([0.1, 0.3, 0.6], dtype=torch.float64)
-    threshold, alias = _alias_table(probability)
+    threshold, alias = _walker_alias(probability)
     reconstructed = torch.zeros_like(probability)
     for column in range(probability.numel()):
         reconstructed[column] += threshold[column] / probability.numel()
@@ -181,7 +184,9 @@ def test_alias_table_reconstructs_law_and_draws_from_it() -> None:
     assert torch.allclose(reconstructed, probability)
 
     gen = torch.Generator().manual_seed(5)
-    draws = _sample_alias(threshold, alias, 40_000, gen)
+    draws = ReusableIndexBuffer(40_000, probability.device).draw_alias(
+        threshold, alias, 40_000, gen
+    )
     empirical = torch.bincount(draws, minlength=3).to(torch.float64) / draws.numel()
     assert torch.allclose(empirical, probability, atol=0.01, rtol=0.0)
 
@@ -193,13 +198,13 @@ def test_flat_gradient_sum_zero_fills_absent_parameters_and_reuses_buffer() -> N
     parameters = list(model.parameters())
     parameters[0].grad.copy_(torch.tensor([[2.0, -3.0]]))
 
-    assert _sync_scaled_gradients(model, 1, flat_buffer=flat)
+    assert sync_scaled_gradients(model, 1, flat_buffer=flat)
     assert torch.equal(parameters[0].grad, torch.tensor([[2.0, -3.0]]))
     assert torch.equal(parameters[1].grad, torch.zeros_like(parameters[1]))
     first = flat.flat
 
     parameters[0].grad.fill_(float("inf"))
-    assert not _sync_scaled_gradients(model, 1, flat_buffer=flat)
+    assert not sync_scaled_gradients(model, 1, flat_buffer=flat)
     assert first is flat.flat
 
 
@@ -211,7 +216,7 @@ def test_nonfinite_common_decision_skips_disabled_scaler_optimizer_step() -> Non
     flat = FlatGradientBuffer(model)
     flat.zero_()
     parameter.grad.fill_(float("inf"))
-    common_finite = _sync_scaled_gradients(model, 1, flat_buffer=flat)
+    common_finite = sync_scaled_gradients(model, 1, flat_buffer=flat)
 
     result = finite_gated_optimizer_step(
         model,

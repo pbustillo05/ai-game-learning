@@ -10,11 +10,14 @@ import torch
 import torch.distributed as dist
 
 from pbg.config import load_config
-from pbg.core.optimization import FlatGradientBuffer, finite_gated_optimizer_step
+from pbg.core.optimization import (
+    FlatGradientBuffer,
+    finite_gated_optimizer_step,
+    sync_scaled_gradients,
+)
 from pbg.core.training import (
     _add_distributed_metric_summaries,
     _scaler,
-    _sync_scaled_gradients,
 )
 
 
@@ -65,7 +68,7 @@ def _unequal_mass_gradient_worker(
         # common global mass. The flat collective must SUM these terms.
         loss = (model(inputs).squeeze(1) - targets).square().sum() / 4.0
         loss.backward()
-        assert _sync_scaled_gradients(model, world, flat_buffer=flat)
+        assert sync_scaled_gradients(model, world, flat_buffer=flat)
         Path(output_dir, f"gradient_{rank}.json").write_text(
             json.dumps(
                 {
@@ -95,7 +98,7 @@ def _unequal_nonfinite_gradient_worker(
         model.weight.grad.fill_(1.0 if rank == 0 else float("inf"))
         optimizer = torch.optim.SGD(model.parameters(), lr=0.5)
         scaler = _scaler(False)
-        common_finite = _sync_scaled_gradients(model, world, flat_buffer=flat)
+        common_finite = sync_scaled_gradients(model, world, flat_buffer=flat)
         result = finite_gated_optimizer_step(
             model,
             optimizer,

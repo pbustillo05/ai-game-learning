@@ -16,6 +16,86 @@ import torch
 from torch import nn
 
 from pbg.core.config import RootConfig
+from pbg.core.memory_control import SEQUENTIAL_MEMORY_CONTROLLER_VERSION
+from pbg.core.storage import TRAINING_STORAGE_SCHEMA_VERSION
+
+
+CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v3"
+LEGACY_CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v2"
+
+
+def _migrate_checkpoint_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate metadata and deterministically migrate the recent v2 payload.
+
+    Migration changes only metadata. It never reconstructs a legacy runtime
+    tree, reach cache, target store, or learner allocation.
+    """
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("checkpoint payload must be a mapping")
+    version = payload.get("checkpoint_schema_version")
+    # Migration mutates metadata keys only. A shallow copy avoids duplicating
+    # model/optimizer tensors, especially after map_location places them on a
+    # GPU during the actual restore.
+    migrated = dict(payload)
+    if version is None:
+        required = {
+            "model", "optimizer", "scaler", "iteration", "config",
+            "torch_generator", "numpy_generator", "torch_cpu_rng",
+        }
+        missing = required.difference(migrated)
+        if missing:
+            raise RuntimeError(
+                "legacy checkpoint is partial; missing required fields "
+                f"{sorted(missing)}"
+            )
+        migrated["migrated_from_checkpoint_schema"] = LEGACY_CHECKPOINT_SCHEMA_VERSION
+        migrated["checkpoint_schema_version"] = CHECKPOINT_SCHEMA_VERSION
+        migrated["storage_schema_version"] = TRAINING_STORAGE_SCHEMA_VERSION
+        state = migrated.get("adaptive_work_state")
+        if state is not None and state.get("version") != SEQUENTIAL_MEMORY_CONTROLLER_VERSION:
+            raise RuntimeError("legacy checkpoint has incompatible controller state")
+        migrated["controller_schema_version"] = (
+            None if state is None else SEQUENTIAL_MEMORY_CONTROLLER_VERSION
+        )
+    elif version != CHECKPOINT_SCHEMA_VERSION:
+        raise RuntimeError(f"unsupported checkpoint schema version {version!r}")
+    if migrated.get("storage_schema_version") != TRAINING_STORAGE_SCHEMA_VERSION:
+        raise RuntimeError("checkpoint storage schema is incompatible")
+    controller_version = migrated.get("controller_schema_version")
+    state = migrated.get("adaptive_work_state")
+    if (state is None) != (controller_version is None):
+        raise RuntimeError("checkpoint contains partial controller metadata")
+    if state is not None and (
+        controller_version != SEQUENTIAL_MEMORY_CONTROLLER_VERSION
+        or state.get("version") != SEQUENTIAL_MEMORY_CONTROLLER_VERSION
+    ):
+        raise RuntimeError("checkpoint controller schema is incompatible")
+    rank_states = migrated.get("rank_rng_states")
+    if rank_states is not None and any(
+        not isinstance(item, dict)
+        or not {"torch_generator", "numpy_generator", "torch_cpu_rng", "torch_cuda_rng"}.issubset(item)
+        for item in rank_states
+    ):
+        raise RuntimeError("checkpoint contains a partial per-rank RNG state")
+    return migrated
+
+
+def inspect_checkpoint(path: str | Path) -> dict[str, Any]:
+    """Validate checkpoint compatibility on CPU before any GPU allocation."""
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    migrated = _migrate_checkpoint_payload(payload)
+    return {
+        "checkpoint_schema_version": migrated["checkpoint_schema_version"],
+        "migrated_from_checkpoint_schema": migrated.get(
+            "migrated_from_checkpoint_schema"
+        ),
+        "storage_schema_version": migrated["storage_schema_version"],
+        "controller_schema_version": migrated["controller_schema_version"],
+        "iteration": int(migrated["iteration"]),
+        "config": copy.deepcopy(migrated["config"]),
+    }
 
 
 def save_checkpoint(
@@ -44,6 +124,13 @@ def save_checkpoint(
     stored_config = scientific_config(cfg)
     hardware_profile = asdict(cfg).get("hardware")
     payload = {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "storage_schema_version": TRAINING_STORAGE_SCHEMA_VERSION,
+        "controller_schema_version": (
+            None
+            if adaptive_work_state is None
+            else SEQUENTIAL_MEMORY_CONTROLLER_VERSION
+        ),
         "model": raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
@@ -83,7 +170,9 @@ def load_checkpoint(
 ) -> dict[str, Any]:
     """Restore checkpoint state and return iteration/config metadata."""
 
-    payload = torch.load(path, map_location=map_location, weights_only=False)
+    payload = _migrate_checkpoint_payload(
+        torch.load(path, map_location=map_location, weights_only=False)
+    )
     raw_model = model.module if hasattr(model, "module") else model
     raw_model.load_state_dict(payload["model"])
     reference_state = payload.get("reference_model")
@@ -126,6 +215,12 @@ def load_checkpoint(
         "adaptive_work_state": payload.get("adaptive_work_state"),
         "probe_target": copy.deepcopy(payload.get("probe_target")),
         "logical_work": copy.deepcopy(payload.get("logical_work")),
+        "checkpoint_schema_version": payload["checkpoint_schema_version"],
+        "migrated_from_checkpoint_schema": payload.get(
+            "migrated_from_checkpoint_schema"
+        ),
+        "storage_schema_version": payload["storage_schema_version"],
+        "controller_schema_version": payload["controller_schema_version"],
     }
 
 

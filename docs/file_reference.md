@@ -18,19 +18,25 @@
   family routing, reusable staging, and logical RNG.
 - `rollout.py` — family-scheduled sequential normal/RB trajectories.
 - `branching.py` — family-scheduled labeled randomized-rounded branching.
-- `tree.py` — CSR topology, device buffer, policy/reach caches, reach replay,
-  and decision alias tables.
+- `partition.py` — immutable exact/natural domains and opaque model/completion boundaries.
+- `storage.py` — versioned schemas, append-only arenas, exact sealed blocks,
+  and immutable rollout/training stores.
+- `topology.py` — decision-only sequential CSR and contiguous-child branched spans.
+- `targets.py` — streaming v1 targets, posterior deduplication, and sampling metadata.
+- `learner.py` — bounded stratified update and transactional reference caches.
+- `tree.py` — rollout-time CSR topology and device construction buffer; no
+  production learner owns it.
 - `completion.py` — completion DTOs, learning-field filtering, and backend
   protocol.
 - `values.py` — sole streamed posterior-mass/value reduction and RB targets.
-- `normal.py` — compact sampled-profile normal targets and minibatches.
-- `minibatch.py` — aligned RB row sampling and gathering.
+- `normal.py`, `minibatch.py` — rollout-to-seal compatibility producers; they
+  do not cross the immutable production learner boundary.
 - `losses.py` — PPO/RB-PPO, value, entropy, reference KL, and metrics.
 - `distributed.py` — exact decision-mass scaling helpers.
 - `optimization.py` — flat gradient SUM, common finite decision, clipping,
   optimizer mutation, and scaler transition.
-- `checkpointing.py` — atomic payloads, per-rank RNG, scientific identity, and
-  metrics-prefix validation.
+- `checkpointing.py` — versioned atomic payloads, deterministic v2 migration,
+  per-rank RNG/controller state, scientific identity, and metrics-prefix validation.
 - `observability.py` — execution, transfer, synchronization, evaluator, and
   memory counters.
 - `training.py` — iteration/learner orchestration, precision contexts, memory
