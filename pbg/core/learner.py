@@ -208,6 +208,61 @@ def allocate_statistical_counts(
     return counts.to(torch.int32)
 
 
+def allocate_fixed_statistical_counts(
+    mass: Tensor,
+    variance: Tensor,
+    seconds_per_draw: Tensor,
+    total_count: int,
+) -> Tensor:
+    """Allocate a fixed draw count with a mass/variance/cost proxy.
+
+    Every positive-mass stratum receives one draw.  Remaining draws use the
+    largest-remainder apportionment of ``mass * sqrt(variance / cost)``.  The
+    per-stratum estimator remains exactly unbiased because execution applies
+    the corresponding exact stratum coefficient divided by the returned
+    positive count.
+    """
+
+    if mass.ndim != 1 or variance.shape != mass.shape or seconds_per_draw.shape != mass.shape:
+        raise ValueError("statistical allocation inputs must be aligned vectors")
+    if not bool(torch.isfinite(mass).all()) or bool((mass < 0).any()):
+        raise ValueError("mass must be finite and nonnegative")
+    if not bool(torch.isfinite(variance).all()) or bool((variance < 0).any()):
+        raise ValueError("lagged variances must be finite and nonnegative")
+    if not bool(torch.isfinite(seconds_per_draw).all()) or bool((seconds_per_draw <= 0).any()):
+        raise ValueError("measured draw costs must be finite and positive")
+    if isinstance(total_count, bool) or total_count <= 0:
+        raise ValueError("total statistical count must be positive")
+    active = mass > 0
+    active_count = int(active.sum())
+    if total_count < active_count:
+        raise ValueError("total count cannot cover every positive-mass stratum")
+    counts = active.to(torch.int64)
+    remaining = total_count - active_count
+    if remaining == 0:
+        return counts.to(torch.int32)
+    score = torch.where(
+        active,
+        mass * torch.sqrt(variance / seconds_per_draw),
+        torch.zeros_like(mass),
+    )
+    total_score = score.sum()
+    if not bool(total_score > 0):
+        score = active.to(mass.dtype)
+        total_score = score.sum()
+    raw = remaining * score / total_score
+    extra = torch.floor(raw).to(torch.int64)
+    counts += extra
+    leftover = remaining - int(extra.sum())
+    if leftover:
+        fractions = raw - extra.to(raw)
+        # Stable sorting makes lower partition positions the deterministic
+        # tie-break, matching the fixed partition order used by the learner.
+        order = torch.argsort(fractions, descending=True, stable=True)
+        counts[order[:leftover]] += 1
+    return counts.to(torch.int32)
+
+
 class ReusableIndexBuffer:
     """One fixed int32 destination for all statistical index draws."""
 
@@ -564,18 +619,49 @@ def _policy_terms(
 ) -> tuple[Callable[[Tensor], Tensor], Tensor, Tensor]:
     """Return selected-logp closure, exact entropy, and exact current||ref KL."""
 
-    entropy = _exact_rows(adapter.entropy(output, legal_ids, legal_mask), phi)
-    if reference is None:
-        kl = torch.zeros_like(entropy)
-    else:
-        try:
-            natural_kl = adapter.kl(output, reference, legal_ids, legal_mask)
-        except TypeError:
-            natural_kl = adapter.kl(output, reference)
+    fused = getattr(adapter, "policy_terms", None)
+    natural_log_rows: Tensor | None = None
+    if callable(fused):
+        natural_log_rows, natural_entropy, natural_kl = fused(
+            output, reference, legal_ids, legal_mask
+        )
+        entropy = _exact_rows(natural_entropy, phi)
         kl = _exact_rows(natural_kl, phi)
+    else:
+        entropy = _exact_rows(adapter.entropy(output, legal_ids, legal_mask), phi)
+        if reference is None:
+            kl = torch.zeros_like(entropy)
+        else:
+            try:
+                natural_kl = adapter.kl(output, reference, legal_ids, legal_mask)
+            except TypeError:
+                natural_kl = adapter.kl(output, reference)
+            kl = _exact_rows(natural_kl, phi)
 
     def selected(events: Tensor) -> Tensor:
-        natural = adapter.log_prob(output, events, legal_ids, legal_mask)
+        if natural_log_rows is None:
+            natural = adapter.log_prob(output, events, legal_ids, legal_mask)
+            return _exact_rows(natural, phi)
+        selected_events = events if events.ndim == 2 else events[:, None]
+        matches = (
+            legal_ids[:, None, :].to(selected_events.device)
+            == selected_events[:, :, None]
+        ) & legal_mask[:, None, :].to(selected_events.device)
+        _require_selected = matches.any(-1)
+        if _require_selected.device.type == "cuda":
+            torch._assert_async(
+                _require_selected.all(),
+                "selected events must select supplied legal events",
+            )
+        elif not bool(_require_selected.all()):
+            raise ValueError("selected events must select supplied legal events")
+        columns = matches.to(torch.int64).argmax(-1).to(natural_log_rows.device)
+        natural = natural_log_rows.gather(
+            -1,
+            columns[:, None, :].expand(
+                natural_log_rows.shape[0], natural_log_rows.shape[1], -1
+            ),
+        ).transpose(1, 2)
         return _exact_rows(natural, phi)
 
     return selected, entropy, kl
@@ -774,6 +860,8 @@ class DistributedLearnerConfig:
     hard_bytes: int | None = None
     resident_base_bytes: int = 0
     reference_candidates: tuple[ReferenceCacheCandidate, ...] = ()
+    reference_build_shapes: Mapping[int, tuple[PhysicalShape, ...]] = MappingProxyType({})
+    sampled_reference_cache: bool = False
     amp_enabled: bool = False
     amp_dtype: torch.dtype = torch.float16
 
@@ -784,10 +872,18 @@ class DistributedLearnerConfig:
         shapes = {int(key): tuple(value) for key, value in self.physical_shapes.items()}
         if any(not value for value in shapes.values()):
             raise ValueError("every configured stratum needs calibrated physical shapes")
+        build_shapes = {
+            int(key): tuple(value) for key, value in self.reference_build_shapes.items()
+        }
+        if any(not value for value in build_shapes.values()):
+            raise ValueError("configured reference build shapes cannot be empty")
+        if not set(build_shapes).issubset(shapes):
+            raise ValueError("reference build shapes require a training stratum")
         if self.available_transient_bytes < 0 or self.resident_base_bytes < 0:
             raise ValueError("learner memory bounds must be nonnegative")
         object.__setattr__(self, "statistical_counts", MappingProxyType(counts))
         object.__setattr__(self, "physical_shapes", MappingProxyType(shapes))
+        object.__setattr__(self, "reference_build_shapes", MappingProxyType(build_shapes))
 
 
 @dataclass(frozen=True)
@@ -829,6 +925,10 @@ class DistributedFixedRolloutUpdate:
         self._planners = {
             key: PhysicalPlanner(value) for key, value in config.physical_shapes.items()
         }
+        self._reference_build_planners = {
+            key: PhysicalPlanner(config.reference_build_shapes.get(key, value))
+            for key, value in config.physical_shapes.items()
+        }
 
     def _forward_partition(
         self,
@@ -844,7 +944,10 @@ class DistributedFixedRolloutUpdate:
         ):
             return _forward(spec, model, inputs)
 
-    def _cache_choice(self) -> ReferenceCacheChoice:
+    def _cache_choice(
+        self,
+        candidates: Sequence[ReferenceCacheCandidate] | None = None,
+    ) -> ReferenceCacheChoice:
         hard = (
             self.config.resident_base_bytes
             + self.flat_gradient.nbytes
@@ -853,7 +956,7 @@ class DistributedFixedRolloutUpdate:
             else self.config.hard_bytes
         )
         return select_reference_cache_set(
-            self.config.reference_candidates,
+            self.config.reference_candidates if candidates is None else candidates,
             resident_base_bytes=self.config.resident_base_bytes + self.flat_gradient.nbytes,
             hard_bytes=hard,
         )
@@ -862,6 +965,9 @@ class DistributedFixedRolloutUpdate:
         self,
         storage: TrainingStorage,
         selected: frozenset[int],
+        *,
+        candidates: Sequence[ReferenceCacheCandidate] | None = None,
+        cache_rows: Mapping[int, Tensor] | None = None,
     ) -> tuple[dict[int, Any], dict[str, float]]:
         if not selected:
             return {}, {"reference_cache_partitions": 0.0}
@@ -872,6 +978,7 @@ class DistributedFixedRolloutUpdate:
         metrics = {
             "reference_cache_partitions": float(len(selected)),
             "reference_cache_build_rows": 0.0,
+            "reference_cache_build_calls": 0.0,
             "reference_cache_bytes": 0.0,
             "reference_cache_build_seconds": 0.0,
         }
@@ -883,7 +990,9 @@ class DistributedFixedRolloutUpdate:
             # every final destination before the first multirow build forward.
             predicted = {
                 item.partition_id: item.resident_bytes
-                for item in self.config.reference_candidates
+                for item in (
+                    self.config.reference_candidates if candidates is None else candidates
+                )
             }
             for partition_id in sorted(selected):
                 partition = storage.partitions[partition_id]
@@ -895,7 +1004,10 @@ class DistributedFixedRolloutUpdate:
                         _gather_inputs(partition, one),
                     )
                 caches[partition_id] = _empty_output_like(
-                    probes[partition_id], partition.inputs.rows
+                    probes[partition_id],
+                    partition.inputs.rows
+                    if cache_rows is None
+                    else cache_rows[partition_id].numel(),
                 )
                 actual_bytes = output_nbytes(caches[partition_id])
                 if actual_bytes != predicted[partition_id]:
@@ -906,22 +1018,35 @@ class DistributedFixedRolloutUpdate:
             started = time.perf_counter()
             for partition_id in sorted(selected):
                 partition = storage.partitions[partition_id]
-                planner = self._planners[partition_id]
-                all_rows = torch.arange(
-                    partition.inputs.rows,
+                planner = self._reference_build_planners[partition_id]
+                selected_rows = (
+                    torch.arange(
+                        partition.inputs.rows,
+                        dtype=torch.int64,
+                        device=self.index_buffer.tensor.device,
+                    )
+                    if cache_rows is None
+                    else cache_rows[partition_id].to(torch.int64)
+                )
+                positions = torch.arange(
+                    selected_rows.numel(),
                     dtype=torch.int32,
                     device=self.index_buffer.tensor.device,
                 )
-                for span in planner.plan(all_rows, self.config.available_transient_bytes):
-                    rows = span.select(all_rows).long()
+                for span in planner.plan(positions, self.config.available_transient_bytes):
+                    destination_rows = span.select(positions).long()
+                    rows = selected_rows[destination_rows]
                     with torch.no_grad():
                         output = self._forward_partition(
                             self.partitions[partition_id],
                             self.reference_model,
                             _gather_inputs(partition, rows),
                         )
-                    _scatter_output(caches[partition_id], rows, output)
+                    _scatter_output(caches[partition_id], destination_rows, output)
                     metrics["reference_cache_build_rows"] += float(rows.numel())
+                    metrics["reference_cache_build_calls"] += 1.0
+                    histogram_key = f"reference_cache_build_rows_{rows.numel()}"
+                    metrics[histogram_key] = metrics.get(histogram_key, 0.0) + 1.0
                     del output
             metrics["reference_cache_build_seconds"] = time.perf_counter() - started
             if device.type == "cuda":
@@ -934,13 +1059,15 @@ class DistributedFixedRolloutUpdate:
             return caches, metrics
         except (MemoryError, RuntimeError):
             # Admission/build failure is a hard transaction rollback.  It
-            # occurs before learner index draws, so targets and randomness are
-            # unchanged and the mandatory empty-cache path remains valid.
+            # either precedes learner draws or reuses the already-predrawn
+            # sampled plan, so targets and randomness are unchanged and the
+            # mandatory empty-cache path remains valid.
             caches.clear()
             return {}, {
                 "reference_cache_partitions": 0.0,
                 "reference_cache_rollback": 1.0,
                 "reference_cache_build_rows": 0.0,
+                "reference_cache_build_calls": 0.0,
                 "reference_cache_bytes": 0.0,
                 "reference_cache_build_seconds": 0.0,
             }
@@ -967,6 +1094,7 @@ class DistributedFixedRolloutUpdate:
                     singleton, self.config.available_transient_bytes
                 )
         reference_singleton_rows = 0
+        singleton_output_bytes: dict[int, int] = {}
         if float(getattr(self.loss_cfg, "c_kl", 0.0)) > 0.0:
             if self.reference_model is None:
                 raise ValueError("positive reference KL requires reference_model")
@@ -981,11 +1109,88 @@ class DistributedFixedRolloutUpdate:
                         _gather_inputs(partition, singleton_rows),
                     )
                 reference_singleton_rows += 1
+                singleton_output_bytes[partition_id] = output_nbytes(singleton_output)
                 del singleton_output
-        # Cache planning/build overlaps the in-flight mass exchange and happens
-        # before any learner randomness.
-        choice = self._cache_choice()
-        caches, metrics = self._build_reference_caches(storage, choice.selected)
+        predrawn: dict[int, Tensor] | None = None
+        cache_rows: dict[int, Tensor] | None = None
+        if self.config.sampled_reference_cache and singleton_output_bytes:
+            # Draw the complete logical index plan using the exact original
+            # step/partition call order.  A cache rollback reuses this plan, so
+            # it neither rerolls the sampled iteration nor changes RNG state.
+            predrawn = {
+                partition_id: torch.empty(
+                    (optimizer_steps, count),
+                    dtype=torch.int32,
+                    device=self.index_buffer.tensor.device,
+                )
+                for partition_id, count in self.config.statistical_counts.items()
+                if storage.partitions.get(partition_id) is not None
+                and storage.partitions[partition_id].inputs.rows
+            }
+            for step_index in range(optimizer_steps):
+                for partition_spec in self.partitions.specs:
+                    partition_id = partition_spec.partition_id
+                    partition = storage.partitions.get(partition_id)
+                    if partition is None or not partition.inputs.rows:
+                        continue
+                    count = self.config.statistical_counts[partition_id]
+                    if storage.mode == "branched_rb":
+                        drawn = self.index_buffer.draw_alias(
+                            storage.sampling.alias_probability[partition_id],
+                            storage.sampling.alias_index[partition_id],
+                            count,
+                            generator,
+                        )
+                    else:
+                        drawn = self.index_buffer.draw_uniform(
+                            partition.inputs.rows, count, generator
+                        )
+                    predrawn[partition_id][step_index].copy_(drawn)
+            cache_rows = {
+                partition_id: torch.unique(indices.flatten(), sorted=True)
+                for partition_id, indices in predrawn.items()
+            }
+            candidates = tuple(
+                ReferenceCacheCandidate(
+                    partition_id=partition_id,
+                    resident_bytes=(
+                        rows.numel() * singleton_output_bytes[partition_id]
+                    ),
+                    build_workspace_bytes=max(
+                        shape.transient_bytes
+                        for shape in self.config.reference_build_shapes.get(
+                            partition_id,
+                            self.config.physical_shapes[partition_id],
+                        )
+                    ),
+                    uncached_training_workspace_bytes=max(
+                        shape.transient_bytes
+                        for shape in self.config.physical_shapes[partition_id]
+                    ),
+                    cached_training_workspace_bytes=max(
+                        shape.transient_bytes
+                        for shape in self.config.physical_shapes[partition_id]
+                    ),
+                    build_seconds=float(rows.numel()),
+                    uncached_training_seconds=float(
+                        optimizer_steps * self.config.statistical_counts[partition_id]
+                    ),
+                    cached_training_seconds=0.0,
+                )
+                for partition_id, rows in cache_rows.items()
+            )
+            choice = self._cache_choice(candidates)
+            caches, metrics = self._build_reference_caches(
+                storage,
+                choice.selected,
+                candidates=candidates,
+                cache_rows=cache_rows,
+            )
+        else:
+            # Full-partition candidates remain available for callers with
+            # externally calibrated cache contracts.
+            choice = self._cache_choice()
+            caches, metrics = self._build_reference_caches(storage, choice.selected)
         metrics["reference_singleton_feasibility_rows"] = float(
             reference_singleton_rows
         )
@@ -1008,9 +1213,26 @@ class DistributedFixedRolloutUpdate:
         activation_checkpointed = 0
         objective_terms: dict[str, Tensor] = {}
         ratio_maximum: Tensor | None = None
-        if self.index_buffer.tensor.device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(self.index_buffer.tensor.device)
-        for _ in range(optimizer_steps):
+        timing_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+        cuda_device = self.index_buffer.tensor.device
+
+        def timing_start() -> torch.cuda.Event | None:
+            if cuda_device.type != "cuda":
+                return None
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            return event
+
+        def timing_end(name: str, started: torch.cuda.Event | None) -> None:
+            if started is None:
+                return
+            ended = torch.cuda.Event(enable_timing=True)
+            ended.record()
+            timing_events.setdefault(name, []).append((started, ended))
+
+        if cuda_device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(cuda_device)
+        for step_index in range(optimizer_steps):
             self.flat_gradient.zero_()
             for position, partition_spec in enumerate(self.partitions.specs):
                 partition_id = partition_spec.partition_id
@@ -1018,7 +1240,9 @@ class DistributedFixedRolloutUpdate:
                 if partition is None or partition.inputs.rows == 0:
                     continue
                 count = self.config.statistical_counts[partition_id]
-                if storage.mode == "branched_rb":
+                if predrawn is not None:
+                    indices = predrawn[partition_id][step_index]
+                elif storage.mode == "branched_rb":
                     indices = self.index_buffer.draw_alias(
                         storage.sampling.alias_probability[partition_id],
                         storage.sampling.alias_index[partition_id],
@@ -1044,14 +1268,27 @@ class DistributedFixedRolloutUpdate:
                         subspan_histogram.get(span.shape_rows, 0) + 1
                     )
                     activation_checkpointed += int(span.activation_checkpointing)
+                    phase_event = timing_start()
                     rows = span.select(indices).long()
                     inputs = _gather_inputs(partition, rows)
+                    timing_end("gather", phase_event)
                     reference_output = None
                     if float(getattr(self.loss_cfg, "c_kl", 0.0)) > 0.0:
+                        phase_event = timing_start()
                         if self.reference_model is None:
                             raise ValueError("positive reference KL requires reference_model")
                         if partition_id in caches:
-                            reference_output = _output_rows(caches[partition_id], rows)
+                            cache_positions = (
+                                rows
+                                if cache_rows is None
+                                else torch.searchsorted(
+                                    cache_rows[partition_id],
+                                    rows.to(cache_rows[partition_id].dtype),
+                                )
+                            )
+                            reference_output = _output_rows(
+                                caches[partition_id], cache_positions
+                            )
                         else:
                             with torch.no_grad():
                                 reference_output = self._forward_partition(
@@ -1062,13 +1299,17 @@ class DistributedFixedRolloutUpdate:
                                 partition_reference_rows.get(partition_id, 0)
                                 + rows.numel()
                             )
+                        timing_end("reference", phase_event)
+                    phase_event = timing_start()
                     output = self._forward_partition(
                         partition_spec, self.model, inputs
                     )
+                    timing_end("forward", phase_event)
                     model_rows += rows.numel()
                     partition_model_rows[partition_id] = (
                         partition_model_rows.get(partition_id, 0) + rows.numel()
                     )
+                    phase_event = timing_start()
                     with torch.autocast(
                         device_type=self.index_buffer.tensor.device.type,
                         enabled=self.config.amp_enabled,
@@ -1086,6 +1327,7 @@ class DistributedFixedRolloutUpdate:
                             iteration=iteration,
                             reference=reference_output,
                         )
+                    timing_end("loss", phase_event)
                     normalization = alpha.to(result.per_decision) / count
                     for name in (
                         "loss_sum",
@@ -1103,8 +1345,11 @@ class DistributedFixedRolloutUpdate:
                         else torch.maximum(ratio_maximum, current_ratio)
                     )
                     contribution = alpha.to(result.per_decision) / count * result.per_decision.sum()
+                    phase_event = timing_start()
                     self.scaler.scale(contribution).backward()
+                    timing_end("backward", phase_event)
                     del result, contribution, output, reference_output, inputs, rows
+            phase_event = timing_start()
             finite = sync_scaled_gradients(
                 self.model,
                 dist.get_world_size(self.group)
@@ -1112,6 +1357,8 @@ class DistributedFixedRolloutUpdate:
                 else 1,
                 flat_buffer=self.flat_gradient,
             )
+            timing_end("gradient_sync", phase_event)
+            phase_event = timing_start()
             steps.append(
                 finite_gated_optimizer_step(
                     self.model,
@@ -1121,6 +1368,7 @@ class DistributedFixedRolloutUpdate:
                     grad_clip=grad_clip,
                 )
             )
+            timing_end("optimizer_update", phase_event)
         metrics.update(
             {
                 "statistical_rows": float(sampled_total),
@@ -1157,6 +1405,12 @@ class DistributedFixedRolloutUpdate:
         metrics["ratio_max"] = (
             0.0 if ratio_maximum is None else float(ratio_maximum)
         )
+        if timing_events:
+            torch.cuda.synchronize(cuda_device)
+            for name, events in timing_events.items():
+                metrics[f"optimization_cuda_{name}_seconds"] = sum(
+                    started.elapsed_time(ended) for started, ended in events
+                ) / 1000.0
         if steps:
             for name, value in steps[-1].metrics().items():
                 metrics[name] = float(value)

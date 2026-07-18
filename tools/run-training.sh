@@ -6,7 +6,7 @@ usage() {
 Usage:
   tools/run-training.sh --config CONFIG --hardware-profile PROFILE \
     --run-dir RUN_DIR --gpus GPU_IDS [--nproc-per-node N]
-    [--resume CHECKPOINT] [--tmux]
+    [--resume CHECKPOINT] [--init-checkpoint CHECKPOINT] [--tmux]
 
 The launcher writes stdout.log, stderr.log, combined.log, status.json,
 gpu_start.csv, and gpu_end.csv under RUN_DIR. With --tmux it starts a detached
@@ -20,6 +20,7 @@ run_dir=""
 gpus=""
 nproc_per_node=2
 resume=""
+init_checkpoint=""
 use_tmux=0
 tmux_child=0
 session=""
@@ -32,6 +33,7 @@ while (($#)); do
     --gpus) gpus=$2; shift 2 ;;
     --nproc-per-node) nproc_per_node=$2; shift 2 ;;
     --resume) resume=$2; shift 2 ;;
+    --init-checkpoint) init_checkpoint=$2; shift 2 ;;
     --tmux) use_tmux=1; shift ;;
     --session) session=$2; shift 2 ;;
     --_tmux-child) tmux_child=1; shift ;;
@@ -63,6 +65,7 @@ if ((use_tmux && !tmux_child)); then
   fi
   args=(--config "$config" --hardware-profile "$hardware_profile" --run-dir "$run_dir" --gpus "$gpus" --nproc-per-node "$nproc_per_node" --session "$session" --_tmux-child)
   [[ -n "$resume" ]] && args+=(--resume "$resume")
+  [[ -n "$init_checkpoint" ]] && args+=(--init-checkpoint "$init_checkpoint")
   tmux new-session -d -s "$session" "$repo_root/tools/$launcher_name" "${args[@]}"
   echo "started tmux session: $session"
   echo "inspect with: tmux attach -t $session"
@@ -147,6 +150,7 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 cmd=(/home/pablob/.venvs/poker/bin/torchrun --standalone --nproc-per-node="$nproc_per_node" -m pbg.cli.train
   --config "$repo_root/$config" --hardware-profile "$repo_root/$hardware_profile")
 [[ -n "$resume" ]] && cmd+=(--resume "$repo_root/$resume")
+[[ -n "$init_checkpoint" ]] && cmd+=(--init-checkpoint "$repo_root/$init_checkpoint")
 printf 'start: %s\ncommand:' "$started_at" > "$command_log"
 printf ' %q' "${cmd[@]}" >> "$command_log"
 printf '\n' >> "$command_log"

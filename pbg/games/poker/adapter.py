@@ -230,6 +230,41 @@ class PokerPolicyAdapter:
 
     compose = probabilities
 
+    def policy_terms(
+        self,
+        raw: PolicyOutput | Mapping[str, Tensor],
+        reference: PolicyOutput | Mapping[str, Tensor] | None,
+        legal_event_ids: Tensor,
+        legal_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Compose log-probabilities, entropy, and KL with one current pass."""
+
+        probability = self.probabilities(raw, legal_event_ids, legal_mask)
+        event_shape = (probability.shape[0],) + (1,) * (probability.ndim - 2) + (
+            probability.shape[-1],
+        )
+        mask = legal_mask.to(probability.device).reshape(event_shape).expand_as(
+            probability
+        )
+        log_probability = torch.where(
+            mask,
+            torch.log(probability.clamp_min(self.eps)),
+            torch.full_like(probability, -torch.inf),
+        )
+        entropy = -(probability * torch.where(mask, log_probability, 0.0)).sum(-1)
+        if reference is None:
+            kl = torch.zeros_like(entropy)
+        else:
+            reference_probability = self.probabilities(
+                reference, legal_event_ids, legal_mask
+            )
+            reference_log = torch.log(reference_probability.clamp_min(self.eps))
+            kl = (
+                probability
+                * (torch.where(mask, log_probability, 0.0) - reference_log)
+            ).sum(-1)
+        return log_probability, entropy, kl
+
     def log_prob(
         self,
         raw: PolicyOutput | Mapping[str, Tensor],

@@ -1,0 +1,26 @@
+name: local_2x2080ti
+scheduler: none
+attention_backend: sdpa
+query_chunk_size: 128
+# Validated on the full-deck HU 32 bb production geometry: 53 preflop and 11
+# postflop statistical rows fit as two physical subspans. The 232-step probe
+# peaked at 3.84 GB learner-reserved memory and 6.80 GB iteration-reserved
+# memory, below this profile's independent hardware ceiling and reserve.
+training_max_tokens: 65536
+training_max_token_pairs: 83886080
+inference_max_tokens: 16384
+inference_max_token_pairs: 134217728
+# CUDA reports 10.57 GiB (11,264 MiB) per card. Cap PBG at about 10.0 GiB,
+# leaving roughly 0.58 GiB for CUDA/NCCL state, allocator variance, and display
+# use. Both constraints remain explicit; the fractional cap is the tighter one
+# on these cards (9.99 GiB with the observed device capacity).
+reserve_vram_gib: 0.5
+max_memory_fraction: 0.945
+max_devices: 2
+expected_compute_capability: [7, 5]
+min_vram_gib: 10.0
+max_vram_gib: 12.0
+precision: fp16
+worker_count: 0
+checkpoint_every: null
+slurm: null

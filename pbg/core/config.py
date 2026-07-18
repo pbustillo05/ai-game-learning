@@ -411,9 +411,10 @@ def _validate_config(cfg: RootConfig) -> None:
     if profile is not None:
         if profile.scheduler not in {"none", "slurm"}:
             raise ConfigError("hardware.scheduler: expected 'none' or 'slurm'")
-        if profile.attention_backend not in {"flex", "chunked_dense", "auto"}:
+        if profile.attention_backend not in {"flex", "sdpa", "chunked_dense", "auto"}:
             raise ConfigError(
-                "hardware.attention_backend: expected 'flex', 'chunked_dense', or 'auto'"
+                "hardware.attention_backend: expected 'flex', 'sdpa', "
+                "'chunked_dense', or 'auto'"
             )
         if profile.precision not in {"fp16", "bf16", "fp32"}:
             raise ConfigError("hardware.precision: expected 'fp16', 'bf16', or 'fp32'")

@@ -19,6 +19,7 @@ from pbg.core.learner import (
     PhysicalShape,
     ReferenceCacheCandidate,
     ReusableIndexBuffer,
+    allocate_fixed_statistical_counts,
     allocate_statistical_counts,
     global_stratum_alphas,
     mode_loss,
@@ -80,6 +81,25 @@ class _Adapter:
         probability = torch.where(torch.isfinite(logp), logp.exp(), 0.0)
         difference = torch.where(torch.isfinite(logp), logp - ref, 0.0)
         return (probability * difference).sum(-1)
+
+
+def test_fixed_statistical_allocation_is_positive_exact_and_cost_aware() -> None:
+    counts = allocate_fixed_statistical_counts(
+        torch.tensor([0.6, 0.4], dtype=torch.float64),
+        torch.ones(2, dtype=torch.float64),
+        torch.tensor([1.0, 16.0], dtype=torch.float64),
+        64,
+    )
+    assert counts.tolist() == [54, 10]
+    assert int(counts.sum()) == 64
+    assert bool((counts > 0).all())
+
+
+def test_fixed_statistical_allocation_rejects_uncovered_strata() -> None:
+    with pytest.raises(ValueError, match="cannot cover"):
+        allocate_fixed_statistical_counts(
+            torch.ones(2), torch.ones(2), torch.ones(2), 1
+        )
 
 
 def _sealed(schema: TensorSchema, **columns: torch.Tensor) -> SealedTensorBlock:
@@ -365,6 +385,58 @@ def test_distributed_update_accepts_only_training_storage_and_arbitrary_tail() -
     assert result.metrics["flat_gradient_bytes"] == 4
     with pytest.raises(TypeError, match="only TrainingStorage"):
         validate_learner_input(SimpleNamespace(), specs)
+
+
+def test_sampled_reference_cache_preserves_update_and_rng() -> None:
+    storage, specs, _ = _fixture("normal")
+    cached_model = _Model()
+    uncached_model = _Model()
+    cached = DistributedFixedRolloutUpdate(
+        cached_model,
+        torch.optim.SGD(cached_model.parameters(), lr=0.01),
+        torch.amp.GradScaler("cpu", enabled=False),
+        specs,
+        _Adapter(),
+        _loss_cfg(),
+        DistributedLearnerConfig(
+            statistical_counts={0: 5},
+            physical_shapes={0: (PhysicalShape(2, 18),)},
+            reference_build_shapes={0: (PhysicalShape(3, 20),)},
+            available_transient_bytes=20,
+            hard_bytes=1024,
+            sampled_reference_cache=True,
+        ),
+        reference_model=_Model(-0.15),
+    )
+    uncached = DistributedFixedRolloutUpdate(
+        uncached_model,
+        torch.optim.SGD(uncached_model.parameters(), lr=0.01),
+        torch.amp.GradScaler("cpu", enabled=False),
+        specs,
+        _Adapter(),
+        _loss_cfg(),
+        DistributedLearnerConfig(
+            statistical_counts={0: 5},
+            physical_shapes={0: (PhysicalShape(2, 18),)},
+            available_transient_bytes=20,
+            hard_bytes=1024,
+        ),
+        reference_model=_Model(-0.15),
+    )
+    cached_generator = torch.Generator().manual_seed(19)
+    uncached_generator = torch.Generator().manual_seed(19)
+    cached_result = cached(
+        storage, cached_generator, optimizer_steps=2, grad_clip=10.0
+    )
+    uncached_result = uncached(
+        storage, uncached_generator, optimizer_steps=2, grad_clip=10.0
+    )
+    assert torch.equal(cached_model.weight, uncached_model.weight)
+    assert torch.equal(cached_generator.get_state(), uncached_generator.get_state())
+    assert cached_result.metrics["reference_cache_partitions"] == 1
+    assert cached_result.metrics["reference_cache_build_rows"] <= 3
+    assert cached_result.metrics["reference_cache_build_calls"] == 1
+    assert cached_result.metrics["reference_rows"] < uncached_result.metrics["reference_rows"]
 
 
 def _storage_to(storage: TrainingStorage, device: torch.device) -> TrainingStorage:

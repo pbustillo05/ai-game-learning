@@ -178,6 +178,31 @@ class MHA(nn.Module):
             dropout_p=0.0,
         )
 
+    def _sdpa_biased_attention(
+        self,
+        q_head: Tensor,
+        k_head: Tensor,
+        v_head: Tensor,
+        key_bias: Tensor,
+        key_mask: Tensor,
+    ) -> Tensor:
+        """Use native SDPA with the exact additive reach/key bias."""
+
+        temperature = self.temperature.to(dtype=q_head.dtype)[None, :, None, None]
+        # Keep reach/key priors in their declared fp32 precision while the
+        # content projections continue to use the configured autocast dtype.
+        additive_mask = key_bias[:, None, None, :]
+        additive_mask = additive_mask.masked_fill(
+            ~key_mask[:, None, None, :], -torch.inf
+        )
+        return F.scaled_dot_product_attention(
+            q_head / temperature,
+            k_head,
+            v_head,
+            attn_mask=additive_mask,
+            dropout_p=0.0,
+        )
+
     def _explicit_attention(
         self,
         q_head: Tensor,
@@ -206,7 +231,7 @@ class MHA(nn.Module):
     def configure_execution(self, backend: str, query_chunk_size: int) -> None:
         """Select a mathematically exact bounded-memory execution strategy."""
 
-        if backend not in {"auto", "flex", "chunked_dense"}:
+        if backend not in {"auto", "flex", "sdpa", "chunked_dense"}:
             raise ValueError("unknown attention backend")
         if isinstance(query_chunk_size, bool) or query_chunk_size <= 0:
             raise ValueError("query_chunk_size must be positive")
@@ -293,6 +318,10 @@ class MHA(nn.Module):
         q_head, k_head, v_head = self._project(q, kv)
         if q.device.type != "cuda":
             attended, _ = self._explicit_attention(
+                q_head, k_head, v_head, key_bias, key_mask
+            )
+        elif self.attention_backend == "sdpa":
+            attended = self._sdpa_biased_attention(
                 q_head, k_head, v_head, key_bias, key_mask
             )
         elif self.attention_backend == "chunked_dense" or (

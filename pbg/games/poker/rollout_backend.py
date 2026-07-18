@@ -1607,10 +1607,28 @@ class PokerRolloutBackend:
         tokens = self._family_maximum_width(source, family)
         layers = int(cfg.n_layers_pre if family == "pre" else cfg.n_layers_post)
         scalar_bytes = 2 if amp else 4
-        # Per layer: attention scores/probabilities plus Q/K/V/output,
-        # residual/normalization and FFN saved activations. The 3/2 guard also
-        # covers gathered inputs, loss tensors, and allocator bin rounding.
-        attention = 2 * int(cfg.n_heads) * tokens * tokens * 4
+        # Match the configured bounded-memory attention implementation.  Flex
+        # attention does not materialize the quadratic score/probability
+        # matrices; the old unconditional dense estimate overstated measured
+        # postflop learner peaks by roughly an order of magnitude and reduced
+        # the production physical batch to three rows.  Chunked dense retains
+        # only one query chunk's fp32 score/probability workspace at a time.
+        profile = self.execution_profile
+        backend = "auto" if profile is None else str(profile.attention_backend)
+        query_chunk = 128 if profile is None else int(profile.query_chunk_size)
+        d_head = int(cfg.d_model) // int(cfg.n_heads)
+        uses_fused_attention = backend in {"flex", "sdpa"} or (
+            backend == "auto" and d_head >= 16
+        )
+        attention = (
+            8 * tokens * int(cfg.d_model) * scalar_bytes
+            if uses_fused_attention
+            else 2
+            * int(cfg.n_heads)
+            * min(tokens, query_chunk)
+            * tokens
+            * 4
+        )
         ffn_hidden = int(cfg.ffn_hidden or (4 * cfg.d_model))
         features = tokens * (
             12 * int(cfg.d_model) + 4 * ffn_hidden
@@ -1621,7 +1639,10 @@ class PokerRolloutBackend:
             if family == "pre"
             else (int(family.removeprefix("post_")) * self.n_hands)
         ) * 4
-        return math.ceil(rows * (per_row + natural) * 1.5)
+        # A 2x envelope covers gathered inputs, loss tensors, fused-attention
+        # workspaces, allocator bins, and the measured forward/backward delta
+        # while retaining the hardware profile's independent VRAM reserve.
+        return math.ceil(rows * (per_row + natural) * 2.0)
 
     def compact_decision_reach(
         self, states: Tensor, reach: Tensor

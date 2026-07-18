@@ -1,0 +1,70 @@
+game:
+  n_players: 2
+  stack_bb: 32.0
+  rank_count: 13
+
+rollout:
+  sequential_roots_per_gpu_initial: 2048
+  beta: null
+  node_budget: 43
+  family_batch_rows: 64
+  max_active_trajectories: 64
+  arena_chunk_nodes: 256
+  execution_memory_bytes: 1610612736
+  sequential_roots_per_gpu_minimum: 2048
+  sequential_roots_per_gpu_maximum: 2048
+  memory_calibration_window: 32
+  memory_growth_fraction: 0.10
+  memory_growth_delay: 8
+  memory_prediction_z: 3.0
+
+completion:
+  n_samples: 1024
+  backend: cuda
+
+model:
+  d_model: 128
+  n_heads: 4
+  n_layers_pre: 4
+  n_layers_post: 6
+  m_raise: 2
+  k_act: 5
+  s_min: 0.02
+  n_buckets_line: 64
+  max_players: 2
+  class_embedding_dim: 32
+  evaluator_summary_dim: 0
+  ffn_hidden: null
+  use_moment_heads: false
+  max_history_tokens: 42
+  folder_beta_rank: 0
+  folder_line_dim: 8
+  eps: 1.0e-8
+
+training:
+  mode: rao_blackwell
+  iters: 1
+  gd_steps_per_iter: 60
+  ppo_epochs: null
+  minibatch_size: 64
+  lr: 0.00005
+  adam_betas: [0.9, 0.999]
+  optimizer: adamw
+  grad_clip: 0.5
+  amp: true
+  seed: 101
+  checkpoint_every: 1
+  out_dir: runs/experiments/nlhe_hu_32bb_optimizer_cache_shape10_60step
+  reproducibility: throughput
+  kl_ref_interval: 690
+
+loss:
+  name: rb_ppo
+  lam: 0.95
+  clip_eps: 0.2
+  clip_eps_v: 0.2
+  c_v: 0.0005
+  c_h: 0.05
+  c_kl: 0.2
+  entropy_schedule: const
+  value_loss: clipped

@@ -36,6 +36,7 @@ from pbg.core.checkpointing import (
 )
 from pbg.core.game import GameBundle
 from pbg.core.learner import (
+    allocate_fixed_statistical_counts,
     DistributedFixedRolloutUpdate,
     DistributedLearnerConfig,
     PhysicalShape,
@@ -1726,17 +1727,44 @@ def _one_iteration(
     active_ids = tuple(sorted(storage.partitions))
     if not active_ids:
         raise ValueError("cannot optimize an empty fixed rollout")
-    base, extra = divmod(cfg.training.minibatch_size, len(active_ids))
-    if base == 0:
+    if cfg.training.minibatch_size < len(active_ids):
         raise ValueError(
             "training.minibatch_size must cover every nonempty execution partition"
         )
+    local_logs = torch.stack(
+        [storage.sampling.log_z[partition_id] for partition_id in active_ids]
+    )
+    local_mass = torch.exp(local_logs - torch.logsumexp(local_logs, 0))
+    family_names = (
+        "pre" if partition_id == 0 else f"post_{partition_id + 1}"
+        for partition_id in active_ids
+    )
+    widths = torch.tensor(
+        [bundle.rollout_backend._family_maximum_width(source, name) for name in family_names],
+        dtype=torch.float64,
+        device=device,
+    )
+    allocated = allocate_fixed_statistical_counts(
+        local_mass,
+        torch.ones_like(local_mass),
+        widths.square(),
+        cfg.training.minibatch_size,
+    )
     statistical_counts = {
-        partition_id: base + int(position < extra)
+        partition_id: int(allocated[position])
         for position, partition_id in enumerate(active_ids)
     }
+    if device.type == "cuda":
+        # Rollout leaves large inactive allocator segments cached.  They are
+        # reusable by PyTorch, but cudaMemGetInfo reports them as driver-used,
+        # which would make the physical learner planner mistake cache slack for
+        # live storage and collapse postflop subspans to singleton rows.  Return
+        # only inactive cache blocks at this phase boundary before measuring the
+        # learner workspace; live sealed storage remains allocated.
+        torch.cuda.empty_cache()
     available_transient = _value_workspace_budget(cfg, device)
     physical_shapes: dict[int, tuple[PhysicalShape, ...]] = {}
+    reference_build_shapes: dict[int, tuple[PhysicalShape, ...]] = {}
     for partition_id in active_ids:
         family_name = "pre" if partition_id == 0 else f"post_{partition_id + 1}"
         configured = int(cfg.rollout.family_batch_rows or statistical_counts[partition_id])
@@ -1765,11 +1793,35 @@ def _one_iteration(
         physical_shapes[partition_id] = (
             PhysicalShape(row_cap, transient_bytes),
         )
+        # Frozen-reference cache construction runs without autograd.  Its
+        # measured row-11 workspace delta was less than half the training
+        # delta, so admit a separately bounded shape up to twice the trained
+        # row count (and never beyond the configured family pack).
+        build_row_cap = min(configured, 2 * row_cap)
+        build_transient = math.ceil(
+            predictor(source, family_name, build_row_cap, amp=amp_enabled) / 2
+        )
+        while build_row_cap > row_cap and build_transient > available_transient:
+            build_row_cap = max(row_cap, build_row_cap // 2)
+            build_transient = math.ceil(
+                predictor(source, family_name, build_row_cap, amp=amp_enabled) / 2
+            )
+        iteration_profile[
+            f"partition_{partition_id}_reference_build_rows"
+        ] = float(build_row_cap)
+        iteration_profile[
+            f"partition_{partition_id}_reference_build_predicted_transient_bytes"
+        ] = float(build_transient)
+        reference_build_shapes[partition_id] = (
+            PhysicalShape(build_row_cap, build_transient),
+        )
     learner_cfg = DistributedLearnerConfig(
         statistical_counts=statistical_counts,
         physical_shapes=physical_shapes,
         available_transient_bytes=available_transient,
         resident_base_bytes=retained_bytes,
+        reference_build_shapes=reference_build_shapes,
+        sampled_reference_cache=float(cfg.loss.c_kl) > 0.0,
         amp_enabled=amp_enabled,
         amp_dtype=amp_dtype,
     )
@@ -1885,8 +1937,12 @@ def run_training(
     target_model_builder: Callable[[dict[str, Any], torch.device, Any | None], nn.Module]
     | None = None,
     resume_from: str | Path | None = None,
+    init_checkpoint: str | Path | None = None,
 ) -> None:
-    """Train from scratch or resume an identity-checked complete run."""
+    """Train from scratch, initialize from model weights, or resume a run."""
+
+    if resume_from is not None and init_checkpoint is not None:
+        raise ValueError("resume_from and init_checkpoint are mutually exclusive")
 
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1908,6 +1964,12 @@ def run_training(
         # Metadata-only CPU validation precedes bundle/model/optimizer CUDA
         # allocation and rejects incompatible partial state deterministically.
         inspect_checkpoint(resume_from)
+    initialized_model_state: Mapping[str, Any] | None = None
+    if init_checkpoint is not None:
+        payload = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict) or not isinstance(payload.get("model"), dict):
+            raise RuntimeError("init checkpoint is not a PBG model checkpoint")
+        initialized_model_state = payload["model"]
     target_payload: dict[str, Any] | None = None
     probe_target: dict[str, Any] | None = None
     if cfg.probe is not None:
@@ -1967,6 +2029,13 @@ def run_training(
     if torch_gen.device != device:
         torch_gen, np_gen = seed_all(cfg.training.seed, rank, device)
     bundle.model.to(device)
+    if initialized_model_state is not None:
+        try:
+            bundle.model.load_state_dict(initialized_model_state)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "init checkpoint model architecture does not match the current config"
+            ) from exc
     if target_payload is not None:
         assert target_model_builder is not None and cfg.probe is not None
         opponent = target_model_builder(

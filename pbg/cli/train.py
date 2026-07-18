@@ -24,10 +24,19 @@ def main() -> None:
         default=None,
         help="checkpoint in training.out_dir from which to resume safely",
     )
+    parser.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help=(
+            "model checkpoint used only to initialize weights; starts a fresh "
+            "run with a new optimizer, RNG, and memory controller"
+        ),
+    )
     args = parser.parse_args()
     train(
         load_config(args.config, hardware_profile=args.hardware_profile),
         resume_from=args.resume,
+        init_checkpoint=args.init_checkpoint,
     )
 
 

@@ -4,37 +4,31 @@ game:
   rank_count: 13
 
 rollout:
-  # Global logical starts: torchrun partitions this as 2,048 per GPU for a
-  # two-rank launch. Three complete iterations realized 6,020--7,119 player
-  # decisions/GPU. The exact geometry peaked at 4.59 GiB driver VRAM; the
-  # largest later allocator reservation plus 25% was 5.37 GiB against the
-  # hardware profile's 8.57 GiB safe limit.
-  # Two-rank launch: 2,048 starts/GPU initially. The controller can take the
-  # full +25% step to the tested 2,560 starts/GPU ceiling after iteration 1.
-  sequential_roots_per_gpu_initial: 2048
+  # This is explicitly per GPU: a two-rank launch begins with 5,120 global
+  # trajectories. A fixed 3,072-root/GPU probe was also safe, so the four-phase
+  # controller may widen to that ceiling after measured successful iterations.
+  sequential_roots_per_gpu_initial: 2560
   beta: null
   # Exact HU 32 bb bound: 39 player nodes + 3 chance nodes + 1 terminal leaf.
   node_budget: 43
-  # At 2,048 starts/GPU, 64-row families completed three iterations and cut
-  # rollout time from 42.2 s (32 rows) to 33.6 s (64 rows).
+  # Keep rollout queue packs at 64 rows. A 128-row probe exhausted the guarded
+  # completion workspace after rollout; larger learner minibatches are split
+  # independently into the validated physical SDPA shapes.
   family_batch_rows: 64
   max_active_trajectories: 64
   arena_chunk_nodes: 256
-  # Corrected hard rollout bound is 1.06 GiB/GPU; measured accounting high
-  # water was 0.92 GiB/GPU. This leaves about 0.44 GiB accounting headroom.
+  # The execution arena is separately bounded from retained training storage.
   execution_memory_bytes: 1610612736
   sequential_roots_per_gpu_minimum: 512
-  # 4,096/GPU reserved 7.70 GiB even at the minimum active count; its 25%
-  # The 2,560/GPU probe realized 7,994 rank-max decisions and a later resumed
-  # iteration measured an 8.03 GB allocator peak. The companion 12-hour
-  # hardware profile accepts that measured tier while retaining a 25% gate.
-  sequential_roots_per_gpu_maximum: 2560
-  # Policy-conditioned memory forecasts are updated on every successful
-  # iteration and clean pre-draw admission stop. Positive surprises widen
-  # immediately; tightening requires a fresh calibration window after drift.
-  memory_calibration_window: 128
+  # The fixed 3,072-root/GPU probe peaked at 5.04 GB allocated and 7.37 GB
+  # reserved. Admission still accounts for the measured four-phase envelope
+  # and the hardware profile's independent VRAM guard.
+  sequential_roots_per_gpu_maximum: 3072
+  # Eight clean observations are required between 10% upward steps; downward
+  # corrections remain immediate. The 32-point window tracks recent geometry.
+  memory_calibration_window: 32
   memory_growth_fraction: 0.10
-  memory_growth_delay: 40
+  memory_growth_delay: 8
   memory_prediction_z: 3.0
 
 completion:
@@ -63,28 +57,31 @@ model:
 
 training:
   mode: rao_blackwell
-  # Measured: 5.76 minutes for the 2,048-start first iteration and about
-  # 7.10 minutes at 2,560 starts. 100 iterations project to about 11.8 hours.
-  iters: 100
-  # Mean realized mass was 6,346 decisions/GPU. 298 * 64 = 19,072 draws gives
-  # 3.01x mean reuse and approximately exp(-3.01) = 4.9% unseen.
-  gd_steps_per_iter: 298
+  # This is a fresh run initialized from the iteration-20 model weights. At the
+  # measured 104.17 s steady-state iteration, 1,110 iterations plus the faster
+  # controller ramp project to about 32.1 wall-hours (about 64.2 GPU-hours).
+  iters: 1110
+  # Preserve 14,848 sampled rows/GPU per iteration: 116 * 128 = 14,848. At
+  # 2,560 roots/GPU this is approximately 2x retained-decision reuse; a tested
+  # 3,072-root iteration realized 1.70x reuse.
+  gd_steps_per_iter: 116
   ppo_epochs: null
-  # Batch 64 completed the tested 2,048-start/GPU geometry; two ranks therefore
-  # contribute 128 sampled decision nodes to each synchronized update.
-  minibatch_size: 64
+  # Two ranks contribute 256 statistical rows per synchronized update. Batch
+  # 256 saved less than another 0.5% end-to-end and halves update count again.
+  minibatch_size: 128
   lr: 0.00005
   adam_betas: [0.9, 0.999]
   optimizer: adamw
   grad_clip: 0.5
   amp: true
   seed: 101
-  checkpoint_every: 5
-  out_dir: runs/nlhe_hu_32bb_sequential_rb
+  # 37 steady-state iterations are about 64 minutes. Since 1,110 = 30 * 37,
+  # the run also writes a checkpoint after its final iteration.
+  checkpoint_every: 37
+  out_dir: runs/nlhe_hu_32bb_full_sequential_rb_from_ckpt_0000020_optimized
   reproducibility: throughput
-  # 537 rollouts * 298 optimizer steps = 160,026 steps per fixed reference,
-  # preserving the original approximately 160k-step reference cadence.
-  kl_ref_interval: 537
+  # 1,380 iterations * 116 optimizer steps = 160,080 steps per fixed reference.
+  kl_ref_interval: 1380
 
 loss:
   name: rb_ppo

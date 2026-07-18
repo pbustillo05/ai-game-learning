@@ -21,14 +21,20 @@ def build_game_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     return bundle
 
 
-def train(cfg: RootConfig, *, resume_from: str | Path | None = None) -> None:
-    """Train the production NLHE implementation from scratch or checkpoint."""
+def train(
+    cfg: RootConfig,
+    *,
+    resume_from: str | Path | None = None,
+    init_checkpoint: str | Path | None = None,
+) -> None:
+    """Train from scratch, initialize from model weights, or resume."""
 
     run_training(
         cfg,
         bundle_builder=build_game_bundle,
         target_model_builder=build_model_from_config,
         resume_from=resume_from,
+        init_checkpoint=init_checkpoint,
     )
 
 
