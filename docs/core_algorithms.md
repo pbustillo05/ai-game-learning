@@ -76,9 +76,9 @@ child ordinal.
 ## Completion and value reduction
 
 The sibling evaluator owns collision-conditioned joint profiles, runouts,
-showdown shares, and folded-player partition summaries. The active completion
-adapter returns bounded `BatchedCompletionStats` and immediately releases
-diagnostic-only tensors after summarizing their quality.
+showdown payoffs, and folded-player partition summaries. The active production
+completion adapter returns only posterior mass, conditional value, and
+spot-level effective sample size.
 
 `streamed_branched_value` is the sole RB value reducer. Completion batches feed
 a contracted boundary frontier of posterior mass $P$ and weighted moment $M$.

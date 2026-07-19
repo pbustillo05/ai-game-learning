@@ -204,6 +204,30 @@ def test_folder_pressure_and_folder_seat_readout_consume_semantic_fields():
     assert not torch.allclose(first.v, second.v)
 
 
+def test_compact_contract_v1_folder_features_feed_postflop_model():
+    torch.manual_seed(74)
+    pub, ranges, masks = _inputs()
+    pub.status[:, 1] = 1
+    pub.to_act.zero_()
+    masks.status = pub.status
+    batch = ranges.shape[0]
+    fields = {
+        "hand_log_ratio": torch.randn(batch, 1326) * 0.01,
+        "beta_eigenvalue": torch.randn(batch, 2),
+        "beta_eigenvector": torch.randn(batch, 52, 2),
+        "folder_log_mass": torch.zeros(batch, 1),
+        "folder_card_mass": torch.rand(batch, 1, 52),
+        "tight_cluster_scalar": torch.zeros(batch),
+        "folder_mask": torch.ones(batch, 1, dtype=torch.bool),
+        "folder_line_meta": torch.randn(batch, 1, 8),
+        "folder_seat": torch.ones(batch, 1, dtype=torch.long),
+    }
+    masks.evaluator_summary = PartitionSummaryBatch(fields, {"contract_version": "1"})
+    cfg = type(_cfg())(**{**_cfg().__dict__, "folder_beta_rank": 2})
+    output = PostflopNet(cfg).eval()(pub, ranges, masks=masks)
+    assert torch.isfinite(output.v).all()
+
+
 def test_folded_seats_do_not_create_postflop_attention_rows():
     pub, ranges, masks = _inputs()
     pub.status[:, 1] = 1

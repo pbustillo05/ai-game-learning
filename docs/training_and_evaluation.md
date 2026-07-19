@@ -5,7 +5,7 @@
 Use Python 3.10+, PyTorch, NumPy, PyYAML, and the separately installed sibling
 poker evaluator. On the shared server use `/home/pablob/.venvs/poker`; never
 install into system Python. `tools/poker-python` selects the checked CUDA
-toolkit and verifies the sibling `pbg-v3` API before running Python.
+toolkit and verifies the sibling contract-v1 API before running Python.
 
 ## Strict NLHE configuration
 

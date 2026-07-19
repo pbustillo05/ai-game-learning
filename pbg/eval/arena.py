@@ -21,7 +21,11 @@ from pbg.games.poker.cards import (
     sample_uniform_complement,
 )
 from pbg.games.poker.engine import FOLDED, NLHEEngine, PokerConfig
-from pbg.games.poker.mc import PokerGPURejectionSampler, PokerGPUShowdownEvaluator
+from pbg.games.poker.mc import (
+    PokerGPURejectionSampler,
+    PokerGPUShowdownEvaluator,
+    stratum_levels,
+)
 from pbg.games.poker.model.postflop import PostflopMasks, PostflopNet
 from pbg.games.poker.model.preflop import PokerModelConfig, PreflopNet
 
@@ -163,10 +167,11 @@ def _settle_showdown(
     result = evaluator.evaluate(
         board_cards=board,
         combo_ids=combos,
-        active_mask=active,
-        stratum_players=strata.stratum_players,
+        stratum_level=stratum_levels(strata.stratum_players),
+        payoff_baseline=strata.payoff_baseline,
+        stratum_amount=strata.stratum_amount,
     )
-    return engine.assemble_showdown_payoff(strata, result.showdown_share)[0]
+    return result.payoff[0]
 
 
 def _replay(

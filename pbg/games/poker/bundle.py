@@ -19,8 +19,8 @@ from pbg.games.poker.folded import PokerGPUPartitionAdapter
 from pbg.games.poker.mc import (
     PokerGPUCompletion,
     PokerGPURejectionSampler,
-    _CompletionConfig,
     _allocate_seeds,
+    _evaluator_metadata,
 )
 from pbg.games.poker.model.postflop import PostflopNet
 from pbg.games.poker.model.capacity import (
@@ -175,7 +175,7 @@ def _reach_rows(reach: Any) -> Tensor:
 class _TensorPokerGPUCompletion(PokerGPUCompletion):
     """Run sibling completion directly from tensor-native rollout state.
 
-    Pre-terminal showdowns use ``poker_gpu_evaluator.pbg.complete``. Public
+    Pre-terminal showdowns use the bound evaluator's ``complete`` method. Public
     fold terminals use exact sibling joint-profile draws to estimate their
     collision-conditioned hand posterior; their chip payoff is already fixed
     by the public engine.
@@ -326,12 +326,7 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
             (batch, players, n_hands), dtype=torch.float32, device=device
         )
         v_hat = torch.zeros_like(p_hat)
-        vvec_hat = torch.zeros((batch, players), dtype=torch.float32, device=device)
-        u_hat = torch.zeros(batch, dtype=torch.float32, device=device)
         n_eff = torch.zeros(batch, dtype=torch.float32, device=device)
-        output_valid = torch.zeros_like(p_hat, dtype=torch.bool)
-        sample_count = torch.full((batch,), n_samples, dtype=torch.int64, device=device)
-        estimator_stddev = torch.full_like(p_hat, torch.nan)
 
         owner = tree.owner[node_ids.to(tree.owner.device).long()]
         preterm = (owner == PRETERM).nonzero(as_tuple=False).squeeze(1)
@@ -345,11 +340,11 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
                 if keys is None
                 else keys[preterm].contiguous()
             )
-            result = self._operation()(
-                rank_count=self.rank_count,
+            evaluator = self._bound_evaluator()
+            result = evaluator.complete(
                 **inputs,
+                n_samples=n_samples,
                 seed=seed,
-                config=_CompletionConfig(n_samples, self.n_partials, self.backend),
             )
             metrics = getattr(game, "execution_metrics", None)
             if metrics is not None:
@@ -358,20 +353,12 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
                 result,
                 preterm.numel(),
                 players,
-                inputs["stratum_amount"].shape[1],
                 device,
+                _evaluator_metadata(evaluator),
             )
             p_hat[preterm] = stats.p_hat
             v_hat[preterm] = stats.v_hat
-            vvec_hat[preterm] = stats.vvec_hat
-            u_hat[preterm] = stats.u_hat
             n_eff[preterm] = stats.n_eff
-            if stats.output_valid is not None:
-                output_valid[preterm] = stats.output_valid
-            if stats.sample_count is not None:
-                sample_count[preterm] = stats.sample_count
-            if stats.estimator_stddev is not None:
-                estimator_stddev[preterm] = stats.estimator_stddev
             metadata.update({f"showdown_{key}": value for key, value in stats.metadata.items()})
 
         terminal = (owner != PRETERM).nonzero(as_tuple=False).squeeze(1)
@@ -413,20 +400,12 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
             reward = game.reward(profiles[:, 0], states).float()  # [Bt,P]
             p_hat[terminal] = posterior
             v_hat[terminal] = reward[:, :, None] * (posterior > 0).to(torch.float32)
-            vvec_hat[terminal] = reward
-            u_hat[terminal] = reward.square().sum(1)
             n_eff[terminal] = float(n_samples)
-            output_valid[terminal] = posterior > 0
 
         return BatchedCompletionStats(
             p_hat=p_hat,
             v_hat=v_hat,
-            vvec_hat=vvec_hat,
-            u_hat=u_hat,
             n_eff=n_eff,
-            output_valid=output_valid,
-            sample_count=sample_count,
-            estimator_stddev=estimator_stddev,
             metadata=metadata,
         )
 

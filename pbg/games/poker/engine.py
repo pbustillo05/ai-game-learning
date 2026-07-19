@@ -1,8 +1,9 @@
 """Public no-limit hold'em navigation and affine pot accounting.
 
-The engine knows chips, seats, actions, and public cards.  It intentionally
-does not know how to compare private hands; fixed showdown shares cross the
-evaluator boundary and are assembled by :func:`assemble_showdown_payoff`.
+The engine knows chips, seats, actions, and public cards. It intentionally
+does not know how to compare private hands; production showdown payoffs cross
+the evaluator boundary already assembled. :func:`assemble_showdown_payoff`
+remains a public affine-accounting validator.
 """
 
 from __future__ import annotations
@@ -192,7 +193,7 @@ class StateTable:
 
 @dataclass
 class PotStrata:
-    """Public affine coefficients for evaluator-supplied showdown shares."""
+    """Public affine coefficients supplied to evaluator showdown methods."""
 
     stratum_players: Tensor  # bool [B,K,P]
     stratum_amount: Tensor  # float32 [B,K]

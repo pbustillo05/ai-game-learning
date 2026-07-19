@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -14,6 +15,20 @@ from pbg.eval import arena as arena_module
 from pbg.eval.arena import arena
 from pbg.games.poker.cards import hand_index, hand_cards
 from pbg.games.poker.model.preflop import PolicyOutput
+
+
+@dataclass(frozen=True)
+class _Info:
+    contract_version: str = "1"
+    package_version: str = "test"
+    build_revision: str = "fake"
+    rank_count: int = 13
+    deck_geometry_version: str = "global-suffix-lex-v1"
+    category_order_version: str = "cumulative-five-card-v1"
+    folder_feature_version: str = "compact-folder-v1"
+    cpu_rng_version: str = "cpu-test"
+    cuda_rng_version: str = "cuda-test"
+    mps_rng_version: str = "mps-test"
 
 
 class _CheckCallModel(nn.Module):
@@ -35,50 +50,37 @@ class _CheckCallModel(nn.Module):
 
 def _install_fake_sibling(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     package = ModuleType("poker_gpu_evaluator")
-    facade = ModuleType("poker_gpu_evaluator.pbg")
-    facade.API_VERSION = "pbg-v3"  # type: ignore[attr-defined]
+    package.CONTRACT_VERSION = "1"  # type: ignore[attr-defined]
     combo_table = torch.tensor(
         [hand_cards(combo) for combo in range(1326)], dtype=torch.uint8
     )
-    facade.combo_cards = lambda rank_count: combo_table.clone()  # type: ignore[attr-defined]
     calls: dict[str, object] = {"showdowns": []}
+
+    evaluator = SimpleNamespace(info=_Info(), combo_cards=combo_table.clone())
 
     def sample_joint_profiles(**kwargs):
         calls["profiles"] = kwargs
         samples = kwargs["n_samples"]
-        players = kwargs["dealt_mask"].shape[1]
+        players = kwargs["range_weights"].shape[1]
         combos = [hand_index(2 * seat, 2 * seat + 1) for seat in range(players)]
         profile = torch.tensor(combos, dtype=torch.int32).view(1, 1, players)
         profile = profile.expand(1, samples, players).clone()
-        return SimpleNamespace(
-            combo_ids=profile,
-            accepted=torch.ones((1, samples), dtype=torch.bool),
-            attempt_count=torch.ones((1, samples), dtype=torch.int32),
-            acceptance_rate=torch.ones(1),
-            metadata={"backend": "fake"},
-        )
+        return profile
 
     def evaluate_showdowns(**kwargs):
         calls["showdowns"].append(kwargs)
-        eligible = kwargs["stratum_players"]
-        shares = torch.zeros_like(eligible, dtype=torch.float32)
-        winner_mask = torch.zeros(eligible.shape[:2], dtype=torch.int32)
-        for batch in range(eligible.shape[0]):
-            for stratum in range(eligible.shape[1]):
-                winner = int(eligible[batch, stratum].nonzero()[0])
-                shares[batch, stratum, winner] = 1.0
-                winner_mask[batch, stratum] = 1 << winner
-        return SimpleNamespace(
-            winner_mask=winner_mask,
-            showdown_share=shares,
-            metadata={"backend": "fake"},
-        )
+        levels = kwargs["stratum_level"]
+        payoff = kwargs["payoff_baseline"].clone()
+        for batch in range(levels.shape[0]):
+            for stratum in range(kwargs["stratum_amount"].shape[1]):
+                winner = int((levels[batch] >= stratum).nonzero()[0])
+                payoff[batch, winner] += kwargs["stratum_amount"][batch, stratum]
+        return payoff.contiguous()
 
-    facade.sample_joint_profiles = sample_joint_profiles  # type: ignore[attr-defined]
-    facade.evaluate_showdowns = evaluate_showdowns  # type: ignore[attr-defined]
-    package.pbg = facade  # type: ignore[attr-defined]
+    evaluator.sample_joint_profiles = sample_joint_profiles
+    evaluator.evaluate_showdowns = evaluate_showdowns
+    package.bind = lambda *, rank_count: evaluator  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "poker_gpu_evaluator", package)
-    monkeypatch.setitem(sys.modules, "poker_gpu_evaluator.pbg", facade)
     return calls
 
 
@@ -132,9 +134,10 @@ def test_duplicate_self_play_is_zero_rotates_seats_and_crosses_showdown_facade(
 
 
 def test_real_sibling_combo_export_matches_every_local_row() -> None:
-    facade = pytest.importorskip("poker_gpu_evaluator.pbg")
-    combo_cards = facade.combo_cards(13)
-    assert facade.API_VERSION == "pbg-v3"
+    package = pytest.importorskip("poker_gpu_evaluator")
+    evaluator = package.bind(rank_count=13)
+    combo_cards = evaluator.combo_cards
+    assert package.CONTRACT_VERSION == "1"
     assert combo_cards.dtype == torch.uint8
     assert combo_cards.tolist() == [
         list(hand_cards(combo)) for combo in range(1326)

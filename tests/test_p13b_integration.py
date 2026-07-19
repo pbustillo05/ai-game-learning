@@ -137,11 +137,12 @@ def test_nlhe_builder_constructs_one_owning_poker_model(tmp_path: Path) -> None:
 
 
 def test_real_sibling_combo_table_and_partition_signature() -> None:
-    pbg = pytest.importorskip("poker_gpu_evaluator.pbg")
-    assert pbg.API_VERSION == "pbg-v3"
-    validate_evaluator_combo_cards(pbg.combo_cards(13))
-    assert tuple(inspect.signature(pbg.partition_many).parameters) == (
-        "rank_count", "board_cards", "range_weights", "row_mask", "field_order", "backend",
+    package = pytest.importorskip("poker_gpu_evaluator")
+    evaluator = package.bind(rank_count=13)
+    assert package.CONTRACT_VERSION == "1"
+    validate_evaluator_combo_cards(evaluator.combo_cards)
+    assert tuple(inspect.signature(evaluator.summarize_folders).parameters) == (
+        "board_cards", "folder_weights", "row_mask", "beta_rank",
     )
     source = inspect.getsource(PokerGPUPartitionAdapter.summarize)
     assert "query_combo_ids" not in source
@@ -150,7 +151,7 @@ def test_real_sibling_combo_table_and_partition_signature() -> None:
 
 
 def test_three_iteration_cpu_sibling_smoke_is_finite_and_checkpoints(tmp_path: Path) -> None:
-    pytest.importorskip("poker_gpu_evaluator.pbg")
+    pytest.importorskip("poker_gpu_evaluator")
     cfg = _small_poker_cfg(tmp_path)
     train(cfg)
     metrics = [
@@ -176,7 +177,7 @@ def test_three_iteration_cpu_sibling_smoke_is_finite_and_checkpoints(tmp_path: P
 
 
 def test_normal_poker_settles_sampled_showdown_without_completion(tmp_path: Path) -> None:
-    pytest.importorskip("poker_gpu_evaluator.pbg")
+    pytest.importorskip("poker_gpu_evaluator")
     cfg = _small_poker_cfg(tmp_path)
     cfg.training.mode = "normal"
     cfg.completion.n_samples = None

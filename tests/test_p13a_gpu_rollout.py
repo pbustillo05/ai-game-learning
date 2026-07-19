@@ -739,11 +739,12 @@ def _real_execution_poker_sample(
 
 
 def _assert_real_execution_poker_sample(cfg, backend, model, sampled) -> None:
-    facade = pytest.importorskip("poker_gpu_evaluator.pbg")
+    package = pytest.importorskip("poker_gpu_evaluator")
+    evaluator = package.bind(rank_count=13)
     tree, reach, policy, profiles = sampled
     tree.validate()
     assert profiles.shape == (4, 2)
-    cards = facade.combo_cards(13).to(profiles.device)[profiles.to(torch.int64)]
+    cards = evaluator.combo_cards.to(profiles.device)[profiles.to(torch.int64)]
     ordered = cards.reshape(4, -1).sort(1).values
     assert bool((ordered[:, 1:] != ordered[:, :-1]).all())
     chance = tree.owner == CHANCE
@@ -770,7 +771,7 @@ def _assert_real_execution_poker_sample(cfg, backend, model, sampled) -> None:
 
 
 def test_real_sibling_execution_poker_cpu_is_logically_addressed_and_collision_free() -> None:
-    pytest.importorskip("poker_gpu_evaluator.pbg")
+    pytest.importorskip("poker_gpu_evaluator")
     left = _real_execution_poker_sample(torch.device("cpu"), batch_rows=1, admission=1)
     right = _real_execution_poker_sample(torch.device("cpu"), batch_rows=4, admission=4)
     _assert_real_execution_poker_sample(*left)
@@ -930,8 +931,8 @@ def test_completion_inputs_are_device_facade_tensors_and_conserve_pots() -> None
     reach = torch.zeros((3, 3, 1326), dtype=torch.float32)
     inputs = backend.completion_inputs(roots, reach)
     assert set(inputs) == {
-        "board_cards", "range_weights", "dealt_mask", "contender_mask",
-        "stratum_players", "payoff_baseline", "stratum_amount",
+        "board_cards", "range_weights", "stratum_level",
+        "payoff_baseline", "stratum_amount",
     }
     assert inputs["board_cards"].dtype == torch.uint8
     assert (inputs["board_cards"] == 255).all()
@@ -942,7 +943,7 @@ def test_completion_inputs_are_device_facade_tensors_and_conserve_pots() -> None
 def test_real_tensor_poker_keyed_completion_mixes_showdown_and_fold_rows() -> None:
     """The tensor-native boundary keys both sibling completion paths directly."""
 
-    pytest.importorskip("poker_gpu_evaluator.pbg")
+    pytest.importorskip("poker_gpu_evaluator")
     backend = _backend(
         PokerConfig(n_players=2, stack_bb=8.0),
         capacity=32,
@@ -972,7 +973,7 @@ def test_real_tensor_poker_keyed_completion_mixes_showdown_and_fold_rows() -> No
     node_ids = torch.tensor([0, 1], dtype=torch.int32)
     reach = torch.zeros((2, 2, 1326), dtype=torch.float32)
     keys = torch.tensor([1_234_567, 7_654_321], dtype=torch.int64)
-    completion = _TensorPokerGPUCompletion(backend="cpu", n_partials=2)
+    completion = _TensorPokerGPUCompletion(backend="cpu")
 
     first = completion.complete_keyed(backend, tree, node_ids, reach, 8, keys)
     second = completion.complete_keyed(backend, tree, node_ids, reach, 8, keys)
@@ -980,20 +981,12 @@ def test_real_tensor_poker_keyed_completion_mixes_showdown_and_fold_rows() -> No
     for name in (
         "p_hat",
         "v_hat",
-        "vvec_hat",
-        "u_hat",
         "n_eff",
-        "output_valid",
-        "sample_count",
     ):
         assert torch.equal(getattr(first, name), getattr(second, name)), name
     torch.testing.assert_close(first.p_hat.sum(2), torch.ones((2, 2)))
-    torch.testing.assert_close(
-        first.vvec_hat[1], backend.states.fold_payoff[fold.to(torch.int64)][0]
-    )
-    assert torch.equal(first.sample_count, torch.full((2,), 8, dtype=torch.int64))
     assert first.metadata["fold_completion"] == "joint_profiles"
-    assert first.metadata["showdown_api_version"] == "pbg-v3"
+    assert first.metadata["showdown_contract_version"] == "1"
 
     metrics = backend.execution_metrics.snapshot()
     assert metrics["execution_evaluator_calls"] == 4

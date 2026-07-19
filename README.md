@@ -18,7 +18,7 @@ under `archive/synthetic_games/`.
 - duplicate-deal checkpoint evaluation and same-implementation benchmarking.
 
 This repository owns public poker state, policy, likelihood reaches, and chip
-accounting. The read-only sibling `poker_gpu_evaluator.pbg` API owns all joint
+accounting. The read-only sibling's bound `poker_gpu_evaluator` API owns all joint
 private-profile sampling, collision-conditioned completion, folded-card
 partition summaries, and showdown comparison. There is no local poker-math
 fallback.

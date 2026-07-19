@@ -1,14 +1,15 @@
 """Evaluator-owned partition-summary data transfer boundary.
 
-This module only batches fold snapshots and forwards them to the stable
-``poker_gpu_evaluator.pbg`` facade.  Private-card collision and partition
+This module only batches fold snapshots and forwards them to the bound
+``poker_gpu_evaluator`` API. Private-card collision and partition
 calculations remain entirely evaluator-owned.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Callable
+from dataclasses import asdict, dataclass
+import importlib
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -17,8 +18,7 @@ from pbg.games.poker.cards import DeckGeometry, validate_evaluator_combo_cards
 
 
 PAD_CARD = 255
-EXPECTED_API_VERSION = "pbg-v3"
-EXPECTED_FOLDER_API_VERSION = "pbg-folder-v1"
+EXPECTED_CONTRACT_VERSION = "1"
 
 
 def _require_device(predicate: Tensor, message: str) -> None:
@@ -51,10 +51,8 @@ class FoldSnapshotBatch:
 class PartitionSummaryBatch:
     """Opaque evaluator summary tensors and host metadata.
 
-    The compact model-ready fields include combined unary/pair corrections,
-    signed beta factors, per-folder mass/card pressure/delta, tight contraction,
-    fold-line/seat metadata, and validity. Bulky evaluator-owned per-folder
-    pair/covariance tensors are validated at the boundary but not retained.
+    The compact model-ready fields include hand log ratios, signed beta factors,
+    per-folder mass/card pressure, tight contraction, and fold-line/seat metadata.
     """
 
     fields: dict[str, Tensor]
@@ -78,41 +76,31 @@ class PokerGPUPartitionAdapter:
                 f"beta_rank must be an integer in [0,{self.geometry.n_cards}]"
             )
         self.beta_rank = beta_rank
-        self._partition_folders: Callable[..., Any] | None = None
-        self._result_type: type[Any] | None = None
+        self._evaluator: Any | None = None
 
-    def _load_facade(self) -> tuple[Callable[..., Any], type[Any]]:
-        if self._partition_folders is not None and self._result_type is not None:
-            return self._partition_folders, self._result_type
+    def _bound_evaluator(self) -> Any:
+        if self._evaluator is not None:
+            return self._evaluator
         try:
-            from poker_gpu_evaluator.pbg import (
-                API_VERSION,
-                FOLDER_API_VERSION,
-                FolderSummaryResult,
-                combo_cards,
-                partition_folders,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
+            package = importlib.import_module("poker_gpu_evaluator")
+            contract_version = package.CONTRACT_VERSION
+            evaluator = package.bind(rank_count=self.rank_count)
+        except (ImportError, ModuleNotFoundError, AttributeError) as exc:
             raise RuntimeError(
-                "poker_gpu_evaluator with the public pbg-v3 facade is required; "
+                "poker_gpu_evaluator with the bound contract-v1 API is required; "
                 "install the sibling package (an editable install is sufficient)"
             ) from exc
-        if API_VERSION != EXPECTED_API_VERSION:
+        if contract_version != EXPECTED_CONTRACT_VERSION:
             raise RuntimeError(
-                "incompatible poker_gpu_evaluator facade: expected API_VERSION "
-                f"{EXPECTED_API_VERSION!r}, got {API_VERSION!r}; update the sibling package"
+                "incompatible poker_gpu_evaluator: expected CONTRACT_VERSION "
+                f"{EXPECTED_CONTRACT_VERSION!r}, got {contract_version!r}; "
+                "update the sibling package"
             )
-        if FOLDER_API_VERSION != EXPECTED_FOLDER_API_VERSION:
-            raise RuntimeError(
-                "incompatible evaluator folder facade: expected FOLDER_API_VERSION "
-                f"{EXPECTED_FOLDER_API_VERSION!r}, got {FOLDER_API_VERSION!r}"
-            )
-        validate_evaluator_combo_cards(
-            combo_cards(self.rank_count), self.rank_count
-        )
-        self._partition_folders = partition_folders
-        self._result_type = FolderSummaryResult
-        return partition_folders, FolderSummaryResult
+        validate_evaluator_combo_cards(evaluator.combo_cards, self.rank_count)
+        if evaluator.info.contract_version != contract_version:
+            raise RuntimeError("bound evaluator contract version disagrees with the package")
+        self._evaluator = evaluator
+        return evaluator
 
     def _normalize_board(self, board_cards: Tensor) -> Tensor:
         if not isinstance(board_cards, Tensor):
@@ -223,31 +211,19 @@ class PokerGPUPartitionAdapter:
     def _validate_result(
         self,
         result: Any,
-        result_type: type[Any],
         batch_size: int,
         n_folders: int,
         beta_rank: int,
         device: torch.device,
     ) -> None:
-        if not isinstance(result, result_type):
-            raise TypeError("partition_folders returned an unexpected result type")
         n_cards = self.geometry.n_cards
         expected = (
-            ("base_log_z", (batch_size,), torch.float32),
-            ("single_card_log_ratio", (batch_size, n_cards), torch.float32),
-            ("pair_card_log_ratio", (batch_size, n_cards, n_cards), torch.float32),
+            ("hand_log_ratio", (batch_size, self.geometry.n_hands), torch.float32),
             ("beta_eigenvalue", (batch_size, beta_rank), torch.float32),
             ("beta_eigenvector", (batch_size, n_cards, beta_rank), torch.float32),
             ("folder_log_mass", (batch_size, n_folders), torch.float32),
-            ("folder_single_card_log_ratio", (batch_size, n_folders, n_cards), torch.float32),
-            ("folder_pair_card_log_ratio", (batch_size, n_folders, n_cards, n_cards), torch.float32),
-            ("folder_card_marginal", (batch_size, n_folders, n_cards), torch.float32),
-            ("folder_delta", (batch_size, n_folders, n_cards), torch.float32),
-            ("folder_sigma", (batch_size, n_folders, n_cards, n_cards), torch.float32),
-            ("sigma_total", (batch_size, n_cards, n_cards), torch.float32),
+            ("folder_card_mass", (batch_size, n_folders, n_cards), torch.float32),
             ("tight_cluster_scalar", (batch_size,), torch.float32),
-            ("folder_output_valid", (batch_size, n_folders), torch.bool),
-            ("output_valid", (batch_size,), torch.bool),
         )
         for name, shape, dtype in expected:
             value = getattr(result, name, None)
@@ -261,10 +237,6 @@ class PokerGPUPartitionAdapter:
                 raise ValueError(f"partition result {name} is on the wrong device")
             if not value.is_contiguous():
                 raise ValueError(f"partition result {name} must be contiguous")
-        if not isinstance(getattr(result, "metadata", None), dict):
-            raise TypeError("partition result metadata must be a dict")
-        if any(isinstance(value, Tensor) for value in result.metadata.values()):
-            raise TypeError("partition result metadata may not contain tensors")
 
     def summarize(
         self,
@@ -285,7 +257,7 @@ class PokerGPUPartitionAdapter:
         self._validate_inputs(boundary_board, live_range_weights, folded)
         batch_size = boundary_board.shape[0]
         # The correction is the folded subsystem integrated out. Live ranges are accepted
-        # only because they remain part of the versioned call-site contract;
+        # only because they remain part of the local call-site contract;
         # including them in the neutral partition law would double-count live
         # collision geometry and produce a non-neutral correction with K=0.
         if folded.reach_weights.shape[1] == 0:
@@ -295,18 +267,12 @@ class PokerGPUPartitionAdapter:
             n_folders = folded.reach_weights.shape[1]
             n_cards = self.geometry.n_cards
             fields = {
-                "base_log_z": zeros,
-                "single_card_log_ratio": torch.zeros((batch_size, n_cards), dtype=torch.float32, device=boundary_board.device),
-                "pair_card_log_ratio": torch.zeros((batch_size, n_cards, n_cards), dtype=torch.float32, device=boundary_board.device),
+                "hand_log_ratio": torch.zeros((batch_size, self.geometry.n_hands), dtype=torch.float32, device=boundary_board.device),
                 "beta_eigenvalue": torch.zeros((batch_size, self.beta_rank), dtype=torch.float32, device=boundary_board.device),
                 "beta_eigenvector": torch.zeros((batch_size, n_cards, self.beta_rank), dtype=torch.float32, device=boundary_board.device),
                 "folder_log_mass": torch.zeros((batch_size, n_folders), dtype=torch.float32, device=boundary_board.device),
-                "folder_single_card_log_ratio": torch.zeros((batch_size, n_folders, n_cards), dtype=torch.float32, device=boundary_board.device),
-                "folder_card_marginal": torch.zeros((batch_size, n_folders, n_cards), dtype=torch.float32, device=boundary_board.device),
-                "folder_delta": torch.zeros((batch_size, n_folders, n_cards), dtype=torch.float32, device=boundary_board.device),
+                "folder_card_mass": torch.zeros((batch_size, n_folders, n_cards), dtype=torch.float32, device=boundary_board.device),
                 "tight_cluster_scalar": zeros,
-                "folder_output_valid": folded.folder_mask.clone(),
-                "output_valid": torch.ones((batch_size,), dtype=torch.bool, device=boundary_board.device),
                 "folder_mask": folded.folder_mask,
                 "folder_line_meta": folded.line_meta,
                 "folder_seat": folded.seat_ids if folded.seat_ids is not None else torch.arange(
@@ -315,31 +281,30 @@ class PokerGPUPartitionAdapter:
             }
             return PartitionSummaryBatch(
                 fields=fields,
-                metadata={"api_version": EXPECTED_API_VERSION, "neutral_no_folders": True},
+                metadata={
+                    "contract_version": EXPECTED_CONTRACT_VERSION,
+                    "neutral_no_folders": True,
+                },
             )
 
-        partition_folders, result_type = self._load_facade()
+        evaluator = self._bound_evaluator()
         range_weights = folded.reach_weights.contiguous()  # [B,F,H]
         row_mask = folded.folder_mask.contiguous()  # [B,F]
-        result = partition_folders(
-            rank_count=self.rank_count,
+        result = evaluator.summarize_folders(
             board_cards=boundary_board,
-            range_weights=range_weights,
+            folder_weights=range_weights,
             row_mask=row_mask,
             beta_rank=self.beta_rank,
         )
         n_folders = folded.reach_weights.shape[1]
         self._validate_result(
-            result, result_type, batch_size, n_folders, self.beta_rank, boundary_board.device
+            result, batch_size, n_folders, self.beta_rank, boundary_board.device
         )
         fields = {
             name: getattr(result, name)
             for name in (
-                "base_log_z", "single_card_log_ratio", "pair_card_log_ratio",
-                "beta_eigenvalue", "beta_eigenvector", "folder_log_mass",
-                "folder_single_card_log_ratio", "folder_card_marginal",
-                "folder_delta", "tight_cluster_scalar", "folder_output_valid",
-                "output_valid",
+                "hand_log_ratio", "beta_eigenvalue", "beta_eigenvector",
+                "folder_log_mass", "folder_card_mass", "tight_cluster_scalar",
             )
         }
         fields.update({
@@ -353,9 +318,4 @@ class PokerGPUPartitionAdapter:
                 )
             ),
         })
-        if result.metadata.get("folder_api_version") != EXPECTED_FOLDER_API_VERSION:
-            raise RuntimeError(
-                "incompatible evaluator folder summary: expected folder_api_version "
-                f"{EXPECTED_FOLDER_API_VERSION!r}"
-            )
-        return PartitionSummaryBatch(fields=fields, metadata=result.metadata)
+        return PartitionSummaryBatch(fields=fields, metadata=asdict(evaluator.info))

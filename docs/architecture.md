@@ -16,9 +16,9 @@ protocols, and `pbg.eval` owns read-only duplicate-deal evaluation. There is no
 game registry or rollout implementation selector.
 
 Poker owns public betting, chance navigation, action policy, likelihood
-reaches, pot accounting, and model input. The sibling `poker_gpu_evaluator.pbg`
+reaches, pot accounting, and model input. The sibling's bound `poker_gpu_evaluator`
 owns joint private profiles, collision-conditioned completion, folded-card
-partition summaries, and showdown shares. Local adapters validate its API and
+partition summaries, and showdown payoffs. Local adapters validate its API and
 never implement a fallback hand evaluator.
 
 ## One iteration

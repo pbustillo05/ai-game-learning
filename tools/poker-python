@@ -18,5 +18,5 @@ export CUDA_HOME="${toolkit}"
 export PATH="${venv}/bin:${toolkit}/bin:${PATH}"
 export LD_LIBRARY_PATH="${toolkit}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-"${python}" -c 'import torch; from poker_gpu_evaluator import pbg; assert str(torch.version.cuda).startswith("13."), torch.version.cuda; assert pbg.API_VERSION == "pbg-v3", pbg.API_VERSION'
+"${python}" -c 'import torch, poker_gpu_evaluator as poker; assert str(torch.version.cuda).startswith("13."), torch.version.cuda; assert poker.CONTRACT_VERSION == "1", poker.CONTRACT_VERSION; poker.bind(rank_count=13)'
 exec "${python}" "$@"

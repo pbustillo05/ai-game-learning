@@ -26,8 +26,8 @@ flop/turn/river labels plus dealt-card payloads.
 
 `NLHEEngine` is the append-only CPU rule oracle. It covers blind/button order,
 fold/check/call/raise-to, minimum full raises, short-all-in reopening, street
-closure, public chance, folds, and showdown cuts. It assembles payoff only from
-externally supplied winner shares.
+closure, public chance, folds, and showdown cuts. Exact sampled-showdown payoff
+is returned by the sibling evaluator.
 
 Production uses `PokerRolloutBackend` and `PokerTensorStateStore`. State handles
 are device `int32` row indices into a preallocated structure of arrays. Each
@@ -62,25 +62,25 @@ after an immutable summary can reproduce those features identically.
 
 ## Evaluator boundary
 
-`pbg/games/poker/mc.py` calls `poker_gpu_evaluator.pbg` for:
+`pbg/games/poker/mc.py` binds `poker_gpu_evaluator` by rank count for:
 
 - collision-free joint private profiles;
 - posterior/completion samples and showdown values;
 - deterministic folded-card partition summaries; and
-- fixed-profile showdown shares.
+- fixed-profile showdown payoffs.
 
-The installed `pbg-v3` interface supports the configured compact deck. Local
-code validates API version, combo mapping, metadata, dtype, shape, device,
+The installed contract-v1 interface supports the configured compact deck. Local
+code validates contract identity, combo mapping, dtype, shape, device,
 padding, seeds, and numerical validity. Missing or incompatible operations fail
 loudly. The sibling contract is documented at
-`/home/pablob/poker-gpu-evaluator/docs/api_pbg.md`; this repository treats that
+`/home/pablob/poker-gpu-evaluator/docs/api.md`; this repository treats that
 file and repository as read-only.
 
-An RB showdown leaf sends board, live/dealt masks, reaches, and pot strata to
+An RB showdown leaf sends board, ranges, nested stratum levels, and pot amounts to
 completion. A fold leaf has fixed public chip payoff but still samples the
 collision-conditioned private posterior. Normal mode carries one joint profile,
-draws its missing board with logical randomness, requests fixed-profile shares,
-and assembles the sampled reward.
+draws its missing board with logical randomness, and requests the evaluator's
+fixed-profile payoff.
 
 ## Model bundle
 

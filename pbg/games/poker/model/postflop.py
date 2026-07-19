@@ -66,7 +66,9 @@ def _summary_fields(
     if isinstance(summary, PartitionSummaryBatch) or hasattr(summary, "fields"):
         summary = summary.fields
     semantic = {
-        "base_log_z", "single_card_log_ratio", "pair_card_log_ratio", "output_valid"
+        "base_log_z", "single_card_log_ratio", "pair_card_log_ratio", "output_valid",
+        "hand_log_ratio", "beta_eigenvalue", "beta_eigenvector",
+        "tight_cluster_scalar",
     }
     values = (
         [summary]
@@ -254,8 +256,15 @@ class PostflopNet(nn.Module):
             fields = None
         alpha = None if fields is None else fields.get("single_card_log_ratio")
         beta = None if fields is None else fields.get("pair_card_log_ratio")
+        supplied_hand = None if fields is None else fields.get("hand_log_ratio")
         valid = None if fields is None else fields.get("output_valid")
-        if alpha is None:
+        if supplied_hand is not None:
+            if supplied_hand.shape != (batch, mapping.full_size):
+                raise ValueError("hand_log_ratio must have shape [B,H]")
+            lambda_hand = compact_gather(
+                supplied_hand.to(device=device, dtype=dtype), mapping, dim=1
+            )
+        elif alpha is None:
             lambda_hand = torch.zeros((batch, compact), dtype=dtype, device=device)
         else:
             if alpha.shape != (batch, self.n_cards):
@@ -264,7 +273,7 @@ class PostflopNet(nn.Module):
                 )
             alpha = alpha.to(device=device, dtype=dtype)
             lambda_hand = alpha.gather(1, cards[..., 0]) + alpha.gather(1, cards[..., 1])
-        if beta is not None:
+        if beta is not None and supplied_hand is None:
             if beta.shape != (batch, self.n_cards, self.n_cards):
                 raise ValueError("pair_card_log_ratio has the wrong deck width")
             beta = beta.to(device=device, dtype=torch.float32)
@@ -357,17 +366,20 @@ class PostflopNet(nn.Module):
         mask = fields.get("folder_mask")
         seat = fields.get("folder_seat")
         valid = fields.get("folder_output_valid")
-        card_marginal = fields.get("folder_card_marginal")
+        card_mass = fields.get("folder_card_mass")
+        if card_mass is None:
+            # Backward-compatible input name used by older saved test fixtures.
+            card_mass = fields.get("folder_card_marginal")
         supplied_delta = fields.get("folder_delta")
-        if card_marginal is None and (
+        if card_mass is None and (
             single is None
             or single.shape != (batch, folder_count, self.n_cards)
         ):
             raise ValueError("folder card marginals or single-card ratios are required")
-        if card_marginal is not None and card_marginal.shape != (
+        if card_mass is not None and card_mass.shape != (
             batch, folder_count, self.n_cards
         ):
-            raise ValueError("folder_card_marginal has the wrong deck width")
+            raise ValueError("folder_card_mass has the wrong deck width")
         if line is None or line.shape != (batch, folder_count, self.cfg.folder_line_dim):
             raise ValueError("folder_line_meta has the wrong shape")
         if mask is None or mask.shape != (batch, folder_count) or mask.dtype != torch.bool:
@@ -379,7 +391,7 @@ class PostflopNet(nn.Module):
         marginal = (
             (1.0 - single.to(device=device, dtype=dtype).exp()).clamp(0.0, 1.0)
             if single is not None
-            else card_marginal.to(device=device, dtype=dtype)
+            else card_mass.to(device=device, dtype=dtype)
             / log_mass.exp().clamp_min(self.cfg.eps)[..., None]
         )
         context = self.folder_context(
@@ -388,8 +400,8 @@ class PostflopNet(nn.Module):
         context = context * mask[..., None]
         unnormalized = (
             log_mass.exp()[..., None] * marginal
-            if card_marginal is None
-            else card_marginal.to(device=device, dtype=dtype)
+            if card_mass is None
+            else card_mass.to(device=device, dtype=dtype)
         ) * mask[..., None]
         card_pressure = torch.einsum("bfc,bfd->bcd", unnormalized, context)
         cards = self.combo_ordinals[mapping.compact_to_full]

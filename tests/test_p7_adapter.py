@@ -124,13 +124,10 @@ class _FakeShowdown:
 
     def evaluate(self, **kwargs):
         self.calls.append(kwargs)
-        eligible = kwargs["stratum_players"]
-        shares = torch.zeros_like(eligible, dtype=torch.float32)
-        shares[:, :, 0] = 1.0
-        return SimpleNamespace(showdown_share=shares)
+        return SimpleNamespace(payoff=torch.tensor([[1.0, -1.0]]))
 
 
-def test_fixed_showdown_crosses_facade_and_uses_supplied_shares():
+def test_fixed_showdown_crosses_bound_api_and_uses_evaluator_payoff():
     engine = NLHEEngine(PokerConfig(n_players=2))
     fake = _FakeShowdown()
     game = PokerGame(engine, profile_sampler=object(), showdown_evaluator=fake, partition_adapter=object())

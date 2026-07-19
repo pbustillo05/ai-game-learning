@@ -13,6 +13,7 @@ _FOLDER_FIELDS = frozenset(
         "folder_log_mass",
         "folder_single_card_log_ratio",
         "folder_card_marginal",
+        "folder_card_mass",
         "folder_delta",
         "folder_output_valid",
         "folder_mask",
@@ -144,8 +145,9 @@ class DevicePartitionSummaryCache:
         if min(capacity, n_cards, beta_rank, max_folders, line_dim) < 0:
             raise ValueError("partition cache dimensions must be nonnegative")
         d, r, f = n_cards, beta_rank, max_folders
-        float_values = 2 + d + d * d + r + d * r
-        float_values += f + 3 * f * d + f * line_dim
-        bool_values = 2 + 2 * f  # cache/output validity and two folder masks
+        h = d * (d - 1) // 2
+        float_values = h + r + d * r + 1
+        float_values += f + f * d + f * line_dim
+        bool_values = 1 + f  # cache validity and folder mask
         int64_values = f
         return capacity * (4 * float_values + bool_values + 8 * int64_values)

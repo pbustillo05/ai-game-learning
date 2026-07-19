@@ -520,13 +520,11 @@ def streamed_branched_value(
         _, actual_counts = tree.tree_id.to(torch.int64).unique(return_counts=True)
         if bool((actual_counts > configured_node_budget).any()):
             raise ValueError("stored tree exceeds configured_node_budget")
-    # p_hat, v_hat, estimator_stddev and output_valid conservatively represent
-    # the dense learning/quality fields returned by active completion backends.
-    completion_bytes = (
-        min(completion_batch_rows, int(leaf_nodes.numel()))
-        * layout.p_max
-        * layout.x_max
-        * (3 * 4 + 1)
+    # Contract-v1 production completion returns two dense fp32 learning fields
+    # plus one fp32 effective-sample-size scalar per row.
+    completion_rows = min(completion_batch_rows, int(leaf_nodes.numel()))
+    completion_bytes = completion_rows * (
+        layout.p_max * layout.x_max * 2 * 4 + 4
     )
     plan = _frontier_memory_plan_from_shape(tree, layout, completion_bytes)
     if plan.peak_bytes > max_workspace_bytes:

@@ -19,7 +19,11 @@ from pbg.games.poker.engine import (
     NLHEEngine,
 )
 from pbg.games.poker.folded import PokerGPUPartitionAdapter
-from pbg.games.poker.mc import PokerGPURejectionSampler, PokerGPUShowdownEvaluator
+from pbg.games.poker.mc import (
+    PokerGPURejectionSampler,
+    PokerGPUShowdownEvaluator,
+    stratum_levels,
+)
 from pbg.games.poker.model.heads import dlogistic_tick
 from pbg.games.poker.model.postflop import PostflopMasks, PostflopNet
 from pbg.games.poker.model.preflop import (
@@ -596,15 +600,16 @@ class PokerGame:
         showdown_rows = preterminal.nonzero(as_tuple=False).squeeze(1)
         if showdown_rows.numel():
             showdown_refs = state_refs[showdown_rows]
-            board, status = self._state_tensors(showdown_refs)
+            board, _ = self._state_tensors(showdown_refs)
             strata = self.engine.pot_strata(showdown_refs)
             result = self.showdown_evaluator.evaluate(
                 board_cards=board,
                 combo_ids=xprofile[showdown_rows].to(device=board.device, dtype=torch.int32),
-                active_mask=status != FOLDED,
-                stratum_players=strata.stratum_players,
+                stratum_level=stratum_levels(strata.stratum_players),
+                payoff_baseline=strata.payoff_baseline,
+                stratum_amount=strata.stratum_amount,
             )
-            payoff[showdown_rows] = self.engine.assemble_showdown_payoff(strata, result.showdown_share)
+            payoff[showdown_rows] = result.payoff
         return payoff
 
     def encode_public(self, state_refs: Tensor) -> PokerPublicBatch:

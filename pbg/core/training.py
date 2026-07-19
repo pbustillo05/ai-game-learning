@@ -156,11 +156,11 @@ def _hardware_metadata(
         },
     }
     try:
-        evaluator = importlib.import_module("poker_gpu_evaluator.pbg")
-        metadata["evaluator_api_version"] = evaluator.API_VERSION
+        evaluator = importlib.import_module("poker_gpu_evaluator")
+        metadata["evaluator_contract_version"] = evaluator.CONTRACT_VERSION
         metadata["evaluator_module"] = str(Path(evaluator.__file__).resolve())
     except (ImportError, AttributeError):
-        metadata["evaluator_api_version"] = None
+        metadata["evaluator_contract_version"] = None
         metadata["evaluator_module"] = None
     if cfg.training.mode == "branched_rao_blackwell":
         metadata["rank_start_quotas"] = [1] * world

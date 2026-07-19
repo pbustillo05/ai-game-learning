@@ -28,14 +28,17 @@ from pbg.games.poker.engine import (
     RIVER,
     PokerConfig,
     PotStrata,
-    assemble_showdown_payoff,
 )
 from pbg.games.poker.folded import (
     FoldSnapshotBatch,
     PartitionSummaryBatch,
     PokerGPUPartitionAdapter,
 )
-from pbg.games.poker.mc import PokerGPURejectionSampler, PokerGPUShowdownEvaluator
+from pbg.games.poker.mc import (
+    PokerGPURejectionSampler,
+    PokerGPUShowdownEvaluator,
+    stratum_levels,
+)
 from pbg.games.poker.model_inputs import DeviceHistoryMaterializer
 from pbg.games.poker.partition_cache import DevicePartitionSummaryCache
 from pbg.games.poker.policy_planning import plan_policy_batches as _plan_policy_batches
@@ -761,28 +764,15 @@ class PokerRolloutBackend:
             active = status != FOLDED
             combos = selected_profiles.clone().masked_fill(~active, -1)
             strata = self.pot_strata(states[showdown])
-            # The public strata tensor is padded to P rows.  The evaluator
-            # requires even zero-amount padding rows to name an eligible seat;
-            # assigning all active seats there is payoff-neutral.
-            empty = ~strata.stratum_players.any(2)
-            evaluator_players = torch.where(
-                empty[:, :, None],
-                active[:, None, :].expand_as(strata.stratum_players),
-                strata.stratum_players,
-            )
-            settlement = PotStrata(
-                evaluator_players, strata.stratum_amount, strata.payoff_baseline
-            )
             result = self.showdown_evaluator.evaluate(
                 board_cards=complete_board,
                 combo_ids=combos.contiguous(),
-                active_mask=active.contiguous(),
-                stratum_players=evaluator_players.contiguous(),
+                stratum_level=stratum_levels(strata.stratum_players),
+                payoff_baseline=strata.payoff_baseline.contiguous(),
+                stratum_amount=strata.stratum_amount.contiguous(),
             )
             self.execution_metrics.record_evaluator(rows=int(selected_rows.numel()))
-            reward[showdown] = assemble_showdown_payoff(
-                settlement, result.showdown_share
-            )
+            reward[showdown] = result.payoff
         return reward
 
     def sample_events(
@@ -1921,21 +1911,17 @@ class PokerRolloutBackend:
         return PotStrata(eligible, amount, -committed)
 
     def completion_inputs(self, states: Tensor, reach: Tensor) -> dict[str, Tensor]:
-        """Build device-local tensors for the public sibling completion facade.
+        """Build device-local tensors for bound sibling completion.
 
         ``states`` is int32 ``[B]`` and ``reach`` is log reach
         float32 ``[B,P,H]``.  Returned fields match the tensor arguments of
-        ``poker_gpu_evaluator.pbg.complete`` except for caller-owned seed and
-        completion configuration.
+        ``evaluator.complete`` except for caller-owned seed and sample count.
         """
 
         self._validate_handles(states)
         if reach.shape != (states.shape[0], self.n_players, self.n_hands):
             raise ValueError("reach has the wrong compact hand width")
         rows = states.to(torch.int64)
-        dealt = torch.ones(
-            (states.shape[0], self.n_players), dtype=torch.bool, device=self.device
-        )  # [B,P]
         finite = torch.isfinite(reach)
         row_max = reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
         weights = torch.exp(reach - row_max).masked_fill(~finite, 0.0).contiguous()
@@ -1948,9 +1934,7 @@ class PokerRolloutBackend:
         return {
             "board_cards": board,
             "range_weights": weights,
-            "dealt_mask": dealt,
-            "contender_mask": (self.states.status[rows] != FOLDED).contiguous(),
-            "stratum_players": strata.stratum_players.contiguous(),
+            "stratum_level": stratum_levels(strata.stratum_players),
             "payoff_baseline": strata.payoff_baseline.contiguous(),
             "stratum_amount": strata.stratum_amount.contiguous(),
         }

@@ -1,4 +1,4 @@
-"""Thin adapters to the public ``poker_gpu_evaluator.pbg`` facade.
+"""Thin adapters to the bound :mod:`poker_gpu_evaluator` API.
 
 Poker collision laws, profile sampling, runouts, hand ranking, and winner
 selection are all owned by the sibling evaluator.  This module only translates
@@ -7,85 +7,100 @@ public engine state and validates the stable tensor contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import importlib
-from typing import Any, Callable, Mapping
+from typing import Any, Mapping
 
 import torch
 from torch import Tensor
 
 from pbg.core.completion import BatchedCompletionStats, ReachView
 from pbg.games.poker.cards import DeckGeometry, validate_evaluator_combo_cards
-from pbg.games.poker.engine import FOLDED, NLHEEngine
+from pbg.games.poker.engine import NLHEEngine
 
 PAD_CARD = 255
-EXPECTED_API_VERSION = "pbg-v3"
+EXPECTED_CONTRACT_VERSION = "1"
 
 
 class EvaluatorContractError(RuntimeError):
     """The sibling returned a value outside its frozen public contract."""
 
 
-class AcceptanceError(RuntimeError):
-    """One or more requested exact joint profiles were not accepted."""
-
-    def __init__(
-        self,
-        failed_indices: Tensor,
-        acceptance_rate: Tensor,
-        attempt_count: Tensor,
-        metadata: Mapping[str, object],
-    ) -> None:
-        self.failed_indices = failed_indices
-        self.acceptance_rate = acceptance_rate
-        self.attempt_count = attempt_count
-        self.metadata = metadata
-        indices = failed_indices.detach().cpu().tolist()
-        rates = acceptance_rate.detach().cpu().tolist()
-        super().__init__(
-            "poker_gpu_evaluator failed to accept requested joint profiles; "
-            f"failed_indices={indices}, acceptance_rate={rates}, metadata={dict(metadata)!r}"
-        )
-
-
-@dataclass(frozen=True)
-class _CompletionConfig:
-    """Structural counterpart of the facade's frozen completion config."""
-
-    n_samples: int
-    n_partials: int = 8
-    backend: str = "auto"
-
-
 @dataclass
 class ShowdownResult:
-    """Validated evaluator-owned winners and tie shares."""
+    """Validated evaluator-owned fixed-showdown payoff."""
 
-    winner_mask: Tensor  # int32 [B,K]
-    showdown_share: Tensor  # float32 [B,K,P]
+    payoff: Tensor  # float32 [B,P]
     metadata: Mapping[str, object]
 
 
-def _load_operation(name: str, rank_count: int) -> Callable[..., Any]:
-    """Import and version-check one stable facade operation, lazily."""
+def _load_evaluator(rank_count: int) -> Any:
+    """Import, bind, and validate the production evaluator lazily."""
 
     try:
-        facade = importlib.import_module("poker_gpu_evaluator.pbg")
-        api_version = facade.API_VERSION
-        combo_cards = facade.combo_cards(rank_count)
-        operation = getattr(facade, name)
+        package = importlib.import_module("poker_gpu_evaluator")
+        contract_version = package.CONTRACT_VERSION
+        evaluator = package.bind(rank_count=rank_count)
+        combo_cards = evaluator.combo_cards
     except (ImportError, ModuleNotFoundError, AttributeError) as exc:
         raise RuntimeError(
-            "poker_gpu_evaluator with the public pbg-v3 facade is required; "
+            "poker_gpu_evaluator with the bound contract-v1 API is required; "
             "install or update the sibling package (an editable install is sufficient)"
         ) from exc
-    if api_version != EXPECTED_API_VERSION:
+    if contract_version != EXPECTED_CONTRACT_VERSION:
         raise RuntimeError(
-            "incompatible poker_gpu_evaluator facade: expected API_VERSION "
-            f"{EXPECTED_API_VERSION!r}, got {api_version!r}; update the sibling package"
+            "incompatible poker_gpu_evaluator: expected CONTRACT_VERSION "
+            f"{EXPECTED_CONTRACT_VERSION!r}, got {contract_version!r}; "
+            "update the sibling package"
         )
     validate_evaluator_combo_cards(combo_cards, rank_count)
-    return operation
+    if evaluator.info.contract_version != contract_version:
+        raise RuntimeError("bound evaluator contract version disagrees with the package")
+    return evaluator
+
+
+def _evaluator_metadata(evaluator: Any) -> Mapping[str, object]:
+    """Return immutable evaluator identity as host-only metadata."""
+
+    try:
+        return asdict(evaluator.info)
+    except (TypeError, AttributeError) as exc:
+        raise EvaluatorContractError("bound evaluator must expose dataclass info") from exc
+
+
+def _require_backend_device(backend: str, device: torch.device, operation: str) -> None:
+    if backend != "auto" and device.type != backend:
+        raise ValueError(
+            f"{operation} backend {backend!r} requires {backend} input tensors, "
+            f"got {device.type!r}"
+        )
+
+
+def stratum_levels(stratum_players: Tensor) -> Tensor:
+    """Convert padded nested eligibility ``[B,K,P]`` to highest levels.
+
+    Engine strata use a fixed ``K=P`` width and may have zero-amount empty
+    padding rows. The evaluator still evaluates every named level, so those
+    payoff-neutral rows inherit all contenders before conversion.
+    """
+
+    if not isinstance(stratum_players, Tensor) or stratum_players.ndim != 3:
+        raise TypeError("stratum_players must be a Tensor with shape [B,K,P]")
+    if stratum_players.dtype != torch.bool:
+        raise TypeError("stratum_players must have dtype torch.bool")
+    contenders = stratum_players.any(dim=1)
+    empty = ~stratum_players.any(dim=2)
+    normalized = torch.where(
+        empty[:, :, None], contenders[:, None, :], stratum_players
+    )
+    levels = torch.arange(
+        stratum_players.shape[1], dtype=torch.int32, device=stratum_players.device
+    )
+    return torch.where(
+        normalized,
+        levels[None, :, None],
+        torch.full((), -1, dtype=torch.int32, device=stratum_players.device),
+    ).amax(dim=1).contiguous()
 
 
 def _normalize_board(board_cards: Tensor, rank_count: int = 13) -> Tensor:
@@ -117,14 +132,6 @@ def _normalize_board(board_cards: Tensor, rank_count: int = 13) -> Tensor:
     return torch.where(
         padding, torch.full_like(board_cards, PAD_CARD), board_cards
     ).to(dtype=torch.uint8).contiguous()  # [B,5]
-
-
-def _validate_metadata(metadata: Any, operation: str) -> Mapping[str, object]:
-    if not isinstance(metadata, dict):
-        raise EvaluatorContractError(f"{operation} metadata must be a dict")
-    if any(isinstance(value, Tensor) for value in metadata.values()):
-        raise EvaluatorContractError(f"{operation} metadata may not contain tensors")
-    return metadata
 
 
 def _require_tensor(
@@ -203,23 +210,20 @@ class PokerGPUCompletion:
     """Adapter for evaluator-owned Monte Carlo completion."""
 
     def __init__(
-        self, *, backend: str = "auto", n_partials: int = 8, rank_count: int = 13
+        self, *, backend: str = "auto", rank_count: int = 13
     ) -> None:
         if backend not in {"auto", "cpu", "cuda"}:
             raise ValueError("backend must be 'auto', 'cpu', or 'cuda'")
-        if isinstance(n_partials, bool) or not isinstance(n_partials, int) or n_partials <= 0:
-            raise ValueError("n_partials must be a positive integer")
         self.backend = backend
-        self.n_partials = n_partials
         if isinstance(rank_count, bool) or not 4 <= rank_count <= 13:
             raise ValueError("rank_count must be an integer in [4,13]")
         self.rank_count = int(rank_count)
-        self._complete: Callable[..., Any] | None = None
+        self._evaluator: Any | None = None
 
-    def _operation(self) -> Callable[..., Any]:
-        if self._complete is None:
-            self._complete = _load_operation("complete", self.rank_count)
-        return self._complete
+    def _bound_evaluator(self) -> Any:
+        if self._evaluator is None:
+            self._evaluator = _load_evaluator(self.rank_count)
+        return self._evaluator
 
     def complete(
         self,
@@ -282,15 +286,9 @@ class PokerGPUCompletion:
             [engine.states.board[ref] for ref in refs], dtype=torch.int16, device=rows.device
         )
         board_cards = _normalize_board(boards, self.rank_count)
+        _require_backend_device(self.backend, rows.device, "complete")
         dealt_mask = torch.zeros((batch_size, p_max), dtype=torch.bool, device=rows.device)
         dealt_mask[:, : engine.n_players] = True
-        contender_mask = torch.zeros_like(dealt_mask)
-        for batch, ref in enumerate(refs):
-            contender_mask[batch, : engine.n_players] = torch.tensor(
-                [status != FOLDED for status in engine.states.status[ref]],
-                dtype=torch.bool,
-                device=rows.device,
-            )
         range_weights = _linear_reach(rows, dealt_mask, self.rank_count)
         strata = engine.pot_strata(state_refs)
         k = strata.stratum_amount.shape[1]
@@ -298,6 +296,7 @@ class PokerGPUCompletion:
             (batch_size, k, p_max), dtype=torch.bool, device=rows.device
         )
         stratum_players[:, :, : engine.n_players] = strata.stratum_players
+        stratum_level = stratum_levels(stratum_players)
         payoff_baseline = torch.zeros((batch_size, p_max), dtype=torch.float32, device=rows.device)
         payoff_baseline[:, : engine.n_players] = strata.payoff_baseline
         if seed is None:
@@ -311,58 +310,46 @@ class PokerGPUCompletion:
         ):
             raise ValueError("completion seeds must be device-local int64 [B]")
         seed = seed.contiguous()
-        result = self._operation()(
-            rank_count=self.rank_count,
+        evaluator = self._bound_evaluator()
+        result = evaluator.complete(
             board_cards=board_cards,
             range_weights=range_weights,
-            dealt_mask=dealt_mask.contiguous(),
-            contender_mask=contender_mask.contiguous(),
-            stratum_players=stratum_players.contiguous(),
+            stratum_level=stratum_level,
             payoff_baseline=payoff_baseline.contiguous(),
             stratum_amount=strata.stratum_amount.contiguous(),
+            n_samples=n_samples,
             seed=seed,
-            config=_CompletionConfig(n_samples, self.n_partials, self.backend),
         )
         metrics = getattr(game, "execution_metrics", None)
         if metrics is not None:
             metrics.record_evaluator(rows=batch_size)
-        return self._validate_result(result, batch_size, p_max, k, rows.device)
+        return self._validate_result(
+            result, batch_size, p_max, rows.device, _evaluator_metadata(evaluator)
+        )
 
     def _validate_result(
-        self, result: Any, batch_size: int, p_max: int, k: int, device: torch.device
+        self,
+        result: Any,
+        batch_size: int,
+        p_max: int,
+        device: torch.device,
+        metadata: Mapping[str, object],
     ) -> BatchedCompletionStats:
         op = "complete"
         n_hands = DeckGeometry(self.rank_count).n_hands
         p_hat = _require_tensor(result, "p_hat", (batch_size, p_max, n_hands), torch.float32, device, op)
         v_hat = _require_tensor(result, "v_hat", (batch_size, p_max, n_hands), torch.float32, device, op)
-        vvec_hat = _require_tensor(result, "vvec_hat", (batch_size, p_max), torch.float32, device, op)
-        u_hat = _require_tensor(result, "u_hat", (batch_size,), torch.float32, device, op)
         n_eff = _require_tensor(result, "n_eff", (batch_size,), torch.float32, device, op)
-        equity_share = _require_tensor(
-            result, "equity_share", (batch_size, p_max, n_hands, k), torch.float32, device, op
-        )
-        output_valid = _require_tensor(result, "output_valid", (batch_size, p_max, n_hands), torch.bool, device, op)
-        sample_count = _require_tensor(result, "sample_count", (batch_size,), torch.int64, device, op)
-        estimator_stddev = _require_tensor(
-            result, "estimator_stddev", (batch_size, p_max, n_hands), torch.float32, device, op
-        )
-        metadata = _validate_metadata(getattr(result, "metadata", None), op)
         return BatchedCompletionStats(
             p_hat=p_hat,
             v_hat=v_hat,
-            vvec_hat=vvec_hat,
-            u_hat=u_hat,
             n_eff=n_eff,
-            equity_share=equity_share,
-            output_valid=output_valid,
-            sample_count=sample_count,
-            estimator_stddev=estimator_stddev,
             metadata=metadata,
         )
 
 
 class PokerGPURejectionSampler:
-    """Adapter for exact whole-profile independent rejection sampling."""
+    """Adapter for exact whole-profile all-or-raise sampling."""
 
     def __init__(
         self,
@@ -380,12 +367,12 @@ class PokerGPURejectionSampler:
         if isinstance(rank_count, bool) or not 4 <= rank_count <= 13:
             raise ValueError("rank_count must be an integer in [4,13]")
         self.rank_count = int(rank_count)
-        self._sample: Callable[..., Any] | None = None
+        self._evaluator: Any | None = None
 
-    def _operation(self) -> Callable[..., Any]:
-        if self._sample is None:
-            self._sample = _load_operation("sample_joint_profiles", self.rank_count)
-        return self._sample
+    def _bound_evaluator(self) -> Any:
+        if self._evaluator is None:
+            self._evaluator = _load_evaluator(self.rank_count)
+        return self._evaluator
 
     def sample(
         self,
@@ -431,6 +418,9 @@ class PokerGPURejectionSampler:
         if dealt_mask.dtype != torch.bool or dealt_mask.ndim != 2:
             raise TypeError("dealt_mask must be bool [B,P]")
         range_weights = _linear_reach(reach_rows, dealt_mask, self.rank_count)
+        _require_backend_device(
+            self.backend, reach_rows.device, "sample_joint_profiles"
+        )
         batch_size, p_max = dealt_mask.shape
         if board_cards.shape[0] != batch_size or board_cards.device != reach_rows.device:
             raise ValueError("board, reach rows, and dealt_mask must share B and device")
@@ -439,40 +429,35 @@ class PokerGPURejectionSampler:
         if seed.device != reach_rows.device:
             raise ValueError("seed and reach rows must share a device")
         seed = seed.contiguous()
-        result = self._operation()(
-            rank_count=self.rank_count,
+        combo_ids = self._bound_evaluator().sample_joint_profiles(
             board_cards=board_cards,
             range_weights=range_weights,
-            dealt_mask=dealt_mask.contiguous(),
             n_samples=n,
             seed=seed,
             max_attempts=self.max_attempts,
-            backend=self.backend,
         )
         op = "sample_joint_profiles"
-        combo_ids = _require_tensor(result, "combo_ids", (batch_size, n, p_max), torch.int32, reach_rows.device, op)
-        accepted = _require_tensor(result, "accepted", (batch_size, n), torch.bool, reach_rows.device, op)
-        attempt_count = _require_tensor(result, "attempt_count", (batch_size, n), torch.int32, reach_rows.device, op)
-        acceptance_rate = _require_tensor(result, "acceptance_rate", (batch_size,), torch.float32, reach_rows.device, op)
-        metadata = _validate_metadata(getattr(result, "metadata", None), op)
+        if not isinstance(combo_ids, Tensor):
+            raise EvaluatorContractError(f"{op} must return a torch.Tensor")
+        if combo_ids.shape != (batch_size, n, p_max):
+            raise EvaluatorContractError(f"{op} returned the wrong shape")
+        if combo_ids.dtype != torch.int32 or combo_ids.device != reach_rows.device:
+            raise EvaluatorContractError(f"{op} returned the wrong dtype or device")
+        if not combo_ids.is_contiguous():
+            raise EvaluatorContractError(f"{op} result must be contiguous")
         inactive = ~dealt_mask[:, None, :].expand_as(combo_ids)
         if bool((combo_ids[inactive] != -1).any()):
             raise EvaluatorContractError("sample_joint_profiles must return -1 for undealt seats")
-        if bool((combo_ids[dealt_mask[:, None, :].expand_as(combo_ids) & accepted[:, :, None]] < 0).any()):
-            raise EvaluatorContractError("accepted profiles must contain every dealt seat")
-        if not bool(accepted.all()):
-            failed_mask = (~accepted)[:, :, None].expand_as(combo_ids)
-            if bool((combo_ids[failed_mask] != -1).any()):
-                raise EvaluatorContractError(
-                    "failed sample_joint_profiles rows must contain only -1"
-                )
-            failed = (~accepted).nonzero(as_tuple=False).to(torch.int32).contiguous()
-            raise AcceptanceError(failed, acceptance_rate, attempt_count, metadata)
+        dealt = dealt_mask[:, None, :].expand_as(combo_ids)
+        if bool((combo_ids[dealt] < 0).any()):
+            raise EvaluatorContractError("sampled profiles must contain every dealt seat")
+        if bool((combo_ids[dealt] >= DeckGeometry(self.rank_count).n_hands).any()):
+            raise EvaluatorContractError("sampled profile contains an invalid combo id")
         return combo_ids
 
 
 class PokerGPUShowdownEvaluator:
-    """Adapter for exact fixed-showdown winner masks and shares."""
+    """Adapter for exact fixed-showdown payoffs."""
 
     def __init__(self, *, backend: str = "auto", rank_count: int = 13) -> None:
         if backend not in {"auto", "cpu", "cuda"}:
@@ -481,20 +466,21 @@ class PokerGPUShowdownEvaluator:
         if isinstance(rank_count, bool) or not 4 <= rank_count <= 13:
             raise ValueError("rank_count must be an integer in [4,13]")
         self.rank_count = int(rank_count)
-        self._evaluate: Callable[..., Any] | None = None
+        self._evaluator: Any | None = None
 
-    def _operation(self) -> Callable[..., Any]:
-        if self._evaluate is None:
-            self._evaluate = _load_operation("evaluate_showdowns", self.rank_count)
-        return self._evaluate
+    def _bound_evaluator(self) -> Any:
+        if self._evaluator is None:
+            self._evaluator = _load_evaluator(self.rank_count)
+        return self._evaluator
 
     def evaluate(
         self,
         *,
         board_cards: Tensor,
         combo_ids: Tensor,
-        active_mask: Tensor,
-        stratum_players: Tensor,
+        stratum_level: Tensor,
+        payoff_baseline: Tensor,
+        stratum_amount: Tensor,
     ) -> ShowdownResult:
         board = _normalize_board(board_cards, self.rank_count)
         if bool((board == PAD_CARD).any()):
@@ -502,45 +488,31 @@ class PokerGPUShowdownEvaluator:
         if combo_ids.dtype != torch.int32 or combo_ids.ndim != 2:
             raise TypeError("combo_ids must be int32 [B,P]")
         batch_size, p_max = combo_ids.shape
-        if active_mask.shape != (batch_size, p_max) or active_mask.dtype != torch.bool:
-            raise TypeError("active_mask must be bool [B,P]")
-        if stratum_players.ndim != 3 or stratum_players.shape[0] != batch_size or stratum_players.shape[2] != p_max:
-            raise ValueError("stratum_players must have shape [B,K,P]")
-        if stratum_players.dtype != torch.bool:
-            raise TypeError("stratum_players must have dtype torch.bool")
-        tensors = (board, combo_ids, active_mask, stratum_players)
+        if stratum_level.shape != (batch_size, p_max) or stratum_level.dtype != torch.int32:
+            raise TypeError("stratum_level must be int32 [B,P]")
+        if payoff_baseline.shape != (batch_size, p_max) or payoff_baseline.dtype != torch.float32:
+            raise TypeError("payoff_baseline must be float32 [B,P]")
+        if stratum_amount.ndim != 2 or stratum_amount.shape[0] != batch_size or stratum_amount.dtype != torch.float32:
+            raise TypeError("stratum_amount must be float32 [B,K]")
+        tensors = (board, combo_ids, stratum_level, payoff_baseline, stratum_amount)
         if len({tensor.device for tensor in tensors}) != 1:
             raise ValueError("all showdown tensors must share a device")
-        if bool((stratum_players & ~active_mask[:, None, :]).any()):
-            raise ValueError("every stratum-eligible player must be active")
-        result = self._operation()(
-            rank_count=self.rank_count,
+        _require_backend_device(self.backend, board.device, "evaluate_showdowns")
+        evaluator = self._bound_evaluator()
+        payoff = evaluator.evaluate_showdowns(
             board_cards=board,
             combo_ids=combo_ids.contiguous(),
-            active_mask=active_mask.contiguous(),
-            stratum_players=stratum_players.contiguous(),
-            backend=self.backend,
+            stratum_level=stratum_level.contiguous(),
+            payoff_baseline=payoff_baseline.contiguous(),
+            stratum_amount=stratum_amount.contiguous(),
         )
-        k = stratum_players.shape[1]
         op = "evaluate_showdowns"
-        winner_mask = _require_tensor(result, "winner_mask", (batch_size, k), torch.int32, board.device, op)
-        shares = _require_tensor(result, "showdown_share", (batch_size, k, p_max), torch.float32, board.device, op)
-        metadata = _validate_metadata(getattr(result, "metadata", None), op)
-        if bool((shares < 0).any()) or not bool(torch.isfinite(shares).all()):
-            raise EvaluatorContractError("showdown shares must be finite and nonnegative")
-        if bool((shares.masked_select(~stratum_players).abs() > 1e-6).any()):
-            raise EvaluatorContractError("ineligible seats must have zero showdown share")
-        if bool((torch.abs(shares.sum(dim=-1) - 1.0) > 1e-5).any()):
-            raise EvaluatorContractError("showdown shares must sum to one per stratum")
-        seat_bits = torch.bitwise_left_shift(
-            torch.ones((p_max,), dtype=torch.int32, device=board.device),
-            torch.arange(p_max, dtype=torch.int32, device=board.device),
-        )
-        mask_from_shares = ((shares > 0).to(torch.int32) * seat_bits).sum(dim=-1)
-        if not bool(torch.equal(mask_from_shares, winner_mask)):
-            raise EvaluatorContractError("winner_mask and positive showdown shares disagree")
-        winners = (shares > 0).sum(dim=-1).to(torch.float32)
-        expected = torch.where(shares > 0, winners.reciprocal()[:, :, None], torch.zeros_like(shares))
-        if bool((torch.abs(shares - expected) > 1e-6).any()):
-            raise EvaluatorContractError("showdown shares must split each winner mask equally")
-        return ShowdownResult(winner_mask, shares, metadata)
+        if not isinstance(payoff, Tensor) or payoff.shape != (batch_size, p_max):
+            raise EvaluatorContractError(f"{op} must return float32 [B,P]")
+        if payoff.dtype != torch.float32 or payoff.device != board.device:
+            raise EvaluatorContractError(f"{op} returned the wrong dtype or device")
+        if not payoff.is_contiguous() or not bool(torch.isfinite(payoff).all()):
+            raise EvaluatorContractError(f"{op} returned an invalid payoff")
+        if bool((payoff.sum(dim=1).abs() > 2e-4).any()):
+            raise EvaluatorContractError(f"{op} returned a non-conserved payoff")
+        return ShowdownResult(payoff, _evaluator_metadata(evaluator))

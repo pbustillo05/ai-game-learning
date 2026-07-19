@@ -246,17 +246,17 @@ def validate_evaluator_combo_cards(
 
     geometry = DeckGeometry(rank_count)
     if not isinstance(combo_cards, Tensor):
-        raise RuntimeError("poker_gpu_evaluator.pbg combo_cards must be a torch.Tensor")
+        raise RuntimeError("bound evaluator combo_cards must be a torch.Tensor")
     if combo_cards.shape != (geometry.n_hands, 2) or combo_cards.dtype != torch.uint8:
         raise RuntimeError(
-            "poker_gpu_evaluator.pbg combo_cards has the wrong compact shape or dtype"
+            "bound evaluator combo_cards has the wrong compact shape or dtype"
         )
     expected = torch.tensor(
         geometry.combo_cards, dtype=torch.uint8, device=combo_cards.device
     )
     if not torch.equal(combo_cards, expected):
         raise RuntimeError(
-            "poker_gpu_evaluator.pbg.COMBO_CARDS is incompatible with the local "
+            "bound evaluator combo_cards is incompatible with the local "
             "lexicographic hand_index/hand_cards mapping"
         )
 

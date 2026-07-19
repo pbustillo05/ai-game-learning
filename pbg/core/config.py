@@ -55,7 +55,7 @@ class RolloutConfig:
 
 @dataclass
 class CompletionConfig:
-    """Configure Monte Carlo completion at pre-terminal nodes."""
+    """Configure samples and the expected evaluator tensor device."""
 
     n_samples: int | None
     backend: str
