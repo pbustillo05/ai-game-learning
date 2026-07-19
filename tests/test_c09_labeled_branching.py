@@ -13,6 +13,7 @@ import yaml
 from torch import Tensor, nn
 
 from pbg.core.branching import (
+    BranchingCutoffReached,
     _index_policy_output,
     sample_branched_tree,
 )
@@ -211,6 +212,59 @@ def test_branched_dispatches_actual_cost_family_blocks() -> None:
     assert backend.actual_cost_batch_sizes == [1, 2]
     assert backend.forward_batch_sizes == [1, 2]
     assert policy.old_logp_child.shape == (3, 2, 1)
+
+
+def test_upper_cutoff_switches_later_expansions_to_spines() -> None:
+    backend = _LabeledBackend(2.0, two_levels=True)
+    cfg = _cfg(1, 2.0)
+    cfg.branching_upper_cutoff_nodes = 4
+    diagnostics: dict[str, int] = {}
+
+    bundle = GameBundle(_Model(), backend, _Adapter(), None)
+    tree, _, policy = sample_branched_tree(
+        bundle,
+        cfg,
+        torch.Generator().manual_seed(7),
+        diagnostics=diagnostics,
+    )
+
+    degree = tree.child_ptr[1:] - tree.child_ptr[:-1]
+    assert tree.owner.numel() == 5
+    assert int(degree[0]) == 2
+    assert torch.equal(degree[1:3], torch.ones(2, dtype=torch.int64))
+    assert policy.old_logp_child.shape == (3, 2, 1)
+    assert diagnostics == {
+        "upper_cutoff_batches": 1,
+        "upper_cutoff_parents": 2,
+        "upper_cutoff_avoided_children": 2,
+        "upper_cutoff_first_node_count": 3,
+    }
+
+
+def test_stop_cutoff_reports_unexpanded_live_queue() -> None:
+    backend = _LabeledBackend(2.0, two_levels=True)
+    cfg = _cfg(1, 2.0)
+    cfg.branching_stop_cutoff_nodes = 3
+    bundle = GameBundle(_Model(), backend, _Adapter(), None)
+
+    with pytest.raises(BranchingCutoffReached) as caught:
+        sample_branched_tree(
+            bundle,
+            cfg,
+            torch.Generator().manual_seed(7),
+        )
+
+    cutoff = caught.value
+    assert cutoff.node_count == 3
+    assert cutoff.pending_nodes == 2
+    assert cutoff.queued_nodes == 0
+    assert cutoff.frontier_nodes == 2
+    assert cutoff.family_queue_nodes == {"default": 0}
+    assert cutoff.completed_leaves == 0
+    assert cutoff.completed_decisions == 1
+    assert cutoff.state_refs.tolist() == [0, 1, 1]
+    assert cutoff.owners.tolist() == [0, 0, 0]
+    assert backend.actual_cost_batch_sizes == [1]
 
 
 def test_root_fractional_rounding_is_keyed_and_repeatable() -> None:

@@ -18,12 +18,43 @@ from pbg.core.tree import (
 )
 
 
+class BranchingCutoffReached(RuntimeError):
+    """A geometry-only rollout stopped with a live, unexpanded frontier."""
+
+    def __init__(
+        self,
+        *,
+        node_count: int,
+        queued_nodes: int,
+        frontier_nodes: int,
+        family_queue_nodes: Mapping[str, int],
+        completed_leaves: int,
+        completed_decisions: int,
+        state_refs: Tensor,
+        owners: Tensor,
+    ) -> None:
+        self.node_count = node_count
+        self.queued_nodes = queued_nodes
+        self.frontier_nodes = frontier_nodes
+        self.pending_nodes = queued_nodes + frontier_nodes
+        self.family_queue_nodes = dict(family_queue_nodes)
+        self.completed_leaves = completed_leaves
+        self.completed_decisions = completed_decisions
+        self.state_refs = state_refs
+        self.owners = owners
+        super().__init__(
+            f"branched rollout stopped at {node_count} nodes with "
+            f"{self.pending_nodes} live nodes pending"
+        )
+
+
 def sample_branched_tree(
     bundle: GameBundle,
     cfg: Any,
     gen: torch.Generator,
     *,
     iteration: int = 0,
+    diagnostics: dict[str, int] | None = None,
 ) -> tuple[TreeBatch, ReachCache, PolicyCache]:
     """Sample one duplicate-preserving branched tree through execution families."""
 
@@ -63,6 +94,38 @@ def sample_branched_tree(
     x_sizes = tuple(int(value) for value in backend.x_sizes)
     x_max = max(x_sizes)
     node_budget = int(rollout_cfg.node_budget)
+    upper_cutoff = getattr(rollout_cfg, "branching_upper_cutoff_nodes", None)
+    if upper_cutoff is not None:
+        if (
+            isinstance(upper_cutoff, bool)
+            or not isinstance(upper_cutoff, int)
+            or not 1 < upper_cutoff < node_budget
+        ):
+            raise ValueError(
+                "branching_upper_cutoff_nodes must be an integer strictly between "
+                "one and node_budget"
+            )
+    stop_cutoff = getattr(rollout_cfg, "branching_stop_cutoff_nodes", None)
+    if stop_cutoff is not None:
+        if (
+            isinstance(stop_cutoff, bool)
+            or not isinstance(stop_cutoff, int)
+            or not 1 < stop_cutoff < node_budget
+        ):
+            raise ValueError(
+                "branching_stop_cutoff_nodes must be an integer strictly between "
+                "one and node_budget"
+            )
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update(
+            {
+                "upper_cutoff_batches": 0,
+                "upper_cutoff_parents": 0,
+                "upper_cutoff_avoided_children": 0,
+                "upper_cutoff_first_node_count": -1,
+            }
+        )
     roots = backend.branched_root_state()
     if roots.shape != (1,) or roots.dtype != torch.int32 or roots.device != device:
         raise ValueError("branched_root_state must return device-local int32 [1]")
@@ -114,6 +177,24 @@ def sample_branched_tree(
     policy_node_reaches: list[Tensor] = []
     leaf_node_ids: list[Tensor] = []
     leaf_reaches: list[Tensor] = []
+    cutoff_active = False
+
+    def stop_if_cutoff_reached(frontier_nodes: int = 0) -> None:
+        if stop_cutoff is None or buffer.node_count < stop_cutoff:
+            return
+        family_queue_nodes = {
+            name: int(queue.host_count) for name, queue in queues.items()
+        }
+        raise BranchingCutoffReached(
+            node_count=buffer.node_count,
+            queued_nodes=sum(family_queue_nodes.values()),
+            frontier_nodes=frontier_nodes,
+            family_queue_nodes=family_queue_nodes,
+            completed_leaves=sum(int(nodes.numel()) for nodes in leaf_node_ids),
+            completed_decisions=sum(int(nodes.numel()) for nodes in policy_node_ids),
+            state_refs=buffer.state_ref[: buffer.node_count].detach().clone(),
+            owners=buffer.owner[: buffer.node_count].detach().clone(),
+        )
 
     def read_control(value: Tensor) -> tuple[int, ...]:
         if value.ndim != 1 or value.dtype != torch.int64:
@@ -142,9 +223,12 @@ def sample_branched_tree(
             )
 
     def offspring_for(nodes: Tensor) -> tuple[Tensor, int]:
+        nonlocal cutoff_active
         rows = nodes.to(torch.int64)
         states = buffer.state_ref[rows]
         beta = _validate_beta(backend.beta_fn(states), nodes.numel(), device)
+        if cutoff_active:
+            beta = torch.ones_like(beta)
         base = torch.floor(beta)
         fraction = beta - base
         paths = arena.gather_many(("path_key",), rows)["path_key"]
@@ -160,6 +244,21 @@ def sample_branched_tree(
             base + (logical_uniform(keys) < fraction).to(torch.float32)
         ).to(torch.int64)
         total = read_control(offspring.sum().reshape(1))[0]
+        if upper_cutoff is not None and (
+            cutoff_active or buffer.node_count + total >= upper_cutoff
+        ):
+            cutoff_active = True
+            proposed_total = total
+            offspring = torch.ones_like(offspring)
+            total = nodes.numel()
+            if diagnostics is not None:
+                diagnostics["upper_cutoff_batches"] += 1
+                diagnostics["upper_cutoff_parents"] += int(nodes.numel())
+                diagnostics["upper_cutoff_avoided_children"] += max(
+                    0, proposed_total - total
+                )
+                if diagnostics["upper_cutoff_first_node_count"] < 0:
+                    diagnostics["upper_cutoff_first_node_count"] = buffer.node_count
         if total <= 0:
             raise RuntimeError("branched intensity produced no child")
         buffer.require_child_capacity(total)
@@ -275,6 +374,7 @@ def sample_branched_tree(
         frontier = frontier.to(torch.int32)
         chance_steps = 0
         while frontier.numel():
+            stop_if_cutoff_reached(int(frontier.numel()))
             scheduler_step += 1
             rows = frontier.to(torch.int64)
             owners = buffer.owner[rows]
@@ -330,6 +430,7 @@ def sample_branched_tree(
     chance_close(root_nodes)
     progress_limit = node_budget * (int(backend.max_rollout_steps) + 2)
     while any(queue.host_count for queue in queues.values()):
+        stop_if_cutoff_reached()
         scheduler_step += 1
         if scheduler_step > progress_limit:
             raise RuntimeError("family-scheduled branched scheduler exceeded its progress bound")

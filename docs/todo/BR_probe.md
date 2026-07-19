@@ -13,3 +13,7 @@ We need to implement a modification of the training algorithm to train a BR prob
 - Technically, it's true that there always exists a deterministic BR probe (no need to have a mixing strategy). We might still want mixing output head to facilitate exploration. Maybe a compromise is to use less raise modes (maybe just 1 raising mode is enough).
 - Practically speaking, it will be difficult to "fully train" the BR probe to convergence. A good proxy for exploitability might be "how fast is the expected leak growing?"
 - We probably need to rollout P times more trajectories in the start to reach the same number of nodes to use in minibatches.
+
+
+## NEW REMARK
+- Seems like in branching mode, we just need to guarantee 1 tree per player seat. In heads-up that's easy: 1 tree = 1 exploiter seat = 1 GPU = 1 rank. For 6-max we might need two trees per rank and 3 active GPUs. Otherwise, I think the rest of the algorithm is modified in a very similar way to the sequential RB case.
