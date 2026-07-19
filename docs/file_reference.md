@@ -8,6 +8,8 @@
 - `pbg/benchmark.py`, `pbg/cli/benchmark.py` — three-mode profiling of the
   single production implementation.
 - `pbg/eval/arena.py` — offline duplicate-deal checkpoint evaluation.
+- `pbg/inference.py`, `pbg/inference_artifact.py` — stateful CPU-rules/MPS-model
+  serving and compact model-only artifacts.
 
 ## Generic core
 
@@ -95,6 +97,7 @@ lifecycle phases and must use its exact future Python object names.
 - `docs/core_algorithms.md` — implementation mapping for all three modes.
 - `docs/poker.md` — NLHE/evaluator/model details.
 - `docs/training_and_evaluation.md` — operational guide.
+- `docs/inference_on_mac.md` — Apple Silicon installation, export, and serving API.
 - `docs/audit/` — current readiness and reachability inventory only.
 
 ## Tests
@@ -112,6 +115,8 @@ lifecycle phases and must use its exact future Python object names.
   all-mode integration.
 - `test_p13b_integration.py`, `test_p13b_ddp.py` — runtime composition,
   training/resume, unequal distributed mass, and finite gradient reduction.
+- `test_inference_api.py` — artifact, stateful batch, folded CPU boundary, and
+  real MPS parity contracts.
 - `test_c09_*` through `test_c11_*` — corrected branching/value/loss laws.
 
 ## Archive

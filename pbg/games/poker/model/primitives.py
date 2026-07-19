@@ -316,7 +316,16 @@ class MHA(nn.Module):
 
         key_bias, key_mask = self._validate(q, kv, key_bias, key_mask)
         q_head, k_head, v_head = self._project(q, kv)
-        if q.device.type != "cuda":
+        if q.device.type == "mps" and self.attention_backend != "chunked_dense":
+            # MPS must not take the generic explicit path: postflop sequences
+            # make its fp32 [B,H,Nq,Nk] score/probability materialization both
+            # slow and prohibitively large. PyTorch's Metal SDPA accepts the
+            # same additive reach bias and keeps the whole neural forward on
+            # the MPS device.
+            attended = self._sdpa_biased_attention(
+                q_head, k_head, v_head, key_bias, key_mask
+            )
+        elif q.device.type != "cuda":
             attended, _ = self._explicit_attention(
                 q_head, k_head, v_head, key_bias, key_mask
             )

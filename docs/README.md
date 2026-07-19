@@ -20,6 +20,8 @@ Read the pages in this order:
 - [Training, evaluation, and configuration](training_and_evaluation.md) covers
   commands, presets, checkpoints, DDP, and evaluation. It is maintained as a
   separate operational guide.
+- [Poker inference on Apple Silicon](inference_on_mac.md) covers model-only
+  artifacts and the stateful CPU-rules/MPS-model serving API.
 
 Current readiness and the cleanup reachability inventory are indexed in
 [`audit/README.md`](audit/README.md). Superseded performance investigations and
