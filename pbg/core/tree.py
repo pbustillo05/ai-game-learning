@@ -75,49 +75,66 @@ class TreeBatch:
         if not bool(torch.isfinite(self.nu).all()) or bool((self.nu < 0).any()):
             raise ValueError("nu must be finite and nonnegative")
 
-        incoming = torch.zeros(n, dtype=torch.int64, device=self.parent.device)
-        for node in range(n):
-            start, stop = int(ptr[node]), int(ptr[node + 1])
-            leaf = start == stop
-            node_owner = int(self.owner[node])
-            if leaf:
-                if node_owner not in (TERMINAL, PRETERM, PROBE_FOLD):
-                    raise ValueError("every leaf must be TERMINAL, PRETERM, or PROBE_FOLD")
-            else:
-                if node_owner in (TERMINAL, PRETERM, PROBE_FOLD):
-                    raise ValueError("leaf-coded nodes cannot have children")
-                if not torch.isclose(
-                    self.nu[start:stop].sum(),
-                    torch.ones((), dtype=self.nu.dtype, device=self.nu.device),
-                    atol=1e-6,
-                    rtol=0.0,
-                ):
-                    raise ValueError("nu rows must sum to one")
-            for edge in range(start, stop):
-                child = int(self.child_node[edge])
-                if not 0 <= child < n:
-                    raise ValueError("child_node contains an invalid node id")
-                incoming[child] += 1
-                if int(self.parent[child]) != node:
-                    raise ValueError("child and parent arrays disagree")
-                if int(self.tree_id[child]) != int(self.tree_id[node]):
-                    raise ValueError("an edge cannot cross tree ids")
-                child_owner = int(self.owner[child])
-                expected_depth = self.depth_p[node].clone()
-                if 0 <= child_owner < p_max:
-                    expected_depth[child_owner] += 1
-                if not torch.equal(self.depth_p[child], expected_depth):
-                    raise ValueError("depth_p is inconsistent with the parent chain")
-                expected_player_depth = int(self.depth_player[node]) + int(
-                    0 <= child_owner < p_max
-                )
-                if int(self.depth_player[child]) != expected_player_depth:
-                    raise ValueError("depth_player is inconsistent with the parent chain")
-                expected_weight = self.path_weight[node] * self.nu[edge]
-                if not torch.isclose(
-                    self.path_weight[child], expected_weight, atol=1e-6, rtol=1e-6
-                ):
-                    raise ValueError("path_weight is inconsistent with edge nu")
+        # Validate all CSR rows and edges in a bounded number of tensor
+        # operations.  The former scalar loop read several CUDA values for
+        # every node and edge, which synchronized the host thousands of times
+        # for an otherwise device-resident rollout.
+        counts = ptr[1:] - ptr[:-1]
+        leaves = counts == 0
+        leaf_coded = (
+            (self.owner == TERMINAL)
+            | (self.owner == PRETERM)
+            | (self.owner == PROBE_FOLD)
+        )
+        if bool((leaves & ~leaf_coded).any()):
+            raise ValueError("every leaf must be TERMINAL, PRETERM, or PROBE_FOLD")
+        if bool((~leaves & leaf_coded).any()):
+            raise ValueError("leaf-coded nodes cannot have children")
+
+        edge_parent = torch.repeat_interleave(
+            torch.arange(n, dtype=torch.int64, device=self.parent.device), counts
+        )
+        row_nu = torch.zeros(n, dtype=self.nu.dtype, device=self.nu.device)
+        row_nu.index_add_(0, edge_parent, self.nu)
+        if not torch.allclose(
+            row_nu[~leaves],
+            torch.ones_like(row_nu[~leaves]),
+            atol=1e-6,
+            rtol=0.0,
+        ):
+            raise ValueError("nu rows must sum to one")
+
+        child = self.child_node.to(torch.int64)
+        if bool(((child < 0) | (child >= n)).any()):
+            raise ValueError("child_node contains an invalid node id")
+        if not torch.equal(self.parent[child].to(torch.int64), edge_parent):
+            raise ValueError("child and parent arrays disagree")
+        if not torch.equal(self.tree_id[child], self.tree_id[edge_parent]):
+            raise ValueError("an edge cannot cross tree ids")
+
+        child_owner = self.owner[child].to(torch.int64)
+        child_is_player = (child_owner >= 0) & (child_owner < p_max)
+        expected_depth = self.depth_p[edge_parent].clone()
+        expected_depth.scatter_add_(
+            1,
+            child_owner.clamp(0, p_max - 1)[:, None],
+            child_is_player.to(expected_depth.dtype)[:, None],
+        )
+        if not torch.equal(self.depth_p[child], expected_depth):
+            raise ValueError("depth_p is inconsistent with the parent chain")
+        expected_player_depth = (
+            self.depth_player[edge_parent]
+            + child_is_player.to(self.depth_player.dtype)
+        )
+        if not torch.equal(self.depth_player[child], expected_player_depth):
+            raise ValueError("depth_player is inconsistent with the parent chain")
+        expected_weight = self.path_weight[edge_parent] * self.nu
+        if not torch.allclose(
+            self.path_weight[child], expected_weight, atol=1e-6, rtol=1e-6
+        ):
+            raise ValueError("path_weight is inconsistent with edge nu")
+
+        incoming = torch.bincount(child, minlength=n)
 
         roots = self.parent == -1
         if not bool(roots.any()) or bool(((self.parent < 0) & ~roots).any()):
