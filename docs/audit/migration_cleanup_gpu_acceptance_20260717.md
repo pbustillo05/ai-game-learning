@@ -1,5 +1,10 @@
 # Migration cleanup and GPU acceptance — 2026-07-17
 
+> Historical evidence: this acceptance predates the 2026-07-21 sole-path
+> storage restoration. Its rollout ownership and phase-memory claims describe
+> the retired compatibility pipeline; use the restoration acceptance index for
+> current readiness.
+
 ## Verdict and revision
 
 The memory-ownership and correctness migration is accepted. Long-run release

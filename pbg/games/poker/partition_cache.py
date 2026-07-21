@@ -12,16 +12,64 @@ from pbg.games.poker.folded import PartitionSummaryBatch
 _FOLDER_FIELDS = frozenset(
     {
         "folder_log_mass",
-        "folder_single_card_log_ratio",
-        "folder_card_marginal",
         "folder_card_mass",
-        "folder_delta",
-        "folder_output_valid",
         "folder_mask",
         "folder_line_meta",
         "folder_seat",
     }
 )
+
+
+def poker_folded_summary_schema(
+    *,
+    n_cards: int,
+    beta_rank: int,
+    max_folders: int,
+    line_dim: int = 8,
+    include_anchor: bool = True,
+    name: str = "poker_folded_summary",
+) -> TensorSchema:
+    """Return the sole schema for sparse evaluator summary anchors."""
+
+    if min(n_cards, beta_rank, max_folders, line_dim) <= 0:
+        raise ValueError("folded-summary schema dimensions must be positive")
+    hands = n_cards * (n_cards - 1) // 2
+    fields = [TensorFieldSchema("anchor", torch.int64, alignment=8)] if include_anchor else []
+    fields.extend(
+        (
+            TensorFieldSchema("hand_log_ratio", torch.float32, (hands,), alignment=16),
+            TensorFieldSchema("beta_eigenvalue", torch.float32, (beta_rank,), alignment=16),
+            TensorFieldSchema(
+                "beta_eigenvector", torch.float32, (n_cards, beta_rank), alignment=16
+            ),
+            TensorFieldSchema(
+                "folder_log_mass", torch.float32, (max_folders,), alignment=16
+            ),
+            TensorFieldSchema(
+                "folder_card_mass",
+                torch.float32,
+                (max_folders, n_cards),
+                alignment=16,
+            ),
+            TensorFieldSchema("tight_cluster_scalar", torch.float32, alignment=4),
+            TensorFieldSchema("folder_mask", torch.bool, (max_folders,)),
+            TensorFieldSchema(
+                "folder_line_meta",
+                torch.float32,
+                (max_folders, line_dim),
+                alignment=16,
+            ),
+            TensorFieldSchema(
+                "folder_seat", torch.int64, (max_folders,), alignment=16
+            ),
+        )
+    )
+    return TensorSchema(
+        name,
+        tuple(fields),
+        chunk_header_bytes=64 if include_anchor else 0,
+        allocator_slack_bytes=64 if include_anchor else 0,
+    )
 
 
 class DevicePartitionSummaryCache:
@@ -38,6 +86,9 @@ class DevicePartitionSummaryCache:
         max_folders: int,
         device: torch.device | str,
         *,
+        n_cards: int,
+        beta_rank: int,
+        line_dim: int = 8,
         page_rows: int = 64,
     ) -> None:
         if max_folders < 0:
@@ -45,6 +96,16 @@ class DevicePartitionSummaryCache:
         self.max_folders = int(max_folders)
         self.device = torch.device(device)
         self.page_rows = int(page_rows)
+        self.schema = (
+            None
+            if self.max_folders == 0
+            else poker_folded_summary_schema(
+                n_cards=n_cards,
+                beta_rank=beta_rank,
+                max_folders=self.max_folders,
+                line_dim=line_dim,
+            )
+        )
         self.arena: PagedTensorArena | None = None
         self._field_names: frozenset[str] | None = None
         self._metadata: dict[str, object] = {}
@@ -94,24 +155,26 @@ class DevicePartitionSummaryCache:
                 )
             assert self.arena is not None
             return self.arena
-        fields = [TensorFieldSchema("anchor", torch.int64, alignment=8)]
+        if self.max_folders == 0:
+            raise RuntimeError("an all-live game cannot allocate folded summaries")
+        assert self.schema is not None
+        expected = {field.name: field for field in self.schema.fields if field.name != "anchor"}
+        if names != set(expected):
+            raise ValueError("partition summary fields do not match the declared schema")
         for name, value in computed.fields.items():
-            if value.ndim < 1 or value.device != self.device:
-                raise ValueError(f"partition field {name} has invalid storage geometry")
-            shape = (
-                (self.max_folders, *value.shape[2:])
+            spec = expected[name]
+            shape_ok = (
+                value.ndim >= 2
+                and value.shape[1] <= self.max_folders
+                and tuple(value.shape[2:]) == spec.shape[1:]
                 if name in _FOLDER_FIELDS
-                else tuple(value.shape[1:])
+                else tuple(value.shape[1:]) == spec.shape
             )
-            fields.append(TensorFieldSchema(name, value.dtype, tuple(shape)))
+            if not shape_ok or value.dtype != spec.dtype or value.device != self.device:
+                raise ValueError(f"partition field {name} violates the declared schema")
         self._field_names = names
         self.arena = PagedTensorArena(
-            TensorSchema(
-                "poker_folded_summary",
-                tuple(fields),
-                chunk_header_bytes=64,
-                allocator_slack_bytes=64,
-            ),
+            self.schema,
             self.page_rows,
             self.device,
             label="poker_folded_summary",
@@ -245,16 +308,19 @@ class DevicePartitionSummaryCache:
     ) -> int:
         """Return schema payload bytes for ``capacity`` realized sparse rows.
 
-        This pure estimator remains for the transitional memory planner.  The
-        cache itself admits pages only as distinct anchors are materialized.
+        This is the exact sealed-pool estimator. The mutable cache itself
+        admits pages only as distinct anchors are materialized.
         """
 
         if min(capacity, n_cards, beta_rank, max_folders, line_dim) < 0:
             raise ValueError("partition cache dimensions must be nonnegative")
-        d, r, f = n_cards, beta_rank, max_folders
-        h = d * (d - 1) // 2
-        float_values = h + r + d * r + 1
-        float_values += f + f * d + f * line_dim
-        bool_values = f  # folder mask; there is no capacity-wide validity map
-        int64_values = f
-        return capacity * (4 * float_values + bool_values + 8 * int64_values)
+        if capacity == 0 or max_folders == 0:
+            return 0
+        schema = poker_folded_summary_schema(
+            n_cards=n_cards,
+            beta_rank=beta_rank,
+            max_folders=max_folders,
+            line_dim=line_dim,
+            include_anchor=False,
+        )
+        return schema.capacity_bytes(capacity, chunks=1)

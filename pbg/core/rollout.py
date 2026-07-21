@@ -892,7 +892,7 @@ def _sample_trees_sequential(
             "node_id", torch.arange(leaf_rows.rows, device=device)
         )
         leaf_order = torch.argsort(source_nodes.to(torch.int64), stable=True)
-        leaf_block, _ = leaf_rows.seal(row_order=leaf_order)
+        leaf_block, leaf_metrics = leaf_rows.seal(row_order=leaf_order)
         reach_nodes = leaf_block["node_id"].to(torch.int32)
         retained_reach = leaf_block["log_reach"].to(torch.float32)
         leaf_payload = {
@@ -901,10 +901,17 @@ def _sample_trees_sequential(
             if name not in {"node_id", "log_reach"}
         } or None
     else:
+        leaf_metrics = None
         reach_nodes = torch.empty(0, dtype=torch.int32, device=device)
         retained_reach = torch.empty((0, p_max, x_max), dtype=torch.float32, device=device)
         leaf_payload = None
-    reach_cache = StoppedLeafRows("sealed", retained_reach, reach_nodes, leaf_payload)
+    reach_cache = StoppedLeafRows(
+        "sealed",
+        retained_reach,
+        reach_nodes,
+        leaf_payload,
+        {} if leaf_metrics is None else {"leaf_rows": leaf_metrics},
+    )
     verify_recycling = getattr(backend, "verify_state_recycling_boundary", None)
     if callable(verify_recycling):
         verify_recycling()
@@ -914,11 +921,12 @@ def _sample_trees_sequential(
             "node_id", torch.arange(policy_rows.rows, device=device)
         )
         order = torch.argsort(source_nodes.to(torch.int64), stable=True)
-        policy_block, _ = policy_rows.seal(row_order=order)
+        policy_block, policy_metrics = policy_rows.seal(row_order=order)
         node_ids = policy_block["node_id"].to(torch.int32)
         old_logp = policy_block["old_logp"].to(torch.float32)
         old_v = policy_block["old_v"].to(torch.float32)
     else:
+        policy_metrics = None
         node_ids = torch.empty(0, dtype=torch.int32, device=device)
         old_logp = torch.empty((0, x_max), dtype=torch.float32, device=device)
         old_v = torch.empty((0, x_max), dtype=torch.float32, device=device)
@@ -937,6 +945,10 @@ def _sample_trees_sequential(
         old_logp,
         old_v,
         decision_inputs,
+        seal_metrics={
+            **({} if policy_metrics is None else {"policy_rows": policy_metrics}),
+            **decision_inputs.seal_metrics,
+        },
     )
     if probe_enabled:
         assert probe_seats is not None

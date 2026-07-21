@@ -26,29 +26,25 @@ from pbg.games.poker.rollout_backend import PokerRolloutBackend
 class _DevicePartition:
     """Device-only evaluator stand-in for sync-debug policy construction."""
 
+    beta_rank = 4
+
     @staticmethod
     def summarize(*, board_cards, live_range_weights, folded):
-        del live_range_weights
         batch = board_cards.shape[0]
-        folders = folded.reach_weights.shape[1]
+        folders = folded.folder_mask.shape[1]
         device = board_cards.device
-        cards = 52
+        hands = live_range_weights.shape[-1]
+        cards = int((1 + (1 + 8 * hands) ** 0.5) / 2)
         rank = 4
         zeros = lambda *shape: torch.zeros(shape, dtype=torch.float32, device=device)
         return PartitionSummaryBatch(
             fields={
-                "base_log_z": zeros(batch),
-                "single_card_log_ratio": zeros(batch, cards),
-                "pair_card_log_ratio": zeros(batch, cards, cards),
+                "hand_log_ratio": zeros(batch, hands),
                 "beta_eigenvalue": zeros(batch, rank),
                 "beta_eigenvector": zeros(batch, cards, rank),
                 "folder_log_mass": zeros(batch, folders),
-                "folder_single_card_log_ratio": zeros(batch, folders, cards),
-                "folder_card_marginal": zeros(batch, folders, cards),
-                "folder_delta": zeros(batch, folders, cards),
+                "folder_card_mass": zeros(batch, folders, cards),
                 "tight_cluster_scalar": zeros(batch),
-                "folder_output_valid": folded.folder_mask.clone(),
-                "output_valid": torch.ones(batch, dtype=torch.bool, device=device),
                 "folder_mask": folded.folder_mask,
                 "folder_line_meta": folded.line_meta,
                 "folder_seat": folded.seat_ids,
@@ -114,8 +110,8 @@ def test_full_preflop_postflop_policy_inputs_request_no_host_sync() -> None:
     cfg = PokerConfig(n_players=3, stack_bb=8.0)
     backend = PokerRolloutBackend(
         cfg,
-        16,
         device,
+        storage_page_rows=16,
         max_rollout_steps=32,
         partition_adapter=_DevicePartition(),
     )

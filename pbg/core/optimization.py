@@ -111,26 +111,17 @@ class OptimizerStepResult:
 
 
 def sync_scaled_gradients(
-    model: nn.Module,
     world: int,
     *,
     metrics: Any | None = None,
-    flat_buffer: FlatGradientBuffer | None = None,
+    flat_buffer: FlatGradientBuffer,
 ) -> bool:
     """SUM the owning fp32 gradient buffer and return the common finite decision.
 
-    New callers must bind ``flat_buffer`` before backward.  The compatibility
-    fallback is intentionally strict: it only accepts gradients that already
-    alias a cached direct buffer and never copies gradients into one.
+    Callers bind ``flat_buffer`` before backward; no copy-flatten fallback is
+    part of the learner boundary.
     """
 
-    source = model.module if hasattr(model, "module") else model
-    if flat_buffer is None:
-        flat_buffer = getattr(source, "_pbg_direct_flat_gradient_buffer", None)
-        if flat_buffer is None:
-            raise RuntimeError(
-                "a FlatGradientBuffer must be allocated and bound before backward"
-            )
     if not isinstance(flat_buffer, FlatGradientBuffer):
         raise TypeError("flat_buffer must be a FlatGradientBuffer")
     flat_buffer.assert_aliasing()

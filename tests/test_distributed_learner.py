@@ -145,6 +145,9 @@ def _fixture(mode: str, *, rows: int = 3):
     else:
         common.pop("event")
         common.pop("old_log_prob")
+        common["log_weight"] = torch.zeros(rows, dtype=torch.float64)
+        common["nominal_child_count"] = torch.tensor([2, 1, 2], dtype=torch.int32)[:rows]
+        common["executed_child_count"] = torch.tensor([2, 1, 2], dtype=torch.int32)[:rows]
         common["value_hat"] = torch.tensor(
             [[0.7, 0.0, -0.2, 0.1], [0.3, 0.2, 0.0, -0.1], [0.2, 0.4, 0.1, 0.0]]
         )[:rows]
@@ -193,6 +196,24 @@ def _loss_cfg(**updates):
     )
     values.update(updates)
     return SimpleNamespace(**values)
+
+
+def test_training_storage_rejects_transient_branched_controller_predictions() -> None:
+    storage, _, partition = _fixture("branched_rb")
+    columns = dict(partition.columns)
+    columns["frozen_trace_variance"] = torch.zeros(partition.inputs.rows)
+    bad_partition = TrainingPartition(
+        partition.partition_id,
+        partition.inputs,
+        columns,
+        partition.action_columns,
+    )
+    with pytest.raises(ValueError, match="declared schemas"):
+        TrainingStorage(
+            storage.mode,
+            {partition.partition_id: bad_partition},
+            storage.sampling,
+        )
 
 
 def test_log_mass_empty_strata_and_log_domain_stability() -> None:
@@ -355,7 +376,7 @@ def test_flat_gradient_aliases_one_buffer_and_has_no_copy_flatten() -> None:
     model(torch.ones(4, 2)).sum().backward()
     flat.assert_aliasing()
     assert all(parameter.grad is not None for parameter in model.parameters())
-    assert sync_scaled_gradients(model, 1, flat_buffer=flat)
+    assert sync_scaled_gradients(1, flat_buffer=flat)
     assert flat.nbytes == sum(parameter.numel() * 4 for parameter in model.parameters())
 
 
@@ -573,7 +594,9 @@ def test_tiny_cuda_bounded_update_cache_and_recompute(mode) -> None:
     )
 
 
-def _two_cuda_learner_worker(rank: int, world: int, port: int, output_dir: str) -> None:
+def _two_cuda_learner_worker(
+    rank: int, world: int, port: int, output_dir: str, mode: str
+) -> None:
     os.environ.update(
         {
             "MASTER_ADDR": "127.0.0.1",
@@ -588,7 +611,7 @@ def _two_cuda_learner_worker(rank: int, world: int, port: int, output_dir: str) 
     dist.init_process_group("nccl", rank=rank, world_size=world)
     try:
         rows = 1 if rank == 0 else 3
-        storage, specs, _ = _fixture("normal", rows=rows)
+        storage, specs, _ = _fixture(mode, rows=rows)
         storage = _storage_to(storage, torch.device("cuda", rank))
         # Constant rows make each sampled stratum mean exact despite arbitrary B.
         block = storage.partitions[0]
@@ -597,7 +620,11 @@ def _two_cuda_learner_worker(rank: int, world: int, port: int, output_dir: str) 
         block.columns["old_value"].zero_()
         block.columns["old_log_prob"].fill_(-math.log(2.0))
         block.columns["event"].zero_()
-        block.columns["realized_type"].zero_()
+        if mode == "normal":
+            block.columns["realized_type"].zero_()
+        else:
+            assert storage.posterior_pool is not None
+            storage.posterior_pool.posterior.fill_(0.25)
         model = _Model(0.0).to(rank)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
         learner = DistributedFixedRolloutUpdate(
@@ -618,7 +645,7 @@ def _two_cuda_learner_worker(rank: int, world: int, port: int, output_dir: str) 
             torch.Generator(device=torch.device("cuda", rank)).manual_seed(20 + rank),
             grad_clip=100.0,
         )
-        Path(output_dir, f"learner_rank_{rank}.json").write_text(
+        Path(output_dir, f"learner_{mode}_rank_{rank}.json").write_text(
             json.dumps(
                 {
                     "weight": float(model.weight.detach()),
@@ -633,18 +660,19 @@ def _two_cuda_learner_worker(rank: int, world: int, port: int, output_dir: str) 
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two CUDA GPUs unavailable")
-def test_two_cuda_unequal_strata_exact_sum(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ("normal", "sequential_rb"))
+def test_two_cuda_unequal_strata_exact_sum(tmp_path: Path, mode: str) -> None:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     torch.multiprocessing.spawn(
         _two_cuda_learner_worker,
-        args=(2, port, str(tmp_path)),
+        args=(2, port, str(tmp_path), mode),
         nprocs=2,
         join=True,
     )
     records = [
-        json.loads((tmp_path / f"learner_rank_{rank}.json").read_text())
+        json.loads((tmp_path / f"learner_{mode}_rank_{rank}.json").read_text())
         for rank in range(2)
     ]
     assert records[0]["weight"] == pytest.approx(records[1]["weight"], abs=0)

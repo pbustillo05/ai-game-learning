@@ -1,5 +1,10 @@
 # Policy-conditioned CUDA memory control — implementation audit
 
+> Historical design evidence: the policy-conditioned capacity forecaster and
+> compatibility owners discussed below were retired on 2026-07-21. Current
+> production uses schema-derived four-phase byte planning and realized page
+> observations.
+
 ## Accounting identity
 
 At a synchronized boundary the runtime records

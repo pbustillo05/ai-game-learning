@@ -913,7 +913,7 @@ def _sample_branched_tree_impl(
             "node_id", torch.arange(leaf_rows.rows, device=device)
         )
         leaf_order = torch.argsort(source_nodes.to(torch.int64), stable=True)
-        leaf_block, _ = leaf_rows.seal(row_order=leaf_order)
+        leaf_block, leaf_metrics = leaf_rows.seal(row_order=leaf_order)
         reach_nodes = leaf_block["node_id"].to(torch.int32)
         retained_leaf_reach = leaf_block["log_reach"].to(torch.float32)
         leaf_payload = {
@@ -922,13 +922,18 @@ def _sample_branched_tree_impl(
             if name not in {"node_id", "log_reach"}
         } or None
     else:
+        leaf_metrics = None
         reach_nodes = torch.empty(0, dtype=torch.int32, device=device)
         retained_leaf_reach = torch.empty(
             (0, p_max, x_max), dtype=torch.float32, device=device
         )
         leaf_payload = None
     reach_cache = StoppedLeafRows(
-        "sealed", retained_leaf_reach, reach_nodes, leaf_payload
+        "sealed",
+        retained_leaf_reach,
+        reach_nodes,
+        leaf_payload,
+        {} if leaf_metrics is None else {"leaf_rows": leaf_metrics},
     )
     verify_recycling = getattr(backend, "verify_state_recycling_boundary", None)
     if callable(verify_recycling):
@@ -954,7 +959,7 @@ def _sample_branched_tree_impl(
             dtype=torch.float32,
             device=device,
         )
-        edge_block, _ = policy_edge_rows.seal()
+        edge_block, edge_metrics = policy_edge_rows.seal()
         edge_ids = edge_block["edge_id"].to(torch.int64)
         edge_logp = edge_block["old_logp"].to(torch.float32)
         parents = buffer.edge_parent[edge_ids].to(torch.int64)
@@ -978,13 +983,14 @@ def _sample_branched_tree_impl(
             "node_id", torch.arange(policy_node_rows.rows, device=device)
         ).to(torch.int32)
         order = torch.argsort(cached_nodes.to(torch.int64))
-        node_block, _ = policy_node_rows.seal(row_order=order)
+        node_block, node_metrics = policy_node_rows.seal(row_order=order)
         if not torch.equal(cached_nodes[order], decision_nodes):
             raise RuntimeError("family-scheduled branched rollout omitted a decision cache row")
         old_v = node_block["old_v"].to(torch.float32)
         old_t = node_block.columns.get("old_t")
         old_c = node_block.columns.get("old_c")
     else:
+        edge_metrics = node_metrics = None
         action_ptr = torch.zeros(1, dtype=torch.int32, device=device)
         ordered_event = torch.empty(0, dtype=torch.int32, device=device)
         logp_action = torch.empty((0, x_max), dtype=torch.float32, device=device)
@@ -996,6 +1002,11 @@ def _sample_branched_tree_impl(
     frozen = RolloutDecisionRows(
         decision_nodes.to(torch.int32), action_ptr, ordered_event, logp_action,
         old_v, decision_inputs, old_t, old_c,
+        {
+            **({} if edge_metrics is None else {"policy_action_rows": edge_metrics}),
+            **({} if node_metrics is None else {"policy_decision_rows": node_metrics}),
+            **decision_inputs.seal_metrics,
+        },
     )
     buffer.release()
     control_arena.release()

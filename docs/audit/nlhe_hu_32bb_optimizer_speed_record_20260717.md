@@ -1,5 +1,9 @@
 # HU 32 bb optimizer speed record — 2026-07-17
 
+> Historical performance evidence: this run used the pre-restoration rollout
+> data plane. It remains a record of the learner optimization work, not current
+> storage-lifecycle acceptance or an equal-semantics throughput baseline.
+
 ## Outcome
 
 The full-deck heads-up 32 bb sequential-RB production geometry now completes

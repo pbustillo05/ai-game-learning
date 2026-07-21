@@ -1,9 +1,9 @@
-"""Legacy rollout trees, sealed leaf rows, and decision compatibility views."""
+"""Scheduler topology plus exact sealed leaf and decision rows."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Iterable
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 import torch
@@ -14,6 +14,7 @@ from pbg.core.storage import (
     ByteAccountant,
     PagedTensorArena,
     PagedTensorColumn,
+    SealMetrics,
     TensorFieldSchema,
     TensorSchema,
     admit_arena_growth,
@@ -41,7 +42,7 @@ class SampledTree:
     state_ref: Tensor
     path_weight: Tensor
     # Nominal randomized-rounded offspring and frozen rollout controller
-    # quantities. They are absent on sequential/legacy hand-built trees.
+    # quantities. They are absent on sequential or manually built test trees.
     nominal_child_count: Tensor | None = None
     branching_beta: Tensor | None = None
     # Root-refill metadata. The protected prefix of root children and nodes
@@ -691,6 +692,7 @@ class RolloutDecisionRows:
     decision_inputs: Any | None = None  # zero-copy-compatible natural input owner
     old_t: Tensor | None = None  # float32 [Nd]
     old_c: Tensor | None = None  # float32 [Nd]
+    seal_metrics: Mapping[str, SealMetrics] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.node_ids.ndim != 1 or self.node_ids.dtype != torch.int32:
@@ -730,6 +732,7 @@ class StoppedLeafRows:
     log_r: Tensor
     node_index: Tensor
     payload: dict[str, Tensor] | None = None
+    seal_metrics: Mapping[str, SealMetrics] = field(default_factory=dict)
 
     def rows_for(
         self,

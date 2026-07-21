@@ -39,8 +39,8 @@ finite `default >= 1`. It must also set `rollout.branching_mode` to `fixed` or
 `dynamic`, enable `model.use_branching_heads`, and use positive `loss.c_t` and
 `loss.c_c`. Fixed mode follows the beta map for the whole run. Dynamic mode
 requires `rollout.adaptive_kkt`, follows the beta map during warmup, and enables
-T/C-driven KKT rollout control only afterward. The legacy
-`adaptive_kkt.enabled` switch is rejected.
+T/C-driven KKT rollout control only afterward. The removed
+`adaptive_kkt.enabled` switch is rejected rather than interpreted.
 
 Optional `rollout.branching_min_nodes` must be greater than one. It enables
 protected-cohort root refill: a public tree below the

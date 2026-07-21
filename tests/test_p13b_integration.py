@@ -230,17 +230,25 @@ def test_iteration_seals_the_sole_training_owner_and_releases_poker_pages(
     }.intersection(vars(data))
     assert bundle.rollout_backend.states.arena.allocated_capacity_bytes == 0
     assert bundle.rollout_backend.partition_summary_cache.allocated_capacity_bytes == 0
-    for partition in data.storage.partitions.values():
+    for partition_id, partition in data.storage.partitions.items():
         assert "state_ref" not in partition.inputs.columns
+        expected_model_width = 169 if partition_id == 0 else 1326
+        assert partition.inputs["range_weights"].shape[-1] == expected_model_width
+        if mode != "normal":
+            assert partition.columns["old_value"].shape[-1] == expected_model_width
+            target_name = "lambda_return" if mode == "rao_blackwell" else "value_hat"
+            assert partition.columns[target_name].shape[-1] == 1326
     if mode == "rao_blackwell":
         pool = data.storage.posterior_pool
         assert pool is not None
+        assert pool.posterior.shape[-1] == 1326
         pairs = torch.stack((pool.trajectory, pool.player), 1)
         assert pairs.unique(dim=0).shape[0] == pairs.shape[0]
     elif mode == "branched_rao_blackwell":
         assert all(
             partition.action_columns is not None
             and "action_ptr" in partition.action_columns
+            and partition.action_columns["advantage_hat"].shape[-1] == 1326
             for partition in data.storage.partitions.values()
         )
 

@@ -62,10 +62,10 @@ def test_four_phase_memory_plan_is_schema_derived_without_padded_action_owner() 
         max_rollout_steps=42,
         states=SimpleNamespace(storage=torch.empty(17, dtype=torch.uint8)),
         partition_summary_cache=SimpleNamespace(
-            valid=torch.empty(43, dtype=torch.bool)
+            arena=torch.empty(43, dtype=torch.bool)
         ),
         training_partition_specs=lambda: SimpleNamespace(
-            specs=(SimpleNamespace(input_schema=input_schema),)
+            specs=(SimpleNamespace(input_schema=input_schema, model_width=1326),)
         ),
     )
     bundle = GameBundle(
@@ -96,6 +96,12 @@ def test_four_phase_memory_plan_is_schema_derived_without_padded_action_owner() 
     assert plan["memory_plan_seal_phase_bytes"] > plan["memory_plan_rollout_phase_bytes"]
     assert plan["memory_plan_training_storage_bytes"] > 0
     assert plan["memory_plan_sealed_rollout_bytes"] > 0
+    assert plan["memory_plan_target_variable_bytes"] == (
+        plan["memory_plan_sealed_rollout_bytes"]
+        + plan["memory_plan_target_destination_bytes"]
+        + plan["memory_plan_completion_workspace_bytes"]
+        + plan["memory_plan_frontier_workspace_bytes"]
+    )
     assert plan["memory_plan_structural_peak_bytes"] == max(
         plan[f"memory_plan_{phase}_phase_bytes"]
         for phase in ("rollout", "seal", "target", "optimization")
@@ -213,13 +219,13 @@ def test_flat_gradient_sum_zero_fills_absent_parameters_and_reuses_buffer() -> N
     parameters = list(model.parameters())
     parameters[0].grad.copy_(torch.tensor([[2.0, -3.0]]))
 
-    assert sync_scaled_gradients(model, 1, flat_buffer=flat)
+    assert sync_scaled_gradients(1, flat_buffer=flat)
     assert torch.equal(parameters[0].grad, torch.tensor([[2.0, -3.0]]))
     assert torch.equal(parameters[1].grad, torch.zeros_like(parameters[1]))
     first = flat.flat
 
     parameters[0].grad.fill_(float("inf"))
-    assert not sync_scaled_gradients(model, 1, flat_buffer=flat)
+    assert not sync_scaled_gradients(1, flat_buffer=flat)
     assert first is flat.flat
 
 
@@ -231,7 +237,7 @@ def test_nonfinite_common_decision_skips_disabled_scaler_optimizer_step() -> Non
     flat = FlatGradientBuffer(model)
     flat.zero_()
     parameter.grad.fill_(float("inf"))
-    common_finite = sync_scaled_gradients(model, 1, flat_buffer=flat)
+    common_finite = sync_scaled_gradients(1, flat_buffer=flat)
 
     result = finite_gated_optimizer_step(
         model,

@@ -64,6 +64,15 @@ from pbg.core.storage import (
     TrainingPartition,
     TrainingStorage,
     paged_capacity_bytes,
+    rollout_action_source_schema,
+    rollout_action_schema,
+    rollout_decision_schema,
+    rollout_leaf_schema,
+    rollout_policy_source_schema,
+    sequential_posterior_schema,
+    stopped_leaf_source_schema,
+    target_action_schema,
+    target_decision_schema,
     topology_schema,
 )
 from pbg.core.tree import PagedTreeSource
@@ -302,6 +311,11 @@ def _add_distributed_metric_summaries(
         "completion_samples",
         "minibatches",
         "optimizer_steps",
+        "safeguard_batches",
+        "safeguard_suppressed_children",
+        "root_refill_count",
+        "root_refill_added_nodes",
+        "counterfactual_tree_size",
     )
     present = torch.tensor(
         [name in metrics for name in names], dtype=torch.float64, device=device
@@ -379,7 +393,7 @@ def _synchronize_memory_control_metrics(
         "trajectory_length_le_32",
         "trajectory_length_le_64",
     ]
-    for phase in ("snapshot", "rollout", "completion", "backward", "compaction", "optimization"):
+    for phase in ("snapshot", "rollout", "completion", "backward", "seal", "optimization"):
         keys.extend(
             (
                 f"phase_{phase}_peak_allocated_bytes",
@@ -563,109 +577,59 @@ def _analytical_memory_plan(
         )
         for schema in input_schemas
     )
-
-    rb = cfg.training.mode != "normal"
-    decision_fields = [
-        TensorFieldSchema("owner", torch.int32, alignment=4),
-        TensorFieldSchema(
-            "old_value", torch.float32, (() if not rb else (exact_width,)), alignment=16
-        ),
-        TensorFieldSchema("legal_event_ids", torch.int32, (events,), alignment=16),
-        TensorFieldSchema("legal_event_mask", torch.bool, (events,)),
-    ]
-    if sequential:
-        decision_fields.extend(
-            (
-                TensorFieldSchema("event", torch.int32, alignment=4),
-                TensorFieldSchema(
-                    "old_log_prob",
-                    torch.float32,
-                    (() if not rb else (exact_width,)),
-                    alignment=16,
-                ),
-            )
+    pool_factory = getattr(backend, "training_input_pool_schemas", None)
+    pool_schemas = (
+        ()
+        if not callable(pool_factory)
+        else tuple(
+            pair
+            for pools in pool_factory().values()
+            for pair in pools.values()
         )
-        if not rb:
-            decision_fields.append(
-                TensorFieldSchema("realized_type", torch.int32, alignment=4)
-            )
-    else:
-        decision_fields.extend(
-            (
-                TensorFieldSchema("log_weight", torch.float64, alignment=8),
-                TensorFieldSchema("nominal_child_count", torch.int32, alignment=4),
-                TensorFieldSchema("executed_child_count", torch.int32, alignment=4),
-                TensorFieldSchema("frozen_trace_variance", torch.float32, alignment=4),
-                TensorFieldSchema("frozen_cost", torch.float32, alignment=4),
-            )
-        )
-    decision_schema = TensorSchema("sealed_decision_rows", tuple(decision_fields))
-    action_schema = TensorSchema(
-        "sealed_action_rows",
-        (
-            TensorFieldSchema("event", torch.int32, alignment=4),
-            TensorFieldSchema("old_log_prob", torch.float32, (exact_width,), alignment=16),
-        ),
     )
-    source_decision_schema = TensorSchema(
-        "rollout_policy_rows",
-        (
-            TensorFieldSchema("node_id", torch.int32, alignment=4),
-            *(
-                (
-                    TensorFieldSchema(
-                        "old_logp", torch.float32, (exact_width,), alignment=16
-                    ),
-                    TensorFieldSchema(
-                        "old_v", torch.float32, (exact_width,), alignment=16
-                    ),
-                )
-                if sequential
-                else (
-                    TensorFieldSchema(
-                        "old_v", torch.float32, (exact_width,), alignment=16
-                    ),
-                    TensorFieldSchema("old_t", torch.float32, alignment=4),
-                    TensorFieldSchema("old_c", torch.float32, alignment=4),
-                )
-            ),
-        ),
+    input_pool_source = max(
+        (paged(source, decision_rows) for source, _ in pool_schemas),
+        default=0,
+    )
+    input_pool_destination = max(
+        (exact(destination, decision_rows) for _, destination in pool_schemas),
+        default=0,
+    )
+    input_source += input_pool_source
+    input_destination += input_pool_destination
+
+    widest_model_width = max(int(spec.model_width) for spec in partition_specs)
+    decision_schema = rollout_decision_schema(
+        mode,
+        model_width=widest_model_width,
+        event_count=events,
+        dynamic_heads=True,
+    )
+    action_schema = rollout_action_schema(widest_model_width)
+    source_action_schema = rollout_action_source_schema(exact_width)
+    source_decision_schema = rollout_policy_source_schema(
+        mode, exact_width=exact_width, dynamic_heads=True
     )
     decision_source = paged(source_decision_schema, decision_rows)
     decision_destination = exact(decision_schema, decision_rows)
-    action_source = 0 if sequential else paged(action_schema, action_rows)
+    training_decision_base = exact(
+        rollout_decision_schema(
+            mode,
+            model_width=widest_model_width,
+            event_count=events,
+            dynamic_heads=False,
+        ),
+        decision_rows,
+    )
+    action_source = 0 if sequential else paged(source_action_schema, action_rows)
     action_destination = 0 if sequential else exact(action_schema, action_rows)
 
-    if cfg.training.mode == "normal":
-        source_leaf_fields = (
-            TensorFieldSchema("node_id", torch.int32, alignment=4),
-            TensorFieldSchema("log_reach", torch.float32, (players, exact_width), alignment=16),
-            TensorFieldSchema("reward", torch.float32, (players,), alignment=16),
-        )
-        destination_leaf_fields = (
-            TensorFieldSchema("reward", torch.float32, (players,), alignment=16),
-        )
-    else:
-        completion_fields = (
-            TensorFieldSchema("owner", torch.int32, alignment=4),
-            TensorFieldSchema("fold_payoff", torch.float32, (players,), alignment=16),
-            TensorFieldSchema("board_cards", torch.uint8, (5,)),
-            TensorFieldSchema("stratum_level", torch.int32, (players,), alignment=16),
-            TensorFieldSchema("payoff_baseline", torch.float32, (players,), alignment=16),
-            TensorFieldSchema("stratum_amount", torch.float32, (players,), alignment=16),
-        )
-        source_leaf_fields = (
-            TensorFieldSchema("node_id", torch.int32, alignment=4),
-            TensorFieldSchema("log_reach", torch.float32, (players, exact_width), alignment=16),
-            *completion_fields,
-        )
-        destination_leaf_fields = (
-            *completion_fields,
-            TensorFieldSchema("completion_key", torch.int64, alignment=8),
-            TensorFieldSchema("range_weights", torch.float32, (players, exact_width), alignment=16),
-        )
-    source_leaf_schema = TensorSchema("stopped_leaf_source", source_leaf_fields)
-    destination_leaf_schema = TensorSchema("sealed_leaf_rows", destination_leaf_fields)
+    source_leaf_schema = stopped_leaf_source_schema(
+        mode, players=players, exact_width=exact_width
+    )
+    destination_leaf_schema = rollout_leaf_schema(
+        mode, players=players, exact_width=exact_width
+    )
     leaf_source = paged(source_leaf_schema, leaf_rows)
     leaf_destination = exact(destination_leaf_schema, leaf_rows)
 
@@ -674,9 +638,28 @@ def _analytical_memory_plan(
     ) + paged(PagedTreeSource.edge_schema(), realized_prior_rows)
     sealed_topology = exact(topology_schema(mode), realized_prior_rows)
     if sequential:
-        sealed_topology += (roots + 1) * 4 + roots * 4
+        sealed_topology += exact(
+            TensorSchema(
+                "sequential_trajectory_ptr",
+                (TensorFieldSchema("trajectory_ptr", torch.int32, alignment=4),),
+            ),
+            roots + 1,
+        )
+        sealed_topology += exact(
+            TensorSchema(
+                "sequential_leaf_row",
+                (TensorFieldSchema("leaf_row", torch.int32, alignment=4),),
+            ),
+            roots,
+        )
     else:
-        sealed_topology += realized_prior_rows * 4
+        sealed_topology += exact(
+            TensorSchema(
+                "branched_nominal_degree",
+                (TensorFieldSchema("nominal_degree", torch.int32, alignment=4),),
+            ),
+            realized_prior_rows,
+        )
     rollout_minimum = getattr(backend, "rollout_memory_plan", None)
     minimum_live_pages = int(getattr(rollout_minimum, "peak_bytes", 0))
     active_rows = min(
@@ -700,7 +683,7 @@ def _analytical_memory_plan(
     if not sequential:
         source_rows_bytes = max(
             source_rows_bytes,
-            int(getattr(cfg.rollout, "execution_memory_bytes", 1 << 30)),
+            int(getattr(cfg.rollout, "execution_memory_bytes", None) or (1 << 30)),
         )
     sealed_rollout = (
         sealed_topology
@@ -717,65 +700,40 @@ def _analytical_memory_plan(
             decision_schema,
             source_leaf_schema,
             destination_leaf_schema,
+            source_action_schema,
             action_schema,
         )
     )
 
-    if cfg.training.mode == "normal":
-        target_schema = TensorSchema(
-            "normal_target", (TensorFieldSchema("lambda_return", torch.float32),)
-        )
-        target_destination = exact(target_schema, decision_rows)
-        posterior_pool = 0
-        action_target = 0
-    elif cfg.training.mode == "rao_blackwell":
-        target_schema = TensorSchema(
-            "sequential_rb_target",
-            (
-                TensorFieldSchema("posterior_ref", torch.int32, alignment=4),
-                TensorFieldSchema("lambda_return", torch.float32, (exact_width,), alignment=16),
-            ),
-        )
-        posterior_schema = TensorSchema(
-            "sequential_posterior_pool",
-            (
-                TensorFieldSchema("posterior", torch.float32, (exact_width,), alignment=16),
-                TensorFieldSchema("trajectory", torch.int32, alignment=4),
-                TensorFieldSchema("player", torch.int32, alignment=4),
-            ),
-        )
-        target_destination = exact(target_schema, decision_rows)
-        posterior_pool = exact(posterior_schema, decision_rows)
-        action_target = 0
-    else:
-        target_schema = TensorSchema(
-            "branched_rb_decision_target",
-            (
-                TensorFieldSchema("value_hat", torch.float32, (exact_width,), alignment=16),
-                TensorFieldSchema("trace_variance_hat", torch.float32),
-                TensorFieldSchema("trace_variance_mask", torch.bool),
-                TensorFieldSchema("cost_hat", torch.float32),
-            ),
-        )
-        action_target_schema = TensorSchema(
-            "branched_rb_action_target",
-            (
-                TensorFieldSchema("child_posterior", torch.float32, (exact_width,), alignment=16),
-                TensorFieldSchema("advantage_hat", torch.float32, (exact_width,), alignment=16),
-            ),
-        )
-        target_destination = exact(target_schema, decision_rows)
-        action_target = exact(action_target_schema, action_rows)
-        posterior_pool = 0
-    training_storage = (
-        input_destination
-        + decision_destination
-        + action_destination
-        + target_destination
+    target_schema = target_decision_schema(
+        mode, exact_width=exact_width, dynamic_heads=True
+    )
+    target_destination = exact(target_schema, decision_rows)
+    posterior_pool = (
+        exact(sequential_posterior_schema(exact_width), decision_rows)
+        if mode == "sequential_rb"
+        else 0
+    )
+    action_target = (
+        exact(target_action_schema(exact_width), action_rows)
+        if mode == "branched_rb"
+        else 0
+    )
+    sampling_metadata = len(partition_specs) * 8
+    if mode == "branched_rb":
+        sampling_metadata += decision_rows * (8 + 4)
+    action_pointers = (decision_rows + 1) * 4 if mode == "branched_rb" else 0
+    rollout_training_base = (
+        input_destination + training_decision_base + action_destination
+    )
+    target_only_destination = (
+        target_destination
         + action_target
         + posterior_pool
-        + decision_rows * 20
+        + sampling_metadata
+        + action_pointers
     )
+    training_storage = rollout_training_base + target_only_destination
     completion_rows = min(max(leaf_rows, 1), 64)
     completion_workspace = (
         0
@@ -807,7 +765,12 @@ def _analytical_memory_plan(
     optimization_fixed = target_fixed + gradient_sync
     rollout_variable = source_rows_bytes
     seal_variable = source_rows_bytes + sealed_rollout + seal_scratch
-    target_variable = sealed_rollout + training_storage + completion_workspace + frontier_workspace
+    target_variable = (
+        sealed_rollout
+        + target_only_destination
+        + completion_workspace
+        + frontier_workspace
+    )
     learner_rows = min(decision_rows, int(getattr(cfg.training, "minibatch_size", 1)))
     learner_workspace = learner_rows * exact_width * 6 * 4
     optimization_variable = training_storage + learner_workspace
@@ -820,9 +783,13 @@ def _analytical_memory_plan(
         "memory_plan_opponent_parameter_bytes": opponent_parameter,
         "memory_plan_backend_resident_bytes": backend_resident,
         "memory_plan_rollout_source_page_bytes": source_rows_bytes,
+        "memory_plan_input_pool_source_bytes": input_pool_source,
+        "memory_plan_input_pool_destination_bytes": input_pool_destination,
         "memory_plan_sealed_rollout_bytes": sealed_rollout,
         "memory_plan_seal_scratch_bytes": seal_scratch,
-        "memory_plan_target_destination_bytes": target_destination + action_target + posterior_pool,
+        "memory_plan_target_destination_bytes": target_only_destination,
+        "memory_plan_sampling_metadata_bytes": sampling_metadata,
+        "memory_plan_action_pointer_bytes": action_pointers,
         "memory_plan_training_storage_bytes": training_storage,
         "memory_plan_completion_workspace_bytes": completion_workspace,
         "memory_plan_frontier_workspace_bytes": frontier_workspace,
@@ -1027,6 +994,12 @@ def _record_branched_controller_metrics(
 
     if rollout_decisions.old_t is None or rollout_decisions.old_c is None:
         raise RuntimeError("branched rollout did not retain frozen T/C heads")
+    profile_metrics.update(
+        {
+            key: float(value)
+            for key, value in getattr(tree, "branching_diagnostics", {}).items()
+        }
+    )
     if cfg.rollout.branching_mode != "dynamic":
         return
     adaptive = cfg.rollout.adaptive_kkt
@@ -1057,10 +1030,6 @@ def _record_branched_controller_metrics(
             ),
             "tree_size_vs_M": float(tree.owner.numel())
             / float(adaptive.target_tree_size),
-            **{
-                key: float(value)
-                for key, value in getattr(tree, "branching_diagnostics", {}).items()
-            },
         }
     )
     if iteration < int(adaptive.warmup_iters):
@@ -1139,6 +1108,38 @@ def _build_iteration_data(
     )
     normal = cfg.training.mode == "normal"
 
+    def record_sealed_rollout(rollout: RolloutStorage) -> None:
+        """Expose exact owner extents and admitted page-seal overlap."""
+
+        metrics = tuple(rollout.seal_metrics.values())
+        profile_metrics.update(
+            {
+                "rollout_storage_bytes": float(_tensor_bytes(rollout)),
+                "actions": float(
+                    sum(
+                        0 if block.actions is None else block.actions.rows
+                        for block in rollout.partitions.values()
+                    )
+                ),
+                "seal_source_pages": float(sum(value.source_pages for value in metrics)),
+                "seal_source_capacity_bytes": float(
+                    sum(value.source_capacity_bytes for value in metrics)
+                ),
+                "seal_destination_capacity_bytes": float(
+                    sum(value.destination_capacity_bytes for value in metrics)
+                ),
+                "seal_scratch_capacity_bytes": float(
+                    sum(value.scratch_capacity_bytes for value in metrics)
+                ),
+                "seal_overlap_peak_bytes": float(
+                    max((value.peak_accounted_bytes for value in metrics), default=0)
+                ),
+                "seal_logical_payload_bytes": float(
+                    sum(value.logical_payload_bytes for value in metrics)
+                ),
+            }
+        )
+
     def sample_normal_rollout() -> Any:
         with torch.autocast(
             device_type=device.type, enabled=amp_enabled, dtype=amp_dtype
@@ -1196,7 +1197,7 @@ def _build_iteration_data(
                 )
             rollout, partitions, _, _ = _profiled_call(
                 profile_metrics,
-                "compaction",
+                "seal",
                 device,
                 profile,
                 lambda: _seal_sequential_rollout_storage(
@@ -1207,6 +1208,8 @@ def _build_iteration_data(
                     gen=torch_gen,
                 ),
             )
+            if profile:
+                record_sealed_rollout(rollout)
             rollout_leaf_count = int(rollout.leaves.rows)
             del sampled, sampled_tree, sampled_policy
             if profile:
@@ -1282,7 +1285,7 @@ def _build_iteration_data(
                 )
             rollout, partitions, completion, quality_parts = _profiled_call(
                 profile_metrics,
-                "compaction",
+                "seal",
                 device,
                 profile,
                 lambda: _seal_sequential_rollout_storage(
@@ -1293,6 +1296,8 @@ def _build_iteration_data(
                     gen=torch_gen,
                 ),
             )
+            if profile:
+                record_sealed_rollout(rollout)
             rollout_leaf_count = int(rollout.leaves.rows)
             del rb_sample, tree, rollout_decisions
             if profile:
@@ -1369,7 +1374,7 @@ def _build_iteration_data(
                 )
             rollout, partitions, completion, quality_parts = _profiled_call(
                 profile_metrics,
-                "compaction",
+                "seal",
                 device,
                 profile,
                 lambda: _seal_branched_rollout_storage(
@@ -1380,6 +1385,8 @@ def _build_iteration_data(
                     gen=torch_gen,
                 ),
             )
+            if profile:
+                record_sealed_rollout(rollout)
             rollout_leaf_count = int(rollout.leaves.rows)
             del rb_sample, tree, rollout_decisions
             workspace_bytes = _value_workspace_budget(cfg, device)
@@ -1451,24 +1458,30 @@ def _sealed_input_block(spec: Any, columns: Mapping[str, Tensor]) -> SealedTenso
     return block
 
 
-def _sealed_dynamic_block(label: str, columns: Mapping[str, Tensor]) -> SealedTensorBlock:
+def _sealed_dynamic_block(
+    label: str,
+    columns: Mapping[str, Tensor],
+    *,
+    schema: TensorSchema | None = None,
+) -> SealedTensorBlock:
     """Seal an exact game-owned auxiliary pool from its realized field shapes."""
 
     if not columns:
         raise ValueError("a sealed auxiliary block requires at least one field")
     rows = next(iter(columns.values())).shape[0]
-    schema = TensorSchema(
-        label,
-        tuple(
-            TensorFieldSchema(
-                name,
-                value.dtype,
-                tuple(value.shape[1:]),
-                alignment=min(max(value.element_size(), 1), 16),
-            )
-            for name, value in columns.items()
-        ),
-    )
+    if schema is None:
+        schema = TensorSchema(
+            label,
+            tuple(
+                TensorFieldSchema(
+                    name,
+                    value.dtype,
+                    tuple(value.shape[1:]),
+                    alignment=min(max(value.element_size(), 1), 16),
+                )
+                for name, value in columns.items()
+            ),
+        )
     block = SealedTensorBlock(
         schema,
         {name: value.detach() for name, value in columns.items()},
@@ -1591,6 +1604,12 @@ def _seal_sequential_rollout_storage(
         decisions = _sealed_dynamic_block(
             f"poker_partition_{partition.partition_id}_decision",
             decision_columns,
+            schema=rollout_decision_schema(
+                "normal" if cfg.training.mode == "normal" else "sequential_rb",
+                model_width=partition.model_width,
+                event_count=backend.e_max,
+                dynamic_heads=False,
+            ),
         )
         global_to_partition_row[selected] = captured.partition_row[selected]
         blocks[partition.partition_id] = PartitionRolloutBlock(
@@ -1617,7 +1636,13 @@ def _seal_sequential_rollout_storage(
         assert root_profiles is not None
         reward = reach_cache.payload_for(leaf_ids.to(torch.int32))["reward"]
         reward = reward.float() * utility_scale(cfg)
-        leaves = _sealed_dynamic_block("normal_leaf", {"reward": reward})
+        leaves = _sealed_dynamic_block(
+            "normal_leaf",
+            {"reward": reward},
+            schema=rollout_leaf_schema(
+                "normal", players=backend.n_players, exact_width=backend.n_hands
+            ),
+        )
         mode = "normal"
     else:
         if bundle.completion_backend is None or cfg.completion.n_samples is None:
@@ -1650,7 +1675,15 @@ def _seal_sequential_rollout_storage(
             "fold_payoff": fold_payoff.detach().to(torch.float32),
             **{name: value.detach() for name, value in completion_inputs.items()},
         }
-        leaves = _sealed_dynamic_block("sequential_rb_leaf", leaf_columns)
+        leaves = _sealed_dynamic_block(
+            "sequential_rb_leaf",
+            leaf_columns,
+            schema=rollout_leaf_schema(
+                "sequential_rb",
+                players=backend.n_players,
+                exact_width=backend.n_hands,
+            ),
+        )
         service = bundle.completion_backend
         complete_sealed = getattr(service, "complete_sealed", None)
         if not callable(complete_sealed):
@@ -1698,7 +1731,13 @@ def _seal_sequential_rollout_storage(
         leaf_row=torch.arange(root_count, dtype=torch.int32, device=device),
         root_count=root_count,
     )
-    rollout = RolloutStorage(mode, blocks, topology, leaves)
+    rollout = RolloutStorage(
+        mode,
+        blocks,
+        topology,
+        leaves,
+        {**reach_cache.seal_metrics, **rollout_decisions.seal_metrics},
+    )
     return rollout, partitions, completion, quality_parts
 
 
@@ -1861,6 +1900,12 @@ def _seal_branched_rollout_storage(
         decisions = _sealed_dynamic_block(
             f"poker_partition_{partition.partition_id}_branched_decision",
             decisions_columns,
+            schema=rollout_decision_schema(
+                "branched_rb",
+                model_width=partition.model_width,
+                event_count=backend.e_max,
+                dynamic_heads="frozen_trace_variance" in decisions_columns,
+            ),
         )
         partition_actions = captured.partition_id[action_decision] == partition.partition_id
         action_events = rollout_decisions.action_event[partition_actions]
@@ -1873,6 +1918,7 @@ def _seal_branched_rollout_storage(
                 "event": action_events.detach().to(torch.int32),
                 "old_log_prob": action_old_logp.detach().to(torch.float32),
             },
+            schema=rollout_action_schema(partition.model_width),
         )
         counts = target_degree[selected]
         action_ptr = torch.empty(
@@ -1923,7 +1969,15 @@ def _seal_branched_rollout_storage(
         "fold_payoff": fold_payoff.detach().to(torch.float32),
         **{name: value.detach() for name, value in completion_inputs.items()},
     }
-    leaves = _sealed_dynamic_block("branched_rb_leaf", leaf_columns)
+    leaves = _sealed_dynamic_block(
+        "branched_rb_leaf",
+        leaf_columns,
+        schema=rollout_leaf_schema(
+            "branched_rb",
+            players=backend.n_players,
+            exact_width=backend.n_hands,
+        ),
+    )
     service = bundle.completion_backend
     if service is None or cfg.completion.n_samples is None:
         raise RuntimeError("branched RB requires a completion service")
@@ -1963,7 +2017,13 @@ def _seal_branched_rollout_storage(
         lambda count: int(count) * backend.n_players * backend.n_hands * 12,
         key_fields=("completion_key",),
     )
-    rollout = RolloutStorage("branched_rb", blocks, topology, leaves)
+    rollout = RolloutStorage(
+        "branched_rb",
+        blocks,
+        topology,
+        leaves,
+        {**reach_cache.seal_metrics, **rollout_decisions.seal_metrics},
+    )
     return rollout, partitions, completion, quality_parts
 
 
@@ -2211,15 +2271,8 @@ def _one_iteration(
 
     optimizer_steps_this_iteration = int(cfg.training.gd_steps_per_iter)
 
-    if profile and device.type == "cuda":
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device)
-    seal_started = time.perf_counter()
     storage = data.storage
     partition_specs = data.partition_specs
-    if profile and device.type == "cuda":
-        torch.cuda.synchronize(device)
-    seal_seconds = time.perf_counter() - seal_started
     retained_bytes = storage.tensor_storage_bytes()
     if data.profile_metrics is not None:
         for partition_id, partition in storage.partitions.items():
@@ -2247,7 +2300,6 @@ def _one_iteration(
             )
         data.profile_metrics.update(
             {
-                "phase_seal_seconds": seal_seconds,
                 "retained_target_bytes": float(retained_bytes),
                 "training_storage_schema_version": 1.0,
                 "preflop_model_width": float(bundle.rollout_backend.n_classes),
@@ -2255,17 +2307,6 @@ def _one_iteration(
                 "rb_exact_width": float(bundle.rollout_backend.n_hands),
             }
         )
-        if device.type == "cuda":
-            data.profile_metrics.update(
-                {
-                    "phase_seal_peak_allocated_bytes": float(
-                        torch.cuda.max_memory_allocated(device)
-                    ),
-                    "phase_seal_peak_reserved_bytes": float(
-                        torch.cuda.max_memory_reserved(device)
-                    ),
-                }
-            )
         # The target builder is the profiled backward-estimator phase. Expose
         # the design name as an explicit alias in release/soak telemetry.
         for suffix in ("seconds", "peak_allocated_bytes", "peak_reserved_bytes"):
@@ -2427,7 +2468,7 @@ def _one_iteration(
             "phase_optimization_host_seconds": optimization_seconds,
             "profiled_iteration_seconds": sum(
                 float(iteration_profile.get(f"phase_{name}_seconds", 0.0))
-                for name in ("snapshot", "rollout", "backward", "compaction", "seal")
+                for name in ("snapshot", "rollout", "backward", "seal")
             ) + optimization_seconds,
             "target_bytes_per_decision": retained_bytes / max(decisions, 1),
         }

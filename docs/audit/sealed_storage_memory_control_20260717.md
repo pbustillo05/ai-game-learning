@@ -1,5 +1,9 @@
 # Sealed storage and memory-root control acceptance — 2026-07-17
 
+> Historical evidence: this document accepted a post-hoc compatibility seal,
+> not the direct rollout-to-exact-storage pipeline restored on 2026-07-21. Its
+> measurements must not be presented as current sole-path readiness.
+
 This note records phase-1 implementation and validation evidence for
 `docs/todo/refactor/01_rollout_storage_targets_memory_control.md`.
 

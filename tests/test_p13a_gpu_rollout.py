@@ -41,6 +41,8 @@ from pbg.games.poker.tensor_state import PokerTensorStateStore
 
 
 class _Partition:
+    beta_rank = 16
+
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
@@ -48,13 +50,41 @@ class _Partition:
         self.calls.append(kwargs)
         board = kwargs["board_cards"]
         batch = board.shape[0]
+        weights = kwargs["live_range_weights"]
+        hands = weights.shape[-1]
+        cards = int((1 + (1 + 8 * hands) ** 0.5) / 2)
+        folders = kwargs["folded"].folder_mask.shape[1]
         return PartitionSummaryBatch(
             fields={
-                "base_log_z": torch.zeros(batch, dtype=torch.float32, device=board.device),
-                "single_card_log_ratio": torch.zeros(
-                    (batch, 52), dtype=torch.float32, device=board.device
+                "hand_log_ratio": torch.zeros(
+                    (batch, hands), dtype=torch.float32, device=board.device
                 ),
-                "output_valid": torch.ones(batch, dtype=torch.bool, device=board.device),
+                "beta_eigenvalue": torch.zeros(
+                    (batch, self.beta_rank), dtype=torch.float32, device=board.device
+                ),
+                "beta_eigenvector": torch.zeros(
+                    (batch, cards, self.beta_rank),
+                    dtype=torch.float32,
+                    device=board.device,
+                ),
+                "folder_log_mass": torch.zeros(
+                    (batch, folders), dtype=torch.float32, device=board.device
+                ),
+                "folder_card_mass": torch.zeros(
+                    (batch, folders, cards), dtype=torch.float32, device=board.device
+                ),
+                "tight_cluster_scalar": torch.zeros(
+                    batch, dtype=torch.float32, device=board.device
+                ),
+                "folder_mask": torch.ones(
+                    (batch, folders), dtype=torch.bool, device=board.device
+                ),
+                "folder_line_meta": torch.zeros(
+                    (batch, folders, 8), dtype=torch.float32, device=board.device
+                ),
+                "folder_seat": torch.zeros(
+                    (batch, folders), dtype=torch.int64, device=board.device
+                ),
             },
             metadata={},
         )
@@ -484,6 +514,11 @@ def test_device_partition_cache_masks_hits_and_invalidates_on_fold() -> None:
     assert partition.calls[-1]["folded"].folder_mask.tolist() == [[True]]
     assert backend.partition_summary_cache.size == 1
     assert backend.partition_summary_cache.capacity == backend.storage_page_rows
+    assert backend.partition_summary_cache.allocated_capacity_bytes == (
+        backend.partition_summary_cache.schema.capacity_bytes(
+            backend.storage_page_rows, chunks=1
+        )
+    )
     assert not hasattr(backend.partition_summary_cache, "valid")
 
 def test_policy_without_partition_consumer_skips_evaluator() -> None:

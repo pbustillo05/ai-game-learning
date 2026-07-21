@@ -32,7 +32,8 @@ executor or fixed-quantum packing path exists.
 Every occurrence is allocated transactionally and follows
 `NEW -> QUEUED -> EVALUATING -> DONE`. Admission charges persistent state,
 reaches, queue storage, topology, policy retention, and execution workspace
-before mutation. Node, queue, arena, or byte overflow fails loudly.
+before mutation. An inadmissible complete child wave stops cleanly before
+random draws or topology mutation; it is never retried with a changed law.
 
 ## Sequential modes
 
@@ -75,8 +76,10 @@ learning rows only below the root. `nominal_child_count` retains its ordinary
 randomized-rounded beta meaning.
 
 The tree is one labeled CSR topology, never a forest of special root copies.
-The configured node budget caps that tree. Offspring counts are validated
-before topology or occurrence status changes.
+There is no configured node capacity. Paged topology, control, action, and leaf
+owners grow only after the complete already-selected child wave is admitted by
+the hard byte ledger. The scientific queue safeguard remains a distinct
+nominal-versus-executed correction.
 
 ## Logical RNG
 
@@ -93,16 +96,19 @@ showdown payoffs, and folded-player partition summaries. The active production
 completion adapter returns only posterior mass, conditional value, and
 spot-level effective sample size.
 
-`streamed_branched_value` is the sole RB value reducer. Completion batches feed
-a contracted boundary frontier of posterior mass $P$ and weighted moment $M$.
-Ready sibling sets reduce uniformly over stored abstract children. At a player
+`build_sequential_rb_targets` and `build_branched_rb_targets` are the sole RB
+target builders. The branched builder precomputes an exact reusable frontier
+from sealed topology; completion batches feed posterior mass $P$ and weighted
+moment $M$. Ready target-eligible sibling sets reduce uniformly. At a player
 decision it:
 
 1. captures parent and child posterior masses;
 2. conditionalizes $M/P$ only where $P>0$;
 3. forms leave-one-out sibling baselines for multi-child decisions;
 4. uses the frozen old value for a single child; and
-5. applies lambda bootstrap only to the acting player's propagated moment.
+5. applies lambda bootstrap only to the acting player's propagated moment;
+6. applies nominal/executed queue correction and protected-root targeting; and
+7. writes $T/C$ targets and masks before discarding frozen head predictions.
 
 The reducer preflights its byte plan, validates that streamed batches uniquely
 cover every leaf, and emits only the target fields consumed by production
@@ -110,10 +116,11 @@ losses. Completion batch boundaries do not change results.
 
 ## Normal targets
 
-`build_normal_dataset_from_sampled` retains state references, compact decision
-reaches, sampled actor types/events, frozen log probability/value, scalar
-advantage, and value target. Settlement randomness uses logical keys. Sampling
-and gathering keep rows aligned and do not rerun the behavior model.
+`build_normal_targets` reads decision-only chronology from `RolloutStorage` and
+performs the reverse segmented player-clock recurrence. It retains natural
+inputs, selected actor type/event, frozen scalar log probability/value, and one
+scalar lambda return. Advantage and clipped value arguments are derived during
+the bounded learner gather; no state handle or decision reach survives.
 
 ## Loss and optimization
 

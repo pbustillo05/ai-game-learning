@@ -1,266 +1,191 @@
 # Suggested reading order for `pbg/core`
 
-This is a runtime-oriented reading guide, not a file-by-file inventory. It is
-optimized for understanding the decisions that determine GPU memory use,
-retained state, batch shape, queue depth, and synchronization. The active
-pipeline is one implementation shared by normal, sequential Rao--Blackwell
-(RB), and branched RB training; Kuhn/Leduc/synthetic code is archived and is
-not part of this guide.
+This guide describes the sole production pipeline after the 2026-07-21
+storage-lifecycle restoration. Earlier versions of this guide named the
+deleted capacity-shaped tree, reach-cache, padded-target, and minibatch
+implementations; those names are historical and are not alternate paths.
 
-## The big picture first
-
-Read the code as this phase pipeline:
+The runtime data plane is:
 
 ```text
-configuration
-    -> rollout storage + admission plan
-    -> device-local family queues
-    -> policy evaluation and event expansion
-    -> retained topology / reaches / old-policy outputs
-    -> completion and streamed backward reduction (RB)
-       or compact scalar dataset construction (normal)
-    -> stratified minibatches
-    -> gradient accumulation, distributed reduction, optimizer step
+byte-admitted rollout sources
+  -> exact immutable RolloutStorage
+  -> bounded streamed target construction
+  -> immutable TrainingStorage
+  -> bounded physical learner subspans
 ```
 
-The important lifetime boundary is between rollout and optimization. Rollout
-retains enough information to make the estimator exact, then target creation
-and completion are arranged so large temporary workspaces do not overlap with
-the rollout snapshot unnecessarily.
+Normal, sequential Rao--Blackwell (RB), and branched RB share these ownership
+and learner boundaries. They differ only in rollout topology and mathematical
+targets.
 
 ## Recommended order
 
-### 1. `pbg/core/training.py`: read the orchestration skeleton
+### 1. `pbg/core/training.py`: phase orchestration
 
-Start with [`training.py`](../../pbg/core/training.py), in this order:
+Start with [`training.py`](../../pbg/core/training.py):
 
-1. `SequentialMemoryController` and `_rank_local_config` — how a phase-wise
-   memory proof selects one common root width per GPU before any draws.
-2. `TrainingStorage` and `_IterationData` — the deliberate retention set crossing the rollout,
-   target, and optimization phases.
-3. `_analytical_memory_plan`, `_memory_limit`,
-   `_validate_memory_preflight`, and `_profiled_call` — the clearest statement
-   of what the implementation believes is resident at each phase, including
-   parameters, topology, reaches, policy cache, targets, completion workspace,
-   optimizer state, gradient synchronization, and reference-model copies.
-4. `_build_iteration_data` — the actual phase transition: synchronous read-only
-   old-policy rollout, completion microbatches, streamed value reduction, and target/cache
-   retention.
-5. `_one_iteration` — minibatch reuse, gradient accumulation, distributed
-   objective scaling, finite-gradient gating, and optimizer stepping.
-6. `run_training` — device setup, model/reference copies, optimizer creation,
-   preflight, checkpoint boundaries, and the outer iteration loop.
+1. `_analytical_memory_plan` derives rollout, seal, target, and optimization
+   priors from the same schemas that allocate storage.
+2. `_build_iteration_data` dispatches the three rollout modes and makes their
+   lifecycle boundaries explicit.
+3. `_seal_sequential_rollout_storage` and
+   `_seal_branched_rollout_storage` create exact rollout destinations and
+   release mutable sources.
+4. `_one_iteration` calls the matching target builder, finalizes immutable
+   training storage, and passes only that store to the learner.
+5. `run_training` owns distributed setup, model/reference/optimizer lifetime,
+   memory control, checkpointing, and the iteration loop.
 
-Do not begin by reading every helper in this file. The portions above explain
-the ownership and lifetimes; the logging, checkpoint, metadata, and metric
-formatting helpers can be consulted later.
+`IterationData` is a phase-local handoff, not a compatibility representation.
+The optimization phase sees `TrainingStorage`; it cannot address rollout
+states, reaches, topology, leaves, or queues.
 
-Efficiency questions to answer here:
+### 2. `pbg/core/storage.py`: declarations and owners
 
-- Which objects survive from rollout into optimization? In particular, inspect
-  `PolicyCache`, `DecisionReachCache`, targets, and the sampled tree.
-- Which objects are intentionally deleted before completion/backward workspace
-  is allocated?
-- Is a phase bounded analytically, calibrated on the first CUDA iteration, or
-  merely observed?
-- Is each minibatch sampled with replacement, or are rows permuted and reused
-  as epochs? The answer differs between normal and RB paths.
+Read [`storage.py`](../../pbg/core/storage.py) next:
 
-### 2. `pbg/core/execution.py`: understand the allocation and queue primitives
+- `TensorFieldSchema` and `TensorSchema` define dtype, natural/exact width,
+  alignment, payload bytes, and allocation.
+- `PagedTensorArena`, `PagedRowAccumulator`, and
+  `RecyclableTensorPool` provide transactional page growth, stable logical
+  ids, exact sealing, final-page slack reporting, and recyclable live slots.
+- `RolloutStorage` owns exact topology, natural inputs, retained old outputs,
+  ragged actions, and leaves until target construction finishes.
+- `TrainingStorage` owns only immutable natural inputs, exact targets, ragged
+  action targets, and sampling metadata. Its constructor validates every
+  column against the normative mode schema.
+- The `rollout_*_schema`, `target_*_schema`, and
+  `sequential_posterior_schema` functions are the single declarations used by
+  allocation, validation, sealing, and memory planning.
 
-Read [`execution.py`](../../pbg/core/execution.py) next. This is the highest
-value module for the user's stated interests:
+Stable ids are logical integers. No view into a growable allocation is used as
+identity.
 
-- `ByteAccountant` — labeled reservations made before allocation, with a hard
-  limit and high-water accounting.
-- `TrajectoryAdmissionPlan` — retained bytes plus in-flight bytes plus a
-  per-live-trajectory resident cost. `safe_admit` delays new starts rather
-  than changing their logical work or random addresses.
-- `ArenaField` and `ChunkedOccurrenceArena` — append-only struct-of-arrays
-  storage, optional fields, transactional chunk allocation, integer handles,
-  and batched gather/scatter without converting handles to host scalars.
-- `DeviceWorkQueue` — bounded insertion-order queue with device storage and a
-  host mirror of count/age used only at scheduler boundaries. Read
-  `enqueue`, `peek`, `dequeue`, and `mark_done` together with arena status
-  transitions (`NEW -> QUEUED -> EVALUATING -> DONE`).
-- `stable_partition_masked` — fixed-shape routing by family. Pay attention to
-  the device-resident selected counts and the avoidance of dynamic-shape
-  synchronization.
-- `ReusableStagingSlabs` — reusable bounded staging storage for model-facing
-  batches.
-- `logical_rng_keys`, `child_path_keys`, and the draw-purpose enum — schedule
-  changes must not change stochastic outcomes.
+### 3. `pbg/core/execution.py`: admission, queues, and logical RNG
 
-The central design choice is separation of logical work from physical packing:
-queue selection and batch boundaries affect throughput, but trajectory IDs and
-path-addressed RNG determine the estimator's draws.
+Read [`execution.py`](../../pbg/core/execution.py) for:
 
-The remaining RNG mixing helpers are implementation detail after you understand
-the address tuple. The low-level CUDA assertion helper is also lookup material.
+- `ByteAccountant`, whose labeled reservations precede allocation and whose
+  grouped transactions fail without partial publication;
+- `ChunkedOccurrenceArena` and `DeviceWorkQueue`, which bound live scheduling
+  work independently of logical statistical work;
+- `TrajectoryAdmissionPlan`, which freezes sequential root work before draws;
+- logical RNG keys and draw purposes, which make queue/page/batch changes
+  sampling-invariant.
 
-### 3. `pbg/core/rollout.py`: trace normal/sequential rollout end to end
+Scientific child selection and physical byte admission are separate. An
+already selected branched child wave is admitted completely before posterior
+or event draws; a failed admission does not suppress, retry, or reroll it.
 
-Read [`rollout.py`](../../pbg/core/rollout.py) from `_admission_plan` through
-`_sample_trees_sequential`, then the public `sample_trees_sequential` and
-`sample_trees` wrappers.
+### 4. `pbg/core/rollout.py`: normal and sequential RB
 
-Focus on this execution loop:
+Trace `_sample_trees_sequential` in
+[`rollout.py`](../../pbg/core/rollout.py). Each live trajectory owns one
+overwritten state/reach slot. At a player decision the scheduler captures the
+complete immutable natural-width poker input and retained old-policy row. At a
+stopped leaf it captures the sole completion reach/input row. Chance nodes do
+not survive the sequential seal.
 
-1. Allocate the `DeviceTreeBuffer`, occurrence arena, queues, root reaches,
-   profiles, and working reaches.
-2. Construct the admission transaction before private profiles are sampled.
-3. Admit only as many trajectories as the byte plan permits.
-4. Route frontier nodes into logical families, chance, or stopped leaves.
-5. Select a family using full-batch priority, fill ratio, queue age, and stable
-   family priority.
-6. Dequeue a bounded batch, run actual-cost policy batching, sample events,
-   append children, update reach, and mark occurrences done.
-7. Continue until all starts are admitted and all queues drain.
+The resulting topology is decision-only CSR:
 
-Sequential rollout owns one overwritten working reach row per live trajectory.
-It commits exact reach rows only at player decisions and stopped leaves, then
-releases the working row. There is no selectable replay or all-node reach mode.
+- `trajectory_ptr[G+1]`;
+- `decision_partition[D]` and `decision_row[D]`;
+- `leaf_row[G]`.
 
-The default `family_batch_rows`, `max_active_trajectories`,
-`arena_chunk_nodes`, and `node_budget` are not innocuous tuning constants:
-they jointly control queue fill, peak temporary model input/output memory,
-arena reservations, and the number of scheduler boundaries.
+Changing family batch rows or start-admission width may change physical
+packing, but not trajectory addresses or sampled objects.
 
-### 4. `pbg/core/branching.py`: read the alternative tree shape and scheduler
+### 5. `pbg/core/branching.py`: fixed and dynamic branched RB
 
-Read [`branching.py`](../../pbg/core/branching.py), especially
-`sample_branched_tree` and its allocation/routing loop. Compare it with
-`_sample_trees_sequential` rather than reading it in isolation.
+Read [`branching.py`](../../pbg/core/branching.py) as the alternative rollout
+geometry. It maintains one labeled tree rooted at the distinguished root,
+recyclable live reaches/states, paged control columns, bounded family queues,
+and ragged action rows.
 
-The key difference is storage geometry: branched RB retains one labeled tree
-rooted at the distinguished root, with randomized child multiplicities, while
-sequential modes retain one realized path per start. Study where beta is
-validated, where child occurrences are allocated, how family queues are shared,
-and how policy outputs are indexed back to the current frontier.
+`admit_child_wave` reserves every page needed by the complete already-selected
+wave before posterior/action/chance draws or topology mutation. Fixed and
+dynamic modes retain duplicate child identity, nominal versus executed count,
+KKT intensity, queue-safeguard correction, public $T/C$ predictions, and the
+protected ordinary-root cohort under root refill.
 
-Pay special attention to the fact that the root follows the ordinary branching
-rule. It is not given special multiplicity. The rest of the code is mostly
-branching-specific routing and validation once this distinction is clear.
+### 6. `pbg/core/tree.py` and `pbg/core/topology.py`: source and seal
 
-### 5. `pbg/core/tree.py`: learn the retained topology and cache layouts
+[`tree.py`](../../pbg/core/tree.py) contains `PagedTreeSource`, the paged
+rollout-time topology source, plus the small sealed handoff records.
+[`topology.py`](../../pbg/core/topology.py) contains the exact immutable
+`SequentialDecisionCSR` and `BranchedTreeSpan` validators. Validation is
+vectorized on CUDA and checks row domains, roots, contiguous child spans,
+chronology, and player-clock structure without per-node host reads.
 
-Read [`tree.py`](../../pbg/core/tree.py) in this order:
+The branched sealed topology has six columns: parent, child begin, degree,
+decision partition, decision row, and leaf row. Protected-root metadata is
+stored separately and never widens the ragged action domain.
 
-1. `TreeBatch` — flat topology representation (`parent`, `child_ptr`,
-   `child_node`, `tree_id`, `state_ref`, `owner`, and edge metadata).
-2. `TreeBuilder` — append-only construction and capacity checks.
-3. `DeviceTreeBuffer` — preallocated device storage and the conversion from
-   mutable rollout storage to the compact retained tree.
-4. `PolicyCache` — exactly which old log-probabilities and values are retained
-   for later PPO/value targets.
-5. `ReachCache` and `DecisionReachCache` — full, compact, and recomputable reach
-   representations.
-6. `AliasTable` and `build_decision_alias` — decision-mass weighted row
-   selection used by RB minibatches.
+### 7. `pbg/core/targets.py`: bounded target construction
 
-This module answers “what is stored?” more precisely than the dataclasses do:
-topology is flat and index-based, fields are padded to maximum event/type
-widths, and caches are aligned by stable decision-node IDs. Read validation
-methods after understanding the layouts.
+[`targets.py`](../../pbg/core/targets.py) is the only target-builder family:
 
-### 6. `pbg/core/values.py`: understand RB target memory and streaming
+- `build_normal_targets` performs the reverse segmented player-clock
+  recurrence and retains one scalar return per decision;
+- `build_sequential_rb_targets` streams evaluator completion batches,
+  deduplicates exact posterior rows, and retains exact returns plus posterior
+  references;
+- `plan_branched_frontier` derives the maximum live contraction slots from the
+  sealed topology;
+- `build_branched_rb_targets` contracts the reusable frontier into exact value,
+  ragged posterior/advantage, $T/C$, nominal/executed correction, and protected
+  root targets.
 
-Read [`values.py`](../../pbg/core/values.py): `NodeTargets`,
-`BackwardFrontierMemoryPlan`, `_layout_from_shape`,
-`_frontier_memory_plan_from_shape`, `_reduce_streamed_leaf_batches`, and
-`streamed_branched_value`.
+No production $Q$ target exists. Finalization releases topology, leaves,
+completion results, and frontier scratch before optimization.
 
-The core decision is to stream completion leaves into a persistent `P/M`
-backward frontier. Ready sibling subtrees are reduced and compacted as soon as
-possible, rather than retaining all completion outputs or a full dense
-backward workspace. `BackwardFrontierMemoryPlan` makes the intended overlap
-explicit: leaf input, targets, frontier, scratch copies, and topology.
+### 8. `pbg/core/learner.py`: immutable learner boundary
 
-Then read `emit`, `conditionalize`, and `bootstrap` to connect the memory layout
-to the estimator. The arithmetic is important, but the frontier lifecycle is
-the efficiency-critical part.
+Finish with [`learner.py`](../../pbg/core/learner.py):
 
-### 7. Dataset and minibatch materialization
+- global stratum-mass normalization and fixed statistical-count allocation;
+- index-only statistical draws;
+- `PhysicalPlanner` and bounded gather/forward/backward/release subspans;
+- fused policy/entropy/reference-KL terms at natural model width;
+- optional transactionally admitted reference caches with an uncached
+  singleton fallback;
+- one flat fp32 gradient SUM buffer and finite-gated optimizer step.
 
-Read [`normal.py`](../../pbg/core/normal.py) first for the normal path:
-`NormalDataset`, `build_normal_dataset_from_sampled`, and the gather/sample
-functions. It converts sampled trajectories into compact scalar decision rows
-and stores only the fields needed by later optimization.
+The learner never reconstructs public state or reach paths. Current, old, and
+reference outputs stay on each partition's natural width; exact RB posterior,
+return, and advantage tensors stay on the exact hand domain.
 
-Then read [`minibatch.py`](../../pbg/core/minibatch.py): `MinibatchSample`,
-`sample_minibatch`, and `gather_minibatch_rows`. This is where RB target rows,
-reach rows, legal-event masks, old policy data, and value data are assembled
-into model-ready batches. The `gather_*` functions are particularly useful for
-seeing what is copied per optimizer step versus retained for the whole
-iteration.
+## Poker-specific companion reading
 
-### 8. Loss, distributed scaling, and optimizer boundary
+After the generic path, read:
 
-Finish the algorithmic path with:
+- [`pbg/games/poker/tensor_state.py`](../../pbg/games/poker/tensor_state.py)
+  for recyclable public-state slots and refcounted persistent history;
+- [`pbg/games/poker/partition_cache.py`](../../pbg/games/poker/partition_cache.py)
+  for sparse folded-summary anchor pages;
+- [`pbg/games/poker/partitions.py`](../../pbg/games/poker/partitions.py) for the
+  immutable $H\to K$ preflop quotient and partition schemas;
+- [`pbg/games/poker/rollout_backend.py`](../../pbg/games/poker/rollout_backend.py)
+  for last-consumer input capture and the read-only sibling evaluator boundary.
 
-- [`losses.py`](../../pbg/core/losses.py): `LossSpec`, `ppo`, `rb_ppo`, and
-  `finalize_metric_stats`. Read after the batch structures so the tensor names
-  have meaning.
-- [`distributed.py`](../../pbg/core/distributed.py):
-  `global_mass_objective` and `stratum_objective_scale`. These determine how
-  unequal rank-local decision mass becomes one global objective.
-- [`optimization.py`](../../pbg/core/optimization.py):
-  `sync_scaled_gradients` and `finite_gated_optimizer_step`. This is the
-  boundary where accumulated gradients are synchronized, checked, clipped,
-  and applied.
+For $R=13$, preflop natural rows have width $K=169$ and postflop/exact rows
+have width $H=1326$. There is one postflop partition family, not one partition
+per street.
 
-The important batching distinction is that RB rows are selected according to
-decision mass (with alias/stratified selection), whereas normal training uses
-the compact empirical decision dataset. The optimizer sees ordinary model
-batches in both cases, but the row law and scaling are different.
+## Audit checklist
 
-## Read later or skim initially
+At each phase boundary ask:
 
-These modules matter for a complete implementation audit but do not belong in
-the first pass over allocation, retention, batching, or queues:
+1. Which schema declares every live field and its bytes?
+2. Which object is its sole owner and its next/last consumer?
+3. Was page or destination growth admitted before allocation?
+4. Are page/batch/queue choices absent from logical RNG addresses?
+5. Did the prior phase's mutable owners actually release?
+6. Are natural-width model data and exact-width mathematical data separated?
+7. Does optimization retain anything beyond `TrainingStorage`, one bounded
+   physical subspan, and an optional admitted reference cache?
 
-- [`config.py`](../../pbg/core/config.py): read the dataclasses and validation
-  fields early, then defer YAML conversion and validation plumbing.
-- [`game.py`](../../pbg/core/game.py): read `GameBundle` and the rollout
-  protocol signatures early; defer the protocol boilerplate.
-- [`completion.py`](../../pbg/core/completion.py): read the completion result
-  shapes and `for_learning` contract before `values.py`; defer generic protocol
-  definitions.
-- [`checkpointing.py`](../../pbg/core/checkpointing.py): read for resume and
-  state-lifetime auditing, not for the training algorithm.
-- [`observability.py`](../../pbg/core/observability.py) and
-  [`logging_util.py`](../../pbg/core/logging_util.py): use when checking whether
-  queue age, synchronization, memory peaks, and completion quality are
-  actually measured.
-- [`__init__.py`](../../pbg/core/__init__.py): safe to skim last.
-
-## A compact “second pass” checklist
-
-After the first pass, revisit the code with these questions:
-
-1. Before each allocation, what capacity or byte reservation proves it can
-   fit? Check arena chunks, staging slabs, admission, completion batches, and
-   backward frontier workspace.
-2. At every phase boundary, which tensors remain live, and which are deleted?
-3. Does each queue operation preserve insertion order, bounded capacity, status
-   transitions, and observable age?
-4. Which decisions cause a host/device synchronization? In particular, inspect
-   fixed-size scheduler count blocks and model batch planning.
-5. Does changing queue selection or physical batch boundaries alter RNG keys,
-   estimator weights, or decision-mass scaling? It should not.
-6. Is the stored representation proportional to possible topology or realized
-   work? This distinguishes `full` from compact/recompute reaches and sequential
-   from branched trees.
-7. Is a “batch size” limiting logical work, physical model tokens, completion
-   workspace, or optimizer rows? The core intentionally has separate controls
-   for each.
-
-## Suggested supporting material
-
-Once this guide is complete, use the authoritative mathematics and pseudocode
-under [`docs/theory`](../theory/) to verify estimator semantics, then consult
-[`tests/test_execution_foundations.py`](../../tests/test_execution_foundations.py)
-and [`tests/test_p13a_gpu_rollout.py`](../../tests/test_p13a_gpu_rollout.py) as
-executable examples of the queue/arena contracts and rollout invariants.
-The current audit inventory and readiness evidence are useful orientation, but
-the source and theory documents remain the authority for design decisions.
+The mathematical and lifecycle authorities remain
+[`core_math.tex`](../theory/core_math.tex) and the documents in
+[`docs/theory/pseudocode/`](../theory/pseudocode/).

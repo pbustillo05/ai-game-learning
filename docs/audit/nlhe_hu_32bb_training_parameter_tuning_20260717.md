@@ -1,5 +1,9 @@
 # HU 32 bb training-parameter tuning — 2026-07-17
 
+> Historical tuning evidence: these measurements used the pre-restoration
+> rollout data plane. Scientific settings remain useful context, but memory and
+> throughput numbers are not directly comparable to current tiny acceptance.
+
 ## Outcome
 
 The balanced production setting is 2,560 sequential roots/GPU initially,

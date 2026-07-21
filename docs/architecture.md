@@ -32,10 +32,11 @@ never implement a fallback hand evaluator.
 trainable model
   -> read-only synchronous rollout policy
   -> family-scheduled rollout
-       append-only occurrences + natural partition inputs + old policy/value
-  -> normal: sampled terminal settlement and compact scalar targets
-     RB: streamed evaluator completion into the P/M value frontier
-  -> exact seal into immutable TrainingStorage; release topology/reaches
+       recyclable state/reach + paged last-consumer rows
+  -> exact RolloutStorage seal; release sources, queues, state, and reach
+  -> normal: reverse segmented scalar returns
+     RB: bounded evaluator completion and P/M frontier contraction
+  -> immutable TrainingStorage; release topology, leaves, and target scratch
   -> index-only stratified draws by global log mass
   -> bounded gather/forward/backward/release subspans
   -> flat-gradient SUM, common finite gate, clip, optimizer step
@@ -67,13 +68,15 @@ randomized-rounded abstract child, including repeated event labels.
 ## State, topology, and reach
 
 Owner codes are players $\ge0$, `CHANCE=-1`, `TERMINAL=-2`, and `PRETERM=-3`.
-State references are opaque device `int32` handles. `DeviceTreeBuffer` retains
-parent-major CSR topology, tree id, owner, depths, state handle, path weight,
-child label, and empirical edge mass. Capacity overflow never truncates.
+State references are recyclable device `int32` handles, separate from monotone
+logical node ids. `PagedTreeSource` appends topology pages only as realized
+nodes and edges arrive; sealing produces exact sequential chronology or one
+rooted six-column branched span.
 
-Poker public state is a preallocated structure of arrays with one history event
-and a binary-lifting ancestor row per state. Model input gathers chronological
-history in one batched device operation at the preflighted lossless width.
+Poker public state is a paged recyclable structure of arrays. History has an
+explicit refcounted persistent owner, so releasing a dead state recursively
+reclaims unreachable ancestors. Model input captures chronological history in
+one batched device operation at the lossless path width.
 Reach is fp32 unnormalized log likelihood
 `[row, player, private_type]`; actor actions add selected log likelihood and
 board events mask conflicting hands.
@@ -93,11 +96,12 @@ Normal mode carries one sampled joint profile to a terminal reward. RB modes
 stream completion batches from the sibling evaluator. Diagnostic completion
 fields are summarized and released before learning.
 
-`streamed_branched_value` maintains only a contracted boundary of posterior
-mass $P$ and posterior-weighted moment $M=P V$. Once every child of a parent is
-available, it emits conditional values, child posterior masses, and
-leave-one-out advantages, applies owner-only lambda bootstrap, and replaces the
-siblings with their parent summary. The byte plan is checked before allocation.
+`build_branched_rb_targets` first derives an exact live-slot bound from the
+sealed topology, then reuses that frontier for posterior mass $P$ and
+posterior-weighted moment $M=P V$. Once every target-eligible child is ready it
+emits conditional values, ragged child posterior/advantage rows, and current
+$T/C$ targets, applies nominal/executed correction and the protected-root
+cohort, and releases contracted child slots. No production $Q$ target exists.
 
 ## Logical and physical learner work
 
@@ -118,7 +122,7 @@ configured interval, evaluated without gradients, and checkpointed.
 
 Public state, topology, reaches, events, model/evaluator inputs and outputs,
 targets, and learner tensors stay on the owning CUDA device. Folded summaries
-use a fixed device-indexed cache and masked evaluator rows. Declared scheduler
+use sparse immutable dependency-anchor pages and masked evaluator rows. Declared scheduler
 control transfers—including the one fixed mixed-row policy-planning block—are
 measured; undeclared synchronization is separately counted and forbidden by
 acceptance gates.
@@ -127,13 +131,15 @@ The hardware profile's precision applies consistently to frozen rollout-policy,
 identity-replay, and learner forwards. Completion and posterior/value reduction
 remain fp32 outside autocast.
 
-The NLHE bundle preflights rollout storage. Training adds execution, completion,
-target, and optimizer plans. Hardware profiles cap attention work, memory
+The NLHE bundle preflights page geometry and bounded workspaces. Training derives
+rollout, seal, target, and optimization ownership peaks from the allocating
+schemas. Hardware profiles cap attention work, memory
 fraction, and reserve. First-iteration calibration reports allocated/reserved
 peaks per phase and fails if measured use exceeds the safe plan.
 
-Sequential recompute planning charges live trajectories and realized retained
-work rather than a capacity-sized reach frontier for every possible node.
+Sequential planning charges live trajectories and realized retained work rather
+than a capacity-sized reach frontier. Branched growth is admitted by bytes and
+does not turn allocator pressure into scientific offspring suppression.
 
 ## Reproducibility and lifetime
 

@@ -2,16 +2,20 @@
 
 Active audit documents describe the sole production NLHE implementation:
 
-- [`migration_cleanup_gpu_acceptance_20260717.md`](migration_cleanup_gpu_acceptance_20260717.md)
-  records the final migration, schema/checkpoint hardening, full-deck shape
-  gates, throughput measurements, and current CPU/GPU release verdict.
+- [`restore_storage_lifecycle/phase_6_acceptance.md`](restore_storage_lifecycle/phase_6_acceptance.md)
+  is the current CPU/GPU verdict and links the ordered six-phase restoration
+  chain.
+- [`restore_storage_lifecycle/`](restore_storage_lifecycle/) records each
+  reviewable phase boundary from authority reconciliation through sole-path
+  cleanup and acceptance.
 
 - [`distributed_learner_reference_cache_20260717.md`](distributed_learner_reference_cache_20260717.md)
-  records phase-2 bounded learner, direct flat-SUM gradient, reference-cache,
-  CPU/distributed, and GPU acceptance evidence.
+  is historical evidence for the bounded learner and reference-cache work; its
+  compatibility-path measurements are not current rollout acceptance.
 - [`sealed_storage_memory_control_20260717.md`](sealed_storage_memory_control_20260717.md)
-  records the phase-1 immutable storage, streaming-target, and memory-only root
-  controller handoff.
+  is historical evidence for the initially disconnected sealed-storage work.
+- [`migration_cleanup_gpu_acceptance_20260717.md`](migration_cleanup_gpu_acceptance_20260717.md)
+  is the historical acceptance of the capacity-shaped compatibility pipeline.
 - [`release_gate_2026-07-16/`](release_gate_2026-07-16/) — comprehensive
   documentation/math/model/runtime audit and repair record. Current verdict:
   **GO for engineering/estimator correctness**, with strategy quality explicitly

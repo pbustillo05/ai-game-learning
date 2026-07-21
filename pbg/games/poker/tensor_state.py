@@ -94,16 +94,9 @@ def poker_public_history_schema(max_rollout_steps: int) -> TensorSchema:
 class PokerTensorStateStore:
     """Store realized public poker states in byte-measurable pages.
 
-    Args:
-        capacity: Maximum number of state rows.
-        max_rollout_steps: Maximum public action count and ancestor-gather bound.
-        device: Owning Torch device.
-        n_players: Number of table seats ``P``.
-
-    State handles are int32 ``[B]`` row indices. During the compatibility
-    rollout allocation is monotone; later rollout phases consume this same
-    schema through recyclable live-slot ownership. There is deliberately no
-    Python state table.
+    State handles are recyclable int32 ``[B]`` row indices. Logical topology
+    ids remain monotone in their separate owner. There is deliberately no
+    capacity-shaped or Python state table.
     """
 
     def __init__(

@@ -16,6 +16,7 @@ from pbg.core.observability import ExecutionMetrics
 from pbg.core.storage import (
     ByteAccountant,
     PagedTensorArena,
+    SealMetrics,
     SealedDecisionInputs,
     SealedTensorBlock,
     TensorFieldSchema,
@@ -147,11 +148,6 @@ class PokerRolloutBackend:
         )
         self.state_store = self.states
         self.history_materializer = DeviceHistoryMaterializer(self.states)
-        self.partition_summary_cache = DevicePartitionSummaryCache(
-            max(0, cfg.n_players - 2),
-            self.device,
-            page_rows=max(1, storage_page_rows),
-        )
         table = getattr(beta_table, "beta_table", beta_table)
         self.beta_table = dict(table or {"default": 1.0})
         if "default" not in self.beta_table:
@@ -167,11 +163,15 @@ class PokerRolloutBackend:
         self.partition_adapter = partition_adapter or PokerGPUPartitionAdapter(
             rank_count=cfg.rank_count
         )
-        initial_beta = int(getattr(self.partition_adapter, "beta_rank", 16))
-        self._fallback_partition_service = (
-            (self.partition_adapter, self.partition_summary_cache)
-            if not hasattr(self.partition_adapter, "beta_rank")
-            else None
+        if not hasattr(self.partition_adapter, "beta_rank"):
+            raise TypeError("partition adapter must declare its beta_rank schema width")
+        initial_beta = int(self.partition_adapter.beta_rank)
+        self.partition_summary_cache = DevicePartitionSummaryCache(
+            max(0, cfg.n_players - 2),
+            self.device,
+            n_cards=self.n_cards,
+            beta_rank=initial_beta,
+            page_rows=max(1, storage_page_rows),
         )
         self._partition_services = {
             initial_beta: (self.partition_adapter, self.partition_summary_cache)
@@ -1224,22 +1224,9 @@ class PokerRolloutBackend:
                 raise ValueError("summary anchors require summary fields")
             summary = store.summary_arenas.get(partition_id)
             if summary is None:
-                summary_columns = {
-                    "anchor": capture.summary_anchor,
-                    **capture.summary_fields,
-                }
-                summary_schema = TensorSchema(
-                    f"poker_partition_{partition_id}_summary_capture",
-                    tuple(
-                        TensorFieldSchema(
-                            name,
-                            value.dtype,
-                            tuple(value.shape[1:]),
-                            alignment=min(max(value.element_size(), 1), 16),
-                        )
-                        for name, value in summary_columns.items()
-                    ),
-                )
+                summary_schema = self.partition_summary_cache.schema
+                if summary_schema is None:
+                    raise RuntimeError("folded summary capture has no declared schema")
                 summary = PagedTensorArena(
                     summary_schema,
                     self.storage_page_rows,
@@ -1257,20 +1244,26 @@ class PokerRolloutBackend:
         arena.append({"node_id": node_ids.to(torch.int32), **columns})
 
     @staticmethod
-    def _seal_columns(label: str, columns: Mapping[str, Tensor]) -> SealedTensorBlock:
+    def _seal_columns(
+        label: str,
+        columns: Mapping[str, Tensor],
+        *,
+        schema: TensorSchema | None = None,
+    ) -> SealedTensorBlock:
         rows = next(iter(columns.values())).shape[0]
-        schema = TensorSchema(
-            label,
-            tuple(
-                TensorFieldSchema(
-                    name,
-                    value.dtype,
-                    tuple(value.shape[1:]),
-                    alignment=min(max(value.element_size(), 1), 16),
-                )
-                for name, value in columns.items()
-            ),
-        )
+        if schema is None:
+            schema = TensorSchema(
+                label,
+                tuple(
+                    TensorFieldSchema(
+                        name,
+                        value.dtype,
+                        tuple(value.shape[1:]),
+                        alignment=min(max(value.element_size(), 1), 16),
+                    )
+                    for name, value in columns.items()
+                ),
+            )
         return SealedTensorBlock(
             schema,
             {name: value.detach() for name, value in columns.items()},
@@ -1288,20 +1281,29 @@ class PokerRolloutBackend:
         if not store.input_arenas:
             empty = torch.empty(0, dtype=torch.int32, device=self.device)
             return SealedDecisionInputs(empty, empty, empty, {})
-        all_nodes: list[Tensor] = []
-        all_partition: list[Tensor] = []
-        all_rows: list[Tensor] = []
         blocks: dict[int, SealedTensorBlock] = {}
         pools: dict[int, Mapping[str, SealedTensorBlock]] = {}
+        seal_metrics: dict[str, SealMetrics] = {}
         partition_specs = self.training_partition_specs()
+        total_rows = sum(source.size for source in store.input_arenas.values())
+        if store.accountant is not None:
+            store.accountant.reserve(
+                "poker_decision_addresses.sealed", total_rows * 3 * 4
+            )
+        nodes = torch.empty(total_rows, dtype=torch.int32, device=self.device)
+        partition_ids = torch.empty_like(nodes)
+        partition_rows = torch.empty_like(nodes)
+        address_cursor = 0
         for partition_id, source in store.input_arenas.items():
             input_schema = partition_specs[partition_id].input_schema
+            summary_source = store.summary_arenas.get(partition_id)
+            scratch_bytes = source.size * (4 + 8)
+            if summary_source is not None:
+                scratch_bytes += summary_source.size * (8 + 8)
             if store.accountant is not None:
-                summary_source = store.summary_arenas.get(partition_id)
                 store.accountant.reserve(
                     f"poker_partition_{partition_id}_decision_input.sealed",
                     input_schema.capacity_bytes(source.size, chunks=int(source.size > 0))
-                    + source.size * 4
                     + (
                         0
                         if summary_source is None
@@ -1310,6 +1312,10 @@ class PokerRolloutBackend:
                             chunks=int(summary_source.size > 0),
                         )
                     ),
+                )
+                store.accountant.reserve(
+                    f"poker_partition_{partition_id}_decision_input.seal_scratch",
+                    scratch_bytes,
                 )
             node_ids = source.gather(
                 "node_id", torch.arange(source.size, device=self.device)
@@ -1321,6 +1327,8 @@ class PokerRolloutBackend:
                 for name in input_schema.by_name
             }
             summary = store.summary_arenas.get(partition_id)
+            summary_destination_bytes = 0
+            summary_logical_bytes = 0
             if summary is not None:
                 summary_rows = torch.arange(summary.size, device=self.device)
                 anchors = summary.gather("anchor", summary_rows)
@@ -1343,16 +1351,25 @@ class PokerRolloutBackend:
                 input_columns["folded_summary_ref"] = inverse[
                     input_columns["folded_summary_ref"].to(torch.int64)
                 ].to(torch.int32)
-                pools[partition_id] = {
-                    "folded_summary": self._seal_columns(
+                sealed_summary = self._seal_columns(
                         f"poker_partition_{partition_id}_folded_summary",
                         {
                             name: summary.gather(name, first)
                             for name in summary.schema.by_name
                             if name != "anchor"
                         },
+                        schema=TensorSchema(
+                            f"poker_partition_{partition_id}_folded_summary",
+                            tuple(
+                                field
+                                for field in summary.schema.fields
+                                if field.name != "anchor"
+                            ),
+                        ),
                     )
-                }
+                pools[partition_id] = {"folded_summary": sealed_summary}
+                summary_destination_bytes = sealed_summary.allocated_capacity_bytes
+                summary_logical_bytes = sealed_summary.logical_payload_bytes
             blocks[partition_id] = SealedTensorBlock(
                 input_schema,
                 input_columns,
@@ -1361,27 +1378,48 @@ class PokerRolloutBackend:
                     node_ids.numel(), chunks=int(node_ids.numel() > 0)
                 ),
             )
-            all_nodes.append(node_ids)
-            all_partition.append(
-                torch.full_like(node_ids, partition_id, dtype=torch.int32)
+            stop = address_cursor + node_ids.numel()
+            nodes[address_cursor:stop] = node_ids
+            partition_ids[address_cursor:stop] = partition_id
+            partition_rows[address_cursor:stop] = torch.arange(
+                node_ids.numel(), dtype=torch.int32, device=self.device
             )
-            all_rows.append(
-                torch.arange(node_ids.numel(), dtype=torch.int32, device=self.device)
+            address_cursor = stop
+            destination_bytes = input_schema.capacity_bytes(
+                node_ids.numel(), chunks=int(node_ids.numel() > 0)
+            ) + summary_destination_bytes
+            source_bytes = source.allocated_capacity_bytes + (
+                0 if summary is None else summary.allocated_capacity_bytes
             )
+            seal_metrics[f"decision_inputs_partition_{partition_id}"] = SealMetrics(
+                source_capacity_bytes=source_bytes,
+                destination_capacity_bytes=destination_bytes,
+                scratch_capacity_bytes=scratch_bytes,
+                peak_accounted_bytes=source_bytes + destination_bytes + scratch_bytes,
+                logical_payload_bytes=(
+                    input_schema.payload_bytes(node_ids.numel())
+                    + summary_logical_bytes
+                ),
+                source_pages=source.page_count + (0 if summary is None else summary.page_count),
+            )
+            if store.accountant is not None:
+                store.accountant.release(
+                    f"poker_partition_{partition_id}_decision_input.seal_scratch"
+                )
         for arena in store.input_arenas.values():
             arena.release()
         for arena in store.summary_arenas.values():
             arena.release()
         store.input_arenas.clear()
         store.summary_arenas.clear()
-        nodes = torch.cat(all_nodes)
         order = torch.argsort(nodes.to(torch.int64), stable=True)
         return SealedDecisionInputs(
             nodes[order],
-            torch.cat(all_partition)[order],
-            torch.cat(all_rows)[order],
+            partition_ids[order],
+            partition_rows[order],
             blocks,
             pools,
+            seal_metrics,
         )
 
     def _public_from_immutable_inputs(
@@ -1583,6 +1621,23 @@ class PokerRolloutBackend:
             e_max=self.e_max,
         )
 
+    def training_input_pool_schemas(
+        self,
+    ) -> Mapping[int, Mapping[str, tuple[TensorSchema, TensorSchema]]]:
+        """Return paged-source and exact-destination sparse input-pool schemas."""
+
+        source = self.partition_summary_cache.schema
+        if source is None:
+            return {}
+        destination = TensorSchema(
+            "poker_folded_summary",
+            tuple(field for field in source.fields if field.name != "anchor"),
+        )
+        return {
+            partition_id: {"folded_summary": (source, destination)}
+            for partition_id in range(1, self.n_players - 1)
+        }
+
     def rollout_row_cost(
         self, model: nn.Module, states: Tensor
     ) -> tuple[Tensor, Tensor]:
@@ -1649,9 +1704,6 @@ class PokerRolloutBackend:
         post = getattr(source, "postflop", None)
         beta = int(getattr(getattr(post, "cfg", None), "folder_beta_rank", 16))
         service = self._partition_services.get(beta)
-        if service is None and self._fallback_partition_service is not None:
-            service = self._fallback_partition_service
-            self._partition_services[beta] = service
         if service is None:
             service = (
                 PokerGPUPartitionAdapter(
@@ -1660,6 +1712,8 @@ class PokerRolloutBackend:
                 DevicePartitionSummaryCache(
                     max(0, self.n_players - 2),
                     self.device,
+                    n_cards=self.n_cards,
+                    beta_rank=beta,
                     page_rows=self.storage_page_rows,
                 ),
             )
@@ -2331,7 +2385,7 @@ class PokerRolloutBackend:
         keys = torch.where(inherited >= 0, inherited, states).to(torch.int64)
         self.states.partition_cache_key[rows] = keys.to(torch.int32)
         if self.device.type == "cuda":
-            # The compatibility rollout has no scheduler-owned cache-admission
+            # The direct policy-forward API has no scheduler-owned cache-admission
             # boundary. Keep this summary forward-local instead of either
             # synchronizing to grow sparse storage or restoring the retired
             # capacity-wide validity map. Direct rollout phases write each

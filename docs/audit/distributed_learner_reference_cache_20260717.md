@@ -1,5 +1,10 @@
 # Bounded distributed learner and reference-cache acceptance — 2026-07-17
 
+> Historical evidence: these measurements predate the 2026-07-21 sole-path
+> storage restoration. The learner features remain supported, but any rollout
+> ownership, phase-memory, or readiness claim below describes the retired
+> compatibility pipeline and is not current acceptance evidence.
+
 This note records phase-2 implementation and validation evidence for
 `docs/todo/refactor/02_distributed_learner_and_reference_cache.md`.
 

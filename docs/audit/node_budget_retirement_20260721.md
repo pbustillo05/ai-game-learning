@@ -9,6 +9,15 @@
 > and optimization phase models. Checkpoint schema v5 removes the retired field
 > explicitly and records that transition. The proposal and measurements below
 > remain historical design evidence.
+>
+> One implementation detail was resolved in favor of the primary family
+> scheduling authority: production transactionally admits the complete
+> already-selected child wave before any posterior/event draw, as
+> `ReserveChildren` specifies. It does not preallocate hypothetical future
+> offspring for an entire unseen path. If a mandatory wave cannot fit, the
+> iteration sets the common hard-failure condition without changing offspring,
+> drawing, retrying, or rerolling. The exact public path bound remains a
+> sequential progress/controller invariant rather than a replacement capacity.
 
 ## Conclusion
 

@@ -1,5 +1,9 @@
 # HU 32 bb sequential-RB optimization regression — 2026-07-17
 
+> Historical performance evidence: this run used the pre-restoration rollout
+> data plane. Preserve its learner-performance lessons, but do not compare its
+> phase ownership or throughput directly with tiny 2026-07-21 acceptance runs.
+
 ## Purpose and immediate status
 
 This is the self-contained handoff for optimizing the full-deck heads-up

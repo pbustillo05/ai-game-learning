@@ -1115,6 +1115,7 @@ class SealedDecisionInputs:
     input_pools: Mapping[int, Mapping[str, SealedTensorBlock]] = field(
         default_factory=dict
     )
+    seal_metrics: Mapping[str, SealMetrics] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         count = self.node_ids.numel()
@@ -1145,6 +1146,7 @@ class SealedDecisionInputs:
                 raise ValueError("sealed decision partition rows are not exact")
         object.__setattr__(self, "inputs", inputs)
         object.__setattr__(self, "input_pools", pools)
+        object.__setattr__(self, "seal_metrics", MappingProxyType(dict(self.seal_metrics)))
 
     def gather_partition_inputs(
         self, partition_id: int, partition_rows: Tensor
@@ -1319,6 +1321,57 @@ class TrainingStorage:
             raise ValueError("sequential RB training storage requires a posterior pool")
         if self.mode != "sequential_rb" and self.posterior_pool is not None:
             raise ValueError("only sequential RB owns a posterior pool")
+        for partition in self.partitions.values():
+            columns = partition.columns
+            rows = partition.inputs.rows
+            event_count = int(columns["legal_event_ids"].shape[1])
+            model_width = (
+                1 if self.mode == "normal" else int(columns["old_value"].shape[1])
+            )
+            base = rollout_decision_schema(
+                self.mode,
+                model_width=model_width,
+                event_count=event_count,
+                dynamic_heads=False,
+            )
+            base.validate({name: columns[name] for name in base.by_name}, rows)
+            exact_width = (
+                1
+                if self.mode == "normal"
+                else int(
+                    columns[
+                        "lambda_return"
+                        if self.mode == "sequential_rb"
+                        else "value_hat"
+                    ].shape[1]
+                )
+            )
+            dynamic_targets = "trace_variance_hat" in columns
+            target = target_decision_schema(
+                self.mode,
+                exact_width=exact_width,
+                dynamic_heads=dynamic_targets,
+            )
+            if set(columns) != set(base.by_name) | set(target.by_name):
+                raise ValueError("training decision columns do not match declared schemas")
+            target.validate({name: columns[name] for name in target.by_name}, rows)
+            if self.mode == "branched_rb":
+                if partition.action_columns is None:
+                    raise ValueError("branched training partition omitted ragged actions")
+                actions = partition.action_columns
+                action_base = rollout_action_schema(model_width)
+                action_rows = int(actions["event"].shape[0])
+                action_base.validate(
+                    {name: actions[name] for name in action_base.by_name}, action_rows
+                )
+                action_target = target_action_schema(exact_width)
+                action_target.validate(
+                    {name: actions[name] for name in action_target.by_name}, action_rows
+                )
+                if set(actions) != (
+                    set(action_base.by_name) | set(action_target.by_name) | {"action_ptr"}
+                ):
+                    raise ValueError("training action columns do not match declared schemas")
 
     def tensor_storage_bytes(self) -> int:
         """Return unique retained tensor storage bytes (views count once)."""
@@ -1389,4 +1442,243 @@ def topology_schema(mode: str) -> TensorSchema:
     return TensorSchema(
         f"{mode}_topology",
         tuple(TensorFieldSchema(name, torch.int32, fill=-1, alignment=4) for name in names),
+    )
+
+
+def rollout_policy_source_schema(
+    mode: str, *, exact_width: int, dynamic_heads: bool = True
+) -> TensorSchema:
+    """Paged scheduler policy rows before partition-aware sealing."""
+
+    fields = [TensorFieldSchema("node_id", torch.int32, alignment=4)]
+    if mode in {"normal", "sequential_rb"}:
+        fields.extend(
+            (
+                TensorFieldSchema(
+                    "old_logp", torch.float32, (exact_width,), alignment=16
+                ),
+                TensorFieldSchema(
+                    "old_v", torch.float32, (exact_width,), alignment=16
+                ),
+            )
+        )
+    elif mode == "branched_rb":
+        fields.append(
+            TensorFieldSchema("old_v", torch.float32, (exact_width,), alignment=16)
+        )
+        if dynamic_heads:
+            fields.extend(
+                (
+                    TensorFieldSchema("old_t", torch.float32, alignment=4),
+                    TensorFieldSchema("old_c", torch.float32, alignment=4),
+                )
+            )
+    else:
+        raise ValueError("unknown rollout mode")
+    return TensorSchema("rollout_policy_source", tuple(fields))
+
+
+def rollout_decision_schema(
+    mode: str,
+    *,
+    model_width: int,
+    event_count: int,
+    dynamic_heads: bool = True,
+) -> TensorSchema:
+    """Exact retained decision columns on one partition's natural width."""
+
+    rb = mode != "normal"
+    fields = [
+        TensorFieldSchema("owner", torch.int32, alignment=4),
+        TensorFieldSchema(
+            "old_value",
+            torch.float32,
+            (() if not rb else (model_width,)),
+            alignment=16,
+        ),
+        TensorFieldSchema(
+            "legal_event_ids", torch.int32, (event_count,), alignment=16
+        ),
+        TensorFieldSchema("legal_event_mask", torch.bool, (event_count,)),
+    ]
+    if mode in {"normal", "sequential_rb"}:
+        fields.extend(
+            (
+                TensorFieldSchema("event", torch.int32, alignment=4),
+                TensorFieldSchema(
+                    "old_log_prob",
+                    torch.float32,
+                    (() if not rb else (model_width,)),
+                    alignment=16,
+                ),
+            )
+        )
+        if mode == "normal":
+            fields.append(
+                TensorFieldSchema("realized_type", torch.int32, alignment=4)
+            )
+    elif mode == "branched_rb":
+        fields.extend(
+            (
+                TensorFieldSchema("log_weight", torch.float64, alignment=8),
+                TensorFieldSchema("nominal_child_count", torch.int32, alignment=4),
+                TensorFieldSchema("executed_child_count", torch.int32, alignment=4),
+            )
+        )
+        if dynamic_heads:
+            fields.extend(
+                (
+                    TensorFieldSchema(
+                        "frozen_trace_variance", torch.float32, alignment=4
+                    ),
+                    TensorFieldSchema("frozen_cost", torch.float32, alignment=4),
+                )
+            )
+    else:
+        raise ValueError("unknown rollout mode")
+    return TensorSchema(f"{mode}_decision", tuple(fields))
+
+
+def rollout_action_schema(model_width: int) -> TensorSchema:
+    """Exact ragged branched action rows."""
+
+    return TensorSchema(
+        "branched_rb_action",
+        (
+            TensorFieldSchema("event", torch.int32, alignment=4),
+            TensorFieldSchema(
+                "old_log_prob", torch.float32, (model_width,), alignment=16
+            ),
+        ),
+    )
+
+
+def rollout_action_source_schema(exact_width: int) -> TensorSchema:
+    """Paged scheduler edge-policy rows before ragged action sealing."""
+
+    return TensorSchema(
+        "branched_rb_action_source",
+        (
+            TensorFieldSchema("edge_id", torch.int64, alignment=8),
+            TensorFieldSchema(
+                "old_logp", torch.float32, (exact_width,), alignment=16
+            ),
+        ),
+    )
+
+
+def stopped_leaf_source_schema(mode: str, *, players: int, exact_width: int) -> TensorSchema:
+    """Paged last-consumer leaf capture, including its sole log-reach owner."""
+
+    fields = [
+        TensorFieldSchema("node_id", torch.int32, alignment=4),
+        TensorFieldSchema(
+            "log_reach", torch.float32, (players, exact_width), alignment=16
+        ),
+    ]
+    if mode == "normal":
+        fields.append(
+            TensorFieldSchema("reward", torch.float32, (players,), alignment=16)
+        )
+    elif mode in {"sequential_rb", "branched_rb"}:
+        fields.extend(_rb_completion_public_fields(players))
+    else:
+        raise ValueError("unknown rollout mode")
+    return TensorSchema(f"{mode}_stopped_leaf_source", tuple(fields))
+
+
+def _rb_completion_public_fields(players: int) -> tuple[TensorFieldSchema, ...]:
+    return (
+        TensorFieldSchema("owner", torch.int32, alignment=4),
+        TensorFieldSchema("fold_payoff", torch.float32, (players,), alignment=16),
+        TensorFieldSchema("board_cards", torch.uint8, (5,)),
+        TensorFieldSchema("stratum_level", torch.int32, (players,), alignment=16),
+        TensorFieldSchema(
+            "payoff_baseline", torch.float32, (players,), alignment=16
+        ),
+        TensorFieldSchema("stratum_amount", torch.float32, (players,), alignment=16),
+    )
+
+
+def rollout_leaf_schema(mode: str, *, players: int, exact_width: int) -> TensorSchema:
+    """Exact post-seal leaf fields; RB reach is represented once as weights."""
+
+    if mode == "normal":
+        fields = (
+            TensorFieldSchema("reward", torch.float32, (players,), alignment=16),
+        )
+    elif mode in {"sequential_rb", "branched_rb"}:
+        fields = (
+            *_rb_completion_public_fields(players),
+            TensorFieldSchema("completion_key", torch.int64, alignment=8),
+            TensorFieldSchema(
+                "range_weights",
+                torch.float32,
+                (players, exact_width),
+                alignment=16,
+            ),
+        )
+    else:
+        raise ValueError("unknown rollout mode")
+    return TensorSchema(f"{mode}_leaf", fields)
+
+
+def target_decision_schema(
+    mode: str, *, exact_width: int, dynamic_heads: bool = True
+) -> TensorSchema:
+    """Target-only decision columns appended to immutable training storage."""
+
+    if mode == "normal":
+        fields = (TensorFieldSchema("lambda_return", torch.float32),)
+    elif mode == "sequential_rb":
+        fields = (
+            TensorFieldSchema("posterior_ref", torch.int32, alignment=4),
+            TensorFieldSchema(
+                "lambda_return", torch.float32, (exact_width,), alignment=16
+            ),
+        )
+    elif mode == "branched_rb":
+        fields = [
+            TensorFieldSchema(
+                "value_hat", torch.float32, (exact_width,), alignment=16
+            )
+        ]
+        if dynamic_heads:
+            fields.extend(
+                (
+                    TensorFieldSchema("trace_variance_hat", torch.float32),
+                    TensorFieldSchema("trace_variance_mask", torch.bool),
+                    TensorFieldSchema("cost_hat", torch.float32),
+                )
+            )
+        fields = tuple(fields)
+    else:
+        raise ValueError("unknown rollout mode")
+    return TensorSchema(f"{mode}_decision_target", fields)
+
+
+def target_action_schema(exact_width: int) -> TensorSchema:
+    return TensorSchema(
+        "branched_rb_action_target",
+        (
+            TensorFieldSchema(
+                "child_posterior", torch.float32, (exact_width,), alignment=16
+            ),
+            TensorFieldSchema(
+                "advantage_hat", torch.float32, (exact_width,), alignment=16
+            ),
+        ),
+    )
+
+
+def sequential_posterior_schema(exact_width: int) -> TensorSchema:
+    return TensorSchema(
+        "sequential_posterior_pool",
+        (
+            TensorFieldSchema(
+                "posterior", torch.float32, (exact_width,), alignment=16
+            ),
+            TensorFieldSchema("trajectory", torch.int32, alignment=4),
+            TensorFieldSchema("player", torch.int32, alignment=4),
+        ),
     )

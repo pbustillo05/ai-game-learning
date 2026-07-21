@@ -1,5 +1,9 @@
 # NLHE HU 32bb Sequential RB Crash Audit — 2026-07-17
 
+> Historical incident evidence: the allocation and ownership path diagnosed
+> below was retired by the 2026-07-21 storage-lifecycle restoration. Retain the
+> measurements as motivation, not as a description of current production.
+
 ## Executive summary
 
 The run did not fail from an out-of-memory allocation exception, NCCL failure, or

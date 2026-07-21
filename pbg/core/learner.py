@@ -1383,7 +1383,6 @@ class DistributedFixedRolloutUpdate:
                     del result, contribution, output, reference_output, inputs, rows
             phase_event = timing_start()
             finite = sync_scaled_gradients(
-                self.model,
                 dist.get_world_size(self.group)
                 if dist.is_available() and dist.is_initialized()
                 else 1,

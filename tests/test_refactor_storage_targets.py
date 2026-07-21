@@ -22,6 +22,9 @@ from pbg.core.storage import (
     TensorSchema,
     TrainingPartition,
     occurrence_schema,
+    paged_capacity_bytes,
+    rollout_action_schema,
+    rollout_decision_schema,
 )
 from pbg.core.targets import (
     build_branched_rb_targets,
@@ -102,6 +105,20 @@ def test_schema_transaction_page_slack_and_exact_multipage_seal() -> None:
     assert metrics.peak_accounted_bytes == source_bytes + destination + scratch
     assert accountant.high_water_bytes == metrics.peak_accounted_bytes
     assert accountant.reserved_bytes == destination
+
+
+def test_paged_capacity_forecast_applies_alignment_and_overhead_per_page() -> None:
+    schema = TensorSchema(
+        "page_forecast",
+        (
+            TensorFieldSchema("small", torch.uint8),
+            TensorFieldSchema("aligned", torch.float32, (3,), alignment=64),
+        ),
+        chunk_header_bytes=32,
+        allocator_slack_bytes=16,
+    )
+    assert paged_capacity_bytes(schema, 5, 2) == 3 * schema.capacity_bytes(2)
+    assert paged_capacity_bytes(schema, 0, 2) == 0
 
 
 def test_paged_seal_permutation_reorders_wide_rows_with_bounded_scratch() -> None:
@@ -256,15 +273,8 @@ def test_training_partition_resolves_sparse_immutable_input_pool() -> None:
 
 @pytest.mark.parametrize("lam", [0.0, 1.0])
 def test_normal_streaming_player_clock_lambda_return(lam: float) -> None:
-    decision_schema = TensorSchema(
-        "normal_decision",
-        (
-            TensorFieldSchema("owner", torch.int32),
-            TensorFieldSchema("event", torch.int32),
-            TensorFieldSchema("realized_type", torch.int32),
-            TensorFieldSchema("old_value", torch.float32),
-            TensorFieldSchema("old_log_prob", torch.float32),
-        ),
+    decision_schema = rollout_decision_schema(
+        "normal", model_width=2, event_count=3, dynamic_heads=False
     )
     decisions = _sealed(
         decision_schema,
@@ -273,6 +283,8 @@ def test_normal_streaming_player_clock_lambda_return(lam: float) -> None:
         realized_type=torch.tensor([0, 0], dtype=torch.int32),
         old_value=torch.tensor([10.0, 20.0]),
         old_log_prob=torch.tensor([-0.1, -0.2]),
+        legal_event_ids=torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.int32),
+        legal_event_mask=torch.ones((2, 3), dtype=torch.bool),
     )
     leaf_schema = TensorSchema(
         "normal_leaf", (TensorFieldSchema("reward", torch.float32, (2,)),)
@@ -319,14 +331,8 @@ def _completion(posterior: torch.Tensor, value: torch.Tensor) -> CompletionSpec:
 @pytest.mark.parametrize("lam", [0.0, 1.0])
 def test_sequential_rb_exact_targets_deduplicate_posterior_and_use_phi(lam: float) -> None:
     # Exact width four, natural model width two: this is the H -> K contract.
-    decision_schema = TensorSchema(
-        "seq_decision",
-        (
-            TensorFieldSchema("owner", torch.int32),
-            TensorFieldSchema("event", torch.int32),
-            TensorFieldSchema("old_value", torch.float32, (2,)),
-            TensorFieldSchema("old_log_prob", torch.float32, (2,)),
-        ),
+    decision_schema = rollout_decision_schema(
+        "sequential_rb", model_width=2, event_count=3, dynamic_heads=False
     )
     decisions = _sealed(
         decision_schema,
@@ -334,6 +340,8 @@ def test_sequential_rb_exact_targets_deduplicate_posterior_and_use_phi(lam: floa
         event=torch.tensor([1, 2], dtype=torch.int32),
         old_value=torch.tensor([[10.0, 20.0], [30.0, 40.0]]),
         old_log_prob=torch.zeros(2, 2),
+        legal_event_ids=torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.int32),
+        legal_event_mask=torch.ones((2, 3), dtype=torch.bool),
     )
     leaf_schema = TensorSchema("rb_leaf", (TensorFieldSchema("key", torch.int64),))
     rollout = RolloutStorage(
@@ -372,26 +380,19 @@ def test_sequential_rb_exact_targets_deduplicate_posterior_and_use_phi(lam: floa
 
 @pytest.mark.parametrize("lam", [0.0, 1.0])
 def test_branched_bounded_targets_multiple_children_and_zero_mass(lam: float) -> None:
-    decision_schema = TensorSchema(
-        "branch_decision",
-        (
-            TensorFieldSchema("owner", torch.int32),
-            TensorFieldSchema("old_value", torch.float32, (2,)),
-            TensorFieldSchema("log_weight", torch.float32),
-        ),
+    decision_schema = rollout_decision_schema(
+        "branched_rb", model_width=2, event_count=3, dynamic_heads=False
     )
-    action_schema = TensorSchema(
-        "branch_action",
-        (
-            TensorFieldSchema("event", torch.int32),
-            TensorFieldSchema("old_log_prob", torch.float32, (2,)),
-        ),
-    )
+    action_schema = rollout_action_schema(2)
     decisions = _sealed(
         decision_schema,
         owner=torch.tensor([0], dtype=torch.int32),
         old_value=torch.tensor([[5.0, 7.0]]),
-        log_weight=torch.tensor([0.0]),
+        legal_event_ids=torch.tensor([[0, 1, 2]], dtype=torch.int32),
+        legal_event_mask=torch.ones((1, 3), dtype=torch.bool),
+        log_weight=torch.tensor([0.0], dtype=torch.float64),
+        nominal_child_count=torch.tensor([2], dtype=torch.int32),
+        executed_child_count=torch.tensor([2], dtype=torch.int32),
     )
     actions = _sealed(
         action_schema,
@@ -458,23 +459,17 @@ def _dynamic_branched_rollout(
     rows = len(decision_nodes)
     topology.decision_partition[decision_nodes] = 0
     topology.decision_row[decision_nodes] = torch.arange(rows, dtype=torch.int32)
-    decision_schema = TensorSchema(
-        "dynamic_branch_decision",
-        (
-            TensorFieldSchema("owner", torch.int32),
-            TensorFieldSchema("old_value", torch.float32, (1,)),
-            TensorFieldSchema("log_weight", torch.float64),
-            TensorFieldSchema("nominal_child_count", torch.int32),
-            TensorFieldSchema("executed_child_count", torch.int32),
-            TensorFieldSchema("frozen_trace_variance", torch.float32),
-            TensorFieldSchema("frozen_cost", torch.float32),
-        ),
+    event_count = max(1, sum(action_counts))
+    decision_schema = rollout_decision_schema(
+        "branched_rb", model_width=1, event_count=event_count, dynamic_heads=True
     )
     assert topology.nominal_degree is not None
     decisions = _sealed(
         decision_schema,
         owner=torch.zeros(rows, dtype=torch.int32),
         old_value=torch.zeros((rows, 1)),
+        legal_event_ids=torch.arange(event_count, dtype=torch.int32).repeat(rows, 1),
+        legal_event_mask=torch.ones((rows, event_count), dtype=torch.bool),
         log_weight=torch.zeros(rows, dtype=torch.float64),
         nominal_child_count=topology.nominal_degree[decision_nodes],
         executed_child_count=torch.tensor(action_counts, dtype=torch.int32),
@@ -482,13 +477,7 @@ def _dynamic_branched_rollout(
         frozen_cost=torch.tensor(frozen_c),
     )
     action_rows = sum(action_counts)
-    action_schema = TensorSchema(
-        "dynamic_branch_action",
-        (
-            TensorFieldSchema("event", torch.int32),
-            TensorFieldSchema("old_log_prob", torch.float32, (1,)),
-        ),
-    )
+    action_schema = rollout_action_schema(1)
     actions = _sealed(
         action_schema,
         event=torch.arange(action_rows, dtype=torch.int32),
