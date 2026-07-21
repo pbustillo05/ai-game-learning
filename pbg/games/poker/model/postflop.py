@@ -10,7 +10,7 @@ from torch import Tensor, nn
 
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.folded import PartitionSummaryBatch
-from pbg.games.poker.model.heads import MomentHeads, RaiseMixtureHead, TypeHead, ValueHead
+from pbg.games.poker.model.heads import PublicBranchingHeads, RaiseMixtureHead, TypeHead, ValueHead
 from pbg.games.poker.model.incidence import (
     CompactMap,
     IncidenceResidual,
@@ -225,7 +225,11 @@ class PostflopNet(nn.Module):
         self.type_head = TypeHead(d)
         self.raise_head = RaiseMixtureHead(d, c.m_raise, c.s_min)
         self.value_head = ValueHead(readout_dim, feature_dim=d, hidden=c.ffn_hidden)
-        self.moment_heads = MomentHeads(2 * d, d, c.ffn_hidden) if c.use_moment_heads else None
+        branching_dim = (2 + c.max_players) * d
+        self.branching_heads = (
+            PublicBranchingHeads(branching_dim, d, c.ffn_hidden)
+            if c.use_branching_heads else None
+        )
         combo_cards = torch.tensor(self.geometry.combo_cards, dtype=torch.long)
         self.register_buffer("combo_cards", combo_cards, persistent=True)
         combo_ordinals = combo_cards - self.geometry.first_card
@@ -902,8 +906,11 @@ class PostflopNet(nn.Module):
         raw["s"] = raw["s"].masked_fill(invalid[..., None], 1.0)
         raw["iota"] = raw["iota"].masked_fill(invalid, 0.5)
         full_value = compact_scatter(value, mapping, dim=1)
-        vvec: Tensor | None = None
-        u: Tensor | None = None
-        if self.moment_heads is not None:
-            vvec, u = self.moment_heads(torch.cat((global_feature, public_mean), dim=-1), seat_summary, seat_mask)
-        return PolicyOutput(raw=raw, v=full_value, vvec=vvec, u=u)
+        t: Tensor | None = None
+        cost: Tensor | None = None
+        if self.branching_heads is not None:
+            branching_public = torch.cat(
+                (global_feature, public_mean, padded_seats.flatten(1)), dim=-1
+            )
+            t, cost = self.branching_heads(branching_public)
+        return PolicyOutput(raw=raw, v=full_value, t=t, c=cost)

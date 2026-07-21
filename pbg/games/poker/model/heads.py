@@ -1,4 +1,4 @@
-"""Policy, value, and optional public-moment output heads."""
+"""Policy, value, and optional public branching output heads."""
 
 from __future__ import annotations
 
@@ -144,34 +144,26 @@ class ValueHead(nn.Module):
         return self.affine(self.features(z_value)).squeeze(-1)
 
 
-class MomentHeads(nn.Module):
-    """Emit public per-seat values and a nonnegative squared-return moment."""
+class PublicBranchingHeads(nn.Module):
+    """Emit public trace-variance ``T`` and subtree-cost ``C`` scalars."""
 
-    def __init__(self, public_dim: int, seat_dim: int, hidden: int | None = None) -> None:
+    def __init__(self, public_dim: int, feature_dim: int, hidden: int | None = None) -> None:
         super().__init__()
         self.public_dim = public_dim
-        self.seat_dim = seat_dim
-        self.public_features = FFN(public_dim, seat_dim, hidden)
-        self.seat_features = FFN(2 * seat_dim, seat_dim, hidden)
-        self.value_affine = nn.Linear(seat_dim, 1)
-        self.u_features = FFN(seat_dim, seat_dim, hidden)
-        self.u_affine = nn.Linear(seat_dim, 1)
+        self.public_features = FFN(public_dim, feature_dim, hidden)
+        self.t_features = FFN(feature_dim, feature_dim, hidden)
+        self.c_features = FFN(feature_dim, feature_dim, hidden)
+        self.t_affine = nn.Linear(feature_dim, 1)
+        self.c_affine = nn.Linear(feature_dim, 1)
 
-    def forward(
-        self, public: Tensor, seats: Tensor, seat_mask: Tensor
-    ) -> tuple[Tensor, Tensor]:
-        """Return ``Vvec [B,P]`` and ``U [B]`` with padded seats zeroed."""
-
+    def forward(self, public: Tensor) -> tuple[Tensor, Tensor]:
         if public.ndim != 2 or public.shape[-1] != self.public_dim:
-            raise ValueError("public must have shape [B,public_dim]")
-        if seats.ndim != 3 or seats.shape[0] != public.shape[0] or seats.shape[-1] != self.seat_dim:
-            raise ValueError("seats must have shape [B,P,seat_dim]")
-        if seat_mask.shape != seats.shape[:2] or seat_mask.dtype != torch.bool:
-            raise TypeError("seat_mask must be bool [B,P]")
-        public_features = self.public_features(public)
-        expanded = public_features[:, None, :].expand_as(seats)
-        seat_hidden = self.seat_features(torch.cat((expanded, seats), dim=-1))
-        vvec = self.value_affine(seat_hidden).squeeze(-1)
-        vvec = vvec.masked_fill(~seat_mask, 0.0)
-        u = F.softplus(self.u_affine(self.u_features(public_features)).squeeze(-1))
-        return vvec, u
+            raise ValueError("public branching input must have shape [B,public_dim]")
+        features = self.public_features(public)
+        # Heads remain fp32 under autocast: exp in fp16 overflows at ordinary
+        # cost scales, while the controller consumes frozen fp32 quantities.
+        t_logit = self.t_affine(self.t_features(features)).squeeze(-1).float()
+        c_logit = self.c_affine(self.c_features(features)).squeeze(-1).float()
+        t = torch.sigmoid(t_logit)
+        c = torch.exp(c_logit.clamp(min=-30.0, max=30.0))
+        return t, c

@@ -689,14 +689,6 @@ class PokerInferenceSession:
                     )
                     probabilities[destination] = part_probability.float()
                     values[destination] = output.v.float()
-                    if output.vvec is not None:
-                        if seat_values is None:
-                            seat_values = torch.empty(
-                                (batch, output.vvec.shape[1]),
-                                dtype=torch.float32,
-                                device=self.device,
-                            )
-                        seat_values[destination] = output.vvec.float()
         return (
             probabilities,
             values,

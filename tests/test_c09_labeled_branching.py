@@ -143,6 +143,8 @@ def _cfg(root_count: int, beta: float, budget: int = 32) -> SimpleNamespace:
     return SimpleNamespace(
         roots_per_gpu=root_count,
         node_budget=budget,
+        branching_mode="fixed",
+        adaptive_kkt=None,
     )
 
 

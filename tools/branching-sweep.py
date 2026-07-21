@@ -142,6 +142,11 @@ def main() -> None:
     cfg.rollout.sequential_roots_per_gpu_maximum = 1
     cfg.rollout.node_budget = args.node_budget
     cfg.rollout.beta = {"default": 1.0}
+    cfg.rollout.branching_mode = "fixed"
+    cfg.rollout.adaptive_kkt = None
+    cfg.model["use_branching_heads"] = True
+    cfg.loss.c_t = cfg.loss.c_t or 1.0
+    cfg.loss.c_c = cfg.loss.c_c or 1.0
     cfg.rollout.branching_upper_cutoff_nodes = args.upper_cutoff
     cfg.rollout.branching_stop_cutoff_nodes = args.stop_cutoff
     cfg.completion.n_samples = cfg.completion.n_samples or 64

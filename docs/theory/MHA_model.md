@@ -53,8 +53,8 @@ F^{\mathrm{pre}}_{\theta_{\mathrm{pre}}}
 \Big(
 \{k\mapsto(\pi^{\mathrm{pre}}_{\theta_{\mathrm{pre}}}(\cdot\mid k,\sigma),
 V^{\mathrm{pre}}_{\theta_{\mathrm{pre}}}(k,\sigma))\}_{k\in\mathcal K_R},
-\ \text{optional } \mathbf V^{\mathrm{pre}}_{\theta_{\mathrm{pre}}}(\sigma),
-\ \text{optional } U^{\mathrm{pre}}_{\theta_{\mathrm{pre}}}(\sigma)
+\ \text{optional } T^{\mathrm{pre}}_{\theta_{\mathrm{pre}}}(\sigma),
+\ \text{optional } C^{\mathrm{pre}}_{\theta_{\mathrm{pre}}}(\sigma)
 \Big).
 $$
 
@@ -69,8 +69,8 @@ F^{\mathrm{post}}_{\theta_{\mathrm{post}}}
 \Big(
 \{h\mapsto(\pi^{\mathrm{post}}_{\theta_{\mathrm{post}}}(\cdot\mid h,\sigma),
 V^{\mathrm{post}}_{\theta_{\mathrm{post}}}(h,\sigma))\}_{h\in\mathcal H_R},
-\ \text{optional } \mathbf V^{\mathrm{post}}_{\theta_{\mathrm{post}}}(\sigma),
-\ \text{optional } U^{\mathrm{post}}_{\theta_{\mathrm{post}}}(\sigma)
+\ \text{optional } T^{\mathrm{post}}_{\theta_{\mathrm{post}}}(\sigma),
+\ \text{optional } C^{\mathrm{post}}_{\theta_{\mathrm{post}}}(\sigma)
 \Big).
 $$
 
@@ -78,10 +78,11 @@ The model never receives the dealt private hand as a selected input. It
 computes one policy row for every actor hand class preflop or actor hand
 postflop. The action policy is factored into an action-type distribution and a
 conditional raise-size distribution. Board-impossible hands and illegal actions
-are masked outside the model. Optional public moment output heads exist
-structurally: $\mathbf V^\theta(\sigma)$ has one scalar per live player, and
-$U^\theta(\sigma)$ is a single public scalar. The production reducer emits no
-targets for them and no registered loss or branching controller consumes them.
+are masked outside the model. Public branching heads $T^\theta(\sigma)$ and
+$C^\theta(\sigma)$ are mandatory in branched training and receive reducer
+targets and registered losses from the first iteration. Fixed branching never
+uses them to choose rollout geometry. Dynamic branching begins using them for
+KKT intensity and queue-pressure control only after its fixed-beta warmup.
 
 ## Layer Notation
 
@@ -386,7 +387,7 @@ global stack endpoint.
 
 Binomial ticks remain an ablation.
 
-## Value And Public Moment Heads
+## Value And Public Branching Heads
 
 $$
 V_\theta(\xi,\sigma)=w_V^\top\operatorname{FFN}_V\big(\big[
@@ -395,7 +396,7 @@ $$
 
 There are no learned per-action value heads.
 
-For branched rollout training, either model may optionally emit public moment
+For branched rollout training, either model emits public branching
 heads read from final public/global and seat-summary activations rather than
 from actor hand-row states. Let $q_1,\dots,q_{P_{\max}}$ be the fixed
 button-relative seat order with empty seats zero-masked, and define
@@ -407,36 +408,23 @@ c^L_{\rm pub}=
 m^L_{\rm pub}=\operatorname{FFN}_{\rm pubmom}(c^L_{\rm pub}).
 $$
 
-For every live player $q\in\mathcal P_{\mathrm{live}}(\sigma)$,
+The public trace-variance and cost heads are
 
 $$
-\mathbf V^\theta_q(\sigma)
-=w_{\mathbf V}^\top
-\operatorname{FFN}_{\mathbf V}\big([m^L_{\rm pub},t_q,
-\rho_{\operatorname{pos}(q)},\alpha_{\operatorname{status}(q)}]\big)
-+b_{\mathbf V}.
-$$
-
-The public squared-return-moment head is
-
-$$
-U^\theta(\sigma)=
-\operatorname{softplus}\!\big(
-w_U^\top\operatorname{FFN}_{U}(m^L_{\rm pub})+b_U
+T^\theta(\sigma)=\operatorname{sigmoid}\!\big(
+w_T^\top\operatorname{FFN}_{T}(m^L_{\rm pub})+b_T
+\big),
+\qquad
+C^\theta(\sigma)=\exp\!\big(
+w_C^\top\operatorname{FFN}_{C}(m^L_{\rm pub})+b_C
 \big).
 $$
 
-The optional public-head output is
-
-$$
-\mathbf V^\theta(\sigma)\in\mathbb R^{|\mathcal P_{\mathrm{live}}(\sigma)|},
-\qquad
-U^\theta(\sigma)\in\mathbb R.
-$$
-
-$\mathbf V^\theta$ has one scalar per live player and $U^\theta$ is a single
-scalar estimating the squared-norm return moment used by the variance-based
-branching intensities in `core_math.tex`.
+They estimate respectively
+$\mathbb E(\widehat T(\mathsf s)\mid\ell(\mathsf s)=\sigma,
+N(\mathsf s)\geq2)$ and
+$\mathbb E(\widehat C^1(\mathsf s)\mid\ell(\mathsf s)=\sigma)$ from
+`core_math.tex`.
 
 ## Definitions of Layer Primitives
 

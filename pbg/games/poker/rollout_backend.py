@@ -992,21 +992,21 @@ class PokerRolloutBackend:
             for name, value in sample.raw.items()
         }
         value = torch.empty((batch, *sample.v.shape[1:]), dtype=sample.v.dtype, device=sample.v.device)
-        vvec = None if sample.vvec is None else torch.empty(
-            (batch, *sample.vvec.shape[1:]), dtype=sample.vvec.dtype, device=sample.vvec.device
+        t = None if sample.t is None else torch.empty(
+            (batch, *sample.t.shape[1:]), dtype=sample.t.dtype, device=sample.t.device
         )
-        u = None if sample.u is None else torch.empty(
-            (batch, *sample.u.shape[1:]), dtype=sample.u.dtype, device=sample.u.device
+        cost = None if sample.c is None else torch.empty(
+            (batch, *sample.c.shape[1:]), dtype=sample.c.dtype, device=sample.c.device
         )
         for positions, output in parts:
             for name in raw:
                 raw[name][positions] = output.raw[name]
             value[positions] = output.v
-            if vvec is not None and output.vvec is not None:
-                vvec[positions] = output.vvec
-            if u is not None and output.u is not None:
-                u[positions] = output.u
-        return PolicyOutput(raw=raw, v=value, vvec=vvec, u=u)
+            if t is not None and output.t is not None:
+                t[positions] = output.t
+            if cost is not None and output.c is not None:
+                cost[positions] = output.c
+        return PolicyOutput(raw=raw, v=value, t=t, c=cost)
 
     def _planned_policy_batches(
         self, model: nn.Module, states: Tensor, phase: str
@@ -1316,8 +1316,8 @@ class PokerRolloutBackend:
                         for name, value in output.raw.items()
                     },
                     v=output.v[:, self.combo_class],
-                    vvec=output.vvec,
-                    u=output.u,
+                    t=output.t,
+                    c=output.c,
                 )
             self.batch_size_histograms["preflop"].append(states.numel())
         else:
@@ -1727,7 +1727,7 @@ class PokerRolloutBackend:
             if output.v.shape[1] == self.n_classes:
                 output = PolicyOutput(
                     raw={name: value[:, self.combo_class] for name, value in output.raw.items()},
-                    v=output.v[:, self.combo_class], vvec=output.vvec, u=output.u,
+                    v=output.v[:, self.combo_class], t=output.t, c=output.c,
                 )
             parts.append((preflop, output))
             self.batch_size_histograms["preflop"].append(preflop.shape[0])

@@ -32,6 +32,10 @@ class TreeBatch:
     depth_player: Tensor
     state_ref: Tensor
     path_weight: Tensor
+    # Nominal randomized-rounded offspring and frozen rollout controller
+    # quantities. They are absent on sequential/legacy hand-built trees.
+    nominal_child_count: Tensor | None = None
+    branching_beta: Tensor | None = None
 
     def validate(self) -> None:
         """Raise ``ValueError`` when topology or rollout-law invariants fail."""
@@ -51,6 +55,21 @@ class TreeBatch:
                 raise ValueError(f"{name} must have shape [N]")
         if self.depth_p.ndim != 2 or self.depth_p.shape[0] != n:
             raise ValueError("depth_p must have shape [N,P_max]")
+        if self.nominal_child_count is not None and (
+            self.nominal_child_count.shape != (n,)
+            or self.nominal_child_count.dtype != torch.int32
+            or self.nominal_child_count.device != self.parent.device
+            or bool((self.nominal_child_count < 0).any())
+        ):
+            raise ValueError("nominal_child_count must be device-local nonnegative int32 [N]")
+        if self.branching_beta is not None and (
+            self.branching_beta.shape != (n,)
+            or self.branching_beta.dtype != torch.float32
+            or self.branching_beta.device != self.parent.device
+            or bool((~torch.isfinite(self.branching_beta)).any())
+            or bool((self.branching_beta < 0).any())
+        ):
+            raise ValueError("branching_beta must be device-local finite fp32 [N]")
         if p_max <= 0:
             raise ValueError("depth_p must have a positive player dimension")
         if self.child_ptr.ndim != 1 or self.child_ptr.numel() != n + 1:
@@ -612,6 +631,8 @@ class PolicyCache:
     old_logp_child: Tensor  # float32 [Nd,E,X]
     old_v: Tensor  # float32 [Nd,X]
     decision_reach: Any | None = None  # zero-copy-compatible natural input owner
+    old_t: Tensor | None = None  # float32 [Nd]
+    old_c: Tensor | None = None  # float32 [Nd]
 
     def __post_init__(self) -> None:
         if self.node_ids.ndim != 1 or self.node_ids.dtype != torch.int32:
@@ -622,6 +643,15 @@ class PolicyCache:
             raise ValueError("PolicyCache.old_v must have shape [Nd,X]")
         if self.old_logp_child.dtype != torch.float32 or self.old_v.dtype != torch.float32:
             raise ValueError("PolicyCache floating tensors must be fp32")
+        for name, value in (("old_t", self.old_t), ("old_c", self.old_c)):
+            if value is not None and (
+                value.shape != (self.node_ids.numel(),)
+                or value.dtype != torch.float32
+                or value.device != self.old_v.device
+                or bool((~torch.isfinite(value)).any())
+                or (name == "old_c" and bool((value <= 0).any()))
+            ):
+                raise ValueError(f"PolicyCache.{name} must be an aligned finite fp32 vector")
 
 
 @dataclass

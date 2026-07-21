@@ -6,7 +6,7 @@ from dataclasses import MISSING, dataclass, fields, is_dataclass
 import math
 from pathlib import Path
 from types import UnionType
-from typing import Any, TypeVar, Union, get_args, get_origin, get_type_hints
+from typing import Any, Literal, TypeVar, Union, get_args, get_origin, get_type_hints
 
 import numpy as np
 import torch
@@ -27,6 +27,21 @@ class GameConfig:
 
 
 @dataclass
+class AdaptiveKKTConfig:
+    """Dynamic public branching and queue-pressure control parameters."""
+
+    beta_max: float
+    warmup_iters: int
+    target_tree_size: float
+    safe_tree_size: float
+    kappa_initial: float
+    kappa_min: float
+    kappa_max: float
+    gamma_kappa: float
+    eta_kappa: float
+
+
+@dataclass
 class RolloutConfig:
     """Configure rollout storage and optional branching intensity.
 
@@ -38,6 +53,7 @@ class RolloutConfig:
     sequential_roots_per_gpu_initial: int
     beta: dict[str, float] | None
     node_budget: int
+    branching_mode: Literal["fixed", "dynamic"] | None = None
     sequential_roots_per_gpu_minimum: int | None = None
     sequential_roots_per_gpu_maximum: int | None = None
     family_batch_rows: int | None = None
@@ -48,6 +64,7 @@ class RolloutConfig:
     memory_growth_fraction: float = 0.10
     memory_growth_delay: int = 8
     memory_prediction_z: float = 3.0
+    adaptive_kkt: AdaptiveKKTConfig | None = None
 
     def __post_init__(self) -> None:
         self.roots_per_gpu = int(self.sequential_roots_per_gpu_initial)
@@ -74,6 +91,9 @@ class LossConfig:
     entropy_schedule: str
     value_loss: str = "mse"
     c_kl: float = 0.0
+    c_t: float = 0.0
+    c_c: float = 0.0
+    epsilon_t: float = 1.0e-6
 
 
 @dataclass
@@ -196,6 +216,11 @@ def _convert_value(value: Any, annotation: Any, path: str) -> Any:
             _convert_value(item, item_type, f"{path}[{index}]")
             for index, (item, item_type) in enumerate(zip(value, args, strict=True))
         )
+    if origin is Literal:
+        if value not in args:
+            expected = ", ".join(repr(item) for item in args)
+            raise ConfigError(f"{path}: expected one of {expected}")
+        return value
     if annotation is Any:
         return value
     if annotation is bool:
@@ -277,6 +302,11 @@ def _validate_config(cfg: RootConfig) -> None:
                 )
             cfg.probe.target_sha256 = digest
     if cfg.training.mode == "branched_rao_blackwell":
+        if cfg.rollout.branching_mode is None:
+            raise ConfigError(
+                "root.rollout.branching_mode: branched_rao_blackwell requires "
+                "an explicit 'fixed' or 'dynamic' mode"
+            )
         if cfg.rollout.beta is None or "default" not in cfg.rollout.beta:
             raise ConfigError(
                 "root.rollout.beta.default: required for branched_rao_blackwell"
@@ -292,10 +322,55 @@ def _validate_config(cfg: RootConfig) -> None:
                 "branched_rao_blackwell; "
                 "production creates exactly one root per rank"
             )
-    elif cfg.rollout.beta is not None:
+    else:
+        if cfg.rollout.branching_mode is not None:
+            raise ConfigError(
+                "root.rollout.branching_mode: only valid for branched_rao_blackwell"
+            )
+        if cfg.rollout.beta is not None:
+            raise ConfigError(
+                f"root.rollout.beta: only valid for branched_rao_blackwell, not {cfg.training.mode}"
+            )
+    adaptive = cfg.rollout.adaptive_kkt
+    if cfg.rollout.branching_mode == "dynamic" and adaptive is None:
         raise ConfigError(
-            f"root.rollout.beta: only valid for branched_rao_blackwell, not {cfg.training.mode}"
+            "root.rollout.adaptive_kkt: required when branching_mode is 'dynamic'"
         )
+    if cfg.rollout.branching_mode != "dynamic" and adaptive is not None:
+        raise ConfigError(
+            "root.rollout.adaptive_kkt: only valid when branching_mode is 'dynamic'"
+        )
+    if adaptive is not None:
+        for name in (
+            "beta_max", "target_tree_size", "safe_tree_size", "kappa_initial",
+            "kappa_min", "kappa_max", "gamma_kappa", "eta_kappa",
+        ):
+            positive(f"root.rollout.adaptive_kkt.{name}", getattr(adaptive, name))
+        if isinstance(adaptive.warmup_iters, bool) or adaptive.warmup_iters < 0:
+            raise ConfigError(
+                "root.rollout.adaptive_kkt.warmup_iters: expected a nonnegative integer"
+            )
+        if adaptive.beta_max < 1.0:
+            raise ConfigError("root.rollout.adaptive_kkt.beta_max: must be at least one")
+        if adaptive.safe_tree_size < 1.0:
+            raise ConfigError("root.rollout.adaptive_kkt.safe_tree_size: must be at least one")
+        if not adaptive.kappa_min <= adaptive.kappa_initial <= adaptive.kappa_max:
+            raise ConfigError(
+                "root.rollout.adaptive_kkt kappa values must satisfy min <= initial <= max"
+            )
+        if adaptive.gamma_kappa > 1.0 or adaptive.eta_kappa > 1.0:
+            raise ConfigError(
+                "root.rollout.adaptive_kkt gamma_kappa and eta_kappa must be in (0,1]"
+            )
+    if cfg.training.mode == "branched_rao_blackwell":
+        if not bool(cfg.model.get("use_branching_heads", False)):
+            raise ConfigError(
+                "root.model.use_branching_heads: must be true in both branching modes"
+            )
+        if cfg.loss.c_t <= 0.0 or cfg.loss.c_c <= 0.0:
+            raise ConfigError(
+                "root.loss.c_t and root.loss.c_c must be positive in both branching modes"
+            )
     initial = cfg.rollout.sequential_roots_per_gpu_initial
     minimum = cfg.rollout.sequential_roots_per_gpu_minimum
     maximum = cfg.rollout.sequential_roots_per_gpu_maximum
@@ -342,6 +417,9 @@ def _validate_config(cfg: RootConfig) -> None:
     nonnegative("root.loss.c_v", cfg.loss.c_v)
     nonnegative("root.loss.c_h", cfg.loss.c_h)
     nonnegative("root.loss.c_kl", cfg.loss.c_kl)
+    nonnegative("root.loss.c_t", cfg.loss.c_t)
+    nonnegative("root.loss.c_c", cfg.loss.c_c)
+    positive("root.loss.epsilon_t", cfg.loss.epsilon_t)
     if cfg.training.iters <= 0:
         raise ConfigError("root.training.iters: expected a positive integer")
     if cfg.training.gd_steps_per_iter <= 0:

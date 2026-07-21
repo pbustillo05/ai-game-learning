@@ -31,7 +31,7 @@ def _scientific(n_players: int = 2) -> dict:
             "class_embedding_dim": 4,
             "ffn_hidden": 24,
             "folder_beta_rank": 0,
-            "use_moment_heads": True,
+            "use_branching_heads": True,
         },
     }
 

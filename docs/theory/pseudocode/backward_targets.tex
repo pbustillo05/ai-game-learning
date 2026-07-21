@@ -162,8 +162,9 @@ $\widehat P_d=n_d^{-1}\sum_{a=a_d}^{a_d+n_d-1}
 \mathtt{childPosterior}[a]$ is derived in the loss gather.}
 Assert the outputs and propagated moments equal
 \texttt{core\_math.tex}, Eqs.~\textnormal{(branched-backward-updates)} and
-\textnormal{(branched-targets)} after projecting to the fixed-intensity PPO v1
-value and advantage arguments; the optional $Q$ target is deliberately deferred;
+\textnormal{(branched-targets)} after projecting to the production PPO value,
+advantage, trace-variance, and cost arguments; the optional $Q$ target is
+deliberately deferred;
 \Return{$\Obj{FinalizeTrainingStorage}(\Obj{RolloutStorage})$};
 \end{algorithm}
 

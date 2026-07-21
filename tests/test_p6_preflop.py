@@ -20,7 +20,7 @@ def _config(*, moment: bool = False, players: int = 3) -> PokerModelConfig:
         max_players=players,
         class_embedding_dim=4,
         ffn_hidden=32,
-        use_moment_heads=moment,
+        use_branching_heads=moment,
     )
 
 
@@ -73,8 +73,8 @@ def test_preflop_forward_shapes_fp32_and_autocast() -> None:
     for name in ("omega", "mu", "s"):
         assert output.raw[name].shape == (2, 169, 2)
     assert output.raw["iota"].shape == output.v.shape == (2, 169)
-    assert output.vvec is not None and output.vvec.shape == (2, 3)
-    assert output.u is not None and output.u.shape == (2,)
+    assert output.t is not None and output.t.shape == (2,)
+    assert output.c is not None and output.c.shape == (2,)
     assert all(tensor.dtype == torch.float32 for tensor in output.raw.values())
     assert output.v.dtype == torch.float32
 
@@ -125,7 +125,7 @@ def test_gradient_reaches_every_parameter() -> None:
     pub, ranges = _inputs(batch=2)
     pub.status[0] = torch.tensor([0, 1, 2])
     output = model(pub, ranges)
-    tensors = list(output.raw.values()) + [output.v, output.vvec, output.u]
+    tensors = list(output.raw.values()) + [output.v, output.t, output.c]
     loss = sum((tensor * torch.randn_like(tensor)).sum() for tensor in tensors if tensor is not None)
     loss.backward()
     missing = [name for name, parameter in model.named_parameters() if parameter.grad is None]

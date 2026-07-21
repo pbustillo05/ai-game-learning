@@ -10,6 +10,11 @@ code.
 | `rao_blackwell` | common per-GPU independent roots | sibling-evaluator posterior at each pre-terminal leaf | `rb_ppo` |
 | `branched_rao_blackwell` | one distinguished root/tree per rank | sibling-evaluator posterior at every sampled leaf | `rb_ppo` |
 
+Branched training has an additional required `rollout.branching_mode` selector.
+`fixed` uses the configured beta map for every iteration. `dynamic` uses that
+same map during warmup, then enables public T/C-driven KKT control. Both modes
+instantiate, target, optimize, and checkpoint the T/C heads from iteration zero.
+
 ## Family-scheduled rollout
 
 `pbg/core/execution.py` owns the occurrence arena, byte accountant, bounded work

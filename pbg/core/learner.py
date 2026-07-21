@@ -18,6 +18,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 
+from pbg.core.adaptive_branching import gamma_deviance
 from pbg.core.losses import _entropy_coefficient
 from pbg.core.optimization import (
     FlatGradientBuffer,
@@ -705,6 +706,10 @@ def mode_loss(
     clipped_value = getattr(loss_cfg, "value_loss", "mse") == "clipped"
     eps_v = float(getattr(loss_cfg, "clip_eps_v"))
     natural_value = output.v
+    branching_t = natural_value.new_zeros(natural_value.shape[0])
+    branching_c = natural_value.new_zeros(natural_value.shape[0])
+    branching_t_raw = natural_value.new_zeros(natural_value.shape[0])
+    branching_c_raw = natural_value.new_zeros(natural_value.shape[0])
 
     columns = partition.columns
     if mode == "normal":
@@ -827,7 +832,29 @@ def mode_loss(
         value = (weight * value_elements(target, old_value_natural)).sum(1)
         entropy_loss = (weight * (-entropy_coefficient * entropy)).sum(1)
         kl_loss = (weight * (c_kl * reference_kl)).sum(1)
-        per_decision = policy + value + entropy_loss + kl_loss
+        if "trace_variance_hat" in columns or "cost_hat" in columns:
+            if output.t is None or output.c is None:
+                raise ValueError("adaptive branching targets require model T/C heads")
+            if "trace_variance_hat" not in columns or "cost_hat" not in columns:
+                raise ValueError("adaptive branching target columns are incomplete")
+            t_mask = _column(columns, "trace_variance_mask")[rows]
+            if t_mask.dtype != torch.bool:
+                raise TypeError("trace_variance_mask must be boolean")
+            branching_t_raw = gamma_deviance(
+                output.t.float(),
+                _column(columns, "trace_variance_hat")[rows].to(output.t).float(),
+                shift=float(getattr(loss_cfg, "epsilon_t")),
+            )
+            branching_t_raw = torch.where(
+                t_mask, branching_t_raw, torch.zeros_like(branching_t_raw)
+            )
+            branching_c_raw = gamma_deviance(
+                output.c.float(),
+                _column(columns, "cost_hat")[rows].to(output.c).float(),
+            )
+            branching_t = float(getattr(loss_cfg, "c_t")) * branching_t_raw
+            branching_c = float(getattr(loss_cfg, "c_c")) * branching_c_raw
+        per_decision = policy + value + entropy_loss + kl_loss + branching_t + branching_c
     elif mode != "normal":
         raise ValueError(f"unsupported production-v1 mode {mode!r}")
 
@@ -839,6 +866,10 @@ def mode_loss(
             "value_sum": value.detach().sum(),
             "entropy_loss_sum": entropy_loss.detach().sum(),
             "reference_kl_sum": kl_loss.detach().sum(),
+            "trace_variance_raw_sum": branching_t_raw.detach().sum(),
+            "cost_raw_sum": branching_c_raw.detach().sum(),
+            "trace_variance_loss_sum": branching_t.detach().sum(),
+            "cost_loss_sum": branching_c.detach().sum(),
             "posterior_mass": weight.detach().sum(),
             "ratio_max": ratio.detach().max(),
             "clip_num": was_clipped.detach().to(torch.float32).sum(),
@@ -1335,6 +1366,10 @@ class DistributedFixedRolloutUpdate:
                         "value_sum",
                         "entropy_loss_sum",
                         "reference_kl_sum",
+                        "trace_variance_raw_sum",
+                        "cost_raw_sum",
+                        "trace_variance_loss_sum",
+                        "cost_loss_sum",
                     ):
                         term = normalization * result.stats[name]
                         objective_terms[name] = objective_terms.get(name, term.new_zeros(())) + term
@@ -1399,6 +1434,10 @@ class DistributedFixedRolloutUpdate:
             "value_sum": "value",
             "entropy_loss_sum": "entropy_loss",
             "reference_kl_sum": "reference_kl",
+            "trace_variance_raw_sum": "trace_variance_raw",
+            "cost_raw_sum": "cost_raw",
+            "trace_variance_loss_sum": "trace_variance_loss",
+            "cost_loss_sum": "cost_loss",
         }
         for source_name, target_name in metric_names.items():
             metrics[target_name] = float(objective_terms.get(source_name, torch.zeros(())))

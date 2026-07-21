@@ -49,7 +49,7 @@ def _cfg(summary_dim: int = 0):
     return PokerModelConfig(
         d_model=16, n_heads=4, n_layers_pre=1, n_layers_post=1,
         m_raise=2, k_act=5, max_players=2, class_embedding_dim=4,
-        evaluator_summary_dim=summary_dim, ffn_hidden=24, use_moment_heads=True,
+        evaluator_summary_dim=summary_dim, ffn_hidden=24, use_branching_heads=True,
     )
 
 
@@ -73,8 +73,8 @@ def test_postflop_forward_scatter_summary_and_autocast():
     assert output.raw["type_logits"].shape == (2, 1326, 3)
     assert output.raw["omega"].shape == output.raw["mu"].shape == output.raw["s"].shape == (2, 1326, 2)
     assert output.raw["iota"].shape == output.v.shape == (2, 1326)
-    assert output.vvec is not None and output.vvec.shape == (2, 2)
-    assert output.u is not None and output.u.shape == (2,)
+    assert output.t is not None and output.t.shape == (2,)
+    assert output.c is not None and output.c.shape == (2,)
     assert torch.count_nonzero(output.v[0, 12:]) == 0
     changed = {"opaque_query_rows": masks.evaluator_summary["opaque_query_rows"] + 2.0}
     other = model(pub, ranges, masks=PostflopMasks(masks.compatibility, evaluator_summary=changed))

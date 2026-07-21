@@ -10,6 +10,11 @@
 | `rao_blackwell` | sampled profile/path cut at completion leaf | posterior mass and actor-type value | `rb_ppo` |
 | `branched_rao_blackwell` | one labeled sampled tree per rank | posterior-moment sibling targets | `rb_ppo` |
 
+`branched_rao_blackwell` requires `rollout.branching_mode: fixed | dynamic`.
+Both choices train and checkpoint public T/C heads. Fixed mode always follows
+the configured beta schedule; dynamic mode follows it through warmup and only
+then lets T/C and the KKT controller alter rollout geometry.
+
 `pbg.config` and `pbg.runtime` are the NLHE composition roots. Generic modules
 under `pbg.core` never import a game. `pbg.games.poker` implements the core
 protocols, and `pbg.eval` owns read-only duplicate-deal evaluation. There is no

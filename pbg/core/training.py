@@ -11,6 +11,7 @@ import os
 import platform
 import time
 import uuid
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -21,6 +22,7 @@ import torch.distributed as dist
 from torch import Tensor, nn
 
 from pbg.core.config import RootConfig, seed_all
+from pbg.core.adaptive_branching import AdaptiveKKTController
 from pbg.core.checkpointing import (
     _capture_rng_state,
     config_dict_fingerprint,
@@ -517,7 +519,7 @@ def _analytical_memory_plan(
         ),
     )
     topology = nodes * (
-        int32 * (6 + players) + fp32 * 2
+        int32 * (6 + players) + fp32 * 2 + (0 if sequential else int32 + fp32)
     )
     dense_reach = nodes * players * types * fp32
     reach_row = players * types * fp32
@@ -534,9 +536,14 @@ def _analytical_memory_plan(
     # Sequential poker currently requests full [P,H] decision reaches. Include
     # the node/state/owner indices retained by DecisionReachCache as well.
     decision_reach = dense_reach + nodes * 3 * int32
+    model_cfg = getattr(cfg, "model", {})
+    branching_head_cache = 2 * fp32 if (
+        not sequential and bool(model_cfg.get("use_branching_heads", False))
+    ) else 0
     policy_cache = nodes * (
-        (retained_events * types + types) * fp32 + int32
+        (retained_events * types + types) * fp32 + int32 + branching_head_cache
     )
+    branching_target_bytes = 0 if sequential else 2 * fp32 + int32 + 1
     rb_targets = (
         0
         if cfg.training.mode == "normal"
@@ -546,6 +553,7 @@ def _analytical_memory_plan(
             + int32  # node id
             + retained_events * (int32 + 1)  # child event and mask
             + int32  # child count
+            + branching_target_bytes  # T/C, nominal child count, T mask
         )
     )
     # Once single-child target validation completes, child_p_hat aliases
@@ -557,6 +565,7 @@ def _analytical_memory_plan(
         * (
             (2 + retained_events) * types * fp32
             + int32
+            + branching_target_bytes
             + retained_events * (int32 + 1)
             + int32
         )
@@ -846,6 +855,7 @@ def _build_iteration_data(
     profile: bool = False,
     frozen_model: nn.Module | None = None,
     iteration: int = 0,
+    branching_controller: Any | None = None,
 ) -> _RolloutSealInput:
     """Build compact training data in a frame that owns all frozen transients.
 
@@ -894,7 +904,8 @@ def _build_iteration_data(
             device_type=device.type, enabled=amp_enabled, dtype=amp_dtype
         ):
             return sample_trees(
-                frozen_bundle, cfg, torch_gen, iteration=iteration
+                frozen_bundle, cfg, torch_gen, iteration=iteration,
+                branching_controller=branching_controller,
             )
 
     with torch.no_grad():
@@ -986,7 +997,12 @@ def _build_iteration_data(
         ).squeeze(1)
         if bundle.completion_backend is None or cfg.completion.n_samples is None:
             raise RuntimeError("RB modes require a completion backend and sample budget")
-        heads = HeadEvals(node_ids=policy_cache.node_ids, v=policy_cache.old_v)
+        heads = HeadEvals(
+            node_ids=policy_cache.node_ids,
+            v=policy_cache.old_v,
+            t=policy_cache.old_t,
+            c=policy_cache.old_c,
+        )
         workspace_bytes = _value_workspace_budget(cfg, device)
         completion_rows = _completion_batch_rows(
             bundle, int(leaf_ids.numel()), workspace_bytes
@@ -1149,6 +1165,59 @@ def _build_iteration_data(
                 "offspring_max": float(offspring.max()),
             }
         )
+        branched = cfg.training.mode == "branched_rao_blackwell"
+        if branched and (policy_cache.old_t is None or policy_cache.old_c is None):
+            raise RuntimeError("branched rollout did not retain frozen T/C heads")
+        dynamic = cfg.rollout.branching_mode == "dynamic"
+        adaptive = cfg.rollout.adaptive_kkt
+        if dynamic:
+            if adaptive is None:
+                raise RuntimeError("dynamic branching has no adaptive KKT configuration")
+            decision_ids = policy_cache.node_ids.to(torch.int64)
+            executed = offspring[decision_ids].to(torch.float32)
+            nominal = (
+                executed
+                if tree.nominal_child_count is None
+                else tree.nominal_child_count[decision_ids].to(torch.float32)
+            )
+            beta_values = (
+                nominal
+                if tree.branching_beta is None
+                else tree.branching_beta[decision_ids]
+            )
+            profile_metrics.update(
+                {
+                    "beta_mean": float(beta_values.mean()),
+                    "beta_max": float(beta_values.max()),
+                    "realized_child_count_mean": float(executed.mean()),
+                    "realized_child_count_max": float(executed.max()),
+                    "beta_min_clip_rate": float((beta_values <= 1.0).float().mean()),
+                    "beta_max_clip_rate": float(
+                        (beta_values >= float(adaptive.beta_max)).float().mean()
+                    ),
+                    "tree_size_vs_M": float(tree.owner.numel()) / float(adaptive.target_tree_size),
+                }
+            )
+            profile_metrics.update(
+                {
+                    key: float(value)
+                    for key, value in getattr(tree, "branching_diagnostics", {}).items()
+                }
+            )
+            if iteration >= int(adaptive.warmup_iters):
+                counterfactual = float(tree.owner.numel()) + float(
+                    ((nominal - executed) * policy_cache.old_c).sum()
+                )
+                if dist.is_available() and dist.is_initialized():
+                    shared_counterfactual = torch.tensor(
+                        counterfactual, dtype=torch.float64, device=device
+                    )
+                    dist.all_reduce(shared_counterfactual, op=dist.ReduceOp.SUM)
+                    counterfactual = float(shared_counterfactual) / dist.get_world_size()
+                profile_metrics["counterfactual_tree_size"] = counterfactual
+                if branching_controller is None:
+                    raise RuntimeError("adaptive rollout has no KKT controller")
+                profile_metrics.update(branching_controller.observe(counterfactual))
         _decision_street_metrics(
             profile_metrics,
             bundle.rollout_backend,
@@ -1169,6 +1238,10 @@ def _build_iteration_data(
                     "completion_effective_samples": completion_effective,
                     "retained_target_bytes": float(retained),
                 }
+            )
+        if branched:
+            profile_metrics["missing_T_target_rate"] = float(
+                (~targets.t_mask).float().mean()
             )
         return _RolloutSealInput(
             normal=False,
@@ -1380,6 +1453,15 @@ def _seal_iteration_training_storage(
                     "value_hat": data.targets.v_hat[rows].detach().to(torch.float32),
                 }
             )
+            if cfg.training.mode == "branched_rao_blackwell":
+                columns.update(
+                    {
+                        "trace_variance_hat": data.targets.t_hat[rows].detach().to(torch.float32),
+                        "trace_variance_mask": data.targets.t_mask[rows].detach(),
+                        "cost_hat": data.targets.c_hat[rows].detach().to(torch.float32),
+                        "nominal_child_count": data.targets.nominal_child_count[rows].detach().to(torch.int32),
+                    }
+                )
             counts = data.targets.child_count[rows].to(torch.int64)
             flat_mask = data.targets.child_mask[rows].reshape(-1)
             old_logp = data.policy_cache.old_logp_child[rows].reshape(-1, backend.n_hands)[flat_mask]
@@ -1582,6 +1664,7 @@ def _one_iteration(
     profile: bool = False,
     reference_model: nn.Module | None = None,
     validate_identity: bool = False,
+    branching_controller: Any | None = None,
 ) -> dict[str, Any]:
     spec = _loss_spec(cfg)
     execution_metrics = getattr(bundle.rollout_backend, "execution_metrics", None)
@@ -1617,6 +1700,7 @@ def _one_iteration(
         spec,
         profile=profile,
         iteration=iteration,
+        branching_controller=branching_controller,
     )
     if profile:
         memory_metrics.update(
@@ -2033,9 +2117,29 @@ def run_training(
         try:
             bundle.model.load_state_dict(initialized_model_state)
         except RuntimeError as exc:
-            raise RuntimeError(
-                "init checkpoint model architecture does not match the current config"
-            ) from exc
+            if cfg.training.mode != "branched_rao_blackwell":
+                raise RuntimeError(
+                    "init checkpoint model architecture does not match the current config"
+                ) from exc
+            incompatible = bundle.model.load_state_dict(
+                initialized_model_state, strict=False
+            )
+            allowed_missing = {
+                name for name in bundle.model.state_dict()
+                if ".branching_heads." in name or name.startswith("branching_heads.")
+            }
+            missing = set(incompatible.missing_keys)
+            if incompatible.unexpected_keys or missing != allowed_missing:
+                raise RuntimeError(
+                    "init checkpoint is incompatible beyond absent T/C branching heads; "
+                    f"missing={sorted(missing)}, unexpected={sorted(incompatible.unexpected_keys)}"
+                ) from exc
+            warnings.warn(
+                "initialized T/C branching heads from current defaults because the explicit "
+                "init checkpoint predates them; optimizer/controller state starts fresh",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     if target_payload is not None:
         assert target_model_builder is not None and cfg.probe is not None
         opponent = target_model_builder(
@@ -2090,6 +2194,7 @@ def run_training(
     start_iteration = 0
     run_id: str | None = None
     restored_memory_state: Mapping[str, Any] | None = None
+    restored_branching_state: Mapping[str, Any] | None = None
     resume_path = None if resume_from is None else Path(resume_from)
     logical_work = {
         "trajectories": 0,
@@ -2136,6 +2241,19 @@ def run_training(
             restored_memory_state = checkpoint_metadata["adaptive_work_state"]
             if restored_memory_state is None:
                 raise RuntimeError("sequential resume checkpoint has no memory controller state")
+        if cfg.rollout.branching_mode == "dynamic":
+            restored_branching_state = checkpoint_metadata.get(
+                "branching_controller_state"
+            )
+            if restored_branching_state is None:
+                raise RuntimeError(
+                    "adaptive KKT resume checkpoint has no branching controller state"
+                )
+        elif checkpoint_metadata.get("branching_controller_state") is not None:
+            raise RuntimeError(
+                "fixed branching resume checkpoint unexpectedly contains dynamic "
+                "controller state"
+            )
         if not run_id:
             raise RuntimeError("checkpoint predates run identities and cannot be resumed safely")
         if device.type == "cuda":
@@ -2150,6 +2268,16 @@ def run_training(
     )
     _validate_memory_preflight(allocation_cfg, device, memory_plan)
     memory_controller: SequentialMemoryController | None = None
+    branching_controller: AdaptiveKKTController | None = None
+    adaptive_cfg = cfg.rollout.adaptive_kkt
+    if cfg.rollout.branching_mode == "dynamic":
+        if adaptive_cfg is None:
+            raise RuntimeError("dynamic branching has no adaptive KKT configuration")
+        branching_controller = (
+            AdaptiveKKTController.from_state_dict(restored_branching_state)
+            if restored_branching_state is not None
+            else AdaptiveKKTController.from_config(adaptive_cfg)
+        )
     if sequential_memory_control:
         maximum = int(cfg.rollout.sequential_roots_per_gpu_maximum)
         phase_parts = {
@@ -2323,6 +2451,10 @@ def run_training(
                         reference_model=reference_model,
                         reference_iteration=reference_iteration,
                         adaptive_work_state=memory_controller.state_dict(),
+                        branching_controller_state=(
+                            None if branching_controller is None
+                            else branching_controller.state_dict()
+                        ),
                         probe_target=probe_target,
                         logical_work=logical_work,
                     )
@@ -2357,6 +2489,7 @@ def run_training(
             profile=True,
             reference_model=reference_model,
             validate_identity=iteration == start_iteration,
+            branching_controller=branching_controller,
         )
         if resume_path is not None and iteration == start_iteration:
             for key in tuple(metrics):
@@ -2512,6 +2645,10 @@ def run_training(
                     None
                     if memory_controller is None
                     else memory_controller.state_dict()
+                ),
+                branching_controller_state=(
+                    None if branching_controller is None
+                    else branching_controller.state_dict()
                 ),
                 probe_target=probe_target,
                 logical_work=logical_work,

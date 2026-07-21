@@ -4,6 +4,7 @@ game:
   rank_count: 13
 rollout:
   sequential_roots_per_gpu_initial: 1
+  branching_mode: fixed
   beta:
     # A 600-iteration launch gate at 1.10 doubled mean decision coverage while
     # keeping the largest observed tree at 681/4,096 nodes.  The old 1.25
@@ -28,6 +29,7 @@ model:
   m_raise: 4
   k_act: 7
   max_players: 6
+  use_branching_heads: true
 training:
   mode: branched_rao_blackwell
   # This is a ceiling for a wall-clock-limited seven-hour launch.  Runtime
@@ -58,5 +60,7 @@ loss:
   c_v: 0.0005
   c_h: 0.1
   c_kl: 0.2
+  c_t: 1.0
+  c_c: 1.0
   entropy_schedule: const
   value_loss: clipped

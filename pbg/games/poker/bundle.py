@@ -70,6 +70,7 @@ def estimate_rollout_memory(
     max_history_tokens: int = 1,
     folder_beta_rank: int = 16,
     partition_cache_materialized: bool = True,
+    use_branching_heads: bool = False,
 ) -> PokerRolloutMemoryPlan:
     """Estimate worst-case rollout bytes before allocating a poker backend.
 
@@ -105,7 +106,8 @@ def estimate_rollout_memory(
         ),
         # Selected policy likelihoods and values are retained only for realized
         # player edges/nodes, but this remains a safe capacity bound.
-        policy_cache_bytes=(edge_capacity + capacity) * n_hands * 4,
+        policy_cache_bytes=(edge_capacity + capacity) * n_hands * 4
+        + (2 * capacity * 4 if use_branching_heads else 0),
         partition_cache_bytes=(
             DevicePartitionSummaryCache.storage_nbytes(
                 capacity,
@@ -597,6 +599,7 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         max_history_tokens=state_history_steps,
         folder_beta_rank=model_cfg.folder_beta_rank,
         partition_cache_materialized=model_cfg.evaluator_summary_dim > 0,
+        use_branching_heads=model_cfg.use_branching_heads,
     )
     _preflight_cuda_rollout(
         plan,

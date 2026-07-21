@@ -36,7 +36,12 @@ contracts. `training.mode` is `normal`, `rao_blackwell`, or
 null`, and `rollout.beta: null`. Sequential RB requires `rb_ppo`, positive
 completion samples, and `beta: null`. Branched RB uses `rb_ppo`, positive
 completion samples, all three sequential-root fields set to `1`, and a beta mapping containing a
-finite `default >= 1`.
+finite `default >= 1`. It must also set `rollout.branching_mode` to `fixed` or
+`dynamic`, enable `model.use_branching_heads`, and use positive `loss.c_t` and
+`loss.c_c`. Fixed mode follows the beta map for the whole run. Dynamic mode
+requires `rollout.adaptive_kkt`, follows the beta map during warmup, and enables
+T/C-driven KKT rollout control only afterward. The legacy
+`adaptive_kkt.enabled` switch is rejected.
 
 In sequential modes, the controller selects one common per-GPU root width from
 the phase-wise memory budget before any current-iteration draw. Unsafe evidence

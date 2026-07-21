@@ -263,17 +263,18 @@ later defining recursion.
 
 ---
 
-## 9. Fixed intensities (v1)
+## 9. Branching intensity modes
 
 The active implementation exposes `training.mode` as `normal`,
 `rao_blackwell`, or `branched_rao_blackwell`. Only the branched mode accepts a
 `rollout.beta` map. A game-owned batched `beta_fn(states) -> float32[B]` returns
 public-stage-dependent values in [1,∞) for poker's preflop/flop/turn/river and
-optional chance-transition buckets. There is no learned controller state.
-
-The Neyman proxy based on public **V** and U heads remains a deliberately
-naïve research direction in `core_math.tex`. Its heads, estimators, losses and
-bucket updates are deferred until the correct variance/cost objective is known.
+optional chance-transition buckets. Every branched configuration explicitly
+selects `rollout.branching_mode: fixed | dynamic`. Both modes instantiate and
+train the public trace-variance T and cost C heads from iteration zero. `fixed`
+uses `beta_fn` throughout and has no branching controller. `dynamic` uses the
+same fixed schedule while `iteration < adaptive_kkt.warmup_iters`; only after
+that boundary may rollout geometry and the KKT controller consume T/C.
 
 ---
 
@@ -326,9 +327,10 @@ Entropy follows `entropy_schedule`; all type sums are explicitly masked.
   postflop), pre-LN trunk,
   key-side reach prior added un-tempered, learned transforms of evaluator-supplied
   partition fields, factored type × DLogisticTick raise head,
-  actor-row V head. Optional public moment output heads exist structurally but
-  have no registered target, loss, or controller; the suit-consistency loss is
-  deferred. Compact H_B tokenization is the default (CONTRACTS §5-P7).
+  actor-row V head. Branched training requires public trace-variance T and cost
+  C heads with registered targets and losses in both branching modes; only
+  post-warmup dynamic rollout control consumes them. The suit-consistency loss
+  is deferred. Compact H_B tokenization is the default (CONTRACTS §5-P7).
 - **Preflop gauge symmetry.** Preflop net is class-native ($R^2$ classes; 169
   for $R=13$); deterministic
   combo-to-class aggregation may live in `cards.py`/`ranges.py` because it is a

@@ -10,7 +10,7 @@ import torch
 from torch import Tensor, nn
 
 from pbg.games.poker.cards import DeckGeometry
-from pbg.games.poker.model.heads import MomentHeads, RaiseMixtureHead, TypeHead, ValueHead
+from pbg.games.poker.model.heads import PublicBranchingHeads, RaiseMixtureHead, TypeHead, ValueHead
 from pbg.games.poker.model.incidence import IncidenceResidual
 from pbg.games.poker.model.primitives import FFN, LN, MHA
 
@@ -40,7 +40,7 @@ class PokerModelConfig:
     class_embedding_dim: int = 32
     evaluator_summary_dim: int = 0
     ffn_hidden: int | None = None
-    use_moment_heads: bool = False
+    use_branching_heads: bool = False
     max_history_tokens: int = 256
     folder_beta_rank: int = 16
     folder_line_dim: int = 8
@@ -61,8 +61,8 @@ class PokerModelConfig:
             isinstance(self.ffn_hidden, bool) or not isinstance(self.ffn_hidden, int)
         ):
             raise TypeError("ffn_hidden must be an integer when supplied")
-        if type(self.use_moment_heads) is not bool:
-            raise TypeError("use_moment_heads must be bool")
+        if type(self.use_branching_heads) is not bool:
+            raise TypeError("use_branching_heads must be bool")
         for name in ("s_min", "eps"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -97,6 +97,12 @@ class PokerModelConfig:
         """Parse ``RootConfig.model`` while rejecting unknown model keys."""
 
         data = dict(values or {})
+        legacy_moments = data.pop("use_moment_heads", None)
+        if legacy_moments not in (None, False):
+            raise ValueError(
+                "root.model.use_moment_heads: V/U heads were removed; set "
+                "use_branching_heads: true and migrate the checkpoint explicitly"
+            )
         if "p_max" in data:
             if "max_players" in data:
                 raise ValueError(
@@ -196,8 +202,8 @@ class PolicyOutput:
 
     raw: dict[str, Tensor]
     v: Tensor  # [B,K]
-    vvec: Tensor | None = None  # [B,P_max]
-    u: Tensor | None = None  # [B]
+    t: Tensor | None = None  # [B]
+    c: Tensor | None = None  # [B]
 
 
 def _mask_value(masks: PreflopMasks | Mapping[str, Tensor] | Tensor | None, name: str) -> Tensor | None:
@@ -271,7 +277,11 @@ class PreflopNet(nn.Module):
         self.type_head = TypeHead(d)
         self.raise_head = RaiseMixtureHead(d, c.m_raise, c.s_min)
         self.value_head = ValueHead(readout_dim, feature_dim=d, hidden=c.ffn_hidden)
-        self.moment_heads = MomentHeads(2 * d, d, c.ffn_hidden) if c.use_moment_heads else None
+        branching_dim = (2 + c.max_players) * d
+        self.branching_heads = (
+            PublicBranchingHeads(branching_dim, d, c.ffn_hidden)
+            if c.use_branching_heads else None
+        )
 
         sizes = torch.tensor(
             [len(members) for members in self.geometry.class_memberships],
@@ -692,18 +702,16 @@ class PreflopNet(nn.Module):
         omega, mu, scale, iota = self.raise_head(z_raise, z_type)
         value = self.value_head(readout)
 
-        vvec: Tensor | None = None
-        u: Tensor | None = None
-        if self.moment_heads is not None:
-            moment_public = torch.cat((global_feature, public_mean), dim=-1)
-            padded_mask = torch.zeros((batch, c.max_players), dtype=torch.bool, device=seat_mask.device)
-            padded_mask[:, :players] = ordered_mask
-            relative_vvec, u = self.moment_heads(moment_public, padded_seats, padded_mask)
-            vvec = torch.zeros_like(relative_vvec)
-            vvec[:, :players] = relative_vvec[:, :players].gather(1, relative_seats)
+        t: Tensor | None = None
+        cost: Tensor | None = None
+        if self.branching_heads is not None:
+            branching_public = torch.cat(
+                (global_feature, public_mean, padded_seats.flatten(1)), dim=-1
+            )
+            t, cost = self.branching_heads(branching_public)
         return PolicyOutput(
             raw={"type_logits": type_logits, "omega": omega, "mu": mu, "s": scale, "iota": iota},
             v=value,
-            vvec=vvec,
-            u=u,
+            t=t,
+            c=cost,
         )

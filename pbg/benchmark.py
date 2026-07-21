@@ -73,11 +73,15 @@ def _mode_config(base: RootConfig, mode: str) -> RootConfig:
         if cfg.loss.name == "rb_ppo":
             cfg.loss.name = "ppo"
         cfg.rollout.beta = None
+        cfg.rollout.branching_mode = None
+        cfg.rollout.adaptive_kkt = None
         cfg.completion.n_samples = None
     elif mode == "rao_blackwell":
         if cfg.loss.name == "ppo":
             cfg.loss.name = "rb_ppo"
         cfg.rollout.beta = None
+        cfg.rollout.branching_mode = None
+        cfg.rollout.adaptive_kkt = None
         cfg.completion.n_samples = cfg.completion.n_samples or 64
     else:
         if cfg.loss.name == "ppo":
@@ -86,6 +90,11 @@ def _mode_config(base: RootConfig, mode: str) -> RootConfig:
         # decision count, rather than root count, is the cross-mode normalizer.
         cfg.rollout.roots_per_gpu = 1
         cfg.rollout.beta = cfg.rollout.beta or {"default": 1.5}
+        cfg.rollout.branching_mode = "fixed"
+        cfg.rollout.adaptive_kkt = None
+        cfg.model["use_branching_heads"] = True
+        cfg.loss.c_t = cfg.loss.c_t or 1.0
+        cfg.loss.c_c = cfg.loss.c_c or 1.0
         cfg.completion.n_samples = cfg.completion.n_samples or 64
     return cfg
 

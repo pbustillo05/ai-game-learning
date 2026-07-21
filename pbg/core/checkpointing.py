@@ -16,11 +16,13 @@ import torch
 from torch import nn
 
 from pbg.core.config import RootConfig
+from pbg.core.adaptive_branching import BRANCHING_CONTROLLER_VERSION
 from pbg.core.memory_control import SEQUENTIAL_MEMORY_CONTROLLER_VERSION
 from pbg.core.storage import TRAINING_STORAGE_SCHEMA_VERSION
 
 
-CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v3"
+CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v4"
+PREVIOUS_CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v3"
 LEGACY_CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v2"
 
 
@@ -58,8 +60,15 @@ def _migrate_checkpoint_payload(payload: dict[str, Any]) -> dict[str, Any]:
         migrated["controller_schema_version"] = (
             None if state is None else SEQUENTIAL_MEMORY_CONTROLLER_VERSION
         )
+    elif version == PREVIOUS_CHECKPOINT_SCHEMA_VERSION:
+        migrated["migrated_from_checkpoint_schema"] = version
+        migrated["checkpoint_schema_version"] = CHECKPOINT_SCHEMA_VERSION
+        migrated["branching_controller_schema_version"] = None
+        migrated["branching_controller_state"] = None
     elif version != CHECKPOINT_SCHEMA_VERSION:
         raise RuntimeError(f"unsupported checkpoint schema version {version!r}")
+    migrated.setdefault("branching_controller_schema_version", None)
+    migrated.setdefault("branching_controller_state", None)
     if migrated.get("storage_schema_version") != TRAINING_STORAGE_SCHEMA_VERSION:
         raise RuntimeError("checkpoint storage schema is incompatible")
     controller_version = migrated.get("controller_schema_version")
@@ -71,6 +80,15 @@ def _migrate_checkpoint_payload(payload: dict[str, Any]) -> dict[str, Any]:
         or state.get("version") != SEQUENTIAL_MEMORY_CONTROLLER_VERSION
     ):
         raise RuntimeError("checkpoint controller schema is incompatible")
+    branching_state = migrated.get("branching_controller_state")
+    branching_version = migrated.get("branching_controller_schema_version")
+    if (branching_state is None) != (branching_version is None):
+        raise RuntimeError("checkpoint contains partial adaptive KKT controller metadata")
+    if branching_state is not None and (
+        branching_version != BRANCHING_CONTROLLER_VERSION
+        or branching_state.get("version") != BRANCHING_CONTROLLER_VERSION
+    ):
+        raise RuntimeError("checkpoint adaptive KKT controller schema is incompatible")
     rank_states = migrated.get("rank_rng_states")
     if rank_states is not None and any(
         not isinstance(item, dict)
@@ -93,6 +111,9 @@ def inspect_checkpoint(path: str | Path) -> dict[str, Any]:
         ),
         "storage_schema_version": migrated["storage_schema_version"],
         "controller_schema_version": migrated["controller_schema_version"],
+        "branching_controller_schema_version": migrated[
+            "branching_controller_schema_version"
+        ],
         "iteration": int(migrated["iteration"]),
         "config": copy.deepcopy(migrated["config"]),
     }
@@ -113,6 +134,7 @@ def save_checkpoint(
     reference_model: nn.Module | None = None,
     reference_iteration: int | None = None,
     adaptive_work_state: dict[str, Any] | None = None,
+    branching_controller_state: dict[str, Any] | None = None,
     probe_target: dict[str, Any] | None = None,
     logical_work: dict[str, int] | None = None,
 ) -> None:
@@ -131,6 +153,9 @@ def save_checkpoint(
             if adaptive_work_state is None
             else SEQUENTIAL_MEMORY_CONTROLLER_VERSION
         ),
+        "branching_controller_schema_version": (
+            None if branching_controller_state is None else BRANCHING_CONTROLLER_VERSION
+        ),
         "model": raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
@@ -148,6 +173,7 @@ def save_checkpoint(
         ),
         "reference_iteration": reference_iteration,
         "adaptive_work_state": adaptive_work_state,
+        "branching_controller_state": branching_controller_state,
         "probe_target": copy.deepcopy(probe_target),
         "logical_work": copy.deepcopy(logical_work),
     }
@@ -213,6 +239,7 @@ def load_checkpoint(
         "run_id": payload.get("run_id"),
         "reference_iteration": payload.get("reference_iteration"),
         "adaptive_work_state": payload.get("adaptive_work_state"),
+        "branching_controller_state": payload.get("branching_controller_state"),
         "probe_target": copy.deepcopy(payload.get("probe_target")),
         "logical_work": copy.deepcopy(payload.get("logical_work")),
         "checkpoint_schema_version": payload["checkpoint_schema_version"],
@@ -221,6 +248,9 @@ def load_checkpoint(
         ),
         "storage_schema_version": payload["storage_schema_version"],
         "controller_schema_version": payload["controller_schema_version"],
+        "branching_controller_schema_version": payload[
+            "branching_controller_schema_version"
+        ],
     }
 
 

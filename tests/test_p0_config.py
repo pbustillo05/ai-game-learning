@@ -115,6 +115,7 @@ def test_training_mode_validates_beta_completion_and_loss_axes(tmp_path: Path) -
     raw["completion"]["n_samples"] = None
     raw["loss"]["name"] = "ppo"
     raw["rollout"]["beta"] = None
+    raw["rollout"]["branching_mode"] = None
     path = tmp_path / "normal.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     cfg = load_config(path)
@@ -153,6 +154,7 @@ def test_production_execution_config_is_explicit_and_strict(
     raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
     raw["training"]["mode"] = "rao_blackwell"
     raw["rollout"]["beta"] = None
+    raw["rollout"]["branching_mode"] = None
     raw["rollout"]["sequential_roots_per_gpu_initial"] = 10
     raw["rollout"].update(
         {

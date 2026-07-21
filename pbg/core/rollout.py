@@ -888,6 +888,7 @@ def sample_trees(
     gen: torch.Generator,
     *,
     iteration: int = 0,
+    branching_controller: Any | None = None,
 ) -> tuple[TreeBatch, ReachCache, PolicyCache] | ProbeRollout:
     """Sample trajectories for sequential RB or one tree for branched RB."""
 
@@ -898,5 +899,8 @@ def sample_trees(
     if mode == "branched_rao_blackwell":
         from pbg.core.branching import sample_branched_tree
 
-        return sample_branched_tree(bundle, cfg, gen, iteration=iteration)
+        return sample_branched_tree(
+            bundle, cfg, gen, iteration=iteration,
+            controller=branching_controller,
+        )
     raise ValueError("sample_trees requires an RB training mode")

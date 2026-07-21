@@ -48,10 +48,10 @@ game:
   stack_bb: float
   rank_count: int
 rollout:
-  sequential_starts: int
+  sequential_roots_per_gpu_initial: int
+  branching_mode: fixed | dynamic | null
   beta: mapping | null
   node_budget: int
-  reach_storage: full | decisions_only | recompute
   family_batch_rows: positive int | null
   max_active_trajectories: positive int | null
   arena_chunk_nodes: positive int | null
@@ -68,7 +68,13 @@ global logical count. Distributed launch partitions that count into contiguous,
 collision-free rank quotas and requires at least one start per rank. Branched
 Rao--Blackwell requires the literal value one and creates one distinguished
 root/tree per rank. Only branched mode accepts `beta`; it requires `default`
-and all intensities must be finite and at least one.
+and all intensities must be finite and at least one. Branched configurations
+must also choose `branching_mode: fixed` or `branching_mode: dynamic` explicitly.
+Both modes require public T/C heads and positive T/C loss coefficients from the
+first update. Fixed mode uses the configured beta schedule for the entire run.
+Dynamic mode additionally requires `adaptive_kkt`; it uses the same fixed beta
+schedule during warmup, then enables T/C-driven KKT intensities and controller
+updates. `adaptive_kkt.enabled` is not a compatibility alias and is rejected.
 
 Hardware profiles contain execution limits only. Checkpoint scientific identity
 excludes the hardware profile, so the same scientific run can resume on a

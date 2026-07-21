@@ -1,4 +1,4 @@
-"""Fixed-intensity duplicate-preserving labeled branching."""
+"""Fixed or post-warmup dynamic duplicate-preserving labeled branching."""
 
 from __future__ import annotations
 
@@ -9,6 +9,11 @@ import torch
 from torch import Tensor
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, GameBundle
+from pbg.core.adaptive_branching import (
+    child_path_factors,
+    log_kkt_intensity,
+    randomized_round,
+)
 from pbg.core.tree import (
     DecisionReachCache,
     DeviceTreeBuffer,
@@ -55,8 +60,12 @@ def sample_branched_tree(
     *,
     iteration: int = 0,
     diagnostics: dict[str, int] | None = None,
+    controller: Any | None = None,
 ) -> tuple[TreeBatch, ReachCache, PolicyCache]:
     """Sample one duplicate-preserving branched tree through execution families."""
+
+    if diagnostics is None:
+        diagnostics = {}
 
     # Imports are local because rollout dispatch imports this module lazily.
     import time
@@ -174,10 +183,41 @@ def sample_branched_tree(
     policy_edge_logp: list[Tensor] = []
     policy_node_ids: list[Tensor] = []
     policy_node_values: list[Tensor] = []
+    policy_node_t: list[Tensor] = []
+    policy_node_c: list[Tensor] = []
     policy_node_reaches: list[Tensor] = []
     leaf_node_ids: list[Tensor] = []
     leaf_reaches: list[Tensor] = []
     cutoff_active = False
+    branching_mode = getattr(rollout_cfg, "branching_mode", None)
+    if branching_mode not in {"fixed", "dynamic"}:
+        raise ValueError("branched rollout requires branching_mode 'fixed' or 'dynamic'")
+    adaptive_cfg = getattr(rollout_cfg, "adaptive_kkt", None)
+    dynamic_configured = branching_mode == "dynamic"
+    if dynamic_configured and adaptive_cfg is None:
+        raise ValueError("dynamic branching requires adaptive_kkt configuration")
+    if not dynamic_configured and adaptive_cfg is not None:
+        raise ValueError("adaptive_kkt configuration is only valid for dynamic branching")
+    dynamic_active = bool(
+        dynamic_configured and iteration >= int(adaptive_cfg.warmup_iters)
+    )
+    if dynamic_active and controller is None:
+        raise ValueError("dynamic branching after warmup requires controller state")
+    nominal_count = torch.zeros(node_budget, dtype=torch.int32, device=device)
+    beta_rows = torch.zeros(node_budget, dtype=torch.float32, device=device)
+    log_player_sum = torch.full(
+        (node_budget,), -torch.inf, dtype=torch.float32, device=device
+    )
+    log_ancestor_product = torch.zeros(
+        node_budget, dtype=torch.float32, device=device
+    )
+    root_is_player = (root_owner >= 0) & (root_owner < p_max)
+    log_player_sum[0] = torch.where(
+        root_is_player[0], torch.tensor(0.0, device=device),
+        torch.tensor(-torch.inf, device=device),
+    )
+    queue_cost = torch.zeros(node_budget, dtype=torch.float32, device=device)
+    queue_cost_total = 0.0
 
     def stop_if_cutoff_reached(frontier_nodes: int = 0) -> None:
         if stop_cutoff is None or buffer.node_count < stop_cutoff:
@@ -212,6 +252,21 @@ def sample_branched_tree(
             host = value
         return tuple(int(item) for item in host.tolist())
 
+    def read_float_control(value: Tensor) -> float:
+        if value.numel() != 1 or not value.is_floating_point():
+            raise ValueError("branched scheduler float control must be one scalar")
+        if device.type == "cuda":
+            started = time.perf_counter()
+            host = value.detach().to("cpu")
+            elapsed = time.perf_counter() - started
+            if metrics is not None:
+                metrics.record_scheduler_control_synchronization(
+                    seconds=elapsed, nbytes=value.element_size()
+                )
+        else:
+            host = value.detach()
+        return float(host)
+
     def record_queues() -> None:
         if metrics is None:
             return
@@ -222,15 +277,31 @@ def sample_branched_tree(
                 oldest_age=float(queue.oldest_age(scheduler_step)),
             )
 
-    def offspring_for(nodes: Tensor) -> tuple[Tensor, int]:
+    def offspring_for(
+        nodes: Tensor,
+        family: str | None,
+        output: Any | None,
+        frontier_cost_forecast: float,
+    ) -> tuple[Tensor, Tensor, int]:
         nonlocal cutoff_active
         rows = nodes.to(torch.int64)
         states = buffer.state_ref[rows]
-        beta = _validate_beta(backend.beta_fn(states), nodes.numel(), device)
+        fixed_beta = _validate_beta(backend.beta_fn(states), nodes.numel(), device)
+        if dynamic_active and family is not None:
+            if output is None or output.t is None or output.c is None:
+                raise RuntimeError("adaptive KKT rollout model omitted T/C heads")
+            beta = log_kkt_intensity(
+                output.t,
+                output.c,
+                controller.log_kappa,
+                log_player_sum[rows],
+                log_ancestor_product[rows],
+                float(adaptive_cfg.beta_max),
+            )
+        else:
+            beta = fixed_beta
         if cutoff_active:
             beta = torch.ones_like(beta)
-        base = torch.floor(beta)
-        fraction = beta - base
         paths = arena.gather_many(("path_key",), rows)["path_key"]
         keys = logical_rng_keys(
             seed=logical_seed,
@@ -240,9 +311,16 @@ def sample_branched_tree(
             draw=0,
             purpose=DrawPurpose.ROUND,
         )
-        offspring = (
-            base + (logical_uniform(keys) < fraction).to(torch.float32)
-        ).to(torch.int64)
+        nominal = randomized_round(beta, logical_uniform(keys))
+        offspring = nominal
+        safeguard = bool(
+            dynamic_active
+            and family is not None
+            and buffer.node_count + frontier_cost_forecast
+            > float(adaptive_cfg.safe_tree_size)
+        )
+        if safeguard:
+            offspring = torch.ones_like(nominal)
         total = read_control(offspring.sum().reshape(1))[0]
         if upper_cutoff is not None and (
             cutoff_active or buffer.node_count + total >= upper_cutoff
@@ -263,13 +341,29 @@ def sample_branched_tree(
             raise RuntimeError("branched intensity produced no child")
         buffer.require_child_capacity(total)
         arena.require_capacity(total)
-        return offspring, total
+        nominal_count[rows] = nominal.to(torch.int32)
+        beta_rows[rows] = beta.detach().to(torch.float32)
+        if dynamic_active and diagnostics is not None:
+            diagnostics["safeguard_batches"] = diagnostics.get("safeguard_batches", 0) + int(safeguard)
+            diagnostics["safeguard_suppressed_children"] = diagnostics.get(
+                "safeguard_suppressed_children", 0
+            ) + (int((nominal - offspring).sum()) if safeguard else 0)
+        return offspring, nominal, total
 
-    def expand(nodes: Tensor, family: str | None) -> Tensor:
+    def expand(
+        nodes: Tensor, family: str | None, frontier_cost_forecast: float = 0.0
+    ) -> Tensor:
         rows = nodes.to(torch.int64)
         states = buffer.state_ref[rows]
         reaches = reach_rows[rows]
-        offspring, total = offspring_for(nodes)
+        output = None
+        if dynamic_active and family is not None:
+            output = actual_cost_forward(bundle.model, family, states, reaches)
+        offspring, _, total = offspring_for(
+            nodes, family, output, frontier_cost_forecast
+        )
+        if family is not None and output is None:
+            output = actual_cost_forward(bundle.model, family, states, reaches)
         parent_positions = torch.repeat_interleave(
             torch.arange(nodes.numel(), device=device),
             offspring,
@@ -295,10 +389,9 @@ def sample_branched_tree(
         profiles = _sample_profiles_logical(
             backend, child_states, child_reach, posterior_keys, gen
         )
-        output = None
         child_output = None
         if family is not None:
-            output = actual_cost_forward(bundle.model, family, states, reaches)
+            assert output is not None
             child_output = _index_policy_output(output, parent_positions)
             policy_node_reaches.append(reaches.detach().clone())
         event_keys = logical_rng_keys(
@@ -345,6 +438,14 @@ def sample_branched_tree(
             {"path_key": child_path_keys(expanded_paths, ordinal)},
         )
         reach_rows[children.to(torch.int64)] = next_reach
+        child_log_sum, child_log_product = child_path_factors(
+            log_player_sum[rows][parent_positions],
+            log_ancestor_product[rows][parent_positions],
+            beta_rows[rows][parent_positions],
+            (next_owner >= 0) & (next_owner < p_max),
+        )
+        log_player_sum[children.to(torch.int64)] = child_log_sum
+        log_ancestor_product[children.to(torch.int64)] = child_log_product
         if family is not None:
             assert output is not None and child_output is not None
             legal_ids, legal_mask = backend.legal_events(child_states)
@@ -366,11 +467,16 @@ def sample_branched_tree(
             policy_edge_logp.append(edge_logp)
             policy_node_ids.append(nodes.to(torch.int32))
             policy_node_values.append(output.v.detach().float())
+            output_t = getattr(output, "t", None)
+            output_c = getattr(output, "c", None)
+            if output_t is not None and output_c is not None:
+                policy_node_t.append(output_t.detach().float())
+                policy_node_c.append(output_c.detach().float())
             DeviceWorkQueue.mark_done(arena, rows)
         return children
 
     def chance_close(frontier: Tensor) -> None:
-        nonlocal scheduler_step
+        nonlocal scheduler_step, queue_cost_total
         frontier = frontier.to(torch.int32)
         chance_steps = 0
         while frontier.numel():
@@ -405,11 +511,24 @@ def sample_branched_tree(
                 zip(family_names, counts[: len(family_names)], strict=True)
             ):
                 if count:
+                    queued = partition.candidate_handles[index, :count]
                     queues[name].enqueue(
-                        partition.candidate_handles[index, :count],
+                        queued,
                         arena=arena,
                         logical_time=scheduler_step,
                     )
+                    if dynamic_active:
+                        qrows = queued.to(torch.int64)
+                        qstates = buffer.state_ref[qrows]
+                        qout = actual_cost_forward(
+                            bundle.model, name, qstates, reach_rows[qrows]
+                        )
+                        if qout.c is None:
+                            raise RuntimeError("adaptive KKT queue accounting requires C head")
+                        queue_cost[qrows] = qout.c.detach().float()
+                        queue_cost_total += read_float_control(
+                            qout.c.detach().float().sum()
+                        )
             record_queues()
             stopped = counts[-1]
             if stopped:
@@ -454,11 +573,22 @@ def sample_branched_tree(
             getattr(rollout_cfg, "family_batch_rows", None) or queue.host_count
         )
         count = min(queue.host_count, configured_rows)
+        frontier_cost_forecast = queue_cost_total
         nodes = queue.dequeue(count, arena=arena).to(torch.int32)
+        if dynamic_active:
+            # This synchronization is co-located with the scheduler's existing
+            # host control boundary and keeps R_F incremental.
+            removed = read_float_control(
+                queue_cost[nodes.to(torch.int64)].sum()
+            )
+            queue_cost_total -= removed
         record_queues()
-        chance_close(expand(nodes, family))
+        chance_close(expand(nodes, family, frontier_cost_forecast))
 
     tree = buffer.finalize()
+    tree.nominal_child_count = nominal_count[: buffer.node_count].detach()
+    tree.branching_beta = beta_rows[: buffer.node_count].detach()
+    tree.branching_diagnostics = dict(diagnostics)
     tree.validate()
     if leaf_node_ids:
         reach_nodes = torch.cat(leaf_node_ids).to(torch.int32)
@@ -501,10 +631,13 @@ def sample_branched_tree(
         if not torch.equal(cached_nodes[order], decision_nodes):
             raise RuntimeError("family-scheduled branched rollout omitted a decision cache row")
         old_v = cached_values[order]
+        old_t = torch.cat(policy_node_t).to(torch.float32)[order] if policy_node_t else None
+        old_c = torch.cat(policy_node_c).to(torch.float32)[order] if policy_node_c else None
         decision_rows = cached_reaches[order]
     else:
         logp_child = torch.empty((0, 0, x_max), dtype=torch.float32, device=device)
         old_v = torch.empty((0, x_max), dtype=torch.float32, device=device)
+        old_t = old_c = None
         decision_rows = torch.empty(
             (0, p_max, x_max), dtype=torch.float32, device=device
         )
@@ -518,7 +651,8 @@ def sample_branched_tree(
         owners,
     )
     return tree, reach_cache, PolicyCache(
-        decision_nodes.to(torch.int32), logp_child, old_v, decision_reach
+        decision_nodes.to(torch.int32), logp_child, old_v, decision_reach,
+        old_t, old_c,
     )
 
 

@@ -25,6 +25,8 @@ class HeadEvals:
 
     node_ids: Tensor  # int32 [Nd]
     v: Tensor  # float32 [Nd,X]
+    t: Tensor | None = None  # float32 [Nd]
+    c: Tensor | None = None  # float32 [Nd]
 
 
 @dataclass
@@ -43,6 +45,10 @@ class NodeTargets:
     child_event_row: Tensor  # int32 [Nd,E]
     child_mask: Tensor  # bool [Nd,E]
     child_count: Tensor  # int32 [Nd]
+    nominal_child_count: Tensor | None = None  # int32 [Nd]
+    t_hat: Tensor | None = None  # float32 [Nd], zero where unavailable
+    t_mask: Tensor | None = None  # bool [Nd]
+    c_hat: Tensor | None = None  # float32 [Nd]
 
 
 @dataclass
@@ -209,6 +215,17 @@ def _layout_from_shape(
     _reject_low_precision("heads.v", heads.v)
     if heads.node_ids.device != device or heads.v.device != device:
         raise ValueError("heads and completion tensors must share a device")
+    for name, value in (("t", heads.t), ("c", heads.c)):
+        if value is not None and (
+            value.shape != (nd,)
+            or value.device != device
+            or value.dtype != torch.float32
+            or bool((~torch.isfinite(value)).any())
+            or (name == "c" and bool((value <= 0).any()))
+        ):
+            raise ValueError(f"heads.{name} must be an aligned finite fp32 vector")
+    if (heads.t is None) != (heads.c is None):
+        raise ValueError("trace-variance and cost heads must be supplied together")
     head_ids = heads.node_ids.to(torch.int64)
     if head_ids.numel() and (
         head_ids.unique().numel() != nd
@@ -245,6 +262,7 @@ def _layout_from_shape(
 def _empty_targets(layout: _Layout) -> NodeTargets:
     nd, e_max, x_max = int(layout.decision_nodes.numel()), layout.e_max, layout.x_max
     zeros = lambda *shape: torch.zeros(shape, dtype=torch.float32, device=layout.device)
+    nominal_all = getattr(layout, "nominal_child_count_all", None)
     return NodeTargets(
         node_ids=layout.decision_nodes.to(torch.int32),
         parent_p_hat=zeros(nd, x_max),
@@ -254,6 +272,10 @@ def _empty_targets(layout: _Layout) -> NodeTargets:
         child_event_row=torch.full((nd, e_max), -1, dtype=torch.int32, device=layout.device),
         child_mask=torch.zeros((nd, e_max), dtype=torch.bool, device=layout.device),
         child_count=layout.child_count_all[layout.decision_nodes].to(torch.int32),
+        nominal_child_count=layout.child_count_all[layout.decision_nodes].to(torch.int32),
+        t_hat=zeros(nd),
+        t_mask=torch.zeros(nd, dtype=torch.bool, device=layout.device),
+        c_hat=zeros(nd),
     )
 
 
@@ -293,7 +315,10 @@ def _frontier_memory_plan_from_shape(
 
     leaves = int(layout.leaf_nodes.numel())
     moment_row_bytes = layout.p_max * layout.x_max * torch.tensor([], dtype=torch.float32).element_size()
-    frontier_bytes = 2 * leaves * moment_row_bytes
+    frontier_bytes = (
+        2 * leaves * moment_row_bytes
+        + leaves * (layout.n_players + 2) * 4  # public V vector, C, Delta
+    )
     nd, e_max, x_max = (
         int(layout.decision_nodes.numel()),
         layout.e_max,
@@ -306,6 +331,7 @@ def _frontier_memory_plan_from_shape(
         + nd * e_max * 4  # child event ids
         + nd * e_max  # child mask
         + nd * 4  # child counts
+        + nd * (2 * 4 + 4 + 1)  # T/C targets, nominal count, T mask
     )
     # Parent/child gathers, newly reduced rows, and the compacted next frontier
     # can overlap with the old frontier in PyTorch's caching allocator.
@@ -337,6 +363,16 @@ def _reduce_streamed_leaf_batches(
         (0, layout.p_max, layout.x_max), dtype=torch.float32, device=layout.device
     )
     frontier_m = torch.empty_like(frontier_p)
+    frontier_vvec = torch.empty(
+        (0, layout.n_players), dtype=torch.float32, device=layout.device
+    )
+    frontier_cost = torch.empty(0, dtype=torch.float32, device=layout.device)
+    frontier_delta = torch.empty(0, dtype=torch.float32, device=layout.device)
+    nominal_all = (
+        layout.child_count_all.to(torch.int32)
+        if tree.nominal_child_count is None
+        else tree.nominal_child_count
+    )
     seen = torch.zeros(layout.n, dtype=torch.bool, device=layout.device)
     peak_rows = 0
 
@@ -376,6 +412,14 @@ def _reduce_streamed_leaf_batches(
         frontier_nodes = torch.cat((frontier_nodes, node_ids))
         frontier_p = torch.cat((frontier_p, added_p))
         frontier_m = torch.cat((frontier_m, added_p * added_v))
+        leaf_vvec = (added_p[:, : layout.n_players] * added_v[:, : layout.n_players]).sum(-1)
+        frontier_vvec = torch.cat((frontier_vvec, leaf_vvec))
+        frontier_cost = torch.cat(
+            (frontier_cost, torch.zeros(node_ids.numel(), dtype=torch.float32, device=layout.device))
+        )
+        frontier_delta = torch.cat(
+            (frontier_delta, torch.zeros(node_ids.numel(), dtype=torch.float32, device=layout.device))
+        )
         peak_rows = max(peak_rows, int(frontier_nodes.numel()))
 
         contracted = False
@@ -422,11 +466,26 @@ def _reduce_streamed_leaf_batches(
                 device=layout.device,
             )
             parent_m = torch.zeros_like(parent_p)
+            parent_vvec = torch.zeros(
+                (ready.numel(), layout.n_players), dtype=torch.float32,
+                device=layout.device,
+            )
+            parent_cost = torch.zeros(ready.numel(), dtype=torch.float32, device=layout.device)
+            parent_delta = torch.zeros_like(parent_cost)
             parent_p.index_add_(0, parent_rows, frontier_p[child_rows])
             parent_m.index_add_(0, parent_rows, frontier_m[child_rows])
+            parent_vvec.index_add_(0, parent_rows, frontier_vvec[child_rows])
+            child_nominal = nominal_all[child_nodes].to(torch.float32)
+            parent_cost.index_add_(
+                0, parent_rows, 1.0 + child_nominal * frontier_cost[child_rows]
+            )
+            parent_delta.index_add_(0, parent_rows, frontier_delta[child_rows])
             divisor = counts.to(torch.float32)[:, None, None]
             parent_p /= divisor
             parent_m /= divisor
+            parent_vvec /= counts.to(torch.float32)[:, None]
+            parent_cost /= counts.to(torch.float32)
+            parent_delta /= counts.to(torch.float32)
 
             decision = layout.decision_row[ready] >= 0
             if bool(decision.any()):
@@ -448,6 +507,40 @@ def _reduce_streamed_leaf_batches(
                     heads.v[hrows].detach().to(torch.float32),
                     lam,
                 )
+                if heads.t is not None and heads.c is not None:
+                    dec_counts = counts[dec_local]
+                    multi = dec_counts >= 2
+                    if bool(multi.any()):
+                        edge_parent_local = torch.repeat_interleave(
+                            torch.arange(dec_local.numel(), device=layout.device),
+                            dec_counts,
+                        )
+                        centered = (
+                            frontier_vvec[child_rows[dec_edge_mask]]
+                            - parent_vvec[dec_local][edge_parent_local]
+                        )
+                        square = centered.square().sum(-1)
+                        trace_sum = torch.zeros(
+                            dec_local.numel(), dtype=torch.float32, device=layout.device
+                        )
+                        trace_sum.index_add_(0, edge_parent_local, square)
+                        exec_t = trace_sum / (dec_counts.to(torch.float32) - 1.0).clamp_min(1.0)
+                        corrected = (exec_t - parent_delta[dec_local]).clamp_min(0.0)
+                        result.t_hat[rows[multi]] = corrected[multi].detach()
+                        result.t_mask[rows[multi]] = True
+                    result.c_hat[rows] = parent_cost[dec_local].detach()
+                    t_star = heads.t[hrows].detach().to(torch.float32)
+                    t_star = torch.where(result.t_mask[rows], result.t_hat[rows], t_star)
+                    executed = dec_counts.to(torch.float32)
+                    nominal = nominal_all[dec_nodes].to(torch.float32)
+                    parent_delta[dec_local] = (
+                        (t_star + parent_delta[dec_local]) / executed
+                        - t_star / nominal
+                    )
+                    parent_cost[dec_local] = (
+                        float(lam) * parent_cost[dec_local]
+                        + (1.0 - float(lam)) * heads.c[hrows].detach().to(torch.float32)
+                    )
                 owner_m = parent_m[dec_local, players]
                 owner_p = parent_p[dec_local, players]
                 old_v = (
@@ -458,6 +551,10 @@ def _reduce_streamed_leaf_batches(
                     owner_m, owner_p, old_v, lam
                 )
 
+            chance = ~decision
+            if bool(chance.any()):
+                parent_delta[chance] /= counts[chance].to(torch.float32)
+
             consumed = torch.zeros(
                 frontier_nodes.numel(), dtype=torch.bool, device=layout.device
             )
@@ -465,11 +562,15 @@ def _reduce_streamed_leaf_batches(
             frontier_nodes = torch.cat((frontier_nodes[~consumed], ready))
             frontier_p = torch.cat((frontier_p[~consumed], parent_p))
             frontier_m = torch.cat((frontier_m[~consumed], parent_m))
+            frontier_vvec = torch.cat((frontier_vvec[~consumed], parent_vvec))
+            frontier_cost = torch.cat((frontier_cost[~consumed], parent_cost))
+            frontier_delta = torch.cat((frontier_delta[~consumed], parent_delta))
             peak_rows = max(peak_rows, int(frontier_nodes.numel()))
 
         del stats, added_p, added_v, frontier_parent, has_parent
         if contracted:
-            del parent_p, parent_m, child_rows, parent_rows, divisor, consumed
+            del parent_p, parent_m, parent_vvec, parent_cost, parent_delta
+            del child_rows, parent_rows, divisor, consumed
 
     if not bool(seen[layout.leaf_nodes].all()):
         raise ValueError("streamed completion did not cover every stored leaf")
@@ -535,6 +636,10 @@ def streamed_branched_value(
             f"{max_workspace_bytes / gib:.3f} GiB byte budget"
         )
     result = _empty_targets(layout)
+    if tree.nominal_child_count is not None:
+        result.nominal_child_count = tree.nominal_child_count[
+            layout.decision_nodes
+        ].detach().to(torch.int32)
     _edge_metadata(result, tree, layout)
     if layout.n:
         _reduce_streamed_leaf_batches(

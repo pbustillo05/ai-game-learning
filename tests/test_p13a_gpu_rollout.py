@@ -852,6 +852,8 @@ def test_poker_last_consumer_reaches_are_schedule_repeatable(
         roots_per_gpu=1 if mode == "branched_rao_blackwell" else 2,
         node_budget=128 if mode == "branched_rao_blackwell" else 64,
     )
+    if mode == "branched_rao_blackwell":
+        common.update(branching_mode="fixed", adaptive_kkt=None)
     full_backend = _backend(cfg, capacity=256, beta_table=beta_table)
     replay_backend = _backend(cfg, capacity=256, beta_table=beta_table)
     sampler = (

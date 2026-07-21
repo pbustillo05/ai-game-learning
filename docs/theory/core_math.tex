@@ -1319,14 +1319,14 @@ Initialize target table $\mathcal O\gets\varnothing$\;
 \end{algorithm}
 
 Note that returning $\widehat{Q}$ is only necessary for the deferred \texttt{NeuRD} research extension.
-The fixed-intensity PPO v1 returns $\widehat{A}$ and does not store $\widehat Q$ by default.
+The production PPO path returns $\widehat{A}$ and does not store $\widehat Q$ by default.
 
 \begin{algorithm}[H]
 \caption{$(\theta_k)_{k\ge0}\gets$~\texttt{BranchedRaoBlackwellPG}$(\theta_0)$}
 \label{alg:branched-rao-blackwell-pg}
 \DontPrintSemicolon
 \tcc{Tree-valued generalization of the sequential Rao--Blackwellized template; $\beta\equiv1$ recovers it exactly.}
-\tcc{Research template: the implementation companion freezes v1 to fixed intensities, actor-type $V$ heads, and PPO advantage targets.}
+\tcc{The implementation exposes fixed and post-warmup dynamic intensity modes; both train actor-type $V$ and public $T/C$ heads with PPO advantage targets.}
 \KwParam{$\theta_0$, initial weights; $\theta$, working copy of the next iterate}
 \KwHyper{$B$, minibatch size; $\lambda$; $\beta_{\max}$}
 \KwHyper{$\beta_{\tt fix}$, $k_{\tt warm}$, $M$, $\kappa_0$; chosen number of gradient-descent steps per iterate}
@@ -1436,14 +1436,15 @@ Several specificities impact our implementation:
 
   \item \textbf{Research loss design:} the full design combines clipped \texttt{PPO} with an optional \texttt{KL} term to an older reference index $\operatorname{ref}(k)$, an entropy term, and losses for each proposed value head:
   \[
-    \mathcal L_{\tt clip}[\widehat A^\lambda]+\mathcal L_{\tt H} + \mathcal L_{\tt KL} + \mathcal L_{\tt V}[\widehat V^\lambda] + \mathcal L^{W,S}[\widehat W,\widehat S^\lambda]
+    \mathcal L_{\tt clip}[\widehat A^\lambda]+\mathcal L_{\tt H} + \mathcal L_{\tt KL} + \mathcal L_{\tt V}[\widehat V^\lambda] + \mathcal L^{T,C}[\widehat T,\widehat C^\lambda]
   \]
-  The implementation companion's fixed-intensity PPO v1 uses the clipped policy,
-  actor-type value, entropy, and optional exact legal-action reference-policy KL
-  terms. Optional public $W/S$ output heads exist structurally, but the production
-  reducer emits no targets for them and no registered loss or branching controller
-  consumes them. Public $W/S$ losses and control, \texttt{NeuRD}, and stored
-  all-action $Q$ targets remain deferred research extensions.
+  The implementation companion exposes explicit \texttt{fixed} and
+  \texttt{dynamic} branching modes. Both use the clipped policy, actor-type
+  value, entropy, optional exact legal-action reference-policy KL, and public
+  $T/C$ losses from the first update. The dynamic mode follows
+  $\beta_{\tt fix}$ during warmup and only afterward lets the KKT controller
+  consume $T/C$ for rollout control. \texttt{NeuRD} and stored all-action $Q$
+  targets remain deferred research extensions.
 
   \item Ideally, the implemtation should be clearly modular: it will be used for poker, but must be easily adaptable to other PBGs.
 \end{enumerate}

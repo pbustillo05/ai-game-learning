@@ -63,6 +63,13 @@ def _gather_targets(targets: NodeTargets, rows: Tensor) -> NodeTargets:
         child_event_row=targets.child_event_row[rows],
         child_mask=targets.child_mask[rows],
         child_count=targets.child_count[rows],
+        nominal_child_count=(
+            None if targets.nominal_child_count is None
+            else targets.nominal_child_count[rows]
+        ),
+        t_hat=None if targets.t_hat is None else targets.t_hat[rows],
+        t_mask=None if targets.t_mask is None else targets.t_mask[rows],
+        c_hat=None if targets.c_hat is None else targets.c_hat[rows],
     )
 
 

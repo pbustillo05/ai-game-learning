@@ -408,7 +408,7 @@ class PokerModelBundle(nn.Module):
         output = self.preflop(pub, class_ranges, actor_seat, masks)
         return PolicyOutput(
             {name: value[:, self.combo_class] for name, value in output.raw.items()},
-            output.v[:, self.combo_class], output.vvec, output.u,
+            output.v[:, self.combo_class], output.t, output.c,
         )
 
     def forward_postflop(
@@ -450,8 +450,8 @@ class PokerModelBundle(nn.Module):
             for local, global_row in enumerate(pre_rows.tolist()):
                 outputs[global_row] = PolicyOutput({k: v[local:local+1] for k, v in lifted.raw.items()},
                                                    lifted.v[local:local+1],
-                                                   None if lifted.vvec is None else lifted.vvec[local:local+1],
-                                                   None if lifted.u is None else lifted.u[local:local+1])
+                                                   None if lifted.t is None else lifted.t[local:local+1],
+                                                   None if lifted.c is None else lifted.c[local:local+1])
         if post_rows.numel():
             if postflop_masks is None:
                 raise ValueError("postflop rows require postflop_masks")
@@ -460,13 +460,13 @@ class PokerModelBundle(nn.Module):
             for local, global_row in enumerate(post_rows.tolist()):
                 outputs[global_row] = PolicyOutput({k: v[local:local+1] for k, v in post.raw.items()},
                                                    post.v[local:local+1],
-                                                   None if post.vvec is None else post.vvec[local:local+1],
-                                                   None if post.u is None else post.u[local:local+1])
+                                                   None if post.t is None else post.t[local:local+1],
+                                                   None if post.c is None else post.c[local:local+1])
         raw = {key: torch.cat([outputs[row].raw[key] for row in range(batch)]) for key in next(iter(outputs.values())).raw}
         value = torch.cat([outputs[row].v for row in range(batch)])
-        vvec = None if any(outputs[row].vvec is None for row in range(batch)) else torch.cat([outputs[row].vvec for row in range(batch)])
-        u = None if any(outputs[row].u is None for row in range(batch)) else torch.cat([outputs[row].u for row in range(batch)])
-        return PolicyOutput(raw, value, vvec, u)
+        t = None if any(outputs[row].t is None for row in range(batch)) else torch.cat([outputs[row].t for row in range(batch)])
+        cost = None if any(outputs[row].c is None for row in range(batch)) else torch.cat([outputs[row].c for row in range(batch)])
+        return PolicyOutput(raw, value, t, cost)
 
 
 @dataclass
