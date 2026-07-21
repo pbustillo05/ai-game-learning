@@ -74,12 +74,12 @@ stores a production $Q$ target.
 
 - Current full feasible suite after the final telemetry/soak diff:
   `CUDA_VISIBLE_DEVICES='' ./tools/poker-python -m pytest -q` -- 454 passed,
-  31 platform skips, and three sandbox-only Gloo failures after 105.90 s. All
+  32 platform skips, and three sandbox-only Gloo failures after 105.89 s. All
   failures were local socket creation denied with `Operation not permitted`.
 - Distributed rerun outside that socket sandbox:
   `CUDA_VISIBLE_DEVICES='' ./tools/poker-python -m pytest -q
-  tests/test_p13b_ddp.py -x` -- 4 passed in 8.03 s. The three failed cases
-  from the full run all pass, for 457 distinct passing tests and 31 skips.
+  tests/test_p13b_ddp.py -x` -- 4 passed in 7.99 s. The three failed cases
+  from the full run all pass, for 457 distinct passing tests and 32 skips.
 - Final schema/owner/shape impact set:
   `tests/test_p13b_integration.py::test_iteration_seals_the_sole_training_owner_and_releases_poker_pages
   tests/test_aud26_no_host_sync.py tests/test_phase3_migration.py` -- 6 passed,
@@ -99,27 +99,28 @@ desktop processes were also left alone.
 
 - Complete checked-in GPU acceptance on GPU 1:
   `CUDA_VISIBLE_DEVICES=1 ./tools/poker-python -m pytest -q
-  tests/test_refactor_gpu_acceptance.py -s -x` -- 8 passed and the two-GPU
-  case skipped because only one GPU was exposed, in 15.63 s. This includes one
+  tests/test_refactor_gpu_acceptance.py -s -x` -- 9 passed and the two two-GPU
+  cases skipped because only one GPU was exposed, in 15.56 s. This includes one
   update in every mode, three-iteration normal/sequential owner-stability
   soaks, a two-iteration fixed root-refill soak, and a two-iteration dynamic
-  queue-safeguard soak with observed child suppression.
-- Three-iteration all-mode GPU-1 soak -- all 12 updates passed. Final realized
-  rows were normal/sequential 13 nodes, 9 decisions, 2 leaves; fixed/dynamic
-  branched 6 nodes, 4 decisions, 1 leaf. Maximum allocator-reserved bytes were
-  25,165,824 in every soak.
+  queue-safeguard soak with observed child suppression. It also proves the
+  same tiny workload succeeds when `torch.cuda.empty_cache` is a no-op.
 - Full-deck/device/evaluator checks on GPU 1:
   `test_poker_actual_cost_keeps_physical_pack_indices_on_device`,
   `test_real_sibling_execution_poker_tiny_cuda`, and
   `test_cuda_outputs_and_sibling_inputs_remain_on_original_device` -- 3 passed
-  in 4.46 s.
-- Earlier in this phase, while GPUs 0 and 1 were both idle, the two-GPU common
-  width/collective update test passed in 7.11 s. It was not repeated after GPU
-  0 became occupied because the schema-only hardening did not alter collective
-  semantics and other users' jobs take precedence.
-- Final `nvidia-smi` at 16:54:24 showed GPU 1 back at display-only 6 MiB, P8,
-  0% utilization, with no validation process. GPU 0's unrelated process was
-  still present and untouched.
+  in 4.30 s.
+- Consolidated multi-GPU acceptance on physical GPUs 1 and 2:
+  `CUDA_VISIBLE_DEVICES=1,2 ./tools/poker-python -m pytest -q
+  tests/test_distributed_learner.py::test_two_cuda_unequal_strata_exact_sum
+  tests/test_refactor_gpu_acceptance.py::test_tiny_two_gpu_common_width_and_collective_update
+  tests/test_refactor_gpu_acceptance.py::test_tiny_two_gpu_dynamic_branched_common_controller`
+  -- 4 passed in 22.94 s. This covers unequal-mass normal and sequential-RB
+  learner updates, common sequential width, and a common dynamic KKT/safeguard
+  update.
+- Final `nvidia-smi` showed GPUs 0/1/2 at 6/6/16 MiB, all P8 and 0%
+  utilization, with no validation process. GPU 0's unrelated 426 MiB process
+  ended independently after the tests; it was never touched by this work.
 
 ## Tiny-run phase ledger
 
@@ -138,8 +139,8 @@ are bounds rather than expected allocation.
 | dynamic branched RB | 1,073,883,040 / 1,073,926,296 / 642,516 / 739,308 | 17,746,944 / 17,329,664 / 17,325,056 / 18,714,112 | 23,068,672 | 2,531 |
 
 The hardware-profile safe ceiling was 9,199,091,712 bytes. One-update measured
-reserved headroom was therefore at least 9,176,023,040 bytes; the soak maximum
-left 9,173,925,888 bytes. No run approached OOM.
+reserved headroom was therefore at least 9,176,023,040 bytes. No run approached
+OOM.
 
 The first-iteration exact seal ledgers were:
 
@@ -150,8 +151,8 @@ The first-iteration exact seal ledgers were:
 | fixed/dynamic branched RB | 22,408 | 2,869 | 1,997 | 4 |
 
 Each run used one two-row physical learner subspan and no physical tail. Tiny
-final acceptance decision throughput was 2.25/s normal, 10.77/s sequential RB,
-4.81/s fixed branched, and 4.82/s dynamic branched. These are cold-start
+final acceptance decision throughput was 2.24/s normal, 10.88/s sequential RB,
+4.11/s fixed branched, and 4.81/s dynamic branched. These are cold-start
 acceptance measurements, not an equal-semantics performance comparison. The
 2026-07-17 throughput records used the retired capacity-shaped rollout path and
 larger full-deck workloads, so no honest before/after throughput ratio exists.
@@ -194,9 +195,8 @@ Narrow limitations:
   schemas; correctness and the hard stop do not depend on `empty_cache()`;
 - no equal-hardware, equal-sampled-object full-deck throughput baseline exists,
   so only current acceptance throughput is reported;
-- the final two-GPU test was not repeated after another user's job occupied GPU
-  0; the already-passing collective code was unchanged by the final schema
-  declaration cleanup.
+- the multi-GPU gate used two idle 2080 Ti devices and deliberately did not
+  include a large throughput or memory-pressure run.
 
 These are evidence limitations, not alternate implementations or known
 correctness failures.
