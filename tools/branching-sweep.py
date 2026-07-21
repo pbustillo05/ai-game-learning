@@ -144,6 +144,12 @@ def main() -> None:
     cfg.rollout.beta = {"default": 1.0}
     cfg.rollout.branching_mode = "fixed"
     cfg.rollout.adaptive_kkt = None
+    # Sequential checkpoints legitimately have no T/C branching heads.  Keep
+    # those heads enabled so geometry benchmarks include production branching
+    # compute, while requiring every trained trunk parameter from the
+    # checkpoint below.
+    checkpoint_path = Path(args.checkpoint)
+    model_state, checkpoint_metadata = _checkpoint(checkpoint_path)
     cfg.model["use_branching_heads"] = True
     cfg.loss.c_t = cfg.loss.c_t or 1.0
     cfg.loss.c_c = cfg.loss.c_c or 1.0
@@ -155,11 +161,18 @@ def main() -> None:
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("the branching sweep requires an available CUDA device")
     torch.cuda.set_device(device)
-    model_state, checkpoint_metadata = _checkpoint(Path(args.checkpoint))
     seed_all(args.seed, 0, device)
     bundle = build_game_bundle(cfg, device)
     bundle.model.to(device)
-    bundle.model.load_state_dict(model_state, strict=True)
+    incompatible = bundle.model.load_state_dict(model_state, strict=False)
+    missing = tuple(incompatible.missing_keys)
+    unexpected = tuple(incompatible.unexpected_keys)
+    if unexpected or any("branching_heads" not in key for key in missing):
+        raise RuntimeError(
+            "checkpoint load may omit only newly initialized branching heads; "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    checkpoint_metadata["randomly_initialized_branching_head_keys"] = list(missing)
     bundle.model.eval()
     generator, _ = seed_all(args.seed, 0, device)
     backend = bundle.rollout_backend
@@ -240,6 +253,7 @@ def main() -> None:
                 }
             sample = {
                     **geometry,
+                    "execution": execution,
                     "rollout_seconds": elapsed,
                     "peak_allocated_bytes": float(torch.cuda.max_memory_allocated(device)),
                     "peak_reserved_bytes": float(torch.cuda.max_memory_reserved(device)),

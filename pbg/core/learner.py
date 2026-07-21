@@ -1453,6 +1453,26 @@ class DistributedFixedRolloutUpdate:
         if steps:
             for name, value in steps[-1].metrics().items():
                 metrics[name] = float(value)
+            grad_norms = [step.grad_norm_pre_clip for step in steps]
+            clip_scales = [step.grad_clip_scale for step in steps]
+            clipped = [scale < 1.0 - 1.0e-12 for scale in clip_scales]
+            metrics.update(
+                {
+                    "grad_norm_pre_clip_step_mean": sum(grad_norms) / len(grad_norms),
+                    "grad_norm_pre_clip_step_min": min(grad_norms),
+                    "grad_norm_pre_clip_step_max": max(grad_norms),
+                    "grad_clip_scale_step_mean": sum(clip_scales) / len(clip_scales),
+                    "grad_clip_scale_step_min": min(clip_scales),
+                    "grad_clipped_step_count": float(sum(clipped)),
+                    "grad_clipped_step_fraction": sum(clipped) / len(clipped),
+                    "optimizer_steps_applied_count": float(
+                        sum(step.optimizer_step_applied for step in steps)
+                    ),
+                    "optimizer_steps_nonfinite_count": float(
+                        sum(not step.gradients_finite for step in steps)
+                    ),
+                }
+            )
         if self.index_buffer.tensor.device.type == "cuda":
             metrics["training_peak_allocated_bytes"] = float(
                 torch.cuda.max_memory_allocated(self.index_buffer.tensor.device)

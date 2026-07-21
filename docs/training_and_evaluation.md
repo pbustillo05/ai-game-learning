@@ -43,6 +43,11 @@ requires `rollout.adaptive_kkt`, follows the beta map during warmup, and enables
 T/C-driven KKT rollout control only afterward. The legacy
 `adaptive_kkt.enabled` switch is rejected.
 
+Optional `rollout.branching_min_nodes` must lie strictly between one and the
+node budget. It enables protected-cohort root refill: a public tree below the
+threshold receives complete additional root-child subtrees before completion,
+while all root targets retain the ordinary pre-refill beta cohort.
+
 In sequential modes, the controller selects one common per-GPU root width from
 the phase-wise memory budget before any current-iteration draw. Unsafe evidence
 decreases it immediately; successful evidence widens it only after the configured

@@ -125,6 +125,15 @@ def sample_branched_tree(
                 "branching_stop_cutoff_nodes must be an integer strictly between "
                 "one and node_budget"
             )
+    minimum_nodes = getattr(rollout_cfg, "branching_min_nodes", None)
+    if minimum_nodes is not None and (
+        isinstance(minimum_nodes, bool)
+        or not isinstance(minimum_nodes, int)
+        or not 1 < minimum_nodes < node_budget
+    ):
+        raise ValueError(
+            "branching_min_nodes must be an integer strictly between one and node_budget"
+        )
     if diagnostics is not None:
         diagnostics.clear()
         diagnostics.update(
@@ -351,7 +360,13 @@ def sample_branched_tree(
         return offspring, nominal, total
 
     def expand(
-        nodes: Tensor, family: str | None, frontier_cost_forecast: float = 0.0
+        nodes: Tensor,
+        family: str | None,
+        frontier_cost_forecast: float = 0.0,
+        *,
+        forced_offspring: Tensor | None = None,
+        forced_edge_weight: float | None = None,
+        record_policy_node: bool = True,
     ) -> Tensor:
         rows = nodes.to(torch.int64)
         states = buffer.state_ref[rows]
@@ -359,9 +374,24 @@ def sample_branched_tree(
         output = None
         if dynamic_active and family is not None:
             output = actual_cost_forward(bundle.model, family, states, reaches)
-        offspring, _, total = offspring_for(
-            nodes, family, output, frontier_cost_forecast
-        )
+        if forced_offspring is None:
+            offspring, _, total = offspring_for(
+                nodes, family, output, frontier_cost_forecast
+            )
+        else:
+            if (
+                forced_offspring.shape != nodes.shape
+                or forced_offspring.device != device
+                or forced_offspring.dtype != torch.int64
+                or bool((forced_offspring <= 0).any())
+            ):
+                raise ValueError(
+                    "forced offspring must be positive device-local int64 [B]"
+                )
+            offspring = forced_offspring
+            total = read_control(offspring.sum().reshape(1))[0]
+            buffer.require_child_capacity(total)
+            arena.require_capacity(total)
         if family is not None and output is None:
             output = actual_cost_forward(bundle.model, family, states, reaches)
         parent_positions = torch.repeat_interleave(
@@ -375,7 +405,13 @@ def sample_branched_tree(
         prefix = torch.cat(
             (torch.zeros(1, dtype=torch.int64, device=device), offspring.cumsum(0)[:-1])
         )
-        ordinal = torch.arange(total, device=device) - prefix[parent_positions] + 1
+        prior_children = buffer.child_count[rows].to(torch.int64)
+        ordinal = (
+            torch.arange(total, device=device)
+            - prefix[parent_positions]
+            + 1
+            + prior_children[parent_positions]
+        )
         parent_paths = arena.gather_many(("path_key",), rows)["path_key"]
         expanded_paths = parent_paths[parent_positions]
         posterior_keys = logical_rng_keys(
@@ -393,7 +429,8 @@ def sample_branched_tree(
         if family is not None:
             assert output is not None
             child_output = _index_policy_output(output, parent_positions)
-            policy_node_reaches.append(reaches.detach().clone())
+            if record_policy_node:
+                policy_node_reaches.append(reaches.detach().clone())
         event_keys = logical_rng_keys(
             seed=logical_seed,
             iteration=iteration,
@@ -421,7 +458,14 @@ def sample_branched_tree(
         )
         next_owner = backend.classify(next_states).to(torch.int32)
         first_edge = buffer.edge_count
-        weights = offspring[parent_positions].reciprocal().to(torch.float32)
+        if forced_edge_weight is None:
+            weights = offspring[parent_positions].reciprocal().to(torch.float32)
+        else:
+            if not 0.0 < float(forced_edge_weight) <= 1.0:
+                raise ValueError("forced edge weight must lie in (0,1]")
+            weights = torch.full(
+                (total,), float(forced_edge_weight), dtype=torch.float32, device=device
+            )
         children = buffer.append_children(
             parents, next_states, next_owner, events.public_id, weights
         )
@@ -465,14 +509,15 @@ def sample_branched_tree(
                 )
             )
             policy_edge_logp.append(edge_logp)
-            policy_node_ids.append(nodes.to(torch.int32))
-            policy_node_values.append(output.v.detach().float())
-            output_t = getattr(output, "t", None)
-            output_c = getattr(output, "c", None)
-            if output_t is not None and output_c is not None:
-                policy_node_t.append(output_t.detach().float())
-                policy_node_c.append(output_c.detach().float())
-            DeviceWorkQueue.mark_done(arena, rows)
+            if record_policy_node:
+                policy_node_ids.append(nodes.to(torch.int32))
+                policy_node_values.append(output.v.detach().float())
+                output_t = getattr(output, "t", None)
+                output_c = getattr(output, "c", None)
+                if output_t is not None and output_c is not None:
+                    policy_node_t.append(output_t.detach().float())
+                    policy_node_c.append(output_c.detach().float())
+                DeviceWorkQueue.mark_done(arena, rows)
         return children
 
     def chance_close(frontier: Tensor) -> None:
@@ -546,46 +591,107 @@ def sample_branched_tree(
             chance_nodes = partition.candidate_handles[-2, :chance_count].to(torch.int32)
             frontier = expand(chance_nodes, None)
 
-    chance_close(root_nodes)
     progress_limit = node_budget * (int(backend.max_rollout_steps) + 2)
-    while any(queue.host_count for queue in queues.values()):
-        stop_if_cutoff_reached()
-        scheduler_step += 1
-        if scheduler_step > progress_limit:
-            raise RuntimeError("family-scheduled branched scheduler exceeded its progress bound")
-        nonempty = [name for name in family_names if queues[name].host_count]
-        upstream = min(family_priorities[family_names.index(name)] for name in nonempty)
-        eligible = [
-            name
-            for name in nonempty
-            if family_priorities[family_names.index(name)] == upstream
-        ]
-        family = max(
-            eligible,
-            key=lambda name: (
-                queues[name].host_count,
-                queues[name].oldest_age(scheduler_step),
-                -family_names.index(name),
-            ),
-        )
-        queue = queues[family]
-        configured_rows = int(
-            getattr(rollout_cfg, "family_batch_rows", None) or queue.host_count
-        )
-        count = min(queue.host_count, configured_rows)
-        frontier_cost_forecast = queue_cost_total
-        nodes = queue.dequeue(count, arena=arena).to(torch.int32)
-        if dynamic_active:
-            # This synchronization is co-located with the scheduler's existing
-            # host control boundary and keeps R_F incremental.
-            removed = read_float_control(
-                queue_cost[nodes.to(torch.int64)].sum()
+    def drain_player_queues() -> None:
+        nonlocal scheduler_step, queue_cost_total
+        while any(queue.host_count for queue in queues.values()):
+            stop_if_cutoff_reached()
+            scheduler_step += 1
+            if scheduler_step > progress_limit:
+                raise RuntimeError(
+                    "family-scheduled branched scheduler exceeded its progress bound"
+                )
+            nonempty = [name for name in family_names if queues[name].host_count]
+            upstream = min(
+                family_priorities[family_names.index(name)] for name in nonempty
             )
-            queue_cost_total -= removed
-        record_queues()
-        chance_close(expand(nodes, family, frontier_cost_forecast))
+            eligible = [
+                name
+                for name in nonempty
+                if family_priorities[family_names.index(name)] == upstream
+            ]
+            family = max(
+                eligible,
+                key=lambda name: (
+                    queues[name].host_count,
+                    queues[name].oldest_age(scheduler_step),
+                    -family_names.index(name),
+                ),
+            )
+            queue = queues[family]
+            configured_rows = int(
+                getattr(rollout_cfg, "family_batch_rows", None) or queue.host_count
+            )
+            count = min(queue.host_count, configured_rows)
+            frontier_cost_forecast = queue_cost_total
+            nodes = queue.dequeue(count, arena=arena).to(torch.int32)
+            if dynamic_active:
+                # This synchronization is co-located with the scheduler's existing
+                # host control boundary and keeps R_F incremental.
+                removed = read_float_control(queue_cost[nodes.to(torch.int64)].sum())
+                queue_cost_total -= removed
+            record_queues()
+            chance_close(expand(nodes, family, frontier_cost_forecast))
+
+    chance_close(root_nodes)
+    drain_player_queues()
+
+    pre_refill_node_count: int | None = None
+    root_pre_refill_child_count: int | None = None
+    if minimum_nodes is not None:
+        pre_refill_node_count = buffer.node_count
+        root_pre_refill_child_count = int(buffer.child_count[0])
+        if root_pre_refill_child_count <= 0:
+            raise RuntimeError("a refillable branched root must have an ordinary child")
+        root_owner_value = int(root_owner[0])
+        if root_owner_value == CHANCE:
+            root_family = None
+        elif 0 <= root_owner_value < p_max:
+            root_family_value = read_control(
+                _family_ids(backend, roots).reshape(1)
+            )[0]
+            try:
+                root_family = family_names[family_values.index(root_family_value)]
+            except ValueError as error:
+                raise RuntimeError("branched root has an unknown execution family") from error
+        else:
+            raise RuntimeError("branched root must be expandable for root refill")
+
+        refill_count = 0
+        while buffer.node_count < minimum_nodes:
+            refill_count += 1
+            extra = expand(
+                root_nodes,
+                root_family,
+                forced_offspring=torch.ones(1, dtype=torch.int64, device=device),
+                forced_edge_weight=1.0 / root_pre_refill_child_count,
+                record_policy_node=False,
+            )
+            chance_close(extra)
+            drain_player_queues()
+        diagnostics.update(
+            {
+                "root_refill_count": refill_count,
+                "pre_refill_nodes": pre_refill_node_count,
+                "root_refill_added_nodes": buffer.node_count - pre_refill_node_count,
+                "root_pre_refill_child_count": root_pre_refill_child_count,
+                "root_final_child_count": int(buffer.child_count[0]),
+            }
+        )
 
     tree = buffer.finalize()
+    if minimum_nodes is not None:
+        assert pre_refill_node_count is not None
+        assert root_pre_refill_child_count is not None
+        root_final_child_count = int(buffer.child_count[0])
+        root_scale = root_pre_refill_child_count / root_final_child_count
+        root_edge_stop = int(tree.child_ptr[1])
+        tree.nu[:root_edge_stop].fill_(1.0 / root_final_child_count)
+        tree.path_weight[1:].mul_(root_scale)
+        root_children = tree.child_node[:root_edge_stop].to(torch.int64)
+        tree.path_weight[root_children] = tree.nu[:root_edge_stop]
+        tree.root_pre_refill_child_count = root_pre_refill_child_count
+        tree.pre_refill_node_count = pre_refill_node_count
     tree.nominal_child_count = nominal_count[: buffer.node_count].detach()
     tree.branching_beta = beta_rows[: buffer.node_count].detach()
     tree.branching_diagnostics = dict(diagnostics)

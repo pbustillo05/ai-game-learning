@@ -299,6 +299,106 @@ def test_branched_value_exact_cost_recurrence_and_trace_sample_covariance() -> N
     assert not target.t_hat.requires_grad and not target.c_hat.requires_grad
 
 
+def test_refilled_root_targets_use_only_the_protected_child_prefix() -> None:
+    builder = TreeBuilder(1)
+    root = builder.add_root(0, 0)
+    builder.add_child(root, 1, 0, 1.0 / 3.0, TERMINAL)
+    builder.add_child(root, 2, 1, 1.0 / 3.0, TERMINAL)
+    builder.add_child(root, 3, 2, 1.0 / 3.0, TERMINAL)
+    tree = builder.finalize()
+    tree.nominal_child_count = torch.tensor([2, 0, 0, 0], dtype=torch.int32)
+    tree.root_pre_refill_child_count = 2
+    tree.pre_refill_node_count = 3
+    leaves = torch.tensor([1, 2, 3], dtype=torch.int32)
+    completion = BatchedCompletionStats(
+        p_hat=torch.ones((3, 1, 1)),
+        v_hat=torch.tensor([[[1.0]], [[3.0]], [[100.0]]]),
+    )
+    target = streamed_branched_value(
+        tree,
+        leaves,
+        [(leaves, completion)],
+        None,
+        HeadEvals(
+            torch.tensor([root], dtype=torch.int32),
+            torch.zeros((1, 1)),
+            t=torch.tensor([0.5]),
+            c=torch.tensor([1.0]),
+        ),
+        1.0,
+        _OnePlayerGame(),
+        configured_node_budget=4,
+        completion_batch_rows=3,
+    )
+
+    assert target.child_count.tolist() == [2]
+    assert target.child_mask.tolist() == [[True, True, False]]
+    assert target.v_hat[0, 0].item() == pytest.approx(2.0)
+    assert target.t_mask.tolist() == [True]
+    assert target.t_hat[0].item() == pytest.approx(2.0)
+    assert target.c_hat[0].item() == pytest.approx(1.0)
+
+
+def test_refill_does_not_manufacture_root_trace_target_from_one_child() -> None:
+    builder = TreeBuilder(1)
+    root = builder.add_root(0, 0)
+    builder.add_child(root, 1, 0, 0.5, TERMINAL)
+    builder.add_child(root, 2, 1, 0.5, TERMINAL)
+    tree = builder.finalize()
+    tree.nominal_child_count = torch.tensor([1, 0, 0], dtype=torch.int32)
+    tree.root_pre_refill_child_count = 1
+    tree.pre_refill_node_count = 2
+    leaves = torch.tensor([1, 2], dtype=torch.int32)
+    target = streamed_branched_value(
+        tree,
+        leaves,
+        [(
+            leaves,
+            BatchedCompletionStats(
+                p_hat=torch.ones((2, 1, 1)),
+                v_hat=torch.tensor([[[4.0]], [[100.0]]]),
+            ),
+        )],
+        None,
+        HeadEvals(
+            torch.tensor([root], dtype=torch.int32),
+            torch.zeros((1, 1)),
+            t=torch.tensor([0.5]),
+            c=torch.tensor([1.0]),
+        ),
+        1.0,
+        _OnePlayerGame(),
+        configured_node_budget=3,
+        completion_batch_rows=2,
+    )
+
+    assert target.child_count.tolist() == [1]
+    assert target.child_mask.tolist() == [[True, False]]
+    assert target.v_hat[0, 0].item() == pytest.approx(4.0)
+    assert target.t_mask.tolist() == [False]
+
+
+def test_size_triggered_all_child_mean_is_biased_but_protected_mean_is_not() -> None:
+    # Each branch is either small/value=0 or large/value=1 with equal chance.
+    # Start with two branches and append until total size reaches four. The
+    # stopped all-child mean overweights the small/value=0 outcome.
+    from itertools import product
+
+    naive_expectation = 0.0
+    protected_expectation = 0.0
+    for draws in product((0.0, 1.0), repeat=4):
+        sizes = [1 if value == 0.0 else 3 for value in draws]
+        stop = 2
+        while sum(sizes[:stop]) < 4:
+            stop += 1
+        probability = 0.5**4
+        naive_expectation += probability * sum(draws[:stop]) / stop
+        protected_expectation += probability * sum(draws[:2]) / 2
+
+    assert protected_expectation == pytest.approx(0.5)
+    assert naive_expectation != pytest.approx(0.5)
+
+
 def test_counterfactual_delta_corrects_parent_t_for_suppressed_children() -> None:
     builder = TreeBuilder(1)
     root = builder.add_root(0, 0)

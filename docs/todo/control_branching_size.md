@@ -177,16 +177,16 @@ same multiplicative change may compound through depth. Whole-tree elasticity,
 oscillation, and cap hits must therefore be measured for
 $\eta\in\{0.25,0.5,1\}$.
 
-## Why there is no post-completion refill
+## Protected-cohort lower-size refill
 
-The first experiments never reopen completed nodes, randomly choose old
-nodes, or append root children after seeing final tree size. Such refill makes
-the stopping rule depend on already observed child outcomes, changes sampled
-node inclusion probabilities, and confounds the comparison between intensity
-rules. Root-only refill is especially unjustified: it concentrates branching
-at the highest-variance location despite no measured marginal benefit. A
-future adaptive design would need its own sampling law and unbiased weighting
-argument; it is not a size-controller shortcut.
+Production branching now optionally appends complete root-child subtrees when
+the finished public tree is below `branching_min_nodes`. Because this stopping
+rule depends on observed subtree sizes, every root target is computed only from
+the ordinary pre-refill child prefix. Added branches contribute learning rows
+strictly below the root. Final root transition weights are uniform over all
+children, while nominal offspring, pre-refill degree, and final degree remain
+separate metadata. This supersedes the earlier prohibition on post-rollout
+refill with an explicit sampling law and root-estimator correction.
 
 ## Harness contract
 

@@ -79,6 +79,8 @@ from pbg.core.rollout import (
 from pbg.core.execution import LOGICAL_RNG_VERSION, DrawPurpose
 from pbg.core.tree import DecisionReachCache
 from pbg.core.values import HeadEvals, streamed_branched_value
+from pbg.core.completion import BatchedCompletionStats
+from pbg.core.utility import utility_conversion, utility_scale
 
 
 def _configure_reproducibility(profile: str) -> None:
@@ -112,6 +114,44 @@ def _loss_spec(cfg: RootConfig) -> LossSpec:
         return COMPOSITES[cfg.loss.name]
     except KeyError as exc:
         raise ValueError(f"unknown composite loss {cfg.loss.name!r}") from exc
+
+
+def _scale_completion_utility(
+    completion: BatchedCompletionStats, cfg: RootConfig
+) -> BatchedCompletionStats:
+    """Convert completed conditional values at the sole target boundary."""
+
+    scale = utility_scale(cfg)
+    if scale == 1.0:
+        return completion
+    return BatchedCompletionStats(
+        p_hat=completion.p_hat,
+        v_hat=completion.v_hat * scale,
+        metadata={**completion.metadata, "training_utility_scale": scale},
+    )
+
+
+def _migrate_value_head_state(
+    state: Mapping[str, Any], source_cfg: Any, target_cfg: Any
+) -> tuple[dict[str, Any], float, tuple[str, ...]]:
+    """Convert only final value affines between checkpoint utility units."""
+
+    factor = utility_conversion(source_cfg, target_cfg)
+    copied = dict(state)
+    if factor == 1.0:
+        return copied, factor, ()
+    suffixes = ("value_head.affine.weight", "value_head.affine.bias")
+    converted = tuple(sorted(name for name in copied if name.endswith(suffixes)))
+    if len(converted) != 4:
+        raise RuntimeError(
+            "utility migration requires preflop/postflop value-head weights and biases"
+        )
+    for name in converted:
+        value = copied[name]
+        if not isinstance(value, Tensor) or not value.is_floating_point():
+            raise RuntimeError(f"value-head checkpoint tensor {name!r} is invalid")
+        copied[name] = value * factor
+    return copied, factor, converted
 
 
 def _precision(cfg: RootConfig, device: torch.device) -> tuple[bool, torch.dtype]:
@@ -1086,7 +1126,9 @@ def _build_iteration_data(
                         profile_metrics[key] = max(
                             profile_metrics.get(key, 0.0), value
                         )
-                completion = completion_result.for_learning()
+                completion = _scale_completion_utility(
+                    completion_result.for_learning(), cfg
+                )
                 quality_parts.append(
                     (
                         int(selected.numel()),
@@ -1205,9 +1247,29 @@ def _build_iteration_data(
                 }
             )
             if iteration >= int(adaptive.warmup_iters):
-                counterfactual = float(tree.owner.numel()) + float(
-                    ((nominal - executed) * policy_cache.old_c).sum()
-                )
+                pre_refill_nodes = tree.pre_refill_node_count
+                if pre_refill_nodes is None:
+                    counterfactual = float(tree.owner.numel()) + float(
+                        ((nominal - executed) * policy_cache.old_c).sum()
+                    )
+                else:
+                    original = decision_ids < int(pre_refill_nodes)
+                    original_executed = executed[original].clone()
+                    original_ids = decision_ids[original]
+                    root = original_ids == 0
+                    if bool(root.any()):
+                        protected = tree.root_pre_refill_child_count
+                        if protected is None:
+                            raise RuntimeError(
+                                "pre-refill node metadata omitted the protected root degree"
+                            )
+                        original_executed[root] = float(protected)
+                    counterfactual = float(pre_refill_nodes) + float(
+                        (
+                            (nominal[original] - original_executed)
+                            * policy_cache.old_c[original]
+                        ).sum()
+                    )
                 if dist.is_available() and dist.is_initialized():
                     shared_counterfactual = torch.tensor(
                         counterfactual, dtype=torch.float64, device=device
@@ -2049,11 +2111,42 @@ def run_training(
         # allocation and rejects incompatible partial state deterministically.
         inspect_checkpoint(resume_from)
     initialized_model_state: Mapping[str, Any] | None = None
+    initialization_metadata: dict[str, Any] | None = None
     if init_checkpoint is not None:
         payload = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
-        if not isinstance(payload, dict) or not isinstance(payload.get("model"), dict):
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("model"), dict)
+            or not isinstance(payload.get("config"), dict)
+        ):
             raise RuntimeError("init checkpoint is not a PBG model checkpoint")
-        initialized_model_state = payload["model"]
+        source_config = payload["config"]
+        source_game = source_config.get("game")
+        expected_game = {
+            "n_players": cfg.game.n_players,
+            "stack_bb": cfg.game.stack_bb,
+            "rank_count": cfg.game.rank_count,
+        }
+        if source_game != expected_game:
+            raise RuntimeError("init checkpoint and target must use identical game settings")
+        initialized_model_state, conversion, converted = _migrate_value_head_state(
+            payload["model"], source_config, cfg
+        )
+        digest = hashlib.sha256()
+        with Path(init_checkpoint).open("rb") as stream:
+            for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        initialization_metadata = {
+            "source_checkpoint": str(Path(init_checkpoint).resolve()),
+            "source_checkpoint_sha256": digest.hexdigest(),
+            "source_iteration": int(payload.get("iteration", -1)),
+            "source_utility_normalization": source_config.get("loss", {}).get(
+                "utility_normalization", "none"
+            ),
+            "target_utility_normalization": cfg.loss.utility_normalization,
+            "value_head_conversion": conversion,
+            "converted_tensors": list(converted),
+        }
     target_payload: dict[str, Any] | None = None
     probe_target: dict[str, Any] | None = None
     if cfg.probe is not None:
@@ -2237,6 +2330,7 @@ def run_training(
             raise RuntimeError("checkpoint iteration is outside the configured schedule")
         run_id = checkpoint_metadata["run_id"]
         reference_iteration = checkpoint_metadata["reference_iteration"]
+        initialization_metadata = checkpoint_metadata.get("initialization")
         if sequential_memory_control:
             restored_memory_state = checkpoint_metadata["adaptive_work_state"]
             if restored_memory_state is None:
@@ -2368,6 +2462,7 @@ def run_training(
                         "config_sha256": _config_fingerprint(cfg),
                         "world_size": world,
                         "probe_target": probe_target,
+                        "initialization": initialization_metadata,
                     },
                     indent=2,
                     sort_keys=True,
@@ -2457,6 +2552,7 @@ def run_training(
                         ),
                         probe_target=probe_target,
                         logical_work=logical_work,
+                        initialization=initialization_metadata,
                     )
                     (out_dir / "memory_stop.json").write_text(
                         json.dumps(
@@ -2652,6 +2748,7 @@ def run_training(
                 ),
                 probe_target=probe_target,
                 logical_work=logical_work,
+                initialization=initialization_metadata,
             )
     if world > 1 and dist.is_initialized():
         dist.barrier()

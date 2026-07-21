@@ -12,6 +12,7 @@ from pbg.core.game import GameBundle
 from pbg.core.execution import DrawPurpose
 from pbg.core.rollout import sequential_leaf_logical_rng_keys
 from pbg.core.tree import DecisionReachCache
+from pbg.core.utility import utility_scale
 
 
 @dataclass
@@ -114,6 +115,7 @@ def build_normal_dataset_from_sampled(
         terminal_reward = bundle.rollout_backend.sampled_terminal_reward(
             tree.state_ref[leaf], leaf_profiles, gen
         ).float()
+    terminal_reward = terminal_reward * utility_scale(cfg)
     start_count = int(cfg.rollout.roots_per_gpu)
     reward_by_tree = torch.empty(
         (start_count, p_max), dtype=torch.float32, device=device

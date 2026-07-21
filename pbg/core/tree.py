@@ -36,6 +36,10 @@ class TreeBatch:
     # quantities. They are absent on sequential/legacy hand-built trees.
     nominal_child_count: Tensor | None = None
     branching_beta: Tensor | None = None
+    # Root-refill metadata. The protected prefix of root children and nodes
+    # belongs to the ordinary beta law; later rows are size-triggered samples.
+    root_pre_refill_child_count: int | None = None
+    pre_refill_node_count: int | None = None
 
     def validate(self) -> None:
         """Raise ``ValueError`` when topology or rollout-law invariants fail."""
@@ -182,6 +186,46 @@ class TreeBatch:
         root_ids = self.tree_id[roots].to(torch.int64)
         if root_ids.unique().numel() != root_ids.numel():
             raise ValueError("each tree id must have exactly one root")
+        if (self.root_pre_refill_child_count is None) != (
+            self.pre_refill_node_count is None
+        ):
+            raise ValueError("root refill metadata must be present as a complete pair")
+        if self.root_pre_refill_child_count is not None:
+            if root_rows.numel() != 1:
+                raise ValueError("root refill metadata requires exactly one root")
+            root = root_rows[0]
+            root_degree = int(counts[root])
+            protected = self.root_pre_refill_child_count
+            if (
+                isinstance(protected, bool)
+                or not isinstance(protected, int)
+                or not 1 <= protected <= root_degree
+            ):
+                raise ValueError(
+                    "root_pre_refill_child_count must be between one and the root degree"
+                )
+        if self.pre_refill_node_count is not None:
+            protected_nodes = self.pre_refill_node_count
+            if (
+                isinstance(protected_nodes, bool)
+                or not isinstance(protected_nodes, int)
+                or not 1 <= protected_nodes <= n
+            ):
+                raise ValueError("pre_refill_node_count must lie within the stored tree")
+            assert self.root_pre_refill_child_count is not None
+            root = root_rows[0]
+            start = int(self.child_ptr[root])
+            stop = int(self.child_ptr[root + 1])
+            root_children = self.child_node[start:stop].to(torch.int64)
+            protected = self.root_pre_refill_child_count
+            if protected_nodes < 1 + protected:
+                raise ValueError("the pre-refill tree cannot contain its protected root cohort")
+            if bool((root_children[:protected] >= protected_nodes).any()) or bool(
+                (root_children[protected:] < protected_nodes).any()
+            ):
+                raise ValueError(
+                    "root children must preserve the ordinary prefix before refill children"
+                )
 
 
 class TreeBuilder:

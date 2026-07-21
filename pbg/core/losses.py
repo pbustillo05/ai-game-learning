@@ -89,15 +89,18 @@ def l_v_clip(new: Any, old: Any, targets: Any, adapter: Any, cfg: Any) -> tuple[
 def _entropy_coefficient(cfg: Any, iteration: int) -> float:
     """Return the entropy coefficient for a zero-based training iteration.
 
-    Linear decay starts at ``c_h`` for iteration zero and reaches zero at
-    ``training.iters``.  Callers that pass a loss-like object directly may
-    expose ``iters`` on that object, but the horizon is never guessed.
+    Linear decay starts at ``c_h`` for iteration zero and reaches zero at the
+    explicit ``entropy_decay_iters`` horizon when supplied, otherwise at the
+    legacy ``training.iters`` horizon.  The fallback preserves old scientific
+    configurations; new continuation runs should set the explicit horizon.
     """
 
     value = float(_cfg(cfg, "c_h"))
     if _cfg(cfg, "entropy_schedule", "const") == "linear_decay":
         schedule = getattr(cfg, "training", cfg)
-        iters = getattr(schedule, "iters", None)
+        iters = _cfg(cfg, "entropy_decay_iters", None)
+        if iters is None:
+            iters = getattr(schedule, "iters", None)
         if isinstance(iters, bool) or not isinstance(iters, int) or iters <= 0:
             raise ValueError(
                 "linear entropy decay requires a positive training.iters horizon"

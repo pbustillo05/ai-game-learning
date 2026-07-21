@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 from pbg.benchmark import MODES, benchmark_modes, compare_benchmark
@@ -27,8 +28,21 @@ def main() -> None:
     parser.add_argument("--mode", action="append", choices=MODES, dest="modes")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--roots-per-gpu", type=int, default=None)
     parser.add_argument("--node-budget", type=int, default=None)
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=None,
+        help="fixed branching intensity (branched mode only)",
+    )
+    parser.add_argument(
+        "--branching-upper-cutoff-nodes",
+        type=int,
+        default=None,
+        help="suppress further duplication near this fixed-mode node ceiling",
+    )
     parser.add_argument("--family-batch-rows", type=int, default=None)
     parser.add_argument("--max-active-trajectories", type=int, default=None)
     parser.add_argument("--arena-chunk-nodes", type=int, default=None)
@@ -48,6 +62,19 @@ def main() -> None:
         cfg.rollout.roots_per_gpu = args.roots_per_gpu
     if args.node_budget is not None:
         cfg.rollout.node_budget = args.node_budget
+    if args.beta is not None:
+        if not math.isfinite(args.beta) or args.beta < 1.0:
+            parser.error("--beta must be finite and at least one")
+        cfg.rollout.beta = {"default": args.beta}
+    if args.branching_upper_cutoff_nodes is not None:
+        if not 1 < args.branching_upper_cutoff_nodes < cfg.rollout.node_budget:
+            parser.error(
+                "--branching-upper-cutoff-nodes must lie strictly between one "
+                "and --node-budget"
+            )
+        cfg.rollout.branching_upper_cutoff_nodes = (
+            args.branching_upper_cutoff_nodes
+        )
     if args.family_batch_rows is not None:
         cfg.rollout.family_batch_rows = args.family_batch_rows
     if args.max_active_trajectories is not None:
@@ -62,6 +89,8 @@ def main() -> None:
         cfg.training.minibatch_size = args.minibatch_size
     if args.gd_steps is not None:
         cfg.training.gd_steps_per_iter = args.gd_steps
+    if args.seed is not None:
+        cfg.training.seed = args.seed
     result = benchmark_modes(
         cfg,
         args.modes or MODES,

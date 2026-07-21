@@ -69,6 +69,7 @@ def _migrate_checkpoint_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(f"unsupported checkpoint schema version {version!r}")
     migrated.setdefault("branching_controller_schema_version", None)
     migrated.setdefault("branching_controller_state", None)
+    migrated.setdefault("initialization", None)
     if migrated.get("storage_schema_version") != TRAINING_STORAGE_SCHEMA_VERSION:
         raise RuntimeError("checkpoint storage schema is incompatible")
     controller_version = migrated.get("controller_schema_version")
@@ -137,6 +138,7 @@ def save_checkpoint(
     branching_controller_state: dict[str, Any] | None = None,
     probe_target: dict[str, Any] | None = None,
     logical_work: dict[str, int] | None = None,
+    initialization: dict[str, Any] | None = None,
 ) -> None:
     """Atomically store model, optimizer, scaler, config, and explicit RNG state."""
 
@@ -176,6 +178,7 @@ def save_checkpoint(
         "branching_controller_state": branching_controller_state,
         "probe_target": copy.deepcopy(probe_target),
         "logical_work": copy.deepcopy(logical_work),
+        "initialization": copy.deepcopy(initialization),
     }
     temporary = target.with_suffix(target.suffix + ".tmp")
     torch.save(payload, temporary)
@@ -242,6 +245,7 @@ def load_checkpoint(
         "branching_controller_state": payload.get("branching_controller_state"),
         "probe_target": copy.deepcopy(payload.get("probe_target")),
         "logical_work": copy.deepcopy(payload.get("logical_work")),
+        "initialization": copy.deepcopy(payload.get("initialization")),
         "checkpoint_schema_version": payload["checkpoint_schema_version"],
         "migrated_from_checkpoint_schema": payload.get(
             "migrated_from_checkpoint_schema"

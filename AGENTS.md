@@ -20,6 +20,37 @@ as its sole active game.
   `docs/audit/` for current readiness and open issues.
 - In Markdown, write math with `$...$` and `$$...$$` rather than `\(...\)` or `\[...\]` so it renders in VS Code.
 
+## Design authority and drift prevention
+
+- `docs/theory/core_math.tex` is authoritative for sampling laws, estimators,
+  targets, losses, and other mathematical semantics. The documents in
+  `docs/theory/pseudocode/` are authoritative for the production implementation
+  philosophy: ownership, storage layout, phase lifetimes, bounded streaming,
+  memory accounting, scheduling, distributed updates, and failure behavior.
+  Production code is not an authority when it conflicts with either source.
+- In particular, preserve the pseudocode's last-consumer storage discipline:
+  allocate from immutable schemas and realized work, retain only data required
+  by a future consumer, seal exact stores explicitly, release phase-local owners
+  at the specified boundary, and bound transient work independently of logical
+  statistical work. Do not replace these invariants with convenient global
+  capacities, replay/recomputation of discarded rollout state, or post-hoc
+  conversion from a larger legacy representation.
+- A refactor that supersedes a production path must make the new path the sole
+  implementation. Migrate all production and evaluation consumers, then delete
+  obsolete implementations, compatibility allocations, configuration fields,
+  tests, and documentation. Do not keep parallel legacy code "for safety"
+  unless the user explicitly approves a narrowly scoped, time-bounded migration.
+- Before changing a core training path, trace the change to the relevant theory
+  and pseudocode contracts. If a requested or proposed change conflicts with
+  them, flag the conflict to the user before implementing it rather than silently
+  drifting. If you discover that existing code has already drifted, surface it
+  explicitly and treat reconciliation or an explicit user decision as part of
+  the task.
+- When mathematics evolves, update the implementation pseudocode and storage
+  schemas alongside the code so the authorities remain mutually consistent.
+  Tests must cover structural ownership/lifetime invariants, not only numerical
+  outputs or successful end-to-end execution.
+
 ## PBG tree terminology and rollout convention
 
 - A PBG public game tree has exactly one distinguished root,

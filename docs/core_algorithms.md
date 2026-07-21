@@ -66,6 +66,14 @@ ordinary randomized-rounding rule. Repeated event labels remain distinct
 children. Empirical child frequency determines edge mass, and `path_weight`
 stores the product of incoming edge masses.
 
+When `rollout.branching_min_nodes` is configured, a completed public tree below
+that size receives one fresh root child at a time, with each new subtree
+expanded by the ordinary downstream beta rules before posterior completion.
+Final root edges are renormalized uniformly. The pre-refill root children form
+a protected prefix used for every root target; refill branches contribute
+learning rows only below the root. `nominal_child_count` retains its ordinary
+randomized-rounded beta meaning.
+
 The tree is one labeled CSR topology, never a forest of special root copies.
 The configured node budget caps that tree. Offspring counts are validated
 before topology or occurrence status changes.

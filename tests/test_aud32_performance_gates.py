@@ -166,3 +166,62 @@ def test_benchmark_loads_and_records_read_only_model_checkpoint(
     assert result["workload"]["model_initialization_protocol"] == "checkpoint_model_state_v1"
     assert result["workload"]["model_checkpoint"]["iteration"] == 17
     assert result["workload"]["model_checkpoint"]["run_id"] == "trained-policy"
+
+
+def test_branched_benchmark_initializes_only_missing_branching_heads(
+    monkeypatch, tmp_path
+) -> None:
+    cfg = load_config("configs/train/nlhe6.yaml")
+    cfg.loss.c_kl = 0.0
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.trunk = torch.nn.Linear(2, 2)
+            self.branching_heads = torch.nn.Linear(2, 2)
+
+    trained = Model()
+    checkpoint_state = {
+        key: value
+        for key, value in trained.state_dict().items()
+        if not key.startswith("branching_heads.")
+    }
+    checkpoint = tmp_path / "sequential-checkpoint.pt"
+    torch.save({"model": checkpoint_state, "iteration": 23}, checkpoint)
+    observed: list[dict[str, torch.Tensor]] = []
+
+    def build(_cfg, device):
+        return SimpleNamespace(
+            model=Model(),
+            rollout_backend=SimpleNamespace(device=torch.device(device)),
+        )
+
+    def iteration(_cfg, bundle, *_args, profile=False, **_kwargs):
+        if profile:
+            observed.append(copy.deepcopy(bundle.model.state_dict()))
+            return {
+                "profiled_iteration_seconds": 1.0,
+                "phase_rollout_seconds": 0.5,
+                "decisions": 1.0,
+            }
+        return {}
+
+    monkeypatch.setattr("pbg.benchmark.build_game_bundle", build)
+    monkeypatch.setattr("pbg.benchmark._one_iteration", iteration)
+    result = benchmark_modes(
+        cfg,
+        ("branched_rao_blackwell",),
+        warmup=0,
+        repeats=1,
+        device="cpu",
+        checkpoint=checkpoint,
+    )
+
+    assert len(observed) == 1
+    assert all(
+        torch.equal(observed[0][key], value)
+        for key, value in checkpoint_state.items()
+    )
+    assert result["modes"][0]["workload"][
+        "randomly_initialized_checkpoint_keys"
+    ] == ["branching_heads.weight", "branching_heads.bias"]

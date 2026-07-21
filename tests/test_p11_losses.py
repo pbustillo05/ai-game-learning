@@ -250,3 +250,18 @@ def test_linear_entropy_schedule_never_guesses_a_horizon() -> None:
     cfg = SimpleNamespace(c_h=0.01, entropy_schedule="linear_decay")
     with pytest.raises(ValueError, match="training.iters"):
         _entropy_coefficient(cfg, 0)
+
+
+def test_explicit_entropy_decay_horizon_overrides_training_length() -> None:
+    cfg = SimpleNamespace(
+        loss=SimpleNamespace(
+            c_h=0.01,
+            entropy_schedule="linear_decay",
+            entropy_decay_iters=500,
+        ),
+        training=SimpleNamespace(iters=1110),
+    )
+    assert _entropy_coefficient(cfg, 0) == pytest.approx(0.01)
+    assert _entropy_coefficient(cfg, 250) == pytest.approx(0.005)
+    assert _entropy_coefficient(cfg, 500) == 0.0
+    assert _entropy_coefficient(cfg, 900) == 0.0

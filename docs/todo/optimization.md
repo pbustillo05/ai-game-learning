@@ -11,7 +11,85 @@ Measured average budget from the completed run:
 - Optimizer update: 1.0 s
 - Scheduler CPU synchronization: only 0.009 s
 
-So CPU scheduler control is already negligible. The leaks are GPU launch overhead, duplicated tensor work, poor postflop packing, immutable preprocessing, and exposed communication.
+Those numbers are the sequential RB baseline. CPU scheduler control is already
+negligible there. The leaks are GPU launch overhead, duplicated tensor work,
+poor postflop packing, immutable preprocessing, and exposed communication.
+
+## Fixed-$\beta$ branching benchmark
+
+Measured on 2026-07-21 on one idle RTX 2080 Ti using checkpoint 1110 from
+`runs/nlhe_hu_32bb_full_sequential_rb` (SHA-256
+`bced881945512f2a4152d3acd88a0a06395a00130cdf68a61aa2652bc1b5aebb`). The
+trained trunk was loaded exactly. Because that sequential checkpoint has no
+T/C branching heads, the 32 missing head tensors were newly initialized. This
+is appropriate for compute and memory benchmarking, but their numerical loss
+or gradient behavior is not a trained-model result.
+
+The geometry benchmark used fixed $\beta=2.3$, one rooted tree, 64-row family
+batches, a hard capacity of 12,000 nodes, a fixed-mode upper cutoff at 2,000
+nodes, and an 8.5 GB measured peak gate. Once the upper cutoff activates,
+further multiplicity is suppressed to one. The capacity prevents allocation
+beyond the finite analytical plan; placing the upper cutoff well below that
+capacity leaves room for already queued paths to close. The two tiny trees are
+excluded from the analysis below.
+
+Across the six relevant trees:
+
+| Metric | Median | Range |
+|---|---:|---:|
+| Nodes | 3,756 | 2,948–4,416 |
+| Decisions | 2,308 | 1,701–2,817 |
+| Leaves | 1,077 | 1,055–1,108 |
+| Rollout time | 24.18 s | 17.28–29.22 s |
+| Time per decision | about 10.4 ms | about 10.2–10.6 ms |
+| Peak allocated VRAM | 3.48 GiB | 3.47–3.49 GiB |
+| Peak reserved VRAM | 6.13 GiB | 6.11–6.13 GiB |
+
+A representative 4,494-node/2,866-decision tree took 29.71 seconds. It made 48
+postflop model calls for 2,862 rows; 43 calls were full 64-row packs. Queue fill
+is therefore already good in branching mode. The same tree made 73 evaluator
+calls for 4,493 posterior rows. Its 147 scheduler control synchronizations moved
+only 2,952 bytes and consumed 2.8 ms in total, so scheduler synchronization is
+not an optimization target.
+
+The important geometry is postflop width. Of the representative tree's
+decisions, 0.1% were preflop, 2.9% flop, 24.8% turn, and 72.1% river. Nevertheless,
+all postflop rows used the flop-width 2,554-token physical layout. The rollout
+therefore executed 18.67 billion padded attention pairs, or essentially one
+full flop-width square per postflop decision.
+
+A bounded end-to-end diagnostic used the same checkpoint and $\beta$, a 1,000
+node upper cutoff inside the 12,000-node capacity, 64 completion samples, and
+one requested optimizer step. It produced 2,591 nodes, 1,627 decisions, and 557
+leaves:
+
+| Phase | Seconds | Share of 11.38 s profiled iteration |
+|---|---:|---:|
+| Rollout | 10.316 | 90.7% |
+| Completion + branched targets | 0.316 | 2.8% |
+| Seal/compact storage | 0.037 | 0.3% |
+| Learner/reference/optimizer path | 0.707 | 6.2% |
+
+Peak allocation was 3.27 GiB and peak reservation was 5.78 GiB. Repeating the
+same tree with 16 rather than 64 completion samples changed measured completion
+time only from 0.192 to 0.196 seconds. This does not establish scaling to the
+production 1,024 samples; it only shows that small-$n$ completion is not the
+present bottleneck. The optimizer correctly skipped its update after the
+untrained T/C heads produced a nonfinite reduced gradient, so the learner timing
+is useful as a shape/compute diagnostic, not as a training-valid result. Every
+CUDA process exited and all three GPUs returned idle.
+
+### Branching-specific ROI additions
+
+| Priority | Optimization | Evidence and likely payoff | Effort |
+|---:|---|---|---:|
+| B1 | Split postflop physical execution by street | 97% of representative decisions were turn/river but paid flop width; about 11–13% attention-pair reduction is available before other compaction | Medium |
+| B2 | Segment child sampling by parent without expanding full policy/reach tensors | Every branched parent output is gathered into repeated child-sized structures before profile/action/reach work | Medium–high |
+| B3 | Write branched decision caches directly by node id | Removes batch-list clones, `cat`, node sort, and edge remapping; reduces peak coexistence with dense reach storage | Medium |
+| B4 | Chunk the remaining node-capacity tensors | Current reach, topology, diagnostics, and queues scale with the hard node budget rather than realized nodes | Medium–high |
+| B5 | Make fixed-$\beta$ memory admission a first-class contract | Safety-critical; permits larger useful trees without risking allocator OOM | Medium |
+| B6 | Fuse/capture fixed-shape posterior/action/transition blocks | 73 evaluator calls and 50 policy calls in one representative rollout; useful after B1/B2 establish stable shapes | High |
+| B7 | Add cutoff-stratified branching performance baselines | Separates natural completion from cutoff closure and normalizes by decisions/nodes | Low |
 
 ## ROI ranking
 
@@ -304,6 +382,113 @@ Since the sibling evaluator owns posterior sampling, this must be implemented th
 - JSON metrics and checkpoint writes can be moved off the critical path, but their amortized contribution is small.
 - Thermal throttling is real on the 2080 Tis, but reducing wasted work is the actionable fix; fan privileges are unavailable.
 
+## Branching implementation details
+
+### B1. Street-specific postflop physical families
+
+Keep the logical sampling family `post_2`, but split its physical packs into
+flop, turn, and river buffers. The current family forward always sets
+`compact_size=comb(n_cards - 3, 2)`, even for turn and river. For a full deck,
+the compatible two-card domains are 1,176 on the flop, 1,128 on the turn, and
+1,081 on the river. With two live players, moving from flop to turn/river width
+removes the duplicated player-token rows twice.
+
+The observed street mixes imply about an 11–13% reduction in padded attention
+pairs if nothing else changes. This should precede CUDA graph capture because
+it defines the useful stable graph shapes. The logical RNG address and tree
+semantics remain unchanged; only physical packing changes.
+
+History length can become a secondary physical bucket later. Its ceiling is
+small relative to the two compact hand domains, so it should not delay the
+street split.
+
+### B2. Segmented parent-to-child expansion
+
+`expand()` currently creates `parent_positions` and then materializes repeated
+child-sized states, reaches, and every tensor in `PolicyOutput`. For
+$N(u)\in\{2,3\}$, all children of parent $u$ share the same public state and
+policy output until their keyed posterior/profile and action draws diverge.
+
+Implement a segmented primitive with parent rows, offspring counts, and child
+ordinals:
+
+```text
+parent output + parent reach + child RNG keys
+    → child profiles/actions
+    → selected logp by child
+    → next state/reach/owner
+```
+
+The primitive should index the parent output inside the sampling kernel rather
+than first gathering complete child copies. It can also produce child path keys
+and parent-local edge ordinals directly. This is the branching counterpart of
+the generic fused rollout policy step in item 1.
+
+### B3. Direct cache writes instead of list/cat/sort
+
+Branched rollout retains cloned reach batches in `policy_node_reaches`, cloned
+policy outputs in several more Python lists, and then concatenates and sorts
+them by node id at finalization. Edge log probabilities are similarly rebuilt
+through a dense node-to-row map and an append-order-to-CSR scatter.
+
+Reserve cache rows once and write them by stable node id or assigned decision
+row as each batch expands. Store edge data at its already-known parent-local
+ordinal. This removes the final `cat`/sort/scatter wave and, more importantly,
+avoids coexistence between list-owned cloned decision reaches and the full
+`reach_rows` table. Preflop rows should use the 169-class representation from
+item 9.
+
+### B4. Chunk capacity-proportional branching state
+
+The occurrence arena is chunked, but `DeviceTreeBuffer`, `reach_rows`, the T/C
+diagnostic arrays, path-factor arrays, and every family queue are allocated at
+the complete node budget. That makes a conservative safety budget expensive
+even when the realized tree is much smaller.
+
+Move the largest remaining arrays—starting with reach and queue payloads—to
+admitted slabs. Grow only after checking the next slab plus the reserved
+completion/learner envelope. Stable logical node ids can remain flat while a
+small slab table resolves physical storage. Keep a modest number of fixed slab
+sizes so allocator fragmentation does not replace capacity waste.
+
+### B5. Fixed-$\beta$ OOM safeguard
+
+Fixed mode must use the same quality of memory control as dynamic mode. The
+benchmark path now accepts an explicit fixed $\beta$ and
+`branching_upper_cutoff_nodes`. Across the geometry and full-iteration probes,
+the safeguards were the analytical plan/preflight, hard node capacity, hardware
+reserve, measured peak gate, and teardown check.
+
+For production, make the cutoff part of the validated rollout schema rather
+than a tool-injected attribute. Admission should account for:
+
+- Current realized nodes.
+- At least one closing descendant for every queued/frontier occurrence.
+- The next offspring block before it is materialized.
+- Retained completion, target, reference, gradient, and optimizer envelopes.
+- Driver reserve and allocator fragmentation slack.
+
+When the forecast crosses the operating ceiling, atomically set future
+multiplicity to one before allocating children. If even unit-multiplicity
+closure cannot fit, fail before allocation with geometry and memory evidence;
+never discover the condition through a CUDA OOM. Record the first cutoff node,
+suppressed children, pending frontier, and whether the sample is censored so
+performance and scientific reports cannot silently mix regimes.
+
+### B6–B7. Capture only after stratified measurement
+
+After B1/B2, capture fixed street/batch blocks for posterior sampling, action
+sampling, transition, reach update, and cache writes. Preserve logical RNG keys
+as mutable graph inputs. A fixed attempt budget with masked survivors is still
+required for evaluator rejection work as described in item 12.
+
+Report naturally completed and cutoff-closed trees separately. For each,
+record seconds per node/decision, street mix, full-pack rate, evaluator calls,
+padded token pairs, and peak allocated/reserved bytes. The measured branching
+queue already filled 43 of 48 postflop calls to 64 rows, and scheduler control
+took only 2.8 ms, so neither extra queue accumulation nor scheduler rewrites
+should precede B1–B4.
+
 ## Recommended implementation order
 
 I would run the next optimization session in this order:
@@ -317,5 +502,14 @@ I would run the next optimization session in this order:
 7. Improve postflop queue fill.
 8. Overlap gradient buckets with final backward.
 9. Then consider compact preflop reach and multi-stream pipelining.
+
+For branching mode specifically:
+
+1. Promote the fixed-$\beta$ cutoff and memory admission into validated production configuration.
+2. Split postflop physical packs by street and remeasure padded attention work.
+3. Implement segmented parent-to-child sampling without repeated full outputs/reaches.
+4. Replace branched list/cat/sort caches with direct indexed writes.
+5. Chunk the remaining budget-sized reach/queue/topology tensors.
+6. Capture the resulting fixed street/batch shapes and evaluator attempt blocks.
 
 The relevant execution loops are [rollout.py](/home/pablob/ai-game-learning/pbg/core/rollout.py:698) and [learner.py](/home/pablob/ai-game-learning/pbg/core/learner.py:1276); gradient synchronization is in [optimization.py](/home/pablob/ai-game-learning/pbg/core/optimization.py:113). The existing optimization progression is documented in [nlhe_hu_32bb_optimizer_speed_record_20260717.md](/home/pablob/ai-game-learning/docs/audit/nlhe_hu_32bb_optimizer_speed_record_20260717.md:1).

@@ -152,10 +152,13 @@ def test_small_cpu_cuda_parity() -> None:
     tree, stats, heads = _posterior_shift_fixture()
     cpu = _targets(tree, stats, heads, 0.5)
     device = torch.device("cuda")
-    gpu_tree = TreeBatch(**{
-        name: getattr(tree, name).to(device)
-        for name in TreeBatch.__dataclass_fields__
-    })
+    gpu_tree = TreeBatch(
+        **{
+            name: value.to(device) if isinstance(value, torch.Tensor) else value
+            for name in TreeBatch.__dataclass_fields__
+            for value in (getattr(tree, name),)
+        }
+    )
     gpu_stats = _stats(stats.p_hat.to(device), stats.v_hat.to(device))
     gpu_heads = HeadEvals(heads.node_ids.to(device), heads.v.to(device))
     gpu = _targets(gpu_tree, gpu_stats, gpu_heads, 0.5)

@@ -278,6 +278,54 @@ def test_root_fractional_rounding_is_keyed_and_repeatable() -> None:
     assert second_count == first_count
 
 
+def test_root_refill_reaches_minimum_and_finalizes_uniform_weights() -> None:
+    backend = _LabeledBackend(2.3)
+    cfg = _cfg(1, 2.3, budget=16)
+    cfg.branching_min_nodes = 10
+    diagnostics: dict[str, int] = {}
+
+    tree, _, policy = sample_branched_tree(
+        GameBundle(_Model(), backend, _Adapter(), None),
+        cfg,
+        torch.Generator().manual_seed(19),
+        diagnostics=diagnostics,
+    )
+
+    root_degree = int(tree.child_ptr[1] - tree.child_ptr[0])
+    assert tree.owner.numel() == 10
+    assert tree.pre_refill_node_count in {3, 4}
+    assert tree.root_pre_refill_child_count in {2, 3}
+    assert root_degree == 9
+    assert diagnostics["root_refill_count"] == (
+        root_degree - tree.root_pre_refill_child_count
+    )
+    assert diagnostics["root_refill_added_nodes"] == (
+        tree.owner.numel() - tree.pre_refill_node_count
+    )
+    assert int(tree.nominal_child_count[0]) == tree.root_pre_refill_child_count
+    assert torch.allclose(
+        tree.nu[:root_degree],
+        torch.full((root_degree,), 1.0 / root_degree),
+        atol=1.0e-7,
+        rtol=0.0,
+    )
+    assert torch.allclose(
+        tree.path_weight[1:],
+        torch.full((root_degree,), 1.0 / root_degree),
+        atol=1.0e-7,
+        rtol=0.0,
+    )
+    assert policy.node_ids.tolist() == [0]
+    assert policy.old_logp_child.shape == (1, root_degree, 1)
+    tree.validate()
+
+
+def test_root_refill_is_disabled_without_minimum() -> None:
+    ordinary, _, _ = _sample(_LabeledBackend(2.3), _cfg(1, 2.3), 19)
+    assert ordinary.root_pre_refill_child_count is None
+    assert ordinary.pre_refill_node_count is None
+
+
 def test_branched_overflow_is_transactional() -> None:
     backend = _LabeledBackend(4.0)
     with pytest.raises((MemoryError, RuntimeError), match="capacity|overflow"):
@@ -317,6 +365,12 @@ def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> 
     raw["rollout"]["sequential_roots_per_gpu_initial"] = 2
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ConfigError, match="exactly one root per rank"):
+        load_config(path)
+
+    raw["rollout"]["sequential_roots_per_gpu_initial"] = 1
+    raw["rollout"]["branching_min_nodes"] = raw["rollout"]["node_budget"]
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="branching_min_nodes"):
         load_config(path)
 
 

@@ -233,6 +233,33 @@ def test_behavioral_profile_enums_are_strict(
         load_config(path)
 
 
+def test_loss_unit_and_explicit_entropy_horizon_are_strict(tmp_path: Path) -> None:
+    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
+    raw["loss"].update(
+        {
+            "utility_normalization": "stack",
+            "entropy_schedule": "linear_decay",
+            "entropy_decay_iters": 500,
+        }
+    )
+    path = tmp_path / "normalized.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.loss.utility_normalization == "stack"
+    assert cfg.loss.entropy_decay_iters == 500
+
+    raw["loss"]["utility_normalization"] = "mystery"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="utility_normalization"):
+        load_config(path)
+
+    raw["loss"]["utility_normalization"] = "stack"
+    raw["loss"]["entropy_decay_iters"] = 0
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="entropy_decay_iters"):
+        load_config(path)
+
+
 @pytest.mark.parametrize(
     ("section", "field", "value", "pattern"),
     [

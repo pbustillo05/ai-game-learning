@@ -752,7 +752,7 @@ The design constraint, encouraged by the Rao--Blackwellized pipeline, is that th
 \label{alg:sample-tree}
 \DontPrintSemicolon
 \tcc{Sampling procedure for the rollout tree of \cref{def:branched-rollout-tree}.}
-\KwParam{$\pi$, rollout profile; $\beta:\mathcal S\setminus\mathcal T\to[1,\infty)$, intensity; optional frozen cost head $C$ and budget $M_{\tt safe}$, with $M_{\tt safe}=\infty$ disabling the safeguard}
+\KwParam{$\pi$, rollout profile; $\beta:\mathcal S\setminus\mathcal T\to[1,\infty)$, intensity; optional frozen cost head $C$ and budget $M_{\tt safe}$; optional lower tree-size safeguard $M_{\min}$}
 \KwOut{sampled tree $\mathfrak{S}^{\beta,\pi}$, label map $\ell^{\beta,\pi}$, executed and nominal child counts $(N,\widetilde N)$, and node-specific reach caches $\mathfrak r$}
 Set $\mathfrak{S}^{\beta,\pi}\gets\{\varnothing\}$, $\ell^{\beta,\pi}(\varnothing)\gets\varnothing$, $\mathfrak r_{\varnothing}\gets(1)_{q\in\mathcal P\cup\{\mathsf c\}}$, and expansion queue $\mathcal F\gets\{\varnothing\}$\;
 \While{$\mathcal F\neq\varnothing$}{
@@ -801,6 +801,15 @@ Set $\mathfrak{S}^{\beta,\pi}\gets\{\varnothing\}$, $\ell^{\beta,\pi}(\varnothin
   $\mathcal F\gets(\mathcal F\setminus\mathcal B)\sqcup\mathcal A_{\mathcal B}$,
   and update $R_{\mathcal F}$ by the corresponding removals and insertions\;
 }
+Let $N_0(\varnothing)$ be the executed root degree and $\mathfrak S_0$ the
+completed tree before lower-size safeguarding.  While
+$|\mathfrak S|<M_{\min}$, append one fresh independently sampled root child,
+using the next root-child logical ordinal, and expand its complete descendant
+subtree by the ordinary $\beta$ rule.  Let $N_+(\varnothing)$ be the final root
+degree.  Set every final root-edge transition mass to
+$1/N_+(\varnothing)$ and recompute descendant path masses.  Retain
+$N_0(\varnothing)$ and $|\mathfrak S_0|$ as protected-cohort metadata; neither
+replaces the nominal randomized-rounded count $\widetilde N(\varnothing)$.
 \Return{$(\mathfrak{S}^{\beta,\pi},\ell^{\beta,\pi},N,\widetilde N,\mathfrak r)$}
 \end{algorithm}
 
@@ -1094,21 +1103,45 @@ satisfies $\mathbb E(\widetilde N(\mathsf s)\mid\ell(\mathsf s)=\sigma)=\beta(\s
 the mean-field KKT ignores the corresponding reciprocal-moment correction.
 Practically speaking, we can't immediately use these heads in training before they are somewhat trained.
 So we warmup the training on a fixed intensity $\beta_{\tt fix}$ before starting this iterative process.
+
+The lower tree-size safeguard is an outcome-dependent stopping rule and is
+therefore different from the queue-pressure correction above. At the root,
+all learning targets are reduced over only the first
+$N_0(\varnothing)$ children. In particular, writing
+$\mathfrak E^0_{\varnothing}$ for that protected prefix,
+\[
+  \widehat C^\lambda(\varnothing)
+  =\frac1{N_0(\varnothing)}
+    \sum_{\mathsf a\in\mathfrak E^0_{\varnothing}}
+    \left(1+\widetilde N(\mathsf a)\widehat C^\lambda(\mathsf a)\right).
+\]
+The root trace sample covariance and its average child $\Delta$ correction are
+likewise computed only over $\mathfrak E^0_{\varnothing}$, and the trace target
+is absent when $N_0(\varnothing)=1$, regardless of the final augmented degree.
+The same protected prefix is used for the root posterior, value, and
+leave-one-out advantage targets. Refill branches remain ordinary learning data
+strictly below the root. This prevents the size stopping rule from changing
+root estimands when subtree size is correlated with value or cost.
+For the target equations below, define
+$\mathfrak E^{\tt tgt}_{\mathsf s}=\mathfrak E^0_{\varnothing}$ at a refilled
+root and $\mathfrak E^{\tt tgt}_{\mathsf s}=\mathfrak E_{\mathsf s}$ otherwise,
+and let $N^{\tt tgt}(\mathsf s)=|\mathfrak E^{\tt tgt}_{\mathsf s}|$.
+
 To train the trace-variance head, for every sampled node $\mathsf{s}$ labeled by
-$\sigma$ with $N(\mathsf{s})\geq 2$, first compute the executed-tree trace
+$\sigma$ with $N^{\tt tgt}(\mathsf{s})\geq 2$, first compute the executed-tree trace
 sample covariance
 \begin{equation}
   \widehat{T}^{\tt exec}(\mathsf{s})
   =
-    \frac{1}{N(\mathsf{s})-1}
-  \sum_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}}
+    \frac{1}{N^{\tt tgt}(\mathsf{s})-1}
+  \sum_{\mathsf{a}\in\mathfrak{E}^{\tt tgt}_{\mathsf{s}}}
   \left\|
     \widehat{\mathbf V}(\mathsf{s}\mathsf{a})
     -\widehat{\mathbf V}(\mathsf{s})
   \right\|_2^2
   \label{eq:branched-trace-variance-target}
 \end{equation}
-and set it to $\bot$ when $N(\mathsf s)=1$.  Using the same GAE horizon
+and set it to $\bot$ when $N^{\tt tgt}(\mathsf s)=1$.  Using the same GAE horizon
 $\lambda\in[0,1]$ as above, $\widehat C^\lambda(\mathsf s)$ estimates nominal
 per-child subtree size and $\widehat C^1$ is its Monte Carlo target.  The
 counterfactual recurrences are given directly in \cref{alg:branched-value};
@@ -1124,8 +1157,8 @@ Gamma-deviance losses
     c_T\left(
       \dfrac{\widehat T+\varepsilon_T}{T^\theta(\Sigma)+\varepsilon_T}
       +\log\dfrac{T^\theta(\Sigma)+\varepsilon_T}{\widehat T+\varepsilon_T}-1
-    \right) & \textnormal{if $N(\mathsf S)\geq2$},\\
-    0 & \textnormal{if $N(\mathsf S)=1$},
+    \right) & \textnormal{if $N^{\tt tgt}(\mathsf S)\geq2$},\\
+    0 & \textnormal{if $N^{\tt tgt}(\mathsf S)=1$},
   \end{cases}
   \\
   \mathcal L_C[\widehat C^\lambda]
@@ -1169,7 +1202,8 @@ For any tuple-valued child expression $F(\bullet)$, write
 \[
   \operatorname{Avg}_{\mathsf{s}}[F(\bullet)]
   :=
-  \frac{1}{N(\mathsf{s})}\sum_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}}F(\mathsf{s}\mathsf{a})
+  \frac{1}{N^{\tt tgt}(\mathsf{s})}
+  \sum_{\mathsf{a}\in\mathfrak{E}^{\tt tgt}_{\mathsf{s}}}F(\mathsf{s}\mathsf{a})
 \]
 and
 \[
@@ -1177,10 +1211,10 @@ and
   :=
   \begin{cases}[l"l]
     \displaystyle
-    \frac{1}{N(\mathsf{s})-1}
-    \sum_{\mathsf{b}\in\mathfrak{E}_{\mathsf{s}}\setminus\{\mathsf{a}\}}F(\mathsf{s}\mathsf{b})
-    & \textnormal{if }N(\mathsf{s})>1,\\
-    \bot & \textnormal{if }N(\mathsf{s})=1.
+    \frac{1}{N^{\tt tgt}(\mathsf{s})-1}
+    \sum_{\mathsf{b}\in\mathfrak{E}^{\tt tgt}_{\mathsf{s}}\setminus\{\mathsf{a}\}}F(\mathsf{s}\mathsf{b})
+    & \textnormal{if }N^{\tt tgt}(\mathsf{s})>1,\\
+    \bot & \textnormal{if }N^{\tt tgt}(\mathsf{s})=1.
   \end{cases}
 \]
 For tuples $z,h$ of the same shape, set
@@ -1256,18 +1290,18 @@ Initialize target table $\mathcal O\gets\varnothing$\;
   \If{$o(\sigma) \in \mathcal{P}$}{
       Set $\widehat T(\mathsf s)\gets
       \max\{0,\widehat T^{\tt exec}(\mathsf s)-\overline\Delta(\mathsf s)\}$
-      if $N(\mathsf s)\geq2$ and to $\bot$ otherwise; set
+      if $N^{\tt tgt}(\mathsf s)\geq2$ and to $\bot$ otherwise; set
       $T^*(\mathsf s)\gets\widehat T(\mathsf s)$ if present and to $T(\sigma)$ otherwise; set
-      $\Delta(\mathsf s)\gets(T^*(\mathsf s)+\overline\Delta(\mathsf s))/N(\mathsf s)-T^*(\mathsf s)/\widetilde N(\mathsf s)$\;
-      $\left(\widehat{Q}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a})\right)_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}}
+      $\Delta(\mathsf s)\gets(T^*(\mathsf s)+\overline\Delta(\mathsf s))/N^{\tt tgt}(\mathsf s)-T^*(\mathsf s)/\widetilde N(\mathsf s)$\;
+      $\left(\widehat{Q}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a})\right)_{\mathsf{a}\in\mathfrak{E}^{\tt tgt}_{\mathsf{s}}}
       \gets
       \left(
         \operatorname{Cond}\left(
           \widehat M_{o(\sigma)}(-_{o(\sigma)},\mathsf{s}\mathsf{a}),
           \widehat{\mathbb P}(-_{o(\sigma)}\mid\mathsf{s}\mathsf{a})
         \right)
-      \right)_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}}$\;
-      $\left(\widehat{V}^{\lambda,\neg\mathsf{a}}(-_{o(\sigma)},\mathsf{s})\right)_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}}
+      \right)_{\mathsf{a}\in\mathfrak{E}^{\tt tgt}_{\mathsf{s}}}$\;
+      $\left(\widehat{V}^{\lambda,\neg\mathsf{a}}(-_{o(\sigma)},\mathsf{s})\right)_{\mathsf{a}\in\mathfrak{E}^{\tt tgt}_{\mathsf{s}}}
       \gets
       \left(
         \operatorname{Mix}_{\lambda}\left(
@@ -1277,13 +1311,13 @@ Initialize target table $\mathcal O\gets\varnothing$\;
           \right),
           V(-_{o(\sigma)},\sigma)
         \right)
-      \right)_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}}$\;
-      $\left(\widehat{A}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a})\right)_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}}
+      \right)_{\mathsf{a}\in\mathfrak{E}^{\tt tgt}_{\mathsf{s}}}$\;
+      $\left(\widehat{A}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a})\right)_{\mathsf{a}\in\mathfrak{E}^{\tt tgt}_{\mathsf{s}}}
       \gets
-      \left(\widehat{Q}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a})-\widehat{V}^{\lambda,\neg\mathsf{a}}(-_{o(\sigma)},\mathsf{s})\right)_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}}$\;
+      \left(\widehat{Q}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a})-\widehat{V}^{\lambda,\neg\mathsf{a}}(-_{o(\sigma)},\mathsf{s})\right)_{\mathsf{a}\in\mathfrak{E}^{\tt tgt}_{\mathsf{s}}}$\;
       $\widehat V_{o(\sigma)}(-_{o(\sigma)},\mathsf s)
       \gets\operatorname{Cond}(\widehat M_{o(\sigma)}(-_{o(\sigma)},\mathsf s),\widehat{\mathbb P}(-_{o(\sigma)}\mid\mathsf s))$\;
-      Store current targets $\mathcal O[\mathsf s].\mathrm{targets} \gets \left((\widehat{A}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a}),\widehat{Q}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a}))_{\mathsf{a}\in\mathfrak{E}_{\mathsf{s}}},\widehat V_{o(\sigma)}(-_{o(\sigma)},\mathsf s),\widehat T(\mathsf s),\widehat C^\lambda(\mathsf s)\right)$\;
+      Store current targets $\mathcal O[\mathsf s].\mathrm{targets} \gets \left((\widehat{A}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a}),\widehat{Q}^\lambda(-_{o(\sigma)},\mathsf{s}\mathsf{a}))_{\mathsf{a}\in\mathfrak{E}^{\tt tgt}_{\mathsf{s}}},\widehat V_{o(\sigma)}(-_{o(\sigma)},\mathsf s),\widehat T(\mathsf s),\widehat C^\lambda(\mathsf s)\right)$\;
       Overwrite with the bootstrapped private-state moment propagated to ancestors:
       \begin{equation}[rCl]
         \widehat M_{o(\sigma)}(-_{o(\sigma)},\mathsf s)
@@ -1302,7 +1336,7 @@ Initialize target table $\mathcal O\gets\varnothing$\;
       \end{equation}
   }
   \Else{
-    Set $\Delta(\mathsf s)\gets\overline\Delta(\mathsf s)/N(\mathsf s)$\;
+    Set $\Delta(\mathsf s)\gets\overline\Delta(\mathsf s)/N^{\tt tgt}(\mathsf s)$\;
   }
 }
 \Return{target table $\mathcal O$}

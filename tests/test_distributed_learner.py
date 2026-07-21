@@ -437,6 +437,14 @@ def test_sampled_reference_cache_preserves_update_and_rng() -> None:
     assert cached_result.metrics["reference_cache_build_rows"] <= 3
     assert cached_result.metrics["reference_cache_build_calls"] == 1
     assert cached_result.metrics["reference_rows"] < uncached_result.metrics["reference_rows"]
+    assert cached_result.metrics["optimizer_steps_applied_count"] == 2
+    assert cached_result.metrics["optimizer_steps_nonfinite_count"] == 0
+    assert cached_result.metrics["grad_clipped_step_fraction"] == 0.0
+    assert (
+        cached_result.metrics["grad_norm_pre_clip_step_min"]
+        <= cached_result.metrics["grad_norm_pre_clip_step_mean"]
+        <= cached_result.metrics["grad_norm_pre_clip_step_max"]
+    )
 
 
 def _storage_to(storage: TrainingStorage, device: torch.device) -> TrainingStorage:

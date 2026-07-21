@@ -193,8 +193,31 @@ def benchmark_modes(
         bundle = build_game_bundle(local, requested)
         device = torch.device(bundle.rollout_backend.device)
         bundle.model.to(device)
+        randomly_initialized_checkpoint_keys: tuple[str, ...] = ()
         if checkpoint_state is not None:
-            bundle.model.load_state_dict(checkpoint_state, strict=True)
+            incompatible = bundle.model.load_state_dict(
+                checkpoint_state, strict=False
+            )
+            randomly_initialized_checkpoint_keys = tuple(
+                incompatible.missing_keys
+            )
+            unexpected = tuple(incompatible.unexpected_keys)
+            allowed_missing = (
+                local.training.mode == "branched_rao_blackwell"
+                and all(
+                    "branching_heads" in key
+                    for key in randomly_initialized_checkpoint_keys
+                )
+            )
+            if unexpected or (
+                randomly_initialized_checkpoint_keys and not allowed_missing
+            ):
+                raise RuntimeError(
+                    "checkpoint load may omit only newly initialized branching "
+                    "heads in branched mode; "
+                    f"missing={randomly_initialized_checkpoint_keys}, "
+                    f"unexpected={unexpected}"
+                )
         torch_gen, _ = seed_all(local.training.seed, 0, device)
         optimizer_cls = (
             torch.optim.AdamW
@@ -273,11 +296,18 @@ def benchmark_modes(
                     "model_initialization_protocol": initialization_protocol,
                     "model_initialization_seed": local.training.seed,
                     "model_checkpoint": checkpoint_metadata,
+                    "randomly_initialized_checkpoint_keys": list(
+                        randomly_initialized_checkpoint_keys
+                    ),
                     "repeat_seeds": repeat_seeds,
                     "profile_iteration": profile_iteration,
                     "family_batch_rows": local.rollout.family_batch_rows,
                     "max_active_trajectories": local.rollout.max_active_trajectories,
                     "arena_chunk_nodes": local.rollout.arena_chunk_nodes,
+                    "node_budget": local.rollout.node_budget,
+                    "branching_upper_cutoff_nodes": getattr(
+                        local.rollout, "branching_upper_cutoff_nodes", None
+                    ),
                 },
                 "metrics": _median_metrics(samples),
                 "samples": samples,

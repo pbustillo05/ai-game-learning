@@ -65,6 +65,7 @@ class RolloutConfig:
     memory_growth_delay: int = 8
     memory_prediction_z: float = 3.0
     adaptive_kkt: AdaptiveKKTConfig | None = None
+    branching_min_nodes: int | None = None
 
     def __post_init__(self) -> None:
         self.roots_per_gpu = int(self.sequential_roots_per_gpu_initial)
@@ -91,6 +92,8 @@ class LossConfig:
     entropy_schedule: str
     value_loss: str = "mse"
     c_kl: float = 0.0
+    utility_normalization: str = "none"
+    entropy_decay_iters: int | None = None
     c_t: float = 0.0
     c_c: float = 0.0
     epsilon_t: float = 1.0e-6
@@ -322,6 +325,16 @@ def _validate_config(cfg: RootConfig) -> None:
                 "branched_rao_blackwell; "
                 "production creates exactly one root per rank"
             )
+        minimum_nodes = cfg.rollout.branching_min_nodes
+        if minimum_nodes is not None and (
+            isinstance(minimum_nodes, bool)
+            or not isinstance(minimum_nodes, int)
+            or not 1 < minimum_nodes < cfg.rollout.node_budget
+        ):
+            raise ConfigError(
+                "root.rollout.branching_min_nodes: expected an integer strictly "
+                "between one and node_budget"
+            )
     else:
         if cfg.rollout.branching_mode is not None:
             raise ConfigError(
@@ -330,6 +343,10 @@ def _validate_config(cfg: RootConfig) -> None:
         if cfg.rollout.beta is not None:
             raise ConfigError(
                 f"root.rollout.beta: only valid for branched_rao_blackwell, not {cfg.training.mode}"
+            )
+        if cfg.rollout.branching_min_nodes is not None:
+            raise ConfigError(
+                "root.rollout.branching_min_nodes: only valid for branched_rao_blackwell"
             )
     adaptive = cfg.rollout.adaptive_kkt
     if cfg.rollout.branching_mode == "dynamic" and adaptive is None:
@@ -407,6 +424,23 @@ def _validate_config(cfg: RootConfig) -> None:
             raise ConfigError(f"root.rollout.{name}: expected a positive integer")
     if cfg.loss.entropy_schedule not in {"const", "linear_decay"}:
         raise ConfigError("root.loss.entropy_schedule: expected 'const' or 'linear_decay'")
+    if cfg.loss.utility_normalization not in {"none", "stack"}:
+        raise ConfigError(
+            "root.loss.utility_normalization: expected 'none' or 'stack'"
+        )
+    entropy_decay_iters = cfg.loss.entropy_decay_iters
+    if entropy_decay_iters is not None and (
+        isinstance(entropy_decay_iters, bool)
+        or not isinstance(entropy_decay_iters, int)
+        or entropy_decay_iters <= 0
+    ):
+        raise ConfigError(
+            "root.loss.entropy_decay_iters: expected a positive integer or null"
+        )
+    if cfg.loss.entropy_schedule == "const" and entropy_decay_iters is not None:
+        raise ConfigError(
+            "root.loss.entropy_decay_iters: only valid with linear_decay"
+        )
     if cfg.loss.value_loss not in {"mse", "clipped"}:
         raise ConfigError("root.loss.value_loss: expected 'mse' or 'clipped'")
     if not math.isfinite(cfg.loss.lam) or not 0.0 <= cfg.loss.lam <= 1.0:
