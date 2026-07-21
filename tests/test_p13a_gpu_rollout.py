@@ -199,9 +199,16 @@ def test_tensor_store_has_required_device_soa_and_prefix_allocation() -> None:
             "board", "last_full_raise", "current_bet", "history_parent", "history_event",
             "history_length", "fold_payoff",
         }
-    assert required.issubset(vars(store))
+    assert (required - {"history_parent"}).issubset(vars(store))
+    assert hasattr(store, "history_parent")
     assert "action_history" not in vars(store)
-    assert store.history_parent.shape == store.history_event.shape == (16,)
+    assert store.history_parent.shape == store.history_event.shape == (3,)
+    assert store.capacity == 16
+    assert store.pool.live_rows == 3
+    store.release_rows(torch.tensor([0], dtype=torch.int32))
+    assert torch.equal(store.allocate_all(1), torch.tensor([0], dtype=torch.int32))
+    assert store.pool.live_rows == 3
+    assert store.capacity == 16
     assert all(
         value.device.type == "cpu"
         for value in vars(store).values()
@@ -312,7 +319,9 @@ def test_parent_linked_history_reconstructs_exact_actions_arithmetic_and_streets
     torch.testing.assert_close(history.amount, torch.tensor([[2.0, 1.0, 0.0]]))
     torch.testing.assert_close(history.pot_before, torch.tensor([[1.5, 3.0, 4.0]]))
     torch.testing.assert_close(history.call_amount, torch.tensor([[0.5, 1.0, 0.0]]))
-    assert backend.states.history_parent.numel() == backend.states.capacity
+    assert backend.states.history_parent.numel() == int(backend.states.size)
+    assert backend.states.capacity <= backend.states.arena.page_rows
+    assert backend.states.history_parent.numel() < backend.states.capacity
 
 
 def _install_state(backend: PokerRolloutBackend, state: _State) -> Tensor:
@@ -455,6 +464,8 @@ def test_device_partition_cache_masks_hits_and_invalidates_on_fold() -> None:
     model = _RecordingModel()
     backend.policy_forward(model, current, reach)
     assert len(partition.calls) == 1
+    assert backend.partition_summary_cache.size == 0
+    assert backend.partition_summary_cache.allocated_capacity_bytes == 0
 
     called = backend.step(current, EventBatch(torch.tensor([CHECK_CALL], dtype=torch.int32)))
     backend.policy_forward(model, called, reach)
@@ -464,6 +475,9 @@ def test_device_partition_cache_masks_hits_and_invalidates_on_fold() -> None:
     backend.policy_forward(model, folded, reach)
     assert len(partition.calls) == 3
     assert partition.calls[-1]["folded"].folder_mask.tolist() == [[True]]
+    assert backend.partition_summary_cache.size == 1
+    assert backend.partition_summary_cache.capacity == 64
+    assert not hasattr(backend.partition_summary_cache, "valid")
 
     decision_states = torch.cat((called, folded))
     decision_reach = torch.stack(

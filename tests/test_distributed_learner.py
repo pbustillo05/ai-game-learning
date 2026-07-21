@@ -463,6 +463,15 @@ def _storage_to(storage: TrainingStorage, device: torch.device) -> TrainingStora
             None
             if partition.action_columns is None
             else {name: value.to(device) for name, value in partition.action_columns.items()},
+            input_pools={
+                name: SealedTensorBlock(
+                    block.schema,
+                    {field: value.to(device) for field, value in block.columns.items()},
+                    block.rows,
+                    block.allocated_capacity_bytes,
+                )
+                for name, block in partition.input_pools.items()
+            },
         )
     sampling = SamplingMetadata(
         {key: value.to(device) for key, value in storage.sampling.log_z.items()},

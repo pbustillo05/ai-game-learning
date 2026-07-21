@@ -585,10 +585,7 @@ def _forward(spec: PartitionSpec, model: nn.Module, inputs: Mapping[str, Tensor]
 
 
 def _gather_inputs(partition: TrainingPartition, rows: Tensor) -> Mapping[str, Tensor]:
-    rows = rows.to(dtype=torch.int64, device=next(iter(partition.inputs.columns.values())).device)
-    return MappingProxyType(
-        {name: value[rows] for name, value in partition.inputs.columns.items()}
-    )
+    return partition.gather_inputs(rows)
 
 
 def _column(columns: Mapping[str, Tensor], *names: str) -> Tensor:

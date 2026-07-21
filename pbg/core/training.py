@@ -66,6 +66,8 @@ from pbg.core.storage import (
     SamplingMetadata,
     SealedTensorBlock,
     SequentialPosteriorPool,
+    TensorFieldSchema,
+    TensorSchema,
     TrainingPartition,
     TrainingStorage,
 )
@@ -1348,6 +1350,34 @@ def _sealed_input_block(spec: Any, columns: Mapping[str, Tensor]) -> SealedTenso
     return block
 
 
+def _sealed_dynamic_block(label: str, columns: Mapping[str, Tensor]) -> SealedTensorBlock:
+    """Seal an exact game-owned auxiliary pool from its realized field shapes."""
+
+    if not columns:
+        raise ValueError("a sealed auxiliary block requires at least one field")
+    rows = next(iter(columns.values())).shape[0]
+    schema = TensorSchema(
+        label,
+        tuple(
+            TensorFieldSchema(
+                name,
+                value.dtype,
+                tuple(value.shape[1:]),
+                alignment=min(max(value.element_size(), 1), 16),
+            )
+            for name, value in columns.items()
+        ),
+    )
+    block = SealedTensorBlock(
+        schema,
+        {name: value.detach() for name, value in columns.items()},
+        rows,
+        schema.capacity_bytes(rows, chunks=int(rows > 0)),
+    )
+    block.assert_exact_payload()
+    return block
+
+
 def _compress_preflop_rows(value: Tensor, backend: Any) -> Tensor:
     """Project an old combo-indexed model row back to its native class rows."""
 
@@ -1407,6 +1437,9 @@ def _seal_iteration_training_storage(
     legal_ids, legal_mask = backend.legal_events(state_refs.to(backend.device))
     legal_ids = legal_ids.to(state_refs.device, dtype=torch.int32)
     legal_mask = legal_mask.to(state_refs.device, dtype=torch.bool)
+    public_inputs = backend.serialize_decision_inputs(
+        state_refs.to(backend.device)
+    )
 
     training: dict[int, TrainingPartition] = {}
     log_z: dict[int, Tensor] = {}
@@ -1463,14 +1496,51 @@ def _seal_iteration_training_storage(
                 torch.arange(rows.numel(), device=state_refs.device)[:, None], live_seats
             ].contiguous()
         input_columns: dict[str, Tensor] = {
-            "state_ref": states,
-            "range_weights": natural_ranges.detach(),
+            name: public_inputs[name][rows].detach()
+            for name in spec.input_schema.by_name
+            if name not in {"range_weights", "folded_summary_ref"}
         }
-        if "summary_anchor" in {field.name for field in spec.input_schema.fields}:
+        input_columns["range_weights"] = natural_ranges.detach()
+        input_pools: dict[str, SealedTensorBlock] = {}
+        if "folded_summary_ref" in spec.input_schema.by_name:
+            live = spec.partition_id + 1
+            status = public_inputs["status"][rows].to(torch.int8)
             anchors = backend.states.partition_cache_key[states.to(torch.int64)]
-            input_columns["summary_anchor"] = torch.where(
-                anchors >= 0, anchors, states
-            ).detach().to(torch.int32)
+            if bool((anchors < 0).any()):
+                raise RuntimeError("folded decision omitted its dependency anchor")
+            unique_anchors, inverse = torch.unique(
+                anchors.to(torch.int64), sorted=True, return_inverse=True
+            )
+            first = torch.full(
+                (unique_anchors.numel(),),
+                rows.numel(),
+                dtype=torch.int64,
+                device=rows.device,
+            )
+            first.scatter_reduce_(
+                0,
+                inverse,
+                torch.arange(rows.numel(), device=rows.device),
+                reduce="amin",
+                include_self=True,
+            )
+            summary = backend._partition_summary_uncached(
+                states[first],
+                public_inputs["board"][rows][first],
+                weights[rows][first],
+                status[first],
+                live,
+                compute_mask=torch.ones(
+                    unique_anchors.shape,
+                    dtype=torch.bool,
+                    device=rows.device,
+                ),
+            )
+            input_columns["folded_summary_ref"] = inverse.to(torch.int32)
+            input_pools["folded_summary"] = _sealed_dynamic_block(
+                f"poker_partition_{spec.partition_id}_folded_summary",
+                summary.fields,
+            )
         inputs = _sealed_input_block(spec, input_columns)
         columns: dict[str, Tensor] = {
             "owner": owner[rows].detach().to(torch.int32),
@@ -1542,7 +1612,11 @@ def _seal_iteration_training_storage(
                 "advantage_hat": data.targets.a_hat[rows].reshape(-1, backend.n_hands)[flat_mask].detach().to(torch.float32),
             }
         training[spec.partition_id] = TrainingPartition(
-            spec.partition_id, inputs, columns, actions
+            spec.partition_id,
+            inputs,
+            columns,
+            actions,
+            input_pools=input_pools,
         )
         if cfg.training.mode == "branched_rao_blackwell":
             partition_weights = data.decision_weight[rows].detach().to(torch.float64)

@@ -53,10 +53,6 @@ def test_training_orchestrator_uses_rollout_storage_and_authoritative_targets_di
     }.issubset(imports)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="phase 2/3 must store complete immutable poker decision inputs",
-)
 def test_poker_training_inputs_do_not_retain_mutable_state_handles() -> None:
     partition_source = _source("pbg/games/poker/partitions.py")
     forward_source = _source("pbg/games/poker/rollout_backend.py")

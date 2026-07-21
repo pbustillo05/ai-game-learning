@@ -113,11 +113,14 @@ def test_h100_bootstrap_bundle_constructs_without_capacity_sized_history() -> No
     backend = bundle.rollout_backend
     assert backend.rollout_memory_plan.peak_bytes == 436_685_628
     assert "action_history" not in vars(backend.states)
-    assert backend.states.history_parent.shape == (4_096,)
-    assert backend.states.history_jump.shape == (4_096, 10)
-    # evaluator_summary_dim=0 never materializes the lazy partition fields;
-    # only the capacity-sized validity bitmap exists.
+    assert backend.states.history_parent.shape == (0,)
+    assert backend.states.history_jump.shape == (0, 10)
+    assert backend.states.capacity == 0
+    assert backend.states.arena.allocated_capacity_bytes == 0
+    # The transitional forecast remains until phase 5; construction itself
+    # owns neither state pages nor a capacity-sized summary validity bitmap.
     assert backend.rollout_memory_plan.partition_cache_bytes == 4_096
+    assert backend.partition_summary_cache.allocated_capacity_bytes == 0
 
 
 def test_nlhe_builder_constructs_one_owning_poker_model(tmp_path: Path) -> None:

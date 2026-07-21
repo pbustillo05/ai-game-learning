@@ -13,12 +13,15 @@ from pbg.core.partition import (
     PartitionSpec,
 )
 from pbg.core.storage import (
-    ChunkedTensorArena,
+    PagedTensorArena,
     PartitionRolloutBlock,
+    RecyclableTensorPool,
     RolloutStorage,
     SealedTensorBlock,
     TensorFieldSchema,
     TensorSchema,
+    TrainingPartition,
+    occurrence_schema,
 )
 from pbg.core.targets import (
     build_branched_rb_targets,
@@ -65,7 +68,7 @@ def _spec(exact: int, model: int, mapping: tuple[int, ...]) -> PartitionSet:
     )
 
 
-def test_schema_transaction_chunk_slack_and_exact_multichunk_seal() -> None:
+def test_schema_transaction_page_slack_and_exact_multipage_seal() -> None:
     schema = TensorSchema(
         "rows",
         (
@@ -79,26 +82,56 @@ def test_schema_transaction_chunk_slack_and_exact_multichunk_seal() -> None:
     destination = schema.capacity_bytes(5)
     scratch = schema.payload_bytes(1)
     accountant = ByteAccountant(3 * per_chunk + destination + scratch)
-    arena = ChunkedTensorArena(schema, 2, "cpu", accountant=accountant)
+    arena = PagedTensorArena(schema, 2, "cpu", accountant=accountant)
     values = {
         "id": torch.arange(5, dtype=torch.int32),
         "payload": torch.arange(15, dtype=torch.float32).reshape(5, 3),
     }
     ids = arena.append(values)
     assert torch.equal(ids, torch.arange(5))
-    assert arena.chunk_count == 3
+    assert arena.page_count == 3
     assert arena.capacity_rows == 6
-    assert arena.chunk_slack_bytes > schema.payload_bytes(1)
+    assert arena.page_slack_bytes > schema.payload_bytes(1)
     source_bytes = arena.allocated_capacity_bytes
 
     block, metrics = arena.seal(scratch_rows=1)
     assert torch.equal(block["id"], values["id"])
     assert torch.equal(block["payload"], values["payload"])
     assert block.tensor_storage_bytes == block.logical_payload_bytes == schema.payload_bytes(5)
-    assert metrics.source_chunks == 3
+    assert metrics.source_pages == 3
     assert metrics.peak_accounted_bytes == source_bytes + destination + scratch
     assert accountant.high_water_bytes == metrics.peak_accounted_bytes
     assert accountant.reserved_bytes == destination
+
+
+def test_paged_reservation_is_atomic_and_recyclable_slots_follow_last_consumer() -> None:
+    schema = TensorSchema(
+        "live",
+        (TensorFieldSchema("payload", torch.float32, (2,), alignment=16),),
+        chunk_header_bytes=32,
+        allocator_slack_bytes=16,
+    )
+    page_bytes = schema.capacity_bytes(2)
+    accountant = ByteAccountant(page_bytes)
+    arena = PagedTensorArena(schema, 2, "cpu", accountant=accountant)
+    with pytest.raises(MemoryError):
+        arena.reserve_rows(3)
+    assert arena.size == arena.capacity_rows == arena.page_count == 0
+    assert accountant.snapshot() == {}
+
+    pool = RecyclableTensorPool(schema, 2, "cpu")
+    first = pool.allocate(2)
+    pool.write(first, {"payload": torch.tensor([[1.0, 2.0], [3.0, 4.0]])})
+    assert pool.capacity_rows == pool.live_rows == pool.high_water_live_rows == 2
+    released = first[:1]
+    pool.release_rows(released)
+    with pytest.raises(RuntimeError, match="last consumer"):
+        pool.gather("payload", released)
+    reused = pool.allocate(1)
+    assert reused.item() == released.item()
+    pool.write(reused, {"payload": torch.tensor([[9.0, 8.0]])})
+    assert torch.equal(pool.gather("payload", reused), torch.tensor([[9.0, 8.0]]))
+    assert pool.capacity_rows == 2
 
 
 def test_byte_accountant_group_reservation_rolls_back_before_allocation() -> None:
@@ -129,6 +162,71 @@ def test_sequential_csr_seals_stable_root_ordinal_order() -> None:
     assert torch.equal(topology.decision_row, torch.tensor([1, 0, 0, 1], dtype=torch.int32))
     assert torch.equal(topology.leaf_row, torch.tensor([0, 1], dtype=torch.int32))
     assert topology.nbytes == 4 * (2 * 4 + 2 * 2 + 1)
+
+
+def test_dynamic_occurrence_schema_and_protected_root_action_prefix() -> None:
+    fields = occurrence_schema(n_players=2, mode="branched_rb").by_name
+    for name in (
+        "nominal_count",
+        "executed_count",
+        "log_player_sum",
+        "log_ancestor_product",
+        "queue_cost",
+    ):
+        assert name in fields
+
+    topology = BranchedTreeSpan(
+        parent=torch.tensor([-1, 0, 0, 0], dtype=torch.int32),
+        child_begin=torch.tensor([1, -1, -1, -1], dtype=torch.int32),
+        degree=torch.tensor([3, 0, 0, 0], dtype=torch.int32),
+        decision_partition=torch.tensor([0, -1, -1, -1], dtype=torch.int32),
+        decision_row=torch.tensor([0, -1, -1, -1], dtype=torch.int32),
+        leaf_row=torch.tensor([-1, 0, 1, 2], dtype=torch.int32),
+        root_target_degree=2,
+        pre_refill_node_count=3,
+    )
+    topology.validate(
+        partition_rows={0: 1},
+        action_ptr={0: torch.tensor([0, 2], dtype=torch.int32)},
+        leaf_rows=3,
+    )
+    assert topology.protected_root_degree == 2
+    assert topology.pre_refill_nodes == 3
+    assert topology.nbytes == 6 * 4 * 4 + 8
+
+
+def test_training_partition_resolves_sparse_immutable_input_pool() -> None:
+    input_schema = TensorSchema(
+        "decision_input",
+        (
+            TensorFieldSchema("model_input", torch.float32, (2,)),
+            TensorFieldSchema("folded_summary_ref", torch.int32),
+        ),
+    )
+    inputs = _sealed(
+        input_schema,
+        model_input=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        folded_summary_ref=torch.tensor([1, 0], dtype=torch.int32),
+    )
+    summary_schema = TensorSchema(
+        "summary", (TensorFieldSchema("beta", torch.float32, (3,)),)
+    )
+    summaries = _sealed(
+        summary_schema,
+        beta=torch.tensor([[10.0, 11.0, 12.0], [20.0, 21.0, 22.0]]),
+    )
+    partition = TrainingPartition(
+        0,
+        inputs,
+        {"owner": torch.tensor([0, 1], dtype=torch.int32)},
+        input_pools={"folded_summary": summaries},
+    )
+    gathered = partition.gather_inputs(torch.tensor([0, 1]))
+    assert "folded_summary_ref" not in gathered
+    assert torch.equal(
+        gathered["folded_summary.beta"],
+        torch.tensor([[20.0, 21.0, 22.0], [10.0, 11.0, 12.0]]),
+    )
 
 
 @pytest.mark.parametrize("lam", [0.0, 1.0])
@@ -352,7 +450,7 @@ def test_full_deck_poker_natural_model_and_exact_target_widths() -> None:
         post = specs[live - 1]
         assert post.model_width == post.exact_width == 1326
         assert post.input_schema.by_name["range_weights"].shape == (live, 1326)
-        assert ("summary_anchor" in post.input_schema.by_name) == (live < 6)
+        assert ("folded_summary_ref" in post.input_schema.by_name) == (live < 6)
     assert_poker_storage_widths(
         specs,
         partition_id=0,

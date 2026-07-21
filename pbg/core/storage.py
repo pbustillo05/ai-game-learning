@@ -1,4 +1,4 @@
-"""Schema-derived chunked, sealed, rollout, and training storage.
+"""Schema-derived paged, sealed, rollout, and training storage.
 
 One :class:`TensorSchema` drives allocation, capacity accounting, sealing,
 validation, and diagnostics.  Growing stores expose only logical integer row
@@ -182,34 +182,39 @@ class SealedTensorBlock:
             )
 
 
-class ChunkedTensorArena:
-    """Append-only schema allocation with stable logical integer row ids."""
+class PagedTensorArena:
+    """Append-only schema allocation with stable logical integer row ids.
+
+    A page is the indivisible allocation/admission unit.  Reserving rows first
+    admits every newly required page as one transaction and publishes neither
+    page nor cursor movement unless all allocations succeed.
+    """
 
     def __init__(
         self,
         schema: TensorSchema,
-        chunk_rows: int,
+        page_rows: int,
         device: torch.device | str,
         *,
         accountant: ByteAccountant | None = None,
         label: str | None = None,
         maximum_rows: int | None = None,
     ) -> None:
-        if isinstance(chunk_rows, bool) or chunk_rows <= 0:
-            raise ValueError("chunk_rows must be a positive integer")
+        if isinstance(page_rows, bool) or page_rows <= 0:
+            raise ValueError("page_rows must be a positive integer")
         if maximum_rows is not None and (
             isinstance(maximum_rows, bool) or maximum_rows <= 0
         ):
             raise ValueError("maximum_rows must be positive or None")
         self.schema = schema
-        self.chunk_rows = int(chunk_rows)
+        self.page_rows = int(page_rows)
         self.device = torch.device(device)
         self.accountant = accountant
         self.label = schema.name if label is None else str(label)
         if not self.label:
             raise ValueError("arena label must be nonempty")
         self.maximum_rows = maximum_rows
-        self._chunks: list[dict[str, Tensor]] = []
+        self._pages: list[dict[str, Tensor]] = []
         self._lengths: list[int] = []
         self._reservation_labels: list[str] = []
         self._size = 0
@@ -220,8 +225,8 @@ class ChunkedTensorArena:
         return self._size
 
     @property
-    def chunk_count(self) -> int:
-        return len(self._chunks)
+    def page_count(self) -> int:
+        return len(self._pages)
 
     @property
     def capacity_rows(self) -> int:
@@ -238,35 +243,101 @@ class ChunkedTensorArena:
         return self.schema.payload_bytes(self._size)
 
     @property
-    def chunk_slack_bytes(self) -> int:
+    def page_slack_bytes(self) -> int:
         return self.allocated_capacity_bytes - self.schema.payload_bytes(
             self.capacity_rows
         ) + self.schema.payload_bytes(self.capacity_rows - self._size)
 
     def _check_live(self) -> None:
         if self._released:
-            raise RuntimeError("chunked arena has been released")
+            raise RuntimeError("paged arena has been released")
 
-    def _allocate_chunk(self) -> None:
+    def reset(self, *, release_pages: bool = False) -> None:
+        """Return the logical cursor to zero, optionally dropping admitted pages.
+
+        Retaining pages makes repeated iterations reuse the same byte-admitted
+        allocation.  Dropping them releases the ledger reservations but keeps
+        the arena live so a later iteration can admit a different realized
+        extent.
+        """
+
         self._check_live()
-        if self.maximum_rows is not None and self.capacity_rows >= self.maximum_rows:
-            raise MemoryError(f"{self.label} maximum row capacity exhausted")
-        length = self.chunk_rows
-        if self.maximum_rows is not None:
-            length = min(length, self.maximum_rows - self.capacity_rows)
-        nbytes = self.schema.capacity_bytes(length, chunks=1)
-        reservation = f"{self.label}.chunk.{len(self._chunks)}"
+        self._size = 0
+        if not release_pages:
+            return
+        self._pages.clear()
+        self._lengths.clear()
         if self.accountant is not None:
-            self.accountant.reserve(reservation, nbytes)
+            self.accountant.release_many(self._reservation_labels)
+        self._reservation_labels.clear()
+
+    def lookup_rows(self, name: str, keys: Tensor) -> Tensor:
+        """Return logical rows for unique scalar keys, or ``-1`` when absent.
+
+        The search is page-bounded: it never builds a capacity-wide validity
+        map or a contiguous copy of every stored key.  The named schema field
+        must be scalar and every stored key must be unique.
+        """
+
+        self._check_live()
+        spec = self.schema.by_name[name]
+        if spec.shape:
+            raise ValueError("lookup key field must be scalar")
+        keys = keys.to(device=self.device, dtype=spec.dtype)
+        if keys.ndim != 1:
+            raise ValueError("lookup keys must be one-dimensional")
+        result = torch.full(
+            (keys.numel(),), -1, dtype=torch.int64, device=self.device
+        )
+        cursor = 0
+        for columns, capacity in zip(self._pages, self._lengths, strict=True):
+            used = min(capacity, self._size - cursor)
+            if used <= 0:
+                break
+            matches = keys[:, None] == columns[name][None, :used]
+            hit = matches.any(1)
+            candidate = cursor + matches.to(torch.int64).argmax(1)
+            result = torch.where(hit & (result < 0), candidate, result)
+            cursor += used
+        return result
+
+    def _next_page_lengths(self, stop: int) -> list[int]:
+        lengths: list[int] = []
+        capacity = self.capacity_rows
+        while stop > capacity:
+            if self.maximum_rows is not None and capacity >= self.maximum_rows:
+                raise MemoryError(f"{self.label} maximum row capacity exhausted")
+            length = self.page_rows
+            if self.maximum_rows is not None:
+                length = min(length, self.maximum_rows - capacity)
+            lengths.append(length)
+            capacity += length
+        return lengths
+
+    def _allocate_pages(self, lengths: Iterable[int]) -> None:
+        self._check_live()
+        selected = tuple(int(length) for length in lengths)
+        if not selected:
+            return
+        first = len(self._pages)
+        labels = tuple(
+            f"{self.label}.page.{first + offset}" for offset in range(len(selected))
+        )
+        reservations = {
+            label: self.schema.capacity_bytes(length, chunks=1)
+            for label, length in zip(labels, selected, strict=True)
+        }
+        if self.accountant is not None:
+            self.accountant.reserve_many(reservations)
         try:
-            columns = self.schema.allocate(length, self.device)
+            pages = [self.schema.allocate(length, self.device) for length in selected]
         except BaseException:
             if self.accountant is not None:
-                self.accountant.release(reservation)
+                self.accountant.release_many(labels)
             raise
-        self._chunks.append(columns)
-        self._lengths.append(length)
-        self._reservation_labels.append(reservation)
+        self._pages.extend(pages)
+        self._lengths.extend(selected)
+        self._reservation_labels.extend(labels)
 
     def reserve_rows(self, count: int) -> Tensor:
         """Reserve stable ids before their payload is populated."""
@@ -279,8 +350,7 @@ class ChunkedTensorArena:
             raise MemoryError(
                 f"{self.label} overflow: requested_stop={stop}, maximum={self.maximum_rows}"
             )
-        while stop > self.capacity_rows:
-            self._allocate_chunk()
+        self._allocate_pages(self._next_page_lengths(stop))
         start = self._size
         self._size = stop
         return torch.arange(start, stop, dtype=torch.int64, device=self.device)
@@ -311,12 +381,13 @@ class ChunkedTensorArena:
         rows = rows.to(device=self.device, dtype=torch.int64)
         if rows.ndim != 1:
             raise ValueError("logical row ids must be one-dimensional")
-        if rows.numel() and (
-            bool((rows < 0).any())
-            or bool((rows >= self._size).any())
-            or rows.unique().numel() != rows.numel()
-        ):
-            raise ValueError("logical row ids must be unique allocated rows")
+        if rows.numel():
+            torch._assert_async(
+                ((rows >= 0) & (rows < self._size)).all(),
+                "logical row ids must be allocated rows",
+            )
+            if self.device.type == "cpu" and rows.unique().numel() != rows.numel():
+                raise ValueError("logical row ids must be unique")
         for name, value in values.items():
             try:
                 spec = self.schema.by_name[name]
@@ -326,33 +397,53 @@ class ChunkedTensorArena:
                 raise ValueError(f"write value for {name!r} violates its schema")
             if value.device != self.device:
                 raise ValueError("write tensors must already be on the arena device")
-        chunk_id = torch.div(rows, self.chunk_rows, rounding_mode="floor")
-        offset = torch.remainder(rows, self.chunk_rows)
-        # Chunk count is a host-owned allocation fact.  Payload selection stays
-        # tensor-indexed and preserves the caller's stable row order.
-        for index, columns in enumerate(self._chunks):
-            selected = (chunk_id == index).nonzero(as_tuple=False).squeeze(1)
-            if selected.numel() == 0:
+        page_id = torch.div(rows, self.page_rows, rounding_mode="floor")
+        offset = torch.remainder(rows, self.page_rows)
+        # Each page update uses a fixed, admitted page-width match matrix.
+        # This avoids CUDA ``nonzero`` shape discovery and its host sync.
+        for index, (columns, length) in enumerate(
+            zip(self._pages, self._lengths, strict=True)
+        ):
+            positions = torch.arange(length, device=self.device)
+            matches = (page_id[:, None] == index) & (
+                offset[:, None] == positions[None, :]
+            )
+            present = matches.any(0)
+            if rows.numel() == 0:
                 continue
-            local = offset[selected]
+            source = matches.to(torch.int64).argmax(0)
             for name, value in values.items():
-                columns[name][local] = value[selected]
+                candidate = value[source]
+                mask = present.reshape(
+                    (length,) + (1,) * (candidate.ndim - 1)
+                )
+                columns[name].copy_(torch.where(mask, candidate, columns[name]))
 
     def gather(self, name: str, rows: Tensor) -> Tensor:
         self._check_live()
         spec = self.schema.by_name[name]
         rows = rows.to(device=self.device, dtype=torch.int64)
-        if rows.ndim != 1 or (rows.numel() and bool(((rows < 0) | (rows >= self._size)).any())):
-            raise ValueError("gather row ids are outside the logical arena")
-        output = torch.empty(
+        if rows.ndim != 1:
+            raise ValueError("gather row ids must be one-dimensional")
+        if rows.numel():
+            torch._assert_async(
+                ((rows >= 0) & (rows < self._size)).all(),
+                "gather row ids are outside the logical arena",
+            )
+        output = torch.zeros(
             (rows.numel(), *spec.shape), dtype=spec.dtype, device=self.device
         )
-        chunk_id = torch.div(rows, self.chunk_rows, rounding_mode="floor")
-        offset = torch.remainder(rows, self.chunk_rows)
-        for index, columns in enumerate(self._chunks):
-            selected = (chunk_id == index).nonzero(as_tuple=False).squeeze(1)
-            if selected.numel():
-                output[selected] = columns[name][offset[selected]]
+        page_id = torch.div(rows, self.page_rows, rounding_mode="floor")
+        offset = torch.remainder(rows, self.page_rows)
+        for index, (columns, length) in enumerate(
+            zip(self._pages, self._lengths, strict=True)
+        ):
+            local = offset.clamp_max(length - 1)
+            candidate = columns[name][local]
+            mask = (page_id == index).reshape(
+                (rows.numel(),) + (1,) * len(spec.shape)
+            )
+            output = torch.where(mask, candidate, output)
         return output
 
     def seal(
@@ -400,7 +491,7 @@ class ChunkedTensorArena:
             # payload proportional to total rows and replaces repeated cat.
             scratch = self.schema.allocate(bounded_rows, self.device)
             cursor = 0
-            for columns, capacity in zip(self._chunks, self._lengths, strict=True):
+            for columns, capacity in zip(self._pages, self._lengths, strict=True):
                 used = min(capacity, self._size - cursor)
                 copied = 0
                 while copied < used:
@@ -440,7 +531,7 @@ class ChunkedTensorArena:
                 self.allocated_capacity_bytes + destination_bytes + scratch_bytes
             ),
             logical_payload_bytes=block.logical_payload_bytes,
-            source_chunks=self.chunk_count,
+            source_pages=self.page_count,
         )
         if release_source:
             self.release()
@@ -450,12 +541,160 @@ class ChunkedTensorArena:
         """Drop source chunks and their accounting reservations exactly once."""
 
         self._check_live()
-        self._chunks.clear()
+        self._pages.clear()
         self._lengths.clear()
         if self.accountant is not None:
             self.accountant.release_many(self._reservation_labels)
         self._reservation_labels.clear()
         self._released = True
+
+
+class RecyclableTensorPool:
+    """Page-backed mutable slot owner with explicit last-consumer release.
+
+    Logical rollout/topology ids must not use these handles as identities.
+    Handles are physical live-slot addresses and may be reused only after the
+    caller releases their last mutable-state consumer.  The append-only arena
+    remains the sole page allocator and byte ledger owner.
+    """
+
+    def __init__(
+        self,
+        schema: TensorSchema,
+        page_rows: int,
+        device: torch.device | str,
+        *,
+        accountant: ByteAccountant | None = None,
+        label: str | None = None,
+        maximum_rows: int | None = None,
+    ) -> None:
+        self.arena = PagedTensorArena(
+            schema,
+            page_rows,
+            device,
+            accountant=accountant,
+            label=label,
+            maximum_rows=maximum_rows,
+        )
+        self._free: list[Tensor] = []
+        self._live_rows = 0
+        self.high_water_live_rows = 0
+
+    @property
+    def schema(self) -> TensorSchema:
+        return self.arena.schema
+
+    @property
+    def device(self) -> torch.device:
+        return self.arena.device
+
+    @property
+    def capacity_rows(self) -> int:
+        return self.arena.capacity_rows
+
+    @property
+    def live_rows(self) -> int:
+        return self._live_rows
+
+    @property
+    def allocated_capacity_bytes(self) -> int:
+        return self.arena.allocated_capacity_bytes
+
+    @property
+    def live_payload_bytes(self) -> int:
+        return self.schema.payload_bytes(self.live_rows)
+
+    @property
+    def slack_bytes(self) -> int:
+        return self.allocated_capacity_bytes - self.live_payload_bytes
+
+    def allocate(self, count: int) -> Tensor:
+        if isinstance(count, bool) or count < 0:
+            raise ValueError("pool allocation count must be nonnegative")
+        requested = int(count)
+        available = sum(batch.numel() for batch in self._free)
+        reused_count = min(requested, available)
+        fresh_count = requested - reused_count
+        fresh_start = self.arena.size
+        fresh = self.arena.reserve_rows(fresh_count)
+        pieces: list[Tensor] = []
+        remaining = reused_count
+        while remaining:
+            batch = self._free.pop()
+            take = min(remaining, batch.numel())
+            pieces.append(batch[:take])
+            if take < batch.numel():
+                self._free.append(batch[take:])
+            remaining -= take
+        if fresh_count:
+            pieces.append(fresh)
+        handles = (
+            torch.cat(pieces)
+            if len(pieces) > 1
+            else (
+                pieces[0]
+                if pieces
+                else torch.empty(0, dtype=torch.int64, device=self.device)
+            )
+        )
+        self._live_rows += requested
+        self.high_water_live_rows = max(self.high_water_live_rows, self.live_rows)
+        return handles
+
+    def _device_handles(self, rows: Tensor | Iterable[int]) -> Tensor:
+        handles = torch.as_tensor(rows, dtype=torch.int64, device=self.device)
+        if handles.ndim != 1:
+            raise ValueError("pool handles must be one-dimensional")
+        if handles.numel():
+            torch._assert_async(
+                ((handles >= 0) & (handles < self.arena.size)).all(),
+                "pool handle is outside admitted storage",
+            )
+        return handles
+
+    def _assert_not_free(self, handles: Tensor) -> None:
+        for free in self._free:
+            torch._assert_async(
+                ~(handles[:, None] == free[None, :]).any(),
+                "pool handle has already reached its last consumer",
+            )
+
+    def release_rows(self, rows: Tensor | Iterable[int]) -> None:
+        handles = self._device_handles(rows)
+        if handles.numel() > 1:
+            ordered = handles.sort().values
+            torch._assert_async(
+                (ordered[1:] != ordered[:-1]).all(),
+                "released pool handles must be unique",
+            )
+        self._assert_not_free(handles)
+        if handles.numel():
+            self._free.append(handles.clone())
+        self._live_rows -= handles.numel()
+        if self._live_rows < 0:
+            raise RuntimeError("pool live-row accounting underflow")
+
+    def write(self, rows: Tensor, values: Mapping[str, Tensor]) -> None:
+        handles = self._device_handles(rows)
+        self._assert_not_free(handles)
+        self.arena.write(handles, values)
+
+    def gather(self, name: str, rows: Tensor) -> Tensor:
+        handles = self._device_handles(rows)
+        self._assert_not_free(handles)
+        return self.arena.gather(name, handles)
+
+    def reset(self) -> None:
+        """Release every iteration-local consumer and reuse admitted pages."""
+
+        self._free.clear()
+        self._live_rows = 0
+        self.arena.reset()
+
+    def release(self) -> None:
+        self._free.clear()
+        self._live_rows = 0
+        self.arena.release()
 
 
 @dataclass(frozen=True)
@@ -465,7 +704,7 @@ class SealMetrics:
     scratch_capacity_bytes: int
     peak_accounted_bytes: int
     logical_payload_bytes: int
-    source_chunks: int
+    source_pages: int
 
 
 @dataclass(frozen=True)
@@ -529,6 +768,7 @@ class TrainingPartition:
     inputs: SealedTensorBlock
     columns: Mapping[str, Tensor]
     action_columns: Mapping[str, Tensor] | None = None
+    input_pools: Mapping[str, SealedTensorBlock] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         columns = MappingProxyType(dict(self.columns))
@@ -564,6 +804,39 @@ class TrainingPartition:
                 ):
                     raise ValueError("training action_ptr is not valid CSR")
             object.__setattr__(self, "action_columns", action_columns)
+        pools = MappingProxyType(dict(self.input_pools))
+        for name, block in pools.items():
+            if not name or not isinstance(block, SealedTensorBlock):
+                raise TypeError("input pools require nonempty names and sealed blocks")
+            ref_name = f"{name}_ref"
+            if ref_name not in self.inputs.columns:
+                raise ValueError(f"input pool {name!r} has no aligned {ref_name!r}")
+            refs = self.inputs.columns[ref_name]
+            if refs.dtype != torch.int32 or refs.shape != (rows,):
+                raise ValueError(f"input pool reference {ref_name!r} must be int32 [D]")
+            if refs.numel():
+                torch._assert_async(
+                    ((refs >= 0) & (refs < block.rows)).all(),
+                    f"input pool reference {ref_name!r} is out of range",
+                )
+        object.__setattr__(self, "input_pools", pools)
+
+    def gather_inputs(self, rows: Tensor) -> Mapping[str, Tensor]:
+        """Gather one bounded subspan and resolve exact immutable input pools."""
+
+        rows = rows.to(
+            dtype=torch.int64,
+            device=next(iter(self.inputs.columns.values())).device,
+        )
+        gathered = {name: value[rows] for name, value in self.inputs.columns.items()}
+        for name, block in self.input_pools.items():
+            refs = gathered.pop(f"{name}_ref").to(torch.int64)
+            for field_name, value in block.columns.items():
+                resolved = f"{name}.{field_name}"
+                if resolved in gathered:
+                    raise ValueError(f"resolved input name collision: {resolved!r}")
+                gathered[resolved] = value[refs]
+        return MappingProxyType(gathered)
 
 
 @dataclass(frozen=True)
@@ -675,7 +948,16 @@ def occurrence_schema(*, n_players: int, mode: str) -> TensorSchema:
             )
         )
     else:
-        fields.append(TensorFieldSchema("log_weight", torch.float32, alignment=4))
+        fields.extend(
+            (
+                TensorFieldSchema("log_weight", torch.float32, alignment=4),
+                TensorFieldSchema("nominal_count", torch.int32, alignment=4),
+                TensorFieldSchema("executed_count", torch.int32, alignment=4),
+                TensorFieldSchema("log_player_sum", torch.float32, alignment=4),
+                TensorFieldSchema("log_ancestor_product", torch.float32, alignment=4),
+                TensorFieldSchema("queue_cost", torch.float32, alignment=4),
+            )
+        )
     return TensorSchema(
         "occurrence",
         tuple(fields),

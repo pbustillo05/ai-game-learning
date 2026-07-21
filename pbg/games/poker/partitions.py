@@ -23,16 +23,20 @@ def poker_partition_specs(
     n_players: int,
     router: Callable[[Any], int | Tensor],
     forwards: Mapping[int, Callable[[Mapping[str, Tensor]], Any]],
+    max_history_tokens: int = 1,
+    n_ticks: int = 1,
+    e_max: int = 3,
     public_input_bytes: Mapping[int, int] | None = None,
     completion: CompletionSpec | None = None,
 ) -> PartitionSet:
     """Build ``pre`` plus fixed-width ``post_A`` partitions.
 
     Partition ids are stable: preflop is zero and ``post_A`` is ``A-1``.
-    Names remain diagnostics only. Public state is retained as one immutable
-    int32 handle into the iteration's read-only tensor-state store. Range rows
-    are stored only on the model's natural domain. Postflop folded summaries
-    are addressed by an immutable dependency anchor and are never inlined.
+    Names remain diagnostics only. Every public/history field required by a
+    model forward is immutable row-owned data; no handle into a mutable rollout
+    state store crosses the seal boundary. Range rows are stored only on the
+    model's natural domain. Postflop folded summaries are referenced through an
+    exact immutable pool and are never duplicated per decision.
     """
 
     if not 2 <= n_players <= 6:
@@ -41,16 +45,57 @@ def poker_partition_specs(
     exact_width = geometry.n_hands
     class_width = geometry.n_classes
     widths = {} if public_input_bytes is None else dict(public_input_bytes)
+    if max_history_tokens <= 0 or n_ticks <= 0 or e_max < 3:
+        raise ValueError("poker input geometry must be positive")
 
     def input_schema(partition_id: int, live: int, model_width: int) -> TensorSchema:
         fields = [
-            TensorFieldSchema("state_ref", torch.int32, fill=-1, alignment=4),
+            TensorFieldSchema("street", torch.int32, alignment=4),
+            TensorFieldSchema("board", torch.int16, (5,), fill=-1, alignment=2),
+            TensorFieldSchema("pot", torch.float32, alignment=4),
+            TensorFieldSchema("stacks", torch.float32, (n_players,), alignment=16),
+            TensorFieldSchema("committed", torch.float32, (n_players,), alignment=16),
+            TensorFieldSchema("to_act", torch.int32, alignment=4),
+            TensorFieldSchema("legality_summary", torch.float32, (3,), alignment=4),
+            TensorFieldSchema("n_ticks", torch.int32, alignment=4),
+            TensorFieldSchema("raise_grid_bounds", torch.float32, (2,), alignment=4),
+            TensorFieldSchema("status", torch.int8, (n_players,)),
+            TensorFieldSchema("seat_mask", torch.bool, (n_players,)),
+            TensorFieldSchema("button", torch.int32, alignment=4),
+            TensorFieldSchema("committed_street", torch.float32, (n_players,), alignment=16),
+            TensorFieldSchema("call_amount", torch.float32, alignment=4),
+            TensorFieldSchema("current_bet", torch.float32, alignment=4),
+            TensorFieldSchema("min_raise_to", torch.float32, alignment=4),
+            TensorFieldSchema("max_raise_to", torch.float32, alignment=4),
+            TensorFieldSchema("last_full_raise", torch.float32, alignment=4),
+            TensorFieldSchema("legal_action_mask", torch.bool, (e_max,)),
+            TensorFieldSchema("raise_ticks", torch.float32, (n_ticks,), alignment=4),
+            TensorFieldSchema("history_actor", torch.int8, (max_history_tokens,), fill=-1),
+            TensorFieldSchema("history_street", torch.int8, (max_history_tokens,), fill=-1),
+            TensorFieldSchema("history_action", torch.int8, (max_history_tokens,), fill=-1),
+            TensorFieldSchema("history_mask", torch.bool, (max_history_tokens,)),
             TensorFieldSchema(
                 "range_weights", torch.float32, (live, model_width), alignment=16
             ),
         ]
+        for name in (
+            "amount",
+            "pot_before",
+            "call_amount",
+            "current_bet",
+            "min_raise_to",
+            "max_raise_to",
+        ):
+            fields.append(
+                TensorFieldSchema(
+                    f"history_{name}",
+                    torch.float32,
+                    (max_history_tokens,),
+                    alignment=16,
+                )
+            )
         if partition_id and live < n_players:
-            fields.append(TensorFieldSchema("summary_anchor", torch.int32, fill=-1))
+            fields.append(TensorFieldSchema("folded_summary_ref", torch.int32, fill=-1))
         return TensorSchema(f"poker_partition_{partition_id}_input", tuple(fields))
 
     specs = []

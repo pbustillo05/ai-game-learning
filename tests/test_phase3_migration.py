@@ -86,4 +86,4 @@ def test_storage_schema_and_full_deck_partition_domains_are_strict() -> None:
     post_fields = {field.name: field for field in post.input_schema.fields}
     assert pre_fields["range_weights"].shape == (2, 169)
     assert post_fields["range_weights"].shape == (2, 1326)
-    assert "summary_anchor" not in {field.name for field in post.input_schema.fields}
+    assert "folded_summary_ref" not in {field.name for field in post.input_schema.fields}

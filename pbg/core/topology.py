@@ -159,6 +159,8 @@ class BranchedTreeSpan:
     decision_partition: Tensor
     decision_row: Tensor
     leaf_row: Tensor
+    root_target_degree: int | None = None
+    pre_refill_node_count: int | None = None
 
     @property
     def nodes(self) -> int:
@@ -166,7 +168,21 @@ class BranchedTreeSpan:
 
     @property
     def nbytes(self) -> int:
-        return 6 * 4 * self.nodes
+        return 6 * 4 * self.nodes + 2 * 4
+
+    @property
+    def protected_root_degree(self) -> int:
+        return (
+            int(self.degree[0])
+            if self.root_target_degree is None
+            else int(self.root_target_degree)
+        )
+
+    @property
+    def pre_refill_nodes(self) -> int:
+        return self.nodes if self.pre_refill_node_count is None else int(
+            self.pre_refill_node_count
+        )
 
     def children(self, node: int) -> slice:
         start = int(self.child_begin[node])
@@ -180,42 +196,58 @@ class BranchedTreeSpan:
         leaf_rows: int | None = None,
     ) -> None:
         n = self.nodes
-        for name in self.__dataclass_fields__:
+        column_names = (
+            "parent",
+            "child_begin",
+            "degree",
+            "decision_partition",
+            "decision_row",
+            "leaf_row",
+        )
+        for name in column_names:
             _require_int32_vector(name, getattr(self, name), n)
-        if len({getattr(self, name).device for name in self.__dataclass_fields__}) != 1:
+        if len({getattr(self, name).device for name in column_names}) != 1:
             raise ValueError("branched topology columns must share one device")
         if n == 0:
             raise ValueError("a branched rollout must contain its distinguished root")
         if int(self.parent[0]) != -1 or bool((self.parent[1:] < 0).any()):
             raise ValueError("branched root must be row zero and the only root")
+        node_ids = torch.arange(n, dtype=torch.int64, device=self.parent.device)
+        degree = self.degree.to(torch.int64)
+        begin = self.child_begin.to(torch.int64)
+        leaf = degree == 0
+        nonleaf = ~leaf
+        if bool((degree < 0).any()):
+            raise ValueError("branched node degree cannot be negative")
+        if bool((leaf & ((begin != -1) | (self.leaf_row < 0))).any()):
+            raise ValueError("every leaf must use child sentinel -1 and own a leaf row")
+        if bool((nonleaf & ((begin <= node_ids) | (begin + degree > n))).any()):
+            raise ValueError("branched child span is not a valid forward contiguous span")
+        if bool((nonleaf & (self.leaf_row != -1)).any()):
+            raise ValueError("nonleaf node cannot own a leaf row")
+        if bool(((self.decision_partition == -1) != (self.decision_row == -1)).any()):
+            raise ValueError("decision partition/row sentinels must agree")
+        if bool(((self.decision_partition >= 0) & leaf).any()):
+            raise ValueError("a player decision must have sampled children")
+
+        edge_parents = torch.repeat_interleave(node_ids, degree)
+        edge_offsets = torch.arange(edge_parents.numel(), device=self.parent.device)
+        group_base = torch.repeat_interleave(torch.cumsum(degree, 0) - degree, degree)
+        children = begin[edge_parents] + edge_offsets - group_base
+        if bool((self.parent[children] != edge_parents.to(torch.int32)).any()):
+            raise ValueError("branched parent and child span columns disagree")
         incoming = torch.zeros(n, dtype=torch.int32, device=self.parent.device)
-        for node in range(n):
-            degree = int(self.degree[node])
-            begin = int(self.child_begin[node])
-            if degree < 0:
-                raise ValueError("branched node degree cannot be negative")
-            if degree == 0:
-                if begin != -1:
-                    raise ValueError("leaf child_begin must use sentinel -1")
-                if int(self.leaf_row[node]) < 0:
-                    raise ValueError("every topology leaf must own a leaf row")
-            else:
-                if begin <= node or begin + degree > n:
-                    raise ValueError("branched child span is not a valid forward contiguous span")
-                children = torch.arange(begin, begin + degree, device=self.parent.device)
-                if not bool((self.parent[children] == node).all()):
-                    raise ValueError("branched parent and child span columns disagree")
-                incoming[children] += 1
-                if int(self.leaf_row[node]) != -1:
-                    raise ValueError("nonleaf node cannot own a leaf row")
-            partition = int(self.decision_partition[node])
-            row = int(self.decision_row[node])
-            if (partition == -1) != (row == -1):
-                raise ValueError("decision partition/row sentinels must agree")
-            if partition >= 0 and degree == 0:
-                raise ValueError("a player decision must have sampled children")
+        incoming.scatter_add_(
+            0, children, torch.ones_like(children, dtype=torch.int32)
+        )
         if int(incoming[0]) != 0 or bool((incoming[1:] != 1).any()):
             raise ValueError("every nonroot branched node must have one incoming edge")
+        protected = self.protected_root_degree
+        pre_refill = self.pre_refill_nodes
+        if not 1 <= protected <= int(self.degree[0]):
+            raise ValueError("protected root degree is outside the final child span")
+        if not protected + 1 <= pre_refill <= n:
+            raise ValueError("pre-refill node boundary is outside the sealed tree")
         if leaf_rows is not None:
             selected = self.leaf_row[self.leaf_row >= 0].to(torch.int64)
             if selected.numel() != leaf_rows or (
@@ -248,6 +280,7 @@ class BranchedTreeSpan:
                         raise ValueError("branched action pointer has wrong extent")
                     node_ids = (self.decision_partition == int(partition)).nonzero(as_tuple=False).squeeze(1)
                     decision_rows = self.decision_row[node_ids].to(torch.int64)
-                    degrees = self.degree[node_ids].to(torch.int64)
+                    degrees = self.degree[node_ids].to(torch.int64).clone()
+                    degrees[node_ids == 0] = protected
                     if not torch.equal(ptr[decision_rows + 1] - ptr[decision_rows], degrees):
                         raise ValueError("player action and child span degrees differ")
