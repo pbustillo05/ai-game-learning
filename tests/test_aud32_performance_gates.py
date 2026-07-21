@@ -22,7 +22,7 @@ def _result(speed: float, seconds: float, target_bytes: float) -> dict:
         "workload": {
             "game": "poker",
             "roots_per_gpu": 64,
-            "node_budget": 128,
+            "storage_page_rows": 128,
             "completion_samples": 32,
             "completion_backend": "cpu",
             "minibatch_size": 32,
@@ -35,7 +35,7 @@ def _result(speed: float, seconds: float, target_bytes: float) -> dict:
             "profile_iteration": 1,
             "family_batch_rows": None,
             "max_active_trajectories": None,
-            "arena_chunk_nodes": None,
+            "storage_page_rows": None,
         },
         "modes": [
             {

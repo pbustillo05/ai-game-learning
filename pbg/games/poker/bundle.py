@@ -12,6 +12,7 @@ from torch import Tensor
 from pbg.core.completion import BatchedCompletionStats
 from pbg.core.config import RootConfig
 from pbg.core.game import PRETERM, PROBE_FOLD, GameBundle
+from pbg.core.tree import PagedTreeSource
 from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.engine import PokerConfig
@@ -31,39 +32,37 @@ from pbg.games.poker.model.preflop import PokerModelConfig, PreflopNet
 from pbg.games.poker.model.primitives import MHA
 from pbg.games.poker.partition_cache import DevicePartitionSummaryCache
 from pbg.games.poker.rollout_backend import PokerRolloutBackend
-from pbg.games.poker.tensor_state import PokerTensorStateStore
+from pbg.games.poker.tensor_state import (
+    poker_live_state_schema,
+    poker_public_history_schema,
+)
 
 
 @dataclass(frozen=True)
 class PokerRolloutMemoryPlan:
-    """Conservative byte plan for persistent and peak rollout allocations."""
+    """Schema-derived minimum admitted rollout transaction."""
 
-    capacity: int
-    state_bytes: int
-    tree_bytes: int
-    reach_cache_bytes: int
-    frontier_reach_bytes: int
-    policy_cache_bytes: int
-    partition_cache_bytes: int
+    page_rows: int
+    state_page_bytes: int
+    history_page_bytes: int
+    topology_page_bytes: int
+    active_reach_bytes: int
+    partition_page_bytes: int
 
     @property
     def peak_bytes(self) -> int:
-        return sum(
-            (
-                self.state_bytes,
-                self.tree_bytes,
-                self.reach_cache_bytes,
-                self.frontier_reach_bytes,
-                self.policy_cache_bytes,
-                self.partition_cache_bytes,
-            )
+        return (
+            self.state_page_bytes
+            + self.history_page_bytes
+            + self.topology_page_bytes
+            + self.active_reach_bytes
+            + self.partition_page_bytes
         )
 
 
 def estimate_rollout_memory(
     *,
     root_count: int,
-    node_budget: int,
     n_players: int,
     sequential: bool = False,
     rank_count: int = 13,
@@ -71,55 +70,38 @@ def estimate_rollout_memory(
     folder_beta_rank: int = 16,
     partition_cache_materialized: bool = True,
     use_branching_heads: bool = False,
+    storage_page_rows: int = 256,
 ) -> PokerRolloutMemoryPlan:
-    """Estimate worst-case rollout bytes before allocating a poker backend.
+    """Return the page/live-frontier minimum needed before the first draw."""
 
-    The branched estimate intentionally counts two capacity-sized reach
-    frontiers: a branched wave can retain active rows while constructing its
-    successors. Sequential execution is tighter: exactly one
-    live occurrence exists per trajectory and execution allocates root and
-    overwriteable working reaches with ``root_count`` rows each. It excludes model,
-    completion, optimizer, and autograd allocations, so the CUDA preflight
-    leaves half of currently free device memory for those phases.
-    """
-
-    if root_count < 0 or node_budget <= 0 or n_players <= 0:
+    del use_branching_heads
+    if root_count < 0 or n_players <= 0 or storage_page_rows <= 0:
         raise ValueError("invalid rollout memory-plan dimensions")
-    capacity = root_count * node_budget
-    edge_capacity = capacity - root_count
-    node_bytes = capacity * (6 * 4 + n_players * 4)
-    edge_bytes = edge_capacity * 4 * 4
+    page_rows = int(storage_page_rows)
     n_hands = DeckGeometry(rank_count).n_hands
-    reach_row_bytes = n_players * n_hands * 4
-    reach_cache = (root_count if sequential else capacity) * reach_row_bytes
+    reach_rows = max(root_count, 1) if sequential else page_rows
+    state_schema = poker_live_state_schema(n_players)
+    history_schema = poker_public_history_schema(max_history_tokens)
+    node_schema = PagedTreeSource.node_schema(n_players)
+    edge_schema = PagedTreeSource.edge_schema()
     return PokerRolloutMemoryPlan(
-        capacity=capacity,
-        state_bytes=PokerTensorStateStore.storage_nbytes(
-            capacity, n_players, max_history_tokens
+        page_rows=page_rows,
+        state_page_bytes=state_schema.capacity_bytes(page_rows, chunks=1),
+        history_page_bytes=history_schema.capacity_bytes(page_rows, chunks=1),
+        topology_page_bytes=(
+            node_schema.capacity_bytes(page_rows, chunks=1)
+            + edge_schema.capacity_bytes(page_rows, chunks=1)
         ),
-        tree_bytes=node_bytes + edge_bytes,
-        reach_cache_bytes=reach_cache,
-        frontier_reach_bytes=(
-            2 * root_count * reach_row_bytes
-            if sequential
-            else 2 * capacity * reach_row_bytes
-        ),
-        # Selected policy likelihoods and values are retained only for realized
-        # player edges/nodes, but this remains a safe capacity bound.
-        policy_cache_bytes=(edge_capacity + capacity) * n_hands * 4
-        + (2 * capacity * 4 if use_branching_heads else 0),
-        partition_cache_bytes=(
+        active_reach_bytes=reach_rows * n_players * n_hands * 4,
+        partition_page_bytes=(
             DevicePartitionSummaryCache.storage_nbytes(
-                capacity,
+                page_rows,
                 n_cards=4 * rank_count,
                 beta_rank=folder_beta_rank,
                 max_folders=max(0, n_players - 2),
             )
             if partition_cache_materialized
-            # The cache always allocates its device validity bitmap. Its large
-            # evaluator-owned fields are lazy and must not be charged when the
-            # configured model never consumes partition summaries.
-            else capacity
+            else 0
         ),
     )
 
@@ -158,7 +140,7 @@ def _preflight_cuda_rollout(
             f"{plan.peak_bytes / gib:.2f} GiB, exceeding the usable rollout limit "
             f"{limit / gib:.2f} GiB on {device} (free {free_bytes / gib:.2f} GiB, "
             f"total {total_bytes / gib:.2f} GiB); "
-            "reduce rollout sequential roots per GPU/node_budget or use a smaller storage plan"
+            "reduce sequential roots per GPU or the storage page size"
         )
 
 
@@ -227,10 +209,10 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
             raise ValueError("n_samples must be a positive integer")
         rows = rows.to(device=game.device, dtype=torch.int64)
         owner = leaves["owner"][rows]
-        log_reach = leaves["log_reach"][rows]
+        range_weights = leaves["range_weights"][rows].to(torch.float32)
         keys = leaves["completion_key"][rows].to(torch.int64).contiguous()
-        batch, players, n_hands = log_reach.shape
-        p_hat = torch.zeros_like(log_reach, dtype=torch.float32)
+        batch, players, n_hands = range_weights.shape
+        p_hat = torch.zeros_like(range_weights, dtype=torch.float32)
         v_hat = torch.zeros_like(p_hat)
         n_eff = torch.zeros(batch, dtype=torch.float32, device=game.device)
         metadata: dict[str, object] = {
@@ -244,7 +226,7 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
             evaluator = self._bound_evaluator()
             result = evaluator.complete(
                 board_cards=leaves["board_cards"][rows][preterm].contiguous(),
-                range_weights=leaves["range_weights"][rows][preterm].contiguous(),
+                range_weights=range_weights[preterm].contiguous(),
                 stratum_level=leaves["stratum_level"][rows][preterm].contiguous(),
                 payoff_baseline=leaves["payoff_baseline"][rows][preterm].contiguous(),
                 stratum_amount=leaves["stratum_amount"][rows][preterm].contiguous(),
@@ -267,13 +249,19 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
 
         terminal = (owner != PRETERM).nonzero(as_tuple=False).squeeze(1)
         if terminal.numel():
+            terminal_weights = range_weights[terminal]
+            log_reach = torch.where(
+                terminal_weights > 0,
+                terminal_weights.log(),
+                torch.full_like(terminal_weights, -torch.inf),
+            )
             dealt = torch.ones(
                 (terminal.numel(), players),
                 dtype=torch.bool,
                 device=game.device,
             )
             profiles = game.profile_sampler.sample_seeded(
-                log_reach[terminal],
+                log_reach,
                 leaves["board_cards"][rows][terminal],
                 dealt,
                 n_samples,
@@ -680,7 +668,6 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     state_history_steps = 4 * engine_cfg.n_players * (raises_per_street + 1) + 3
     plan = estimate_rollout_memory(
         root_count=resident_trees,
-        node_budget=cfg.rollout.node_budget,
         n_players=engine_cfg.n_players,
         sequential=cfg.training.mode != "branched_rao_blackwell",
         rank_count=engine_cfg.rank_count,
@@ -690,6 +677,7 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         folder_beta_rank=model_cfg.folder_beta_rank,
         partition_cache_materialized=model_cfg.evaluator_summary_dim > 0,
         use_branching_heads=model_cfg.use_branching_heads,
+        storage_page_rows=int(cfg.rollout.storage_page_rows or 256),
     )
     _preflight_cuda_rollout(
         plan,
@@ -703,8 +691,8 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     )
     backend = PokerRolloutBackend(
         engine_cfg,
-        plan.capacity,
         device,
+        storage_page_rows=plan.page_rows,
         beta_table=cfg.rollout.beta or {"default": 1.0},
         profile_sampler=profiles,
         partition_adapter=partition,

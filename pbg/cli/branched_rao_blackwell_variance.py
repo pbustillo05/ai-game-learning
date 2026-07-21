@@ -75,7 +75,6 @@ def _load_moments(config: Mapping[str, Any], beta: float, count: int | None = No
 def run_smoke(config: dict[str, Any], device: torch.device) -> dict[str, Any]:
     smoke = config["smoke"]
     bounded = json.loads(json.dumps(config))
-    bounded["rollout"]["node_budget"] = int(smoke["node_budget"])
     bounded["rollout"]["branching_upper_cutoff_nodes"] = int(smoke["upper_cutoff_nodes"])
     bounded["oracle"]["n_oracle"] = int(smoke["oracle_samples"])
     bounded["probes"]["parameter_count"] = int(smoke["parameter_probes"])
@@ -90,8 +89,6 @@ def run_smoke(config: dict[str, Any], device: torch.device) -> dict[str, Any]:
         -1,
         n_samples=int(smoke["oracle_samples"]),
     )
-    if result["geometry"]["nodes"] > int(smoke["node_budget"]):
-        raise RuntimeError("smoke exceeded its hard node budget")
     if not all(
         math.isfinite(float(value))
         for key in ("gradient", "minibatch_coefficient_raw", "completion_pair_coefficient", "completion_node_coefficient")

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from pbg.core.game import CHANCE, PRETERM
-from pbg.core.tree import TreeBuilder
+from pbg.core.tree import DiagnosticTreeBuilder
 from pbg.eval.branched_rao_blackwell_variance import (
     _propagate_functional_coefficients,
     _tree_layout,
@@ -40,7 +40,7 @@ def test_projected_leave_one_out_partials_match_autograd() -> None:
 
 
 def test_child_summary_partials_propagate_through_chance_average() -> None:
-    builder = TreeBuilder(2)
+    builder = DiagnosticTreeBuilder(2)
     root = builder.add_root(0, 0)
     chance = builder.add_child(root, 1, 4, 1.0, CHANCE)
     left = builder.add_child(chance, 2, 5, 0.5, PRETERM)

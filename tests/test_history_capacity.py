@@ -37,7 +37,6 @@ def test_lossless_history_bound_covers_documented_player_nodes_and_separators(
 def test_omitted_history_capacity_is_derived_before_model_allocation(tmp_path: Path) -> None:
     raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
     raw["completion"]["backend"] = "cpu"
-    raw["rollout"]["node_budget"] = 8
     raw["model"].update(
         {
             "d_model": 8,
@@ -99,8 +98,8 @@ def test_adversarial_minimum_raise_trajectory_reaches_exact_history_bound(
     bound = max_public_history_tokens(players, stack)
     backend = PokerRolloutBackend(
         game_cfg,
-        bound + 1,
         "cpu",
+        storage_page_rows=bound + 1,
         max_rollout_steps=bound,
     )
     state = backend.sequential_start_states(1)

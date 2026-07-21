@@ -21,9 +21,27 @@ from pbg.core.memory_control import SEQUENTIAL_MEMORY_CONTROLLER_VERSION
 from pbg.core.storage import TRAINING_STORAGE_SCHEMA_VERSION
 
 
-CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v4"
-PREVIOUS_CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v3"
-LEGACY_CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v2"
+CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v5"
+PREVIOUS_CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v4"
+LEGACY_CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v3"
+ANCIENT_CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v2"
+_RETIRED_ROLLOUT_CAPACITY_FIELD = "node" + "_budget"
+
+
+def _migrate_rollout_config(migrated: dict[str, Any]) -> None:
+    """Remove the retired allocation capacity without reinterpreting its value."""
+
+    config = migrated.get("config")
+    rollout = config.get("rollout") if isinstance(config, dict) else None
+    if isinstance(rollout, dict) and _RETIRED_ROLLOUT_CAPACITY_FIELD in rollout:
+        rollout = dict(rollout)
+        rollout.pop(_RETIRED_ROLLOUT_CAPACITY_FIELD)
+        config = dict(config)
+        config["rollout"] = rollout
+        migrated["config"] = config
+        transitions = list(migrated.get("configuration_schema_transitions", ()))
+        transitions.append("removed retired total-row allocation field; no replacement")
+        migrated["configuration_schema_transitions"] = transitions
 
 
 def _migrate_checkpoint_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -51,7 +69,7 @@ def _migrate_checkpoint_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "legacy checkpoint is partial; missing required fields "
                 f"{sorted(missing)}"
             )
-        migrated["migrated_from_checkpoint_schema"] = LEGACY_CHECKPOINT_SCHEMA_VERSION
+        migrated["migrated_from_checkpoint_schema"] = ANCIENT_CHECKPOINT_SCHEMA_VERSION
         migrated["checkpoint_schema_version"] = CHECKPOINT_SCHEMA_VERSION
         migrated["storage_schema_version"] = TRAINING_STORAGE_SCHEMA_VERSION
         state = migrated.get("adaptive_work_state")
@@ -60,18 +78,22 @@ def _migrate_checkpoint_payload(payload: dict[str, Any]) -> dict[str, Any]:
         migrated["controller_schema_version"] = (
             None if state is None else SEQUENTIAL_MEMORY_CONTROLLER_VERSION
         )
-    elif version == PREVIOUS_CHECKPOINT_SCHEMA_VERSION:
+    elif version in {PREVIOUS_CHECKPOINT_SCHEMA_VERSION, LEGACY_CHECKPOINT_SCHEMA_VERSION}:
         migrated["migrated_from_checkpoint_schema"] = version
         migrated["checkpoint_schema_version"] = CHECKPOINT_SCHEMA_VERSION
-        migrated["branching_controller_schema_version"] = None
-        migrated["branching_controller_state"] = None
+        if version == LEGACY_CHECKPOINT_SCHEMA_VERSION:
+            migrated["branching_controller_schema_version"] = None
+            migrated["branching_controller_state"] = None
     elif version != CHECKPOINT_SCHEMA_VERSION:
         raise RuntimeError(f"unsupported checkpoint schema version {version!r}")
     migrated.setdefault("branching_controller_schema_version", None)
     migrated.setdefault("branching_controller_state", None)
     migrated.setdefault("initialization", None)
+    if migrated.get("storage_schema_version") == "pbg-training-storage-v1":
+        migrated["storage_schema_version"] = TRAINING_STORAGE_SCHEMA_VERSION
     if migrated.get("storage_schema_version") != TRAINING_STORAGE_SCHEMA_VERSION:
         raise RuntimeError("checkpoint storage schema is incompatible")
+    _migrate_rollout_config(migrated)
     controller_version = migrated.get("controller_schema_version")
     state = migrated.get("adaptive_work_state")
     if (state is None) != (controller_version is None):
@@ -117,6 +139,9 @@ def inspect_checkpoint(path: str | Path) -> dict[str, Any]:
         ],
         "iteration": int(migrated["iteration"]),
         "config": copy.deepcopy(migrated["config"]),
+        "configuration_schema_transitions": tuple(
+            migrated.get("configuration_schema_transitions", ())
+        ),
     }
 
 
@@ -302,6 +327,7 @@ def compatible_scientific_configs(
         if result.get("probe") is not None:
             result["probe"].pop("target_checkpoint", None)
         rollout = result.get("rollout", {})
+        rollout.pop(_RETIRED_ROLLOUT_CAPACITY_FIELD, None)
         # Width bounds and calibration are execution controls.  They do not
         # change the estimator represented by a scientific checkpoint.
         for key in (

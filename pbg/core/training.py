@@ -43,7 +43,6 @@ from pbg.core.learner import (
     DistributedLearnerConfig,
     PhysicalShape,
 )
-from pbg.core.losses import COMPOSITES, LossSpec, _selected_logp
 from pbg.core.memory_control import (
     MEMORY_PHASES,
     MemoryAdmissionStop,
@@ -52,10 +51,6 @@ from pbg.core.memory_control import (
     PhaseMemoryModel,
     PhaseMemoryObservation,
     SequentialMemoryController,
-)
-from pbg.core.minibatch import (
-    gather_minibatch_rows,
-    index_minibatch,
 )
 from pbg.core.storage import (
     PartitionRolloutBlock,
@@ -68,7 +63,10 @@ from pbg.core.storage import (
     TensorSchema,
     TrainingPartition,
     TrainingStorage,
+    paged_capacity_bytes,
+    topology_schema,
 )
+from pbg.core.tree import PagedTreeSource
 from pbg.core.targets import (
     _walker_alias,
     build_branched_rb_targets,
@@ -85,7 +83,6 @@ from pbg.core.rollout import (
     sequential_leaf_logical_rng_keys,
 )
 from pbg.core.execution import LOGICAL_RNG_VERSION, DrawPurpose, logical_rng_keys
-from pbg.core.values import HeadEvals, streamed_branched_value
 from pbg.core.completion import BatchedCompletionStats
 from pbg.core.utility import utility_conversion, utility_scale
 
@@ -114,13 +111,6 @@ def _scaler(enabled: bool) -> Any:
         return torch.cuda.amp.GradScaler(
             enabled=enabled, init_scale=1024.0, growth_interval=2000
         )
-
-
-def _loss_spec(cfg: RootConfig) -> LossSpec:
-    try:
-        return COMPOSITES[cfg.loss.name]
-    except KeyError as exc:
-        raise ValueError(f"unknown composite loss {cfg.loss.name!r}") from exc
 
 
 def _scale_completion_utility(
@@ -195,11 +185,10 @@ def _hardware_metadata(
         "execution_calibration": {
             "batch_rows": cfg.rollout.family_batch_rows,
             "max_active_trajectories": cfg.rollout.max_active_trajectories,
-            "arena_chunk_nodes": cfg.rollout.arena_chunk_nodes,
+            "storage_page_rows": cfg.rollout.storage_page_rows,
         },
         "memory_limits": {
             "execution_memory_bytes": cfg.rollout.execution_memory_bytes,
-            "node_budget": cfg.rollout.node_budget,
             "reserve_vram_gib": None if cfg.hardware is None else cfg.hardware.reserve_vram_gib,
             "max_memory_fraction": None if cfg.hardware is None else cfg.hardware.max_memory_fraction,
         },
@@ -425,24 +414,16 @@ def _synchronize_memory_control_metrics(
 
 
 @dataclass
-class _RolloutSealInput:
-    """Short-lived rollout owners consumed exactly once by storage sealing."""
+class IterationData:
+    """Immutable training owner and diagnostics for one sampled iteration."""
 
     normal: bool
     completion_quality: dict[str, float]
-    dataset: Any = None
-    tree: Any = None
-    targets: Any = None
-    policy_cache: Any = None
-    decision_reach: Any = None
-    decision_weight: Tensor | None = None
-    trajectory_id: Tensor | None = None
-    owner: Tensor | None = None
-    profile_metrics: dict[str, float] | None = None
-    storage: TrainingStorage | None = None
-    partition_specs: Any = None
-    decision_count: int = 0
-    leaf_count: int = 0
+    profile_metrics: dict[str, float]
+    storage: TrainingStorage
+    partition_specs: Any
+    decision_count: int
+    leaf_count: int
 
 
 def _value_workspace_budget(cfg: RootConfig, device: torch.device) -> int:
@@ -530,201 +511,327 @@ def _tensor_bytes(value: Any, seen: set[int] | None = None) -> int:
 def _analytical_memory_plan(
     cfg: RootConfig, bundle: GameBundle, *, has_reference: bool
 ) -> dict[str, int]:
-    """Return a mode-aware bound for allocations that can coexist by phase.
-
-    Sequential trajectories retain exactly one realized child at each player
-    node. Charging the backend's entire legal event vocabulary to every node
-    produces a bound for tensors this execution mode never allocates. Capacity
-    remains the conservative decision-row count, but sequential policy and
-    target widths are one. The hardware reserve is intentionally left outside
-    this structural plan for attention/autograd workspaces and allocator slack.
-    """
+    """Build the four phase prior from the schemas that own real tensors."""
 
     model = bundle.model.module if hasattr(bundle.model, "module") else bundle.model
-    parameter = sum(
-        value.numel() * value.element_size() for value in model.parameters()
-    )
-    opponent_parameter = (
-        0
-        if bundle.opponent_model is None
-        else sum(
-            value.numel() * value.element_size()
-            for value in bundle.opponent_model.parameters()
-        )
+    parameter = sum(value.numel() * value.element_size() for value in model.parameters())
+    opponent_parameter = 0 if bundle.opponent_model is None else sum(
+        value.numel() * value.element_size()
+        for value in bundle.opponent_model.parameters()
     )
     backend = bundle.rollout_backend
     players = int(backend.n_players)
-    types = max(int(value) for value in backend.x_sizes)
+    exact_width = max(int(value) for value in backend.x_sizes)
     events = int(getattr(backend, "e_max", 1))
-    resident_trees = int(cfg.rollout.roots_per_gpu)
-    nodes = resident_trees * int(cfg.rollout.node_budget)
-    fp32 = 4
-    int32 = 4
+    roots = int(cfg.rollout.roots_per_gpu)
+    page_rows = int(getattr(cfg.rollout, "storage_page_rows", None) or 256)
     sequential = cfg.training.mode != "branched_rao_blackwell"
-    retained_events = 1 if sequential else events
-    active_rows = min(
-        resident_trees,
-        max(
-            int(cfg.rollout.family_batch_rows or 1),
-            int(cfg.rollout.max_active_trajectories or 1),
+    mode = {
+        "normal": "normal",
+        "rao_blackwell": "sequential_rb",
+        "branched_rao_blackwell": "branched_rb",
+    }[cfg.training.mode]
+    path_rows = int(getattr(backend, "max_rollout_steps", 1)) + 1
+    realized_prior_rows = roots * path_rows if sequential else page_rows
+    decision_rows = realized_prior_rows
+    leaf_rows = roots if sequential else page_rows
+    action_rows = decision_rows if sequential else page_rows
+
+    def paged(schema: TensorSchema, rows: int) -> int:
+        return paged_capacity_bytes(schema, rows, page_rows)
+
+    def exact(schema: TensorSchema, rows: int) -> int:
+        return schema.capacity_bytes(rows, chunks=int(rows > 0))
+
+    partition_factory = getattr(backend, "training_partition_specs", None)
+    if not callable(partition_factory):
+        raise TypeError("memory planning requires game-owned partition schemas")
+    partition_specs = tuple(partition_factory().specs)
+    if not partition_specs:
+        raise ValueError("memory planning requires at least one partition schema")
+    input_schemas = tuple(spec.input_schema for spec in partition_specs)
+    input_destination = max(exact(schema, decision_rows) for schema in input_schemas)
+    input_source = max(
+        paged(
+            TensorSchema(
+                f"{schema.name}_capture",
+                (TensorFieldSchema("node_id", torch.int32, alignment=4), *schema.fields),
+                chunk_header_bytes=schema.chunk_header_bytes,
+                allocator_slack_bytes=schema.allocator_slack_bytes,
+            ),
+            decision_rows,
+        )
+        for schema in input_schemas
+    )
+
+    rb = cfg.training.mode != "normal"
+    decision_fields = [
+        TensorFieldSchema("owner", torch.int32, alignment=4),
+        TensorFieldSchema(
+            "old_value", torch.float32, (() if not rb else (exact_width,)), alignment=16
+        ),
+        TensorFieldSchema("legal_event_ids", torch.int32, (events,), alignment=16),
+        TensorFieldSchema("legal_event_mask", torch.bool, (events,)),
+    ]
+    if sequential:
+        decision_fields.extend(
+            (
+                TensorFieldSchema("event", torch.int32, alignment=4),
+                TensorFieldSchema(
+                    "old_log_prob",
+                    torch.float32,
+                    (() if not rb else (exact_width,)),
+                    alignment=16,
+                ),
+            )
+        )
+        if not rb:
+            decision_fields.append(
+                TensorFieldSchema("realized_type", torch.int32, alignment=4)
+            )
+    else:
+        decision_fields.extend(
+            (
+                TensorFieldSchema("log_weight", torch.float64, alignment=8),
+                TensorFieldSchema("nominal_child_count", torch.int32, alignment=4),
+                TensorFieldSchema("executed_child_count", torch.int32, alignment=4),
+                TensorFieldSchema("frozen_trace_variance", torch.float32, alignment=4),
+                TensorFieldSchema("frozen_cost", torch.float32, alignment=4),
+            )
+        )
+    decision_schema = TensorSchema("sealed_decision_rows", tuple(decision_fields))
+    action_schema = TensorSchema(
+        "sealed_action_rows",
+        (
+            TensorFieldSchema("event", torch.int32, alignment=4),
+            TensorFieldSchema("old_log_prob", torch.float32, (exact_width,), alignment=16),
         ),
     )
-    topology = nodes * (
-        int32 * (6 + players) + fp32 * 2 + (0 if sequential else int32 + fp32)
+    source_decision_schema = TensorSchema(
+        "rollout_policy_rows",
+        (
+            TensorFieldSchema("node_id", torch.int32, alignment=4),
+            *(
+                (
+                    TensorFieldSchema(
+                        "old_logp", torch.float32, (exact_width,), alignment=16
+                    ),
+                    TensorFieldSchema(
+                        "old_v", torch.float32, (exact_width,), alignment=16
+                    ),
+                )
+                if sequential
+                else (
+                    TensorFieldSchema(
+                        "old_v", torch.float32, (exact_width,), alignment=16
+                    ),
+                    TensorFieldSchema("old_t", torch.float32, alignment=4),
+                    TensorFieldSchema("old_c", torch.float32, alignment=4),
+                )
+            ),
+        ),
     )
-    dense_reach = nodes * players * types * fp32
-    reach_row = players * types * fp32
-    if sequential:
-        # Root reach and the overwriteable per-trajectory working reach coexist.
-        rollout_reach = 2 * resident_trees * reach_row
-        # Current/child/gather/scatter waves are bounded by scheduler admission,
-        # not by the total node capacity accumulated across all trajectories.
-        rollout_transient_reach = 4 * active_rows * reach_row
-    else:
-        rollout_reach = dense_reach
-        rollout_transient_reach = 4 * dense_reach
+    decision_source = paged(source_decision_schema, decision_rows)
+    decision_destination = exact(decision_schema, decision_rows)
+    action_source = 0 if sequential else paged(action_schema, action_rows)
+    action_destination = 0 if sequential else exact(action_schema, action_rows)
 
-    # Sequential poker currently requests full [P,H] decision reaches. Include
-    # the node/state/owner indices retained by DecisionReachCache as well.
-    decision_reach = dense_reach + nodes * 3 * int32
-    model_cfg = getattr(cfg, "model", {})
-    branching_head_cache = 2 * fp32 if (
-        not sequential and bool(model_cfg.get("use_branching_heads", False))
-    ) else 0
-    policy_cache = nodes * (
-        (retained_events * types + types) * fp32 + int32 + branching_head_cache
+    if cfg.training.mode == "normal":
+        source_leaf_fields = (
+            TensorFieldSchema("node_id", torch.int32, alignment=4),
+            TensorFieldSchema("log_reach", torch.float32, (players, exact_width), alignment=16),
+            TensorFieldSchema("reward", torch.float32, (players,), alignment=16),
+        )
+        destination_leaf_fields = (
+            TensorFieldSchema("reward", torch.float32, (players,), alignment=16),
+        )
+    else:
+        completion_fields = (
+            TensorFieldSchema("owner", torch.int32, alignment=4),
+            TensorFieldSchema("fold_payoff", torch.float32, (players,), alignment=16),
+            TensorFieldSchema("board_cards", torch.uint8, (5,)),
+            TensorFieldSchema("stratum_level", torch.int32, (players,), alignment=16),
+            TensorFieldSchema("payoff_baseline", torch.float32, (players,), alignment=16),
+            TensorFieldSchema("stratum_amount", torch.float32, (players,), alignment=16),
+        )
+        source_leaf_fields = (
+            TensorFieldSchema("node_id", torch.int32, alignment=4),
+            TensorFieldSchema("log_reach", torch.float32, (players, exact_width), alignment=16),
+            *completion_fields,
+        )
+        destination_leaf_fields = (
+            *completion_fields,
+            TensorFieldSchema("completion_key", torch.int64, alignment=8),
+            TensorFieldSchema("range_weights", torch.float32, (players, exact_width), alignment=16),
+        )
+    source_leaf_schema = TensorSchema("stopped_leaf_source", source_leaf_fields)
+    destination_leaf_schema = TensorSchema("sealed_leaf_rows", destination_leaf_fields)
+    leaf_source = paged(source_leaf_schema, leaf_rows)
+    leaf_destination = exact(destination_leaf_schema, leaf_rows)
+
+    source_topology = paged(
+        PagedTreeSource.node_schema(players), realized_prior_rows
+    ) + paged(PagedTreeSource.edge_schema(), realized_prior_rows)
+    sealed_topology = exact(topology_schema(mode), realized_prior_rows)
+    if sequential:
+        sealed_topology += (roots + 1) * 4 + roots * 4
+    else:
+        sealed_topology += realized_prior_rows * 4
+    rollout_minimum = getattr(backend, "rollout_memory_plan", None)
+    minimum_live_pages = int(getattr(rollout_minimum, "peak_bytes", 0))
+    active_rows = min(
+        roots,
+        max(
+            int(getattr(cfg.rollout, "family_batch_rows", None) or 1),
+            int(getattr(cfg.rollout, "max_active_trajectories", None) or 1),
+        ),
     )
-    branching_target_bytes = 0 if sequential else 2 * fp32 + int32 + 1
-    rb_targets = (
-        0
-        if cfg.training.mode == "normal"
-        else nodes
-        * (
-            (2 + 2 * retained_events) * types * fp32
-            + int32  # node id
-            + retained_events * (int32 + 1)  # child event and mask
-            + int32  # child count
-            + branching_target_bytes  # T/C, nominal child count, T mask
+    reach_pack = active_rows * players * exact_width * 4
+    bounded_workspace = 4 * reach_pack
+    source_rows_bytes = (
+        source_topology
+        + input_source
+        + decision_source
+        + action_source
+        + leaf_source
+        + minimum_live_pages
+        + bounded_workspace
+    )
+    if not sequential:
+        source_rows_bytes = max(
+            source_rows_bytes,
+            int(getattr(cfg.rollout, "execution_memory_bytes", 1 << 30)),
+        )
+    sealed_rollout = (
+        sealed_topology
+        + input_destination
+        + decision_destination
+        + action_destination
+        + leaf_destination
+    )
+    seal_scratch = max(
+        schema.payload_bytes(min(page_rows, max(decision_rows, 1)))
+        for schema in (
+            *input_schemas,
+            source_decision_schema,
+            decision_schema,
+            source_leaf_schema,
+            destination_leaf_schema,
+            action_schema,
         )
     )
-    # Once single-child target validation completes, child_p_hat aliases
-    # parent_p_hat. Target construction still needs the larger rb_targets term.
-    compact_rb_targets = (
+
+    if cfg.training.mode == "normal":
+        target_schema = TensorSchema(
+            "normal_target", (TensorFieldSchema("lambda_return", torch.float32),)
+        )
+        target_destination = exact(target_schema, decision_rows)
+        posterior_pool = 0
+        action_target = 0
+    elif cfg.training.mode == "rao_blackwell":
+        target_schema = TensorSchema(
+            "sequential_rb_target",
+            (
+                TensorFieldSchema("posterior_ref", torch.int32, alignment=4),
+                TensorFieldSchema("lambda_return", torch.float32, (exact_width,), alignment=16),
+            ),
+        )
+        posterior_schema = TensorSchema(
+            "sequential_posterior_pool",
+            (
+                TensorFieldSchema("posterior", torch.float32, (exact_width,), alignment=16),
+                TensorFieldSchema("trajectory", torch.int32, alignment=4),
+                TensorFieldSchema("player", torch.int32, alignment=4),
+            ),
+        )
+        target_destination = exact(target_schema, decision_rows)
+        posterior_pool = exact(posterior_schema, decision_rows)
+        action_target = 0
+    else:
+        target_schema = TensorSchema(
+            "branched_rb_decision_target",
+            (
+                TensorFieldSchema("value_hat", torch.float32, (exact_width,), alignment=16),
+                TensorFieldSchema("trace_variance_hat", torch.float32),
+                TensorFieldSchema("trace_variance_mask", torch.bool),
+                TensorFieldSchema("cost_hat", torch.float32),
+            ),
+        )
+        action_target_schema = TensorSchema(
+            "branched_rb_action_target",
+            (
+                TensorFieldSchema("child_posterior", torch.float32, (exact_width,), alignment=16),
+                TensorFieldSchema("advantage_hat", torch.float32, (exact_width,), alignment=16),
+            ),
+        )
+        target_destination = exact(target_schema, decision_rows)
+        action_target = exact(action_target_schema, action_rows)
+        posterior_pool = 0
+    training_storage = (
+        input_destination
+        + decision_destination
+        + action_destination
+        + target_destination
+        + action_target
+        + posterior_pool
+        + decision_rows * 20
+    )
+    completion_rows = min(max(leaf_rows, 1), 64)
+    completion_workspace = (
         0
         if cfg.training.mode == "normal"
-        else nodes
-        * (
-            (2 + retained_events) * types * fp32
-            + int32
-            + branching_target_bytes
-            + retained_events * (int32 + 1)
-            + int32
-        )
+        else completion_rows * players * exact_width * (3 * 4 + 1)
     )
-    normal_targets = (
-        nodes * (5 * fp32 + int32)
-        if cfg.training.mode == "normal"
-        else 0
+    frontier_workspace = (
+        page_rows * players * exact_width * 2 * 4
+        if not sequential
+        else roots * players * exact_width * 4
     )
-    optimizer_and_grad = 3 * parameter  # grad + two fp32 Adam moments
-    gradient_sync = parameter  # explicit flat SUM buffer; this code does not use DDP buckets
-    # Rollout is synchronous with optimization and reads the live model under
-    # no_grad/eval; there is no second full behavior-policy allocation.
-    rollout_snapshot = 0
-    reference = parameter if has_reference else 0
-    alias = nodes * (8 + 8 + int32) if sequential else 0
+
     resident_seen: set[int] = set()
     backend_resident = _tensor_bytes(vars(backend), resident_seen)
-    for owned in (getattr(backend, "states", None),):
+    for owned in (
+        getattr(backend, "states", None),
+        getattr(backend, "partition_summary_cache", None),
+    ):
         if owned is not None:
             backend_resident += _tensor_bytes(vars(owned), resident_seen)
-    partition_bound_fn = getattr(backend, "partition_cache_memory_bound", None)
-    if callable(partition_bound_fn):
-        registered_cache_bytes = 0
-        for service in getattr(backend, "_partition_services", {}).values():
-            cache = service[1]
-            registered_cache_bytes += _tensor_bytes(vars(cache), resident_seen)
-        backend_resident += registered_cache_bytes
-        backend_resident += max(
-            int(partition_bound_fn()) - registered_cache_bytes,
-            0,
-        )
-    else:
-        cache = getattr(backend, "partition_summary_cache", None)
-        if cache is not None:
-            backend_resident += _tensor_bytes(vars(cache), resident_seen)
-    completion_workspace = (
-        8 * resident_trees * reach_row
-        + min(resident_trees, 256) * players * types * (3 * fp32 + 1)
-        if cfg.training.mode != "normal"
-        else 0
-    )
-    rollout_fixed = (
-        parameter
-        + opponent_parameter
-        + rollout_snapshot
-        + reference
-        + backend_resident
-    )
-    rollout_variable = (
-        topology
-        + rollout_reach
-        + rollout_transient_reach
-        + policy_cache
-    )
+    for service in getattr(backend, "_partition_services", {}).values():
+        backend_resident += _tensor_bytes(vars(service[1]), resident_seen)
+    reference = parameter if has_reference else 0
+    optimizer_and_grad = 3 * parameter
+    gradient_sync = parameter
+    rollout_fixed = parameter + opponent_parameter + reference + backend_resident
+    seal_fixed = rollout_fixed
+    target_fixed = rollout_fixed + optimizer_and_grad
+    optimization_fixed = target_fixed + gradient_sync
+    rollout_variable = source_rows_bytes
+    seal_variable = source_rows_bytes + sealed_rollout + seal_scratch
+    target_variable = sealed_rollout + training_storage + completion_workspace + frontier_workspace
+    learner_rows = min(decision_rows, int(getattr(cfg.training, "minibatch_size", 1)))
+    learner_workspace = learner_rows * exact_width * 6 * 4
+    optimization_variable = training_storage + learner_workspace
     rollout_phase = rollout_fixed + rollout_variable
-    target_fixed = (
-        parameter
-        + opponent_parameter
-        + optimizer_and_grad
-        + reference
-        + backend_resident
-    )
-    target_variable = (
-        topology
-        + rollout_reach
-        + policy_cache
-        + rb_targets
-        + normal_targets
-        + completion_workspace
-    )
+    seal_phase = seal_fixed + seal_variable
     target_phase = target_fixed + target_variable
-    optimization_fixed = (
-        parameter
-        + opponent_parameter
-        + optimizer_and_grad
-        + gradient_sync
-        + reference
-        + backend_resident
-    )
-    optimization_variable = (
-        decision_reach
-        + policy_cache
-        + compact_rb_targets
-        + normal_targets
-        + alias
-    )
     optimization_phase = optimization_fixed + optimization_variable
-    seal_fixed = max(rollout_fixed, target_fixed)
-    seal_variable = max(rollout_variable, target_variable)
     return {
         "memory_plan_parameter_bytes": parameter,
         "memory_plan_opponent_parameter_bytes": opponent_parameter,
         "memory_plan_backend_resident_bytes": backend_resident,
-        "memory_plan_topology_bytes": topology,
-        "memory_plan_rollout_reach_bytes": rollout_reach,
-        "memory_plan_transient_reach_bytes": rollout_transient_reach,
-        "memory_plan_decision_reach_bytes": decision_reach,
-        "memory_plan_policy_cache_bytes": policy_cache,
-        "memory_plan_target_bytes": rb_targets + normal_targets,
-        "memory_plan_compact_target_bytes": compact_rb_targets + normal_targets,
-        "memory_plan_alias_bytes": alias,
+        "memory_plan_rollout_source_page_bytes": source_rows_bytes,
+        "memory_plan_sealed_rollout_bytes": sealed_rollout,
+        "memory_plan_seal_scratch_bytes": seal_scratch,
+        "memory_plan_target_destination_bytes": target_destination + action_target + posterior_pool,
+        "memory_plan_training_storage_bytes": training_storage,
         "memory_plan_completion_workspace_bytes": completion_workspace,
+        "memory_plan_frontier_workspace_bytes": frontier_workspace,
+        "memory_plan_learner_workspace_bytes": learner_workspace,
         "memory_plan_optimizer_and_grad_bytes": optimizer_and_grad,
         "memory_plan_gradient_sync_bytes": gradient_sync,
-        "memory_plan_snapshot_bytes": rollout_snapshot,
         "memory_plan_reference_bytes": reference,
         "memory_plan_rollout_phase_bytes": rollout_phase,
+        "memory_plan_seal_phase_bytes": seal_phase,
         "memory_plan_target_phase_bytes": target_phase,
         "memory_plan_optimization_phase_bytes": optimization_phase,
         "memory_plan_rollout_fixed_bytes": rollout_fixed,
@@ -736,7 +843,7 @@ def _analytical_memory_plan(
         "memory_plan_optimization_fixed_bytes": optimization_fixed,
         "memory_plan_optimization_variable_bytes": optimization_variable,
         "memory_plan_structural_peak_bytes": max(
-            rollout_phase, target_phase, optimization_phase
+            rollout_phase, seal_phase, target_phase, optimization_phase
         ),
     }
 
@@ -853,7 +960,7 @@ def _decision_street_metrics(
     profile_metrics: dict[str, float],
     backend: Any,
     tree: Any,
-    node_ids: Tensor,
+    policy: Any,
 ) -> None:
     """Record decision-node counts by poker street for one sampled rollout.
 
@@ -862,12 +969,21 @@ def _decision_street_metrics(
     to the host once per iteration rather than synchronizing every decision.
     """
 
-    states = getattr(backend, "states", None)
-    street = getattr(states, "street", None)
-    if street is None or node_ids.numel() == 0:
+    node_ids = policy.node_ids
+    if node_ids.numel() == 0:
         return
-    refs = tree.state_ref[node_ids.to(torch.int64)].to(torch.int64)
-    labels = street[refs].to(torch.int64).clamp(0, 3)
+    captured = getattr(policy, "decision_inputs", None)
+    if not isinstance(captured, SealedDecisionInputs):
+        raise RuntimeError("decision metrics require sealed immutable inputs")
+    labels = torch.empty(
+        node_ids.numel(), dtype=torch.int64, device=node_ids.device
+    )
+    for partition_id, block in captured.inputs.items():
+        selected = captured.partition_id == partition_id
+        labels[selected] = block["street"][
+            captured.partition_row[selected].to(torch.int64)
+        ].to(torch.int64)
+    labels = labels.clamp(0, 3)
     counts = torch.bincount(labels, minlength=4).detach().cpu().tolist()
     names = ("preflop", "flop", "turn", "river")
     total = max(sum(int(value) for value in counts), 1)
@@ -900,7 +1016,7 @@ def _trajectory_length_metrics(
 def _record_branched_controller_metrics(
     cfg: RootConfig,
     tree: Any,
-    policy_cache: Any,
+    rollout_decisions: Any,
     controller: Any | None,
     profile_metrics: dict[str, float],
     *,
@@ -909,14 +1025,14 @@ def _record_branched_controller_metrics(
 ) -> None:
     """Preserve dynamic-KKT observations before rollout owners are released."""
 
-    if policy_cache.old_t is None or policy_cache.old_c is None:
+    if rollout_decisions.old_t is None or rollout_decisions.old_c is None:
         raise RuntimeError("branched rollout did not retain frozen T/C heads")
     if cfg.rollout.branching_mode != "dynamic":
         return
     adaptive = cfg.rollout.adaptive_kkt
     if adaptive is None:
         raise RuntimeError("dynamic branching has no adaptive KKT configuration")
-    decision_ids = policy_cache.node_ids.to(torch.int64)
+    decision_ids = rollout_decisions.node_ids.to(torch.int64)
     offspring = tree.child_ptr[1:] - tree.child_ptr[:-1]
     executed = offspring[decision_ids].to(torch.float32)
     nominal = (
@@ -952,7 +1068,7 @@ def _record_branched_controller_metrics(
     pre_refill_nodes = tree.pre_refill_node_count
     if pre_refill_nodes is None:
         counterfactual = float(tree.owner.numel()) + float(
-            ((nominal - executed) * policy_cache.old_c).sum()
+            ((nominal - executed) * rollout_decisions.old_c).sum()
         )
     else:
         original = decision_ids < int(pre_refill_nodes)
@@ -969,7 +1085,7 @@ def _record_branched_controller_metrics(
         counterfactual = float(pre_refill_nodes) + float(
             (
                 (nominal[original] - original_executed)
-                * policy_cache.old_c[original]
+                * rollout_decisions.old_c[original]
             ).sum()
         )
     if dist.is_available() and dist.is_initialized():
@@ -986,13 +1102,13 @@ def _build_iteration_data(
     cfg: RootConfig,
     bundle: GameBundle,
     torch_gen: torch.Generator,
-    spec: LossSpec,
     *,
     profile: bool = False,
     frozen_model: nn.Module | None = None,
     iteration: int = 0,
     branching_controller: Any | None = None,
-) -> _RolloutSealInput:
+    branching_diagnostic_limits: Any | None = None,
+) -> IterationData:
     """Build compact training data in a frame that owns all frozen transients.
 
     Rollout and target construction are synchronous, so the live model is put
@@ -1042,6 +1158,7 @@ def _build_iteration_data(
             return sample_trees(
                 frozen_bundle, cfg, torch_gen, iteration=iteration,
                 branching_controller=branching_controller,
+                branching_diagnostic_limits=branching_diagnostic_limits,
             )
 
     with torch.no_grad():
@@ -1054,12 +1171,23 @@ def _build_iteration_data(
                 sample_normal_rollout,
             )
             sampled_tree, _, sampled_policy, _ = sampled
+            sampled_decisions = int(sampled_policy.node_ids.numel())
+            sampled_nodes = int(sampled_tree.owner.numel())
+            sampled_leaves = sampled_offspring_mean = sampled_offspring_max = None
             if profile:
+                sampled_leaves = int(
+                    (sampled_tree.child_ptr[1:] == sampled_tree.child_ptr[:-1]).sum()
+                )
+                sampled_offspring = (
+                    sampled_tree.child_ptr[1:] - sampled_tree.child_ptr[:-1]
+                )
+                sampled_offspring_mean = float(sampled_offspring.float().mean())
+                sampled_offspring_max = float(sampled_offspring.max())
                 _decision_street_metrics(
                     profile_metrics,
                     bundle.rollout_backend,
                     sampled_tree,
-                    sampled_policy.node_ids,
+                    sampled_policy,
                 )
                 _trajectory_length_metrics(
                     profile_metrics,
@@ -1079,6 +1207,10 @@ def _build_iteration_data(
                     gen=torch_gen,
                 ),
             )
+            rollout_leaf_count = int(rollout.leaves.rows)
+            del sampled, sampled_tree, sampled_policy
+            if profile:
+                del sampled_offspring
             storage = _profiled_call(
                 profile_metrics,
                 "backward",
@@ -1088,38 +1220,36 @@ def _build_iteration_data(
                     rollout, partitions, cfg.loss.lam
                 ),
             )
+            del rollout
             if execution_metrics is not None:
                 execution_metrics.record_target_bytes(_tensor_bytes(storage))
             decisions = sum(
                 partition.inputs.rows for partition in storage.partitions.values()
             )
-            if decisions != int(sampled_policy.node_ids.numel()):
+            if decisions != sampled_decisions:
                 raise ValueError("normal target table lost or duplicated decision rows")
             if profile:
-                tree, policy_cache = sampled_tree, sampled_policy
-                leaves = int((tree.child_ptr[1:] == tree.child_ptr[:-1]).sum())
-                offspring = tree.child_ptr[1:] - tree.child_ptr[:-1]
                 profile_metrics.update(
                     {
                         "trajectories": float(cfg.rollout.roots_per_gpu),
-                        "nodes": float(tree.owner.numel()),
-                        "leaves": float(leaves),
+                        "nodes": float(sampled_nodes),
+                        "leaves": float(sampled_leaves),
                         "decisions": float(decisions),
-                        "terminal_samples": float(leaves),
+                        "terminal_samples": float(sampled_leaves),
                         "retained_target_bytes": float(_tensor_bytes(storage)),
-                        "policy_decisions": float(policy_cache.node_ids.numel()),
-                        "offspring_mean": float(offspring.float().mean()),
-                        "offspring_max": float(offspring.max()),
+                        "policy_decisions": float(sampled_decisions),
+                        "offspring_mean": sampled_offspring_mean,
+                        "offspring_max": sampled_offspring_max,
                     }
                 )
-            return _RolloutSealInput(
+            return IterationData(
                 normal=True,
                 completion_quality={},
                 profile_metrics=profile_metrics,
                 storage=storage,
                 partition_specs=partitions,
                 decision_count=decisions,
-                leaf_count=int(rollout.leaves.rows),
+                leaf_count=rollout_leaf_count,
             )
 
         rb_sample = _profiled_call(
@@ -1129,16 +1259,23 @@ def _build_iteration_data(
             profile,
             sample_rb_rollout,
         )
-        if cfg.training.mode == "rao_blackwell" and not isinstance(
-            rb_sample, ProbeRollout
-        ):
-            tree, _, policy_cache = rb_sample
+        if cfg.training.mode == "rao_blackwell":
+            if isinstance(rb_sample, ProbeRollout):
+                tree = rb_sample.tree
+                rollout_decisions = rb_sample.policy
+            else:
+                tree, _, rollout_decisions = rb_sample
+            sampled_nodes = int(tree.owner.numel())
+            sampled_offspring_mean = sampled_offspring_max = None
             if profile:
+                sampled_offspring = tree.child_ptr[1:] - tree.child_ptr[:-1]
+                sampled_offspring_mean = float(sampled_offspring.float().mean())
+                sampled_offspring_max = float(sampled_offspring.max())
                 _decision_street_metrics(
                     profile_metrics,
                     bundle.rollout_backend,
                     tree,
-                    policy_cache.node_ids,
+                    rollout_decisions,
                 )
                 _trajectory_length_metrics(
                     profile_metrics, tree, int(cfg.rollout.roots_per_gpu)
@@ -1156,6 +1293,10 @@ def _build_iteration_data(
                     gen=torch_gen,
                 ),
             )
+            rollout_leaf_count = int(rollout.leaves.rows)
+            del rb_sample, tree, rollout_decisions
+            if profile:
+                del sampled_offspring
             if completion is None:
                 raise RuntimeError("sequential RB seal omitted completion")
             workspace_bytes = _value_workspace_budget(cfg, device)
@@ -1175,44 +1316,45 @@ def _build_iteration_data(
                     leaf_microbatch_rows=completion_rows,
                 ),
             )
+            del rollout, completion
             if execution_metrics is not None:
                 execution_metrics.record_target_bytes(_tensor_bytes(storage))
             completion_quality = _merge_completion_quality(quality_parts)
             decisions = sum(
                 partition.inputs.rows for partition in storage.partitions.values()
             )
-            offspring = tree.child_ptr[1:] - tree.child_ptr[:-1]
             profile_metrics.update(
                 {
                     "trajectories": float(cfg.rollout.roots_per_gpu),
-                    "nodes": float(tree.owner.numel()),
-                    "leaves": float(rollout.leaves.rows),
+                    "nodes": float(sampled_nodes),
+                    "leaves": float(rollout_leaf_count),
                     "decisions": float(decisions),
                     "completion_samples": float(
-                        rollout.leaves.rows * int(cfg.completion.n_samples)
+                        rollout_leaf_count * int(cfg.completion.n_samples)
                     ),
-                    "offspring_mean": float(offspring.float().mean()),
-                    "offspring_max": float(offspring.max()),
+                    "offspring_mean": sampled_offspring_mean,
+                    "offspring_max": sampled_offspring_max,
                     "retained_target_bytes": float(_tensor_bytes(storage)),
                 }
             )
-            return _RolloutSealInput(
+            return IterationData(
                 normal=False,
                 completion_quality=completion_quality,
                 profile_metrics=profile_metrics,
                 storage=storage,
                 partition_specs=partitions,
                 decision_count=decisions,
-                leaf_count=rollout.leaves.rows,
+                leaf_count=rollout_leaf_count,
             )
         if cfg.training.mode == "branched_rao_blackwell":
             if isinstance(rb_sample, ProbeRollout):
                 raise RuntimeError("branched rollout cannot be an opponent probe")
-            tree, _, policy_cache = rb_sample
+            tree, _, rollout_decisions = rb_sample
+            sampled_nodes = int(tree.owner.numel())
             _record_branched_controller_metrics(
                 cfg,
                 tree,
-                policy_cache,
+                rollout_decisions,
                 branching_controller,
                 profile_metrics,
                 iteration=iteration,
@@ -1223,7 +1365,7 @@ def _build_iteration_data(
                     profile_metrics,
                     bundle.rollout_backend,
                     tree,
-                    policy_cache.node_ids,
+                    rollout_decisions,
                 )
             rollout, partitions, completion, quality_parts = _profiled_call(
                 profile_metrics,
@@ -1238,6 +1380,8 @@ def _build_iteration_data(
                     gen=torch_gen,
                 ),
             )
+            rollout_leaf_count = int(rollout.leaves.rows)
+            del rb_sample, tree, rollout_decisions
             workspace_bytes = _value_workspace_budget(cfg, device)
             completion_rows = _completion_batch_rows(
                 bundle, rollout.leaves.rows, workspace_bytes
@@ -1255,6 +1399,7 @@ def _build_iteration_data(
                     leaf_microbatch_rows=completion_rows,
                 ),
             )
+            del rollout, completion
             if execution_metrics is not None:
                 execution_metrics.record_target_bytes(_tensor_bytes(storage))
             decisions = sum(
@@ -1263,332 +1408,25 @@ def _build_iteration_data(
             profile_metrics.update(
                 {
                     "trajectories": 1.0,
-                    "nodes": float(tree.owner.numel()),
-                    "leaves": float(rollout.leaves.rows),
+                    "nodes": float(sampled_nodes),
+                    "leaves": float(rollout_leaf_count),
                     "decisions": float(decisions),
                     "completion_samples": float(
-                        rollout.leaves.rows * int(cfg.completion.n_samples)
+                        rollout_leaf_count * int(cfg.completion.n_samples)
                     ),
                     "retained_target_bytes": float(_tensor_bytes(storage)),
                 }
             )
-            return _RolloutSealInput(
+            return IterationData(
                 normal=False,
                 completion_quality=_merge_completion_quality(quality_parts),
                 profile_metrics=profile_metrics,
                 storage=storage,
                 partition_specs=partitions,
                 decision_count=decisions,
-                leaf_count=rollout.leaves.rows,
+                leaf_count=rollout_leaf_count,
             )
-        probe_rollout = rb_sample if isinstance(rb_sample, ProbeRollout) else None
-        if probe_rollout is None:
-            tree, reach_cache, policy_cache = rb_sample
-            probe_seats = None
-            prebuilt_decision_reach = None
-        else:
-            tree = probe_rollout.tree
-            reach_cache = probe_rollout.leaf_reach
-            policy_cache = probe_rollout.policy
-            probe_seats = probe_rollout.seats
-            prebuilt_decision_reach = probe_rollout.decision_reach
-        decision_weight = tree.path_weight[
-            policy_cache.node_ids.to(tree.path_weight.device, dtype=torch.int64)
-        ].detach().to(torch.float64)
-        # The rollout view has no consumer in completion or target reduction.
-        del frozen_bundle
-        leaf_ids = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero(
-            as_tuple=False
-        ).squeeze(1)
-        if bundle.completion_backend is None or cfg.completion.n_samples is None:
-            raise RuntimeError("RB modes require a completion backend and sample budget")
-        heads = HeadEvals(
-            node_ids=policy_cache.node_ids,
-            v=policy_cache.old_v,
-            t=policy_cache.old_t,
-            c=policy_cache.old_c,
-        )
-        workspace_bytes = _value_workspace_budget(cfg, device)
-        completion_rows = _completion_batch_rows(
-            bundle, int(leaf_ids.numel()), workspace_bytes
-        )
-        keyed_completion = getattr(bundle.completion_backend, "complete_keyed", None)
-        selected_keyed_completion = getattr(
-            bundle.completion_backend, "complete_selected_keyed", None
-        )
-        completion_keys = None
-        if callable(keyed_completion) and cfg.training.mode == "rao_blackwell":
-            completion_keys = sequential_leaf_logical_rng_keys(
-                tree,
-                cfg,
-                torch_gen,
-                leaf_ids,
-                iteration=iteration,
-                purpose=DrawPurpose.COMPLETION,
-            )
-        quality_parts: list[tuple[int, dict[str, float]]] = []
-
-        def completion_batches():
-            for first in range(0, int(leaf_ids.numel()), completion_rows):
-                selected = leaf_ids[first : first + completion_rows].to(torch.int32)
-                leaf_reach = reach_cache.rows_for(
-                    tree,
-                    selected,
-                    bundle.rollout_backend,
-                    policy_cache,
-                )
-
-                def complete_selected():
-                    if completion_keys is not None:
-                        if probe_seats is not None:
-                            if not callable(selected_keyed_completion):
-                                raise TypeError(
-                                    "probe completion backend lacks complete_selected_keyed"
-                                )
-                            selected_trees = tree.tree_id[
-                                selected.to(tree.tree_id.device, dtype=torch.int64)
-                            ].to(torch.int64)
-                            return selected_keyed_completion(
-                                bundle.rollout_backend,
-                                tree,
-                                selected,
-                                leaf_reach,
-                                cfg.completion.n_samples,
-                                completion_keys[first : first + selected.numel()],
-                                probe_seats[selected_trees],
-                            )
-                        return keyed_completion(
-                            bundle.rollout_backend,
-                            tree,
-                            selected,
-                            leaf_reach,
-                            cfg.completion.n_samples,
-                            completion_keys[first : first + selected.numel()],
-                        )
-                    return bundle.completion_backend.complete(
-                        bundle.rollout_backend,
-                        tree,
-                        selected,
-                        leaf_reach,
-                        cfg.completion.n_samples,
-                        torch_gen,
-                    )
-
-                batch_profile: dict[str, float] = {}
-                completion_result = _profiled_call(
-                    batch_profile,
-                    "completion",
-                    device,
-                    profile,
-                    complete_selected,
-                )
-                if execution_metrics is not None:
-                    execution_metrics.record_completion(rows=int(selected.numel()))
-                for key, value in batch_profile.items():
-                    if key.endswith("_seconds"):
-                        profile_metrics[key] = profile_metrics.get(key, 0.0) + value
-                    else:
-                        profile_metrics[key] = max(
-                            profile_metrics.get(key, 0.0), value
-                        )
-                completion = _scale_completion_utility(
-                    completion_result.for_learning(), cfg
-                )
-                quality_parts.append(
-                    (
-                        int(selected.numel()),
-                        {
-                            key: float(value)
-                            for key, value in completion.metadata.items()
-                            if key.startswith("completion_")
-                            and isinstance(value, (int, float))
-                        },
-                    )
-                )
-                yield selected, completion
-                del completion, completion_result, leaf_reach
-
-        targets = _profiled_call(
-            profile_metrics,
-            "backward",
-            device,
-            profile,
-            lambda: streamed_branched_value(
-                tree,
-                leaf_ids.to(torch.int32),
-                completion_batches(),
-                reach_cache,
-                heads,
-                cfg.loss.lam,
-                bundle.rollout_backend,
-                configured_node_budget=cfg.rollout.node_budget,
-                completion_batch_rows=completion_rows,
-                max_workspace_bytes=workspace_bytes,
-                decision_players_by_tree=probe_seats,
-            ),
-        )
-        if execution_metrics is not None:
-            execution_metrics.record_target_bytes(_tensor_bytes(targets))
-        completion_quality = _merge_completion_quality(quality_parts)
-        if not torch.equal(policy_cache.node_ids, targets.node_ids):
-            raise ValueError("PolicyCache and NodeTargets node_ids must match exactly")
-        unavailable = {
-            name for name in spec.required_targets
-            if not hasattr(targets, name) or getattr(targets, name) is None
-        }
-        if unavailable:
-            raise ValueError(
-                f"loss {cfg.loss.name!r} requires unavailable targets {sorted(unavailable)}"
-            )
-        decision_reach = _profiled_call(
-            profile_metrics,
-            "compaction",
-            device,
-            profile,
-            lambda: (
-                prebuilt_decision_reach
-                if prebuilt_decision_reach is not None
-                else policy_cache.decision_reach
-            ),
-        )
-        if decision_reach is None:
-            raise RuntimeError("rollout did not retain natural decision inputs")
-        decisions = int(policy_cache.node_ids.numel())
-        offspring = tree.child_ptr[1:] - tree.child_ptr[:-1]
-        profile_metrics.update(
-            {
-                (
-                    "sampled_trees"
-                    if cfg.training.mode == "branched_rao_blackwell"
-                    else "trajectories"
-                ): float(cfg.rollout.roots_per_gpu),
-                "nodes": float(tree.owner.numel()),
-                "leaves": float(leaf_ids.numel()),
-                "decisions": float(decisions),
-                "completion_samples": float(
-                    leaf_ids.numel() * int(cfg.completion.n_samples)
-                ),
-                "offspring_mean": float(offspring.float().mean()),
-                "offspring_max": float(offspring.max()),
-            }
-        )
-        branched = cfg.training.mode == "branched_rao_blackwell"
-        if branched and (policy_cache.old_t is None or policy_cache.old_c is None):
-            raise RuntimeError("branched rollout did not retain frozen T/C heads")
-        dynamic = cfg.rollout.branching_mode == "dynamic"
-        adaptive = cfg.rollout.adaptive_kkt
-        if dynamic:
-            if adaptive is None:
-                raise RuntimeError("dynamic branching has no adaptive KKT configuration")
-            decision_ids = policy_cache.node_ids.to(torch.int64)
-            executed = offspring[decision_ids].to(torch.float32)
-            nominal = (
-                executed
-                if tree.nominal_child_count is None
-                else tree.nominal_child_count[decision_ids].to(torch.float32)
-            )
-            beta_values = (
-                nominal
-                if tree.branching_beta is None
-                else tree.branching_beta[decision_ids]
-            )
-            profile_metrics.update(
-                {
-                    "beta_mean": float(beta_values.mean()),
-                    "beta_max": float(beta_values.max()),
-                    "realized_child_count_mean": float(executed.mean()),
-                    "realized_child_count_max": float(executed.max()),
-                    "beta_min_clip_rate": float((beta_values <= 1.0).float().mean()),
-                    "beta_max_clip_rate": float(
-                        (beta_values >= float(adaptive.beta_max)).float().mean()
-                    ),
-                    "tree_size_vs_M": float(tree.owner.numel()) / float(adaptive.target_tree_size),
-                }
-            )
-            profile_metrics.update(
-                {
-                    key: float(value)
-                    for key, value in getattr(tree, "branching_diagnostics", {}).items()
-                }
-            )
-            if iteration >= int(adaptive.warmup_iters):
-                pre_refill_nodes = tree.pre_refill_node_count
-                if pre_refill_nodes is None:
-                    counterfactual = float(tree.owner.numel()) + float(
-                        ((nominal - executed) * policy_cache.old_c).sum()
-                    )
-                else:
-                    original = decision_ids < int(pre_refill_nodes)
-                    original_executed = executed[original].clone()
-                    original_ids = decision_ids[original]
-                    root = original_ids == 0
-                    if bool(root.any()):
-                        protected = tree.root_pre_refill_child_count
-                        if protected is None:
-                            raise RuntimeError(
-                                "pre-refill node metadata omitted the protected root degree"
-                            )
-                        original_executed[root] = float(protected)
-                    counterfactual = float(pre_refill_nodes) + float(
-                        (
-                            (nominal[original] - original_executed)
-                            * policy_cache.old_c[original]
-                        ).sum()
-                    )
-                if dist.is_available() and dist.is_initialized():
-                    shared_counterfactual = torch.tensor(
-                        counterfactual, dtype=torch.float64, device=device
-                    )
-                    dist.all_reduce(shared_counterfactual, op=dist.ReduceOp.SUM)
-                    counterfactual = float(shared_counterfactual) / dist.get_world_size()
-                profile_metrics["counterfactual_tree_size"] = counterfactual
-                if branching_controller is None:
-                    raise RuntimeError("adaptive rollout has no KKT controller")
-                profile_metrics.update(branching_controller.observe(counterfactual))
-        _decision_street_metrics(
-            profile_metrics,
-            bundle.rollout_backend,
-            tree,
-            policy_cache.node_ids,
-        )
-        _trajectory_length_metrics(
-            profile_metrics, tree, int(cfg.rollout.roots_per_gpu)
-        )
-        if profile:
-            completion_effective = (
-                completion_quality.get("completion_mean_n_eff", 0.0)
-                * float(leaf_ids.numel())
-            )
-            retained = _tensor_bytes((targets, policy_cache, decision_reach, decision_weight))
-            profile_metrics.update(
-                {
-                    "completion_effective_samples": completion_effective,
-                    "retained_target_bytes": float(retained),
-                }
-            )
-        if branched:
-            profile_metrics["missing_T_target_rate"] = float(
-                (~targets.t_mask).float().mean()
-            )
-        return _RolloutSealInput(
-            normal=False,
-            completion_quality=completion_quality,
-            targets=targets,
-            policy_cache=policy_cache,
-            decision_reach=decision_reach,
-            decision_weight=decision_weight,
-            trajectory_id=tree.tree_id[
-                policy_cache.node_ids.to(tree.tree_id.device, dtype=torch.int64)
-            ].detach().to(torch.int32),
-            owner=(
-                decision_reach.owners.detach().to(torch.int32)
-                if decision_reach.owners is not None
-                else tree.owner[
-                    policy_cache.node_ids.to(tree.owner.device, dtype=torch.int64)
-                ].detach().to(torch.int32)
-            ),
-            profile_metrics=profile_metrics,
-        )
+        raise RuntimeError(f"unsupported training mode {cfg.training.mode!r}")
 
 
 def _natural_partition_set(cfg: RootConfig, bundle: GameBundle):
@@ -1649,72 +1487,46 @@ def _seal_sequential_rollout_storage(
     iteration: int,
     gen: torch.Generator,
 ) -> tuple[RolloutStorage, Any, CompletionSpec | None, list[tuple[int, dict[str, float]]]]:
-    """Seal one legacy-scheduled sequential sample before target construction.
+    """Seal one family-scheduled sequential sample before target construction.
 
-    The family scheduler remains the phase-3 execution engine, but none of its
-    tree, reach-cache, policy-cache, or mutable poker-state owners cross this
-    boundary. The returned topology is decision-only and every model/completion
-    input is immutable.
+    None of the scheduler topology, stopped-reach capture, policy capture, or
+    mutable poker-state owners cross this boundary. The returned topology is
+    decision-only and every model/completion input is immutable.
     """
 
     probe = sampled if isinstance(sampled, ProbeRollout) else None
     if probe is None:
-        tree, reach_cache, policy_cache, *tail = sampled
+        tree, reach_cache, rollout_decisions, *tail = sampled
         root_profiles = tail[0] if tail else None
     else:
         tree = probe.tree
         reach_cache = probe.leaf_reach
-        policy_cache = probe.policy
+        rollout_decisions = probe.policy
         root_profiles = probe.root_profiles
     backend = bundle.rollout_backend
     device = backend.device
     partitions = _natural_partition_set(cfg, bundle)
-    nodes = policy_cache.node_ids.to(torch.int64)
-    decision_reach = policy_cache.decision_reach
-    captured = (
-        decision_reach if isinstance(decision_reach, SealedDecisionInputs) else None
-    )
-    if captured is None:
-        if decision_reach is None or not isinstance(decision_reach.payload, Tensor):
-            raise RuntimeError("sequential sealing requires immutable decision inputs")
-        state_refs = decision_reach.state_refs.to(torch.int32)
-        log_reach = decision_reach.payload.detach().to(torch.float32)
-        if log_reach.shape != (
-            nodes.numel(),
-            backend.n_players,
-            backend.n_hands,
-        ):
-            raise ValueError("sequential decision reach has the wrong exact domain")
-    else:
-        if not torch.equal(captured.node_ids.to(torch.int64), nodes):
-            raise RuntimeError("captured decision inputs and policy rows are misaligned")
-        state_refs = None
-        log_reach = None
+    nodes = rollout_decisions.node_ids.to(torch.int64)
+    captured = rollout_decisions.decision_inputs
+    if not isinstance(captured, SealedDecisionInputs):
+        raise RuntimeError("sequential sealing requires immutable decision inputs")
+    if not torch.equal(captured.node_ids.to(torch.int64), nodes):
+        raise RuntimeError("captured decision inputs and policy rows are misaligned")
     owner = tree.owner[nodes].to(torch.int32)
-    if captured is None:
-        assert state_refs is not None and log_reach is not None
-        family = backend.rollout_family_ids(state_refs).to(torch.int64)
-        partition_id = torch.where(family == 0, family, family - 1)
-        legal_ids, legal_mask = backend.legal_events(state_refs)
-        public_inputs = backend.serialize_decision_inputs(state_refs)
-        finite = torch.isfinite(log_reach)
-        gauge = log_reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
-        weights = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
-    else:
-        partition_id = captured.partition_id.to(torch.int64)
-        legal_ids = torch.arange(
-            backend.e_max, dtype=torch.int32, device=device
-        )[None].expand(nodes.numel(), -1)
-        legal_mask = torch.empty(
-            (nodes.numel(), backend.e_max), dtype=torch.bool, device=device
-        )
-        for pid, input_block in captured.inputs.items():
-            positions = (captured.partition_id == pid).nonzero(
-                as_tuple=False
-            ).squeeze(1)
-            legal_mask[positions] = input_block.columns["legal_action_mask"][
-                captured.partition_row[positions].to(torch.int64)
-            ]
+    partition_id = captured.partition_id.to(torch.int64)
+    legal_ids = torch.arange(
+        backend.e_max, dtype=torch.int32, device=device
+    )[None].expand(nodes.numel(), -1)
+    legal_mask = torch.empty(
+        (nodes.numel(), backend.e_max), dtype=torch.bool, device=device
+    )
+    for pid, input_block in captured.inputs.items():
+        positions = (captured.partition_id == pid).nonzero(
+            as_tuple=False
+        ).squeeze(1)
+        legal_mask[positions] = input_block.columns["legal_action_mask"][
+            captured.partition_row[positions].to(torch.int64)
+        ]
 
     edge = tree.child_ptr[nodes].to(torch.int64)
     event = tree.child_event[edge].to(torch.int32)
@@ -1729,10 +1541,10 @@ def _seal_sequential_rollout_storage(
             "owner": owner,
             "event": event,
             "realized_type": realized_type,
-            "old_log_prob": policy_cache.old_logp_child[:, 0][
+            "old_log_prob": rollout_decisions.old_logp_action[
                 batch, realized_type.to(torch.int64)
             ].detach().to(torch.float32),
-            "old_value": policy_cache.old_v[
+            "old_value": rollout_decisions.old_v[
                 batch, realized_type.to(torch.int64)
             ].detach().to(torch.float32),
             "legal_event_ids": legal_ids.to(torch.int32),
@@ -1742,8 +1554,8 @@ def _seal_sequential_rollout_storage(
         global_decisions = {
             "owner": owner,
             "event": event,
-            "old_log_prob": policy_cache.old_logp_child[:, 0].detach().to(torch.float32),
-            "old_value": policy_cache.old_v.detach().to(torch.float32),
+            "old_log_prob": rollout_decisions.old_logp_action.detach().to(torch.float32),
+            "old_value": rollout_decisions.old_v.detach().to(torch.float32),
             "legal_event_ids": legal_ids.to(torch.int32),
             "legal_event_mask": legal_mask.to(torch.bool),
         }
@@ -1758,85 +1570,14 @@ def _seal_sequential_rollout_storage(
         ).squeeze(1)
         if selected.numel() == 0:
             continue
-        if captured is not None:
-            inputs = captured.inputs[partition.partition_id]
-            input_pools = dict(captured.input_pools.get(partition.partition_id, {}))
-            captured_rows = captured.partition_row[selected].to(torch.int64)
-            if not torch.equal(
-                captured_rows,
-                torch.arange(selected.numel(), dtype=torch.int64, device=device),
-            ):
-                raise RuntimeError("captured partition rows are not exact and contiguous")
-        elif partition.partition_id == 0:
-            assert state_refs is not None and log_reach is not None
-            states = state_refs[selected]
-            natural_ranges = torch.zeros(
-                (selected.numel(), backend.n_players, backend.n_classes),
-                dtype=torch.float32,
-                device=device,
-            )
-            class_ids = backend.combo_class[None, None, :].expand_as(weights[selected])
-            natural_ranges.scatter_add_(2, class_ids, weights[selected])
-        else:
-            assert state_refs is not None and log_reach is not None
-            states = state_refs[selected]
-            live = partition.partition_id + 1
-            status = public_inputs["status"][selected]
-            live_seats = torch.where(
-                status != 1,
-                torch.arange(backend.n_players, device=device)[None],
-                backend.n_players,
-            ).sort(1).values[:, :live]
-            natural_ranges = weights[selected][
-                torch.arange(selected.numel(), device=device)[:, None], live_seats
-            ].contiguous()
-        if captured is None:
-            input_columns = {
-                name: public_inputs[name][selected].detach()
-                for name in partition.input_schema.by_name
-                if name not in {"range_weights", "folded_summary_ref"}
-            }
-            input_columns["range_weights"] = natural_ranges.detach()
-            input_pools = {}
-        if captured is None and "folded_summary_ref" in partition.input_schema.by_name:
-            live = partition.partition_id + 1
-            status = public_inputs["status"][selected].to(torch.int8)
-            anchors = backend.states.partition_cache_key[states.to(torch.int64)]
-            if bool((anchors < 0).any()):
-                raise RuntimeError("folded decision omitted its dependency anchor")
-            unique_anchors, inverse = torch.unique(
-                anchors.to(torch.int64), sorted=True, return_inverse=True
-            )
-            first = torch.full(
-                (unique_anchors.numel(),),
-                selected.numel(),
-                dtype=torch.int64,
-                device=device,
-            )
-            first.scatter_reduce_(
-                0,
-                inverse,
-                torch.arange(selected.numel(), device=device),
-                reduce="amin",
-                include_self=True,
-            )
-            summary = backend._partition_summary_uncached(
-                states[first],
-                public_inputs["board"][selected][first],
-                weights[selected][first],
-                status[first],
-                live,
-                compute_mask=torch.ones(
-                    unique_anchors.shape, dtype=torch.bool, device=device
-                ),
-            )
-            input_columns["folded_summary_ref"] = inverse.to(torch.int32)
-            input_pools["folded_summary"] = _sealed_dynamic_block(
-                f"poker_partition_{partition.partition_id}_folded_summary",
-                summary.fields,
-            )
-        if captured is None:
-            inputs = _sealed_input_block(partition, input_columns)
+        inputs = captured.inputs[partition.partition_id]
+        input_pools = dict(captured.input_pools.get(partition.partition_id, {}))
+        captured_rows = captured.partition_row[selected].to(torch.int64)
+        if not torch.equal(
+            captured_rows,
+            torch.arange(selected.numel(), dtype=torch.int64, device=device),
+        ):
+            raise RuntimeError("captured partition rows are not exact and contiguous")
         decision_columns = {
             name: value[selected].detach() for name, value in global_decisions.items()
         }
@@ -1851,11 +1592,7 @@ def _seal_sequential_rollout_storage(
             f"poker_partition_{partition.partition_id}_decision",
             decision_columns,
         )
-        global_to_partition_row[selected] = (
-            captured.partition_row[selected]
-            if captured is not None
-            else torch.arange(selected.numel(), dtype=torch.int32, device=device)
-        )
+        global_to_partition_row[selected] = captured.partition_row[selected]
         blocks[partition.partition_id] = PartitionRolloutBlock(
             partition.partition_id,
             inputs,
@@ -1878,34 +1615,27 @@ def _seal_sequential_rollout_storage(
     quality_parts: list[tuple[int, dict[str, float]]] = []
     if cfg.training.mode == "normal":
         assert root_profiles is not None
-        completion_keys = sequential_leaf_logical_rng_keys(
-            tree,
-            cfg,
-            gen,
-            leaf_ids,
-            iteration=iteration,
-            purpose=DrawPurpose.COMPLETION,
-            draw=1,
-        )
-        keyed_reward = getattr(backend, "sampled_terminal_reward_keyed", None)
-        profiles = root_profiles[leaf_roots.to(torch.int64)]
-        reward = (
-            keyed_reward(tree.state_ref[leaf_ids], profiles, completion_keys)
-            if callable(keyed_reward)
-            else backend.sampled_terminal_reward(
-                tree.state_ref[leaf_ids], profiles, gen
-            )
-        ).float() * utility_scale(cfg)
+        reward = reach_cache.payload_for(leaf_ids.to(torch.int32))["reward"]
+        reward = reward.float() * utility_scale(cfg)
         leaves = _sealed_dynamic_block("normal_leaf", {"reward": reward})
         mode = "normal"
     else:
         if bundle.completion_backend is None or cfg.completion.n_samples is None:
             raise RuntimeError("sequential RB requires a completion service")
         leaf_reach = reach_cache.rows_for(
-            tree, leaf_ids.to(torch.int32), backend, policy_cache
+            tree, leaf_ids.to(torch.int32), backend, rollout_decisions
         ).detach().to(torch.float32)
-        state = tree.state_ref[leaf_ids].to(torch.int32)
-        completion_inputs = backend.completion_inputs(state, leaf_reach)
+        captured_leaf = reach_cache.payload_for(leaf_ids.to(torch.int32))
+        completion_inputs = {
+            name: value
+            for name, value in captured_leaf.items()
+            if name not in {"owner", "fold_payoff", "reward"}
+        }
+        completion_inputs["range_weights"] = backend.range_weights_from_log_reach(
+            leaf_reach
+        )
+        leaf_owner = captured_leaf["owner"]
+        fold_payoff = captured_leaf["fold_payoff"]
         completion_key = sequential_leaf_logical_rng_keys(
             tree,
             cfg,
@@ -1915,12 +1645,9 @@ def _seal_sequential_rollout_storage(
             purpose=DrawPurpose.COMPLETION,
         )
         leaf_columns = {
-            "owner": tree.owner[leaf_ids].to(torch.int32),
-            "log_reach": leaf_reach,
+            "owner": leaf_owner,
             "completion_key": completion_key.to(torch.int64),
-            "fold_payoff": backend.states.fold_payoff[state.to(torch.int64)]
-            .detach()
-            .to(torch.float32),
+            "fold_payoff": fold_payoff.detach().to(torch.float32),
             **{name: value.detach() for name, value in completion_inputs.items()},
         }
         leaves = _sealed_dynamic_block("sequential_rb_leaf", leaf_columns)
@@ -1954,7 +1681,7 @@ def _seal_sequential_rollout_storage(
 
         completion = CompletionSpec(
             tuple(leaf_columns),
-            ("log_reach",),
+            ("range_weights",),
             ("p_hat", "v_hat"),
             complete_leaf_rows,
             lambda count: int(count) * backend.n_players * backend.n_hands * 12,
@@ -1972,9 +1699,6 @@ def _seal_sequential_rollout_storage(
         root_count=root_count,
     )
     rollout = RolloutStorage(mode, blocks, topology, leaves)
-    release = getattr(backend, "release_rollout_owners", None)
-    if callable(release):
-        release()
     return rollout, partitions, completion, quality_parts
 
 
@@ -1988,12 +1712,12 @@ def _seal_branched_rollout_storage(
 ) -> tuple[RolloutStorage, Any, CompletionSpec, list[tuple[int, dict[str, float]]]]:
     """Seal one rooted branched sample into ragged immutable storage."""
 
-    tree, reach_cache, policy_cache = sampled
+    tree, reach_cache, rollout_decisions = sampled
     backend = bundle.rollout_backend
     device = backend.device
     partitions = _natural_partition_set(cfg, bundle)
-    nodes = policy_cache.node_ids.to(torch.int64)
-    captured = policy_cache.decision_reach
+    nodes = rollout_decisions.node_ids.to(torch.int64)
+    captured = rollout_decisions.decision_inputs
     if not isinstance(captured, SealedDecisionInputs):
         raise RuntimeError("branched production requires captured immutable inputs")
     if not torch.equal(captured.node_ids.to(torch.int64), nodes):
@@ -2090,25 +1814,28 @@ def _seal_branched_rollout_storage(
         nominal_decision = nominal[nodes].detach().to(torch.int32)
     global_decisions: dict[str, Tensor] = {
         "owner": tree.owner[nodes].detach().to(torch.int32),
-        "old_value": policy_cache.old_v.detach().to(torch.float32),
+        "old_value": rollout_decisions.old_v.detach().to(torch.float32),
         "legal_event_ids": legal_ids,
         "legal_event_mask": legal_mask,
         "log_weight": torch.log(tree.path_weight[nodes].detach().to(torch.float64)),
         "nominal_child_count": nominal_decision,
         "executed_child_count": target_degree.to(torch.int32),
     }
-    if policy_cache.old_t is not None or policy_cache.old_c is not None:
-        if policy_cache.old_t is None or policy_cache.old_c is None:
+    if rollout_decisions.old_t is not None or rollout_decisions.old_c is not None:
+        if rollout_decisions.old_t is None or rollout_decisions.old_c is None:
             raise RuntimeError("branched frozen T/C heads are incomplete")
-        global_decisions["frozen_trace_variance"] = policy_cache.old_t.detach()
-        global_decisions["frozen_cost"] = policy_cache.old_c.detach()
+        global_decisions["frozen_trace_variance"] = rollout_decisions.old_t.detach()
+        global_decisions["frozen_cost"] = rollout_decisions.old_c.detach()
 
-    edge_width = policy_cache.old_logp_child.shape[1]
-    edge_slot = torch.arange(edge_width, device=device)[None]
-    selected_edge = tree.child_ptr[nodes, None].to(torch.int64) + edge_slot
-    valid_edge = edge_slot < target_degree[:, None]
-    safe_edge = selected_edge.clamp_max(max(tree.child_event.numel() - 1, 0))
-    event_rows = tree.child_event[safe_edge].to(torch.int32)
+    if not torch.equal(
+        rollout_decisions.action_ptr[1:] - rollout_decisions.action_ptr[:-1],
+        target_degree.to(torch.int32),
+    ):
+        raise RuntimeError("ragged rollout actions disagree with target topology")
+    action_decision = torch.repeat_interleave(
+        torch.arange(nodes.numel(), dtype=torch.int64, device=device),
+        target_degree,
+    )
 
     blocks: dict[int, PartitionRolloutBlock] = {}
     for partition in partitions.specs:
@@ -2135,9 +1862,9 @@ def _seal_branched_rollout_storage(
             f"poker_partition_{partition.partition_id}_branched_decision",
             decisions_columns,
         )
-        partition_valid = valid_edge[selected]
-        action_events = event_rows[selected][partition_valid]
-        action_old_logp = policy_cache.old_logp_child[selected][partition_valid]
+        partition_actions = captured.partition_id[action_decision] == partition.partition_id
+        action_events = rollout_decisions.action_event[partition_actions]
+        action_old_logp = rollout_decisions.old_logp_action[partition_actions]
         if partition.partition_id == 0:
             action_old_logp = _compress_preflop_rows(action_old_logp, backend)
         actions = _sealed_dynamic_block(
@@ -2163,10 +1890,19 @@ def _seal_branched_rollout_storage(
         )
 
     leaf_reach = reach_cache.rows_for(
-        tree, leaf_old.to(torch.int32), backend, policy_cache
+        tree, leaf_old.to(torch.int32), backend, rollout_decisions
     ).detach().to(torch.float32)
-    leaf_states = tree.state_ref[leaf_old].to(torch.int32)
-    completion_inputs = backend.completion_inputs(leaf_states, leaf_reach)
+    captured_leaf = reach_cache.payload_for(leaf_old.to(torch.int32))
+    completion_inputs = {
+        name: value
+        for name, value in captured_leaf.items()
+        if name not in {"owner", "fold_payoff"}
+    }
+    completion_inputs["range_weights"] = backend.range_weights_from_log_reach(
+        leaf_reach
+    )
+    leaf_owner = captured_leaf["owner"]
+    fold_payoff = captured_leaf["fold_payoff"]
     logical_path = getattr(tree, "logical_path", None)
     if not isinstance(logical_path, Tensor):
         raise RuntimeError("branched rollout omitted logical path addresses")
@@ -2182,12 +1918,9 @@ def _seal_branched_rollout_storage(
         purpose=DrawPurpose.COMPLETION,
     )
     leaf_columns = {
-        "owner": tree.owner[leaf_old].to(torch.int32),
-        "log_reach": leaf_reach,
+        "owner": leaf_owner,
         "completion_key": completion_key.to(torch.int64),
-        "fold_payoff": backend.states.fold_payoff[leaf_states.to(torch.int64)]
-        .detach()
-        .to(torch.float32),
+        "fold_payoff": fold_payoff.detach().to(torch.float32),
         **{name: value.detach() for name, value in completion_inputs.items()},
     }
     leaves = _sealed_dynamic_block("branched_rb_leaf", leaf_columns)
@@ -2224,16 +1957,13 @@ def _seal_branched_rollout_storage(
 
     completion = CompletionSpec(
         tuple(leaf_columns),
-        ("log_reach",),
+        ("range_weights",),
         ("p_hat", "v_hat"),
         complete_leaf_rows,
         lambda count: int(count) * backend.n_players * backend.n_hands * 12,
         key_fields=("completion_key",),
     )
     rollout = RolloutStorage("branched_rb", blocks, topology, leaves)
-    release = getattr(backend, "release_rollout_owners", None)
-    if callable(release):
-        release()
     return rollout, partitions, completion, quality_parts
 
 
@@ -2257,392 +1987,15 @@ def _compress_preflop_rows(value: Tensor, backend: Any) -> Tensor:
     return result
 
 
-def _seal_iteration_training_storage(
+
+
+def _validate_policy_identity(
     cfg: RootConfig,
     bundle: GameBundle,
-    data: _RolloutSealInput,
-) -> tuple[TrainingStorage, Any]:
-    """Seal the completed rollout/targets into the sole learner-owned store.
-
-    This is the one-way migration boundary for the established rollout
-    scheduler. The returned storage contains no tree, reach cache, topology,
-    completion object, or padded action axis.
-    """
-
-    if data.storage is not None:
-        if data.partition_specs is None:
-            raise RuntimeError("direct rollout omitted its partition boundary")
-        return data.storage, data.partition_specs
-
-    backend = bundle.rollout_backend
-    partitions = _natural_partition_set(cfg, bundle)
-    if data.normal:
-        source = data.dataset
-        state_refs = source.state_refs
-        reach_cache = source.reach
-        owner = source.actor_type.to(torch.int32)
-    else:
-        source = None
-        if data.decision_reach is None or data.owner is None:
-            raise RuntimeError("RB rollout omitted compact decision ownership")
-        state_refs = data.decision_reach.state_refs
-        reach_cache = data.decision_reach
-        owner = data.owner
-    if not isinstance(reach_cache.payload, Tensor):
-        raise RuntimeError("production sealing requires tensor-owned decision inputs")
-    log_reach = reach_cache.payload.detach().to(torch.float32)
-    if log_reach.shape != (state_refs.numel(), backend.n_players, backend.n_hands):
-        raise ValueError("decision input owner has an unexpected poker domain")
-    finite = torch.isfinite(log_reach)
-    gauge = log_reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
-    weights = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
-    family = backend.rollout_family_ids(state_refs.to(backend.device)).to(state_refs.device)
-    partition_id = torch.where(family == 0, family, family - 1).to(torch.int64)
-    legal_ids, legal_mask = backend.legal_events(state_refs.to(backend.device))
-    legal_ids = legal_ids.to(state_refs.device, dtype=torch.int32)
-    legal_mask = legal_mask.to(state_refs.device, dtype=torch.bool)
-    public_inputs = backend.serialize_decision_inputs(
-        state_refs.to(backend.device)
-    )
-
-    training: dict[int, TrainingPartition] = {}
-    log_z: dict[int, Tensor] = {}
-    alias_probability: dict[int, Tensor] = {}
-    alias_index: dict[int, Tensor] = {}
-
-    posterior_pool = None
-    posterior_ref = None
-    if not data.normal and cfg.training.mode == "rao_blackwell":
-        if data.trajectory_id is None:
-            raise RuntimeError("sequential RB sealing requires trajectory addresses")
-        pairs = torch.stack((data.trajectory_id, owner), 1)
-        unique_pairs, inverse = torch.unique(pairs, dim=0, sorted=True, return_inverse=True)
-        first_by_pair: dict[tuple[int, int], int] = {}
-        pair_rows = pairs.detach().cpu().tolist()
-        for row, raw_pair in enumerate(pair_rows):
-            pair = (int(raw_pair[0]), int(raw_pair[1]))
-            first_by_pair.setdefault(pair, row)
-        first_rows = [
-            first_by_pair[tuple(map(int, pair))]
-            for pair in unique_pairs.detach().cpu().tolist()
-        ]
-        selected = torch.tensor(first_rows, dtype=torch.int64, device=state_refs.device)
-        posterior = data.targets.parent_p_hat[selected].detach().to(torch.float32)
-        posterior_pool = SequentialPosteriorPool(
-            posterior,
-            unique_pairs[:, 0].to(torch.int32),
-            unique_pairs[:, 1].to(torch.int32),
-        )
-        posterior_ref = inverse.to(torch.int32)
-
-    for spec in partitions.specs:
-        rows = (partition_id == spec.partition_id).nonzero(as_tuple=False).squeeze(1)
-        if rows.numel() == 0:
-            continue
-        states = state_refs[rows].detach().to(torch.int32)
-        if spec.partition_id == 0:
-            natural_ranges = torch.zeros(
-                (rows.numel(), backend.n_players, backend.n_classes),
-                dtype=torch.float32,
-                device=state_refs.device,
-            )
-            class_ids = backend.combo_class[None, None, :].expand_as(weights[rows])
-            natural_ranges.scatter_add_(2, class_ids, weights[rows])
-        else:
-            live = spec.partition_id + 1
-            status = backend.states.status[states.to(torch.int64)]
-            live_seats = torch.where(
-                status != 1,
-                torch.arange(backend.n_players, device=state_refs.device)[None],
-                backend.n_players,
-            ).sort(1).values[:, :live]
-            natural_ranges = weights[rows][
-                torch.arange(rows.numel(), device=state_refs.device)[:, None], live_seats
-            ].contiguous()
-        input_columns: dict[str, Tensor] = {
-            name: public_inputs[name][rows].detach()
-            for name in spec.input_schema.by_name
-            if name not in {"range_weights", "folded_summary_ref"}
-        }
-        input_columns["range_weights"] = natural_ranges.detach()
-        input_pools: dict[str, SealedTensorBlock] = {}
-        if "folded_summary_ref" in spec.input_schema.by_name:
-            live = spec.partition_id + 1
-            status = public_inputs["status"][rows].to(torch.int8)
-            anchors = backend.states.partition_cache_key[states.to(torch.int64)]
-            if bool((anchors < 0).any()):
-                raise RuntimeError("folded decision omitted its dependency anchor")
-            unique_anchors, inverse = torch.unique(
-                anchors.to(torch.int64), sorted=True, return_inverse=True
-            )
-            first = torch.full(
-                (unique_anchors.numel(),),
-                rows.numel(),
-                dtype=torch.int64,
-                device=rows.device,
-            )
-            first.scatter_reduce_(
-                0,
-                inverse,
-                torch.arange(rows.numel(), device=rows.device),
-                reduce="amin",
-                include_self=True,
-            )
-            summary = backend._partition_summary_uncached(
-                states[first],
-                public_inputs["board"][rows][first],
-                weights[rows][first],
-                status[first],
-                live,
-                compute_mask=torch.ones(
-                    unique_anchors.shape,
-                    dtype=torch.bool,
-                    device=rows.device,
-                ),
-            )
-            input_columns["folded_summary_ref"] = inverse.to(torch.int32)
-            input_pools["folded_summary"] = _sealed_dynamic_block(
-                f"poker_partition_{spec.partition_id}_folded_summary",
-                summary.fields,
-            )
-        inputs = _sealed_input_block(spec, input_columns)
-        columns: dict[str, Tensor] = {
-            "owner": owner[rows].detach().to(torch.int32),
-            "legal_event_ids": legal_ids[rows].detach(),
-            "legal_event_mask": legal_mask[rows].detach(),
-        }
-        actions = None
-        if data.normal:
-            columns.update(
-                {
-                    "realized_type": source.actor_type[rows].detach().to(torch.int32),
-                    "event": source.event[rows].detach().to(torch.int32),
-                    "old_log_prob": source.old_logp[rows].detach().to(torch.float32),
-                    "old_value": source.old_v[rows].detach().to(torch.float32),
-                    "lambda_return": source.lambda_return[rows].detach().to(torch.float32),
-                }
-            )
-        elif cfg.training.mode == "rao_blackwell":
-            if not bool((data.targets.child_count[rows] == 1).all()):
-                raise RuntimeError("sequential RB decision has non-unit multiplicity")
-            old_value = data.policy_cache.old_v[rows]
-            old_logp = data.policy_cache.old_logp_child[rows, 0]
-            if spec.partition_id == 0:
-                old_value = _compress_preflop_rows(old_value, backend)
-                old_logp = _compress_preflop_rows(old_logp, backend)
-            columns.update(
-                {
-                    "event": data.targets.child_event_row[rows, 0].detach().to(torch.int32),
-                    "posterior_ref": posterior_ref[rows].detach(),
-                    "old_log_prob": old_logp.detach().to(torch.float32),
-                    "old_value": old_value.detach().to(torch.float32),
-                    "lambda_return": data.targets.v_hat[rows].detach().to(torch.float32),
-                }
-            )
-        else:
-            old_value = data.policy_cache.old_v[rows]
-            if spec.partition_id == 0:
-                old_value = _compress_preflop_rows(old_value, backend)
-            columns.update(
-                {
-                    "old_value": old_value.detach().to(torch.float32),
-                    "value_hat": data.targets.v_hat[rows].detach().to(torch.float32),
-                }
-            )
-            if cfg.training.mode == "branched_rao_blackwell":
-                columns.update(
-                    {
-                        "trace_variance_hat": data.targets.t_hat[rows].detach().to(torch.float32),
-                        "trace_variance_mask": data.targets.t_mask[rows].detach(),
-                        "cost_hat": data.targets.c_hat[rows].detach().to(torch.float32),
-                        "nominal_child_count": data.targets.nominal_child_count[rows].detach().to(torch.int32),
-                    }
-                )
-            counts = data.targets.child_count[rows].to(torch.int64)
-            flat_mask = data.targets.child_mask[rows].reshape(-1)
-            old_logp = data.policy_cache.old_logp_child[rows].reshape(-1, backend.n_hands)[flat_mask]
-            if spec.partition_id == 0:
-                old_logp = _compress_preflop_rows(old_logp, backend)
-            actions = {
-                "action_ptr": torch.cat(
-                    (
-                        torch.zeros(1, dtype=torch.int32, device=rows.device),
-                        counts.cumsum(0).to(torch.int32),
-                    )
-                ),
-                "event": data.targets.child_event_row[rows].reshape(-1)[flat_mask].detach().to(torch.int32),
-                "old_log_prob": old_logp.detach().to(torch.float32),
-                "child_posterior": data.targets.child_p_hat[rows].reshape(-1, backend.n_hands)[flat_mask].detach().to(torch.float32),
-                "advantage_hat": data.targets.a_hat[rows].reshape(-1, backend.n_hands)[flat_mask].detach().to(torch.float32),
-            }
-        training[spec.partition_id] = TrainingPartition(
-            spec.partition_id,
-            inputs,
-            columns,
-            actions,
-            input_pools=input_pools,
-        )
-        if cfg.training.mode == "branched_rao_blackwell":
-            partition_weights = data.decision_weight[rows].detach().to(torch.float64)
-            log_z[spec.partition_id] = torch.log(partition_weights).logsumexp(0)
-            probability, alias = _walker_alias(partition_weights)
-            alias_probability[spec.partition_id] = probability
-            alias_index[spec.partition_id] = alias
-        else:
-            log_z[spec.partition_id] = torch.tensor(
-                math.log(rows.numel()), dtype=torch.float64, device=rows.device
-            )
-    mode = {
-        "normal": "normal",
-        "rao_blackwell": "sequential_rb",
-        "branched_rao_blackwell": "branched_rb",
-    }[cfg.training.mode]
-    storage = TrainingStorage(
-        mode,
-        training,
-        SamplingMetadata(log_z, alias_probability, alias_index),
-        posterior_pool,
-    )
-    return storage, partitions
-
-
-def _validate_old_policy_identity(
-    cfg: RootConfig,
-    bundle: GameBundle,
-    data: _RolloutSealInput,
-) -> dict[str, float]:
-    """Gate the first update on exact rollout/optimization model inputs.
-
-    The rollout snapshot and the still-unmodified trainable model must agree on
-    cached selected-action log probabilities and values.  Every retained
-    decision is checked in the backend's bounded physical batches.
-    """
-
-    if data.storage is not None:
-        return _validate_sealed_policy_identity(cfg, bundle, data)
-
-    model = bundle.model.module if hasattr(bundle.model, "module") else bundle.model
-    device = next(model.parameters()).device
-    amp_enabled, amp_dtype = _precision(cfg, device)
-    was_training = model.training
-    model.eval()
-    rows = torch.arange(data.targets.node_ids.numel(), device=device)
-    minibatch = gather_minibatch_rows(
-        data.tree,
-        data.targets,
-        data.policy_cache,
-        data.decision_reach,
-        bundle,
-        rows,
-    )
-    planner = getattr(bundle.rollout_backend, "plan_policy_batches", None)
-    plans = (
-        planner(model, minibatch.state_refs, "inference")
-        if planner is not None
-        else [rows]
-    )
-    maximum_logp_error = torch.zeros((), device=device)
-    maximum_value_error = torch.zeros((), device=device)
-    maximum_value_scale = torch.zeros((), device=device)
-    ratio_min = torch.full((), torch.inf, device=device)
-    ratio_max = torch.zeros((), device=device)
-    with torch.no_grad():
-        for positions in plans:
-            physical = index_minibatch(minibatch, positions)
-            with torch.autocast(
-                device_type=device.type, enabled=amp_enabled, dtype=amp_dtype
-            ):
-                output = bundle.rollout_backend.policy_forward(
-                    model, physical.state_refs, physical.reach
-                )
-            selected = _selected_logp(
-                output, physical, bundle.policy_adapter
-            ).float()
-            active = (
-                physical.targets.child_mask.to(device)[:, :, None]
-                & physical.valid_type_mask.to(device)[:, None, :]
-            )
-            current_logp = selected[active]
-            cached_logp = physical.old_logp_child.to(selected)[active]
-            valid = physical.valid_type_mask.to(device)
-            current_value = output.v.float()[valid]
-            cached_value = physical.old_v.to(output.v).float()[valid]
-            log_ratio = current_logp - cached_logp
-            ratios = torch.exp(log_ratio)
-            maximum_logp_error = torch.maximum(
-                maximum_logp_error, log_ratio.abs().max()
-            )
-            maximum_value_error = torch.maximum(
-                maximum_value_error, (current_value - cached_value).abs().max()
-            )
-            maximum_value_scale = torch.maximum(
-                maximum_value_scale,
-                torch.maximum(
-                    current_value.abs().max(), cached_value.abs().max()
-                ),
-            )
-            ratio_min = torch.minimum(ratio_min, ratios.min())
-            ratio_max = torch.maximum(ratio_max, ratios.max())
-    if was_training:
-        model.train()
-    if dist.is_initialized():
-        dist.all_reduce(maximum_logp_error, op=dist.ReduceOp.MAX)
-        dist.all_reduce(maximum_value_error, op=dist.ReduceOp.MAX)
-        dist.all_reduce(maximum_value_scale, op=dist.ReduceOp.MAX)
-        dist.all_reduce(ratio_min, op=dist.ReduceOp.MIN)
-        dist.all_reduce(ratio_max, op=dist.ReduceOp.MAX)
-    # Rollout queues and this exhaustive validation can partition identical
-    # inputs into different physical batch shapes. FP16 attention/reductions
-    # are shape-dependent; require identity to within a 2% policy ratio rather
-    # than expecting bitwise equality. This remains one tenth of the configured
-    # 20% PPO clipping interval for the production run. Full precision remains
-    # tight enough to expose input/cache misalignment directly.
-    logp_tolerance = 2.0e-2 if amp_enabled else 2.0e-5
-    value_tolerance = 1.0e-2 if amp_enabled else 2.0e-5
-    value_ok = maximum_value_error <= value_tolerance * (
-        1.0 + maximum_value_scale
-    )
-    logp_ok = maximum_logp_error <= logp_tolerance
-    unclipped = (ratio_min >= 1.0 - float(cfg.loss.clip_eps)) & (
-        ratio_max <= 1.0 + float(cfg.loss.clip_eps)
-    )
-    ok = value_ok & logp_ok & unclipped
-    if device.type == "cuda":
-        # This launch/resume gate is an explicit synchronization boundary: its
-        # four diagnostics are returned to the host immediately below.  Raise a
-        # normal exception with the measured disagreement instead of poisoning
-        # the CUDA context with a device-side assertion.
-        torch.cuda.synchronize(device)
-    diagnostics = {
-        "identity_max_abs_logp_error": float(maximum_logp_error),
-        "identity_max_abs_value_error": float(maximum_value_error),
-        "identity_ratio_min": float(ratio_min),
-        "identity_ratio_max": float(ratio_max),
-        "identity_logp_tolerance": float(logp_tolerance),
-        "identity_value_tolerance": float(value_tolerance),
-    }
-    if not bool(ok):
-        raise RuntimeError(
-            "old/current-policy identity launch gate failed: "
-            f"max_abs_logp_error={diagnostics['identity_max_abs_logp_error']:.8g}, "
-            f"max_abs_value_error={diagnostics['identity_max_abs_value_error']:.8g}, "
-            f"ratio_min={diagnostics['identity_ratio_min']:.8g}, "
-            f"ratio_max={diagnostics['identity_ratio_max']:.8g}, "
-            f"logp_tolerance={logp_tolerance:.8g}, "
-            f"value_tolerance={value_tolerance:.8g}"
-        )
-    return diagnostics
-
-
-def _validate_sealed_policy_identity(
-    cfg: RootConfig,
-    bundle: GameBundle,
-    data: _RolloutSealInput,
+    data: IterationData,
 ) -> dict[str, float]:
     """Validate frozen outputs using only immutable natural learner inputs."""
 
-    if data.storage is None or data.partition_specs is None:
-        raise RuntimeError("sealed identity validation requires training storage")
     model = bundle.model.module if hasattr(bundle.model, "module") else bundle.model
     device = next(model.parameters()).device
     amp_enabled, amp_dtype = _precision(cfg, device)
@@ -2786,8 +2139,8 @@ def _one_iteration(
     reference_model: nn.Module | None = None,
     validate_identity: bool = False,
     branching_controller: Any | None = None,
+    branching_diagnostic_limits: Any | None = None,
 ) -> dict[str, Any]:
-    spec = _loss_spec(cfg)
     execution_metrics = getattr(bundle.rollout_backend, "execution_metrics", None)
     if execution_metrics is not None:
         execution_metrics.clear()
@@ -2818,10 +2171,10 @@ def _one_iteration(
         cfg,
         bundle,
         torch_gen,
-        spec,
         profile=profile,
         iteration=iteration,
         branching_controller=branching_controller,
+        branching_diagnostic_limits=branching_diagnostic_limits,
     )
     if profile:
         memory_metrics.update(
@@ -2838,13 +2191,13 @@ def _one_iteration(
         )
     if validate_identity:
         if execution_metrics is None:
-            identity_metrics = _validate_old_policy_identity(cfg, bundle, data)
+            identity_metrics = _validate_policy_identity(cfg, bundle, data)
         else:
             # The identity gate is launch/resume validation, not scientific
             # rollout or learner work.  Excluding it keeps exact execution
             # counters invariant under checkpoint continuation.
             with execution_metrics.suspended():
-                identity_metrics = _validate_old_policy_identity(
+                identity_metrics = _validate_policy_identity(
                     cfg, bundle, data
                 )
         if device.type == "cuda":
@@ -2853,20 +2206,8 @@ def _one_iteration(
             # storage or optimization phase timer.
             torch.cuda.synchronize(device)
 
-    decisions = (
-        data.decision_count
-        if data.storage is not None
-        else (
-            len(data.dataset)
-            if data.normal
-            else int(data.targets.node_ids.numel())
-        )
-    )
-    leaves = (
-        data.leaf_count
-        if data.storage is not None
-        else int((data.profile_metrics or {}).get("leaves", total_trajectories))
-    )
+    decisions = data.decision_count
+    leaves = data.leaf_count
 
     optimizer_steps_this_iteration = int(cfg.training.gd_steps_per_iter)
 
@@ -2874,11 +2215,8 @@ def _one_iteration(
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
     seal_started = time.perf_counter()
-    if data.storage is not None:
-        storage = data.storage
-        partition_specs = data.partition_specs
-    else:
-        storage, partition_specs = _seal_iteration_training_storage(cfg, bundle, data)
+    storage = data.storage
+    partition_specs = data.partition_specs
     if profile and device.type == "cuda":
         torch.cuda.synchronize(device)
     seal_seconds = time.perf_counter() - seal_started

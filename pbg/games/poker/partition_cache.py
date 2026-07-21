@@ -35,15 +35,13 @@ class DevicePartitionSummaryCache:
 
     def __init__(
         self,
-        capacity: int,
         max_folders: int,
         device: torch.device | str,
         *,
         page_rows: int = 64,
     ) -> None:
-        if capacity <= 0 or max_folders < 0:
+        if max_folders < 0:
             raise ValueError("partition cache dimensions are invalid")
-        self.maximum_rows = int(capacity)
         self.max_folders = int(max_folders)
         self.device = torch.device(device)
         self.page_rows = int(page_rows)
@@ -117,7 +115,6 @@ class DevicePartitionSummaryCache:
             self.page_rows,
             self.device,
             label="poker_folded_summary",
-            maximum_rows=self.maximum_rows,
         )
         return self.arena
 

@@ -6,16 +6,17 @@ import pytest
 import torch
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL
+from pbg.core.execution import ByteAccountant
 from pbg.core.tree import (
     AliasTable,
-    DeviceTreeBuffer,
-    TreeBuilder,
+    PagedTreeSource,
+    DiagnosticTreeBuilder,
     build_decision_alias,
 )
 
 
 def _hand_tree():
-    builder = TreeBuilder(2)
+    builder = DiagnosticTreeBuilder(2)
     root = builder.add_root(10, 0, 0)
     left = builder.add_child(root, 11, 4, 0.25, CHANCE)
     right = builder.add_child(root, 12, 5, 0.75, TERMINAL)
@@ -39,7 +40,7 @@ def test_builder_finalize_computes_csr_depth_and_path_weight() -> None:
 
 
 def test_depth_counts_owned_nodes_including_the_current_state() -> None:
-    builder = TreeBuilder(2)
+    builder = DiagnosticTreeBuilder(2)
     root = builder.add_root(0, 0)
     chance = builder.add_child(root, 1, 10, 1.0, CHANCE)
     player_one = builder.add_child(chance, 2, 11, 1.0, 1)
@@ -70,7 +71,7 @@ def test_depth_counts_owned_nodes_including_the_current_state() -> None:
     ],
 )
 def test_device_tree_depth_uses_the_same_inclusive_convention(device: str) -> None:
-    buffer = DeviceTreeBuffer(1, 3, 2, device)
+    buffer = PagedTreeSource(1, 2, device, page_rows=2)
     root = buffer.add_roots(
         torch.tensor([0], dtype=torch.int32, device=device),
         torch.tensor([0], dtype=torch.int32, device=device),
@@ -102,7 +103,7 @@ def test_device_tree_depth_uses_the_same_inclusive_convention(device: str) -> No
 
 
 def test_device_tree_finalizes_cross_depth_expansion_without_sorting() -> None:
-    buffer = DeviceTreeBuffer(2, 3, 2, "cpu")
+    buffer = PagedTreeSource(2, 3, "cpu", page_rows=2)
     roots = buffer.add_roots(
         torch.tensor([0, 1], dtype=torch.int32),
         torch.tensor([0, 0], dtype=torch.int32),
@@ -132,6 +133,39 @@ def test_device_tree_finalizes_cross_depth_expansion_without_sorting() -> None:
     ]
     assert tree.child_event.tolist() == [100, 101, 200]
     assert torch.equal(tree.nu, torch.tensor([0.25, 0.75, 1.0]))
+
+
+def test_child_wave_page_admission_rolls_back_every_owner_before_mutation() -> None:
+    node_page = PagedTreeSource.node_schema(2).capacity_bytes(1, chunks=1)
+    edge_page = PagedTreeSource.edge_schema().capacity_bytes(1, chunks=1)
+    accountant = ByteAccountant(node_page + max(node_page, edge_page))
+    buffer = PagedTreeSource(
+        1, 2, "cpu", page_rows=1, accountant=accountant
+    )
+    root = buffer.add_roots(
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+    )
+    before = (
+        buffer.node_count,
+        buffer.edge_count,
+        int(buffer.child_count[root.to(torch.int64)][0]),
+        accountant.reserved_bytes,
+    )
+    with pytest.raises(MemoryError):
+        buffer.append_children(
+            root,
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([TERMINAL], dtype=torch.int32),
+            torch.tensor([7], dtype=torch.int32),
+            torch.tensor([1.0]),
+        )
+    assert (
+        buffer.node_count,
+        buffer.edge_count,
+        int(buffer.child_count[root.to(torch.int64)][0]),
+        accountant.reserved_bytes,
+    ) == before
 
 
 def test_validate_rejects_bad_nu_and_path_weight() -> None:

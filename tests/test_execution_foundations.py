@@ -41,6 +41,7 @@ from pbg.core.training import (
 from pbg.core.learner import ReusableIndexBuffer
 from pbg.core.targets import _walker_alias
 from pbg.core.game import GameBundle
+from pbg.core.storage import TensorFieldSchema, TensorSchema
 from pbg.core.optimization import (
     FlatGradientBuffer,
     finite_gated_optimizer_step,
@@ -48,15 +49,23 @@ from pbg.core.optimization import (
 )
 
 
-def test_sequential_memory_plan_uses_realized_single_child_width() -> None:
+def test_four_phase_memory_plan_is_schema_derived_without_padded_action_owner() -> None:
     model = torch.nn.Linear(3, 2)
+    input_schema = TensorSchema(
+        "test_natural_input",
+        (TensorFieldSchema("range_weights", torch.float32, (2, 1326)),),
+    )
     backend = SimpleNamespace(
         n_players=2,
         x_sizes=(1326, 1326),
         e_max=66,
+        max_rollout_steps=42,
         states=SimpleNamespace(storage=torch.empty(17, dtype=torch.uint8)),
         partition_summary_cache=SimpleNamespace(
             valid=torch.empty(43, dtype=torch.bool)
+        ),
+        training_partition_specs=lambda: SimpleNamespace(
+            specs=(SimpleNamespace(input_schema=input_schema),)
         ),
     )
     bundle = GameBundle(
@@ -69,22 +78,28 @@ def test_sequential_memory_plan_uses_realized_single_child_width() -> None:
         training=SimpleNamespace(mode="rao_blackwell"),
         rollout=SimpleNamespace(
             roots_per_gpu=10,
-            node_budget=43,
+            storage_page_rows=16,
             family_batch_rows=64,
             max_active_trajectories=64,
         ),
     )
 
     plan = _analytical_memory_plan(cfg, bundle, has_reference=True)
-    nodes = 10 * 43
-    assert plan["memory_plan_policy_cache_bytes"] == nodes * (2 * 1326 * 4 + 4)
-    assert plan["memory_plan_target_bytes"] == nodes * (4 * 1326 * 4 + 13)
-    assert plan["memory_plan_compact_target_bytes"] == nodes * (3 * 1326 * 4 + 13)
-    assert plan["memory_plan_transient_reach_bytes"] == 4 * 10 * 2 * 1326 * 4
     assert plan["memory_plan_backend_resident_bytes"] == 60
-    # The old generic calculation padded every row to all 66 legal events.
-    old_policy = nodes * (66 * 1326 + 1326) * 4
-    assert plan["memory_plan_policy_cache_bytes"] * 20 < old_policy
+    assert "memory_plan_rollout_decisions_bytes" not in plan
+    assert "memory_plan_decision_inputs_bytes" not in plan
+    for phase in ("rollout", "seal", "target", "optimization"):
+        assert plan[f"memory_plan_{phase}_phase_bytes"] == (
+            plan[f"memory_plan_{phase}_fixed_bytes"]
+            + plan[f"memory_plan_{phase}_variable_bytes"]
+        )
+    assert plan["memory_plan_seal_phase_bytes"] > plan["memory_plan_rollout_phase_bytes"]
+    assert plan["memory_plan_training_storage_bytes"] > 0
+    assert plan["memory_plan_sealed_rollout_bytes"] > 0
+    assert plan["memory_plan_structural_peak_bytes"] == max(
+        plan[f"memory_plan_{phase}_phase_bytes"]
+        for phase in ("rollout", "seal", "target", "optimization")
+    )
 
 
 def test_memory_calibration_reports_actual_hard_headroom_without_synthetic_margin(

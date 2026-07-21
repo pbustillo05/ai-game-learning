@@ -14,13 +14,20 @@ from torch import Tensor, nn
 
 from pbg.core.branching import (
     BranchingCutoffReached,
+    BranchingDiagnosticLimits,
     _index_policy_output,
     sample_branched_tree,
 )
 from pbg.config import ConfigError, load_config
 from pbg.core.game import EventBatch, GameBundle, TERMINAL
 from pbg.core.rollout import _selected_policy_logp
-from pbg.core.tree import DeviceTreeBuffer
+from pbg.core.tree import PagedTreeSource
+from pbg.core.storage import (
+    SealedDecisionInputs,
+    SealedTensorBlock,
+    TensorFieldSchema,
+    TensorSchema,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -138,20 +145,75 @@ class _LabeledBackend:
     def beta_fn(self, states: Tensor) -> Tensor:
         return torch.full(states.shape, self.beta, dtype=torch.float32)
 
+    def capture_decision_inputs(
+        self, family: str, states: Tensor, reach: Tensor
+    ) -> Tensor:
+        del family, states
+        return reach.detach().clone()
 
-def _cfg(root_count: int, beta: float, budget: int = 32) -> SimpleNamespace:
+    @staticmethod
+    def begin_decision_input_captures(
+        *, accountant: object | None = None
+    ) -> list[tuple[Tensor, Tensor]]:
+        del accountant
+        return []
+
+    @staticmethod
+    def append_decision_input_capture(
+        store: list[tuple[Tensor, Tensor]], node_ids: Tensor, capture: Tensor
+    ) -> None:
+        store.append((node_ids, capture))
+
+    def seal_decision_input_captures(
+        self, records: list[tuple[Tensor, Tensor]]
+    ) -> SealedDecisionInputs:
+        if not records:
+            empty = torch.empty(0, dtype=torch.int32)
+            return SealedDecisionInputs(empty, empty, empty, {})
+        nodes = torch.cat([node for node, _ in records]).to(torch.int32)
+        reaches = torch.cat([reach for _, reach in records]).to(torch.float32)
+        order = torch.argsort(nodes.to(torch.int64), stable=True)
+        nodes, reaches = nodes[order], reaches[order]
+        schema = TensorSchema(
+            "labeled_test_decision_input",
+            (TensorFieldSchema("reach", torch.float32, (2, 1)),),
+        )
+        block = SealedTensorBlock(
+            schema,
+            {"reach": reaches},
+            nodes.numel(),
+            schema.capacity_bytes(nodes.numel(), chunks=int(nodes.numel() > 0)),
+        )
+        rows = torch.arange(nodes.numel(), dtype=torch.int32)
+        records.clear()
+        return SealedDecisionInputs(nodes, torch.zeros_like(nodes), rows, {0: block})
+
+
+def _cfg(
+    root_count: int, beta: float, execution_memory_bytes: int = 1 << 20
+) -> SimpleNamespace:
     return SimpleNamespace(
         roots_per_gpu=root_count,
-        node_budget=budget,
+        storage_page_rows=8,
+        execution_memory_bytes=execution_memory_bytes,
         branching_mode="fixed",
         adaptive_kkt=None,
     )
 
 
-def _sample(backend: _LabeledBackend, cfg: SimpleNamespace, seed: int = 1):
+def _sample(
+    backend: _LabeledBackend,
+    cfg: SimpleNamespace,
+    seed: int = 1,
+    *,
+    diagnostic_limits: BranchingDiagnosticLimits | None = None,
+):
     bundle = GameBundle(_Model(), backend, _Adapter(), None)
     return sample_branched_tree(
-        bundle, cfg, torch.Generator().manual_seed(seed)
+        bundle,
+        cfg,
+        torch.Generator().manual_seed(seed),
+        diagnostic_limits=diagnostic_limits,
     )
 
 
@@ -164,7 +226,8 @@ def test_equal_labeled_siblings_remain_distinct_with_uniform_weights() -> None:
     assert torch.equal(tree.child_event, torch.zeros_like(tree.child_event))
     assert torch.allclose(tree.nu, torch.full_like(tree.nu, 0.25), atol=0, rtol=0)
     assert torch.allclose(tree.path_weight[tree.child_node], tree.nu, atol=0, rtol=0)
-    assert policy.old_logp_child.shape == (1, 4, 1)
+    assert policy.action_ptr.tolist() == [0, 4]
+    assert policy.old_logp_action.shape == (4, 1)
 
 
 def test_duplicate_siblings_expand_independently_without_label_sorting() -> None:
@@ -202,7 +265,8 @@ def test_branched_uses_one_root_and_preserves_duplicate_children() -> None:
     assert all(children.numel() == 2 for children in descendants)
     assert torch.cat(descendants).unique().numel() == 4
     assert backend.forward_batch_sizes == [1, 2]
-    assert policy.old_logp_child.shape == (3, 2, 1)
+    assert policy.action_ptr.tolist() == [0, 2, 4, 6]
+    assert policy.old_logp_action.shape == (6, 1)
 
 
 def test_branched_dispatches_actual_cost_family_blocks() -> None:
@@ -213,13 +277,12 @@ def test_branched_dispatches_actual_cost_family_blocks() -> None:
     tree.validate()
     assert backend.actual_cost_batch_sizes == [1, 2]
     assert backend.forward_batch_sizes == [1, 2]
-    assert policy.old_logp_child.shape == (3, 2, 1)
+    assert policy.action_ptr.tolist() == [0, 2, 4, 6]
 
 
 def test_upper_cutoff_switches_later_expansions_to_spines() -> None:
     backend = _LabeledBackend(2.0, two_levels=True)
     cfg = _cfg(1, 2.0)
-    cfg.branching_upper_cutoff_nodes = 4
     diagnostics: dict[str, int] = {}
 
     bundle = GameBundle(_Model(), backend, _Adapter(), None)
@@ -228,13 +291,14 @@ def test_upper_cutoff_switches_later_expansions_to_spines() -> None:
         cfg,
         torch.Generator().manual_seed(7),
         diagnostics=diagnostics,
+        diagnostic_limits=BranchingDiagnosticLimits(upper_nodes=4),
     )
 
     degree = tree.child_ptr[1:] - tree.child_ptr[:-1]
     assert tree.owner.numel() == 5
     assert int(degree[0]) == 2
     assert torch.equal(degree[1:3], torch.ones(2, dtype=torch.int64))
-    assert policy.old_logp_child.shape == (3, 2, 1)
+    assert policy.action_ptr.tolist() == [0, 2, 3, 4]
     assert diagnostics == {
         "upper_cutoff_batches": 1,
         "upper_cutoff_parents": 2,
@@ -246,7 +310,6 @@ def test_upper_cutoff_switches_later_expansions_to_spines() -> None:
 def test_stop_cutoff_reports_unexpanded_live_queue() -> None:
     backend = _LabeledBackend(2.0, two_levels=True)
     cfg = _cfg(1, 2.0)
-    cfg.branching_stop_cutoff_nodes = 3
     bundle = GameBundle(_Model(), backend, _Adapter(), None)
 
     with pytest.raises(BranchingCutoffReached) as caught:
@@ -254,6 +317,7 @@ def test_stop_cutoff_reports_unexpanded_live_queue() -> None:
             bundle,
             cfg,
             torch.Generator().manual_seed(7),
+            diagnostic_limits=BranchingDiagnosticLimits(stop_nodes=3),
         )
 
     cutoff = caught.value
@@ -264,8 +328,6 @@ def test_stop_cutoff_reports_unexpanded_live_queue() -> None:
     assert cutoff.family_queue_nodes == {"default": 0}
     assert cutoff.completed_leaves == 0
     assert cutoff.completed_decisions == 1
-    assert cutoff.state_refs.tolist() == [0, 1, 1]
-    assert cutoff.owners.tolist() == [0, 0, 0]
     assert backend.actual_cost_batch_sizes == [1]
 
 
@@ -280,7 +342,7 @@ def test_root_fractional_rounding_is_keyed_and_repeatable() -> None:
 
 def test_root_refill_reaches_minimum_and_finalizes_uniform_weights() -> None:
     backend = _LabeledBackend(2.3)
-    cfg = _cfg(1, 2.3, budget=16)
+    cfg = _cfg(1, 2.3)
     cfg.branching_min_nodes = 10
     diagnostics: dict[str, int] = {}
 
@@ -316,7 +378,8 @@ def test_root_refill_reaches_minimum_and_finalizes_uniform_weights() -> None:
         rtol=0.0,
     )
     assert policy.node_ids.tolist() == [0]
-    assert policy.old_logp_child.shape == (1, root_degree, 1)
+    assert policy.action_ptr.tolist() == [0, tree.root_pre_refill_child_count]
+    assert policy.old_logp_action.shape == (tree.root_pre_refill_child_count, 1)
     tree.validate()
 
 
@@ -328,8 +391,8 @@ def test_root_refill_is_disabled_without_minimum() -> None:
 
 def test_branched_overflow_is_transactional() -> None:
     backend = _LabeledBackend(4.0)
-    with pytest.raises((MemoryError, RuntimeError), match="capacity|overflow"):
-        _sample(backend, _cfg(1, 4.0, budget=1))
+    with pytest.raises(MemoryError, match="byte budget exceeded"):
+        _sample(backend, _cfg(1, 4.0, execution_memory_bytes=1))
     assert backend.forward_batch_sizes == []
 
 
@@ -368,7 +431,7 @@ def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> 
         load_config(path)
 
     raw["rollout"]["sequential_roots_per_gpu_initial"] = 1
-    raw["rollout"]["branching_min_nodes"] = raw["rollout"]["node_budget"]
+    raw["rollout"]["branching_min_nodes"] = 1
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ConfigError, match="branching_min_nodes"):
         load_config(path)
@@ -377,8 +440,8 @@ def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> 
 def test_labeled_hot_path_has_no_explicit_host_transfers_or_label_sort() -> None:
     banned = {"cpu", "numpy", "tolist", "item", "sort", "argsort"}
     for function in (
-        DeviceTreeBuffer.append_children,
-        DeviceTreeBuffer.finalize,
+        PagedTreeSource.append_children,
+        PagedTreeSource.finalize,
         _selected_policy_logp,
     ):
         syntax = ast.parse(textwrap.dedent(inspect.getsource(function)))

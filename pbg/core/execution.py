@@ -256,7 +256,7 @@ class ChunkedOccurrenceArena:
 
     def __init__(
         self,
-        capacity: int,
+        capacity: int | None,
         chunk_nodes: int,
         device: torch.device | str,
         *,
@@ -264,13 +264,13 @@ class ChunkedOccurrenceArena:
         accountant: ByteAccountant | None = None,
         label: str = "occurrence_arena",
     ) -> None:
-        if isinstance(capacity, bool) or capacity <= 0:
-            raise ValueError("arena capacity must be a positive integer")
+        if capacity is not None and (isinstance(capacity, bool) or capacity <= 0):
+            raise ValueError("arena capacity must be positive or None")
         if isinstance(chunk_nodes, bool) or chunk_nodes <= 0:
             raise ValueError("chunk_nodes must be a positive integer")
         if not label:
             raise ValueError("arena label must be nonempty")
-        self.capacity = int(capacity)
+        self.capacity = None if capacity is None else int(capacity)
         self.chunk_nodes = int(chunk_nodes)
         self.device = torch.device(device)
         self.fields = dict(_OCCURRENCE_FIELDS if fields is None else fields)
@@ -295,6 +295,8 @@ class ChunkedOccurrenceArena:
         self._chunk_lengths: list[int] = []
         self._size = 0
         self._reserved_bytes = 0
+        self._reservation_labels: list[str] = []
+        self._released = False
 
     @property
     def size(self) -> int:
@@ -317,11 +319,15 @@ class ChunkedOccurrenceArena:
         return self._size * self.row_bytes
 
     def _ensure_capacity(self, stop: int) -> None:
+        if self._released:
+            raise RuntimeError("occurrence arena has been released")
         required_chunks = math.ceil(stop / self.chunk_nodes)
         if required_chunks <= self.chunk_count:
             return
         new_lengths = [
-            min(self.chunk_nodes, self.capacity - index * self.chunk_nodes)
+            self.chunk_nodes
+            if self.capacity is None
+            else min(self.chunk_nodes, self.capacity - index * self.chunk_nodes)
             for index in range(self.chunk_count, required_chunks)
         ]
         added_bytes = sum(new_lengths) * self.row_bytes
@@ -348,6 +354,22 @@ class ChunkedOccurrenceArena:
             self._chunks[name].extend(chunks)
         self._chunk_lengths.extend(new_lengths)
         self._reserved_bytes += added_bytes
+        self._reservation_labels.append(reservation)
+
+    def release(self) -> None:
+        """Drop every page after its final consumer and release its byte ledger."""
+
+        if self._released:
+            raise RuntimeError("occurrence arena has already been released")
+        for chunks in self._chunks.values():
+            chunks.clear()
+        self._chunk_lengths.clear()
+        if self.accountant is not None:
+            self.accountant.release_many(self._reservation_labels)
+        self._reservation_labels.clear()
+        self._size = 0
+        self._reserved_bytes = 0
+        self._released = True
 
     def allocate(self, count: int) -> Tensor:
         """Allocate ``count`` NEW occurrences and return int64 handles ``[count]``."""
@@ -355,7 +377,7 @@ class ChunkedOccurrenceArena:
         if isinstance(count, bool) or count < 0:
             raise ValueError("occurrence count must be a nonnegative integer")
         stop = self._size + int(count)
-        if stop > self.capacity:
+        if self.capacity is not None and stop > self.capacity:
             raise MemoryError(
                 f"occurrence arena overflow: requested_stop={stop}, capacity={self.capacity}"
             )
@@ -365,15 +387,33 @@ class ChunkedOccurrenceArena:
         return torch.arange(start, stop, dtype=torch.int64, device=self.device)
 
     def require_capacity(self, count: int) -> None:
-        """Validate one future allocation without mutating arena state."""
+        """Admit one future allocation without advancing logical rows."""
 
         if isinstance(count, bool) or count < 0:
             raise ValueError("occurrence count must be a nonnegative integer")
         stop = self._size + int(count)
-        if stop > self.capacity:
+        if self.capacity is not None and stop > self.capacity:
             raise MemoryError(
                 f"occurrence arena overflow: requested_stop={stop}, capacity={self.capacity}"
             )
+        self._ensure_capacity(stop)
+
+    def rollback_chunk_growth(self, chunk_count: int) -> None:
+        """Remove empty chunks published after a failed grouped admission."""
+
+        if not 0 <= chunk_count <= self.chunk_count:
+            raise ValueError("invalid chunk-growth rollback checkpoint")
+        if self._size > sum(self._chunk_lengths[:chunk_count]):
+            raise RuntimeError("cannot roll back chunks containing logical rows")
+        labels = self._reservation_labels[chunk_count:]
+        removed = sum(self._chunk_lengths[chunk_count:]) * self.row_bytes
+        for chunks in self._chunks.values():
+            del chunks[chunk_count:]
+        del self._chunk_lengths[chunk_count:]
+        del self._reservation_labels[chunk_count:]
+        self._reserved_bytes -= removed
+        if self.accountant is not None:
+            self.accountant.release_many(labels)
 
     def _validate_handles(self, handles: Tensor) -> Tensor:
         handles = handles.to(device=self.device, dtype=torch.int64)
@@ -552,44 +592,44 @@ class ChunkedOccurrenceArena:
         )
 
 
-class DeviceWorkQueue:
-    """Bounded insertion-order whose storage and live metadata reside on one device."""
 
-    def __init__(self, capacity: int, device: torch.device | str) -> None:
-        if isinstance(capacity, bool) or capacity <= 0:
-            raise ValueError("queue capacity must be a positive integer")
-        self.capacity = int(capacity)
+class DeviceWorkQueue:
+    """Live-frontier insertion order stored only in realized device batches."""
+
+    def __init__(
+        self,
+        maximum_live_rows: int | None,
+        device: torch.device | str,
+    ) -> None:
+        if maximum_live_rows is not None and (
+            isinstance(maximum_live_rows, bool) or maximum_live_rows <= 0
+        ):
+            raise ValueError("maximum live queue rows must be positive or None")
+        self.maximum_live_rows = maximum_live_rows
         self.device = torch.device(device)
-        self.storage = torch.empty(capacity, dtype=torch.int64, device=self.device)
-        self.head = torch.zeros((), dtype=torch.int64, device=self.device)
-        self.tail = torch.zeros((), dtype=torch.int64, device=self.device)
         self.count = torch.zeros((), dtype=torch.int64, device=self.device)
-        # A deterministic mirror avoids reading device scalars at scheduler
-        # boundaries while the device tensors remain kernel-visible metadata.
+        self._batches: deque[Tensor] = deque()
         self._host_count = 0
-        # Logical enqueue-time runs mirror insertion-order mutations exactly.  They make
-        # queue age observable without reading a device handle or clock scalar.
         self._age_runs: deque[tuple[int, int]] = deque()
         self._last_logical_time = 0
+        self.high_water_rows = 0
 
     @property
     def reserved_bytes(self) -> int:
-        return self.storage.numel() * self.storage.element_size() + 3 * 8
+        return sum(batch.numel() * batch.element_size() for batch in self._batches) + 8
 
     @property
     def host_count(self) -> int:
         return self._host_count
 
     def oldest_age(self, logical_time: int) -> int:
-        """Return the exact oldest wait in scheduler ticks."""
-
         if isinstance(logical_time, bool) or logical_time < 0:
             raise ValueError("logical time must be a nonnegative integer")
         if not self._age_runs:
             return 0
         oldest = self._age_runs[0][1]
         if logical_time < oldest:
-            raise ValueError("logical time cannot precede the oldest waiting row")
+            raise ValueError("logical time cannot precede waiting work")
         return int(logical_time) - oldest
 
     def enqueue(
@@ -599,46 +639,50 @@ class DeviceWorkQueue:
         arena: ChunkedOccurrenceArena | None = None,
         logical_time: int = 0,
     ) -> None:
-        """Append handles, optionally transitioning them NEW -> QUEUED."""
-
         handles = handles.to(device=self.device, dtype=torch.int64)
         if handles.ndim != 1:
             raise ValueError("work handles must be one-dimensional")
         if isinstance(logical_time, bool) or logical_time < self._last_logical_time:
             raise ValueError("queue logical times must be nonnegative and monotone")
         added = int(handles.numel())
-        if self._host_count + added > self.capacity:
+        if (
+            self.maximum_live_rows is not None
+            and self._host_count + added > self.maximum_live_rows
+        ):
             raise MemoryError(
-                f"insertion-order overflow: depth={self._host_count}, added={added}, "
-                f"capacity={self.capacity}"
+                f"insertion-order overflow at live byte/row limit: "
+                f"depth={self._host_count}, added={added}"
             )
         if arena is not None:
             arena.transition(handles, NEW, QUEUED)
-        positions = torch.remainder(
-            self.tail + torch.arange(added, device=self.device), self.capacity
-        )
-        self.storage[positions] = handles
-        self.tail.copy_(torch.remainder(self.tail + added, self.capacity))
+        if added:
+            self._batches.append(handles.clone())
         self.count.add_(added)
         self._host_count += added
+        self.high_water_rows = max(self.high_water_rows, self._host_count)
         self._last_logical_time = int(logical_time)
         if added:
             if self._age_runs and self._age_runs[-1][1] == logical_time:
-                previous, timestamp = self._age_runs.pop()
-                self._age_runs.append((previous + added, timestamp))
+                prior, timestamp = self._age_runs.pop()
+                self._age_runs.append((prior + added, timestamp))
             else:
                 self._age_runs.append((added, int(logical_time)))
 
     def peek(self, count: int | None = None) -> Tensor:
-        """Return a insertion-order-ordered copy without changing queue state."""
-
         selected = self._host_count if count is None else int(count)
         if selected < 0 or selected > self._host_count:
             raise ValueError("peek count is outside the live insertion-order depth")
-        positions = torch.remainder(
-            self.head + torch.arange(selected, device=self.device), self.capacity
-        )
-        return self.storage[positions].clone()
+        pieces: list[Tensor] = []
+        remaining = selected
+        for batch in self._batches:
+            if remaining == 0:
+                break
+            take = min(remaining, int(batch.numel()))
+            pieces.append(batch[:take])
+            remaining -= take
+        if not pieces:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        return pieces[0].clone() if len(pieces) == 1 else torch.cat(pieces)
 
     def dequeue(
         self,
@@ -646,17 +690,21 @@ class DeviceWorkQueue:
         *,
         arena: ChunkedOccurrenceArena | None = None,
     ) -> Tensor:
-        """Pop insertion-order handles, optionally transitioning QUEUED -> EVALUATING."""
-
         if isinstance(count, bool) or count < 0 or count > self._host_count:
             raise ValueError("dequeue count is outside the live insertion-order depth")
         handles = self.peek(count)
         if arena is not None:
             arena.transition(handles, QUEUED, EVALUATING)
-        self.head.copy_(torch.remainder(self.head + count, self.capacity))
+        remaining = int(count)
+        while remaining:
+            batch = self._batches.popleft()
+            consumed = min(remaining, int(batch.numel()))
+            remaining -= consumed
+            if consumed < batch.numel():
+                self._batches.appendleft(batch[consumed:])
         self.count.sub_(count)
         self._host_count -= count
-        remaining = count
+        remaining = int(count)
         while remaining:
             run_count, timestamp = self._age_runs.popleft()
             consumed = min(remaining, run_count)

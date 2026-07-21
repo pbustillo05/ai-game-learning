@@ -21,7 +21,7 @@ configurable, benchmarkable, or tested as active games.
 
 ```text
 pbg.config / pbg.runtime       NLHE composition roots
-  pbg.core                     game-independent rollout, values, loss, training
+  pbg.core                     game-independent rollout, targets, learner, training
   pbg.games.poker              NLHE rules, model, rollout and evaluator adapters
   pbg.eval                     offline duplicate-deal poker evaluation
 pbg.benchmark                  three-mode production profiling
@@ -49,12 +49,13 @@ game:
   rank_count: int
 rollout:
   sequential_roots_per_gpu_initial: int
+  sequential_roots_per_gpu_minimum: positive int | null
+  sequential_roots_per_gpu_maximum: positive int | null
   branching_mode: fixed | dynamic | null
   beta: mapping | null
-  node_budget: int
   family_batch_rows: positive int | null
   max_active_trajectories: positive int | null
-  arena_chunk_nodes: positive int | null
+  storage_page_rows: positive int | null
   execution_memory_bytes: positive int | null
 completion:
   n_samples: positive int | null
@@ -89,8 +90,10 @@ configured independent trajectory starts.
 
 Stored topology is duplicate-preserving CSR. Repeated event labels are distinct
 sampled children. Child ordering, empirical edge masses, `path_weight`, owner,
-depth, state references, and tree identity are retained without deduplication.
-Node and edge capacity overflow fails loudly before partially mutating topology.
+depth, and tree identity are retained without deduplication. Mutable state
+handles exist only during rollout and never enter sealed or training storage.
+Node, edge, reach, history, and control pages are byte-admitted transactionally
+before a child wave mutates topology or consumes a random draw.
 
 Normal, sequential RB, and branched RB use one family-scheduled execution path.
 Poker exposes only the logical families `pre` and `post_A`, where $A$ is the
@@ -143,16 +146,18 @@ Rollout stores exact frozen policy likelihoods and values at retained decisions.
 The first update of a launch or resume recomputes them and checks identity before
 backward. Minibatching never reevaluates the frozen behavior policy.
 
-RB completion is supplied in bounded batches to the single streamed posterior
-value reducer. It propagates posterior mass $P$ and posterior-weighted moment
-$M$, conditionalizes only at target emission, uses leave-one-out sibling
-baselines, and bootstraps only the acting player's moment. A full-completion
-alternate reducer and auxiliary propagation hooks are not active APIs.
+Each mode seals exact `RolloutStorage` before target construction. Natural poker
+decision inputs are captured at their final mutable-state/reach consumer;
+completion leaves retain one exact range-weight owner and immutable evaluator
+inputs. `build_normal_targets`, `build_sequential_rb_targets`, and
+`build_branched_rb_targets` stream bounded work from that store into immutable
+`TrainingStorage`, after which topology and leaves are released.
 
-Normal mode stores a compact scalar trajectory dataset. Sequential RB uses
-single-child topology and completion targets. Branched RB retains labeled
-multi-child topology and empirical path masses. `reach_storage` changes storage
-and replay only; it must not change target values.
+Sequential RB deduplicates posterior rows by trajectory/player. Branched RB
+uses ragged action spans, propagates posterior mass $P$ and weighted moment $M$
+through a prebounded reusable frontier, and retains current dynamic-$\beta$,
+$T/C$, nominal/executed-count, queue-correction, and protected-root semantics.
+There is no alternate padded target reducer or stored production $Q$ target.
 
 ## Loss and distributed objective
 
@@ -191,19 +196,25 @@ decision.
 ## Memory, synchronization, and completion
 
 CUDA launch requires a hardware profile with token, token-pair, memory-fraction,
-and reserve limits. Rollout, completion, value, and optimization phases report
-allocated/reserved peaks. Preflight rejects unsafe plans before large
-allocations. Completion and backward reduction stream within one fixed rollout;
-there is no trajectory-chunk objective.
+and reserve limits. Rollout, seal, target, and optimization phases report
+allocated/reserved peaks. Their priors come from the schemas that allocate the
+real pages and exact stores. Sequential width is selected only from four-phase
+byte feasibility; branched growth uses a hard execution byte ceiling and stops
+cleanly when a mandatory continuation cannot fit. Completion and backward
+reduction stream within one fixed rollout; there is no retry, reroll, replay,
+or trajectory-chunk objective.
 
 Numeric hot-path tensors remain on their owning device. Declared fixed-size
 scheduler control synchronization and transfers are counted separately;
 undeclared synchronization is a contract failure. Empty families, single-child
 paths, and uneven rank work must complete without collective mismatch.
 CUDA history materialization uses the lossless preflighted bound and a batched
-device gather. Folded summaries use a memory-planned device-indexed cache with
-masked evaluator rows. Mixed-family physical planning may transfer one fixed,
-counted control block; it may not introduce row-dependent host decisions.
+device gather. Mutable public states and persistent history records use
+recyclable, refcounted slots; dead history ancestry is reclaimed at its final
+state consumer. Folded summaries seal only sparse dependency anchors, and
+all-live partitions allocate none. Mixed-family physical planning may transfer
+one fixed, counted control block; it may not introduce row-dependent host
+decisions.
 
 ## Checkpoint and resume
 
@@ -217,10 +228,12 @@ identity, and optional reference-policy state. Resume requires:
 - an iteration within the configured schedule.
 
 Current NLHE checkpoints are restored from their tensor/optimizer/RNG payloads.
-Their serialized configuration is compared as data and is not passed through
-the new YAML parser, so removed YAML aliases require no general compatibility
-loader. CUDA RNG byte tensors are normalized to CPU at the setter boundary;
-this narrow compatibility handling is retained for relevant checkpoints.
+Their serialized configuration is compared as data rather than passed through
+the YAML parser. Checkpoint schema v5 contains one explicit migration that
+deletes the retired total-row allocation field without translating its value;
+there is no general configuration-alias loader. CUDA RNG byte tensors are
+normalized to CPU at the setter boundary; this narrow compatibility handling
+is retained for relevant checkpoints.
 
 ## Required validation
 

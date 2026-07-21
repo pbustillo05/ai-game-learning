@@ -13,32 +13,59 @@ from pbg.config import load_config
 from pbg.runtime import train
 
 
+def _tiny_config(mode: str):
+    cfg = load_config(
+        "configs/nlhe6_h100.yaml",
+        hardware_profile="local_3x2080ti",
+    )
+    cfg.game.n_players = 2
+    cfg.game.stack_bb = 8.0
+    cfg.game.rank_count = 4
+    cfg.training.mode = mode
+    if mode == "normal":
+        cfg.rollout.branching_mode = None
+        cfg.rollout.beta = None
+        cfg.completion.n_samples = None
+        cfg.loss.name = "ppo"
+        cfg.loss.c_t = 0.0
+        cfg.loss.c_c = 0.0
+    elif mode == "rao_blackwell":
+        cfg.rollout.branching_mode = None
+        cfg.rollout.beta = None
+        cfg.loss.name = "rb_ppo"
+        cfg.loss.c_t = 0.0
+        cfg.loss.c_c = 0.0
+    else:
+        cfg.rollout.branching_mode = "fixed"
+        cfg.rollout.beta = {"default": 1.0}
+        cfg.loss.name = "rb_ppo"
+        cfg.loss.c_t = 1.0
+        cfg.loss.c_c = 1.0
+    return cfg
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize(
-    ("mode", "config_name", "roots"),
+    ("mode", "roots"),
     (
-        ("normal", "nlhe_hu_normal.yaml", 2),
-        ("rao_blackwell", "nlhe_hu_sequential_rb.yaml", 2),
-        ("branched_rao_blackwell", "nlhe_hu_branched_rb.yaml", 1),
+        ("normal", 2),
+        ("rao_blackwell", 2),
+        ("branched_rao_blackwell", 1),
     ),
 )
 def test_tiny_gpu_training_modes_report_bounded_phase_memory(
-    tmp_path: Path, mode: str, config_name: str, roots: int
+    tmp_path: Path, mode: str, roots: int
 ) -> None:
     """One real learner update per mode with deliberately tiny geometry."""
 
-    cfg = load_config(
-        Path("configs/acceptance") / config_name,
-        hardware_profile="local_3x2080ti",
-    )
+    cfg = _tiny_config(mode)
     cfg.rollout.sequential_roots_per_gpu_initial = roots
     cfg.rollout.sequential_roots_per_gpu_minimum = roots
     cfg.rollout.sequential_roots_per_gpu_maximum = roots
     cfg.rollout.roots_per_gpu = roots
-    cfg.rollout.node_budget = 64
     cfg.rollout.family_batch_rows = 2
     cfg.rollout.max_active_trajectories = roots
-    cfg.rollout.arena_chunk_nodes = 8
+    cfg.rollout.storage_page_rows = 8
     if mode != "normal":
         cfg.completion.n_samples = 4
         cfg.completion.backend = "cuda"
@@ -51,6 +78,7 @@ def test_tiny_gpu_training_modes_report_bounded_phase_memory(
         "k_act": 4,
         "max_players": 2,
         "class_embedding_dim": 4,
+        "use_branching_heads": mode == "branched_rao_blackwell",
     }
     cfg.training.iters = 1
     cfg.training.gd_steps_per_iter = 1
@@ -104,18 +132,14 @@ def _two_gpu_worker(rank: int, world: int, port: int, output_dir: str) -> None:
             "NCCL_SOCKET_IFNAME": "lo",
         }
     )
-    cfg = load_config(
-        "configs/acceptance/nlhe_hu_normal.yaml",
-        hardware_profile="local_3x2080ti",
-    )
+    cfg = _tiny_config("normal")
     cfg.rollout.sequential_roots_per_gpu_initial = 1
     cfg.rollout.sequential_roots_per_gpu_minimum = 1
     cfg.rollout.sequential_roots_per_gpu_maximum = 1
     cfg.rollout.roots_per_gpu = 1
-    cfg.rollout.node_budget = 32
     cfg.rollout.family_batch_rows = 1
     cfg.rollout.max_active_trajectories = 1
-    cfg.rollout.arena_chunk_nodes = 8
+    cfg.rollout.storage_page_rows = 8
     cfg.model = {
         "d_model": 8,
         "n_heads": 2,
@@ -125,6 +149,7 @@ def _two_gpu_worker(rank: int, world: int, port: int, output_dir: str) -> None:
         "k_act": 4,
         "max_players": 2,
         "class_embedding_dim": 4,
+        "use_branching_heads": False,
     }
     cfg.training.iters = 1
     cfg.training.gd_steps_per_iter = 1

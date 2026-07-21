@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from pbg.config import load_config
+from pbg.core.branching import sample_branched_tree
 from pbg.core.game import EventBatch
-from pbg.core.training import (
-    _build_iteration_data,
-    _loss_spec,
-)
+from pbg.core.training import _build_iteration_data
 from pbg.games.poker.bundle import build_bundle
 from pbg.games.poker.engine import CHECK_CALL
 
@@ -24,7 +23,6 @@ def _tiny_normal_config():
     cfg.game.rank_count = 4
     cfg.rollout.roots_per_gpu = 4
     cfg.rollout.sequential_roots_per_gpu_initial = 4
-    cfg.rollout.node_budget = 32
     cfg.rollout.beta = None
     cfg.rollout.branching_mode = None
     cfg.completion.n_samples = None
@@ -57,7 +55,6 @@ def test_direct_rollout_seals_complete_state_independent_poker_inputs() -> None:
         cfg,
         bundle,
         generator,
-        _loss_spec(cfg),
         frozen_model=bundle.model,
     )
     storage = data.storage
@@ -100,4 +97,59 @@ def test_all_live_postflop_forward_uses_no_persistent_summary_owner() -> None:
     )
     output = backend.policy_forward_partition(bundle.model, 1, inputs)
     assert output.v.shape == (1, backend.n_hands)
+    assert backend.partition_summary_cache.allocated_capacity_bytes == 0
+
+
+def test_branched_mandatory_child_no_fit_stops_before_draw_and_releases_pages() -> None:
+    cfg = _tiny_normal_config()
+    cfg.rollout.roots_per_gpu = 1
+    cfg.rollout.sequential_roots_per_gpu_initial = 1
+    cfg.rollout.storage_page_rows = 1
+    cfg.rollout.execution_memory_bytes = 4_000
+    cfg.rollout.branching_mode = "fixed"
+    cfg.rollout.beta = {
+        name: 1.0
+        for name in (
+            "default",
+            "preflop",
+            "flop",
+            "turn",
+            "river",
+            "chance_to_flop",
+            "chance_to_turn",
+            "chance_to_river",
+        )
+    }
+    cfg.model["use_branching_heads"] = True
+    cfg.training.mode = "branched_rao_blackwell"
+    cfg.loss.name = "rb_ppo"
+    cfg.loss.c_t = 1.0
+    cfg.loss.c_c = 1.0
+    cfg.completion.n_samples = 4
+    bundle = build_bundle(cfg, torch.device("cpu"))
+    backend = bundle.rollout_backend
+    forwards = 0
+    original_forward = backend.policy_forward_family_actual_cost
+
+    def record_forward(*args, **kwargs):
+        nonlocal forwards
+        forwards += 1
+        return original_forward(*args, **kwargs)
+
+    backend.policy_forward_family_actual_cost = record_forward
+
+    def forbid_posterior_draw(*args, **kwargs):
+        raise AssertionError("posterior draw occurred before child-wave admission")
+
+    backend.sample_profiles_keyed = forbid_posterior_draw
+    with pytest.raises(MemoryError, match="byte budget exceeded"):
+        sample_branched_tree(
+            bundle,
+            cfg,
+            torch.Generator().manual_seed(3),
+        )
+
+    assert forwards == 1
+    assert backend.states.arena.allocated_capacity_bytes == 0
+    assert backend.states.history_arena.allocated_capacity_bytes == 0
     assert backend.partition_summary_cache.allocated_capacity_bytes == 0

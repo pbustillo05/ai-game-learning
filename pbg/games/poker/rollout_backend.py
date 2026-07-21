@@ -11,9 +11,10 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
+from pbg.core.game import CHANCE, PRETERM, PROBE_FOLD, TERMINAL, EventBatch
 from pbg.core.observability import ExecutionMetrics
 from pbg.core.storage import (
+    ByteAccountant,
     PagedTensorArena,
     SealedDecisionInputs,
     SealedTensorBlock,
@@ -67,16 +68,6 @@ _EPS = 1e-6
 _CHANCE_OFFSETS = (100_000, 200_000, 300_000)
 
 
-@dataclass
-class CompactPokerDecisionReach:
-    """Ragged live-seat reach rows retained for optimization."""
-
-    row_ptr: Tensor  # int64 [D+1]
-    seat_ids: Tensor  # int64 [T]
-    log_r: Tensor  # float32 [T,H]
-    n_rows: int
-
-
 @dataclass(frozen=True)
 class PokerDecisionInputCapture:
     """One scheduler pack of immutable natural poker decision inputs."""
@@ -87,12 +78,20 @@ class PokerDecisionInputCapture:
     summary_fields: Mapping[str, Tensor] | None = None
 
 
+@dataclass
+class PokerDecisionInputCaptureStore:
+    """Paged scheduler owner for exact natural decision-input rows."""
+
+    input_arenas: dict[int, PagedTensorArena]
+    summary_arenas: dict[int, PagedTensorArena]
+    accountant: ByteAccountant | None = None
+
+
 class PokerRolloutBackend:
     """Batched Torch implementation of public NLHE navigation.
 
     Args:
         cfg: Public table configuration.
-        capacity: Maximum number of state rows resident in this pipeline.
         device: Owning CPU or CUDA device.
         max_rollout_steps: Maximum public transitions in one sampled path.
         beta_table: Fixed branching intensities by public-stage bucket.
@@ -105,17 +104,12 @@ class PokerRolloutBackend:
     list-based correctness oracle used only by tests and evaluation.
     """
 
-    # Folded-seat ranges still affect preflop tokens and reach-derived features.
-    # Retain the exact rollout input until an immutable folded-summary cache is
-    # part of the model-input contract.
-    requires_full_decision_reach = True
-
     def __init__(
         self,
         cfg: PokerConfig,
-        capacity: int,
         device: torch.device | str,
         *,
+        storage_page_rows: int = 256,
         max_rollout_steps: int | None = None,
         beta_table: Mapping[str, float] | Any | None = None,
         profile_sampler: PokerGPURejectionSampler | Any | None = None,
@@ -133,6 +127,7 @@ class PokerRolloutBackend:
         self.n_classes = self.geometry.n_classes
         self.x_sizes = (self.n_hands,) * cfg.n_players
         self.n_ticks = cfg.n_ticks
+        self.storage_page_rows = int(storage_page_rows)
         self.e_max = RAISE_OFFSET + cfg.n_ticks
         self.raise_unit_values = (
             torch.arange(1, cfg.n_ticks + 1, dtype=torch.float32, device=self.device)
@@ -145,12 +140,17 @@ class PokerRolloutBackend:
             max_rollout_steps = 4 * cfg.n_players * (raises_per_street + 1) + 3
         self.max_rollout_steps = int(max_rollout_steps)
         self.states = PokerTensorStateStore(
-            capacity, self.max_rollout_steps, self.device, cfg.n_players
+            self.max_rollout_steps,
+            self.device,
+            cfg.n_players,
+            page_rows=storage_page_rows,
         )
         self.state_store = self.states
         self.history_materializer = DeviceHistoryMaterializer(self.states)
         self.partition_summary_cache = DevicePartitionSummaryCache(
-            capacity, max(0, cfg.n_players - 2), self.device
+            max(0, cfg.n_players - 2),
+            self.device,
+            page_rows=max(1, storage_page_rows),
         )
         table = getattr(beta_table, "beta_table", beta_table)
         self.beta_table = dict(table or {"default": 1.0})
@@ -177,6 +177,7 @@ class PokerRolloutBackend:
             initial_beta: (self.partition_adapter, self.partition_summary_cache)
         }
         self._partition_materialized = {initial_beta: False}
+        self._next_dependency_anchor = 0
         self.combo_cards = torch.tensor(
             self.geometry.combo_cards,
             dtype=torch.int16,
@@ -241,11 +242,61 @@ class PokerRolloutBackend:
         for _, cache in self._partition_services.values():
             cache.reset(release_pages=True)
 
+    def release_state_rows(self, states: Tensor) -> None:
+        """Return completed mutable public-state slots to the live pool."""
+
+        self.states.release_rows(states)
+
+    def bind_rollout_accountant(self, accountant: ByteAccountant | None) -> None:
+        """Attach empty mutable poker owners to the current rollout ledger."""
+
+        self.states.bind_accountant(accountant)
+
+    def require_successor_capacity(self, count: int) -> None:
+        """Admit state/history pages for an already selected child wave."""
+
+        self.states.require_successor_capacity(count)
+
+    def verify_state_recycling_boundary(self) -> None:
+        """Assert no mutable state crosses the rollout-to-seal boundary."""
+
+        live = int(self.states.pool.live_rows)
+        self.execution_metrics.maximum(
+            "state_live_rows_high_water",
+            int(self.states.pool.high_water_live_rows),
+        )
+        self.execution_metrics.maximum("state_live_rows_at_seal", live)
+        history_live = int(self.states.history_pool.live_rows)
+        self.execution_metrics.maximum(
+            "history_live_rows_high_water",
+            int(self.states.history_pool.high_water_live_rows),
+        )
+        self.execution_metrics.maximum("history_live_rows_at_seal", history_live)
+        if live != 0:
+            raise RuntimeError(
+                f"{live} mutable poker state rows crossed their last consumer"
+            )
+        if history_live != 1:
+            raise RuntimeError(
+                f"{history_live - 1} public history rows crossed their last consumer"
+            )
+
+    def _dependency_anchors(self, count: int) -> Tensor:
+        start = self._next_dependency_anchor
+        self._next_dependency_anchor += int(count)
+        return torch.arange(
+            start,
+            self._next_dependency_anchor,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
     def _initial_states_with_buttons(self, buttons: Tensor) -> Tensor:
         """Reset storage and initialize roots for explicit buttons ``[B]``."""
 
         n = buttons.shape[0]
         self.states.reset()
+        self._next_dependency_anchor = 0
         for _, cache in self._partition_services.values():
             cache.reset()
         handles = self.states.allocate_all(n)  # [B]
@@ -288,20 +339,7 @@ class PokerRolloutBackend:
         self.states.board[rows] = -1
         self.states.last_full_raise[rows] = float(self.cfg.bb)
         self.states.current_bet[rows] = committed.max(1).values
-        self.states.history_jump[rows] = -1
-        self.states.history_event[rows] = -1
-        self.states.history_actor[rows] = -1
-        self.states.history_street[rows] = -1
-        self.states.history_action[rows] = -1
-        for name in (
-            "history_amount",
-            "history_pot_before",
-            "history_call_amount",
-            "history_current_bet",
-            "history_min_raise_to",
-            "history_max_raise_to",
-        ):
-            getattr(self.states, name)[rows] = 0.0
+        self.states.history_ref[rows] = -1
         self.states.history_length[rows] = 0
         self.states.fold_payoff[rows] = 0.0
         self.states.board_at_fold[rows] = 255
@@ -482,6 +520,7 @@ class PokerRolloutBackend:
         )
         successors = self.states.append_copies(states)  # [B]
         rows = successors.to(torch.int64)
+        history_rows = self.states.history_ref[rows].to(torch.int64)
         actor = self.states.actor[rows].to(torch.int64)
         batch = torch.arange(states.shape[0], device=self.device)
         fold = event_ids == FOLD
@@ -523,24 +562,24 @@ class PokerRolloutBackend:
         )
         length = self.states.history_length[rows]
         torch._assert((length < self.max_rollout_steps).all(), "poker action history capacity exceeded")
-        self.states.history_event[rows] = event_ids
-        self.states.history_actor[rows] = parent_actor.to(torch.int8)
-        self.states.history_street[rows] = self.states.street[parent_rows].to(torch.int8)
-        self.states.history_action[rows] = torch.where(
+        self.states.history_event[history_rows] = event_ids
+        self.states.history_actor[history_rows] = parent_actor.to(torch.int8)
+        self.states.history_street[history_rows] = self.states.street[parent_rows].to(torch.int8)
+        self.states.history_action[history_rows] = torch.where(
             raise_event,
             torch.full_like(event_ids, 2),
             torch.where(call, torch.ones_like(event_ids), torch.zeros_like(event_ids)),
         ).to(torch.int8)
-        self.states.history_amount[rows] = torch.where(
+        self.states.history_amount[history_rows] = torch.where(
             raise_event,
             parent_raise_to,
             torch.where(call, parent_call_paid, torch.zeros_like(parent_call_paid)),
         )
-        self.states.history_pot_before[rows] = self.states.committed_total[parent_rows].sum(1)
-        self.states.history_call_amount[rows] = parent_to_call
-        self.states.history_current_bet[rows] = self.states.current_bet[parent_rows]
-        self.states.history_min_raise_to[rows] = parent_minimum
-        self.states.history_max_raise_to[rows] = parent_maximum
+        self.states.history_pot_before[history_rows] = self.states.committed_total[parent_rows].sum(1)
+        self.states.history_call_amount[history_rows] = parent_to_call
+        self.states.history_current_bet[history_rows] = self.states.current_bet[parent_rows]
+        self.states.history_min_raise_to[history_rows] = parent_minimum
+        self.states.history_max_raise_to[history_rows] = parent_maximum
         self.states.history_length[rows] += 1
         if bool(fold.any()):
             fold_rows = rows[fold]
@@ -562,7 +601,9 @@ class PokerRolloutBackend:
                 ),
                 dim=1,
             )
-            self.states.partition_cache_key[fold_rows] = successors[fold]
+            self.states.partition_cache_key[fold_rows] = self._dependency_anchors(
+                int(fold_rows.numel())
+            )
         self.states.reopen_mask[rows] = (~self.states.acted[rows]) & (self.states.status[rows] == LIVE)
 
         contesting = self.states.status[rows] != FOLDED
@@ -610,6 +651,7 @@ class PokerRolloutBackend:
             raise ValueError("chance cards must have shape [B,3]")
         successors = self.states.append_copies(states)  # [B]
         rows = successors.to(torch.int64)
+        history_rows = self.states.history_ref[rows].to(torch.int64)
         old_street = self.states.street[states.to(torch.int64)]
         flop = old_street == 0
         expected = torch.where(flop, 3, 1)
@@ -648,17 +690,17 @@ class PokerRolloutBackend:
         self.states.phase[rows] = _PLAYER
         length = self.states.history_length[rows]
         torch._assert((length < self.max_rollout_steps).all(), "poker action history capacity exceeded")
-        self.states.history_street[rows] = self.states.street[rows].to(torch.int8)
-        self.states.history_action[rows] = 3
+        self.states.history_street[history_rows] = self.states.street[rows].to(torch.int8)
+        self.states.history_action[history_rows] = 3
         parent_rows = states.to(torch.int64)
-        self.states.history_amount[rows] = 0.0
-        self.states.history_pot_before[rows] = self.states.committed_total[parent_rows].sum(1)
-        self.states.history_call_amount[rows] = 0.0
-        self.states.history_current_bet[rows] = self.states.current_bet[parent_rows]
-        self.states.history_min_raise_to[rows] = 0.0
-        self.states.history_max_raise_to[rows] = 0.0
+        self.states.history_amount[history_rows] = 0.0
+        self.states.history_pot_before[history_rows] = self.states.committed_total[parent_rows].sum(1)
+        self.states.history_call_amount[history_rows] = 0.0
+        self.states.history_current_bet[history_rows] = self.states.current_bet[parent_rows]
+        self.states.history_min_raise_to[history_rows] = 0.0
+        self.states.history_max_raise_to[history_rows] = 0.0
         self.states.history_length[rows] += 1
-        self.states.partition_cache_key[rows] = successors
+        self.states.partition_cache_key[rows] = self._dependency_anchors(rows.numel())
         return successors
 
     def _packed_history(self, states: Tensor) -> PackedPublicHistory:
@@ -1139,6 +1181,81 @@ class PokerRolloutBackend:
             summary.fields,
         )
 
+    def begin_decision_input_captures(
+        self, *, accountant: ByteAccountant | None = None
+    ) -> PokerDecisionInputCaptureStore:
+        """Create one rollout-local paged owner for decision captures."""
+
+        return PokerDecisionInputCaptureStore({}, {}, accountant)
+
+    def append_decision_input_capture(
+        self,
+        store: PokerDecisionInputCaptureStore,
+        node_ids: Tensor,
+        capture: PokerDecisionInputCapture,
+    ) -> None:
+        """Move one scheduler pack immediately into its paged last-consumer owner."""
+
+        if not isinstance(store, PokerDecisionInputCaptureStore):
+            raise TypeError("expected PokerDecisionInputCaptureStore")
+        partition_id = int(capture.partition_id)
+        arena = store.input_arenas.get(partition_id)
+        if arena is None:
+            input_schema = self.training_partition_specs()[partition_id].input_schema
+            arena = PagedTensorArena(
+                TensorSchema(
+                    f"poker_partition_{partition_id}_decision_capture",
+                    (
+                        TensorFieldSchema("node_id", torch.int32, alignment=4),
+                        *input_schema.fields,
+                    ),
+                    chunk_header_bytes=input_schema.chunk_header_bytes,
+                    allocator_slack_bytes=input_schema.allocator_slack_bytes,
+                ),
+                self.storage_page_rows,
+                self.device,
+                accountant=store.accountant,
+                label=f"poker_partition_{partition_id}_decision_capture",
+            )
+            store.input_arenas[partition_id] = arena
+        columns = dict(capture.columns)
+        if capture.summary_anchor is not None:
+            if capture.summary_fields is None:
+                raise ValueError("summary anchors require summary fields")
+            summary = store.summary_arenas.get(partition_id)
+            if summary is None:
+                summary_columns = {
+                    "anchor": capture.summary_anchor,
+                    **capture.summary_fields,
+                }
+                summary_schema = TensorSchema(
+                    f"poker_partition_{partition_id}_summary_capture",
+                    tuple(
+                        TensorFieldSchema(
+                            name,
+                            value.dtype,
+                            tuple(value.shape[1:]),
+                            alignment=min(max(value.element_size(), 1), 16),
+                        )
+                        for name, value in summary_columns.items()
+                    ),
+                )
+                summary = PagedTensorArena(
+                    summary_schema,
+                    self.storage_page_rows,
+                    self.device,
+                    accountant=store.accountant,
+                    label=f"poker_partition_{partition_id}_summary_capture",
+                )
+                store.summary_arenas[partition_id] = summary
+            summary_rows = summary.append(
+                {"anchor": capture.summary_anchor, **capture.summary_fields}
+            )
+            columns["folded_summary_ref"] = summary_rows[
+                capture.columns["folded_summary_ref"].to(torch.int64)
+            ].to(torch.int32)
+        arena.append({"node_id": node_ids.to(torch.int32), **columns})
+
     @staticmethod
     def _seal_columns(label: str, columns: Mapping[str, Tensor]) -> SealedTensorBlock:
         rows = next(iter(columns.values())).shape[0]
@@ -1162,55 +1279,51 @@ class PokerRolloutBackend:
         )
 
     def seal_decision_input_captures(
-        self,
-        records: list[tuple[Tensor, PokerDecisionInputCapture]],
+        self, store: PokerDecisionInputCaptureStore,
     ) -> SealedDecisionInputs:
         """Seal scheduler packs and deduplicate sparse summary anchors exactly."""
 
-        if not records:
+        if not isinstance(store, PokerDecisionInputCaptureStore):
+            raise TypeError("expected PokerDecisionInputCaptureStore")
+        if not store.input_arenas:
             empty = torch.empty(0, dtype=torch.int32, device=self.device)
             return SealedDecisionInputs(empty, empty, empty, {})
-        by_partition: dict[int, list[tuple[Tensor, PokerDecisionInputCapture]]] = {}
-        for node_ids, capture in records:
-            by_partition.setdefault(capture.partition_id, []).append((node_ids, capture))
         all_nodes: list[Tensor] = []
         all_partition: list[Tensor] = []
         all_rows: list[Tensor] = []
         blocks: dict[int, SealedTensorBlock] = {}
         pools: dict[int, Mapping[str, SealedTensorBlock]] = {}
         partition_specs = self.training_partition_specs()
-        for partition_id, parts in by_partition.items():
+        for partition_id, source in store.input_arenas.items():
             input_schema = partition_specs[partition_id].input_schema
-            page_rows = max(1, min(256, sum(ids.numel() for ids, _ in parts)))
-            arena = PagedTensorArena(
-                input_schema,
-                page_rows,
-                self.device,
-                label=f"poker_partition_{partition_id}_decision_input",
-            )
-            remapped_summary_refs: list[Tensor] | None = None
-            if parts[0][1].summary_anchor is not None:
-                anchors = torch.cat(
-                    [part.summary_anchor for _, part in parts if part.summary_anchor is not None]
+            if store.accountant is not None:
+                summary_source = store.summary_arenas.get(partition_id)
+                store.accountant.reserve(
+                    f"poker_partition_{partition_id}_decision_input.sealed",
+                    input_schema.capacity_bytes(source.size, chunks=int(source.size > 0))
+                    + source.size * 4
+                    + (
+                        0
+                        if summary_source is None
+                        else summary_source.schema.capacity_bytes(
+                            summary_source.size,
+                            chunks=int(summary_source.size > 0),
+                        )
+                    ),
                 )
-                field_names = tuple(parts[0][1].summary_fields or {})
-                summary_columns = {
-                    name: torch.cat(
-                        [
-                            part.summary_fields[name]
-                            for _, part in parts
-                            if part.summary_fields is not None
-                        ]
-                    )
-                    for name in field_names
-                }
-                source_ref_parts: list[Tensor] = []
-                offset = 0
-                for _, part in parts:
-                    refs = part.columns["folded_summary_ref"].to(torch.int64)
-                    source_ref_parts.append(refs + offset)
-                    assert part.summary_anchor is not None
-                    offset += part.summary_anchor.numel()
+            node_ids = source.gather(
+                "node_id", torch.arange(source.size, device=self.device)
+            ).to(torch.int32)
+            order = torch.argsort(node_ids.to(torch.int64), stable=True)
+            node_ids = node_ids[order]
+            input_columns = {
+                name: source.gather(name, order).detach()
+                for name in input_schema.by_name
+            }
+            summary = store.summary_arenas.get(partition_id)
+            if summary is not None:
+                summary_rows = torch.arange(summary.size, device=self.device)
+                anchors = summary.gather("anchor", summary_rows)
                 unique_anchor, inverse = torch.unique(
                     anchors, sorted=True, return_inverse=True
                 )
@@ -1227,33 +1340,27 @@ class PokerRolloutBackend:
                     reduce="amin",
                     include_self=True,
                 )
-                remapped_summary_refs = [
-                    inverse[source_ref].to(torch.int32)
-                    for source_ref in source_ref_parts
-                ]
+                input_columns["folded_summary_ref"] = inverse[
+                    input_columns["folded_summary_ref"].to(torch.int64)
+                ].to(torch.int32)
                 pools[partition_id] = {
                     "folded_summary": self._seal_columns(
                         f"poker_partition_{partition_id}_folded_summary",
-                        {name: value[first] for name, value in summary_columns.items()},
+                        {
+                            name: summary.gather(name, first)
+                            for name in summary.schema.by_name
+                            if name != "anchor"
+                        },
                     )
                 }
-            source_rows: list[Tensor] = []
-            node_parts: list[Tensor] = []
-            for part_index, (part_nodes, part) in enumerate(parts):
-                columns = dict(part.columns)
-                if remapped_summary_refs is not None:
-                    columns["folded_summary_ref"] = remapped_summary_refs[part_index]
-                source_rows.append(arena.append(columns))
-                node_parts.append(part_nodes.to(torch.int32))
-            node_ids = torch.cat(node_parts)
-            source_order = torch.cat(source_rows)
-            order = torch.argsort(node_ids.to(torch.int64), stable=True)
-            node_ids = node_ids[order]
-            block, _ = arena.seal(
-                scratch_rows=page_rows,
-                row_order=source_order[order],
+            blocks[partition_id] = SealedTensorBlock(
+                input_schema,
+                input_columns,
+                node_ids.numel(),
+                input_schema.capacity_bytes(
+                    node_ids.numel(), chunks=int(node_ids.numel() > 0)
+                ),
             )
-            blocks[partition_id] = block
             all_nodes.append(node_ids)
             all_partition.append(
                 torch.full_like(node_ids, partition_id, dtype=torch.int32)
@@ -1261,10 +1368,12 @@ class PokerRolloutBackend:
             all_rows.append(
                 torch.arange(node_ids.numel(), dtype=torch.int32, device=self.device)
             )
-        # Scheduler capture objects own the pre-seal wide input packs.  Their
-        # final consumer was the page copy above, so drop them before returning
-        # the exact immutable destination.
-        records.clear()
+        for arena in store.input_arenas.values():
+            arena.release()
+        for arena in store.summary_arenas.values():
+            arena.release()
+        store.input_arenas.clear()
+        store.summary_arenas.clear()
         nodes = torch.cat(all_nodes)
         order = torch.argsort(nodes.to(torch.int64), stable=True)
         return SealedDecisionInputs(
@@ -1549,9 +1658,9 @@ class PokerRolloutBackend:
                     beta_rank=beta, rank_count=self.cfg.rank_count
                 ),
                 DevicePartitionSummaryCache(
-                    self.states.capacity,
                     max(0, self.n_players - 2),
                     self.device,
+                    page_rows=self.storage_page_rows,
                 ),
             )
             self._partition_services[beta] = service
@@ -1577,13 +1686,13 @@ class PokerRolloutBackend:
         for beta, materialized in self._partition_materialized.items():
             total += (
                 DevicePartitionSummaryCache.storage_nbytes(
-                    self.states.capacity,
+                    self.storage_page_rows,
                     n_cards=self.geometry.n_cards,
                     beta_rank=beta,
                     max_folders=max(0, self.n_players - 2),
                 )
                 if materialized
-                else self.states.capacity
+                else 0
             )
         return total
 
@@ -1831,6 +1940,103 @@ class PokerRolloutBackend:
         )
         return output
 
+    def functional_policy_forward_partition(
+        self,
+        model: nn.Module,
+        parameters: Mapping[str, Tensor],
+        partition_id: int,
+        inputs: Mapping[str, Tensor],
+    ) -> PolicyOutput:
+        """Stateless learner call from sealed natural inputs for JVP probes."""
+
+        natural = inputs.get("range_weights")
+        if not isinstance(natural, Tensor):
+            raise TypeError("sealed poker inputs require natural range_weights")
+        pub = self._public_from_immutable_inputs(inputs)
+        batch_size = natural.shape[0]
+        if partition_id == 0:
+            weights = natural.to(torch.float32)
+            masks = {
+                "preflop_masks": PreflopMasks(
+                    seat_mask=pub.seat_mask, status=pub.status
+                ),
+                "postflop_masks": None,
+            }
+        else:
+            live = int(partition_id) + 1
+            status = pub.status
+            live_seat_ids = torch.where(
+                status != FOLDED,
+                torch.arange(self.n_players, device=self.device)[None],
+                self.n_players,
+            ).sort(1).values[:, :live]
+            weights = torch.ones(
+                (batch_size, self.n_players, self.n_hands),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            batch = torch.arange(batch_size, device=self.device)[:, None]
+            weights[batch, live_seat_ids] = natural.to(torch.float32)
+            summary_fields = {
+                name.removeprefix("folded_summary."): value
+                for name, value in inputs.items()
+                if name.startswith("folded_summary.")
+            }
+            source = model.module if hasattr(model, "module") else model
+            post_model = getattr(source, "postflop", None)
+            consumes_partition = bool(
+                getattr(
+                    post_model,
+                    "requires_partition_summary",
+                    getattr(getattr(post_model, "cfg", None), "evaluator_summary_dim", 0)
+                    > 0,
+                )
+            )
+            if consumes_partition and not summary_fields and live < self.n_players:
+                raise ValueError("postflop immutable input omitted folded summary rows")
+            summary = (
+                PartitionSummaryBatch(
+                    fields=summary_fields,
+                    metadata={"cache": "sealed_sparse_anchor"},
+                )
+                if summary_fields
+                else (
+                    self._partition_summary_all_live(pub.board, weights)
+                    if consumes_partition
+                    else None
+                )
+            )
+            masks = {
+                "preflop_masks": None,
+                "postflop_masks": PostflopMasks(
+                    compatibility=self._compatibility(pub.board),
+                    seat_mask=pub.seat_mask,
+                    combo_mask=weights > 0,
+                    status=pub.status,
+                    evaluator_summary=summary,
+                    live_seat_ids=live_seat_ids,
+                    compact_size=math.comb(self.n_cards - 3, 2),
+                ),
+            }
+        output = torch.func.functional_call(
+            model,
+            parameters,
+            (pub, weights, pub.to_act),
+            masks,
+            strict=False,
+        )
+        if partition_id == 0 and output.v.shape[1] == self.n_classes:
+            output = PolicyOutput(
+                raw={
+                    name: value[:, self.combo_class]
+                    for name, value in output.raw.items()
+                },
+                v=output.v[:, self.combo_class],
+                t=output.t,
+                c=output.c,
+            )
+        return output
+
     def policy_forward_family_actual_cost(
         self,
         frozen_model: nn.Module,
@@ -1998,63 +2204,6 @@ class PokerRolloutBackend:
         # workspaces, allocator bins, and the measured forward/backward delta
         # while retaining the hardware profile's independent VRAM reserve.
         return math.ceil(rows * (per_row + natural) * 2.0)
-
-    def compact_decision_reach(
-        self, states: Tensor, reach: Tensor
-    ) -> CompactPokerDecisionReach:
-        """Discard folded full ranges after their final rollout/completion use."""
-
-        self._validate_handles(states)
-        if reach.shape != (states.numel(), self.n_players, self.n_hands):
-            raise ValueError("reach has the wrong compact hand width")
-        rows = states.to(device=self.device, dtype=torch.int64)
-        live = self.states.status[rows] != FOLDED  # [D,P]
-        counts = live.sum(1, dtype=torch.int64)
-        row_ptr = torch.cat(
-            (torch.zeros(1, dtype=torch.int64, device=self.device), counts.cumsum(0))
-        )
-        seats = torch.arange(self.n_players, device=self.device)[None].expand_as(live)
-        return CompactPokerDecisionReach(
-            row_ptr=row_ptr,
-            seat_ids=seats[live].to(torch.int64),
-            log_r=reach[live].contiguous(),
-            n_rows=int(states.numel()),
-        )
-
-    def expand_decision_reach(
-        self, compact: CompactPokerDecisionReach, rows: Tensor
-    ) -> Tensor:
-        """Materialize dense policy rows only for the sampled minibatch."""
-
-        if not isinstance(compact, CompactPokerDecisionReach):
-            raise TypeError("expected CompactPokerDecisionReach")
-        rows = rows.to(device=self.device, dtype=torch.int64)
-        if rows.ndim != 1:
-            raise ValueError("decision reach rows are out of range")
-        valid_rows = ((rows >= 0) & (rows < compact.n_rows)).all()
-        if rows.device.type == "cuda":
-            torch._assert_async(valid_rows, "decision reach rows are out of range")
-        elif not bool(valid_rows):
-            raise ValueError("decision reach rows are out of range")
-        starts = compact.row_ptr[rows]
-        counts = compact.row_ptr[rows + 1] - starts
-        batch_rows = torch.repeat_interleave(
-            torch.arange(rows.numel(), device=self.device), counts
-        )
-        repeated_starts = torch.repeat_interleave(starts, counts)
-        output_starts = torch.repeat_interleave(
-            counts.cumsum(0) - counts, counts
-        )
-        offsets = torch.arange(batch_rows.numel(), device=self.device) - output_starts
-        source = repeated_starts + offsets
-        result = torch.full(
-            (rows.numel(), self.n_players, self.n_hands),
-            -torch.inf,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        result[batch_rows, compact.seat_ids[source]] = compact.log_r[source]
-        return result
 
     def _policy_forward_direct(
         self, frozen_model: nn.Module, states: Tensor, reach: Tensor
@@ -2352,6 +2501,59 @@ class PokerRolloutBackend:
             "payoff_baseline": strata.payoff_baseline.contiguous(),
             "stratum_amount": strata.stratum_amount.contiguous(),
         }
+
+    def capture_rb_leaf(self, states: Tensor, reach: Tensor) -> dict[str, Tensor]:
+        """Materialize the complete immutable RB leaf contract at last use."""
+
+        rows = states.to(torch.int64)
+        completion = self.completion_inputs(states, reach)
+        completion.pop("range_weights")
+        return {
+            "owner": self.classify(states).to(torch.int32),
+            "fold_payoff": self.states.fold_payoff[rows].detach().to(torch.float32),
+            **{name: value.detach() for name, value in completion.items()},
+        }
+
+    @staticmethod
+    def range_weights_from_log_reach(reach: Tensor) -> Tensor:
+        """Convert the sole stopped-leaf reach owner to completion weights."""
+
+        finite = torch.isfinite(reach)
+        gauge = reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
+        return torch.exp(reach - gauge).masked_fill(~finite, 0.0).contiguous()
+
+    def capture_normal_leaf(
+        self, states: Tensor, profiles: Tensor, keys: Tensor
+    ) -> dict[str, Tensor]:
+        """Settle normal leaves before releasing their mutable state slots."""
+
+        return {
+            "reward": self.sampled_terminal_reward_keyed(
+                states, profiles, keys
+            ).detach().to(torch.float32)
+        }
+
+    def capture_probe_leaf(
+        self, states: Tensor, profiles: Tensor, keys: Tensor
+    ) -> dict[str, Tensor]:
+        """Settle ordinary and probe-cutoff leaves before state recycling."""
+
+        owner = self.classify(states)
+        reward = torch.empty(
+            (states.numel(), self.n_players),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        cutoff = owner == PROBE_FOLD
+        if bool(cutoff.any()):
+            rows = states[cutoff].to(torch.int64)
+            reward[cutoff] = -self.states.committed_total[rows].to(torch.float32)
+        ordinary = ~cutoff
+        if bool(ordinary.any()):
+            reward[ordinary] = self.sampled_terminal_reward_keyed(
+                states[ordinary], profiles[ordinary], keys[ordinary]
+            ).to(torch.float32)
+        return {"reward": reward.detach()}
 
     def reward(self, profiles: Tensor, terminal_states: Tensor) -> Tensor:
         """Return locally known fold payoff rows ``[B,P]``."""

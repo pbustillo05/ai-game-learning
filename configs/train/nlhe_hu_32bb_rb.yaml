@@ -10,13 +10,12 @@ rollout:
   sequential_roots_per_gpu_initial: 2560
   beta: null
   # Exact HU 32 bb bound: 39 player nodes + 3 chance nodes + 1 terminal leaf.
-  node_budget: 43
   # Keep rollout queue packs at 64 rows. A 128-row probe exhausted the guarded
   # completion workspace after rollout; larger learner minibatches are split
   # independently into the validated physical SDPA shapes.
   family_batch_rows: 64
   max_active_trajectories: 64
-  arena_chunk_nodes: 256
+  storage_page_rows: 256
   # The execution arena is separately bounded from retained training storage.
   execution_memory_bytes: 1610612736
   sequential_roots_per_gpu_minimum: 512

@@ -20,11 +20,8 @@ from pbg.core.adaptive_branching import (
     randomized_round,
 )
 from pbg.core.branching import sample_branched_tree
-from pbg.core.completion import BatchedCompletionStats
 from pbg.core.game import GameBundle, TERMINAL
 from pbg.core.learner import mode_loss
-from pbg.core.tree import TreeBuilder
-from pbg.core.values import HeadEvals, streamed_branched_value
 from pbg.config import load_config, load_config_mapping, ConfigError
 from pbg.core.checkpointing import load_checkpoint, save_checkpoint
 from tests.categorical_policy_fixture import CategoricalPolicyAdapter
@@ -256,188 +253,6 @@ def test_controller_state_round_trips_through_training_checkpoint(tmp_path) -> N
 
 
 @dataclass
-class _OnePlayerGame:
-    n_players: int = 1
-    x_sizes: tuple[int, ...] = (1,)
-
-
-def test_branched_value_exact_cost_recurrence_and_trace_sample_covariance() -> None:
-    builder = TreeBuilder(1)
-    root = builder.add_root(0, 0)
-    child = builder.add_child(root, 1, 0, 1.0, 0)
-    builder.add_child(child, 2, 0, 0.5, TERMINAL)
-    builder.add_child(child, 3, 1, 0.5, TERMINAL)
-    tree = builder.finalize()
-    tree.nominal_child_count = torch.tensor([1, 2, 0, 0], dtype=torch.int32)
-    leaves = torch.tensor([2, 3], dtype=torch.int32)
-    completion = BatchedCompletionStats(
-        p_hat=torch.ones((2, 1, 1)),
-        v_hat=torch.tensor([[[1.0]], [[3.0]]]),
-    )
-    heads = HeadEvals(
-        node_ids=torch.tensor([root, child], dtype=torch.int32),
-        v=torch.zeros((2, 1)),
-        t=torch.tensor([0.2, 0.2]),
-        c=torch.tensor([5.0, 5.0]),
-    )
-    target = streamed_branched_value(
-        tree,
-        leaves,
-        [(leaves, completion)],
-        None,
-        heads,
-        1.0,
-        _OnePlayerGame(),
-        configured_node_budget=4,
-        completion_batch_rows=2,
-    )
-    assert torch.equal(target.t_mask, torch.tensor([False, True]))
-    assert target.t_hat.tolist() == pytest.approx([0.0, 2.0])
-    # Child cost is one edge; root sees 1 + N_tilde(child) * C(child).
-    assert target.c_hat.tolist() == pytest.approx([3.0, 1.0])
-    assert torch.equal(target.nominal_child_count, torch.tensor([1, 2], dtype=torch.int32))
-    assert not target.t_hat.requires_grad and not target.c_hat.requires_grad
-
-
-def test_refilled_root_targets_use_only_the_protected_child_prefix() -> None:
-    builder = TreeBuilder(1)
-    root = builder.add_root(0, 0)
-    builder.add_child(root, 1, 0, 1.0 / 3.0, TERMINAL)
-    builder.add_child(root, 2, 1, 1.0 / 3.0, TERMINAL)
-    builder.add_child(root, 3, 2, 1.0 / 3.0, TERMINAL)
-    tree = builder.finalize()
-    tree.nominal_child_count = torch.tensor([2, 0, 0, 0], dtype=torch.int32)
-    tree.root_pre_refill_child_count = 2
-    tree.pre_refill_node_count = 3
-    leaves = torch.tensor([1, 2, 3], dtype=torch.int32)
-    completion = BatchedCompletionStats(
-        p_hat=torch.ones((3, 1, 1)),
-        v_hat=torch.tensor([[[1.0]], [[3.0]], [[100.0]]]),
-    )
-    target = streamed_branched_value(
-        tree,
-        leaves,
-        [(leaves, completion)],
-        None,
-        HeadEvals(
-            torch.tensor([root], dtype=torch.int32),
-            torch.zeros((1, 1)),
-            t=torch.tensor([0.5]),
-            c=torch.tensor([1.0]),
-        ),
-        1.0,
-        _OnePlayerGame(),
-        configured_node_budget=4,
-        completion_batch_rows=3,
-    )
-
-    assert target.child_count.tolist() == [2]
-    assert target.child_mask.tolist() == [[True, True, False]]
-    assert target.v_hat[0, 0].item() == pytest.approx(2.0)
-    assert target.t_mask.tolist() == [True]
-    assert target.t_hat[0].item() == pytest.approx(2.0)
-    assert target.c_hat[0].item() == pytest.approx(1.0)
-
-
-def test_refill_does_not_manufacture_root_trace_target_from_one_child() -> None:
-    builder = TreeBuilder(1)
-    root = builder.add_root(0, 0)
-    builder.add_child(root, 1, 0, 0.5, TERMINAL)
-    builder.add_child(root, 2, 1, 0.5, TERMINAL)
-    tree = builder.finalize()
-    tree.nominal_child_count = torch.tensor([1, 0, 0], dtype=torch.int32)
-    tree.root_pre_refill_child_count = 1
-    tree.pre_refill_node_count = 2
-    leaves = torch.tensor([1, 2], dtype=torch.int32)
-    target = streamed_branched_value(
-        tree,
-        leaves,
-        [(
-            leaves,
-            BatchedCompletionStats(
-                p_hat=torch.ones((2, 1, 1)),
-                v_hat=torch.tensor([[[4.0]], [[100.0]]]),
-            ),
-        )],
-        None,
-        HeadEvals(
-            torch.tensor([root], dtype=torch.int32),
-            torch.zeros((1, 1)),
-            t=torch.tensor([0.5]),
-            c=torch.tensor([1.0]),
-        ),
-        1.0,
-        _OnePlayerGame(),
-        configured_node_budget=3,
-        completion_batch_rows=2,
-    )
-
-    assert target.child_count.tolist() == [1]
-    assert target.child_mask.tolist() == [[True, False]]
-    assert target.v_hat[0, 0].item() == pytest.approx(4.0)
-    assert target.t_mask.tolist() == [False]
-
-
-def test_size_triggered_all_child_mean_is_biased_but_protected_mean_is_not() -> None:
-    # Each branch is either small/value=0 or large/value=1 with equal chance.
-    # Start with two branches and append until total size reaches four. The
-    # stopped all-child mean overweights the small/value=0 outcome.
-    from itertools import product
-
-    naive_expectation = 0.0
-    protected_expectation = 0.0
-    for draws in product((0.0, 1.0), repeat=4):
-        sizes = [1 if value == 0.0 else 3 for value in draws]
-        stop = 2
-        while sum(sizes[:stop]) < 4:
-            stop += 1
-        probability = 0.5**4
-        naive_expectation += probability * sum(draws[:stop]) / stop
-        protected_expectation += probability * sum(draws[:2]) / 2
-
-    assert protected_expectation == pytest.approx(0.5)
-    assert naive_expectation != pytest.approx(0.5)
-
-
-def test_counterfactual_delta_corrects_parent_t_for_suppressed_children() -> None:
-    builder = TreeBuilder(1)
-    root = builder.add_root(0, 0)
-    left = builder.add_child(root, 1, 0, 0.5, 0)
-    right = builder.add_child(root, 2, 1, 0.5, 0)
-    builder.add_child(left, 3, 0, 1.0, TERMINAL)
-    builder.add_child(right, 4, 0, 1.0, TERMINAL)
-    tree = builder.finalize()
-    tree.nominal_child_count = torch.tensor([2, 2, 2, 0, 0], dtype=torch.int32)
-    leaves = torch.tensor([3, 4], dtype=torch.int32)
-    completion = BatchedCompletionStats(
-        p_hat=torch.ones((2, 1, 1)),
-        v_hat=torch.tensor([[[1.0]], [[3.0]]]),
-    )
-    decisions = torch.tensor([root, left, right], dtype=torch.int32)
-    target = streamed_branched_value(
-        tree,
-        leaves,
-        [(leaves, completion)],
-        None,
-        HeadEvals(
-            decisions,
-            torch.zeros((3, 1)),
-            t=torch.full((3,), 0.8),
-            c=torch.ones(3),
-        ),
-        1.0,
-        _OnePlayerGame(),
-        configured_node_budget=5,
-        completion_batch_rows=2,
-    )
-    # Executed sibling covariance at root is 2. Each one-child descendant
-    # contributes Delta=.8/1-.8/2=.4, giving the counterfactual target 1.6.
-    assert target.t_mask.tolist() == [True, False, False]
-    assert target.t_hat[0].item() == pytest.approx(1.6)
-    assert target.c_hat.tolist() == pytest.approx([3.0, 1.0, 1.0])
-
-
-@dataclass
 class _AdaptiveOutput:
     raw: Tensor
     v: Tensor
@@ -462,13 +277,13 @@ def test_fixed_and_dynamic_warmup_ignore_heads_then_dynamic_uses_them() -> None:
     backend = _LabeledBackend(1.0, two_levels=True)
     bundle = GameBundle(_AdaptiveModel(), backend, _Adapter(), None)
     fixed_cfg = SimpleNamespace(
-        roots_per_gpu=1, node_budget=32, branching_mode="fixed", adaptive_kkt=None
+        roots_per_gpu=1, storage_page_rows=32, branching_mode="fixed", adaptive_kkt=None
     )
     dynamic = SimpleNamespace(
         warmup_iters=3, beta_max=3.0, safe_tree_size=1000.0
     )
     dynamic_cfg = SimpleNamespace(
-        roots_per_gpu=1, node_budget=32, branching_mode="dynamic",
+        roots_per_gpu=1, storage_page_rows=32, branching_mode="dynamic",
         adaptive_kkt=dynamic,
     )
     controller = AdaptiveKKTController(
@@ -514,7 +329,7 @@ def test_queue_safeguard_is_batch_local_recovers_and_retains_counterfactual_coun
     )
     cfg = SimpleNamespace(
         roots_per_gpu=1,
-        node_budget=32,
+        storage_page_rows=32,
         branching_mode="dynamic",
         adaptive_kkt=adaptive,
     )
@@ -605,115 +420,6 @@ def test_real_mode_loss_reaches_both_heads_and_keeps_targets_detached() -> None:
     assert result.stats["trace_variance_loss_sum"] > 0
     assert result.stats["cost_loss_sum"] > 0
 
-
-@dataclass
-class _TwoPlayerGame:
-    n_players: int = 2
-    x_sizes: tuple[int, ...] = (1, 1)
-
-
-def test_tiny_cpu_rollout_reducer_optimizer_and_controller_end_to_end() -> None:
-    backend = _LabeledBackend(1.0, two_levels=True)
-    adaptive = SimpleNamespace(
-        warmup_iters=0, beta_max=3.0, safe_tree_size=5.0
-    )
-    cfg = SimpleNamespace(
-        roots_per_gpu=1, node_budget=32, branching_mode="dynamic",
-        adaptive_kkt=adaptive
-    )
-    controller = AdaptiveKKTController(
-        target_tree_size=20.0,
-        gamma_kappa=0.5,
-        eta_kappa=0.25,
-        kappa_min=1.0e-3,
-        kappa_max=1.0e6,
-        log_kappa=math.log(1000.0),
-    )
-    tree, reach, policy = sample_branched_tree(
-        GameBundle(_AdaptiveModel(), backend, _Adapter(), None),
-        cfg,
-        torch.Generator().manual_seed(8),
-        controller=controller,
-    )
-    leaves = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero().squeeze(1)
-    leaf_count = leaves.numel()
-    p_hat = torch.ones((leaf_count, 2, 1))
-    v_hat = torch.zeros_like(p_hat)
-    v_hat[:, 0, 0] = torch.arange(leaf_count, dtype=torch.float32)
-    v_hat[:, 1, 0] = -v_hat[:, 0, 0]
-    target = streamed_branched_value(
-        tree,
-        leaves.to(torch.int32),
-        [(leaves.to(torch.int32), BatchedCompletionStats(p_hat, v_hat))],
-        reach,
-        HeadEvals(policy.node_ids, policy.old_v, policy.old_t, policy.old_c),
-        1.0,
-        _TwoPlayerGame(),
-        configured_node_budget=32,
-        completion_batch_rows=leaf_count,
-    )
-    learned_row = int(target.t_mask.nonzero(as_tuple=False)[0, 0])
-    count = int(target.child_count[learned_row])
-    events = target.child_event_row[learned_row, :count]
-    old_logp = policy.old_logp_child[learned_row, :count]
-    actions = {
-        "action_ptr": torch.tensor([0, count], dtype=torch.int32),
-        "event": events,
-        "old_log_prob": old_logp,
-        "child_posterior": target.child_p_hat[learned_row, :count],
-        "advantage_hat": target.a_hat[learned_row, :count],
-    }
-    columns = {
-        "legal_event_ids": torch.tensor([[0, 1]], dtype=torch.int32),
-        "legal_event_mask": torch.ones((1, 2), dtype=torch.bool),
-        "old_value": policy.old_v[learned_row : learned_row + 1],
-        "value_hat": target.v_hat[learned_row : learned_row + 1],
-        "trace_variance_hat": target.t_hat[learned_row : learned_row + 1],
-        "trace_variance_mask": target.t_mask[learned_row : learned_row + 1],
-        "cost_hat": target.c_hat[learned_row : learned_row + 1],
-    }
-    t_logit = nn.Parameter(torch.tensor([0.0]))
-    c_logit = nn.Parameter(torch.tensor([math.log(2.0)]))
-    optimizer = torch.optim.SGD((t_logit, c_logit), lr=0.05)
-    learner_output = _LearnerOutput(
-        raw=torch.zeros((1, 1, 2), requires_grad=True),
-        v=torch.zeros((1, 1), requires_grad=True),
-        t=torch.sigmoid(t_logit),
-        c=torch.exp(c_logit),
-    )
-    loss_cfg = SimpleNamespace(
-        c_v=0.0, c_kl=0.0, clip_eps=0.2, c_h=0.0,
-        entropy_schedule="const", value_loss="mse", clip_eps_v=0.2,
-        epsilon_t=1.0e-6, c_t=1.0, c_c=1.0,
-    )
-    result = mode_loss(
-        "branched_rb",
-        SimpleNamespace(phi=lambda device: torch.tensor([0], device=device)),
-        SimpleNamespace(posterior_pool=None),
-        SimpleNamespace(columns=columns, action_columns=actions),
-        torch.tensor([0]),
-        learner_output,
-        CategoricalPolicyAdapter(),
-        loss_cfg,
-    )
-    before = (t_logit.detach().clone(), c_logit.detach().clone())
-    optimizer.zero_grad()
-    result.per_decision.sum().backward()
-    optimizer.step()
-    assert not torch.equal(t_logit.detach(), before[0])
-    assert not torch.equal(c_logit.detach(), before[1])
-    degree = tree.child_ptr[1:] - tree.child_ptr[:-1]
-    decision_ids = policy.node_ids.long()
-    counterfactual = float(tree.owner.numel()) + float(
-        (
-            (tree.nominal_child_count[decision_ids].float() - degree[decision_ids].float())
-            * policy.old_c
-        ).sum()
-    )
-    old_log_kappa = controller.log_kappa
-    controller.observe(counterfactual)
-    assert controller.log_kappa != old_log_kappa
-    assert not target.t_hat.requires_grad and not target.c_hat.requires_grad
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")

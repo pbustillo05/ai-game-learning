@@ -23,10 +23,9 @@ rollout:
   sequential_roots_per_gpu_minimum: 512
   sequential_roots_per_gpu_maximum: 2048
   beta: null
-  node_budget: 64
   family_batch_rows: 128
   max_active_trajectories: 1536
-  arena_chunk_nodes: 4096
+  storage_page_rows: 4096
   execution_memory_bytes: null
 ```
 
@@ -43,10 +42,15 @@ requires `rollout.adaptive_kkt`, follows the beta map during warmup, and enables
 T/C-driven KKT rollout control only afterward. The legacy
 `adaptive_kkt.enabled` switch is rejected.
 
-Optional `rollout.branching_min_nodes` must lie strictly between one and the
-node budget. It enables protected-cohort root refill: a public tree below the
+Optional `rollout.branching_min_nodes` must be greater than one. It enables
+protected-cohort root refill: a public tree below the
 threshold receives complete additional root-child subtrees before completion,
 while all root targets retain the ordinary pre-refill beta cohort.
+
+`storage_page_rows` is allocation granularity, not a tree-size limit. Branched
+growth admits complete selected child waves against `execution_memory_bytes`;
+cutoffs and KKT control remain scientific controls and do not stand in for
+allocator admission. The retired total-row capacity is rejected in new YAML.
 
 In sequential modes, the controller selects one common per-GPU root width from
 the phase-wise memory budget before any current-iteration draw. Unsafe evidence
@@ -87,11 +91,13 @@ tools/run-status.sh runs/nlhe_hu_32bb_sequential_rb
 tmux attach -t pbg-nlhe_hu_32bb_sequential_rb
 ```
 
-The candidate sequential-RB run checkpoints every 5 iterations. The v3
+The candidate sequential-RB run checkpoints every 5 iterations. The v5
 checkpoint includes storage/controller schema metadata, distributed logical
 RNG state, optimizer/reference schedule, loss scale, and memory-root controller
-state needed for deterministic resume. A recent unversioned v2 checkpoint is
-migrated as metadata only; incompatible or partial state is rejected on CPU
+state needed for deterministic resume. Recent v3/v4 and unversioned v2
+checkpoints are migrated as metadata only. Migration removes the retired
+allocation field without assigning its value to page or byte controls;
+incompatible or partial state is rejected on CPU
 before GPU allocation. If a selected checkpoint predates metrics already flushed after
 it, resume trims that uncheckpointed suffix and preserves it as
 `metrics.jsonl.before_resume_*.bak`.
@@ -156,7 +162,7 @@ Before CUDA work:
 2. select only idle GPUs explicitly;
 3. use the shared poker virtualenv/toolkit;
 4. start with a tiny smoke and retain the hardware-profile reserve;
-5. increase starts, node budget, completion samples, or minibatch size only
+5. increase starts, admitted execution bytes, completion samples, or minibatch size only
    after observing memory; and
 6. confirm device memory and processes return to idle afterward.
 

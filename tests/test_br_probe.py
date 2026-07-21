@@ -13,8 +13,8 @@ from pbg.config import ConfigError, load_config
 from pbg.core.checkpointing import scientific_config
 from pbg.core.game import PROBE_FOLD, EventBatch
 from pbg.core.rollout import ProbeRollout, sample_trees_sequential
-from pbg.core.tree import TreeBatch
-from pbg.core.training import _build_iteration_data, _loss_spec
+from pbg.core.tree import SampledTree
+from pbg.core.training import _build_iteration_data
 from pbg.eval.br_probe import evaluate_br_probe
 from pbg.games.poker.bundle import build_bundle
 from pbg.runtime import train
@@ -23,21 +23,46 @@ from pbg.runtime import train
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _force_fold_policy(model: torch.nn.Module) -> None:
+    """Make the checkpoint-binding integration path terminate immediately."""
+
+    with torch.no_grad():
+        for street_model in (model.preflop, model.postflop):
+            street_model.type_head.affine.weight.zero_()
+            street_model.type_head.affine.bias.copy_(
+                torch.tensor([20.0, -20.0, -20.0])
+            )
+
+
 def _probe_config(tmp_path: Path):
     raw = yaml.safe_load(
-        (ROOT / "configs/acceptance/nlhe_hu_sequential_rb.yaml").read_text()
+        (ROOT / "configs/train/nlhe_hu_32bb_rb.yaml").read_text()
     )
+    raw["game"].update(stack_bb=8.0, rank_count=4)
     raw["completion"]["backend"] = "cpu"
     raw["completion"]["n_samples"] = 4
     raw["rollout"].update(
-        sequential_roots_per_gpu_initial=4,
-        node_budget=32,
-        family_batch_rows=4,
-        max_active_trajectories=4,
-        arena_chunk_nodes=32,
+        sequential_roots_per_gpu_initial=2,
+        sequential_roots_per_gpu_minimum=2,
+        sequential_roots_per_gpu_maximum=2,
+        family_batch_rows=2,
+        max_active_trajectories=2,
+        storage_page_rows=8,
         execution_memory_bytes=1 << 28,
     )
-    raw["model"].update(d_model=32, n_heads=4, n_layers_post=1)
+    raw["model"].update(
+        d_model=8,
+        n_heads=2,
+        n_layers_pre=1,
+        n_layers_post=1,
+        m_raise=1,
+        k_act=4,
+    )
+    raw["training"].update(
+        gd_steps_per_iter=1,
+        minibatch_size=4,
+        amp=False,
+    )
     raw["probe"] = {
         "target_checkpoint": str(tmp_path / "target.pt"),
         "target_sha256": "a" * 64,
@@ -82,7 +107,7 @@ def test_probe_rollout_and_backward_retain_only_selected_player(tmp_path: Path) 
     owners = sampled.tree.owner[nodes]
     selected = sampled.seats[sampled.tree.tree_id[nodes].to(torch.int64)]
     assert torch.equal(owners, selected)
-    assert torch.equal(sampled.policy.node_ids, sampled.decision_reach.node_ids)
+    assert torch.equal(sampled.policy.node_ids, sampled.decision_inputs.node_ids)
 
     cfg.rollout.max_active_trajectories = 1
     rescheduled = sample_trees_sequential(
@@ -95,15 +120,16 @@ def test_probe_rollout_and_backward_retain_only_selected_player(tmp_path: Path) 
         cfg,
         bundle,
         torch.Generator().manual_seed(321),
-        _loss_spec(cfg),
         iteration=0,
     )
-    assert torch.equal(data.targets.node_ids, data.policy_cache.node_ids)
-    assert torch.equal(data.targets.node_ids, data.decision_reach.node_ids)
-    target_nodes = data.targets.node_ids.to(torch.int64)
-    # Compact data no longer retains the tree, so rollout ownership is checked
-    # above and exact target/cache alignment is checked here.
-    assert target_nodes.numel() > 0
+    assert data.storage is not None
+    assert data.storage.mode == "sequential_rb"
+    assert data.decision_count > 0
+    assert data.storage.posterior_pool is not None
+    assert all(
+        "state_ref" not in partition.inputs.columns
+        for partition in data.storage.partitions.values()
+    )
 
 
 def test_identical_probe_has_exact_zero_paired_gain(tmp_path: Path) -> None:
@@ -154,7 +180,7 @@ def test_probe_fold_completion_is_selected_posterior_and_public_payoff(
     folded = backend.step_player_batch(
         root, EventBatch(torch.zeros(1, dtype=torch.int32))
     )
-    tree = TreeBatch(
+    tree = SampledTree(
         parent=torch.tensor([-1], dtype=torch.int32),
         child_ptr=torch.tensor([0, 0], dtype=torch.int32),
         child_node=torch.empty(0, dtype=torch.int32),
@@ -192,6 +218,7 @@ def test_probe_checkpoint_binds_hash_allows_move_and_target_initialization(
 ) -> None:
     cfg = _probe_config(tmp_path)
     initial = build_bundle(cfg, torch.device("cpu"))
+    _force_fold_policy(initial.model)
     target = tmp_path / "target.pt"
     target_config = scientific_config(cfg)
     target_config.pop("probe")
@@ -211,8 +238,8 @@ def test_probe_checkpoint_binds_hash_allows_move_and_target_initialization(
     checkpoint = Path(cfg.training.out_dir) / "ckpt_0000001.pt"
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     assert payload["probe_target"]["sha256"] == digest
-    assert payload["logical_work"]["trajectories"] == 4
-    assert payload["logical_work"]["completion_samples"] == 16
+    assert payload["logical_work"]["trajectories"] == 2
+    assert payload["logical_work"]["completion_samples"] == 8
     assert payload["logical_work"]["minibatches"] >= 1
     assert payload["logical_work"]["optimizer_steps"] == 1
     for name, value in initial.model.state_dict().items():

@@ -30,10 +30,8 @@
   production learner owns it.
 - `completion.py` — completion DTOs, learning-field filtering, and backend
   protocol.
-- `values.py` — sole streamed posterior-mass/value reduction and RB targets.
-- `normal.py`, `minibatch.py` — rollout-to-seal compatibility producers; they
-  do not cross the immutable production learner boundary.
-- `losses.py` — PPO/RB-PPO, value, entropy, reference KL, and metrics.
+- `losses.py` — loss-name/mode registry and entropy schedule shared with the
+  streamed learner.
 - `distributed.py` — exact decision-mass scaling helpers.
 - `optimization.py` — flat gradient SUM, common finite decision, clipping,
   optimizer mutation, and scaler transition.
@@ -49,10 +47,10 @@
 
 - `cards.py` — compact deck/combo/class geometry and masks.
 - `engine.py` — independent CPU public NLHE navigation and pot accounting.
-- `tensor_state.py` — preallocated device public-state and binary-lift history
-  storage.
+- `tensor_state.py` — recyclable paged public-state and refcounted binary-lift
+  history storage.
 - `model_inputs.py` — bounded batched device history materialization.
-- `partition_cache.py` — fixed device-indexed folded-summary cache.
+- `partition_cache.py` — sparse paged folded-summary dependencies.
 - `policy_planning.py` — hardware-bounded family packing and declared scheduler
   control transfer.
 - `rollout_backend.py` — tensor transitions, family inputs/forwards, reach
@@ -68,8 +66,8 @@
 ## Configuration
 
 - `configs/train/` — production and conservative smoke/gate training presets.
-- `configs/acceptance/` — tiny one- and two-rank all-mode acceptance presets.
-- `configs/benchmarks/` — production profiling workloads.
+- `configs/experiments/` — profiling, variance, smoke, and optimization
+  workloads.
 - `configs/hardware/` — local RTX 2080 Ti and Quest execution envelopes.
 
 Every active scientific YAML uses direct `game.n_players`, `stack_bb`, and
@@ -107,9 +105,10 @@ lifecycle phases and must use its exact future Python object names.
   and device primitives.
 - `test_p2_*` through `test_p7_*` — NLHE rules, compact deck, ranges, evaluator,
   model, and adapter.
-- `test_p8_*`, `test_p9_branching.py`, `test_p10_values.py` — topology,
-  rollout, branching, and streamed target laws.
-- `test_p11_*` — losses, checkpointing, reference policy, epochs, and memory.
+- `test_p8_*`, `test_p9_branching.py`, and `test_refactor_storage_targets.py` —
+  topology, rollout, branching, and streamed target laws.
+- `test_distributed_learner.py`, `test_phase3_migration.py`, and memory-control
+  suites — loss, checkpoint, reference-policy, epoch, and memory contracts.
 - `test_p12_eval.py` — duplicate-deal arena.
 - `test_p13a_gpu_rollout.py` — tensor/CUDA rollout, completion, memory, and
   all-mode integration.
@@ -117,7 +116,8 @@ lifecycle phases and must use its exact future Python object names.
   training/resume, unequal distributed mass, and finite gradient reduction.
 - `test_inference_api.py` — artifact, stateful batch, folded CPU boundary, and
   real MPS parity contracts.
-- `test_c09_*` through `test_c11_*` — corrected branching/value/loss laws.
+- `test_c09_*` and adaptive-branching suites — corrected branching, dynamic
+  $T/C$, queue-correction, and protected-root laws.
 
 ## Archive
 

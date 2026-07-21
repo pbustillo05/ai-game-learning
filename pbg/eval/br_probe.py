@@ -68,40 +68,19 @@ def _selected_reward(
     gen: torch.Generator,
 ) -> Tensor:
     if isinstance(sampled, ProbeRollout):
-        tree, profiles = sampled.tree, sampled.root_profiles
+        tree, leaf_rows = sampled.tree, sampled.leaf_reach
     else:
-        tree, _, _, profiles = sampled
+        tree, leaf_rows, _, _ = sampled
     leaf = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero(
         as_tuple=False
     ).squeeze(1)
     leaf_tree = tree.tree_id[leaf].to(torch.int64)
     leaf_seats = seats[leaf_tree].to(torch.int64)
+    del bundle, cfg, gen
+    reward = leaf_rows.payload_for(leaf.to(torch.int32))["reward"]
     result = torch.empty(seats.shape[0], dtype=torch.float32, device=seats.device)
-    cutoff = tree.owner[leaf] == PROBE_FOLD
-    if bool(cutoff.any()):
-        positions = cutoff.nonzero(as_tuple=False).squeeze(1)
-        states = tree.state_ref[leaf[positions]].to(torch.int64)
-        result[leaf_tree[positions]] = -bundle.rollout_backend.states.committed_total[
-            states, leaf_seats[positions]
-        ]
-    ordinary = ~cutoff
-    if bool(ordinary.any()):
-        positions = ordinary.nonzero(as_tuple=False).squeeze(1)
-        selected_leaf = leaf[positions]
-        keys = sequential_leaf_logical_rng_keys(
-            tree,
-            cfg,
-            gen,
-            leaf,
-            iteration=0,
-            purpose=DrawPurpose.COMPLETION,
-            draw=1,
-        )[positions]
-        reward = bundle.rollout_backend.sampled_terminal_reward_keyed(
-            tree.state_ref[selected_leaf], profiles[leaf_tree[positions]], keys
-        )
-        rows = torch.arange(positions.numel(), device=seats.device)
-        result[leaf_tree[positions]] = reward[rows, leaf_seats[positions]]
+    rows = torch.arange(leaf.numel(), device=seats.device)
+    result[leaf_tree] = reward[rows, leaf_seats]
     return result
 
 

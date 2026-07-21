@@ -32,16 +32,11 @@ def _controller() -> SequentialMemoryController:
     )
 
 
-def test_repository_configs_use_explicit_per_gpu_root_contract() -> None:
+def test_repository_sequential_config_uses_explicit_per_gpu_root_contract() -> None:
     adaptive = load_config("configs/train/nlhe_hu_32bb_rb.yaml")
-    assert adaptive.rollout.sequential_roots_per_gpu_initial == 2_048
+    assert adaptive.rollout.sequential_roots_per_gpu_initial == 2_560
     assert adaptive.rollout.sequential_roots_per_gpu_minimum == 512
-    assert adaptive.rollout.sequential_roots_per_gpu_maximum == 2_560
-
-    fixed = load_config("configs/acceptance/nlhe_hu_sequential_rb.yaml")
-    assert fixed.rollout.sequential_roots_per_gpu_initial == 17
-    assert fixed.rollout.sequential_roots_per_gpu_minimum == 17
-    assert fixed.rollout.sequential_roots_per_gpu_maximum == 17
+    assert adaptive.rollout.sequential_roots_per_gpu_maximum == 3_072
 
 
 def test_obsolete_global_and_decision_target_fields_are_rejected(tmp_path) -> None:
@@ -53,7 +48,7 @@ rollout:
   sequential_starts: 8
   target_decisions_per_gpu: 100
   beta: null
-  node_budget: 100
+  storage_page_rows: 100
 completion: {n_samples: 2, backend: cpu}
 model: {}
 loss:

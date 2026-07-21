@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +30,7 @@ def _scaler():
 
 
 def test_checkpoint_v3_and_recent_legacy_metadata_migration(tmp_path: Path) -> None:
-    cfg = load_config("configs/acceptance/nlhe_hu_normal.yaml")
+    cfg = load_config("configs/train/nlhe_hu_32bb_rb.yaml")
     model = torch.nn.Linear(2, 1)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     generator = torch.Generator().manual_seed(7)
@@ -43,6 +44,18 @@ def test_checkpoint_v3_and_recent_legacy_metadata_migration(tmp_path: Path) -> N
     assert restored["iter"] == 3
 
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    previous = copy.deepcopy(payload)
+    previous["checkpoint_schema_version"] = "pbg-checkpoint-v4"
+    previous["storage_schema_version"] = "pbg-training-storage-v1"
+    retired_field = "node" + "_budget"
+    previous["config"]["rollout"][retired_field] = 4096
+    previous_path = tmp_path / "previous.pt"
+    torch.save(previous, previous_path)
+    previous_header = inspect_checkpoint(previous_path)
+    assert previous_header["migrated_from_checkpoint_schema"] == "pbg-checkpoint-v4"
+    assert retired_field not in previous_header["config"]["rollout"]
+    assert previous_header["configuration_schema_transitions"]
+
     for key in (
         "checkpoint_schema_version",
         "storage_schema_version",

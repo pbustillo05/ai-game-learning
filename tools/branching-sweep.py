@@ -16,7 +16,11 @@ from pathlib import Path
 import torch
 
 from pbg.config import load_config
-from pbg.core.branching import BranchingCutoffReached, sample_branched_tree
+from pbg.core.branching import (
+    BranchingCutoffReached,
+    BranchingDiagnosticLimits,
+    sample_branched_tree,
+)
 from pbg.core.config import seed_all
 from pbg.runtime import build_game_bundle
 
@@ -68,29 +72,27 @@ def _summary(samples: list[dict[str, object]]) -> dict[str, dict[str, float]]:
     return result
 
 
-def _street_geometry(
-    backend: object, state_refs: torch.Tensor, owners: torch.Tensor
-) -> dict[str, float]:
-    states = getattr(backend, "states", None)
-    street_rows = getattr(states, "street", None)
-    if not isinstance(street_rows, torch.Tensor):
+def _decision_street_geometry(policy: object) -> dict[str, float]:
+    captured = getattr(policy, "decision_inputs", None)
+    inputs = getattr(captured, "inputs", None)
+    partition_id = getattr(captured, "partition_id", None)
+    partition_row = getattr(captured, "partition_row", None)
+    if not isinstance(inputs, dict) and not hasattr(inputs, "items"):
         return {}
-    street = street_rows[state_refs.to(torch.int64)].to(torch.int64).clamp(0, 3)
-    all_counts = torch.bincount(street, minlength=4)
-    decision = (owners >= 0) & (owners < int(backend.n_players))
-    decision_counts = torch.bincount(street[decision], minlength=4)
-    all_host = all_counts.to("cpu").tolist()
+    street = torch.empty(
+        partition_id.numel(), dtype=torch.int64, device=partition_id.device
+    )
+    for pid, block in inputs.items():
+        selected = partition_id == int(pid)
+        street[selected] = block["street"][
+            partition_row[selected].to(torch.int64)
+        ].to(torch.int64)
+    decision_counts = torch.bincount(street.clamp(0, 3), minlength=4)
     decision_host = decision_counts.to("cpu").tolist()
     labels = ("preflop", "flop", "turn", "river")
     return {
-        **{
-            f"nodes_{label}": float(all_host[index])
-            for index, label in enumerate(labels)
-        },
-        **{
-            f"decision_nodes_{label}": float(decision_host[index])
-            for index, label in enumerate(labels)
-        },
+        f"decision_nodes_{label}": float(decision_host[index])
+        for index, label in enumerate(labels)
     }
 
 
@@ -103,7 +105,8 @@ def main() -> None:
     parser.add_argument("--beta", type=float, action="append", required=True)
     parser.add_argument("--repeats", type=int, default=32)
     parser.add_argument("--start-repeat", type=int, default=0)
-    parser.add_argument("--node-budget", type=int, default=4096)
+    parser.add_argument("--storage-page-rows", type=int, default=256)
+    parser.add_argument("--execution-memory-bytes", type=int, default=None)
     parser.add_argument("--upper-cutoff", type=int, default=None)
     parser.add_argument("--stop-cutoff", type=int, default=None)
     parser.add_argument("--lower-cutoff", type=int, default=None)
@@ -111,18 +114,20 @@ def main() -> None:
     parser.add_argument("--hard-memory-bytes", type=int, default=None)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
-    if args.repeats <= 0 or args.node_budget <= 0:
-        parser.error("repeats and node-budget must be positive")
+    if args.repeats <= 0 or args.storage_page_rows <= 0:
+        parser.error("repeats and storage-page-rows must be positive")
     if not 0 <= args.start_repeat < args.repeats:
         parser.error("start-repeat must be nonnegative and below repeats")
     if args.hard_memory_bytes is not None and args.hard_memory_bytes <= 0:
         parser.error("hard-memory-bytes must be positive")
-    if args.upper_cutoff is not None and not 1 < args.upper_cutoff < args.node_budget:
-        parser.error("upper-cutoff must be strictly between one and node-budget")
-    if args.stop_cutoff is not None and not 1 < args.stop_cutoff < args.node_budget:
-        parser.error("stop-cutoff must be strictly between one and node-budget")
-    if args.lower_cutoff is not None and not 0 < args.lower_cutoff < args.node_budget:
-        parser.error("lower-cutoff must be positive and below node-budget")
+    if args.execution_memory_bytes is not None and args.execution_memory_bytes <= 0:
+        parser.error("execution-memory-bytes must be positive")
+    if args.upper_cutoff is not None and args.upper_cutoff <= 1:
+        parser.error("upper-cutoff must be greater than one")
+    if args.stop_cutoff is not None and args.stop_cutoff <= 1:
+        parser.error("stop-cutoff must be greater than one")
+    if args.lower_cutoff is not None and args.lower_cutoff <= 0:
+        parser.error("lower-cutoff must be positive")
     if (
         args.lower_cutoff is not None
         and args.upper_cutoff is not None
@@ -140,7 +145,8 @@ def main() -> None:
     cfg.rollout.sequential_roots_per_gpu_initial = 1
     cfg.rollout.sequential_roots_per_gpu_minimum = 1
     cfg.rollout.sequential_roots_per_gpu_maximum = 1
-    cfg.rollout.node_budget = args.node_budget
+    cfg.rollout.storage_page_rows = args.storage_page_rows
+    cfg.rollout.execution_memory_bytes = args.execution_memory_bytes
     cfg.rollout.beta = {"default": 1.0}
     cfg.rollout.branching_mode = "fixed"
     cfg.rollout.adaptive_kkt = None
@@ -153,8 +159,10 @@ def main() -> None:
     cfg.model["use_branching_heads"] = True
     cfg.loss.c_t = cfg.loss.c_t or 1.0
     cfg.loss.c_c = cfg.loss.c_c or 1.0
-    cfg.rollout.branching_upper_cutoff_nodes = args.upper_cutoff
-    cfg.rollout.branching_stop_cutoff_nodes = args.stop_cutoff
+    diagnostic_limits = BranchingDiagnosticLimits(
+        upper_nodes=args.upper_cutoff,
+        stop_nodes=args.stop_cutoff,
+    )
     cfg.completion.n_samples = cfg.completion.n_samples or 64
 
     device = torch.device(args.device)
@@ -203,7 +211,12 @@ def main() -> None:
             try:
                 with torch.inference_mode():
                     tree, reach, policy = sample_branched_tree(
-                        bundle, cfg, generator, iteration=0, diagnostics=diagnostics
+                        bundle,
+                        cfg,
+                        generator,
+                        iteration=0,
+                        diagnostics=diagnostics,
+                        diagnostic_limits=diagnostic_limits,
                     )
             except BranchingCutoffReached as caught:
                 cutoff = caught
@@ -231,7 +244,7 @@ def main() -> None:
                     "queued_nodes": 0.0,
                     "frontier_nodes": 0.0,
                     "family_queue_nodes": {},
-                    **_street_geometry(backend, tree.state_ref, tree.owner),
+                    **_decision_street_geometry(policy),
                 }
             else:
                 geometry = {
@@ -247,9 +260,6 @@ def main() -> None:
                     "queued_nodes": float(cutoff.queued_nodes),
                     "frontier_nodes": float(cutoff.frontier_nodes),
                     "family_queue_nodes": cutoff.family_queue_nodes,
-                    **_street_geometry(
-                        backend, cutoff.state_refs, cutoff.owners
-                    ),
                 }
             sample = {
                     **geometry,
@@ -343,7 +353,8 @@ def main() -> None:
             "compute_capability": [props.major, props.minor],
             "total_memory_bytes": props.total_memory,
         },
-        "node_budget": args.node_budget,
+        "storage_page_rows": args.storage_page_rows,
+        "execution_memory_bytes": args.execution_memory_bytes,
         "analytical_rollout_memory_plan": asdict(backend.rollout_memory_plan),
         "analytical_rollout_peak_bytes": backend.rollout_memory_plan.peak_bytes,
         "upper_cutoff": args.upper_cutoff,

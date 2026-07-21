@@ -10,10 +10,18 @@ import torch
 from torch import Tensor
 
 from pbg.core.game import CHANCE, PRETERM, PROBE_FOLD, TERMINAL
+from pbg.core.storage import (
+    ByteAccountant,
+    PagedTensorArena,
+    PagedTensorColumn,
+    TensorFieldSchema,
+    TensorSchema,
+    admit_arena_growth,
+)
 
 
 @dataclass
-class TreeBatch:
+class SampledTree:
     """CSR rollout topology: trajectories or one sampled branching tree.
 
     ``depth_p[node, p]`` counts the ``p``-owned nodes on the path through
@@ -228,7 +236,7 @@ class TreeBatch:
                 )
 
 
-class TreeBuilder:
+class DiagnosticTreeBuilder:
     """Append-only builder used by frontier rollout construction."""
 
     def __init__(self, n_players: int):
@@ -296,7 +304,7 @@ class TreeBuilder:
 
     append_child = add_child
 
-    def finalize(self) -> TreeBatch:
+    def finalize(self) -> SampledTree:
         """Materialize contiguous tensors and compute depths/path weights."""
 
         n = len(self.parents)
@@ -325,7 +333,7 @@ class TreeBuilder:
                 depth_p[node, owner] += 1
                 depth_player[node] += 1
 
-        result = TreeBatch(
+        result = SampledTree(
             parent=torch.tensor(self.parents, dtype=torch.int32),
             child_ptr=torch.tensor(child_ptr, dtype=torch.int32),
             child_node=torch.tensor(child_node, dtype=torch.int32),
@@ -342,119 +350,132 @@ class TreeBuilder:
         return result
 
 
-class DeviceTreeBuffer:
-    """Preallocated device-resident storage for a batch of rollout trees.
 
-    Node capacity is ``root_count * node_budget`` and edge capacity is that value
-    minus ``root_count``.  Roots always occupy the first ``root_count`` rows.
-    """
+class PagedTreeSource:
+    """Append-only page-backed scheduler topology and public-state handles."""
+
+    @staticmethod
+    def node_schema(n_players: int) -> TensorSchema:
+        return TensorSchema(
+            "rollout_topology_nodes",
+            (
+                TensorFieldSchema("parent", torch.int32, fill=-1, alignment=4),
+                TensorFieldSchema("tree_id", torch.int32, alignment=4),
+                TensorFieldSchema("owner", torch.int32, alignment=4),
+                TensorFieldSchema("state_ref", torch.int32, fill=-1, alignment=4),
+                TensorFieldSchema("depth_p", torch.int32, (n_players,), alignment=16),
+                TensorFieldSchema("depth_player", torch.int32, alignment=4),
+                TensorFieldSchema("path_weight", torch.float32, alignment=4),
+                TensorFieldSchema("child_count", torch.int32, alignment=4),
+            ),
+            chunk_header_bytes=64,
+            allocator_slack_bytes=64,
+        )
+
+    @staticmethod
+    def edge_schema() -> TensorSchema:
+        return TensorSchema(
+            "rollout_topology_edges",
+            (
+                TensorFieldSchema("edge_parent", torch.int32, alignment=4),
+                TensorFieldSchema("edge_ordinal", torch.int32, alignment=4),
+                TensorFieldSchema("child_node", torch.int32, alignment=4),
+                TensorFieldSchema("child_event", torch.int32, alignment=4),
+                TensorFieldSchema("edge_weight", torch.float32, alignment=4),
+            ),
+            chunk_header_bytes=64,
+            allocator_slack_bytes=64,
+        )
 
     def __init__(
         self,
         root_count: int,
-        node_budget: int,
         n_players: int,
         device: torch.device | str,
+        *,
+        page_rows: int = 256,
+        accountant: ByteAccountant | None = None,
     ) -> None:
-        if root_count < 0 or node_budget <= 0 or n_players <= 0:
-            raise ValueError("root_count must be nonnegative and budgets must be positive")
+        if root_count < 0 or n_players <= 0 or page_rows <= 0:
+            raise ValueError("paged tree dimensions must be nonnegative/positive")
         self.root_count = int(root_count)
-        self.node_budget = int(node_budget)
         self.n_players = int(n_players)
         self.device = torch.device(device)
-        self.node_capacity = self.root_count * self.node_budget
-        self.edge_capacity = self.node_capacity - self.root_count
-        self.node_count = 0
-        self.edge_count = 0
+        self.nodes = PagedTensorArena(
+            self.node_schema(n_players),
+            page_rows,
+            self.device,
+            accountant=accountant,
+            label="rollout_topology_nodes",
+        )
+        self.edges = PagedTensorArena(
+            self.edge_schema(),
+            page_rows,
+            self.device,
+            accountant=accountant,
+            label="rollout_topology_edges",
+        )
+        for name in self.nodes.schema.by_name:
+            setattr(self, name, PagedTensorColumn(self.nodes, name))
+        for name in self.edges.schema.by_name:
+            setattr(self, name, PagedTensorColumn(self.edges, name))
 
-        self.parent = torch.full(
-            (self.node_capacity,), -1, dtype=torch.int32, device=self.device
-        )
-        self.tree_id = torch.empty(
-            self.node_capacity, dtype=torch.int32, device=self.device
-        )
-        self.owner = torch.empty(
-            self.node_capacity, dtype=torch.int32, device=self.device
-        )
-        self.state_ref = torch.empty(
-            self.node_capacity, dtype=torch.int32, device=self.device
-        )
-        self.depth_p = torch.zeros(
-            (self.node_capacity, self.n_players), dtype=torch.int32, device=self.device
-        )
-        self.depth_player = torch.zeros(
-            self.node_capacity, dtype=torch.int32, device=self.device
-        )
-        self.path_weight = torch.empty(
-            self.node_capacity, dtype=torch.float32, device=self.device
-        )
-        self.edge_parent = torch.empty(
-            self.edge_capacity, dtype=torch.int32, device=self.device
-        )
-        self.child_count = torch.zeros(
-            self.node_capacity, dtype=torch.int32, device=self.device
-        )
-        self.edge_ordinal = torch.empty(
-            self.edge_capacity, dtype=torch.int32, device=self.device
-        )
-        self.child_node = torch.empty(
-            self.edge_capacity, dtype=torch.int32, device=self.device
-        )
-        self.child_event = torch.empty(
-            self.edge_capacity, dtype=torch.int32, device=self.device
-        )
-        self.edge_weight = torch.empty(
-            self.edge_capacity, dtype=torch.float32, device=self.device
-        )
+    @property
+    def node_count(self) -> int:
+        return self.nodes.size
+
+    @property
+    def edge_count(self) -> int:
+        return self.edges.size
+
+    @property
+    def allocated_capacity_bytes(self) -> int:
+        return self.nodes.allocated_capacity_bytes + self.edges.allocated_capacity_bytes
 
     def add_roots(self, states: Tensor, owners: Tensor) -> Tensor:
-        """Store int32 root ``states``/``owners`` ``[G]`` and return node ids."""
-
         if states.shape != (self.root_count,) or owners.shape != (self.root_count,):
             raise ValueError("root tensors must have shape [root_count]")
         if states.device != self.device or owners.device != self.device:
-            raise ValueError("root tensors must be on the buffer device")
-        ids = torch.arange(self.root_count, dtype=torch.int32, device=self.device)  # [G]
-        self.state_ref[: self.root_count] = states.to(torch.int32)
-        self.owner[: self.root_count] = owners.to(torch.int32)
-        self.tree_id[: self.root_count] = ids
-        root_owners = owners.to(torch.int64)
-        player_mask = (root_owners >= 0) & (root_owners < self.n_players)
-        self.depth_p[: self.root_count].zero_()
-        safe_owner = root_owners.clamp(0, self.n_players - 1)
-        self.depth_p[ids.to(torch.int64), safe_owner] = player_mask.to(torch.int32)
-        self.depth_player[: self.root_count] = player_mask.to(torch.int32)
-        self.path_weight[: self.root_count] = 1.0
-        self.node_count = self.root_count
-        return ids
+            raise ValueError("root tensors must be on the topology device")
+        ids = torch.arange(self.root_count, dtype=torch.int32, device=self.device)
+        owner64 = owners.to(torch.int64)
+        player = (owner64 >= 0) & (owner64 < self.n_players)
+        depth = torch.zeros(
+            (self.root_count, self.n_players), dtype=torch.int32, device=self.device
+        )
+        if self.root_count:
+            depth.scatter_(
+                1,
+                owner64.clamp(0, self.n_players - 1)[:, None],
+                player.to(torch.int32)[:, None],
+            )
+        rows = self.nodes.append(
+            {
+                "parent": torch.full_like(ids, -1),
+                "tree_id": ids,
+                "owner": owners.to(torch.int32),
+                "state_ref": states.to(torch.int32),
+                "depth_p": depth,
+                "depth_player": player.to(torch.int32),
+                "path_weight": torch.ones(self.root_count, device=self.device),
+                "child_count": torch.zeros(
+                    self.root_count, dtype=torch.int32, device=self.device
+                ),
+            }
+        )
+        return rows.to(torch.int32)
 
     append_roots = add_roots
 
     def require_child_capacity(self, count: int | Tensor) -> None:
-        """Fail before a wave allocates expanded child/state/reach tensors."""
+        """Validate a wave count; append admits its realized page extents."""
 
-        remaining = min(
-            self.node_capacity - self.node_count,
-            self.edge_capacity - self.edge_count,
-        )
         if isinstance(count, Tensor):
             if count.numel() != 1:
                 raise ValueError("child count must be scalar")
-            condition = count <= remaining
-            if count.device.type == "cuda":
-                torch._assert_async(
-                    condition,
-                    "DeviceTreeBuffer overflow before child expansion",
-                )
-                return
-            count = int(count)
-        if int(count) > remaining:
-            raise RuntimeError(
-                "DeviceTreeBuffer overflow before child expansion: "
-                f"requested nodes={self.node_count + int(count)}, "
-                f"edges={self.edge_count + int(count)}; capacity "
-                f"nodes={self.node_capacity}, edges={self.edge_capacity}"
-            )
+            torch._assert_async(count >= 0, "child count must be nonnegative")
+        elif isinstance(count, bool) or int(count) < 0:
+            raise ValueError("child count must be nonnegative")
 
     def append_children(
         self,
@@ -464,118 +485,109 @@ class DeviceTreeBuffer:
         events: Tensor,
         weights: Tensor,
     ) -> Tensor:
-        """Append flattened parent-major child rows and return int32 node ids.
-
-        All arguments are one-dimensional ``[C_new]`` tensors.  Device prefix
-        sums assign contiguous child and edge rows without per-node mutation.
-        """
-
-        count = parents.numel()
+        count = int(parents.numel())
         if any(value.shape != (count,) for value in (states, owners, events, weights)):
             raise ValueError("child append tensors must all have shape [C_new]")
         if any(value.device != self.device for value in (parents, states, owners, events, weights)):
-            raise ValueError("child append tensors must be on the buffer device")
-        requested_nodes = self.node_count + count
-        requested_edges = self.edge_count + count
-        if requested_nodes > self.node_capacity or requested_edges > self.edge_capacity:
-            raise RuntimeError(
-                "DeviceTreeBuffer overflow: "
-                f"requested nodes={requested_nodes}, edges={requested_edges}; "
-                f"capacity nodes={self.node_capacity}, edges={self.edge_capacity}"
-            )
+            raise ValueError("child append tensors must be on the topology device")
         if count == 0:
             return torch.empty(0, dtype=torch.int32, device=self.device)
-
-        offsets = torch.cumsum(
-            torch.ones(count, dtype=torch.int32, device=self.device), dim=0
-        ).to(torch.int32) - 1  # [C_new]
-        nodes = offsets + self.node_count  # [C_new]
-        edges = offsets.to(torch.int64) + self.edge_count  # [C_new]
-        node_rows = nodes.to(torch.int64)
+        admit_arena_growth({self.nodes: count, self.edges: count})
         parent_rows = parents.to(torch.int64)
-        self.parent[node_rows] = parents.to(torch.int32)
-        self.state_ref[node_rows] = states.to(torch.int32)
-        self.owner[node_rows] = owners.to(torch.int32)
-        self.tree_id[node_rows] = self.tree_id[parent_rows]
-        self.depth_p[node_rows] = self.depth_p[parent_rows]
-        child_owner = owners.to(torch.int64)
-        player_mask = (child_owner >= 0) & (child_owner < self.n_players)  # [C_new]
-        increments = torch.zeros(
-            (count, self.n_players), dtype=torch.int32, device=self.device
-        )  # [C_new,P]
-        safe_owner = child_owner.clamp(0, self.n_players - 1)
-        increments.scatter_(1, safe_owner[:, None], player_mask.to(torch.int32)[:, None])
-        self.depth_p[node_rows] += increments
-        self.depth_player[node_rows] = (
-            self.depth_player[parent_rows] + player_mask.to(torch.int32)
-        )
-        self.path_weight[node_rows] = self.path_weight[parent_rows] * weights.float()
-
-        # ``parents`` is parent-major by contract.  Retain the stable ordinal of
-        # every abstract child so finalization can scatter edges directly into
-        # CSR order even when family-scheduled execution expands parents across depths.
+        parent_tree = self.tree_id[parent_rows]
+        parent_depth = self.depth_p[parent_rows]
+        parent_player_depth = self.depth_player[parent_rows]
+        parent_weight = self.path_weight[parent_rows]
+        current_count = self.child_count[parent_rows]
         local_rows = torch.arange(count, dtype=torch.int32, device=self.device)
         group_start = torch.zeros(count, dtype=torch.int32, device=self.device)
-        group_start[0] = 0
         if count > 1:
-            starts = parents[1:] != parents[:-1]
-            group_start[1:] = torch.where(starts, local_rows[1:], 0)
+            group_start[1:] = torch.where(
+                parents[1:] != parents[:-1], local_rows[1:], 0
+            )
         group_start = torch.cummax(group_start, dim=0).values
         local_ordinal = local_rows - group_start
-        child_base = self.child_count[parent_rows]
-
-        self.edge_parent[edges] = parents.to(torch.int32)
-        self.edge_ordinal[edges] = child_base + local_ordinal
-        self.child_node[edges] = nodes
-        self.child_event[edges] = events.to(torch.int32)
-        self.edge_weight[edges] = weights.float()
-        self.child_count.index_add_(
-            0,
-            parent_rows,
-            torch.ones(count, dtype=torch.int32, device=self.device),
+        child_owner = owners.to(torch.int64)
+        player = (child_owner >= 0) & (child_owner < self.n_players)
+        increments = torch.zeros_like(parent_depth)
+        increments.scatter_(
+            1,
+            child_owner.clamp(0, self.n_players - 1)[:, None],
+            player.to(torch.int32)[:, None],
         )
-        self.node_count = requested_nodes
-        self.edge_count = requested_edges
+        expected_nodes = torch.arange(
+            self.node_count,
+            self.node_count + count,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        nodes = self.nodes.append(
+            {
+                "parent": parents.to(torch.int32),
+                "tree_id": parent_tree.to(torch.int32),
+                "owner": owners.to(torch.int32),
+                "state_ref": states.to(torch.int32),
+                "depth_p": parent_depth + increments,
+                "depth_player": parent_player_depth + player.to(torch.int32),
+                "path_weight": parent_weight * weights.float(),
+                "child_count": torch.zeros(count, dtype=torch.int32, device=self.device),
+            }
+        ).to(torch.int32)
+        if not torch.equal(nodes, expected_nodes):
+            raise RuntimeError("paged topology node ids lost monotone order")
+        self.edges.append(
+            {
+                "edge_parent": parents.to(torch.int32),
+                "edge_ordinal": current_count + local_ordinal,
+                "child_node": nodes,
+                "child_event": events.to(torch.int32),
+                "edge_weight": weights.float(),
+            }
+        )
+        unique_parents, run_counts = torch.unique_consecutive(
+            parent_rows, return_counts=True
+        )
+        updated = self.child_count[unique_parents] + run_counts.to(torch.int32)
+        self.nodes.write(unique_parents, {"child_count": updated})
         return nodes
 
-    def finalize(self) -> TreeBatch:
-        """Return device views truncated to the realized node/edge counts."""
-
-        n = self.node_count
-        c = self.edge_count
-        edge_parent = self.edge_parent[:c].to(torch.int64)  # [C]
-        counts = self.child_count[:n]  # [N]
-        child_ptr = torch.cat(
-            (
-                torch.zeros(1, dtype=torch.int32, device=self.device),
-                torch.cumsum(counts, dim=0).to(torch.int32),
-            )
-        )  # [N+1]
-        # Queued execution can finish a deeper occurrence before an older
-        # occurrence in another family.  Stable ordinals recorded at expansion
-        # make this a direct O(C) scatter, with no label sort or host transfer.
-        edge_destination = (
-            child_ptr[edge_parent] + self.edge_ordinal[:c]
+    def finalize(self) -> SampledTree:
+        node_rows = torch.arange(self.node_count, device=self.device)
+        edge_rows = torch.arange(self.edge_count, device=self.device)
+        node = {name: self.nodes.gather(name, node_rows) for name in self.nodes.schema.by_name}
+        edge = {name: self.edges.gather(name, edge_rows) for name in self.edges.schema.by_name}
+        child_ptr = torch.empty(
+            self.node_count + 1, dtype=torch.int32, device=self.device
+        )
+        child_ptr[0] = 0
+        child_ptr[1:] = node["child_count"].cumsum(0).to(torch.int32)
+        destination = (
+            child_ptr[edge["edge_parent"].to(torch.int64)]
+            + edge["edge_ordinal"]
         ).to(torch.int64)
-        child_node = torch.empty_like(self.child_node[:c])
-        child_event = torch.empty_like(self.child_event[:c])
-        edge_weight = torch.empty_like(self.edge_weight[:c])
-        child_node[edge_destination] = self.child_node[:c]
-        child_event[edge_destination] = self.child_event[:c]
-        edge_weight[edge_destination] = self.edge_weight[:c]
-        return TreeBatch(
-            parent=self.parent[:n],
+        child_node = torch.empty_like(edge["child_node"])
+        child_event = torch.empty_like(edge["child_event"])
+        edge_weight = torch.empty_like(edge["edge_weight"])
+        child_node[destination] = edge["child_node"]
+        child_event[destination] = edge["child_event"]
+        edge_weight[destination] = edge["edge_weight"]
+        return SampledTree(
+            parent=node["parent"],
             child_ptr=child_ptr,
             child_node=child_node,
             child_event=child_event,
             nu=edge_weight,
-            tree_id=self.tree_id[:n],
-            owner=self.owner[:n],
-            depth_p=self.depth_p[:n],
-            depth_player=self.depth_player[:n],
-            state_ref=self.state_ref[:n],
-            path_weight=self.path_weight[:n],
+            tree_id=node["tree_id"],
+            owner=node["owner"],
+            depth_p=node["depth_p"],
+            depth_player=node["depth_player"],
+            state_ref=node["state_ref"],
+            path_weight=node["path_weight"],
         )
+
+    def release(self) -> None:
+        self.nodes.release()
+        self.edges.release()
 
 
 @dataclass
@@ -657,7 +669,7 @@ class AliasTable:
         return self.outcomes[columns].to(torch.int32)
 
 
-def build_decision_alias(tree: TreeBatch) -> AliasTable:
+def build_decision_alias(tree: SampledTree) -> AliasTable:
     """Build the length-biased decision law over decision-row indices."""
 
     p_max = tree.depth_p.shape[1]
@@ -668,25 +680,37 @@ def build_decision_alias(tree: TreeBatch) -> AliasTable:
 
 
 @dataclass
-class PolicyCache:
-    """Frozen rollout outputs for the stored children of player nodes."""
+class RolloutDecisionRows:
+    """Frozen decision outputs with one exact ragged row per retained action."""
 
-    node_ids: Tensor  # int32 [Nd]
-    old_logp_child: Tensor  # float32 [Nd,E,X]
-    old_v: Tensor  # float32 [Nd,X]
-    decision_reach: Any | None = None  # zero-copy-compatible natural input owner
+    node_ids: Tensor  # int32 [D]
+    action_ptr: Tensor  # int32 [D+1]
+    action_event: Tensor  # int32 [A]
+    old_logp_action: Tensor  # float32 [A,X]
+    old_v: Tensor  # float32 [D,X]
+    decision_inputs: Any | None = None  # zero-copy-compatible natural input owner
     old_t: Tensor | None = None  # float32 [Nd]
     old_c: Tensor | None = None  # float32 [Nd]
 
     def __post_init__(self) -> None:
         if self.node_ids.ndim != 1 or self.node_ids.dtype != torch.int32:
-            raise ValueError("PolicyCache.node_ids must be int32 [Nd]")
-        if self.old_logp_child.ndim != 3 or self.old_logp_child.shape[0] != self.node_ids.numel():
-            raise ValueError("PolicyCache.old_logp_child must have shape [Nd,E,X]")
+            raise ValueError("RolloutDecisionRows.node_ids must be int32 [D]")
+        if (
+            self.action_ptr.shape != (self.node_ids.numel() + 1,)
+            or self.action_ptr.dtype != torch.int32
+            or int(self.action_ptr[0]) != 0
+            or bool((self.action_ptr[1:] < self.action_ptr[:-1]).any())
+        ):
+            raise ValueError("RolloutDecisionRows.action_ptr must be CSR int32 [D+1]")
+        actions = int(self.action_ptr[-1])
+        if self.action_event.shape != (actions,) or self.action_event.dtype != torch.int32:
+            raise ValueError("RolloutDecisionRows.action_event must be int32 [A]")
+        if self.old_logp_action.ndim != 2 or self.old_logp_action.shape[0] != actions:
+            raise ValueError("RolloutDecisionRows.old_logp_action must have shape [A,X]")
         if self.old_v.ndim != 2 or self.old_v.shape[0] != self.node_ids.numel():
-            raise ValueError("PolicyCache.old_v must have shape [Nd,X]")
-        if self.old_logp_child.dtype != torch.float32 or self.old_v.dtype != torch.float32:
-            raise ValueError("PolicyCache floating tensors must be fp32")
+            raise ValueError("RolloutDecisionRows.old_v must have shape [D,X]")
+        if self.old_logp_action.dtype != torch.float32 or self.old_v.dtype != torch.float32:
+            raise ValueError("RolloutDecisionRows floating tensors must be fp32")
         for name, value in (("old_t", self.old_t), ("old_c", self.old_c)):
             if value is not None and (
                 value.shape != (self.node_ids.numel(),)
@@ -695,23 +719,24 @@ class PolicyCache:
                 or bool((~torch.isfinite(value)).any())
                 or (name == "old_c" and bool((value <= 0).any()))
             ):
-                raise ValueError(f"PolicyCache.{name} must be an aligned finite fp32 vector")
+                raise ValueError(f"RolloutDecisionRows.{name} must be an aligned finite fp32 vector")
 
 
 @dataclass
-class ReachCache:
+class StoppedLeafRows:
     """Exact last-consumer leaf reach rows; no discarded path can be replayed."""
 
     mode: str
     log_r: Tensor
     node_index: Tensor
+    payload: dict[str, Tensor] | None = None
 
     def rows_for(
         self,
-        tree: TreeBatch,
+        tree: SampledTree,
         node_ids: Tensor,
         game: Any,
-        policy_cache: PolicyCache,
+        rollout_decisions: RolloutDecisionRows,
     ) -> Tensor:
         """Return directly stored rows for arbitrary sealed leaf ids."""
 
@@ -727,53 +752,16 @@ class ReachCache:
             raise KeyError("one or more requested leaf reach rows are not sealed")
         return self.log_r[positions.to(self.log_r.device)]
 
+    def payload_for(self, node_ids: Tensor) -> dict[str, Tensor]:
+        """Return immutable stopped-leaf fields aligned to requested node ids."""
 
-@dataclass
-class DecisionReachCache:
-    """Model-input reaches retained after rollout/completion has finished.
-
-    Games may replace dense ``[D,P,X]`` rows with an opaque compact payload.
-    The payload is expanded only for sampled optimization rows.
-    """
-
-    node_ids: Tensor  # int32 [D], aligned with decision/target rows
-    state_refs: Tensor  # int32 [D]
-    payload: Any
-    owners: Tensor | None = None  # int32 [D], present for compact RB minibatches
-
-    @classmethod
-    def from_rows(
-        cls,
-        node_ids: Tensor,
-        state_refs: Tensor,
-        rows: Tensor,
-        game: Any,
-        owners: Tensor | None = None,
-    ) -> "DecisionReachCache":
-        """Compact dense decision rows through the optional game boundary."""
-
-        if rows.ndim != 3 or rows.shape[0] != node_ids.numel():
-            raise ValueError("decision reach rows must have shape [D,P,X]")
-        if state_refs.shape != node_ids.shape:
-            raise ValueError("decision state refs must align with node ids")
-        compact = getattr(game, "compact_decision_reach", None)
-        if bool(getattr(game, "requires_full_decision_reach", False)):
-            compact = None
-        payload = compact(state_refs, rows) if callable(compact) else rows
-        return cls(
-            node_ids=node_ids.to(torch.int32),
-            state_refs=state_refs.to(torch.int32),
-            payload=payload,
-            owners=None if owners is None else owners.to(torch.int32),
-        )
-
-    def gather(self, rows: Tensor, game: Any) -> Tensor:
-        """Expand sampled decision rows to the backend's dense policy boundary."""
-
-        rows = rows.to(device=self.node_ids.device, dtype=torch.int64)
-        if isinstance(self.payload, Tensor):
-            return self.payload[rows]
-        expand = getattr(game, "expand_decision_reach", None)
-        if not callable(expand):
-            raise TypeError("game compacted decision reaches but cannot expand them")
-        return expand(self.payload, rows)
+        if self.payload is None:
+            raise RuntimeError("stopped leaves do not own immutable payload fields")
+        requested = node_ids.to(device=self.node_index.device, dtype=torch.int64)
+        stored = self.node_index.to(torch.int64)
+        positions = torch.searchsorted(stored, requested)
+        if stored.numel() == 0 or bool(
+            (positions >= stored.numel()).any()
+        ) or not torch.equal(stored[positions], requested):
+            raise KeyError("one or more requested leaf payload rows are not sealed")
+        return {name: value[positions.to(value.device)] for name, value in self.payload.items()}

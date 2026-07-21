@@ -139,7 +139,7 @@ def test_every_legal_player_and_rank_count_pair_builds_compact_rollout_state(
 ) -> None:
     config = PokerConfig(n_players=players, stack_bb=8, rank_count=rank_count)
     geometry = config.geometry
-    backend = PokerRolloutBackend(config, 2, "cpu")
+    backend = PokerRolloutBackend(config, "cpu", storage_page_rows=2)
     state = backend.sequential_start_states(1)
 
     assert state.shape == (1,)
@@ -171,13 +171,12 @@ def test_configuration_rejects_out_of_contract_values(
 
 def test_rollout_memory_uses_compact_private_width() -> None:
     short = estimate_rollout_memory(
-        root_count=2, node_budget=8, n_players=2, rank_count=4
+        root_count=2, n_players=2, rank_count=4, storage_page_rows=8
     )
     full = estimate_rollout_memory(
-        root_count=2, node_budget=8, n_players=2, rank_count=13
+        root_count=2, n_players=2, rank_count=13, storage_page_rows=8
     )
-    assert short.reach_cache_bytes * 1326 == full.reach_cache_bytes * 120
-    assert short.frontier_reach_bytes * 1326 == full.frontier_reach_bytes * 120
+    assert short.active_reach_bytes * 1326 == full.active_reach_bytes * 120
 
 
 @pytest.mark.parametrize("rank_count", range(4, 14))
@@ -186,7 +185,7 @@ def test_every_rank_count_runs_preflop_and_postflop_policy_boundaries(
 ) -> None:
     game_cfg = PokerConfig(n_players=2, stack_bb=8, rank_count=rank_count)
     geometry = game_cfg.geometry
-    backend = PokerRolloutBackend(game_cfg, 16, "cpu")
+    backend = PokerRolloutBackend(game_cfg, "cpu", storage_page_rows=16)
     model_cfg = PokerModelConfig(
         d_model=4,
         n_heads=1,
@@ -290,16 +289,21 @@ def test_every_rank_count_completes_a_boundary_training_iteration(
 ) -> None:
     root = Path(__file__).parents[1]
     raw = yaml.safe_load(
-        (root / "configs" / "acceptance" / "nlhe_hu_normal.yaml").read_text()
+        (root / "configs" / "train" / "nlhe_hu_32bb_rb.yaml").read_text()
     )
     raw["game"]["rank_count"] = rank_count
+    raw["game"]["stack_bb"] = 8.0
+    raw["training"]["mode"] = "normal"
+    raw["loss"]["name"] = "ppo"
+    raw["completion"]["n_samples"] = None
     raw["rollout"].update(
         {
             "sequential_roots_per_gpu_initial": 2,
-            "node_budget": 32,
+            "sequential_roots_per_gpu_minimum": 2,
+            "sequential_roots_per_gpu_maximum": 2,
             "family_batch_rows": 2,
             "max_active_trajectories": 2,
-            "arena_chunk_nodes": 32,
+            "storage_page_rows": 32,
         }
     )
     raw["completion"]["backend"] = "cpu"
@@ -316,6 +320,9 @@ def test_every_rank_count_completes_a_boundary_training_iteration(
         "folder_beta_rank": 4,
     }
     raw["training"]["minibatch_size"] = 2
+    raw["training"]["iters"] = 1
+    raw["training"]["gd_steps_per_iter"] = 1
+    raw["training"]["checkpoint_every"] = 1
     raw["training"]["out_dir"] = str(tmp_path / f"rank_{rank_count}")
     path = tmp_path / f"rank_{rank_count}.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
@@ -337,16 +344,18 @@ def test_every_rank_count_completes_a_rao_blackwell_training_iteration(
 ) -> None:
     root = Path(__file__).parents[1]
     raw = yaml.safe_load(
-        (root / "configs" / "acceptance" / "nlhe_hu_sequential_rb.yaml").read_text()
+        (root / "configs" / "train" / "nlhe_hu_32bb_rb.yaml").read_text()
     )
     raw["game"]["rank_count"] = rank_count
+    raw["game"]["stack_bb"] = 8.0
     raw["rollout"].update(
         {
             "sequential_roots_per_gpu_initial": 2,
-            "node_budget": 32,
+            "sequential_roots_per_gpu_minimum": 2,
+            "sequential_roots_per_gpu_maximum": 2,
             "family_batch_rows": 2,
             "max_active_trajectories": 2,
-            "arena_chunk_nodes": 32,
+            "storage_page_rows": 32,
         }
     )
     raw["completion"].update({"backend": "cpu", "n_samples": 2})
@@ -363,6 +372,9 @@ def test_every_rank_count_completes_a_rao_blackwell_training_iteration(
         "folder_beta_rank": 4,
     }
     raw["training"]["minibatch_size"] = 2
+    raw["training"]["iters"] = 1
+    raw["training"]["gd_steps_per_iter"] = 1
+    raw["training"]["checkpoint_every"] = 1
     raw["training"]["out_dir"] = str(tmp_path / f"rb_rank_{rank_count}")
     path = tmp_path / f"rb_rank_{rank_count}.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")

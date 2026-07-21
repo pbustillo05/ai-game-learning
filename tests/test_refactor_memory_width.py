@@ -62,6 +62,31 @@ def test_memory_only_binary_search_and_rank_minimum() -> None:
     assert controller.choose_root_width(rank_safe_widths=torch.tensor([80, 7, 20])) == 5
 
 
+@pytest.mark.parametrize("limiting_phase", MEMORY_PHASES)
+def test_each_schema_owned_phase_can_independently_limit_root_width(
+    limiting_phase: str,
+) -> None:
+    forecaster = PhaseMemoryForecaster(
+        {
+            phase: PhaseMemoryModel(
+                100,
+                {f"{phase}_schema": 100 if phase == limiting_phase else 10},
+            )
+            for phase in MEMORY_PHASES
+        }
+    )
+    controller = _controller(
+        current_roots_per_gpu=4,
+        device_bytes=1_200,
+        guard_bytes=100,
+        forecaster=forecaster,
+    )
+    assert controller.local_safe_width() == 10
+    assert controller.choose_root_width() == 4
+    assert controller.limiting_phase == limiting_phase
+    assert controller.limiting_field == f"{limiting_phase}_schema"
+
+
 def test_unsafe_evidence_decreases_immediately_and_growth_is_delayed_capped() -> None:
     controller = _controller(
         current_roots_per_gpu=50,

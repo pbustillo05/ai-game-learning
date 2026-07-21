@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -22,17 +23,18 @@ from pbg.core.execution import (
     logical_rng_keys,
     stable_partition_masked,
 )
-from pbg.core.tree import DecisionReachCache, DeviceTreeBuffer, PolicyCache, ReachCache, TreeBatch
+from pbg.core.tree import PagedTreeSource, RolloutDecisionRows, StoppedLeafRows, SampledTree
+from pbg.core.storage import PagedRowAccumulator
 
 
 @dataclass
 class ProbeRollout:
     """Sequential mixed-policy data retained only for the exploiter."""
 
-    tree: TreeBatch
-    leaf_reach: ReachCache
-    policy: PolicyCache
-    decision_reach: DecisionReachCache
+    tree: SampledTree
+    leaf_reach: StoppedLeafRows
+    policy: RolloutDecisionRows
+    decision_inputs: Any
     seats: Tensor
     root_profiles: Tensor
 
@@ -92,7 +94,7 @@ def _logical_seed(cfg: Any, gen: torch.Generator) -> int:
 
 
 def sequential_leaf_logical_rng_keys(
-    tree: TreeBatch,
+    tree: SampledTree,
     cfg: Any,
     gen: torch.Generator,
     leaf_ids: Tensor,
@@ -112,13 +114,10 @@ def sequential_leaf_logical_rng_keys(
 
     rollout_cfg = getattr(cfg, "rollout", cfg)
     start_count = int(rollout_cfg.roots_per_gpu)
-    node_budget = int(
-        getattr(rollout_cfg, "node_budget", max(int(tree.parent.numel()), 1))
-    )
     leaves = leaf_ids.to(device=tree.parent.device, dtype=torch.int64)
     if leaves.ndim != 1:
         raise ValueError("sequential leaf ids must be one-dimensional")
-    if start_count <= 0 or node_budget <= 0:
+    if start_count <= 0:
         raise ValueError("sequential rollout dimensions are invalid")
     if leaves.numel() != start_count:
         raise ValueError("sequential rollout must contain one stopped leaf per trajectory")
@@ -129,7 +128,6 @@ def sequential_leaf_logical_rng_keys(
     valid = (
         (selected_tree >= 0)
         & (selected_tree < start_count)
-        & (counts[selected_tree.clamp(0, max(start_count - 1, 0))] <= node_budget)
     )
     unique = torch.bincount(selected_tree.clamp_min(0), minlength=start_count)[:start_count] == 1
     if tree.parent.device.type == "cuda":
@@ -138,12 +136,10 @@ def sequential_leaf_logical_rng_keys(
     elif not bool(valid.all()) or not bool(unique.all()):
         raise ValueError("invalid sequential stopped-leaf topology")
 
-    depth_paths = torch.empty(node_budget, dtype=torch.int64)
-    depth_paths[0] = 0
-    for depth in range(1, node_budget):
-        depth_paths[depth] = child_path_keys(depth_paths[depth - 1 : depth], 1)[0]
-    leaf_depth = counts[selected_tree] - 1
-    path = depth_paths.to(tree.parent.device)[leaf_depth]
+    logical_path = getattr(tree, "logical_path", None)
+    if not isinstance(logical_path, Tensor) or logical_path.shape != tree.parent.shape:
+        raise RuntimeError("sequential sample omitted logical path addresses")
+    path = logical_path[leaves]
     start = _global_trajectory_start(cfg, start_count)
     return logical_rng_keys(
         seed=_logical_seed(cfg, gen),
@@ -181,7 +177,7 @@ def _admission_plan(
     *,
     backend: Any,
     rollout_cfg: Any,
-    buffer: DeviceTreeBuffer,
+    buffer: PagedTreeSource,
     arena: ChunkedOccurrenceArena,
     queues: dict[str, DeviceWorkQueue],
     root_reach: Tensor,
@@ -211,13 +207,15 @@ def _admission_plan(
             seen.add(identity)
             return int(storage.nbytes())
 
-        retained = sum(
-            unique_tensor_bytes(value)
-            for value in vars(buffer).values()
-            if isinstance(value, Tensor)
+        page_count = math.ceil(arena.capacity / buffer.nodes.page_rows)
+        retained = buffer.nodes.schema.capacity_bytes(
+            arena.capacity, chunks=page_count
+        ) + buffer.edges.schema.capacity_bytes(
+            max(0, arena.capacity - int(rollout_cfg.roots_per_gpu)),
+            chunks=max(0, page_count),
         )
-        # The occurrence arena is chunked, but SafeAdmit reserves its complete
-        # retained structural bound rather than relying on future allocation.
+        # The sequential exact path bound is a feasibility reservation, not an
+        # eager tensor allocation. Realized topology still grows by pages.
         retained += arena.capacity * arena.row_bytes
         retained += sum(queue.reserved_bytes for queue in queues.values())
         retained += sum(
@@ -228,7 +226,7 @@ def _admission_plan(
         x_max = max(int(value) for value in backend.x_sizes)
         # One selected old log-probability row and one old value row per
         # possible player occurrence are retained by the current cache contract.
-        retained += buffer.node_capacity * 2 * x_max * 4
+        retained += arena.capacity * 2 * x_max * 4
         reach_row = p_max * x_max * 4
         profile_row = p_max * 4
         resident_per_start = reach_row + profile_row + 64
@@ -290,8 +288,8 @@ def _sample_trees_sequential(
     *,
     return_profiles: bool = False,
     iteration: int = 0,
-) -> tuple[TreeBatch, ReachCache, PolicyCache] | tuple[
-    TreeBatch, ReachCache, PolicyCache, Tensor
+) -> tuple[SampledTree, StoppedLeafRows, RolloutDecisionRows] | tuple[
+    SampledTree, StoppedLeafRows, RolloutDecisionRows, Tensor
 ] | ProbeRollout:
     """Sample sequential paths with persistent family work queue ready queues.
 
@@ -306,9 +304,8 @@ def _sample_trees_sequential(
     if torch.device(gen.device) != device:
         raise ValueError("rollout generator must be created on the backend device")
     start_count = int(rollout_cfg.roots_per_gpu)
-    node_budget = int(rollout_cfg.node_budget)
-    if start_count < 0 or node_budget <= 0:
-        raise ValueError("start_count must be nonnegative and node_budget positive")
+    if start_count < 0:
+        raise ValueError("start_count must be nonnegative")
     batch_rows = int(
         getattr(rollout_cfg, "family_batch_rows", None) or min(start_count, 256)
     )
@@ -317,9 +314,10 @@ def _sample_trees_sequential(
     )
     if batch_rows <= 0 or admission_size <= 0:
         raise ValueError("family-scheduled batch and admission sizes must be positive")
+    max_rows = max(1, start_count * (int(backend.max_rollout_steps) + 1))
     chunk_nodes = int(
-        getattr(rollout_cfg, "arena_chunk_nodes", None)
-        or min(start_count * node_budget, max(batch_rows, 256))
+        getattr(rollout_cfg, "storage_page_rows", None)
+        or min(max_rows, max(batch_rows, 256))
     )
 
     p_max = int(backend.n_players)
@@ -330,10 +328,10 @@ def _sample_trees_sequential(
         raise ValueError("sequential_start_states must return device-local int32 [count]")
     root_owner = backend.classify(roots).to(torch.int32)
     metrics = getattr(backend, "execution_metrics", None)
-    buffer = DeviceTreeBuffer(start_count, node_budget, p_max, device)
+    buffer = PagedTreeSource(start_count, p_max, device, page_rows=chunk_nodes)
     root_nodes = buffer.add_roots(roots, root_owner)
     arena = ChunkedOccurrenceArena(
-        buffer.node_capacity,
+        max_rows,
         chunk_nodes,
         device,
         fields=arena_fields(("trajectory_id", "path_key")),
@@ -358,14 +356,16 @@ def _sample_trees_sequential(
     )
     probe_enabled = bundle.opponent_model is not None
     capture_inputs = getattr(backend, "capture_decision_inputs", None)
+    begin_captures = getattr(backend, "begin_decision_input_captures", None)
+    append_capture = getattr(backend, "append_decision_input_capture", None)
     seal_captures = getattr(backend, "seal_decision_input_captures", None)
-    direct_inputs = (
-        not probe_enabled
-        and getattr(getattr(cfg, "training", None), "mode", None)
-        in {"normal", "rao_blackwell"}
-        and callable(capture_inputs)
-        and callable(seal_captures)
-    )
+    if not all(
+        callable(value)
+        for value in (capture_inputs, begin_captures, append_capture, seal_captures)
+    ):
+        raise TypeError(
+            "sequential rollout backends must capture immutable natural decision inputs"
+        )
     probe_seats = None
     if probe_enabled:
         configured_seats = getattr(rollout_cfg, "probe_seats", None)
@@ -434,14 +434,13 @@ def _sample_trees_sequential(
         desired_resident_starts=min(start_count, admission_size),
     )
     logical_seed = _logical_seed(cfg, gen)
-    policy_nodes: list[Tensor] = []
-    policy_logp: list[Tensor] = []
-    policy_values: list[Tensor] = []
-    decision_reach_nodes: list[Tensor] = []
-    decision_reach_rows: list[Tensor] = []
-    decision_input_records: list[tuple[Tensor, Any]] = []
-    leaf_reach_nodes: list[Tensor] = []
-    leaf_reach_rows: list[Tensor] = []
+    policy_rows = PagedRowAccumulator(
+        "sequential_policy_rows", chunk_nodes, device
+    )
+    decision_input_store = begin_captures()
+    leaf_rows = PagedRowAccumulator(
+        "sequential_stopped_leaf_rows", chunk_nodes, device
+    )
     scheduler_steps = 0
     active_starts = 0
     if metrics is not None:
@@ -565,8 +564,55 @@ def _sample_trees_sequential(
             chance_count, stopped = counts[-2:]
             if stopped:
                 stopped_nodes = routed.candidate_handles[-1, :stopped].to(torch.int32)
-                leaf_reach_nodes.append(stopped_nodes)
-                leaf_reach_rows.append(reach_rows_for(stopped_nodes).detach().clone())
+                stopped_rows = stopped_nodes.to(torch.int64)
+                stopped_states = buffer.state_ref[stopped_rows].to(torch.int32)
+                stopped_reach = reach_rows_for(stopped_nodes).detach().clone()
+                capture_leaf = None
+                mode = getattr(getattr(cfg, "training", None), "mode", None)
+                if probe_enabled or mode == "normal" or return_profiles:
+                    capture_name = (
+                        "capture_probe_leaf" if probe_enabled else "capture_normal_leaf"
+                    )
+                    capture = getattr(backend, capture_name, None)
+                    if callable(capture):
+                        address = arena.gather_many(
+                            ("trajectory_id", "path_key"), stopped_rows
+                        )
+                        keys = logical_rng_keys(
+                            seed=logical_seed,
+                            iteration=iteration,
+                            trajectory=address["trajectory_id"],
+                            path=address["path_key"],
+                            draw=1,
+                            purpose=DrawPurpose.COMPLETION,
+                        )
+                        tree_ids = buffer.tree_id[stopped_rows].to(torch.int64)
+                        capture_leaf = capture(
+                            stopped_states, root_profiles[tree_ids], keys
+                        )
+                        if probe_enabled and mode != "normal":
+                            capture_rb = getattr(backend, "capture_rb_leaf", None)
+                            if callable(capture_rb):
+                                capture_leaf = {
+                                    **capture_leaf,
+                                    **capture_rb(stopped_states, stopped_reach),
+                                }
+                else:
+                    capture = getattr(backend, "capture_rb_leaf", None)
+                    if callable(capture):
+                        capture_leaf = capture(stopped_states, stopped_reach)
+                leaf_rows.append(
+                    {
+                        "node_id": stopped_nodes,
+                        "log_reach": stopped_reach,
+                        **({} if capture_leaf is None else capture_leaf),
+                    }
+                )
+                if capture_leaf is not None:
+                    release = getattr(backend, "release_state_rows", None)
+                    if callable(release):
+                        release(stopped_states)
+                        buffer.state_ref[stopped_rows] = -1
             if stopped > active_starts:
                 raise RuntimeError("family-scheduled active-trajectory accounting underflow")
             active_starts -= stopped
@@ -617,6 +663,10 @@ def _sample_trees_sequential(
             frontier = append_children(
                 chance_nodes, next_states, next_owner, events, next_reach
             )
+            release = getattr(backend, "release_state_rows", None)
+            if callable(release):
+                release(states)
+                buffer.state_ref[chance_rows] = -1
 
     admitted = 0
     while admitted < start_count or any(queue.host_count for queue in queues.values()):
@@ -782,31 +832,29 @@ def _sample_trees_sequential(
                     destination[positions] = value
                 if retain:
                     legal_ids, legal_mask = backend.legal_events(states[positions])
-                    policy_nodes.append(batch_nodes[positions])
-                    policy_logp.append(
-                        _selected_policy_logp(
-                            bundle.policy_adapter,
-                            output,
-                            role_events.public_id[:, None],
-                            legal_ids,
-                            legal_mask,
-                        ).detach()
+                    selected_logp = _selected_policy_logp(
+                        bundle.policy_adapter,
+                        output,
+                        role_events.public_id[:, None],
+                        legal_ids,
+                        legal_mask,
+                    ).detach()[:, 0]
+                    policy_rows.append(
+                        {
+                            "node_id": batch_nodes[positions].to(torch.int32),
+                            "old_logp": selected_logp.to(torch.float32),
+                            "old_v": output.v.detach().to(torch.float32),
+                        }
                     )
-                    policy_values.append(output.v.detach().float())
-                    if direct_inputs:
-                        decision_input_records.append(
-                            (
-                                batch_nodes[positions],
-                                capture_inputs(
-                                    selected_family,
-                                    states[positions],
-                                    reaches[positions],
-                                ),
-                            )
-                        )
-                    else:
-                        decision_reach_nodes.append(batch_nodes[positions])
-                        decision_reach_rows.append(reaches[positions].detach().clone())
+                    append_capture(
+                        decision_input_store,
+                        batch_nodes[positions],
+                        capture_inputs(
+                            selected_family,
+                            states[positions],
+                            reaches[positions],
+                        ),
+                    )
         events = EventBatch(public_id=event_ids, payload=event_payload)
         next_owner = backend.classify(next_states).to(torch.int32)
         if probe_enabled:
@@ -821,65 +869,79 @@ def _sample_trees_sequential(
         children = append_children(
             batch_nodes, next_states, next_owner, events, next_reach
         )
+        release = getattr(backend, "release_state_rows", None)
+        if callable(release):
+            release(states)
+            buffer.state_ref[batch_nodes.to(torch.int64)] = -1
         DeviceWorkQueue.mark_done(arena, batch_nodes.to(torch.int64))
         chance_close(children)
 
     tree = buffer.finalize()
+    tree.logical_path = arena.gather_many(
+        ("path_key",), torch.arange(buffer.node_count, device=device)
+    )["path_key"].detach()
+    arena.release()
+    buffer.release()
     if admitted != start_count or active_starts != 0:
         raise RuntimeError(
             "family-scheduled rollout terminated with incomplete trajectory admission/accounting"
         )
-    if leaf_reach_nodes:
-        reach_nodes = torch.cat(leaf_reach_nodes).to(torch.int32)
-        retained_reach = torch.cat(leaf_reach_rows).float()
-        leaf_order = torch.argsort(reach_nodes.to(torch.int64))
-        reach_nodes = reach_nodes[leaf_order]
-        retained_reach = retained_reach[leaf_order]
+    if leaf_rows.rows:
+        assert leaf_rows.arena is not None
+        source_nodes = leaf_rows.arena.gather(
+            "node_id", torch.arange(leaf_rows.rows, device=device)
+        )
+        leaf_order = torch.argsort(source_nodes.to(torch.int64), stable=True)
+        leaf_block, _ = leaf_rows.seal(row_order=leaf_order)
+        reach_nodes = leaf_block["node_id"].to(torch.int32)
+        retained_reach = leaf_block["log_reach"].to(torch.float32)
+        leaf_payload = {
+            name: value
+            for name, value in leaf_block.columns.items()
+            if name not in {"node_id", "log_reach"}
+        } or None
     else:
         reach_nodes = torch.empty(0, dtype=torch.int32, device=device)
         retained_reach = torch.empty((0, p_max, x_max), dtype=torch.float32, device=device)
-    reach_cache = ReachCache("sealed", retained_reach, reach_nodes)
-    if policy_nodes:
-        node_ids = torch.cat(policy_nodes).to(torch.int32)
-        old_logp = torch.cat(policy_logp).float()
-        old_v = torch.cat(policy_values).float()
-        order = torch.argsort(node_ids.to(torch.int64))
-        node_ids, old_logp, old_v = node_ids[order], old_logp[order], old_v[order]
+        leaf_payload = None
+    reach_cache = StoppedLeafRows("sealed", retained_reach, reach_nodes, leaf_payload)
+    verify_recycling = getattr(backend, "verify_state_recycling_boundary", None)
+    if callable(verify_recycling):
+        verify_recycling()
+    if policy_rows.rows:
+        assert policy_rows.arena is not None
+        source_nodes = policy_rows.arena.gather(
+            "node_id", torch.arange(policy_rows.rows, device=device)
+        )
+        order = torch.argsort(source_nodes.to(torch.int64), stable=True)
+        policy_block, _ = policy_rows.seal(row_order=order)
+        node_ids = policy_block["node_id"].to(torch.int32)
+        old_logp = policy_block["old_logp"].to(torch.float32)
+        old_v = policy_block["old_v"].to(torch.float32)
     else:
         node_ids = torch.empty(0, dtype=torch.int32, device=device)
-        old_logp = torch.empty((0, 1, x_max), dtype=torch.float32, device=device)
+        old_logp = torch.empty((0, x_max), dtype=torch.float32, device=device)
         old_v = torch.empty((0, x_max), dtype=torch.float32, device=device)
-    if direct_inputs:
-        decision_reach = seal_captures(decision_input_records)
-        decision_nodes = decision_reach.node_ids
-    elif decision_reach_nodes:
-        decision_nodes = torch.cat(decision_reach_nodes).to(torch.int32)
-        decision_rows = torch.cat(decision_reach_rows).float()
-        decision_order = torch.argsort(decision_nodes.to(torch.int64))
-        decision_nodes = decision_nodes[decision_order]
-        decision_rows = decision_rows[decision_order]
-    else:
-        decision_nodes = torch.empty(0, dtype=torch.int32, device=device)
-        decision_rows = torch.empty(
-            (0, p_max, x_max), dtype=torch.float32, device=device
-        )
+    decision_inputs = seal_captures(decision_input_store)
+    decision_nodes = decision_inputs.node_ids
     if not torch.equal(decision_nodes, node_ids):
         raise RuntimeError("policy and natural decision-input rows are misaligned")
-    if not direct_inputs:
-        state_refs = tree.state_ref[decision_nodes.to(torch.int64)].to(torch.int32)
-        owners = tree.owner[decision_nodes.to(torch.int64)].to(torch.int32)
-        decision_reach = DecisionReachCache.from_rows(
-            decision_nodes,
-            state_refs,
-            decision_rows,
-            backend,
-            owners,
-        )
-    policy = PolicyCache(node_ids, old_logp, old_v, decision_reach)
+    action_ptr = torch.arange(
+        node_ids.numel() + 1, dtype=torch.int32, device=device
+    )
+    edge = tree.child_ptr[node_ids.to(torch.int64)].to(torch.int64)
+    policy = RolloutDecisionRows(
+        node_ids,
+        action_ptr,
+        tree.child_event[edge].to(torch.int32),
+        old_logp,
+        old_v,
+        decision_inputs,
+    )
     if probe_enabled:
         assert probe_seats is not None
         return ProbeRollout(
-            tree, reach_cache, policy, decision_reach, probe_seats, root_profiles
+            tree, reach_cache, policy, decision_inputs, probe_seats, root_profiles
         )
     result = (tree, reach_cache, policy)
     if return_profiles:
@@ -894,18 +956,23 @@ def sample_trees_sequential(
     *,
     return_profiles: bool = False,
     iteration: int = 0,
-) -> tuple[TreeBatch, ReachCache, PolicyCache] | tuple[
-    TreeBatch, ReachCache, PolicyCache, Tensor
+) -> tuple[SampledTree, StoppedLeafRows, RolloutDecisionRows] | tuple[
+    SampledTree, StoppedLeafRows, RolloutDecisionRows, Tensor
 ] | ProbeRollout:
     """Sample family-scheduled sequential trajectories."""
 
-    return _sample_trees_sequential(
-        bundle,
-        cfg,
-        gen,
-        return_profiles=return_profiles,
-        iteration=iteration,
-    )
+    try:
+        return _sample_trees_sequential(
+            bundle,
+            cfg,
+            gen,
+            return_profiles=return_profiles,
+            iteration=iteration,
+        )
+    finally:
+        release = getattr(bundle.rollout_backend, "release_rollout_owners", None)
+        if callable(release):
+            release()
 
 
 def sample_trees(
@@ -915,7 +982,8 @@ def sample_trees(
     *,
     iteration: int = 0,
     branching_controller: Any | None = None,
-) -> tuple[TreeBatch, ReachCache, PolicyCache] | ProbeRollout:
+    branching_diagnostic_limits: Any | None = None,
+) -> tuple[SampledTree, StoppedLeafRows, RolloutDecisionRows] | ProbeRollout:
     """Sample trajectories for sequential RB or one tree for branched RB."""
 
     training = getattr(cfg, "training", None)
@@ -928,5 +996,6 @@ def sample_trees(
         return sample_branched_tree(
             bundle, cfg, gen, iteration=iteration,
             controller=branching_controller,
+            diagnostic_limits=branching_diagnostic_limits,
         )
     raise ValueError("sample_trees requires an RB training mode")

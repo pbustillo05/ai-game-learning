@@ -62,6 +62,10 @@ _MAXIMUM_COUNTERS = (
     "allocated_bytes_max",
     "reserved_bytes_max",
     "target_bytes_max",
+    "state_live_rows_high_water",
+    "state_live_rows_at_seal",
+    "history_live_rows_high_water",
+    "history_live_rows_at_seal",
 )
 
 

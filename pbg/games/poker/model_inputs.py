@@ -49,7 +49,7 @@ class DeviceHistoryMaterializer:
         positions = torch.arange(width, device=self.device)[None, :]
         mask = positions < lengths[:, None]
         distances = lengths[:, None] - 1 - positions
-        ancestors = states.to(device=self.device, dtype=torch.int32)[:, None].expand(
+        ancestors = self.store.history_ref[rows].to(torch.int32)[:, None].expand(
             -1, width
         )
 

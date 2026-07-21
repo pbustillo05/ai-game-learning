@@ -39,7 +39,6 @@ def _small_poker_cfg(tmp_path: Path):
     cfg.game.stack_bb = 8.0
     cfg.game.rank_count = 13
     cfg.rollout.roots_per_gpu = 2
-    cfg.rollout.node_budget = 64
     cfg.training.mode = "rao_blackwell"
     cfg.rollout.beta = None
     cfg.completion.n_samples = 8
@@ -83,43 +82,40 @@ def test_all_first_run_presets_load_strictly_without_deferred_settings() -> None
         assert not (_keys(raw) & DEFERRED)
     nlhe = loaded["nlhe6_h100.yaml"]
     assert nlhe.game.n_players == 6
-    assert nlhe.rollout.roots_per_gpu == 1 and nlhe.rollout.node_budget == 4096
+    assert nlhe.rollout.roots_per_gpu == 1
     assert nlhe.training.minibatch_size == 6
     assert nlhe.completion.backend == "cuda"
     assert nlhe.training.iters == 10_000 and nlhe.training.checkpoint_every == 100
 
 def test_poker_rollout_memory_plan_bounds_sequential_and_branched_storage() -> None:
     safe = estimate_rollout_memory(
-        root_count=8, node_budget=512, n_players=6, sequential=True
+        root_count=8, n_players=6, sequential=True, storage_page_rows=64
     )
     wide_sequential = estimate_rollout_memory(
-        root_count=256, node_budget=8192, n_players=6, sequential=True
+        root_count=256, n_players=6, sequential=True, storage_page_rows=256
     )
     full = estimate_rollout_memory(
-        root_count=256, node_budget=8192, n_players=6
+        root_count=256, n_players=6, storage_page_rows=256
     )
     gib = 1024**3
-    assert safe.capacity == 4096
+    assert safe.page_rows == 64
     assert safe.peak_bytes < gib
-    assert wide_sequential.frontier_reach_bytes == 2 * 256 * 6 * 1326 * 4
-    assert full.reach_cache_bytes > 60 * gib
-
-    assert wide_sequential.frontier_reach_bytes < full.frontier_reach_bytes
+    assert wide_sequential.active_reach_bytes == 256 * 6 * 1326 * 4
+    assert full.active_reach_bytes == 256 * 6 * 1326 * 4
+    assert wide_sequential.state_page_bytes == full.state_page_bytes
 
 
 def test_h100_bootstrap_bundle_constructs_without_capacity_sized_history() -> None:
     cfg = load_config(ROOT / "configs" / "nlhe6_h100.yaml")
     bundle = build_game_bundle(cfg, torch.device("cpu"))
     backend = bundle.rollout_backend
-    assert backend.rollout_memory_plan.peak_bytes == 436_685_628
+    assert backend.rollout_memory_plan.peak_bytes == 8_285_952
     assert "action_history" not in vars(backend.states)
     assert backend.states.history_parent.shape == (0,)
     assert backend.states.history_jump.shape == (0, 10)
-    assert backend.states.capacity == 0
+    assert backend.states.size == 0
     assert backend.states.arena.allocated_capacity_bytes == 0
-    # The transitional forecast remains until phase 5; construction itself
-    # owns neither state pages nor a capacity-sized summary validity bitmap.
-    assert backend.rollout_memory_plan.partition_cache_bytes == 4_096
+    assert backend.rollout_memory_plan.partition_page_bytes == 0
     assert backend.partition_summary_cache.allocated_capacity_bytes == 0
 
 
@@ -219,7 +215,6 @@ def test_iteration_seals_the_sole_training_owner_and_releases_poker_pages(
         cfg,
         bundle,
         torch.Generator().manual_seed(177),
-        training_module._loss_spec(cfg),
         iteration=0,
     )
 
@@ -230,16 +225,9 @@ def test_iteration_seals_the_sole_training_owner_and_releases_poker_pages(
         "branched_rao_blackwell": "branched_rb",
     }[mode]
     assert data.storage.mode == expected_mode
-    assert all(
-        owner is None
-        for owner in (
-            data.dataset,
-            data.tree,
-            data.targets,
-            data.policy_cache,
-            data.decision_reach,
-        )
-    )
+    assert not {
+        "dataset", "tree", "targets", "rollout_decisions", "decision_inputs"
+    }.intersection(vars(data))
     assert bundle.rollout_backend.states.arena.allocated_capacity_bytes == 0
     assert bundle.rollout_backend.partition_summary_cache.allocated_capacity_bytes == 0
     for partition in data.storage.partitions.values():
@@ -314,5 +302,4 @@ def test_frozen_rollout_policy_uses_learner_autocast_precision(
             cfg,
             bundle,
             torch.Generator(),
-            SimpleNamespace(),
         )

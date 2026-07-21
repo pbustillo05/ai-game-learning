@@ -1,5 +1,15 @@
 # `node_budget` allocation audit and retirement proposal — 2026-07-21
 
+> Implementation status (2026-07-21): phase 5 of the storage-lifecycle
+> restoration implemented this retirement. Production configuration and YAML
+> no longer contain the total-node field, and its value was not reinterpreted
+> as another global row limit. `storage_page_rows` controls allocation
+> granularity only; `execution_memory_bytes` is the branched hard byte ceiling.
+> Sequential root width is selected from schema-derived rollout, seal, target,
+> and optimization phase models. Checkpoint schema v5 removes the retired field
+> explicitly and records that transition. The proposal and measurements below
+> remain historical design evidence.
+
 ## Conclusion
 
 `rollout.node_budget` should be retired from production configuration and from

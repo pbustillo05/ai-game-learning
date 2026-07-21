@@ -18,8 +18,8 @@ from torch import Tensor
 from pbg.core.execution import ByteAccountant
 
 
-ROLLOUT_STORAGE_SCHEMA_VERSION = "pbg-rollout-storage-v1"
-TRAINING_STORAGE_SCHEMA_VERSION = "pbg-training-storage-v1"
+ROLLOUT_STORAGE_SCHEMA_VERSION = "pbg-rollout-storage-v2"
+TRAINING_STORAGE_SCHEMA_VERSION = "pbg-training-storage-v2"
 
 
 def _dtype_size(dtype: torch.dtype) -> int:
@@ -140,6 +140,27 @@ class TensorSchema:
         if len(devices) > 1:
             raise ValueError(f"{self.name} columns must share one device")
 
+
+def paged_capacity_bytes(schema: TensorSchema, rows: int, page_rows: int) -> int:
+    """Return the exact capacity of the pages needed for ``rows``.
+
+    Alignment and per-page overhead apply independently to every allocation,
+    exactly as they do in :class:`PagedTensorArena`.  Treating several pages as
+    one large allocation can undercount field alignment and is therefore not a
+    valid admission forecast.
+    """
+
+    if isinstance(rows, bool) or rows < 0:
+        raise ValueError("row count must be nonnegative")
+    if isinstance(page_rows, bool) or page_rows <= 0:
+        raise ValueError("page_rows must be positive")
+    full, remainder = divmod(int(rows), int(page_rows))
+    total = full * schema.capacity_bytes(int(page_rows), chunks=1)
+    if remainder:
+        # Arenas allocate a full final page unless a separate maximum_rows
+        # truncates it. Production rollout owners have no count capacity.
+        total += schema.capacity_bytes(int(page_rows), chunks=1)
+    return total
 
 @dataclass(frozen=True)
 class SealedTensorBlock:
@@ -446,6 +467,34 @@ class PagedTensorArena:
             output = torch.where(mask, candidate, output)
         return output
 
+    def require_rows(self, additional_rows: int) -> None:
+        """Admit future rows without advancing the logical row cursor."""
+
+        if isinstance(additional_rows, bool) or additional_rows < 0:
+            raise ValueError("required rows must be nonnegative")
+        stop = self._size + int(additional_rows)
+        if self.maximum_rows is not None and stop > self.maximum_rows:
+            raise MemoryError(
+                f"{self.label} overflow: requested_stop={stop}, maximum={self.maximum_rows}"
+            )
+        self._allocate_pages(self._next_page_lengths(stop))
+
+    def rollback_page_growth(self, page_count: int) -> None:
+        """Remove empty pages published after a failed grouped admission."""
+
+        if not 0 <= page_count <= self.page_count:
+            raise ValueError("invalid page-growth rollback checkpoint")
+        if self._size > sum(self._lengths[:page_count]):
+            raise RuntimeError("cannot roll back pages containing logical rows")
+        labels = self._reservation_labels[page_count:]
+        del self._pages[page_count:]
+        del self._lengths[page_count:]
+        del self._reservation_labels[page_count:]
+        if self.accountant is not None:
+            self.accountant.release_many(labels)
+
+
+
     def seal(
         self,
         *,
@@ -588,6 +637,232 @@ class PagedTensorArena:
         self._released = True
 
 
+class PagedRowAccumulator:
+    """Schema-on-first-write paged owner for one homogeneous row stream.
+
+    The first realized pack fixes an immutable schema.  Later packs move into
+    admitted pages immediately; sealing is the only source-plus-destination
+    overlap and uses :class:`PagedTensorArena`'s bounded scratch copy.
+    """
+
+    def __init__(
+        self,
+        label: str,
+        page_rows: int,
+        device: torch.device | str,
+        *,
+        accountant: ByteAccountant | None = None,
+    ) -> None:
+        self.label = str(label)
+        self.page_rows = int(page_rows)
+        self.device = torch.device(device)
+        self.accountant = accountant
+        self.arena: PagedTensorArena | None = None
+
+    @property
+    def rows(self) -> int:
+        return 0 if self.arena is None else self.arena.size
+
+    def append(self, columns: Mapping[str, Tensor]) -> Tensor:
+        if not columns:
+            raise ValueError("paged row packs require at least one field")
+        if self.arena is None:
+            schema = TensorSchema(
+                self.label,
+                tuple(
+                    TensorFieldSchema(
+                        name,
+                        value.dtype,
+                        tuple(value.shape[1:]),
+                        alignment=min(max(value.element_size(), 1), 16),
+                    )
+                    for name, value in columns.items()
+                ),
+            )
+            self.arena = PagedTensorArena(
+                schema,
+                self.page_rows,
+                self.device,
+                accountant=self.accountant,
+                label=self.label,
+            )
+        return self.arena.append(columns)
+
+    def seal(self, *, row_order: Tensor | None = None) -> tuple[SealedTensorBlock, SealMetrics]:
+        if self.arena is None:
+            raise RuntimeError("cannot seal an unrealized row stream")
+        return self.arena.seal(
+            scratch_rows=self.page_rows,
+            row_order=row_order,
+            release_source=True,
+        )
+
+
+def admit_arena_growth(requests: Mapping[PagedTensorArena, int]) -> None:
+    """Admit and allocate several arena extents as one publication transaction.
+
+    This is the child-wave primitive: every newly required page is reserved
+    before any allocation, all tensor pages are built off-owner, and arena page
+    lists are updated only after the entire group succeeds.
+    """
+
+    selected = tuple(requests.items())
+    if not selected:
+        return
+    accountants = {arena.accountant for arena, _ in selected}
+    if len(accountants) != 1:
+        raise ValueError("grouped arena growth requires one shared byte accountant")
+    accountant = next(iter(accountants))
+    plans: list[tuple[PagedTensorArena, tuple[int, ...], tuple[str, ...]]] = []
+    reservations: dict[str, int] = {}
+    for arena, additional_rows in selected:
+        arena._check_live()
+        if isinstance(additional_rows, bool) or additional_rows < 0:
+            raise ValueError("grouped arena row counts must be nonnegative")
+        stop = arena.size + int(additional_rows)
+        if arena.maximum_rows is not None and stop > arena.maximum_rows:
+            raise MemoryError(
+                f"{arena.label} overflow: requested_stop={stop}, "
+                f"maximum={arena.maximum_rows}"
+            )
+        lengths = tuple(arena._next_page_lengths(stop))
+        first = arena.page_count
+        labels = tuple(
+            f"{arena.label}.page.{first + offset}"
+            for offset in range(len(lengths))
+        )
+        plans.append((arena, lengths, labels))
+        reservations.update(
+            {
+                label: arena.schema.capacity_bytes(length, chunks=1)
+                for label, length in zip(labels, lengths, strict=True)
+            }
+        )
+    labels = tuple(reservations)
+    if not labels:
+        return
+    if accountant is not None:
+        accountant.reserve_many(reservations)
+    pending: list[tuple[PagedTensorArena, tuple[int, ...], tuple[str, ...], list[dict[str, Tensor]]]] = []
+    try:
+        for arena, lengths, arena_labels in plans:
+            pages = [arena.schema.allocate(length, arena.device) for length in lengths]
+            pending.append((arena, lengths, arena_labels, pages))
+    except BaseException:
+        if accountant is not None:
+            accountant.release_many(labels)
+        raise
+    for arena, lengths, arena_labels, pages in pending:
+        arena._pages.extend(pages)
+        arena._lengths.extend(lengths)
+        arena._reservation_labels.extend(arena_labels)
+
+
+class PagedTensorColumn:
+    """Tensor-style row indexing over one field of a paged arena."""
+
+    def __init__(self, arena: PagedTensorArena, name: str) -> None:
+        self.arena = arena
+        self.name = name
+        self.spec = arena.schema.by_name[name]
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return (self.arena.size, *self.spec.shape)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.spec.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.arena.device
+
+    def numel(self) -> int:
+        return self.arena.size * self.spec.elements_per_row
+
+    def _rows(self, selector: Any) -> tuple[Tensor, tuple[int, ...], bool]:
+        if isinstance(selector, slice):
+            start, stop, step = selector.indices(self.arena.size)
+            rows = torch.arange(start, stop, step, device=self.device)
+            return rows, (rows.numel(),), False
+        if isinstance(selector, int):
+            row = selector if selector >= 0 else self.arena.size + selector
+            return torch.tensor([row], dtype=torch.int64, device=self.device), (), True
+        rows = torch.as_tensor(selector, device=self.device)
+        if rows.dtype == torch.bool:
+            if rows.ndim != 1 or rows.numel() != self.arena.size:
+                raise IndexError("paged boolean row selector has the wrong extent")
+            rows = rows.nonzero(as_tuple=False).squeeze(1)
+        else:
+            rows = rows.to(torch.int64)
+        return rows.reshape(-1), tuple(rows.shape), False
+
+    @staticmethod
+    def _select(full: Tensor, row_shape: tuple[int, ...], rest: tuple[Any, ...]) -> Tensor:
+        if not rest:
+            return full
+        first = rest[0]
+        if isinstance(first, Tensor) and tuple(first.shape) == row_shape:
+            flat = full.reshape(-1, *full.shape[len(row_shape) :])
+            selected = flat[
+                torch.arange(flat.shape[0], device=flat.device),
+                first.to(device=flat.device, dtype=torch.int64).reshape(-1),
+            ]
+            selected = selected.reshape(*row_shape, *selected.shape[1:])
+            return selected[(slice(None),) * len(row_shape) + rest[1:]]
+        return full[(slice(None),) * len(row_shape) + rest]
+
+    @staticmethod
+    def _assign(
+        full: Tensor,
+        row_shape: tuple[int, ...],
+        rest: tuple[Any, ...],
+        value: Any,
+    ) -> None:
+        if not rest:
+            full[...] = value
+            return
+        first = rest[0]
+        if isinstance(first, Tensor) and tuple(first.shape) == row_shape:
+            flat = full.reshape(-1, *full.shape[len(row_shape) :])
+            positions = torch.arange(flat.shape[0], device=flat.device)
+            columns = first.to(device=flat.device, dtype=torch.int64).reshape(-1)
+            if len(rest) == 1:
+                flat[positions, columns] = value
+            else:
+                selected = flat[positions, columns]
+                selected[(slice(None),) * len(row_shape) + rest[1:]] = value
+                flat[positions, columns] = selected
+            return
+        full[(slice(None),) * len(row_shape) + rest] = value
+
+    def __getitem__(self, key: Any) -> Tensor:
+        parts = key if isinstance(key, tuple) else (key,)
+        rows, row_shape, scalar = self._rows(parts[0])
+        full = self.arena.gather(self.name, rows)
+        if scalar:
+            full = full[0]
+            row_shape = ()
+        else:
+            full = full.reshape(*row_shape, *self.spec.shape)
+        return self._select(full, row_shape, parts[1:])
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        parts = key if isinstance(key, tuple) else (key,)
+        rows, row_shape, scalar = self._rows(parts[0])
+        full = self.arena.gather(self.name, rows)
+        if scalar:
+            shaped = full[0]
+            self._assign(shaped, (), parts[1:], value)
+            full = shaped.reshape(1, *self.spec.shape)
+        else:
+            shaped = full.reshape(*row_shape, *self.spec.shape)
+            self._assign(shaped, row_shape, parts[1:], value)
+            full = shaped.reshape(rows.numel(), *self.spec.shape)
+        self.arena.write(rows, {self.name: full})
+
+
 class RecyclableTensorPool:
     """Page-backed mutable slot owner with explicit last-consumer release.
 
@@ -680,6 +955,19 @@ class RecyclableTensorPool:
         self.high_water_live_rows = max(self.high_water_live_rows, self.live_rows)
         return handles
 
+    def required_fresh_rows(self, count: int) -> int:
+        """Return rows not satisfiable from already released handles."""
+
+        if isinstance(count, bool) or count < 0:
+            raise ValueError("pool allocation count must be nonnegative")
+        available = sum(batch.numel() for batch in self._free)
+        return max(0, int(count) - available)
+
+    def require_capacity(self, count: int) -> None:
+        """Admit pages for a future allocation without consuming handles."""
+
+        self.arena.require_rows(self.required_fresh_rows(count))
+
     def _device_handles(self, rows: Tensor | Iterable[int]) -> Tensor:
         handles = torch.as_tensor(rows, dtype=torch.int64, device=self.device)
         if handles.ndim != 1:
@@ -728,11 +1016,13 @@ class RecyclableTensorPool:
 
         self._free.clear()
         self._live_rows = 0
+        self.high_water_live_rows = 0
         self.arena.reset(release_pages=release_pages)
 
     def release(self) -> None:
         self._free.clear()
         self._live_rows = 0
+        self.high_water_live_rows = 0
         self.arena.release()
 
 
@@ -855,6 +1145,25 @@ class SealedDecisionInputs:
                 raise ValueError("sealed decision partition rows are not exact")
         object.__setattr__(self, "inputs", inputs)
         object.__setattr__(self, "input_pools", pools)
+
+    def gather_partition_inputs(
+        self, partition_id: int, partition_rows: Tensor
+    ) -> Mapping[str, Tensor]:
+        """Gather bounded natural rows and resolve their immutable pools."""
+
+        partition_id = int(partition_id)
+        block = self.inputs[partition_id]
+        device = next(iter(block.columns.values())).device
+        rows = partition_rows.to(device=device, dtype=torch.int64)
+        gathered = {name: value[rows] for name, value in block.columns.items()}
+        for name, pool in self.input_pools.get(partition_id, {}).items():
+            refs = gathered.pop(f"{name}_ref").to(torch.int64)
+            for field_name, value in pool.columns.items():
+                resolved = f"{name}.{field_name}"
+                if resolved in gathered:
+                    raise ValueError(f"resolved input name collision: {resolved!r}")
+                gathered[resolved] = value[refs]
+        return MappingProxyType(gathered)
 
 
 @dataclass(frozen=True)

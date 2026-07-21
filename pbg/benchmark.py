@@ -15,6 +15,7 @@ from typing import Any, Iterable
 import torch
 
 from pbg.core.config import RootConfig, seed_all
+from pbg.core.branching import BranchingDiagnosticLimits
 from pbg.core.execution import LOGICAL_RNG_VERSION
 from pbg.core.training import (
     _one_iteration,
@@ -150,12 +151,16 @@ def benchmark_modes(
     repeats: int = 5,
     device: torch.device | str | None = None,
     checkpoint: str | Path | None = None,
+    branching_upper_cutoff_nodes: int | None = None,
 ) -> dict[str, Any]:
     """Profile modes and return median phase/cost metrics plus raw samples."""
 
     if warmup < 0 or repeats <= 0:
         raise ValueError("warmup must be nonnegative and repeats must be positive")
     checkpoint_state, checkpoint_metadata = _benchmark_checkpoint(checkpoint)
+    diagnostic_limits = BranchingDiagnosticLimits(
+        upper_nodes=branching_upper_cutoff_nodes
+    )
     initialization_protocol = (
         CHECKPOINT_INITIALIZATION_PROTOCOL
         if checkpoint_state is not None
@@ -247,6 +252,7 @@ def benchmark_modes(
                 iteration,
                 profile=False,
                 reference_model=reference_model,
+                branching_diagnostic_limits=diagnostic_limits,
             )
         model_state = _cpu_snapshot(bundle.model.state_dict())
         optimizer_state = _cpu_snapshot(optimizer.state_dict())
@@ -272,6 +278,7 @@ def benchmark_modes(
                 profile_iteration,
                 profile=True,
                 reference_model=reference_model,
+                branching_diagnostic_limits=diagnostic_limits,
             )
             decisions = float(sample["decisions"])
             if decisions <= 0:
@@ -303,10 +310,9 @@ def benchmark_modes(
                     "profile_iteration": profile_iteration,
                     "family_batch_rows": local.rollout.family_batch_rows,
                     "max_active_trajectories": local.rollout.max_active_trajectories,
-                    "arena_chunk_nodes": local.rollout.arena_chunk_nodes,
-                    "node_budget": local.rollout.node_budget,
-                    "branching_upper_cutoff_nodes": getattr(
-                        local.rollout, "branching_upper_cutoff_nodes", None
+                    "storage_page_rows": local.rollout.storage_page_rows,
+                    "diagnostic_branching_upper_cutoff_nodes": (
+                        diagnostic_limits.upper_nodes
                     ),
                 },
                 "metrics": _median_metrics(samples),
@@ -351,7 +357,6 @@ def benchmark_modes(
         "workload": {
             "game": "nlhe",
             "roots_per_gpu": cfg.rollout.roots_per_gpu,
-            "node_budget": cfg.rollout.node_budget,
             "completion_samples": cfg.completion.n_samples,
             "completion_backend": cfg.completion.backend,
             "minibatch_size": cfg.training.minibatch_size,
@@ -368,7 +373,7 @@ def benchmark_modes(
             "profile_iteration": warmup,
             "family_batch_rows": cfg.rollout.family_batch_rows,
             "max_active_trajectories": cfg.rollout.max_active_trajectories,
-            "arena_chunk_nodes": cfg.rollout.arena_chunk_nodes,
+            "storage_page_rows": cfg.rollout.storage_page_rows,
             "warmup": warmup,
             "repeats": repeats,
         },
@@ -405,7 +410,6 @@ def compare_benchmark(
     workload_keys = (
         "game",
         "roots_per_gpu",
-        "node_budget",
         "completion_samples",
         "completion_backend",
         "minibatch_size",
@@ -419,7 +423,7 @@ def compare_benchmark(
         "profile_iteration",
         "family_batch_rows",
         "max_active_trajectories",
-        "arena_chunk_nodes",
+        "storage_page_rows",
     )
     if any(current["workload"].get(key) != baseline["workload"].get(key) for key in workload_keys):
         raise ValueError("benchmark workload does not match the baseline")

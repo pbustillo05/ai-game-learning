@@ -14,7 +14,6 @@ beta:
 # reaches 4,000.  From that point onward the existing global latch uses beta=1.
 rollout:
   roots_per_gpu: 1
-  node_budget: 12000
   branching_upper_cutoff_nodes: 4000
   branching_stop_cutoff_nodes: null
 
@@ -54,7 +53,6 @@ constraints:
 smoke:
   beta: 2.25
   upper_cutoff_nodes: 96
-  node_budget: 256
   oracle_samples: 256
   parameter_probes: 1
   node_hutchinson_probes: 1

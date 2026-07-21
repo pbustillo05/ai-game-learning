@@ -6,10 +6,9 @@ game:
 rollout:
   sequential_roots_per_gpu_initial: 2048
   beta: null
-  node_budget: 43
   family_batch_rows: 64
   max_active_trajectories: 64
-  arena_chunk_nodes: 256
+  storage_page_rows: 256
   execution_memory_bytes: 1610612736
   sequential_roots_per_gpu_minimum: 512
   sequential_roots_per_gpu_maximum: 2560

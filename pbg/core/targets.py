@@ -23,7 +23,13 @@ from pbg.core.storage import (
     TrainingStorage,
 )
 from pbg.core.topology import BranchedTreeSpan, SequentialDecisionCSR
-from pbg.core.values import conditionalize
+
+
+def conditionalize(moment: Tensor, mass: Tensor) -> Tensor:
+    """Return ``moment / mass`` with exact zeros where posterior mass is zero."""
+
+    valid = mass > 0
+    return torch.where(valid, moment / torch.where(valid, mass, torch.ones_like(mass)), 0)
 
 
 def _column(block: Any, *names: str) -> Tensor:
@@ -417,7 +423,7 @@ def build_branched_rb_targets(
     leaf_reach = next(
         (
             rollout.leaves.columns[name]
-            for name in ("log_reach", "reach")
+            for name in ("range_weights", "log_reach", "reach")
             if name in rollout.leaves.columns
         ),
         None,
@@ -430,7 +436,10 @@ def build_branched_rb_targets(
             for block in rollout.partitions.values()
             if block.decisions.rows
         ]
-        n_players = 0 if not owner_rows else int(torch.cat(owner_rows).max()) + 1
+        n_players = 1 + max(
+            (int(rows.max()) for rows in owner_rows if rows.numel()),
+            default=-1,
+        )
     if n_players <= 0:
         raise ValueError("branched rollout contains no player decisions")
     plan = plan_branched_frontier(topology, leaf_microbatch_rows=leaf_microbatch_rows)

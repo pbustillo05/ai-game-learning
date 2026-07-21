@@ -24,6 +24,7 @@ import torch
 from torch import Tensor, nn
 import yaml
 
+from pbg.core.branching import BranchingDiagnosticLimits
 from pbg.eval.rao_blackwell_variance import (
     checkpoint_sha256,
     logical_seed,
@@ -167,8 +168,8 @@ def load_config(path: str | Path) -> dict[str, Any]:
     rollout = raw.get("rollout", {})
     if rollout.get("roots_per_gpu") != 1:
         raise ValueError("branched mode requires exactly one rooted tree")
-    if not 1 < int(rollout["branching_upper_cutoff_nodes"]) < int(rollout["node_budget"]):
-        raise ValueError("upper cutoff must lie strictly inside the node budget")
+    if int(rollout["branching_upper_cutoff_nodes"]) <= 1:
+        raise ValueError("upper cutoff must be greater than one")
     if raw["probes"].get("distribution") != "rademacher":
         raise ValueError("only Rademacher probes are supported")
     for key in ("B", "n"):
@@ -327,8 +328,7 @@ def _decision_edges(tree: Any, decision_nodes: Tensor) -> tuple[Tensor, Tensor, 
 
 def _model_directional_rows(
     bundle: Any,
-    state_refs: Tensor,
-    log_reach: Tensor,
+    decision_inputs: Any,
     events: Tensor,
     event_mask: Tensor,
     directions: Sequence[Mapping[str, Tensor]],
@@ -336,75 +336,48 @@ def _model_directional_rows(
 ) -> tuple[Tensor, Tensor]:
     """Return ``dV=[Q,D,H]`` and selected ``dlogpi=[Q,D,E,H]``."""
 
-    from pbg.games.poker.model.postflop import PostflopMasks
-    from pbg.games.poker.model.preflop import PreflopMasks
-
     backend = bundle.rollout_backend
     model = bundle.model.module if hasattr(bundle.model, "module") else bundle.model
-    finite = torch.isfinite(log_reach)
-    gauge = log_reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
-    weights = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
-    pub = backend.encode_public(state_refs)
-    state_rows = state_refs.to(torch.int64)
-    street = backend.states.street[state_rows]
-    legal_ids, legal_mask = backend.legal_events(state_refs)
+    device = decision_inputs.node_ids.device
     probes = len(directions)
     decisions, edge_width = events.shape
-    d_value = torch.empty((probes, decisions, backend.n_hands), dtype=torch.float32, device=state_refs.device)
-    d_logp = torch.empty((probes, decisions, edge_width, backend.n_hands), dtype=torch.float32, device=state_refs.device)
+    d_value = torch.empty(
+        (probes, decisions, backend.n_hands), dtype=torch.float32, device=device
+    )
+    d_logp = torch.empty(
+        (probes, decisions, edge_width, backend.n_hands),
+        dtype=torch.float32,
+        device=device,
+    )
     parameters = dict(model.named_parameters())
     stacked = {name: torch.stack([direction[name] for direction in directions]) for name in parameters}
-    family = backend.rollout_family_ids(state_refs).to(torch.int64)
-    group = family * 4 + street.to(torch.int64)
-    for group_id in group.unique(sorted=True).tolist():
-        selected_group = (group == group_id).nonzero(as_tuple=False).squeeze(1)
-        family_id = int(group_id) // 4
+    source_rows = torch.arange(decisions, dtype=torch.int64, device=device)
+    selected_partitions = decision_inputs.partition_id.to(torch.int64)
+    for partition_id in selected_partitions.unique(sorted=True).tolist():
+        selected_group = (selected_partitions == partition_id).nonzero(
+            as_tuple=False
+        ).squeeze(1)
         for selected in selected_group.split(maximum_batch_rows):
-            selected_pub = backend._slice_public(pub, selected)
-            selected_weights = weights[selected]
-            if family_id == 0:
-                pre_masks = PreflopMasks(seat_mask=selected_pub.seat_mask, status=selected_pub.status)
-                post_masks = None
-            else:
-                selected_states = state_refs[selected]
-                selected_rows = selected_states.to(torch.int64)
-                status = backend.states.status[selected_rows]
-                live = int(family_id)
-                live_seat_ids = torch.where(
-                    status != 1,
-                    torch.arange(backend.n_players, device=state_refs.device)[None],
-                    backend.n_players,
-                ).sort(1).values[:, :live]
-                board_cards = (backend.states.board[selected_rows] >= 0).sum(1)
-                if board_cards.unique().numel() != 1:
-                    raise ValueError("directional family batch mixed streets")
-                compact_size = math.comb(backend.n_cards - int(board_cards[0]), 2)
-                pre_masks = None
-                post_masks = PostflopMasks(
-                    compatibility=backend._compatibility(selected_pub.board),
-                    seat_mask=selected_pub.seat_mask,
-                    combo_mask=selected_weights > 0,
-                    status=selected_pub.status,
-                    evaluator_summary=None,
-                    live_seat_ids=live_seat_ids,
-                    compact_size=compact_size,
-                )
+            inputs = decision_inputs.gather_partition_inputs(
+                int(partition_id),
+                decision_inputs.partition_row[source_rows[selected]],
+            )
+            legal_mask = inputs["legal_action_mask"].to(torch.bool)
+            legal_ids = torch.arange(
+                backend.e_max, dtype=torch.int32, device=device
+            )[None].expand(selected.numel(), -1)
             chosen = events[selected]
             chosen_mask = event_mask[selected]
-            safe_column = legal_mask[selected].to(torch.int64).argmax(1, keepdim=True)
-            safe_event = legal_ids[selected].gather(1, safe_column).expand_as(chosen)
+            safe_column = legal_mask.to(torch.int64).argmax(1, keepdim=True)
+            safe_event = legal_ids.gather(1, safe_column).expand_as(chosen)
             safe = torch.where(chosen_mask, chosen, safe_event)
 
             def call(current: Mapping[str, Tensor]) -> tuple[Tensor, Tensor]:
-                output = torch.func.functional_call(
-                    model,
-                    current,
-                    (selected_pub, selected_weights, selected_pub.to_act),
-                    {"preflop_masks": pre_masks, "postflop_masks": post_masks},
-                    strict=False,
+                output = backend.functional_policy_forward_partition(
+                    model, current, int(partition_id), inputs
                 )
                 return output.v, bundle.policy_adapter.log_prob(
-                    output, safe, legal_ids[selected], legal_mask[selected]
+                    output, safe, legal_ids, legal_mask
                 )
 
             def tangent(direction: Mapping[str, Tensor]) -> tuple[Tensor, Tensor]:
@@ -481,7 +454,9 @@ class BranchedVarianceRunner:
         raw["rollout"]["sequential_roots_per_gpu_initial"] = 1
         raw["rollout"]["sequential_roots_per_gpu_minimum"] = 1
         raw["rollout"]["sequential_roots_per_gpu_maximum"] = 1
-        raw["rollout"]["node_budget"] = int(rollout["node_budget"])
+        raw["rollout"]["storage_page_rows"] = int(
+            raw["rollout"].get("storage_page_rows", 256)
+        )
         raw["rollout"]["beta"] = {"default": 1.0}
         raw["rollout"]["branching_mode"] = "fixed"
         raw["rollout"].pop("adaptive_kkt", None)
@@ -502,8 +477,10 @@ class BranchedVarianceRunner:
         hardware = "configs/hardware/local_3x2080ti.yaml" if device.type == "cuda" else None
         self.cfg = load_config_mapping(raw, hardware_profile=hardware)
         self.cfg.rollout.roots_per_gpu = 1
-        setattr(self.cfg.rollout, "branching_upper_cutoff_nodes", int(rollout["branching_upper_cutoff_nodes"]))
-        setattr(self.cfg.rollout, "branching_stop_cutoff_nodes", rollout.get("branching_stop_cutoff_nodes"))
+        self.diagnostic_limits = BranchingDiagnosticLimits(
+            upper_nodes=int(rollout["branching_upper_cutoff_nodes"]),
+            stop_nodes=rollout.get("branching_stop_cutoff_nodes"),
+        )
         if self.cfg.hardware is not None:
             self.cfg.hardware.attention_backend = "chunked_dense"
             self.cfg.hardware.query_chunk_size = min(self.cfg.hardware.query_chunk_size, 16)
@@ -553,17 +530,27 @@ class BranchedVarianceRunner:
                 f"exceeds {self.memory_limit / 1024**3:.3f} GiB"
             )
 
-    def sample_tree(self, beta: float, repeat: int, *, upper_cutoff: int | None = None, node_budget: int | None = None) -> tuple[Any, Any, Any, dict[str, Any]]:
+    def sample_tree(
+        self,
+        beta: float,
+        repeat: int,
+        *,
+        upper_cutoff: int | None = None,
+    ) -> tuple[Any, Any, Any, dict[str, Any]]:
         from pbg.core.branching import sample_branched_tree
 
         seed = logical_seed(int(self.experiment["logical_seed"]), "branched-public-tree", 1110, repeat)
         self.bundle.rollout_backend.beta_table = {"default": float(beta)}
         self.cfg.rollout.logical_seed = seed
         self.cfg.training.seed = seed
-        if upper_cutoff is not None:
-            setattr(self.cfg.rollout, "branching_upper_cutoff_nodes", int(upper_cutoff))
-        if node_budget is not None:
-            self.cfg.rollout.node_budget = int(node_budget)
+        diagnostic_limits = BranchingDiagnosticLimits(
+            upper_nodes=(
+                self.diagnostic_limits.upper_nodes
+                if upper_cutoff is None
+                else int(upper_cutoff)
+            ),
+            stop_nodes=self.diagnostic_limits.stop_nodes,
+        )
         generator = torch.Generator(device=self.device).manual_seed(seed)
         diagnostics: dict[str, int] = {}
         if self.device.type == "cuda":
@@ -571,7 +558,12 @@ class BranchedVarianceRunner:
         started = time.perf_counter()
         with torch.inference_mode():
             tree, reach, policy = sample_branched_tree(
-                self.bundle, self.cfg, generator, iteration=1110, diagnostics=diagnostics
+                self.bundle,
+                self.cfg,
+                generator,
+                iteration=1110,
+                diagnostics=diagnostics,
+                diagnostic_limits=diagnostic_limits,
             )
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -603,9 +595,18 @@ class BranchedVarianceRunner:
         self, tree: Any, reach: Any, policy: Any, beta: float, repeat: int, n_samples: int
     ) -> tuple[Tensor, Tensor, Tensor, dict[str, Tensor], Tensor, float]:
         leaf_ids = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero(as_tuple=False).squeeze(1)
-        leaf_reach = reach.rows_for(tree, leaf_ids.to(torch.int32), self.bundle.rollout_backend, policy)
-        states = tree.state_ref[leaf_ids.to(torch.int64)].to(torch.int32)
-        inputs = self.bundle.rollout_backend.completion_inputs(states, leaf_reach)
+        leaf_reach = reach.rows_for(
+            tree, leaf_ids.to(torch.int32), self.bundle.rollout_backend, policy
+        )
+        captured_leaf = reach.payload_for(leaf_ids.to(torch.int32))
+        inputs = {
+            name: value
+            for name, value in captured_leaf.items()
+            if name not in {"owner", "fold_payoff"}
+        }
+        inputs["range_weights"] = (
+            self.bundle.rollout_backend.range_weights_from_log_reach(leaf_reach)
+        )
         seeds = torch.tensor(
             [logical_seed(int(self.experiment["logical_seed"]), "branched-oracle", 1110, float(beta), repeat, leaf) for leaf in range(leaf_ids.numel())],
             dtype=torch.int64,
@@ -632,17 +633,14 @@ class BranchedVarianceRunner:
         started = time.perf_counter()
         tree, reach, policy, geometry = self.sample_tree(beta, repeat)
         rollout_done = time.perf_counter()
-        if policy.decision_reach is None:
+        if policy.decision_inputs is None:
             raise RuntimeError("branched rollout omitted decision inputs")
         decisions = policy.node_ids.to(torch.int64)
         children, events, child_mask, child_count = _decision_edges(tree, decisions)
         directions_started = time.perf_counter()
         d_value, d_logp = _model_directional_rows(
             self.bundle,
-            policy.decision_reach.state_refs,
-            policy.decision_reach.gather(
-                torch.arange(decisions.numel(), device=self.device), self.bundle.rollout_backend
-            ),
+            policy.decision_inputs,
             events,
             child_mask,
             self.directions,

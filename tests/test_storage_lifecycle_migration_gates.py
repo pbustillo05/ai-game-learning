@@ -1,17 +1,9 @@
-"""Executable gates for the authoritative storage-lifecycle migration.
-
-The expected failures name the known production defects at the phase-1
-baseline.  Each marker is removed by the phase that makes the assertion true;
-strict XPASS prevents a completed migration from remaining hidden here.
-"""
+"""Executable sole-path gates for the authoritative storage lifecycle."""
 
 from __future__ import annotations
 
 import ast
 from pathlib import Path
-
-import pytest
-
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION = ROOT / "pbg"
@@ -32,10 +24,6 @@ def _imports(relative: str) -> set[str]:
     return imported
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="phase 3/4 must replace the post-hoc compatibility pipeline",
-)
 def test_training_orchestrator_uses_rollout_storage_and_authoritative_targets_directly() -> None:
     source = _source("pbg/core/training.py")
     imports = _imports("pbg/core/training.py")
@@ -60,10 +48,6 @@ def test_poker_training_inputs_do_not_retain_mutable_state_handles() -> None:
     assert 'inputs.get("state_ref")' not in forward_source
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="phases 3-5 remove the duplicate rollout/target object model",
-)
 def test_retired_rollout_and_target_artifacts_are_absent_from_production() -> None:
     retired = {
         "DeviceTreeBuffer",
@@ -85,10 +69,6 @@ def test_retired_rollout_and_target_artifacts_are_absent_from_production() -> No
     assert {name: paths for name, paths in found.items() if paths} == {}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="phase 5 retires total-node capacity from production configuration",
-)
 def test_node_budget_is_absent_from_production_python() -> None:
     offenders = [
         str(path.relative_to(ROOT))
@@ -98,26 +78,23 @@ def test_node_budget_is_absent_from_production_python() -> None:
     assert offenders == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="phase 4 replaces the growing legacy backward frontier",
-)
-def test_production_target_reducers_do_not_grow_payload_with_torch_cat() -> None:
-    source = _source("pbg/core/values.py")
-    tree = ast.parse(source, filename="pbg/core/values.py")
-    reducer = next(
-        node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "_reduce_streamed_leaf_batches"
-    )
-    calls = [
-        node
-        for node in ast.walk(reducer)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "torch"
-        and node.func.attr == "cat"
-    ]
-    assert calls == []
+def test_production_rollout_and_targets_do_not_grow_payload_with_torch_cat() -> None:
+    offenders: list[str] = []
+    for relative in (
+        "pbg/core/rollout.py",
+        "pbg/core/branching.py",
+        "pbg/core/targets.py",
+    ):
+        tree = ast.parse(_source(relative), filename=relative)
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "torch"
+            and node.func.attr == "cat"
+        ]
+        if calls:
+            offenders.append(relative)
+    assert offenders == []

@@ -4,19 +4,36 @@ import json
 import torch
 
 from pbg.core.checkpointing import validate_metrics_prefix
+from pbg.core.storage import (
+    SealedDecisionInputs,
+    SealedTensorBlock,
+    TensorFieldSchema,
+    TensorSchema,
+)
 from pbg.core.training import _decision_street_metrics
 
 
 def test_decision_street_metrics_counts_and_normalizes() -> None:
-    backend = SimpleNamespace(
-        states=SimpleNamespace(street=torch.tensor([0, 1, 1, 2, 3, 3]))
+    streets = torch.tensor([0, 1, 1, 2, 3, 3], dtype=torch.int32)
+    schema = TensorSchema(
+        "diagnostic_inputs", (TensorFieldSchema("street", torch.int32),)
     )
-    tree = SimpleNamespace(
-        state_ref=torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int32)
+    block = SealedTensorBlock(
+        schema,
+        {"street": streets},
+        streets.numel(),
+        schema.capacity_bytes(streets.numel()),
     )
+    inputs = SealedDecisionInputs(
+        node_ids=torch.arange(6, dtype=torch.int32),
+        partition_id=torch.zeros(6, dtype=torch.int32),
+        partition_row=torch.arange(6, dtype=torch.int32),
+        inputs={0: block},
+    )
+    policy = SimpleNamespace(node_ids=inputs.node_ids, decision_inputs=inputs)
     metrics: dict[str, float] = {}
 
-    _decision_street_metrics(metrics, backend, tree, torch.arange(6))
+    _decision_street_metrics(metrics, SimpleNamespace(), SimpleNamespace(), policy)
 
     assert metrics["decision_nodes_preflop"] == 1.0
     assert metrics["decision_nodes_flop"] == 2.0

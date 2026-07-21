@@ -52,13 +52,12 @@ class RolloutConfig:
 
     sequential_roots_per_gpu_initial: int
     beta: dict[str, float] | None
-    node_budget: int
     branching_mode: Literal["fixed", "dynamic"] | None = None
     sequential_roots_per_gpu_minimum: int | None = None
     sequential_roots_per_gpu_maximum: int | None = None
     family_batch_rows: int | None = None
     max_active_trajectories: int | None = None
-    arena_chunk_nodes: int | None = None
+    storage_page_rows: int | None = None
     execution_memory_bytes: int | None = None
     memory_calibration_window: int = 32
     memory_growth_fraction: float = 0.10
@@ -329,11 +328,10 @@ def _validate_config(cfg: RootConfig) -> None:
         if minimum_nodes is not None and (
             isinstance(minimum_nodes, bool)
             or not isinstance(minimum_nodes, int)
-            or not 1 < minimum_nodes < cfg.rollout.node_budget
+            or minimum_nodes <= 1
         ):
             raise ConfigError(
-                "root.rollout.branching_min_nodes: expected an integer strictly "
-                "between one and node_budget"
+                "root.rollout.branching_min_nodes: expected an integer greater than one"
             )
     else:
         if cfg.rollout.branching_mode is not None:
@@ -411,12 +409,10 @@ def _validate_config(cfg: RootConfig) -> None:
         raise ConfigError("root.rollout.memory_growth_fraction: expected a value in (0,1)")
     if not math.isfinite(cfg.rollout.memory_prediction_z) or cfg.rollout.memory_prediction_z <= 0:
         raise ConfigError("root.rollout.memory_prediction_z: expected a finite positive value")
-    if cfg.rollout.node_budget <= 0:
-        raise ConfigError("root.rollout.node_budget: expected a positive integer")
     for name in (
         "family_batch_rows",
         "max_active_trajectories",
-        "arena_chunk_nodes",
+        "storage_page_rows",
         "execution_memory_bytes",
     ):
         value = getattr(cfg.rollout, name)

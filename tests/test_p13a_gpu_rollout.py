@@ -19,7 +19,6 @@ from pbg.core.rollout import sample_trees, sample_trees_sequential
 from pbg.core.storage import SealedDecisionInputs
 from pbg.core.targets import build_normal_targets
 from pbg.core.training import _seal_sequential_rollout_storage
-from pbg.core.tree import DecisionReachCache
 from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
 from pbg.games.poker.bundle import _TensorPokerGPUCompletion
 from pbg.games.poker.engine import (
@@ -155,14 +154,14 @@ class _AlwaysFoldModel(_RecordingModel):
 
 def _backend(
     cfg: PokerConfig,
-    capacity: int = 4096,
+    page_rows: int = 256,
     device: str | torch.device = "cpu",
     **kwargs: Any,
 ) -> PokerRolloutBackend:
     return PokerRolloutBackend(
         cfg,
-        capacity,
         device,
+        storage_page_rows=page_rows,
         max_rollout_steps=256,
         profile_sampler=kwargs.pop("profile_sampler", _Profiles()),
         partition_adapter=kwargs.pop("partition_adapter", _Partition()),
@@ -191,7 +190,7 @@ def _compare_state(cpu: NLHEEngine, cpu_ref: int, backend: PokerRolloutBackend, 
 
 
 def test_tensor_store_has_required_device_soa_and_prefix_allocation() -> None:
-    store = PokerTensorStateStore(16, 20, "cpu", n_players=3)
+    store = PokerTensorStateStore(20, "cpu", n_players=3, page_rows=16)
     requested = torch.tensor([True, False, True, True])
     handles = store.allocate(requested)
     assert torch.equal(handles, torch.tensor([0, -1, 1, 2], dtype=torch.int32))
@@ -204,7 +203,8 @@ def test_tensor_store_has_required_device_soa_and_prefix_allocation() -> None:
     assert (required - {"history_parent"}).issubset(vars(store))
     assert hasattr(store, "history_parent")
     assert "action_history" not in vars(store)
-    assert store.history_parent.shape == store.history_event.shape == (3,)
+    assert store.history_ref.shape == (3,)
+    assert store.history_parent.shape == store.history_event.shape == (0,)
     assert store.capacity == 16
     assert store.pool.live_rows == 3
     store.release_rows(torch.tensor([0], dtype=torch.int32))
@@ -264,6 +264,7 @@ def test_random_legal_trajectories_match_cpu_engine_step_for_step(
             if cpu_owner in {PRETERM, TERMINAL}:
                 break
             parent_ref = ref.clone()
+            parent_history = backend.states.history_ref[parent_ref.to(torch.int64)].clone()
             if cpu_owner == CHANCE:
                 street = cpu.states.street[cpu_ref]
                 used = {card for card in cpu.states.board[cpu_ref] if card >= 0}
@@ -288,8 +289,9 @@ def test_random_legal_trajectories_match_cpu_engine_step_for_step(
                 ref = backend.step(ref, EventBatch(torch.tensor([event], dtype=torch.int32)))
                 expected_history_event = event
             row = ref.long()
-            assert torch.equal(backend.states.history_parent[row], parent_ref)
-            assert int(backend.states.history_event[row][0]) == expected_history_event
+            history = backend.states.history_ref[row].to(torch.int64)
+            assert torch.equal(backend.states.history_parent[history], parent_history)
+            assert int(backend.states.history_event[history][0]) == expected_history_event
             _compare_state(cpu, cpu_ref, backend, ref)
         else:
             raise AssertionError("legal poker trajectory exceeded test horizon")
@@ -321,7 +323,9 @@ def test_parent_linked_history_reconstructs_exact_actions_arithmetic_and_streets
     torch.testing.assert_close(history.amount, torch.tensor([[2.0, 1.0, 0.0]]))
     torch.testing.assert_close(history.pot_before, torch.tensor([[1.5, 3.0, 4.0]]))
     torch.testing.assert_close(history.call_amount, torch.tensor([[0.5, 1.0, 0.0]]))
-    assert backend.states.history_parent.numel() == int(backend.states.size)
+    assert backend.states.history_parent.numel() == 1 + int(
+        backend.states.history_length[flop.to(torch.int64)]
+    )
     assert backend.states.capacity <= backend.states.arena.page_rows
     assert backend.states.history_parent.numel() < backend.states.capacity
 
@@ -424,8 +428,9 @@ def test_mixed_player_and_chance_rows_step_in_one_branched_batch() -> None:
     assert int(backend.classify(successors[:1])[0]) == TERMINAL
     assert int(backend.states.street[successors[1:].long()][0]) == 1
     assert 0 <= int(backend.classify(successors[1:])[0]) < 2
-    assert int(backend.states.history_event[successors.long()][0]) == FOLD
-    assert int(backend.states.history_event[successors.long()][1]) == -1
+    history = backend.states.history_ref[successors.long()].to(torch.int64)
+    assert int(backend.states.history_event[history][0]) == FOLD
+    assert int(backend.states.history_event[history][1]) == -1
 
 
 def test_policy_routes_one_large_preflop_and_one_shared_postflop_queue() -> None:
@@ -478,38 +483,8 @@ def test_device_partition_cache_masks_hits_and_invalidates_on_fold() -> None:
     assert len(partition.calls) == 3
     assert partition.calls[-1]["folded"].folder_mask.tolist() == [[True]]
     assert backend.partition_summary_cache.size == 1
-    assert backend.partition_summary_cache.capacity == 64
+    assert backend.partition_summary_cache.capacity == backend.storage_page_rows
     assert not hasattr(backend.partition_summary_cache, "valid")
-
-    decision_states = torch.cat((called, folded))
-    decision_reach = torch.stack(
-        (
-            torch.arange(3 * 1326, dtype=torch.float32).reshape(3, 1326),
-            torch.arange(3 * 1326, dtype=torch.float32).reshape(3, 1326) + 10_000,
-        )
-    )
-    retained = DecisionReachCache.from_rows(
-        torch.tensor([0, 1], dtype=torch.int32),
-        decision_states,
-        decision_reach,
-        backend,
-    )
-    assert isinstance(retained.payload, Tensor)
-    assert torch.equal(retained.payload, decision_reach)
-    compact = backend.compact_decision_reach(decision_states, decision_reach)
-    # Three live seats before the fold and two after it are retained; the
-    # folded full row is gone while the model-ready folder summary stays cached.
-    assert compact.log_r.shape == (5, 1326)
-    sampled_rows = torch.tensor([1, 0, 1], dtype=torch.int64)
-    expanded = backend.expand_decision_reach(compact, sampled_rows)
-    status = backend.states.status[decision_states[sampled_rows].long()]
-    expected = decision_reach[sampled_rows]
-    assert torch.equal(expanded[status != FOLDED], expected[status != FOLDED])
-    assert torch.isneginf(expanded[status == FOLDED]).all()
-    backend.policy_forward(model, folded, expanded[:1])
-    assert len(partition.calls) == 4
-    assert partition.calls[-1]["folded"].folder_mask.tolist() == [[False]]
-
 
 def test_policy_without_partition_consumer_skips_evaluator() -> None:
     cfg = PokerConfig(n_players=2)
@@ -563,10 +538,10 @@ def test_policy_planner_mixes_postflop_streets_and_splits_live_counts() -> None:
 def test_core_sampler_accumulates_many_trees_before_model_forward() -> None:
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
     profiles = _Profiles()
-    backend = _backend(cfg, capacity=2048, profile_sampler=profiles)
+    backend = _backend(cfg, page_rows=2048, profile_sampler=profiles)
     model = _RecordingModel()
     rollout = SimpleNamespace(
-        roots_per_gpu=16, node_budget=64
+        roots_per_gpu=16, storage_page_rows=64
     )
     tree, reach, policy = sample_trees_sequential(
         GameBundle(model, backend, PokerPolicyAdapter(cfg.n_ticks), None),
@@ -586,14 +561,13 @@ def test_poker_family_scheduled_sequential_rollout_closes_chance_segments() -> N
 
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
     profiles = _Profiles()
-    backend = _backend(cfg, capacity=1024, profile_sampler=profiles)
+    backend = _backend(cfg, page_rows=1024, profile_sampler=profiles)
     model = _AlwaysCheckModel()
     rollout = SimpleNamespace(
         roots_per_gpu=8,
-        node_budget=64,
         family_batch_rows=4,
         max_active_trajectories=8,
-        arena_chunk_nodes=32,
+        storage_page_rows=32,
         logical_seed=123,
     )
     tree, reach, policy = sample_trees_sequential(
@@ -605,10 +579,14 @@ def test_poker_family_scheduled_sequential_rollout_closes_chance_segments() -> N
     tree.validate()
     assert int(((tree.owner == TERMINAL) | (tree.owner == PRETERM)).sum()) == 8
     assert reach.log_r.shape[0] == 8
-    assert policy.decision_reach is not None
-    assert policy.decision_reach.node_ids.numel() == policy.node_ids.numel()
+    assert policy.decision_inputs is not None
+    assert policy.decision_inputs.node_ids.numel() == policy.node_ids.numel()
     assert policy.node_ids.numel() > 0
-    assert bool((backend.states.street[tree.state_ref.long()] > 0).any())
+    assert bool(
+        torch.cat(
+            [block["street"] for block in policy.decision_inputs.inputs.values()]
+        ).gt(0).any()
+    )
     assert all(batch > 1 for _, batch, _ in model.calls)
     assert profiles.devices == [backend.device]
 
@@ -616,7 +594,7 @@ def test_poker_family_scheduled_sequential_rollout_closes_chance_segments() -> N
 
 def test_poker_actual_cost_family_block_sorts_and_splits_without_changing_order() -> None:
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
-    backend = _backend(cfg, capacity=256)
+    backend = _backend(cfg, page_rows=256)
     backend.execution_profile = SimpleNamespace(
         name="tiny_actual_cost",
         inference_max_tokens=5_000,
@@ -637,7 +615,7 @@ def test_poker_actual_cost_family_block_sorts_and_splits_without_changing_order(
 
 def test_poker_actual_cost_charges_mixed_postflop_rows_at_flop_width() -> None:
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
-    backend = _backend(cfg, capacity=16)
+    backend = _backend(cfg, page_rows=16)
     model = _AlwaysCheckModel()
     states = backend.sequential_start_states(3)
     rows = states.to(torch.int64)
@@ -652,7 +630,7 @@ def test_poker_actual_cost_charges_mixed_postflop_rows_at_flop_width() -> None:
 
 def test_poker_actual_cost_singleton_skips_cost_planning(monkeypatch) -> None:
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
-    backend = _backend(cfg, capacity=16)
+    backend = _backend(cfg, page_rows=16)
     backend.execution_profile = SimpleNamespace(
         name="tiny_actual_cost_singleton",
         inference_max_tokens=1_000,
@@ -679,7 +657,7 @@ def test_poker_actual_cost_keeps_physical_pack_indices_on_device() -> None:
 
     device = torch.device("cuda", torch.cuda.current_device())
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
-    backend = _backend(cfg, capacity=32, device=device)
+    backend = _backend(cfg, page_rows=32, device=device)
     backend.execution_profile = SimpleNamespace(
         name="tiny_actual_cost_cuda",
         inference_max_tokens=1_000,
@@ -727,7 +705,7 @@ def _real_execution_poker_sample(
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
     backend = _backend(
         cfg,
-        capacity=512,
+        page_rows=512,
         device=device,
         profile_sampler=PokerGPURejectionSampler(
             backend="cuda" if device.type == "cuda" else "cpu"
@@ -738,10 +716,9 @@ def _real_execution_poker_sample(
     run_cfg = SimpleNamespace(
         rollout=SimpleNamespace(
             roots_per_gpu=4,
-            node_budget=64,
             family_batch_rows=batch_rows,
             max_active_trajectories=admission,
-            arena_chunk_nodes=16,
+            storage_page_rows=16,
             logical_seed=741,
         ),
         training=SimpleNamespace(mode="normal"),
@@ -771,7 +748,7 @@ def _assert_real_execution_poker_sample(cfg, backend, model, sampled, run_cfg) -
     chance = tree.owner == CHANCE
     assert bool(((tree.child_ptr[1:] - tree.child_ptr[:-1])[chance] == 1).all())
 
-    captured = policy.decision_reach
+    captured = policy.decision_inputs
     assert isinstance(captured, SealedDecisionInputs)
     for partition_id, block in captured.inputs.items():
         rows = (captured.partition_id == partition_id).nonzero(as_tuple=False).squeeze(1)
@@ -779,7 +756,11 @@ def _assert_real_execution_poker_sample(cfg, backend, model, sampled, run_cfg) -
         assert "range_weights" in block.columns
         assert "state_ref" not in block.columns
     metrics = backend.execution_metrics.snapshot()
-    assert metrics["execution_evaluator_rows"] == 4
+    assert metrics["execution_evaluator_rows"] == 8
+    assert metrics["execution_state_live_rows_at_seal"] == 0
+    assert metrics["execution_history_live_rows_at_seal"] == 1
+    assert metrics["execution_state_live_rows_high_water"] < tree.parent.numel()
+    assert metrics["execution_history_live_rows_high_water"] < tree.parent.numel()
     assert metrics["execution_evaluator_calls"] >= 1
 
 
@@ -852,12 +833,12 @@ def test_poker_last_consumer_reaches_are_schedule_repeatable(
     model = _AlwaysCheckModel()
     common = dict(
         roots_per_gpu=1 if mode == "branched_rao_blackwell" else 2,
-        node_budget=128 if mode == "branched_rao_blackwell" else 64,
+        storage_page_rows=128 if mode == "branched_rao_blackwell" else 64,
     )
     if mode == "branched_rao_blackwell":
         common.update(branching_mode="fixed", adaptive_kkt=None)
-    full_backend = _backend(cfg, capacity=256, beta_table=beta_table)
-    replay_backend = _backend(cfg, capacity=256, beta_table=beta_table)
+    full_backend = _backend(cfg, page_rows=256, beta_table=beta_table)
+    replay_backend = _backend(cfg, page_rows=256, beta_table=beta_table)
     sampler = (
         sample_branched_tree
         if mode == "branched_rao_blackwell"
@@ -877,26 +858,21 @@ def test_poker_last_consumer_reaches_are_schedule_repeatable(
         assert torch.equal(getattr(replay_tree, field), getattr(full_tree, field))
     assert torch.equal(replay_reach.node_index, full_reach.node_index)
     assert torch.equal(replay_reach.log_r, full_reach.log_r)
-    assert full_policy.decision_reach is not None
-    assert replay_policy.decision_reach is not None
-    if isinstance(full_policy.decision_reach, SealedDecisionInputs):
-        expected = full_policy.decision_reach
-        actual = replay_policy.decision_reach
-        assert isinstance(actual, SealedDecisionInputs)
-        assert torch.equal(actual.node_ids, expected.node_ids)
-        assert torch.equal(actual.partition_id, expected.partition_id)
-        assert torch.equal(actual.partition_row, expected.partition_row)
-        for partition_id, block in expected.inputs.items():
-            for name, value in block.columns.items():
-                assert torch.equal(actual.inputs[partition_id].columns[name], value)
-    else:
-        decision_rows = torch.arange(full_policy.node_ids.numel())
-        expected = full_policy.decision_reach.gather(decision_rows, full_backend)
-        actual = replay_policy.decision_reach.gather(decision_rows, replay_backend)
-        assert torch.equal(actual, expected)
+    assert full_policy.decision_inputs is not None
+    assert replay_policy.decision_inputs is not None
+    expected = full_policy.decision_inputs
+    actual = replay_policy.decision_inputs
+    assert isinstance(expected, SealedDecisionInputs)
+    assert isinstance(actual, SealedDecisionInputs)
+    assert torch.equal(actual.node_ids, expected.node_ids)
+    assert torch.equal(actual.partition_id, expected.partition_id)
+    assert torch.equal(actual.partition_row, expected.partition_row)
+    for partition_id, block in expected.inputs.items():
+        for name, value in block.columns.items():
+            assert torch.equal(actual.inputs[partition_id].columns[name], value)
 
-    streets = replay_backend.states.street[replay_tree.state_ref.long()]
-    assert bool(((replay_tree.owner >= 0) & (streets > 0)).any())
+    streets = torch.cat([block["street"] for block in actual.inputs.values()])
+    assert bool((streets > 0).any())
     events = replay_tree.child_event
     assert bool(((events >= 100_000) & (events < 200_000)).any())
     assert bool(((events >= 200_000) & (events < 300_000)).any())
@@ -908,15 +884,39 @@ def test_poker_last_consumer_reaches_are_schedule_repeatable(
             labels = replay_tree.child_event[start:stop]
             has_duplicate_label |= labels.numel() > labels.unique().numel()
         assert has_duplicate_label
+    lifecycle = replay_backend.execution_metrics.snapshot()
+    assert lifecycle["execution_state_live_rows_at_seal"] == 0
+    assert lifecycle["execution_history_live_rows_at_seal"] == 1
+    assert lifecycle["execution_state_live_rows_high_water"] < replay_tree.parent.numel()
+    assert lifecycle["execution_history_live_rows_high_water"] <= replay_tree.parent.numel()
+    assert replay_backend.states.arena.page_count == 0
+    assert replay_backend.states.history_arena.page_count == 0
+
+
+def test_recyclable_history_reclaims_one_dead_branch_without_touching_sibling() -> None:
+    store = PokerTensorStateStore(16, "cpu", n_players=2, page_rows=4)
+    store.reset()
+    root = store.allocate_all(1)
+    children = store.append_copies(root.repeat(2))
+    store.release_rows(root)
+    assert store.history_pool.live_rows == 3  # sentinel plus two live tips
+
+    grandchild = store.append_copies(children[:1])
+    store.release_rows(children[:1])
+    assert store.history_pool.live_rows == 4
+    store.release_rows(grandchild)
+    assert store.history_pool.live_rows == 2  # sibling tip plus sentinel
+    store.release_rows(children[1:])
+    assert store.history_pool.live_rows == 1
 
 
 def test_poker_fold_reaches_are_retained_only_at_last_consumers() -> None:
     cfg = PokerConfig(n_players=2, stack_bb=8.0)
     rollout = SimpleNamespace(
-        roots_per_gpu=2, node_budget=8
+        roots_per_gpu=2, storage_page_rows=8
     )
-    full_backend = _backend(cfg, capacity=32)
-    replay_backend = _backend(cfg, capacity=32)
+    full_backend = _backend(cfg, page_rows=32)
+    replay_backend = _backend(cfg, page_rows=32)
     model = _AlwaysFoldModel()
     full_tree, full_reach, full_policy = sample_trees_sequential(
         GameBundle(model, full_backend, PokerPolicyAdapter(cfg.n_ticks), None),
@@ -930,13 +930,15 @@ def test_poker_fold_reaches_are_retained_only_at_last_consumers() -> None:
     )
     assert torch.equal(replay_reach.node_index, full_reach.node_index)
     assert torch.equal(replay_reach.log_r, full_reach.log_r)
-    assert full_policy.decision_reach is not None
-    assert replay_policy.decision_reach is not None
-    rows = torch.arange(full_policy.node_ids.numel())
-    assert torch.equal(
-        full_policy.decision_reach.gather(rows, full_backend),
-        replay_policy.decision_reach.gather(rows, replay_backend),
-    )
+    assert full_policy.decision_inputs is not None
+    assert replay_policy.decision_inputs is not None
+    expected = full_policy.decision_inputs
+    actual = replay_policy.decision_inputs
+    assert isinstance(expected, SealedDecisionInputs)
+    assert isinstance(actual, SealedDecisionInputs)
+    for partition_id, block in expected.inputs.items():
+        for name, value in block.columns.items():
+            assert torch.equal(actual.inputs[partition_id].columns[name], value)
     assert bool((replay_tree.child_event == FOLD).any())
 
 
@@ -961,7 +963,7 @@ def test_real_tensor_poker_keyed_completion_mixes_showdown_and_fold_rows() -> No
     pytest.importorskip("poker_gpu_evaluator")
     backend = _backend(
         PokerConfig(n_players=2, stack_bb=8.0),
-        capacity=32,
+        page_rows=32,
         profile_sampler=PokerGPURejectionSampler(backend="cpu"),
     )
     roots = backend.sequential_start_states(2)

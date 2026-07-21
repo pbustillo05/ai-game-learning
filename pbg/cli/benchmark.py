@@ -30,7 +30,6 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--roots-per-gpu", type=int, default=None)
-    parser.add_argument("--node-budget", type=int, default=None)
     parser.add_argument(
         "--beta",
         type=float,
@@ -45,7 +44,7 @@ def main() -> None:
     )
     parser.add_argument("--family-batch-rows", type=int, default=None)
     parser.add_argument("--max-active-trajectories", type=int, default=None)
-    parser.add_argument("--arena-chunk-nodes", type=int, default=None)
+    parser.add_argument("--storage-page-rows", type=int, default=None)
     parser.add_argument("--completion-samples", type=int, default=None)
     parser.add_argument(
         "--completion-backend", choices=("auto", "cpu", "cuda"), default=None
@@ -60,27 +59,21 @@ def main() -> None:
     cfg = load_config(args.config, hardware_profile=args.hardware_profile)
     if args.roots_per_gpu is not None:
         cfg.rollout.roots_per_gpu = args.roots_per_gpu
-    if args.node_budget is not None:
-        cfg.rollout.node_budget = args.node_budget
     if args.beta is not None:
         if not math.isfinite(args.beta) or args.beta < 1.0:
             parser.error("--beta must be finite and at least one")
         cfg.rollout.beta = {"default": args.beta}
     if args.branching_upper_cutoff_nodes is not None:
-        if not 1 < args.branching_upper_cutoff_nodes < cfg.rollout.node_budget:
+        if args.branching_upper_cutoff_nodes <= 1:
             parser.error(
-                "--branching-upper-cutoff-nodes must lie strictly between one "
-                "and --node-budget"
+                "--branching-upper-cutoff-nodes must be greater than one"
             )
-        cfg.rollout.branching_upper_cutoff_nodes = (
-            args.branching_upper_cutoff_nodes
-        )
     if args.family_batch_rows is not None:
         cfg.rollout.family_batch_rows = args.family_batch_rows
     if args.max_active_trajectories is not None:
         cfg.rollout.max_active_trajectories = args.max_active_trajectories
-    if args.arena_chunk_nodes is not None:
-        cfg.rollout.arena_chunk_nodes = args.arena_chunk_nodes
+    if args.storage_page_rows is not None:
+        cfg.rollout.storage_page_rows = args.storage_page_rows
     if args.completion_samples is not None:
         cfg.completion.n_samples = args.completion_samples
     if args.completion_backend is not None:
@@ -98,6 +91,7 @@ def main() -> None:
         repeats=args.repeats,
         device=args.device,
         checkpoint=args.checkpoint,
+        branching_upper_cutoff_nodes=args.branching_upper_cutoff_nodes,
     )
     encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output:

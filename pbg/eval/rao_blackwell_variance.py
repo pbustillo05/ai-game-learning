@@ -288,8 +288,8 @@ def cpu_oracle() -> dict[str, float]:
 
 def _model_directional_rows(
     bundle: Any,
-    state_refs: Tensor,
-    log_reach: Tensor,
+    decision_inputs: Any,
+    decision_rows: Tensor,
     events: Tensor,
     directions: Sequence[Mapping[str, Tensor]],
     c_v: float,
@@ -297,19 +297,15 @@ def _model_directional_rows(
 ) -> tuple[Tensor, Tensor]:
     """Return current values and eq. (14) for one or more parameter probes."""
 
-    from pbg.games.poker.model.postflop import PostflopMasks
-    from pbg.games.poker.model.preflop import PreflopMasks
-
     backend = bundle.rollout_backend
     model = bundle.model.module if hasattr(bundle.model, "module") else bundle.model
-    finite = torch.isfinite(log_reach)
-    gauge = log_reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
-    weights = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
-    pub = backend.encode_public(state_refs)
-    rows = state_refs.to(torch.int64)
-    street = backend.states.street[rows]
-    legal_ids, legal_mask = backend.legal_events(state_refs)
-    values = torch.empty((state_refs.numel(), backend.n_hands), dtype=torch.float32, device=state_refs.device)
+    device = decision_inputs.node_ids.device
+    decision_rows = decision_rows.to(device=device, dtype=torch.int64)
+    values = torch.empty(
+        (decision_rows.numel(), backend.n_hands),
+        dtype=torch.float32,
+        device=device,
+    )
     if not directions:
         raise ValueError("at least one parameter direction is required")
     directional = torch.empty(
@@ -321,63 +317,29 @@ def _model_directional_rows(
         for name in parameters
     }
 
-    family = backend.rollout_family_ids(state_refs).to(torch.int64)
-    group = family * 4 + street.to(torch.int64)
-    for group_id in group.unique(sorted=True).tolist():
-        selected_group = (group == group_id).nonzero(as_tuple=False).squeeze(1)
-        family_id = int(group_id) // 4
-        # Forward-mode attention carries primal and tangent activations. Keep
-        # the physical JVP pack bounded independently of statistical chunks.
-        for selected in selected_group.split(maximum_batch_rows):
-            selected_pub = backend._slice_public(pub, selected)
-            selected_weights = weights[selected]
-            if family_id == 0:
-                pre_masks = PreflopMasks(seat_mask=selected_pub.seat_mask, status=selected_pub.status)
-                post_masks = None
-            else:
-                selected_states = state_refs[selected]
-                selected_rows = selected_states.to(torch.int64)
-                status = backend.states.status[selected_rows]
-                live = int(family_id)
-                live_seat_ids = torch.where(
-                    status != 1,
-                    torch.arange(backend.n_players, device=state_refs.device)[None],
-                    backend.n_players,
-                ).sort(1).values[:, :live]
-                board_cards = (backend.states.board[selected_rows] >= 0).sum(1)
-                unique_board_cards = board_cards.unique()
-                if unique_board_cards.numel() != 1:
-                    raise ValueError("one directional family batch cannot mix streets")
-                compact_size = math.comb(backend.n_cards - int(unique_board_cards.item()), 2)
-                pre_masks = None
-                post_masks = PostflopMasks(
-                    compatibility=backend._compatibility(selected_pub.board),
-                    seat_mask=selected_pub.seat_mask,
-                    combo_mask=selected_weights > 0,
-                    status=selected_pub.status,
-                    evaluator_summary=None,
-                    live_seat_ids=live_seat_ids,
-                    compact_size=compact_size,
-                )
-
+    selected_partitions = decision_inputs.partition_id[decision_rows].to(torch.int64)
+    for partition_id in selected_partitions.unique(sorted=True).tolist():
+        partition_positions = (selected_partitions == partition_id).nonzero(
+            as_tuple=False
+        ).squeeze(1)
+        for selected in partition_positions.split(maximum_batch_rows):
+            source_rows = decision_rows[selected]
+            inputs = decision_inputs.gather_partition_inputs(
+                int(partition_id), decision_inputs.partition_row[source_rows]
+            )
+            legal_mask = inputs["legal_action_mask"].to(torch.bool)
+            legal_ids = torch.arange(
+                backend.e_max, dtype=torch.int32, device=device
+            )[None].expand(selected.numel(), -1)
             def call(current: Mapping[str, Tensor]) -> tuple[Tensor, Tensor]:
-                output = torch.func.functional_call(
-                    model,
-                    current,
-                    (selected_pub, selected_weights, selected_pub.to_act),
-                    {
-                        "preflop_masks": pre_masks,
-                        "postflop_masks": post_masks,
-                    },
-                    # Buffers are intentionally frozen targets; only the ordered
-                    # trainable parameter mapping is reparametrized.
-                    strict=False,
+                output = backend.functional_policy_forward_partition(
+                    model, current, int(partition_id), inputs
                 )
                 logp = bundle.policy_adapter.log_prob(
                     output,
                     events[selected, None],
-                    legal_ids[selected],
-                    legal_mask[selected],
+                    legal_ids,
+                    legal_mask,
                 )[:, 0]
                 return output.v, logp
 
@@ -480,9 +442,9 @@ def run_variance_job(
     sampled = sample_trees_sequential(bundle, cfg, generator, iteration=int(checkpoint))
     rollout_seconds = time.perf_counter() - rollout_started
     tree, leaf_reach_cache, policy = sampled
-    if policy.decision_reach is None:
+    if policy.decision_inputs is None:
         raise RuntimeError("sequential rollout did not retain decision inputs")
-    decision_reach = policy.decision_reach
+    decision_inputs = policy.decision_inputs
     decision_nodes = policy.node_ids.to(torch.int64)
     trajectory_id = tree.tree_id[decision_nodes].to(torch.int64)
     owner = tree.owner[decision_nodes].to(torch.int64)
@@ -556,8 +518,19 @@ def run_variance_job(
             raise MemoryError(f"trajectory requires {maximum_functionals} functionals, exceeding configured bound {functional_bound}")
         selected_leaf_ids = leaf_ids[first:stop]
         selected_leaf_reach = leaf_reach[first:stop]
-        leaf_states = tree.state_ref[selected_leaf_ids.to(torch.int64)].to(torch.int32)
-        completion_inputs = bundle.rollout_backend.completion_inputs(leaf_states, selected_leaf_reach)
+        captured_leaf = leaf_reach_cache.payload_for(
+            selected_leaf_ids.to(torch.int32)
+        )
+        completion_inputs = {
+            name: value
+            for name, value in captured_leaf.items()
+            if name not in {"owner", "fold_payoff"}
+        }
+        completion_inputs["range_weights"] = (
+            bundle.rollout_backend.range_weights_from_log_reach(
+                selected_leaf_reach
+            )
+        )
         seeds = torch.tensor(
             [logical_seed(int(experiment["logical_seed"]), "oracle-completion", int(checkpoint), int(superbatch), int(t)) for t in range(first, stop)],
             dtype=torch.int64,
@@ -575,8 +548,8 @@ def run_variance_job(
             jvp_started = time.perf_counter()
             value, derivatives = _model_directional_rows(
                 bundle,
-                decision_reach.state_refs[decision_rows].to(device),
-                decision_reach.payload[decision_rows].to(device),
+                decision_inputs,
+                decision_rows,
                 events[decision_rows],
                 directions,
                 0.0005,

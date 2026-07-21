@@ -160,7 +160,7 @@ def test_production_execution_config_is_explicit_and_strict(
         {
             "family_batch_rows": 8,
             "max_active_trajectories": 16,
-            "arena_chunk_nodes": 32,
+            "storage_page_rows": 32,
             "execution_memory_bytes": 1_000_000,
         }
     )
@@ -169,7 +169,7 @@ def test_production_execution_config_is_explicit_and_strict(
     cfg = load_config(path)
     assert cfg.rollout.family_batch_rows == 8
     assert cfg.rollout.max_active_trajectories == 16
-    assert cfg.rollout.arena_chunk_nodes == 32
+    assert cfg.rollout.storage_page_rows == 32
     assert cfg.rollout.execution_memory_bytes == 1_000_000
 
     raw["rollout"]["family_batch_rows"] = 0
@@ -263,7 +263,7 @@ def test_loss_unit_and_explicit_entropy_horizon_are_strict(tmp_path: Path) -> No
 @pytest.mark.parametrize(
     ("section", "field", "value", "pattern"),
     [
-        ("rollout", "node_budget", 0, r"root\.rollout\.node_budget"),
+        ("rollout", "storage_page_rows", 0, r"root\.rollout\.storage_page_rows"),
         ("loss", "lam", -0.01, r"root\.loss\.lam"),
         ("loss", "lam", 1.01, r"root\.loss\.lam"),
         ("loss", "clip_eps", 0.0, r"root\.loss\.clip_eps"),

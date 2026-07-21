@@ -17,7 +17,6 @@ rollout:
     chance_to_flop: 1.5
     chance_to_turn: 1.25
     chance_to_river: 1.25
-  node_budget: 4096
 completion:
   n_samples: 64
   backend: cuda
