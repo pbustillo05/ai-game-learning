@@ -65,11 +65,11 @@ class DevicePartitionSummaryCache:
     def allocated_capacity_bytes(self) -> int:
         return 0 if self.arena is None else self.arena.allocated_capacity_bytes
 
-    def reset(self) -> None:
-        """Invalidate all anchors while retaining reusable admitted pages."""
+    def reset(self, *, release_pages: bool = False) -> None:
+        """Invalidate anchors and optionally release admitted sparse pages."""
 
         if self.arena is not None:
-            self.arena.reset()
+            self.arena.reset(release_pages=release_pages)
         self._metadata.clear()
 
     def contains(self, keys: Tensor) -> Tensor:

@@ -104,6 +104,31 @@ def test_schema_transaction_page_slack_and_exact_multipage_seal() -> None:
     assert accountant.reserved_bytes == destination
 
 
+def test_paged_seal_permutation_reorders_wide_rows_with_bounded_scratch() -> None:
+    schema = TensorSchema(
+        "scheduled_rows",
+        (
+            TensorFieldSchema("id", torch.int32),
+            TensorFieldSchema("payload", torch.float32, (4,), alignment=16),
+        ),
+    )
+    arena = PagedTensorArena(schema, 2, "cpu")
+    arena.append(
+        {
+            "id": torch.tensor([20, 10, 30], dtype=torch.int32),
+            "payload": torch.arange(12, dtype=torch.float32).reshape(3, 4),
+        }
+    )
+    order = torch.tensor([1, 0, 2], dtype=torch.int64)
+    block, metrics = arena.seal(row_order=order, scratch_rows=1)
+    assert torch.equal(block["id"], torch.tensor([10, 20, 30], dtype=torch.int32))
+    assert torch.equal(
+        block["payload"],
+        torch.arange(12, dtype=torch.float32).reshape(3, 4)[order],
+    )
+    assert metrics.scratch_capacity_bytes == schema.payload_bytes(1)
+
+
 def test_paged_reservation_is_atomic_and_recyclable_slots_follow_last_consumer() -> None:
     schema = TensorSchema(
         "live",

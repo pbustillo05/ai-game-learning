@@ -357,6 +357,15 @@ def _sample_trees_sequential(
         device=device,
     )
     probe_enabled = bundle.opponent_model is not None
+    capture_inputs = getattr(backend, "capture_decision_inputs", None)
+    seal_captures = getattr(backend, "seal_decision_input_captures", None)
+    direct_inputs = (
+        not probe_enabled
+        and getattr(getattr(cfg, "training", None), "mode", None)
+        in {"normal", "rao_blackwell"}
+        and callable(capture_inputs)
+        and callable(seal_captures)
+    )
     probe_seats = None
     if probe_enabled:
         configured_seats = getattr(rollout_cfg, "probe_seats", None)
@@ -430,6 +439,7 @@ def _sample_trees_sequential(
     policy_values: list[Tensor] = []
     decision_reach_nodes: list[Tensor] = []
     decision_reach_rows: list[Tensor] = []
+    decision_input_records: list[tuple[Tensor, Any]] = []
     leaf_reach_nodes: list[Tensor] = []
     leaf_reach_rows: list[Tensor] = []
     scheduler_steps = 0
@@ -783,8 +793,20 @@ def _sample_trees_sequential(
                         ).detach()
                     )
                     policy_values.append(output.v.detach().float())
-                    decision_reach_nodes.append(batch_nodes[positions])
-                    decision_reach_rows.append(reaches[positions].detach().clone())
+                    if direct_inputs:
+                        decision_input_records.append(
+                            (
+                                batch_nodes[positions],
+                                capture_inputs(
+                                    selected_family,
+                                    states[positions],
+                                    reaches[positions],
+                                ),
+                            )
+                        )
+                    else:
+                        decision_reach_nodes.append(batch_nodes[positions])
+                        decision_reach_rows.append(reaches[positions].detach().clone())
         events = EventBatch(public_id=event_ids, payload=event_payload)
         next_owner = backend.classify(next_states).to(torch.int32)
         if probe_enabled:
@@ -827,7 +849,10 @@ def _sample_trees_sequential(
         node_ids = torch.empty(0, dtype=torch.int32, device=device)
         old_logp = torch.empty((0, 1, x_max), dtype=torch.float32, device=device)
         old_v = torch.empty((0, x_max), dtype=torch.float32, device=device)
-    if decision_reach_nodes:
+    if direct_inputs:
+        decision_reach = seal_captures(decision_input_records)
+        decision_nodes = decision_reach.node_ids
+    elif decision_reach_nodes:
         decision_nodes = torch.cat(decision_reach_nodes).to(torch.int32)
         decision_rows = torch.cat(decision_reach_rows).float()
         decision_order = torch.argsort(decision_nodes.to(torch.int64))
@@ -840,15 +865,16 @@ def _sample_trees_sequential(
         )
     if not torch.equal(decision_nodes, node_ids):
         raise RuntimeError("policy and natural decision-input rows are misaligned")
-    state_refs = tree.state_ref[decision_nodes.to(torch.int64)].to(torch.int32)
-    owners = tree.owner[decision_nodes.to(torch.int64)].to(torch.int32)
-    decision_reach = DecisionReachCache.from_rows(
-        decision_nodes,
-        state_refs,
-        decision_rows,
-        backend,
-        owners,
-    )
+    if not direct_inputs:
+        state_refs = tree.state_ref[decision_nodes.to(torch.int64)].to(torch.int32)
+        owners = tree.owner[decision_nodes.to(torch.int64)].to(torch.int32)
+        decision_reach = DecisionReachCache.from_rows(
+            decision_nodes,
+            state_refs,
+            decision_rows,
+            backend,
+            owners,
+        )
     policy = PolicyCache(node_ids, old_logp, old_v, decision_reach)
     if probe_enabled:
         assert probe_seats is not None

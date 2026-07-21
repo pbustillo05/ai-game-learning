@@ -183,7 +183,12 @@ def build_normal_targets(
         # Algebraic duplicates are explicitly absent.
         columns.pop("advantage", None)
         columns.pop("v_target", None)
-        training[partition_id] = TrainingPartition(partition_id, block.inputs, columns)
+        training[partition_id] = TrainingPartition(
+            partition_id,
+            block.inputs,
+            columns,
+            input_pools=block.input_pools,
+        )
     return TrainingStorage(
         "normal", training, _sampling_metadata(rollout, branched=False)
     )
@@ -316,7 +321,12 @@ def build_sequential_rb_targets(
         columns["lambda_return"] = returns[partition_id]
         for forbidden in ("advantage", "v_target", "q_hat", "parent_posterior"):
             columns.pop(forbidden, None)
-        training[partition_id] = TrainingPartition(partition_id, block.inputs, columns)
+        training[partition_id] = TrainingPartition(
+            partition_id,
+            block.inputs,
+            columns,
+            input_pools=block.input_pools,
+        )
     return TrainingStorage(
         "sequential_rb",
         training,
@@ -536,7 +546,11 @@ def build_branched_rb_targets(
         action_columns["advantage_hat"] = advantage[partition_id]
         action_columns["action_ptr"] = block.action_ptr
         training[partition_id] = TrainingPartition(
-            partition_id, block.inputs, columns, action_columns
+            partition_id,
+            block.inputs,
+            columns,
+            action_columns,
+            input_pools=block.input_pools,
         )
     return TrainingStorage(
         "branched_rb", training, _sampling_metadata(rollout, branched=True)

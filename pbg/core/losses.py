@@ -9,6 +9,29 @@ import torch
 from torch import Tensor
 
 
+@dataclass
+class NormalLossBatch:
+    """Small ordinary-PPO math fixture, independent of rollout ownership."""
+
+    actor_type: Tensor
+    event: Tensor
+    old_logp: Tensor
+    old_v: Tensor
+    advantage: Tensor
+    v_target: Tensor
+    legal_event_ids: Tensor
+    legal_event_mask: Tensor
+
+
+def index_normal_loss_batch(sample: NormalLossBatch, rows: Tensor) -> NormalLossBatch:
+    """Select physical rows from an already materialized loss-only batch."""
+
+    rows = rows.to(device=sample.actor_type.device, dtype=torch.int64)
+    return NormalLossBatch(
+        **{name: getattr(sample, name)[rows] for name in sample.__dataclass_fields__}
+    )
+
+
 def _cfg(cfg: Any, name: str, default: Any = None) -> Any:
     source = getattr(cfg, "loss", cfg)
     return getattr(source, name, default)

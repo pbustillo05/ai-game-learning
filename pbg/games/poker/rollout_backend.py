@@ -13,6 +13,13 @@ from torch import Tensor, nn
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
 from pbg.core.observability import ExecutionMetrics
+from pbg.core.storage import (
+    PagedTensorArena,
+    SealedDecisionInputs,
+    SealedTensorBlock,
+    TensorFieldSchema,
+    TensorSchema,
+)
 from pbg.core.execution import (
     child_path_keys,
     logical_categorical_from_valid_probability,
@@ -68,6 +75,16 @@ class CompactPokerDecisionReach:
     seat_ids: Tensor  # int64 [T]
     log_r: Tensor  # float32 [T,H]
     n_rows: int
+
+
+@dataclass(frozen=True)
+class PokerDecisionInputCapture:
+    """One scheduler pack of immutable natural poker decision inputs."""
+
+    partition_id: int
+    columns: Mapping[str, Tensor]
+    summary_anchor: Tensor | None = None
+    summary_fields: Mapping[str, Tensor] | None = None
 
 
 class PokerRolloutBackend:
@@ -216,6 +233,13 @@ class PokerRolloutBackend:
 
         buttons = torch.zeros(1, dtype=torch.int32, device=self.device)
         return self._initial_states_with_buttons(buttons)
+
+    def release_rollout_owners(self) -> None:
+        """Release mutable state/history and summary pages after exact sealing."""
+
+        self.states.reset(release_pages=True)
+        for _, cache in self._partition_services.values():
+            cache.reset(release_pages=True)
 
     def _initial_states_with_buttons(self, buttons: Tensor) -> Tensor:
         """Reset storage and initialize roots for explicit buttons ``[B]``."""
@@ -1034,6 +1058,222 @@ class PokerRolloutBackend:
                 getattr(pub.history, name), fill=0.0
             ).to(torch.float32)
         return result
+
+    def capture_decision_inputs(
+        self,
+        family: str,
+        states: Tensor,
+        log_reach: Tensor,
+    ) -> PokerDecisionInputCapture:
+        """Capture one player pack on its immutable natural model domain."""
+
+        partition_id = 0 if family == "pre" else int(family.removeprefix("post_")) - 1
+        spec = self.training_partition_specs()[partition_id]
+        public = self.serialize_decision_inputs(states)
+        finite = torch.isfinite(log_reach)
+        gauge = log_reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
+        weights = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
+        if partition_id == 0:
+            natural = torch.zeros(
+                (states.numel(), self.n_players, self.n_classes),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            classes = self.combo_class[None, None, :].expand_as(weights)
+            natural.scatter_add_(2, classes, weights)
+        else:
+            live = partition_id + 1
+            status = public["status"]
+            seats = torch.where(
+                status != FOLDED,
+                torch.arange(self.n_players, device=self.device)[None],
+                self.n_players,
+            ).sort(1).values[:, :live]
+            natural = weights[
+                torch.arange(states.numel(), device=self.device)[:, None], seats
+            ].contiguous()
+        columns = {
+            name: public[name].detach()
+            for name in spec.input_schema.by_name
+            if name not in {"range_weights", "folded_summary_ref"}
+        }
+        columns["range_weights"] = natural.detach()
+        if "folded_summary_ref" not in spec.input_schema.by_name:
+            return PokerDecisionInputCapture(partition_id, columns)
+
+        live = partition_id + 1
+        anchors = self.states.partition_cache_key[states.to(torch.int64)]
+        if bool((anchors < 0).any()):
+            raise RuntimeError("folded decision omitted its dependency anchor")
+        unique_anchor, inverse = torch.unique(
+            anchors.to(torch.int64), sorted=True, return_inverse=True
+        )
+        first = torch.full(
+            (unique_anchor.numel(),),
+            states.numel(),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        first.scatter_reduce_(
+            0,
+            inverse,
+            torch.arange(states.numel(), device=self.device),
+            reduce="amin",
+            include_self=True,
+        )
+        summary = self._partition_summary_uncached(
+            states[first],
+            public["board"][first],
+            weights[first],
+            public["status"][first],
+            live,
+            compute_mask=torch.ones(
+                unique_anchor.shape, dtype=torch.bool, device=self.device
+            ),
+        )
+        columns["folded_summary_ref"] = inverse.to(torch.int32)
+        return PokerDecisionInputCapture(
+            partition_id,
+            columns,
+            unique_anchor,
+            summary.fields,
+        )
+
+    @staticmethod
+    def _seal_columns(label: str, columns: Mapping[str, Tensor]) -> SealedTensorBlock:
+        rows = next(iter(columns.values())).shape[0]
+        schema = TensorSchema(
+            label,
+            tuple(
+                TensorFieldSchema(
+                    name,
+                    value.dtype,
+                    tuple(value.shape[1:]),
+                    alignment=min(max(value.element_size(), 1), 16),
+                )
+                for name, value in columns.items()
+            ),
+        )
+        return SealedTensorBlock(
+            schema,
+            {name: value.detach() for name, value in columns.items()},
+            rows,
+            schema.capacity_bytes(rows, chunks=int(rows > 0)),
+        )
+
+    def seal_decision_input_captures(
+        self,
+        records: list[tuple[Tensor, PokerDecisionInputCapture]],
+    ) -> SealedDecisionInputs:
+        """Seal scheduler packs and deduplicate sparse summary anchors exactly."""
+
+        if not records:
+            empty = torch.empty(0, dtype=torch.int32, device=self.device)
+            return SealedDecisionInputs(empty, empty, empty, {})
+        by_partition: dict[int, list[tuple[Tensor, PokerDecisionInputCapture]]] = {}
+        for node_ids, capture in records:
+            by_partition.setdefault(capture.partition_id, []).append((node_ids, capture))
+        all_nodes: list[Tensor] = []
+        all_partition: list[Tensor] = []
+        all_rows: list[Tensor] = []
+        blocks: dict[int, SealedTensorBlock] = {}
+        pools: dict[int, Mapping[str, SealedTensorBlock]] = {}
+        partition_specs = self.training_partition_specs()
+        for partition_id, parts in by_partition.items():
+            input_schema = partition_specs[partition_id].input_schema
+            page_rows = max(1, min(256, sum(ids.numel() for ids, _ in parts)))
+            arena = PagedTensorArena(
+                input_schema,
+                page_rows,
+                self.device,
+                label=f"poker_partition_{partition_id}_decision_input",
+            )
+            remapped_summary_refs: list[Tensor] | None = None
+            if parts[0][1].summary_anchor is not None:
+                anchors = torch.cat(
+                    [part.summary_anchor for _, part in parts if part.summary_anchor is not None]
+                )
+                field_names = tuple(parts[0][1].summary_fields or {})
+                summary_columns = {
+                    name: torch.cat(
+                        [
+                            part.summary_fields[name]
+                            for _, part in parts
+                            if part.summary_fields is not None
+                        ]
+                    )
+                    for name in field_names
+                }
+                source_ref_parts: list[Tensor] = []
+                offset = 0
+                for _, part in parts:
+                    refs = part.columns["folded_summary_ref"].to(torch.int64)
+                    source_ref_parts.append(refs + offset)
+                    assert part.summary_anchor is not None
+                    offset += part.summary_anchor.numel()
+                unique_anchor, inverse = torch.unique(
+                    anchors, sorted=True, return_inverse=True
+                )
+                first = torch.full(
+                    (unique_anchor.numel(),),
+                    anchors.numel(),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                first.scatter_reduce_(
+                    0,
+                    inverse,
+                    torch.arange(anchors.numel(), device=self.device),
+                    reduce="amin",
+                    include_self=True,
+                )
+                remapped_summary_refs = [
+                    inverse[source_ref].to(torch.int32)
+                    for source_ref in source_ref_parts
+                ]
+                pools[partition_id] = {
+                    "folded_summary": self._seal_columns(
+                        f"poker_partition_{partition_id}_folded_summary",
+                        {name: value[first] for name, value in summary_columns.items()},
+                    )
+                }
+            source_rows: list[Tensor] = []
+            node_parts: list[Tensor] = []
+            for part_index, (part_nodes, part) in enumerate(parts):
+                columns = dict(part.columns)
+                if remapped_summary_refs is not None:
+                    columns["folded_summary_ref"] = remapped_summary_refs[part_index]
+                source_rows.append(arena.append(columns))
+                node_parts.append(part_nodes.to(torch.int32))
+            node_ids = torch.cat(node_parts)
+            source_order = torch.cat(source_rows)
+            order = torch.argsort(node_ids.to(torch.int64), stable=True)
+            node_ids = node_ids[order]
+            block, _ = arena.seal(
+                scratch_rows=page_rows,
+                row_order=source_order[order],
+            )
+            blocks[partition_id] = block
+            all_nodes.append(node_ids)
+            all_partition.append(
+                torch.full_like(node_ids, partition_id, dtype=torch.int32)
+            )
+            all_rows.append(
+                torch.arange(node_ids.numel(), dtype=torch.int32, device=self.device)
+            )
+        # Scheduler capture objects own the pre-seal wide input packs.  Their
+        # final consumer was the page copy above, so drop them before returning
+        # the exact immutable destination.
+        records.clear()
+        nodes = torch.cat(all_nodes)
+        order = torch.argsort(nodes.to(torch.int64), stable=True)
+        return SealedDecisionInputs(
+            nodes[order],
+            torch.cat(all_partition)[order],
+            torch.cat(all_rows)[order],
+            blocks,
+            pools,
+        )
 
     def _public_from_immutable_inputs(
         self, inputs: Mapping[str, Tensor]

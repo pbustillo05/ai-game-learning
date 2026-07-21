@@ -15,8 +15,10 @@ from torch import Tensor
 from pbg.config import load_config
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
 from pbg.core.game import GameBundle
-from pbg.core.normal import build_normal_dataset_from_sampled
 from pbg.core.rollout import sample_trees, sample_trees_sequential
+from pbg.core.storage import SealedDecisionInputs
+from pbg.core.targets import build_normal_targets
+from pbg.core.training import _seal_sequential_rollout_storage
 from pbg.core.tree import DecisionReachCache
 from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
 from pbg.games.poker.bundle import _TensorPokerGPUCompletion
@@ -733,26 +735,31 @@ def _real_execution_poker_sample(
         partition_adapter=PokerGPUPartitionAdapter(beta_rank=4),
     )
     model = _AlwaysCheckModel()
-    rollout = SimpleNamespace(
-        roots_per_gpu=4,
-        node_budget=64,
-        family_batch_rows=batch_rows,
-        max_active_trajectories=admission,
-        arena_chunk_nodes=16,
-        logical_seed=741,
+    run_cfg = SimpleNamespace(
+        rollout=SimpleNamespace(
+            roots_per_gpu=4,
+            node_budget=64,
+            family_batch_rows=batch_rows,
+            max_active_trajectories=admission,
+            arena_chunk_nodes=16,
+            logical_seed=741,
+        ),
+        training=SimpleNamespace(mode="normal"),
+        loss=SimpleNamespace(lam=0.95, utility_normalization="none"),
     )
     generator = torch.Generator(device=device).manual_seed(999)
     sampled = sample_trees_sequential(
         GameBundle(model, backend, PokerPolicyAdapter(cfg.n_ticks), None),
-        rollout,
+        run_cfg,
         generator,
         return_profiles=True,
         iteration=12,
     )
-    return cfg, backend, model, sampled
+    return cfg, backend, model, sampled, run_cfg
 
 
-def _assert_real_execution_poker_sample(cfg, backend, model, sampled) -> None:
+def _assert_real_execution_poker_sample(cfg, backend, model, sampled, run_cfg) -> None:
+    del run_cfg
     package = pytest.importorskip("poker_gpu_evaluator")
     evaluator = package.bind(rank_count=13)
     tree, reach, policy, profiles = sampled
@@ -764,21 +771,13 @@ def _assert_real_execution_poker_sample(cfg, backend, model, sampled) -> None:
     chance = tree.owner == CHANCE
     assert bool(((tree.child_ptr[1:] - tree.child_ptr[:-1])[chance] == 1).all())
 
-    assert policy.decision_reach is not None
-    rows = policy.decision_reach.gather(
-        torch.arange(policy.node_ids.numel(), device=policy.node_ids.device), backend
-    )
-    states = tree.state_ref[policy.node_ids.to(torch.int64)]
-    with torch.no_grad():
-        current = backend.policy_forward(model, states, rows)
-    legal_ids, legal_mask = backend.legal_events(states)
-    edge_rows = tree.child_ptr[policy.node_ids.to(torch.int64)].to(torch.int64)
-    selected = tree.child_event[edge_rows, None]
-    current_logp = PokerPolicyAdapter(cfg.n_ticks).log_prob(
-        current, selected, legal_ids, legal_mask
-    ).float()
-    torch.testing.assert_close(current.v.float(), policy.old_v)
-    torch.testing.assert_close(current_logp, policy.old_logp_child)
+    captured = policy.decision_reach
+    assert isinstance(captured, SealedDecisionInputs)
+    for partition_id, block in captured.inputs.items():
+        rows = (captured.partition_id == partition_id).nonzero(as_tuple=False).squeeze(1)
+        assert rows.numel() == block.rows
+        assert "range_weights" in block.columns
+        assert "state_ref" not in block.columns
     metrics = backend.execution_metrics.snapshot()
     assert metrics["execution_evaluator_rows"] == 4
     assert metrics["execution_evaluator_calls"] >= 1
@@ -793,48 +792,37 @@ def test_real_sibling_execution_poker_cpu_is_logically_addressed_and_collision_f
     assert torch.equal(left[3][3], right[3][3])
     assert _execution_public_paths(left[3][0]) == _execution_public_paths(right[3][0])
 
-    normal_cfg = SimpleNamespace(
-        rollout=SimpleNamespace(
-            roots_per_gpu=4,
-            logical_seed=741,
-        ),
-        loss=SimpleNamespace(lam=0.95),
-    )
-    datasets = []
-    canonical_orders = []
-    for game_cfg, backend, model, sampled in (left, right):
-        dataset = build_normal_dataset_from_sampled(
-                GameBundle(
-                    model,
-                    backend,
-                    PokerPolicyAdapter(game_cfg.n_ticks),
-                    None,
-                ),
-                normal_cfg,
-                torch.Generator().manual_seed(123),
-                sampled,
-                iteration=12,
-            )
-        datasets.append(dataset)
-        tree, _, policy, _ = sampled
-        nodes = policy.node_ids.to(torch.int64)
-        stride = int(tree.depth_player.max()) + 1
-        canonical_orders.append(
-            torch.argsort(
-                tree.tree_id[nodes].to(torch.int64) * stride
-                + tree.depth_player[nodes].to(torch.int64)
-            )
+    sealed_runs = []
+    for game_cfg, backend, model, sampled, run_cfg in (left, right):
+        bundle = GameBundle(model, backend, PokerPolicyAdapter(game_cfg.n_ticks), None)
+        rollout, partitions, _, _ = _seal_sequential_rollout_storage(
+            run_cfg,
+            bundle,
+            sampled,
+            iteration=12,
+            gen=torch.Generator(device=backend.device).manual_seed(123),
         )
-    for field in (
-        "actor_type",
-        "event",
-        "old_logp",
-        "old_v",
-        "lambda_return",
-    ):
+        storage = build_normal_targets(rollout, partitions, run_cfg.loss.lam)
+        sealed_runs.append((rollout.topology, storage))
+    assert sealed_runs[0][1].partitions.keys() == sealed_runs[1][1].partitions.keys()
+    for field in ("owner", "event", "realized_type", "old_log_prob", "old_value", "lambda_return"):
+        ordered = []
+        for topology, storage in sealed_runs:
+            ordered.append(
+                torch.stack(
+                    [
+                        storage.partitions[int(partition)].columns[field][int(row)]
+                        for partition, row in zip(
+                            topology.decision_partition,
+                            topology.decision_row,
+                            strict=True,
+                        )
+                    ]
+                )
+            )
         torch.testing.assert_close(
-            getattr(datasets[0], field)[canonical_orders[0]],
-            getattr(datasets[1], field)[canonical_orders[1]],
+            ordered[0],
+            ordered[1],
             msg=lambda message, name=field: f"{name}: {message}",
         )
 
@@ -993,6 +981,19 @@ def test_real_tensor_poker_keyed_completion_mixes_showdown_and_fold_rows() -> No
 
     first = completion.complete_keyed(backend, tree, node_ids, reach, 8, keys)
     second = completion.complete_keyed(backend, tree, node_ids, reach, 8, keys)
+    completion_inputs = backend.completion_inputs(states, reach)
+    sealed = completion.complete_sealed(
+        backend,
+        {
+            "owner": tree.owner,
+            "log_reach": reach,
+            "completion_key": keys,
+            "fold_payoff": backend.states.fold_payoff[states.to(torch.int64)],
+            **completion_inputs,
+        },
+        rows=node_ids.to(torch.int64),
+        n_samples=8,
+    )
 
     for name in (
         "p_hat",
@@ -1000,13 +1001,14 @@ def test_real_tensor_poker_keyed_completion_mixes_showdown_and_fold_rows() -> No
         "n_eff",
     ):
         assert torch.equal(getattr(first, name), getattr(second, name)), name
+        assert torch.equal(getattr(first, name), getattr(sealed, name)), name
     torch.testing.assert_close(first.p_hat.sum(2), torch.ones((2, 2)))
     assert first.metadata["fold_completion"] == "joint_profiles"
     assert first.metadata["showdown_contract_version"] == "2"
 
     metrics = backend.execution_metrics.snapshot()
-    assert metrics["execution_evaluator_calls"] == 4
-    assert metrics["execution_evaluator_rows"] == 4
+    assert metrics["execution_evaluator_calls"] == 5
+    assert metrics["execution_evaluator_rows"] == 6
 
 
 def test_beta_buckets_use_exact_override_or_default() -> None:

@@ -5,9 +5,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from pbg.core.losses import _entropy_coefficient, l_clip, ppo, l_v, l_v_clip, rb_ppo
+from pbg.core.losses import (
+    NormalLossBatch,
+    _entropy_coefficient,
+    l_clip,
+    ppo,
+    l_v,
+    l_v_clip,
+    rb_ppo,
+)
 from pbg.core.minibatch import MinibatchSample
-from pbg.core.normal import NormalMinibatch
 from pbg.core.values import NodeTargets
 from tests.categorical_policy_fixture import CategoricalPolicyAdapter, PolicyOutput
 
@@ -145,9 +152,7 @@ def test_normal_and_rb_modes_use_the_same_exact_kl_term() -> None:
 
     actor_type = torch.tensor([0, 0, 1, 1, 1], dtype=torch.int64)
     repeats = actor_type.numel()
-    normal = NormalMinibatch(
-        state_refs=torch.zeros(repeats, dtype=torch.int32),
-        reach=torch.zeros((repeats, 2, 2)),
+    normal = NormalLossBatch(
         actor_type=actor_type,
         event=torch.zeros(repeats, dtype=torch.int32),
         old_logp=torch.zeros(repeats),
@@ -202,9 +207,7 @@ def test_linear_entropy_schedule_uses_training_horizon_in_both_composites() -> N
     rb_output = PolicyOutput(logits, rb_sample.old_v)
 
     actor_type = torch.tensor([0], dtype=torch.int64)
-    normal_sample = NormalMinibatch(
-        state_refs=torch.tensor([0], dtype=torch.int32),
-        reach=torch.zeros((1, 1, 2)),
+    normal_sample = NormalLossBatch(
         actor_type=actor_type,
         event=torch.tensor([0], dtype=torch.int32),
         old_logp=adapter.log_prob(

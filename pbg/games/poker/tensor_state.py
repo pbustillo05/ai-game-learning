@@ -217,10 +217,10 @@ class PokerTensorStateStore:
     def history_parent(self) -> Tensor:
         return self.history_jump[:, 0]
 
-    def reset(self) -> None:
+    def reset(self, *, release_pages: bool = False) -> None:
         """Reset the device allocation cursor without reallocating storage."""
 
-        self.pool.reset()
+        self.pool.reset(release_pages=release_pages)
 
     def allocate(self, requested: Tensor) -> Tensor:
         """Allocate requested rows and return int32 handles ``[B]``.

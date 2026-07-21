@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 from torch import Tensor
@@ -211,6 +211,96 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
 
         return self._complete_impl(
             game, tree, node_ids, reach, n_samples, gen=None, keys=keys
+        )
+
+    def complete_sealed(
+        self,
+        game: Any,
+        leaves: Mapping[str, Tensor],
+        *,
+        rows: Tensor,
+        n_samples: int,
+    ) -> BatchedCompletionStats:
+        """Complete immutable leaf rows without a tree or mutable state owner."""
+
+        if isinstance(n_samples, bool) or not isinstance(n_samples, int) or n_samples <= 0:
+            raise ValueError("n_samples must be a positive integer")
+        rows = rows.to(device=game.device, dtype=torch.int64)
+        owner = leaves["owner"][rows]
+        log_reach = leaves["log_reach"][rows]
+        keys = leaves["completion_key"][rows].to(torch.int64).contiguous()
+        batch, players, n_hands = log_reach.shape
+        p_hat = torch.zeros_like(log_reach, dtype=torch.float32)
+        v_hat = torch.zeros_like(p_hat)
+        n_eff = torch.zeros(batch, dtype=torch.float32, device=game.device)
+        metadata: dict[str, object] = {
+            "backend": self.backend,
+            "fold_completion": "joint_profiles",
+            "storage": "immutable_leaf_rows",
+        }
+
+        preterm = (owner == PRETERM).nonzero(as_tuple=False).squeeze(1)
+        if preterm.numel():
+            evaluator = self._bound_evaluator()
+            result = evaluator.complete(
+                board_cards=leaves["board_cards"][rows][preterm].contiguous(),
+                range_weights=leaves["range_weights"][rows][preterm].contiguous(),
+                stratum_level=leaves["stratum_level"][rows][preterm].contiguous(),
+                payoff_baseline=leaves["payoff_baseline"][rows][preterm].contiguous(),
+                stratum_amount=leaves["stratum_amount"][rows][preterm].contiguous(),
+                n_samples=n_samples,
+                seed=keys[preterm],
+            )
+            stats = self._validate_result(
+                result,
+                preterm.numel(),
+                players,
+                game.device,
+                _evaluator_metadata(evaluator),
+            )
+            p_hat[preterm] = stats.p_hat
+            v_hat[preterm] = stats.v_hat
+            n_eff[preterm] = stats.n_eff
+            metadata.update(
+                {f"showdown_{key}": value for key, value in stats.metadata.items()}
+            )
+
+        terminal = (owner != PRETERM).nonzero(as_tuple=False).squeeze(1)
+        if terminal.numel():
+            dealt = torch.ones(
+                (terminal.numel(), players),
+                dtype=torch.bool,
+                device=game.device,
+            )
+            profiles = game.profile_sampler.sample_seeded(
+                log_reach[terminal],
+                leaves["board_cards"][rows][terminal],
+                dealt,
+                n_samples,
+                keys[terminal],
+                board_is_normalized=True,
+            )
+            counts = torch.zeros(
+                (terminal.numel(), players, n_hands),
+                dtype=torch.float32,
+                device=game.device,
+            )
+            index = profiles.permute(0, 2, 1).to(torch.int64)
+            counts.scatter_add_(2, index, torch.ones_like(index, dtype=torch.float32))
+            posterior = counts / float(n_samples)
+            payoff = leaves["fold_payoff"][rows][terminal].to(torch.float32)
+            p_hat[terminal] = posterior
+            v_hat[terminal] = payoff[:, :, None] * (posterior > 0)
+            n_eff[terminal] = float(n_samples)
+
+        metrics = getattr(game, "execution_metrics", None)
+        if metrics is not None:
+            metrics.record_evaluator(rows=batch)
+        return BatchedCompletionStats(
+            p_hat=p_hat,
+            v_hat=v_hat,
+            n_eff=n_eff,
+            metadata=metadata,
         )
 
     def complete_selected_keyed(

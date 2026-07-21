@@ -453,12 +453,28 @@ class PagedTensorArena:
         label: str | None = None,
         scratch_rows: int = 1,
         release_source: bool = True,
+        row_order: Tensor | None = None,
     ) -> tuple[SealedTensorBlock, "SealMetrics"]:
-        """Copy stable chunks once into exact contiguous destination columns."""
+        """Copy stable chunks once into an exact contiguous destination.
+
+        ``row_order`` optionally gives the source row for each destination row.
+        It is topology-sized metadata, not payload scratch, and lets schedulers
+        seal their out-of-order family packs without first concatenating and
+        permuting every wide input column.
+        """
 
         self._check_live()
         if isinstance(scratch_rows, bool) or scratch_rows <= 0:
             raise ValueError("scratch_rows must be positive")
+        if row_order is not None:
+            row_order = row_order.to(device=self.device, dtype=torch.int64)
+            if row_order.shape != (self._size,):
+                raise ValueError("seal row_order must contain every logical row")
+            if self._size and not torch.equal(
+                row_order.sort().values,
+                torch.arange(self._size, dtype=torch.int64, device=self.device),
+            ):
+                raise ValueError("seal row_order must be a permutation")
         ledger = self.accountant if accountant is None else accountant
         if ledger is not None and self.accountant is None:
             raise ValueError("accounted sealing requires source chunks on the same ledger")
@@ -491,20 +507,43 @@ class PagedTensorArena:
             # payload proportional to total rows and replaces repeated cat.
             scratch = self.schema.allocate(bounded_rows, self.device)
             cursor = 0
-            for columns, capacity in zip(self._pages, self._lengths, strict=True):
-                used = min(capacity, self._size - cursor)
-                copied = 0
-                while copied < used:
-                    count = min(bounded_rows, used - copied)
+            if row_order is None:
+                for columns, capacity in zip(self._pages, self._lengths, strict=True):
+                    used = min(capacity, self._size - cursor)
+                    copied = 0
+                    while copied < used:
+                        count = min(bounded_rows, used - copied)
+                        for spec in self.schema.fields:
+                            scratch[spec.name][:count].copy_(
+                                columns[spec.name][copied : copied + count]
+                            )
+                            destination[spec.name][
+                                cursor + copied : cursor + copied + count
+                            ].copy_(scratch[spec.name][:count])
+                        copied += count
+                    cursor += used
+            else:
+                while cursor < self._size:
+                    count = min(bounded_rows, self._size - cursor)
+                    selected = row_order[cursor : cursor + count]
+                    page_id = torch.div(
+                        selected, self.page_rows, rounding_mode="floor"
+                    )
+                    offset = torch.remainder(selected, self.page_rows)
                     for spec in self.schema.fields:
-                        scratch[spec.name][:count].copy_(
-                            columns[spec.name][copied : copied + count]
-                        )
-                        destination[spec.name][cursor + copied : cursor + copied + count].copy_(
-                            scratch[spec.name][:count]
-                        )
-                    copied += count
-                cursor += used
+                        target = scratch[spec.name][:count]
+                        target.zero_()
+                        for page_index, (columns, capacity) in enumerate(
+                            zip(self._pages, self._lengths, strict=True)
+                        ):
+                            local = offset.clamp_max(capacity - 1)
+                            candidate = columns[spec.name][local]
+                            mask = (page_id == page_index).reshape(
+                                (count,) + (1,) * len(spec.shape)
+                            )
+                            target.copy_(torch.where(mask, candidate, target))
+                        destination[spec.name][cursor : cursor + count].copy_(target)
+                    cursor += count
             if cursor != self._size:
                 raise RuntimeError("seal copy extent does not match logical row count")
             if self.device.type == "cuda":
@@ -684,12 +723,12 @@ class RecyclableTensorPool:
         self._assert_not_free(handles)
         return self.arena.gather(name, handles)
 
-    def reset(self) -> None:
-        """Release every iteration-local consumer and reuse admitted pages."""
+    def reset(self, *, release_pages: bool = False) -> None:
+        """Release every iteration-local consumer and optionally its pages."""
 
         self._free.clear()
         self._live_rows = 0
-        self.arena.reset()
+        self.arena.reset(release_pages=release_pages)
 
     def release(self) -> None:
         self._free.clear()
@@ -716,6 +755,7 @@ class PartitionRolloutBlock:
     decisions: SealedTensorBlock
     actions: SealedTensorBlock | None = None
     action_ptr: Tensor | None = None
+    input_pools: Mapping[str, SealedTensorBlock] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.inputs.rows != self.decisions.rows:
@@ -735,6 +775,20 @@ class PartitionRolloutBlock:
                 (ptr[1:] < ptr[:-1]).any()
             ):
                 raise ValueError("branched action_ptr is not valid CSR")
+        pools = MappingProxyType(dict(self.input_pools))
+        for name, block in pools.items():
+            ref_name = f"{name}_ref"
+            if ref_name not in self.inputs.columns:
+                raise ValueError(f"rollout input pool {name!r} lacks {ref_name!r}")
+            refs = self.inputs.columns[ref_name]
+            if refs.dtype != torch.int32 or refs.shape != (self.inputs.rows,):
+                raise ValueError("rollout input-pool references must be int32 [D]")
+            if refs.numel():
+                torch._assert_async(
+                    ((refs >= 0) & (refs < block.rows)).all(),
+                    "rollout input-pool reference is out of range",
+                )
+        object.__setattr__(self, "input_pools", pools)
 
 
 @dataclass(frozen=True)
@@ -758,6 +812,49 @@ class RolloutStorage:
             raise ValueError("partition block keys must equal stable partition ids")
         object.__setattr__(self, "partitions", MappingProxyType(partitions))
         object.__setattr__(self, "seal_metrics", MappingProxyType(dict(self.seal_metrics)))
+
+
+@dataclass(frozen=True)
+class SealedDecisionInputs:
+    """Exact natural decision rows emitted by a rollout scheduler."""
+
+    node_ids: Tensor
+    partition_id: Tensor
+    partition_row: Tensor
+    inputs: Mapping[int, SealedTensorBlock]
+    input_pools: Mapping[int, Mapping[str, SealedTensorBlock]] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        count = self.node_ids.numel()
+        for name, value in (
+            ("node_ids", self.node_ids),
+            ("partition_id", self.partition_id),
+            ("partition_row", self.partition_row),
+        ):
+            if value.dtype != torch.int32 or value.shape != (count,):
+                raise ValueError(f"sealed decision {name} must be int32 [D]")
+        inputs = MappingProxyType({int(key): value for key, value in self.inputs.items()})
+        pools = MappingProxyType(
+            {
+                int(key): MappingProxyType(dict(value))
+                for key, value in self.input_pools.items()
+            }
+        )
+        for partition, block in inputs.items():
+            selected = self.partition_id == partition
+            rows = self.partition_row[selected].to(torch.int64)
+            if rows.numel() != block.rows or (
+                rows.numel()
+                and not torch.equal(
+                    rows.sort().values,
+                    torch.arange(block.rows, device=rows.device),
+                )
+            ):
+                raise ValueError("sealed decision partition rows are not exact")
+        object.__setattr__(self, "inputs", inputs)
+        object.__setattr__(self, "input_pools", pools)
 
 
 @dataclass(frozen=True)

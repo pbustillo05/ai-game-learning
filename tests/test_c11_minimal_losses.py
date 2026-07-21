@@ -5,8 +5,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from pbg.core.losses import COMPOSITES, LossSpec, finalize_metric_stats
-from pbg.core.normal import NormalMinibatch, index_normal_minibatch
+from pbg.core.losses import (
+    COMPOSITES,
+    LossSpec,
+    NormalLossBatch,
+    finalize_metric_stats,
+    index_normal_loss_batch,
+)
 from pbg.core.minibatch import MinibatchSample
 from pbg.core.values import NodeTargets
 from tests.categorical_policy_fixture import CategoricalPolicyAdapter, PolicyOutput
@@ -66,9 +71,7 @@ def test_normal_ppo_selects_only_the_sampled_private_type() -> None:
     old_logp = adapter.log_prob(
         output, torch.tensor([[1]], dtype=torch.int32), legal_ids, legal_mask
     )[0, 0, 1].detach()[None]
-    sample = NormalMinibatch(
-        state_refs=torch.tensor([0], dtype=torch.int32),
-        reach=torch.zeros((1, 1, 2)),
+    sample = NormalLossBatch(
         actor_type=torch.tensor([1]),
         event=torch.tensor([1], dtype=torch.int32),
         old_logp=old_logp,
@@ -104,9 +107,7 @@ def test_physical_batch_loss_and_metrics_equal_effective_batch() -> None:
     logp = adapter.log_prob(
         reference, events[:, None], legal_ids, legal_mask
     )[:, 0].gather(1, actor_type[:, None]).squeeze(1)
-    sample = NormalMinibatch(
-        state_refs=torch.arange(2, dtype=torch.int32),
-        reach=torch.zeros((2, 1, 2)),
+    sample = NormalLossBatch(
         actor_type=actor_type,
         event=events,
         old_logp=logp,
@@ -131,7 +132,7 @@ def test_physical_batch_loss_and_metrics_equal_effective_batch() -> None:
     split_value = base_value.clone().requires_grad_()
     parts = []
     for row in (torch.tensor([0]), torch.tensor([1])):
-        physical = index_normal_minibatch(sample, row)
+        physical = index_normal_loss_batch(sample, row)
         loss_sum, stats = COMPOSITES["ppo"].fn(
             PolicyOutput(split_logits[row], split_value[row]),
             physical,

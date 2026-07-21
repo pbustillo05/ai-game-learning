@@ -9,7 +9,6 @@ from pbg.core.game import EventBatch
 from pbg.core.training import (
     _build_iteration_data,
     _loss_spec,
-    _seal_iteration_training_storage,
 )
 from pbg.games.poker.bundle import build_bundle
 from pbg.games.poker.engine import CHECK_CALL
@@ -50,7 +49,7 @@ def _tiny_normal_config():
     return cfg
 
 
-def test_compatibility_rollout_seals_complete_state_independent_poker_inputs() -> None:
+def test_direct_rollout_seals_complete_state_independent_poker_inputs() -> None:
     cfg = _tiny_normal_config()
     bundle = build_bundle(cfg, torch.device("cpu"))
     generator = torch.Generator().manual_seed(17)
@@ -61,8 +60,10 @@ def test_compatibility_rollout_seals_complete_state_independent_poker_inputs() -
         _loss_spec(cfg),
         frozen_model=bundle.model,
     )
-    storage, specs = _seal_iteration_training_storage(cfg, bundle, data)
+    storage = data.storage
+    specs = data.partition_specs
 
+    assert storage is not None and specs is not None
     assert storage.partitions
     for partition_id, partition in storage.partitions.items():
         assert "state_ref" not in partition.inputs.columns
@@ -72,6 +73,7 @@ def test_compatibility_rollout_seals_complete_state_independent_poker_inputs() -
         inputs = partition.gather_inputs(rows)
         output = specs[partition_id].forward(bundle.model, inputs)
         assert output.v.shape == (rows.numel(), specs[partition_id].model_width)
+    assert bundle.rollout_backend.states.arena.allocated_capacity_bytes == 0
 
 
 def test_all_live_postflop_forward_uses_no_persistent_summary_owner() -> None:

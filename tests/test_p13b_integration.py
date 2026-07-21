@@ -196,6 +196,48 @@ def test_normal_poker_settles_sampled_showdown_without_completion(tmp_path: Path
     assert torch.isfinite(torch.tensor(record["loss"]))
 
 
+@pytest.mark.parametrize("mode", ("normal", "rao_blackwell"))
+def test_sequential_iteration_seals_the_sole_training_owner_and_releases_poker_pages(
+    tmp_path: Path, mode: str
+) -> None:
+    pytest.importorskip("poker_gpu_evaluator")
+    cfg = _small_poker_cfg(tmp_path)
+    cfg.training.mode = mode
+    if mode == "normal":
+        cfg.completion.n_samples = None
+        cfg.loss.name = "ppo"
+    bundle = build_game_bundle(cfg, torch.device("cpu"))
+    data = training_module._build_iteration_data(
+        cfg,
+        bundle,
+        torch.Generator().manual_seed(177),
+        training_module._loss_spec(cfg),
+        iteration=0,
+    )
+
+    assert data.storage is not None
+    assert data.storage.mode == ("normal" if mode == "normal" else "sequential_rb")
+    assert all(
+        owner is None
+        for owner in (
+            data.dataset,
+            data.tree,
+            data.targets,
+            data.policy_cache,
+            data.decision_reach,
+        )
+    )
+    assert bundle.rollout_backend.states.arena.allocated_capacity_bytes == 0
+    assert bundle.rollout_backend.partition_summary_cache.allocated_capacity_bytes == 0
+    for partition in data.storage.partitions.values():
+        assert "state_ref" not in partition.inputs.columns
+    if mode == "rao_blackwell":
+        pool = data.storage.posterior_pool
+        assert pool is not None
+        pairs = torch.stack((pool.trajectory, pool.player), 1)
+        assert pairs.unique(dim=0).shape[0] == pairs.shape[0]
+
+
 def test_python_training_api_rejects_cuda_without_hardware_profile(
     tmp_path: Path, monkeypatch
 ) -> None:
