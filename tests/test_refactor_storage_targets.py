@@ -447,6 +447,142 @@ def test_branched_bounded_targets_multiple_children_and_zero_mass(lam: float) ->
     assert torch.equal(training.sampling.log_z[0], torch.tensor(0.0, dtype=torch.float64))
 
 
+def _dynamic_branched_rollout(
+    topology: BranchedTreeSpan,
+    *,
+    decision_nodes: list[int],
+    action_counts: list[int],
+    frozen_t: list[float],
+    frozen_c: list[float],
+) -> RolloutStorage:
+    rows = len(decision_nodes)
+    topology.decision_partition[decision_nodes] = 0
+    topology.decision_row[decision_nodes] = torch.arange(rows, dtype=torch.int32)
+    decision_schema = TensorSchema(
+        "dynamic_branch_decision",
+        (
+            TensorFieldSchema("owner", torch.int32),
+            TensorFieldSchema("old_value", torch.float32, (1,)),
+            TensorFieldSchema("log_weight", torch.float64),
+            TensorFieldSchema("nominal_child_count", torch.int32),
+            TensorFieldSchema("executed_child_count", torch.int32),
+            TensorFieldSchema("frozen_trace_variance", torch.float32),
+            TensorFieldSchema("frozen_cost", torch.float32),
+        ),
+    )
+    assert topology.nominal_degree is not None
+    decisions = _sealed(
+        decision_schema,
+        owner=torch.zeros(rows, dtype=torch.int32),
+        old_value=torch.zeros((rows, 1)),
+        log_weight=torch.zeros(rows, dtype=torch.float64),
+        nominal_child_count=topology.nominal_degree[decision_nodes],
+        executed_child_count=torch.tensor(action_counts, dtype=torch.int32),
+        frozen_trace_variance=torch.tensor(frozen_t),
+        frozen_cost=torch.tensor(frozen_c),
+    )
+    action_rows = sum(action_counts)
+    action_schema = TensorSchema(
+        "dynamic_branch_action",
+        (
+            TensorFieldSchema("event", torch.int32),
+            TensorFieldSchema("old_log_prob", torch.float32, (1,)),
+        ),
+    )
+    actions = _sealed(
+        action_schema,
+        event=torch.arange(action_rows, dtype=torch.int32),
+        old_log_prob=torch.zeros((action_rows, 1)),
+    )
+    ptr = torch.zeros(rows + 1, dtype=torch.int32)
+    ptr[1:] = torch.tensor(action_counts, dtype=torch.int32).cumsum(0)
+    leaf_schema = TensorSchema(
+        "dynamic_branch_leaf", (TensorFieldSchema("key", torch.int64),)
+    )
+    return RolloutStorage(
+        "branched_rb",
+        {0: PartitionRolloutBlock(0, _input(rows, 1), decisions, actions, ptr)},
+        topology,
+        _sealed(
+            leaf_schema,
+            key=torch.arange(int((topology.degree == 0).sum()), dtype=torch.int64),
+        ),
+    )
+
+
+def test_dynamic_branched_targets_match_cost_trace_and_queue_correction_formulas() -> None:
+    topology = BranchedTreeSpan(
+        parent=torch.tensor([-1, 0, 0, 1, 2], dtype=torch.int32),
+        child_begin=torch.tensor([1, 3, 4, -1, -1], dtype=torch.int32),
+        degree=torch.tensor([2, 1, 1, 0, 0], dtype=torch.int32),
+        decision_partition=torch.full((5,), -1, dtype=torch.int32),
+        decision_row=torch.full((5,), -1, dtype=torch.int32),
+        leaf_row=torch.tensor([-1, -1, -1, 0, 1], dtype=torch.int32),
+        nominal_degree=torch.tensor([2, 2, 2, 0, 0], dtype=torch.int32),
+    )
+    rollout = _dynamic_branched_rollout(
+        topology,
+        decision_nodes=[0, 1, 2],
+        action_counts=[2, 1, 1],
+        frozen_t=[0.8, 0.8, 0.8],
+        frozen_c=[1.0, 1.0, 1.0],
+    )
+    result = build_branched_rb_targets(
+        rollout,
+        _spec(1, 1, (0,)),
+        _completion(
+            torch.ones((2, 1, 1)),
+            torch.tensor([[[1.0]], [[3.0]]]),
+        ),
+        1.0,
+        leaf_microbatch_rows=2,
+    ).partitions[0]
+    assert result.columns["trace_variance_hat"].tolist() == pytest.approx(
+        [1.6, 0.0, 0.0]
+    )
+    assert result.columns["trace_variance_mask"].tolist() == [True, False, False]
+    assert result.columns["cost_hat"].tolist() == pytest.approx([3.0, 1.0, 1.0])
+    assert "frozen_trace_variance" not in result.columns
+    assert "frozen_cost" not in result.columns
+
+
+def test_dynamic_branched_targets_protect_root_prefix_from_refill_children() -> None:
+    topology = BranchedTreeSpan(
+        parent=torch.tensor([-1, 0, 0, 0], dtype=torch.int32),
+        child_begin=torch.tensor([1, -1, -1, -1], dtype=torch.int32),
+        degree=torch.tensor([3, 0, 0, 0], dtype=torch.int32),
+        decision_partition=torch.full((4,), -1, dtype=torch.int32),
+        decision_row=torch.full((4,), -1, dtype=torch.int32),
+        leaf_row=torch.tensor([-1, 0, 1, 2], dtype=torch.int32),
+        root_target_degree=2,
+        pre_refill_node_count=3,
+        nominal_degree=torch.tensor([2, 0, 0, 0], dtype=torch.int32),
+    )
+    rollout = _dynamic_branched_rollout(
+        topology,
+        decision_nodes=[0],
+        action_counts=[2],
+        frozen_t=[0.5],
+        frozen_c=[1.0],
+    )
+    result = build_branched_rb_targets(
+        rollout,
+        _spec(1, 1, (0,)),
+        _completion(
+            torch.ones((3, 1, 1)),
+            torch.tensor([[[1.0]], [[3.0]], [[100.0]]]),
+        ),
+        1.0,
+        leaf_microbatch_rows=3,
+    ).partitions[0]
+    assert result.columns["value_hat"][0, 0].item() == pytest.approx(2.0)
+    assert result.columns["trace_variance_hat"][0].item() == pytest.approx(2.0)
+    assert result.columns["trace_variance_mask"].tolist() == [True]
+    assert result.columns["cost_hat"].tolist() == pytest.approx([1.0])
+    assert result.action_columns is not None
+    assert result.action_columns["action_ptr"].tolist() == [0, 2]
+
+
 def test_branched_root_uses_ordinary_declared_multiplicity() -> None:
     topology = BranchedTreeSpan(
         parent=torch.tensor([-1, 0], dtype=torch.int32),

@@ -161,6 +161,7 @@ class BranchedTreeSpan:
     leaf_row: Tensor
     root_target_degree: int | None = None
     pre_refill_node_count: int | None = None
+    nominal_degree: Tensor | None = None
 
     @property
     def nodes(self) -> int:
@@ -168,7 +169,7 @@ class BranchedTreeSpan:
 
     @property
     def nbytes(self) -> int:
-        return 6 * 4 * self.nodes + 2 * 4
+        return (6 + int(self.nominal_degree is not None)) * 4 * self.nodes + 2 * 4
 
     @property
     def protected_root_degree(self) -> int:
@@ -206,6 +207,12 @@ class BranchedTreeSpan:
         )
         for name in column_names:
             _require_int32_vector(name, getattr(self, name), n)
+        if self.nominal_degree is not None:
+            _require_int32_vector("nominal_degree", self.nominal_degree, n)
+            if self.nominal_degree.device != self.parent.device:
+                raise ValueError("nominal_degree must share the topology device")
+            if bool((self.nominal_degree < 0).any()):
+                raise ValueError("nominal_degree cannot be negative")
         if len({getattr(self, name).device for name in column_names}) != 1:
             raise ValueError("branched topology columns must share one device")
         if n == 0:

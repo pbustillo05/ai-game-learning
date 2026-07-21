@@ -350,28 +350,38 @@ def plan_branched_frontier(
     if leaf_microbatch_rows <= 0:
         raise ValueError("leaf_microbatch_rows must be positive")
     topology.validate()
-    leaves = (topology.degree == 0).nonzero(as_tuple=False).squeeze(1).to(torch.int32)
+    # Structural planning has one declared device-to-host boundary.  The
+    # subsequent exact simulation reads only CPU scalar metadata and therefore
+    # never performs a CUDA synchronization per node or edge.
+    structure = torch.stack((topology.parent, topology.degree), 1).detach().to("cpu")
+    parent_host = structure[:, 0].to(torch.int64)
+    degree_host = structure[:, 1].to(torch.int64)
+    leaves_host = (degree_host == 0).nonzero(as_tuple=False).squeeze(1)
     ready = [0] * topology.nodes
     live = 0
     peak = 0
-    for first in range(0, leaves.numel(), leaf_microbatch_rows):
-        batch = [int(value) for value in leaves[first : first + leaf_microbatch_rows]]
+    for first in range(0, leaves_host.numel(), leaf_microbatch_rows):
+        batch = [int(value) for value in leaves_host[first : first + leaf_microbatch_rows]]
         live += len(batch)
         peak = max(peak, live)
         for leaf in batch:
             node = leaf
-            while int(topology.parent[node]) >= 0:
-                parent = int(topology.parent[node])
+            while int(parent_host[node]) >= 0:
+                parent = int(parent_host[node])
                 ready[parent] += 1
-                if ready[parent] != int(topology.degree[parent]):
+                if ready[parent] != int(degree_host[parent]):
                     break
                 # n child slots contract to one parent slot.
-                live -= int(topology.degree[parent]) - 1
+                live -= int(degree_host[parent]) - 1
                 node = parent
             peak = max(peak, live)
     if live != 1:
         raise RuntimeError("branched frontier simulation did not contract to one root")
-    return BranchedFrontierPlan(leaves, max(peak, 1), leaf_microbatch_rows)
+    return BranchedFrontierPlan(
+        leaves_host.to(device=topology.parent.device, dtype=torch.int32),
+        max(peak, 1),
+        leaf_microbatch_rows,
+    )
 
 
 def build_branched_rb_targets(
@@ -382,7 +392,7 @@ def build_branched_rb_targets(
     *,
     leaf_microbatch_rows: int = 32,
 ) -> TrainingStorage:
-    """Build fixed-intensity branched targets with a prebounded live frontier."""
+    """Build fixed/dynamic branched targets with a prebounded live frontier."""
 
     lam = _validate_lambda(lam)
     if rollout.mode != "branched_rb" or not isinstance(rollout.topology, BranchedTreeSpan):
@@ -404,19 +414,68 @@ def build_branched_rb_targets(
     exact_width = widths.pop()
     first_block = next(iter(rollout.partitions.values()))
     device = next(iter(first_block.decisions.columns.values())).device
-    owner_candidates = [
-        _column(block.decisions, "owner") for block in rollout.partitions.values()
-        if block.decisions.rows
-    ]
-    n_players = 0 if not owner_candidates else int(torch.cat(owner_candidates).max()) + 1
+    leaf_reach = next(
+        (
+            rollout.leaves.columns[name]
+            for name in ("log_reach", "reach")
+            if name in rollout.leaves.columns
+        ),
+        None,
+    )
+    if leaf_reach is not None and leaf_reach.ndim == 3:
+        n_players = int(leaf_reach.shape[1])
+    else:
+        owner_rows = [
+            _column(block.decisions, "owner")
+            for block in rollout.partitions.values()
+            if block.decisions.rows
+        ]
+        n_players = 0 if not owner_rows else int(torch.cat(owner_rows).max()) + 1
     if n_players <= 0:
         raise ValueError("branched rollout contains no player decisions")
     plan = plan_branched_frontier(topology, leaf_microbatch_rows=leaf_microbatch_rows)
+    topology_host = torch.stack(
+        (
+            topology.parent,
+            topology.child_begin,
+            topology.degree,
+            topology.decision_partition,
+            topology.decision_row,
+            topology.leaf_row,
+        ),
+        1,
+    ).detach().to("cpu", dtype=torch.int64)
+    parent_host = topology_host[:, 0]
+    child_begin_host = topology_host[:, 1]
+    degree_host = topology_host[:, 2]
+    decision_partition_host = topology_host[:, 3]
+    decision_row_host = topology_host[:, 4]
+    owner_host = {
+        key: _column(block.decisions, "owner").detach().to("cpu", dtype=torch.int64)
+        for key, block in rollout.partitions.items()
+    }
+    action_ptr_host = {
+        key: block.action_ptr.detach().to("cpu", dtype=torch.int64)
+        for key, block in rollout.partitions.items()
+        if block.action_ptr is not None
+    }
+    nominal_decision_host = {
+        key: _column(block.decisions, "nominal_child_count")
+        .detach()
+        .to("cpu", dtype=torch.int64)
+        for key, block in rollout.partitions.items()
+        if "nominal_child_count" in block.decisions.columns
+    }
     mass_slots = torch.empty(
         (plan.peak_slots, n_players, exact_width), dtype=torch.float32, device=device
     )
     moment_slots = torch.empty_like(mass_slots)
-    node_slot = torch.full((topology.nodes,), -1, dtype=torch.int32, device=device)
+    value_vector_slots = torch.empty(
+        (plan.peak_slots, n_players), dtype=torch.float32, device=device
+    )
+    cost_slots = torch.empty(plan.peak_slots, dtype=torch.float32, device=device)
+    delta_slots = torch.empty_like(cost_slots)
+    node_slot = [-1] * topology.nodes
     ready = [0] * topology.nodes
     free_slots = list(range(plan.peak_slots - 1, -1, -1))
     value_hat = {
@@ -437,6 +496,34 @@ def build_branched_rb_targets(
         key: torch.zeros(value.shape[0], dtype=torch.bool, device=device)
         for key, value in child_posterior.items()
     }
+    dynamic_heads = any(
+        "frozen_trace_variance" in block.decisions.columns
+        or "frozen_cost" in block.decisions.columns
+        for block in rollout.partitions.values()
+    )
+    required_dynamic = {
+        "frozen_trace_variance",
+        "frozen_cost",
+        "nominal_child_count",
+        "executed_child_count",
+    }
+    if dynamic_heads and any(
+        not required_dynamic.issubset(block.decisions.columns)
+        for block in rollout.partitions.values()
+    ):
+        raise ValueError("dynamic branched rollout has incomplete controller columns")
+    trace_target = {
+        key: torch.zeros(value.decisions.rows, dtype=torch.float32, device=device)
+        for key, value in rollout.partitions.items()
+    }
+    trace_mask = {
+        key: torch.zeros(value.decisions.rows, dtype=torch.bool, device=device)
+        for key, value in rollout.partitions.items()
+    }
+    cost_target = {
+        key: torch.zeros(value.decisions.rows, dtype=torch.float32, device=device)
+        for key, value in rollout.partitions.items()
+    }
 
     def allocate_slot() -> int:
         if not free_slots:
@@ -445,27 +532,42 @@ def build_branched_rb_targets(
 
     def reduce_ready(start_node: int) -> None:
         node = start_node
-        while int(topology.parent[node]) >= 0:
-            parent = int(topology.parent[node])
+        while int(parent_host[node]) >= 0:
+            parent = int(parent_host[node])
             ready[parent] += 1
-            if ready[parent] != int(topology.degree[parent]):
+            if ready[parent] != int(degree_host[parent]):
                 return
-            begin = int(topology.child_begin[parent])
-            count = int(topology.degree[parent])
+            begin = int(child_begin_host[parent])
+            count = int(degree_host[parent])
             children = torch.arange(begin, begin + count, device=device)
-            slots = node_slot[children].to(torch.int64)
-            if bool((slots < 0).any()):
+            slot_ids = node_slot[begin : begin + count]
+            if any(slot < 0 for slot in slot_ids):
                 raise RuntimeError("ready parent has a missing child frontier slot")
-            summed_mass = mass_slots[slots].sum(0)
-            summed_moment = moment_slots[slots].sum(0)
-            parent_mass = summed_mass / count
-            parent_moment = summed_moment / count
-            partition_id = int(topology.decision_partition[parent])
+            slots = torch.tensor(slot_ids, dtype=torch.int64, device=device)
+            target_count = topology.protected_root_degree if parent == 0 else count
+            target_slots = slots[:target_count]
+            target_children = children[:target_count]
+            summed_mass = mass_slots[target_slots].sum(0)
+            summed_moment = moment_slots[target_slots].sum(0)
+            parent_mass = summed_mass / target_count
+            parent_moment = summed_moment / target_count
+            parent_value_vector = value_vector_slots[target_slots].mean(0)
+            nominal_degree = (
+                topology.degree
+                if topology.nominal_degree is None
+                else topology.nominal_degree
+            )
+            child_nominal = nominal_degree[target_children].to(torch.float32)
+            parent_cost = (
+                1.0 + child_nominal * cost_slots[target_slots]
+            ).mean()
+            parent_delta = delta_slots[target_slots].mean()
+            partition_id = int(decision_partition_host[parent])
             if partition_id >= 0:
-                row = int(topology.decision_row[parent])
+                row = int(decision_row_host[parent])
                 block = rollout.partitions[partition_id]
                 spec = partitions[partition_id]
-                owner = int(_column(block.decisions, "owner")[row])
+                owner = int(owner_host[partition_id][row])
                 old_value = _column(block.decisions, "old_value", "oldV")[row].float()
                 spec.assert_model_width(old_value)
                 exact_old = _phi_exact(old_value, spec.exact_to_model)
@@ -473,12 +575,12 @@ def build_branched_rb_targets(
                     summed_moment[owner], summed_mass[owner]
                 )
                 assert block.action_ptr is not None
-                action_begin = int(block.action_ptr[row])
-                for ordinal, slot in enumerate(slots):
+                action_begin = int(action_ptr_host[partition_id][row])
+                for ordinal, slot in enumerate(target_slots):
                     child_mass = mass_slots[slot, owner]
                     child_moment = moment_slots[slot, owner]
                     continuation = conditionalize(child_moment, child_mass)
-                    if count == 1:
+                    if target_count == 1:
                         baseline = exact_old
                     else:
                         sibling_mass = summed_mass[owner] - child_mass
@@ -490,18 +592,50 @@ def build_branched_rb_targets(
                     child_posterior[partition_id][action_row] = child_mass
                     advantage[partition_id][action_row] = continuation - baseline
                     action_valid[partition_id][action_row] = True
+                if dynamic_heads:
+                    frozen_t = _column(
+                        block.decisions, "frozen_trace_variance"
+                    )[row].float()
+                    frozen_c = _column(block.decisions, "frozen_cost")[row].float()
+                    nominal = float(nominal_decision_host[partition_id][row])
+                    if target_count >= 2:
+                        centered = (
+                            value_vector_slots[target_slots] - parent_value_vector
+                        )
+                        executed_trace = centered.square().sum(1).sum() / (
+                            target_count - 1
+                        )
+                        corrected = (executed_trace - parent_delta).clamp_min(0.0)
+                        trace_target[partition_id][row] = corrected.detach()
+                        trace_mask[partition_id][row] = True
+                        t_star = corrected
+                    else:
+                        t_star = frozen_t
+                    cost_target[partition_id][row] = parent_cost.detach()
+                    parent_delta = (
+                        (t_star + parent_delta) / float(target_count)
+                        - t_star / nominal
+                    )
+                    parent_cost = lam * parent_cost + (1.0 - lam) * frozen_c
                 parent_moment[owner] = (
                     lam * parent_moment[owner]
                     + (1.0 - lam) * parent_mass[owner] * exact_old
                 )
                 decision_valid[partition_id][row] = True
-            destination = int(slots[0])
+            elif dynamic_heads:
+                # Keep the current chance-node counterfactual correction.
+                parent_delta = parent_delta / float(target_count)
+            destination = slot_ids[0]
             mass_slots[destination] = parent_mass
             moment_slots[destination] = parent_moment
+            value_vector_slots[destination] = parent_value_vector
+            cost_slots[destination] = parent_cost
+            delta_slots[destination] = parent_delta
             node_slot[parent] = destination
-            for slot in slots[1:]:
-                free_slots.append(int(slot))
-            node_slot[children] = -1
+            for slot in slot_ids[1:]:
+                free_slots.append(slot)
+            for child in range(begin, begin + count):
+                node_slot[child] = -1
             node_slot[parent] = destination
             node = parent
 
@@ -518,15 +652,20 @@ def build_branched_rb_targets(
         # Reserve the whole declared microbatch before reductions, matching the
         # frontier-plan simulation and completion workspace lifetime.
         slots = [allocate_slot() for _ in range(leaf_nodes.numel())]
-        for local, (leaf_tensor, slot) in enumerate(zip(leaf_nodes, slots, strict=True)):
-            leaf = int(leaf_tensor)
+        leaf_host = leaf_nodes.detach().to("cpu", dtype=torch.int64).tolist()
+        for local, (leaf, slot) in enumerate(zip(leaf_host, slots, strict=True)):
             mass_slots[slot] = posterior[local]
             moment_slots[slot] = posterior[local] * value[local]
+            value_vector_slots[slot] = (
+                posterior[local] * value[local]
+            ).sum(-1)
+            cost_slots[slot] = 0.0
+            delta_slots[slot] = 0.0
             node_slot[leaf] = slot
-        for leaf_tensor in leaf_nodes:
-            reduce_ready(int(leaf_tensor))
+        for leaf in leaf_host:
+            reduce_ready(int(leaf))
         del completed, posterior, value
-    if int(node_slot[0]) < 0 or len(free_slots) != plan.peak_slots - 1:
+    if node_slot[0] < 0 or len(free_slots) != plan.peak_slots - 1:
         raise RuntimeError("branched frontier did not finish with only the root slot")
     training: dict[int, TrainingPartition] = {}
     for partition_id, block in rollout.partitions.items():
@@ -536,7 +675,18 @@ def build_branched_rb_targets(
             raise RuntimeError("branched target builder missed a decision or action")
         columns = _base_columns(block)
         columns["value_hat"] = value_hat[partition_id]
-        for forbidden in ("q_hat", "parent_posterior", "W", "S"):
+        if dynamic_heads:
+            columns["trace_variance_hat"] = trace_target[partition_id]
+            columns["trace_variance_mask"] = trace_mask[partition_id]
+            columns["cost_hat"] = cost_target[partition_id]
+        for forbidden in (
+            "q_hat",
+            "parent_posterior",
+            "W",
+            "S",
+            "frozen_trace_variance",
+            "frozen_cost",
+        ):
             columns.pop(forbidden, None)
         assert block.actions is not None and block.action_ptr is not None
         action_columns = {

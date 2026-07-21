@@ -196,8 +196,10 @@ def test_normal_poker_settles_sampled_showdown_without_completion(tmp_path: Path
     assert torch.isfinite(torch.tensor(record["loss"]))
 
 
-@pytest.mark.parametrize("mode", ("normal", "rao_blackwell"))
-def test_sequential_iteration_seals_the_sole_training_owner_and_releases_poker_pages(
+@pytest.mark.parametrize(
+    "mode", ("normal", "rao_blackwell", "branched_rao_blackwell")
+)
+def test_iteration_seals_the_sole_training_owner_and_releases_poker_pages(
     tmp_path: Path, mode: str
 ) -> None:
     pytest.importorskip("poker_gpu_evaluator")
@@ -206,6 +208,12 @@ def test_sequential_iteration_seals_the_sole_training_owner_and_releases_poker_p
     if mode == "normal":
         cfg.completion.n_samples = None
         cfg.loss.name = "ppo"
+    elif mode == "branched_rao_blackwell":
+        cfg.rollout.roots_per_gpu = 1
+        cfg.rollout.branching_mode = "fixed"
+        cfg.rollout.adaptive_kkt = None
+        cfg.rollout.branching_min_nodes = None
+        cfg.model["use_branching_heads"] = True
     bundle = build_game_bundle(cfg, torch.device("cpu"))
     data = training_module._build_iteration_data(
         cfg,
@@ -216,7 +224,12 @@ def test_sequential_iteration_seals_the_sole_training_owner_and_releases_poker_p
     )
 
     assert data.storage is not None
-    assert data.storage.mode == ("normal" if mode == "normal" else "sequential_rb")
+    expected_mode = {
+        "normal": "normal",
+        "rao_blackwell": "sequential_rb",
+        "branched_rao_blackwell": "branched_rb",
+    }[mode]
+    assert data.storage.mode == expected_mode
     assert all(
         owner is None
         for owner in (
@@ -236,6 +249,12 @@ def test_sequential_iteration_seals_the_sole_training_owner_and_releases_poker_p
         assert pool is not None
         pairs = torch.stack((pool.trajectory, pool.player), 1)
         assert pairs.unique(dim=0).shape[0] == pairs.shape[0]
+    elif mode == "branched_rao_blackwell":
+        assert all(
+            partition.action_columns is not None
+            and "action_ptr" in partition.action_columns
+            for partition in data.storage.partitions.values()
+        )
 
 
 def test_python_training_api_rejects_cuda_without_hardware_profile(

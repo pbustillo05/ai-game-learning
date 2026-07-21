@@ -72,6 +72,7 @@ def sample_branched_tree(
     import torch.distributed as dist
 
     from pbg.core.execution import (
+        ArenaField,
         DONE,
         ChunkedOccurrenceArena,
         DeviceWorkQueue,
@@ -81,6 +82,11 @@ def sample_branched_tree(
         logical_rng_keys,
         logical_uniform,
         stable_partition_masked,
+    )
+    from pbg.core.storage import (
+        RecyclableTensorPool,
+        TensorFieldSchema,
+        TensorSchema,
     )
     from pbg.core.rollout import (
         _logical_seed,
@@ -154,7 +160,10 @@ def sample_branched_tree(
         node_budget,
         int(getattr(rollout_cfg, "arena_chunk_nodes", None) or min(node_budget, 256)),
         device,
-        fields=arena_fields(("path_key",)),
+        fields=arena_fields(
+            ("path_key",),
+            extra={"reach_handle": ArenaField(torch.int64, fill=-1)},
+        ),
         label="branched_occurrences",
     )
     root_handles = arena.allocate(1)
@@ -165,18 +174,49 @@ def sample_branched_tree(
         )
     elif not torch.equal(root_handles, root_nodes.to(torch.int64)):
         raise RuntimeError("branched occurrence and root handles diverged")
-    arena.scatter_many(
-        root_handles,
-        {"path_key": torch.zeros(1, dtype=torch.int64, device=device)},
-    )
-
     root_reach = torch.zeros((1, p_max, x_max), dtype=torch.float32, device=device)
     for player, size in enumerate(x_sizes):
         root_reach[:, player, size:] = -torch.inf
-    reach_rows = torch.empty(
-        (node_budget, p_max, x_max), dtype=torch.float32, device=device
+    reach_pool = RecyclableTensorPool(
+        TensorSchema(
+            "branched_live_reach",
+            (
+                TensorFieldSchema(
+                    "log_reach",
+                    torch.float32,
+                    (p_max, x_max),
+                    alignment=16,
+                ),
+            ),
+            chunk_header_bytes=64,
+            allocator_slack_bytes=64,
+        ),
+        int(getattr(rollout_cfg, "arena_chunk_nodes", None) or min(node_budget, 256)),
+        device,
+        label="branched_live_reach",
+        maximum_rows=node_budget,
     )
-    reach_rows[0] = root_reach[0]
+    root_reach_handles = reach_pool.allocate(1)
+    reach_pool.write(root_reach_handles, {"log_reach": root_reach})
+    arena.scatter_many(
+        root_handles,
+        {
+            "path_key": torch.zeros(1, dtype=torch.int64, device=device),
+            "reach_handle": root_reach_handles,
+        },
+    )
+
+    def reaches_for(occurrences: Tensor) -> Tensor:
+        handles = arena.gather_many(
+            ("reach_handle",), occurrences.to(torch.int64)
+        )["reach_handle"]
+        return reach_pool.gather("log_reach", handles)
+
+    def release_reaches(occurrences: Tensor) -> None:
+        handles = arena.gather_many(
+            ("reach_handle",), occurrences.to(torch.int64)
+        )["reach_handle"]
+        reach_pool.release_rows(handles)
     family_names, family_values, family_priorities = _family_spec(backend)
     queues = {name: DeviceWorkQueue(node_budget, device) for name in family_names}
     metrics = getattr(backend, "execution_metrics", None)
@@ -195,6 +235,10 @@ def sample_branched_tree(
     policy_node_t: list[Tensor] = []
     policy_node_c: list[Tensor] = []
     policy_node_reaches: list[Tensor] = []
+    decision_input_records: list[tuple[Tensor, Any]] = []
+    capture_inputs = getattr(backend, "capture_decision_inputs", None)
+    seal_captures = getattr(backend, "seal_decision_input_captures", None)
+    direct_inputs = callable(capture_inputs) and callable(seal_captures)
     leaf_node_ids: list[Tensor] = []
     leaf_reaches: list[Tensor] = []
     cutoff_active = False
@@ -370,7 +414,7 @@ def sample_branched_tree(
     ) -> Tensor:
         rows = nodes.to(torch.int64)
         states = buffer.state_ref[rows]
-        reaches = reach_rows[rows]
+        reaches = reaches_for(nodes)
         output = None
         if dynamic_active and family is not None:
             output = actual_cost_forward(bundle.model, family, states, reaches)
@@ -430,7 +474,12 @@ def sample_branched_tree(
             assert output is not None
             child_output = _index_policy_output(output, parent_positions)
             if record_policy_node:
-                policy_node_reaches.append(reaches.detach().clone())
+                if direct_inputs:
+                    decision_input_records.append(
+                        (nodes.to(torch.int32), capture_inputs(family, states, reaches))
+                    )
+                else:
+                    policy_node_reaches.append(reaches.detach().clone())
         event_keys = logical_rng_keys(
             seed=logical_seed,
             iteration=iteration,
@@ -477,11 +526,15 @@ def sample_branched_tree(
             )
         elif not torch.equal(child_handles, children.to(torch.int64)):
             raise RuntimeError("branched occurrence and child handles diverged")
+        child_reach_handles = reach_pool.allocate(total)
+        reach_pool.write(child_reach_handles, {"log_reach": next_reach})
         arena.scatter_many(
             child_handles,
-            {"path_key": child_path_keys(expanded_paths, ordinal)},
+            {
+                "path_key": child_path_keys(expanded_paths, ordinal),
+                "reach_handle": child_reach_handles,
+            },
         )
-        reach_rows[children.to(torch.int64)] = next_reach
         child_log_sum, child_log_product = child_path_factors(
             log_player_sum[rows][parent_positions],
             log_ancestor_product[rows][parent_positions],
@@ -518,6 +571,9 @@ def sample_branched_tree(
                     policy_node_t.append(output_t.detach().float())
                     policy_node_c.append(output_c.detach().float())
                 DeviceWorkQueue.mark_done(arena, rows)
+        releasable = nodes[nodes != 0]
+        if releasable.numel():
+            release_reaches(releasable)
         return children
 
     def chance_close(frontier: Tensor) -> None:
@@ -566,7 +622,7 @@ def sample_branched_tree(
                         qrows = queued.to(torch.int64)
                         qstates = buffer.state_ref[qrows]
                         qout = actual_cost_forward(
-                            bundle.model, name, qstates, reach_rows[qrows]
+                            bundle.model, name, qstates, reaches_for(queued)
                         )
                         if qout.c is None:
                             raise RuntimeError("adaptive KKT queue accounting requires C head")
@@ -579,9 +635,8 @@ def sample_branched_tree(
             if stopped:
                 stopped_nodes = partition.candidate_handles[-1, :stopped].to(torch.int32)
                 leaf_node_ids.append(stopped_nodes)
-                leaf_reaches.append(
-                    reach_rows[stopped_nodes.to(torch.int64)].detach().clone()
-                )
+                leaf_reaches.append(reaches_for(stopped_nodes).detach().clone())
+                release_reaches(stopped_nodes)
             chance_count = counts[-2]
             if chance_count == 0:
                 return
@@ -679,6 +734,10 @@ def sample_branched_tree(
             }
         )
 
+    release_reaches(root_nodes)
+    if reach_pool.live_rows != 0:
+        raise RuntimeError("branched live reach slots survived their last consumer")
+    reach_pool.release()
     tree = buffer.finalize()
     if minimum_nodes is not None:
         assert pre_refill_node_count is not None
@@ -694,6 +753,10 @@ def sample_branched_tree(
         tree.pre_refill_node_count = pre_refill_node_count
     tree.nominal_child_count = nominal_count[: buffer.node_count].detach()
     tree.branching_beta = beta_rows[: buffer.node_count].detach()
+    tree.logical_path = arena.gather_many(
+        ("path_key",), torch.arange(buffer.node_count, device=device)
+    )["path_key"].detach()
+    tree.logical_tree_address = int(tree_address)
     tree.branching_diagnostics = dict(diagnostics)
     tree.validate()
     if leaf_node_ids:
@@ -732,30 +795,37 @@ def sample_branched_tree(
         logp_child[node_to_row[parents], columns] = edge_logp
         cached_nodes = torch.cat(policy_node_ids).to(torch.int32)
         cached_values = torch.cat(policy_node_values).to(torch.float32)
-        cached_reaches = torch.cat(policy_node_reaches).to(torch.float32)
         order = torch.argsort(cached_nodes.to(torch.int64))
         if not torch.equal(cached_nodes[order], decision_nodes):
             raise RuntimeError("family-scheduled branched rollout omitted a decision cache row")
         old_v = cached_values[order]
         old_t = torch.cat(policy_node_t).to(torch.float32)[order] if policy_node_t else None
         old_c = torch.cat(policy_node_c).to(torch.float32)[order] if policy_node_c else None
-        decision_rows = cached_reaches[order]
+        if not direct_inputs:
+            cached_reaches = torch.cat(policy_node_reaches).to(torch.float32)
+            decision_rows = cached_reaches[order]
     else:
         logp_child = torch.empty((0, 0, x_max), dtype=torch.float32, device=device)
         old_v = torch.empty((0, x_max), dtype=torch.float32, device=device)
         old_t = old_c = None
-        decision_rows = torch.empty(
-            (0, p_max, x_max), dtype=torch.float32, device=device
+        if not direct_inputs:
+            decision_rows = torch.empty(
+                (0, p_max, x_max), dtype=torch.float32, device=device
+            )
+    if direct_inputs:
+        decision_reach = seal_captures(decision_input_records)
+        if not torch.equal(decision_reach.node_ids, decision_nodes.to(torch.int32)):
+            raise RuntimeError("branched decision inputs are not aligned with topology")
+    else:
+        state_refs = tree.state_ref[decision_nodes].to(torch.int32)
+        owners = tree.owner[decision_nodes].to(torch.int32)
+        decision_reach = DecisionReachCache.from_rows(
+            decision_nodes.to(torch.int32),
+            state_refs,
+            decision_rows,
+            backend,
+            owners,
         )
-    state_refs = tree.state_ref[decision_nodes].to(torch.int32)
-    owners = tree.owner[decision_nodes].to(torch.int32)
-    decision_reach = DecisionReachCache.from_rows(
-        decision_nodes.to(torch.int32),
-        state_refs,
-        decision_rows,
-        backend,
-        owners,
-    )
     return tree, reach_cache, PolicyCache(
         decision_nodes.to(torch.int32), logp_child, old_v, decision_reach,
         old_t, old_c,

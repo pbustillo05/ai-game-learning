@@ -879,10 +879,21 @@ def test_poker_last_consumer_reaches_are_schedule_repeatable(
     assert torch.equal(replay_reach.log_r, full_reach.log_r)
     assert full_policy.decision_reach is not None
     assert replay_policy.decision_reach is not None
-    decision_rows = torch.arange(full_policy.node_ids.numel())
-    expected = full_policy.decision_reach.gather(decision_rows, full_backend)
-    actual = replay_policy.decision_reach.gather(decision_rows, replay_backend)
-    assert torch.equal(actual, expected)
+    if isinstance(full_policy.decision_reach, SealedDecisionInputs):
+        expected = full_policy.decision_reach
+        actual = replay_policy.decision_reach
+        assert isinstance(actual, SealedDecisionInputs)
+        assert torch.equal(actual.node_ids, expected.node_ids)
+        assert torch.equal(actual.partition_id, expected.partition_id)
+        assert torch.equal(actual.partition_row, expected.partition_row)
+        for partition_id, block in expected.inputs.items():
+            for name, value in block.columns.items():
+                assert torch.equal(actual.inputs[partition_id].columns[name], value)
+    else:
+        decision_rows = torch.arange(full_policy.node_ids.numel())
+        expected = full_policy.decision_reach.gather(decision_rows, full_backend)
+        actual = replay_policy.decision_reach.gather(decision_rows, replay_backend)
+        assert torch.equal(actual, expected)
 
     streets = replay_backend.states.street[replay_tree.state_ref.long()]
     assert bool(((replay_tree.owner >= 0) & (streets > 0)).any())

@@ -71,18 +71,20 @@ from pbg.core.storage import (
 )
 from pbg.core.targets import (
     _walker_alias,
+    build_branched_rb_targets,
     build_normal_targets,
     build_sequential_rb_targets,
 )
-from pbg.core.topology import SequentialDecisionCSR
+from pbg.core.topology import BranchedTreeSpan, SequentialDecisionCSR
 from pbg.core.partition import CompletionSpec
 from pbg.core.rollout import (
+    _logical_seed,
     ProbeRollout,
     sample_trees,
     sample_trees_sequential,
     sequential_leaf_logical_rng_keys,
 )
-from pbg.core.execution import LOGICAL_RNG_VERSION, DrawPurpose
+from pbg.core.execution import LOGICAL_RNG_VERSION, DrawPurpose, logical_rng_keys
 from pbg.core.values import HeadEvals, streamed_branched_value
 from pbg.core.completion import BatchedCompletionStats
 from pbg.core.utility import utility_conversion, utility_scale
@@ -895,6 +897,91 @@ def _trajectory_length_metrics(
         )
 
 
+def _record_branched_controller_metrics(
+    cfg: RootConfig,
+    tree: Any,
+    policy_cache: Any,
+    controller: Any | None,
+    profile_metrics: dict[str, float],
+    *,
+    iteration: int,
+    device: torch.device,
+) -> None:
+    """Preserve dynamic-KKT observations before rollout owners are released."""
+
+    if policy_cache.old_t is None or policy_cache.old_c is None:
+        raise RuntimeError("branched rollout did not retain frozen T/C heads")
+    if cfg.rollout.branching_mode != "dynamic":
+        return
+    adaptive = cfg.rollout.adaptive_kkt
+    if adaptive is None:
+        raise RuntimeError("dynamic branching has no adaptive KKT configuration")
+    decision_ids = policy_cache.node_ids.to(torch.int64)
+    offspring = tree.child_ptr[1:] - tree.child_ptr[:-1]
+    executed = offspring[decision_ids].to(torch.float32)
+    nominal = (
+        executed
+        if tree.nominal_child_count is None
+        else tree.nominal_child_count[decision_ids].to(torch.float32)
+    )
+    beta_values = (
+        nominal
+        if tree.branching_beta is None
+        else tree.branching_beta[decision_ids]
+    )
+    profile_metrics.update(
+        {
+            "beta_mean": float(beta_values.mean()),
+            "beta_max": float(beta_values.max()),
+            "realized_child_count_mean": float(executed.mean()),
+            "realized_child_count_max": float(executed.max()),
+            "beta_min_clip_rate": float((beta_values <= 1.0).float().mean()),
+            "beta_max_clip_rate": float(
+                (beta_values >= float(adaptive.beta_max)).float().mean()
+            ),
+            "tree_size_vs_M": float(tree.owner.numel())
+            / float(adaptive.target_tree_size),
+            **{
+                key: float(value)
+                for key, value in getattr(tree, "branching_diagnostics", {}).items()
+            },
+        }
+    )
+    if iteration < int(adaptive.warmup_iters):
+        return
+    pre_refill_nodes = tree.pre_refill_node_count
+    if pre_refill_nodes is None:
+        counterfactual = float(tree.owner.numel()) + float(
+            ((nominal - executed) * policy_cache.old_c).sum()
+        )
+    else:
+        original = decision_ids < int(pre_refill_nodes)
+        original_executed = executed[original].clone()
+        original_ids = decision_ids[original]
+        root = original_ids == 0
+        if bool(root.any()):
+            protected = tree.root_pre_refill_child_count
+            if protected is None:
+                raise RuntimeError(
+                    "pre-refill node metadata omitted the protected root degree"
+                )
+            original_executed[root] = float(protected)
+        counterfactual = float(pre_refill_nodes) + float(
+            (
+                (nominal[original] - original_executed)
+                * policy_cache.old_c[original]
+            ).sum()
+        )
+    if dist.is_available() and dist.is_initialized():
+        shared = torch.tensor(counterfactual, dtype=torch.float64, device=device)
+        dist.all_reduce(shared, op=dist.ReduceOp.SUM)
+        counterfactual = float(shared) / dist.get_world_size()
+    profile_metrics["counterfactual_tree_size"] = counterfactual
+    if controller is None:
+        raise RuntimeError("adaptive rollout has no KKT controller")
+    profile_metrics.update(controller.observe(counterfactual))
+
+
 def _build_iteration_data(
     cfg: RootConfig,
     bundle: GameBundle,
@@ -1112,6 +1199,82 @@ def _build_iteration_data(
             return _RolloutSealInput(
                 normal=False,
                 completion_quality=completion_quality,
+                profile_metrics=profile_metrics,
+                storage=storage,
+                partition_specs=partitions,
+                decision_count=decisions,
+                leaf_count=rollout.leaves.rows,
+            )
+        if cfg.training.mode == "branched_rao_blackwell":
+            if isinstance(rb_sample, ProbeRollout):
+                raise RuntimeError("branched rollout cannot be an opponent probe")
+            tree, _, policy_cache = rb_sample
+            _record_branched_controller_metrics(
+                cfg,
+                tree,
+                policy_cache,
+                branching_controller,
+                profile_metrics,
+                iteration=iteration,
+                device=device,
+            )
+            if profile:
+                _decision_street_metrics(
+                    profile_metrics,
+                    bundle.rollout_backend,
+                    tree,
+                    policy_cache.node_ids,
+                )
+            rollout, partitions, completion, quality_parts = _profiled_call(
+                profile_metrics,
+                "compaction",
+                device,
+                profile,
+                lambda: _seal_branched_rollout_storage(
+                    cfg,
+                    frozen_bundle,
+                    rb_sample,
+                    iteration=iteration,
+                    gen=torch_gen,
+                ),
+            )
+            workspace_bytes = _value_workspace_budget(cfg, device)
+            completion_rows = _completion_batch_rows(
+                bundle, rollout.leaves.rows, workspace_bytes
+            )
+            storage = _profiled_call(
+                profile_metrics,
+                "backward",
+                device,
+                profile,
+                lambda: build_branched_rb_targets(
+                    rollout,
+                    partitions,
+                    completion,
+                    cfg.loss.lam,
+                    leaf_microbatch_rows=completion_rows,
+                ),
+            )
+            if execution_metrics is not None:
+                execution_metrics.record_target_bytes(_tensor_bytes(storage))
+            decisions = sum(
+                partition.inputs.rows for partition in storage.partitions.values()
+            )
+            profile_metrics.update(
+                {
+                    "trajectories": 1.0,
+                    "nodes": float(tree.owner.numel()),
+                    "leaves": float(rollout.leaves.rows),
+                    "decisions": float(decisions),
+                    "completion_samples": float(
+                        rollout.leaves.rows * int(cfg.completion.n_samples)
+                    ),
+                    "retained_target_bytes": float(_tensor_bytes(storage)),
+                }
+            )
+            return _RolloutSealInput(
+                normal=False,
+                completion_quality=_merge_completion_quality(quality_parts),
                 profile_metrics=profile_metrics,
                 storage=storage,
                 partition_specs=partitions,
@@ -1815,6 +1978,265 @@ def _seal_sequential_rollout_storage(
     return rollout, partitions, completion, quality_parts
 
 
+def _seal_branched_rollout_storage(
+    cfg: RootConfig,
+    bundle: GameBundle,
+    sampled: Any,
+    *,
+    iteration: int,
+    gen: torch.Generator,
+) -> tuple[RolloutStorage, Any, CompletionSpec, list[tuple[int, dict[str, float]]]]:
+    """Seal one rooted branched sample into ragged immutable storage."""
+
+    tree, reach_cache, policy_cache = sampled
+    backend = bundle.rollout_backend
+    device = backend.device
+    partitions = _natural_partition_set(cfg, bundle)
+    nodes = policy_cache.node_ids.to(torch.int64)
+    captured = policy_cache.decision_reach
+    if not isinstance(captured, SealedDecisionInputs):
+        raise RuntimeError("branched production requires captured immutable inputs")
+    if not torch.equal(captured.node_ids.to(torch.int64), nodes):
+        raise RuntimeError("branched captured inputs and policy rows are misaligned")
+
+    node_count = int(tree.parent.numel())
+    old_order = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int64, device=device),
+            torch.argsort(tree.parent[1:].to(torch.int64), stable=True) + 1,
+        )
+    )
+    old_to_new = torch.empty(node_count, dtype=torch.int64, device=device)
+    old_to_new[old_order] = torch.arange(node_count, device=device)
+    parent = tree.parent[old_order].to(torch.int64)
+    parent = torch.where(parent < 0, parent, old_to_new[parent]).to(torch.int32)
+    degree_old = (tree.child_ptr[1:] - tree.child_ptr[:-1]).to(torch.int32)
+    degree = degree_old[old_order]
+    child_begin = torch.full(
+        (node_count,), -1, dtype=torch.int32, device=device
+    )
+    if node_count > 1:
+        child_ids = torch.arange(1, node_count, dtype=torch.int32, device=device)
+        child_parents = parent[1:].to(torch.int64)
+        first = torch.full(
+            (node_count,), node_count, dtype=torch.int32, device=device
+        )
+        first.scatter_reduce_(
+            0, child_parents, child_ids, reduce="amin", include_self=True
+        )
+        child_begin[degree > 0] = first[degree > 0]
+
+    decision_partition = torch.full(
+        (node_count,), -1, dtype=torch.int32, device=device
+    )
+    decision_row = torch.full_like(decision_partition, -1)
+    decision_new_nodes = old_to_new[nodes]
+    decision_partition[decision_new_nodes] = captured.partition_id
+    decision_row[decision_new_nodes] = captured.partition_row
+
+    leaf_old = (degree_old == 0).nonzero(as_tuple=False).squeeze(1)
+    leaf_new = old_to_new[leaf_old]
+    leaf_order = torch.argsort(leaf_new, stable=True)
+    leaf_old = leaf_old[leaf_order]
+    leaf_new = leaf_new[leaf_order]
+    leaf_row = torch.full((node_count,), -1, dtype=torch.int32, device=device)
+    leaf_row[leaf_new] = torch.arange(
+        leaf_old.numel(), dtype=torch.int32, device=device
+    )
+    protected_root_degree = getattr(tree, "root_pre_refill_child_count", None)
+    topology = BranchedTreeSpan(
+        parent=parent,
+        child_begin=child_begin,
+        degree=degree,
+        decision_partition=decision_partition,
+        decision_row=decision_row,
+        leaf_row=leaf_row,
+        root_target_degree=(
+            None if protected_root_degree is None else int(protected_root_degree)
+        ),
+        pre_refill_node_count=getattr(tree, "pre_refill_node_count", None),
+        nominal_degree=(
+            degree.clone()
+            if getattr(tree, "nominal_child_count", None) is None
+            else tree.nominal_child_count[old_order].detach().to(torch.int32)
+        ),
+    )
+
+    legal_ids = torch.arange(
+        backend.e_max, dtype=torch.int32, device=device
+    )[None].expand(nodes.numel(), -1)
+    legal_mask = torch.empty(
+        (nodes.numel(), backend.e_max), dtype=torch.bool, device=device
+    )
+    for partition_id, input_block in captured.inputs.items():
+        positions = (captured.partition_id == partition_id).nonzero(
+            as_tuple=False
+        ).squeeze(1)
+        legal_mask[positions] = input_block.columns["legal_action_mask"][
+            captured.partition_row[positions].to(torch.int64)
+        ]
+
+    full_degree = degree_old[nodes].to(torch.int64)
+    target_degree = full_degree.clone()
+    if protected_root_degree is not None:
+        root_position = (nodes == 0).nonzero(as_tuple=False).squeeze(1)
+        if root_position.numel() != 1:
+            raise RuntimeError("protected branched root is not a retained decision")
+        target_degree[root_position] = int(protected_root_degree)
+    nominal = getattr(tree, "nominal_child_count", None)
+    if nominal is None:
+        nominal_decision = full_degree.to(torch.int32)
+    else:
+        nominal_decision = nominal[nodes].detach().to(torch.int32)
+    global_decisions: dict[str, Tensor] = {
+        "owner": tree.owner[nodes].detach().to(torch.int32),
+        "old_value": policy_cache.old_v.detach().to(torch.float32),
+        "legal_event_ids": legal_ids,
+        "legal_event_mask": legal_mask,
+        "log_weight": torch.log(tree.path_weight[nodes].detach().to(torch.float64)),
+        "nominal_child_count": nominal_decision,
+        "executed_child_count": target_degree.to(torch.int32),
+    }
+    if policy_cache.old_t is not None or policy_cache.old_c is not None:
+        if policy_cache.old_t is None or policy_cache.old_c is None:
+            raise RuntimeError("branched frozen T/C heads are incomplete")
+        global_decisions["frozen_trace_variance"] = policy_cache.old_t.detach()
+        global_decisions["frozen_cost"] = policy_cache.old_c.detach()
+
+    edge_width = policy_cache.old_logp_child.shape[1]
+    edge_slot = torch.arange(edge_width, device=device)[None]
+    selected_edge = tree.child_ptr[nodes, None].to(torch.int64) + edge_slot
+    valid_edge = edge_slot < target_degree[:, None]
+    safe_edge = selected_edge.clamp_max(max(tree.child_event.numel() - 1, 0))
+    event_rows = tree.child_event[safe_edge].to(torch.int32)
+
+    blocks: dict[int, PartitionRolloutBlock] = {}
+    for partition in partitions.specs:
+        selected = (captured.partition_id == partition.partition_id).nonzero(
+            as_tuple=False
+        ).squeeze(1)
+        if selected.numel() == 0:
+            continue
+        captured_rows = captured.partition_row[selected].to(torch.int64)
+        if not torch.equal(
+            captured_rows,
+            torch.arange(selected.numel(), dtype=torch.int64, device=device),
+        ):
+            raise RuntimeError("branched partition input rows are not contiguous")
+        decisions_columns = {
+            name: value[selected].detach()
+            for name, value in global_decisions.items()
+        }
+        if partition.partition_id == 0:
+            decisions_columns["old_value"] = _compress_preflop_rows(
+                decisions_columns["old_value"], backend
+            )
+        decisions = _sealed_dynamic_block(
+            f"poker_partition_{partition.partition_id}_branched_decision",
+            decisions_columns,
+        )
+        partition_valid = valid_edge[selected]
+        action_events = event_rows[selected][partition_valid]
+        action_old_logp = policy_cache.old_logp_child[selected][partition_valid]
+        if partition.partition_id == 0:
+            action_old_logp = _compress_preflop_rows(action_old_logp, backend)
+        actions = _sealed_dynamic_block(
+            f"poker_partition_{partition.partition_id}_branched_action",
+            {
+                "event": action_events.detach().to(torch.int32),
+                "old_log_prob": action_old_logp.detach().to(torch.float32),
+            },
+        )
+        counts = target_degree[selected]
+        action_ptr = torch.empty(
+            selected.numel() + 1, dtype=torch.int32, device=device
+        )
+        action_ptr[0] = 0
+        action_ptr[1:] = counts.cumsum(0).to(torch.int32)
+        blocks[partition.partition_id] = PartitionRolloutBlock(
+            partition.partition_id,
+            captured.inputs[partition.partition_id],
+            decisions,
+            actions,
+            action_ptr,
+            captured.input_pools.get(partition.partition_id, {}),
+        )
+
+    leaf_reach = reach_cache.rows_for(
+        tree, leaf_old.to(torch.int32), backend, policy_cache
+    ).detach().to(torch.float32)
+    leaf_states = tree.state_ref[leaf_old].to(torch.int32)
+    completion_inputs = backend.completion_inputs(leaf_states, leaf_reach)
+    logical_path = getattr(tree, "logical_path", None)
+    if not isinstance(logical_path, Tensor):
+        raise RuntimeError("branched rollout omitted logical path addresses")
+    tree_address = int(getattr(tree, "logical_tree_address", 0))
+    completion_key = logical_rng_keys(
+        seed=_logical_seed(cfg, gen),
+        iteration=iteration,
+        trajectory=torch.full(
+            (leaf_old.numel(),), tree_address, dtype=torch.int64, device=device
+        ),
+        path=logical_path[leaf_old],
+        draw=0,
+        purpose=DrawPurpose.COMPLETION,
+    )
+    leaf_columns = {
+        "owner": tree.owner[leaf_old].to(torch.int32),
+        "log_reach": leaf_reach,
+        "completion_key": completion_key.to(torch.int64),
+        "fold_payoff": backend.states.fold_payoff[leaf_states.to(torch.int64)]
+        .detach()
+        .to(torch.float32),
+        **{name: value.detach() for name, value in completion_inputs.items()},
+    }
+    leaves = _sealed_dynamic_block("branched_rb_leaf", leaf_columns)
+    service = bundle.completion_backend
+    if service is None or cfg.completion.n_samples is None:
+        raise RuntimeError("branched RB requires a completion service")
+    complete_sealed = getattr(service, "complete_sealed", None)
+    if not callable(complete_sealed):
+        raise TypeError("completion backend lacks immutable-leaf completion")
+    quality_parts: list[tuple[int, dict[str, float]]] = []
+
+    def complete_leaf_rows(
+        columns: Mapping[str, Tensor], *, rows: Tensor
+    ) -> BatchedCompletionStats:
+        result = complete_sealed(
+            backend,
+            columns,
+            rows=rows,
+            n_samples=int(cfg.completion.n_samples),
+        ).for_learning()
+        scaled = _scale_completion_utility(result, cfg)
+        quality_parts.append(
+            (
+                rows.numel(),
+                {
+                    key: float(value)
+                    for key, value in scaled.metadata.items()
+                    if key.startswith("completion_")
+                    and isinstance(value, (int, float))
+                },
+            )
+        )
+        return scaled
+
+    completion = CompletionSpec(
+        tuple(leaf_columns),
+        ("log_reach",),
+        ("p_hat", "v_hat"),
+        complete_leaf_rows,
+        lambda count: int(count) * backend.n_players * backend.n_hands * 12,
+        key_fields=("completion_key",),
+    )
+    rollout = RolloutStorage("branched_rb", blocks, topology, leaves)
+    release = getattr(backend, "release_rollout_owners", None)
+    if callable(release):
+        release()
+    return rollout, partitions, completion, quality_parts
+
+
 def _compress_preflop_rows(value: Tensor, backend: Any) -> Tensor:
     """Project an old combo-indexed model row back to its native class rows."""
 
@@ -2249,12 +2671,42 @@ def _validate_sealed_policy_identity(
                     dtype=amp_dtype,
                 ):
                     output = spec.forward(model, inputs)
-                selected = bundle.policy_adapter.log_prob(
-                    output,
-                    partition.columns["event"][rows, None],
-                    partition.columns["legal_event_ids"][rows],
-                    partition.columns["legal_event_mask"][rows],
-                )[:, 0].float()
+                legal_ids = partition.columns["legal_event_ids"][rows]
+                legal_mask = partition.columns["legal_event_mask"][rows]
+                if data.storage.mode == "branched_rb":
+                    actions = partition.action_columns
+                    if actions is None:
+                        raise RuntimeError("branched identity gate omitted actions")
+                    ptr = actions["action_ptr"].to(torch.int64)
+                    starts = ptr[rows]
+                    counts = ptr[rows + 1] - starts
+                    width = int(counts.max())
+                    slots = torch.arange(width, device=device)[None]
+                    active = slots < counts[:, None]
+                    action_rows = starts[:, None] + slots
+                    safe_rows = action_rows.clamp_max(actions["event"].numel() - 1)
+                    safe_event = legal_ids.gather(
+                        1, legal_mask.to(torch.int64).argmax(1, keepdim=True)
+                    )
+                    events = torch.where(
+                        active,
+                        actions["event"][safe_rows],
+                        safe_event.expand_as(action_rows),
+                    )
+                    selected = bundle.policy_adapter.log_prob(
+                        output, events, legal_ids, legal_mask
+                    ).float()
+                    current_logp = selected[active]
+                    cached_logp = actions["old_log_prob"][safe_rows][active]
+                    current_value = output.v.float()
+                    cached_value = partition.columns["old_value"][rows]
+                else:
+                    selected = bundle.policy_adapter.log_prob(
+                        output,
+                        partition.columns["event"][rows, None],
+                        legal_ids,
+                        legal_mask,
+                    )[:, 0].float()
                 if data.normal:
                     realized = partition.columns["realized_type"][rows].to(torch.int64)
                     model_type = spec.phi(device=device)[realized]
@@ -2263,7 +2715,7 @@ def _validate_sealed_policy_identity(
                     current_value = output.v.float()[batch, model_type]
                     cached_logp = partition.columns["old_log_prob"][rows]
                     cached_value = partition.columns["old_value"][rows]
-                else:
+                elif data.storage.mode != "branched_rb":
                     current_logp = selected
                     current_value = output.v.float()
                     cached_logp = partition.columns["old_log_prob"][rows]
