@@ -139,7 +139,7 @@ def test_nlhe_builder_constructs_one_owning_poker_model(tmp_path: Path) -> None:
 def test_real_sibling_combo_table_and_partition_signature() -> None:
     package = pytest.importorskip("poker_gpu_evaluator")
     evaluator = package.bind(rank_count=13)
-    assert package.CONTRACT_VERSION == "1"
+    assert package.CONTRACT_VERSION == "2"
     validate_evaluator_combo_cards(evaluator.combo_cards)
     assert tuple(inspect.signature(evaluator.summarize_folders).parameters) == (
         "board_cards", "folder_weights", "row_mask", "beta_rank",

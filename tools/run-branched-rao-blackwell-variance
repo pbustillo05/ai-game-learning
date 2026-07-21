@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+venv=/home/pablob/.venvs/poker
+toolkit=${venv}/lib/python3.10/site-packages/nvidia/cu13
+config=${repo_root}/configs/experiments/nlhe_hu_32bb_branched_rao_blackwell_variance.yaml
+out_dir=${repo_root}/runs/branched_rao_blackwell_variance_ckpt1110
+physical_gpu=${PBG_BRANCH_VARIANCE_GPU:-2}
+session_name=${PBG_BRANCH_VARIANCE_TMUX_SESSION:-branched-rb-variance-1110}
+duty_run_seconds=${PBG_BRANCH_VARIANCE_DUTY_RUN_SECONDS:-4}
+duty_pause_seconds=${PBG_BRANCH_VARIANCE_DUTY_PAUSE_SECONDS:-4}
+
+if [[ ${1:-} != "--inside-tmux" ]]; then
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "tmux is required for the unattended experiment" >&2
+    exit 2
+  fi
+  if tmux has-session -t "${session_name}" 2>/dev/null; then
+    echo "tmux session ${session_name} already exists" >&2
+    exit 3
+  fi
+  PBG_BRANCH_VARIANCE_GPU="${physical_gpu}" \
+  PBG_BRANCH_VARIANCE_DUTY_RUN_SECONDS="${duty_run_seconds}" \
+  PBG_BRANCH_VARIANCE_DUTY_PAUSE_SECONDS="${duty_pause_seconds}" \
+    tmux new-session -d -s "${session_name}" \
+      "${repo_root}/tools/run-branched-rao-blackwell-variance --inside-tmux"
+  echo "Launched tmux session ${session_name} on physical GPU ${physical_gpu}."
+  echo "Log: ${out_dir}/launch.log"
+  exit 0
+fi
+
+if [[ ! -x ${venv}/bin/python ]]; then
+  echo "missing shared poker virtualenv at ${venv}" >&2
+  exit 2
+fi
+if [[ ! -x ${toolkit}/bin/nvcc || ! -d ${toolkit}/lib ]]; then
+  echo "missing checked CUDA 13 toolkit at ${toolkit}" >&2
+  exit 2
+fi
+if [[ ! ${physical_gpu} =~ ^[0-9]+$ ]]; then
+  echo "PBG_BRANCH_VARIANCE_GPU must be one physical numeric GPU id" >&2
+  exit 2
+fi
+if [[ ! ${duty_run_seconds} =~ ^[0-9]+$ || ! ${duty_pause_seconds} =~ ^[0-9]+$ ]] \
+  || { (( duty_run_seconds == 0 )) && (( duty_pause_seconds != 0 )); } \
+  || { (( duty_run_seconds != 0 )) && (( duty_pause_seconds == 0 )); }; then
+  echo "duty-cycle seconds must be nonnegative integers and both zero or both positive" >&2
+  exit 2
+fi
+
+gpu_row=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits \
+  | awk -F, -v wanted="${physical_gpu}" '$1 + 0 == wanted {print $1 "," $2 "," $3}')
+if [[ -z ${gpu_row} ]]; then
+  echo "physical GPU ${physical_gpu} does not exist" >&2
+  exit 3
+fi
+IFS=',' read -r raw_index raw_used raw_util <<< "${gpu_row}"
+used=${raw_used//[[:space:]]/}
+util=${raw_util//[[:space:]]/}
+if (( used > 128 || util > 5 )); then
+  echo "GPU ${physical_gpu} is not idle (${used} MiB, ${util}%); refusing to launch" >&2
+  exit 3
+fi
+
+export CUDA_HOME="${toolkit}"
+export PATH="${venv}/bin:${toolkit}/bin:${PATH}"
+export LD_LIBRARY_PATH="${toolkit}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export CUDA_VISIBLE_DEVICES="${physical_gpu}"
+export POKER_GPU=1
+
+cd "${repo_root}"
+mkdir -p "${out_dir}"
+exec > >(tee -a "${out_dir}/launch.log") 2>&1
+
+echo "Starting checkpoint-1110 branched RB variance experiment on physical GPU ${physical_gpu}."
+echo "Duty cycle: ${duty_run_seconds}s run / ${duty_pause_seconds}s pause."
+nvidia-smi --query-gpu=index,name,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader
+
+resume_flag=()
+if [[ -f ${out_dir}/manifest.json ]]; then
+  resume_flag=(--resume)
+fi
+"${venv}/bin/python" -m pbg.cli.branched_rao_blackwell_variance \
+  --config "${config}" --phase smoke --device cuda:0 "${resume_flag[@]}"
+
+run_command=(
+  "${venv}/bin/python" -m pbg.cli.branched_rao_blackwell_variance
+  --config "${config}" --phase run --device cuda:0 --resume
+)
+"${run_command[@]}" &
+worker_pid=$!
+throttle_pid=
+
+if (( duty_pause_seconds > 0 )); then
+  (
+    paused=0
+    resume_worker() {
+      if (( paused )); then
+        kill -CONT "${worker_pid}" 2>/dev/null || true
+      fi
+    }
+    trap 'resume_worker; exit 0' INT TERM HUP
+    trap resume_worker EXIT
+    while kill -0 "${worker_pid}" 2>/dev/null; do
+      sleep "${duty_run_seconds}"
+      if kill -STOP "${worker_pid}" 2>/dev/null; then
+        paused=1
+        sleep "${duty_pause_seconds}"
+        kill -CONT "${worker_pid}" 2>/dev/null || true
+        paused=0
+      fi
+    done
+  ) &
+  throttle_pid=$!
+fi
+
+terminate_run() {
+  if [[ -n ${throttle_pid} ]]; then
+    kill -TERM "${throttle_pid}" 2>/dev/null || true
+    wait "${throttle_pid}" 2>/dev/null || true
+  fi
+  if kill -0 "${worker_pid}" 2>/dev/null; then
+    kill -INT "${worker_pid}" 2>/dev/null || true
+    wait "${worker_pid}" 2>/dev/null || true
+  fi
+  exit 130
+}
+trap terminate_run INT TERM HUP
+
+if wait "${worker_pid}"; then
+  status=0
+else
+  status=$?
+fi
+if [[ -n ${throttle_pid} ]]; then
+  kill -TERM "${throttle_pid}" 2>/dev/null || true
+  wait "${throttle_pid}" 2>/dev/null || true
+fi
+trap - INT TERM HUP
+if (( status != 0 )); then
+  echo "Experiment worker failed with status ${status}."
+  nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits
+  exit "${status}"
+fi
+
+echo "Experiment complete: ${out_dir}"
+nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits

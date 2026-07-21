@@ -215,6 +215,6 @@ def test_cuda_mapping_has_no_cpu_or_numpy_round_trip(monkeypatch: pytest.MonkeyP
 
 def test_real_sibling_folder_smoke() -> None:
     package = pytest.importorskip("poker_gpu_evaluator")
-    assert package.CONTRACT_VERSION == "1"
+    assert package.CONTRACT_VERSION == "2"
     evaluator = package.bind(rank_count=13)
     assert callable(evaluator.summarize_folders)

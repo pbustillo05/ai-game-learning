@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+venv=/home/pablob/.venvs/poker
+toolkit=${venv}/lib/python3.10/site-packages/nvidia/cu13
+config=${repo_root}/configs/experiments/nlhe_hu_32bb_rao_blackwell_variance.yaml
+gpu_ids=${PBG_VARIANCE_GPUS:-0,1}
+chunk_cooldown_seconds=${PBG_VARIANCE_CHUNK_COOLDOWN_SECONDS:-0}
+duty_run_seconds=${PBG_VARIANCE_DUTY_RUN_SECONDS:-4}
+duty_pause_seconds=${PBG_VARIANCE_DUTY_PAUSE_SECONDS:-4}
+session_name=${PBG_VARIANCE_TMUX_SESSION:-rb-variance-terminal}
+
+if [[ ${1:-} != "--inside-tmux" ]]; then
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "tmux is required to launch the server-safe experiment" >&2
+    exit 2
+  fi
+  if tmux has-session -t "${session_name}" 2>/dev/null; then
+    echo "tmux session ${session_name} already exists; attach with: tmux attach -t ${session_name}" >&2
+    exit 3
+  fi
+  tmux new-session -d -s "${session_name}" "${repo_root}/tools/run-rao-blackwell-variance --inside-tmux"
+  echo "Launched in tmux session ${session_name}."
+  echo "Attach: tmux attach -t ${session_name}"
+  echo "Log: ${repo_root}/runs/rao_blackwell_variance_terminal/launch.log"
+  exit 0
+fi
+
+if [[ ! -x "${venv}/bin/python" || ! -x "${venv}/bin/torchrun" ]]; then
+  echo "missing shared poker virtualenv executables under ${venv}" >&2
+  exit 2
+fi
+if [[ ! -x "${toolkit}/bin/nvcc" || ! -d "${toolkit}/lib" ]]; then
+  echo "missing checked CUDA 13 toolkit under ${toolkit}" >&2
+  exit 2
+fi
+
+IFS=',' read -r -a selected_gpus <<< "${gpu_ids}"
+worker_count=${#selected_gpus[@]}
+if (( worker_count < 1 )); then
+  echo "PBG_VARIANCE_GPUS must contain at least one physical GPU ID" >&2
+  exit 2
+fi
+if [[ ! ${duty_run_seconds} =~ ^[0-9]+$ || ! ${duty_pause_seconds} =~ ^[0-9]+$ ]] \
+  || { (( duty_run_seconds == 0 )) && (( duty_pause_seconds != 0 )); } \
+  || { (( duty_run_seconds != 0 )) && (( duty_pause_seconds == 0 )); }; then
+  echo "PBG_VARIANCE_DUTY_RUN_SECONDS and PBG_VARIANCE_DUTY_PAUSE_SECONDS must be nonnegative integers and either both zero or both positive" >&2
+  exit 2
+fi
+
+declare -A requested=()
+for gpu in "${selected_gpus[@]}"; do
+  if [[ ! "${gpu}" =~ ^[0-9]+$ ]] || [[ -n ${requested[${gpu}]+x} ]]; then
+    echo "PBG_VARIANCE_GPUS must contain distinct numeric GPU IDs" >&2
+    exit 2
+  fi
+  requested[${gpu}]=1
+done
+
+while IFS=',' read -r raw_index raw_used raw_util; do
+  index=${raw_index//[[:space:]]/}
+  used=${raw_used//[[:space:]]/}
+  util=${raw_util//[[:space:]]/}
+  if [[ -n ${requested[${index}]+x} ]] && (( used > 128 || util > 5 )); then
+    echo "GPU ${index} is not idle (${used} MiB, ${util}% utilization); refusing to launch" >&2
+    exit 3
+  fi
+done < <(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits)
+
+export CUDA_HOME="${toolkit}"
+export PATH="${venv}/bin:${toolkit}/bin:${PATH}"
+export LD_LIBRARY_PATH="${toolkit}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export CUDA_VISIBLE_DEVICES="${gpu_ids}"
+export POKER_GPU=1
+export PBG_VARIANCE_CHUNK_COOLDOWN_SECONDS="${chunk_cooldown_seconds}"
+export PBG_VARIANCE_DUTY_RUN_SECONDS="${duty_run_seconds}"
+export PBG_VARIANCE_DUTY_PAUSE_SECONDS="${duty_pause_seconds}"
+
+cd "${repo_root}"
+mkdir -p "${repo_root}/runs/rao_blackwell_variance_terminal"
+exec > >(tee -a "${repo_root}/runs/rao_blackwell_variance_terminal/launch.log") 2>&1
+
+echo "Launching Rao--Blackwell variance jobs on physical GPUs ${gpu_ids} with ${chunk_cooldown_seconds}s chunk cooldown and duty cycle ${duty_run_seconds}s run/${duty_pause_seconds}s pause."
+"${venv}/bin/torchrun" \
+  --standalone \
+  --nproc-per-node="${worker_count}" \
+  -m pbg.cli.rao_blackwell_variance \
+  --config "${config}" \
+  --phase variance \
+  --resume &
+torchrun_pid=$!
+
+throttle_pid=
+if (( duty_pause_seconds > 0 )); then
+  (
+    paused_pids=()
+    resume_paused() {
+      if (( ${#paused_pids[@]} > 0 )); then
+        kill -CONT "${paused_pids[@]}" 2>/dev/null || true
+      fi
+    }
+    trap 'resume_paused; exit 0' INT TERM HUP
+    trap resume_paused EXIT
+    while kill -0 "${torchrun_pid}" 2>/dev/null; do
+      sleep "${duty_run_seconds}"
+      mapfile -t paused_pids < <(pgrep -P "${torchrun_pid}" || true)
+      if (( ${#paused_pids[@]} == 0 )); then
+        continue
+      fi
+      kill -STOP "${paused_pids[@]}" 2>/dev/null || true
+      sleep "${duty_pause_seconds}"
+      resume_paused
+      paused_pids=()
+    done
+  ) &
+  throttle_pid=$!
+fi
+
+terminate_run() {
+  if [[ -n ${throttle_pid} ]]; then
+    kill -TERM "${throttle_pid}" 2>/dev/null || true
+    wait "${throttle_pid}" 2>/dev/null || true
+  fi
+  if kill -0 "${torchrun_pid}" 2>/dev/null; then
+    kill -INT "${torchrun_pid}" 2>/dev/null || true
+    wait "${torchrun_pid}" 2>/dev/null || true
+  fi
+  exit 130
+}
+trap terminate_run INT TERM HUP
+
+if wait "${torchrun_pid}"; then
+  torchrun_status=0
+else
+  torchrun_status=$?
+fi
+if [[ -n ${throttle_pid} ]]; then
+  kill -TERM "${throttle_pid}" 2>/dev/null || true
+  wait "${throttle_pid}" 2>/dev/null || true
+fi
+trap - INT TERM HUP
+if (( torchrun_status != 0 )); then
+  exit "${torchrun_status}"
+fi
+
+"${venv}/bin/python" \
+  -m pbg.cli.rao_blackwell_variance \
+  --config "${config}" \
+  --phase analyze \
+  --device cpu \
+  --resume
+
+echo "Experiment complete. Results: ${repo_root}/runs/rao_blackwell_variance_terminal"
+nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits

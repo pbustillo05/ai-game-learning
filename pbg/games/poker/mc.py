@@ -20,6 +20,7 @@ from pbg.games.poker.engine import NLHEEngine
 
 PAD_CARD = 255
 EXPECTED_CONTRACT_VERSION = "1"
+SUPPORTED_CONTRACT_VERSIONS = frozenset({"1", "2"})
 
 
 class EvaluatorContractError(RuntimeError):
@@ -47,10 +48,10 @@ def _load_evaluator(rank_count: int) -> Any:
             "poker_gpu_evaluator with the bound contract-v1 API is required; "
             "install or update the sibling package (an editable install is sufficient)"
         ) from exc
-    if contract_version != EXPECTED_CONTRACT_VERSION:
+    if contract_version not in SUPPORTED_CONTRACT_VERSIONS:
         raise RuntimeError(
             "incompatible poker_gpu_evaluator: expected CONTRACT_VERSION "
-            f"{EXPECTED_CONTRACT_VERSION!r}, got {contract_version!r}; "
+            f"{EXPECTED_CONTRACT_VERSION!r} or '2', got {contract_version!r}; "
             "update the sibling package"
         )
     validate_evaluator_combo_cards(combo_cards, rank_count)

@@ -988,7 +988,7 @@ def test_real_tensor_poker_keyed_completion_mixes_showdown_and_fold_rows() -> No
         assert torch.equal(getattr(first, name), getattr(second, name)), name
     torch.testing.assert_close(first.p_hat.sum(2), torch.ones((2, 2)))
     assert first.metadata["fold_completion"] == "joint_profiles"
-    assert first.metadata["showdown_contract_version"] == "1"
+    assert first.metadata["showdown_contract_version"] == "2"
 
     metrics = backend.execution_metrics.snapshot()
     assert metrics["execution_evaluator_calls"] == 4

@@ -48,7 +48,7 @@ model:
   class_embedding_dim: 32
   evaluator_summary_dim: 0
   ffn_hidden: null
-  use_moment_heads: false
+  use_branching_heads: false
   max_history_tokens: 42
   # A continuing heads-up state cannot contain a folded third player.
   folder_beta_rank: 0

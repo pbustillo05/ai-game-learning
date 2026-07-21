@@ -1,0 +1,44 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Raise distribution explorer</title>
+<style>
+body { font: 14px sans-serif; max-width: 1100px; margin: 24px auto; }
+canvas { width: 100%; height: 430px; border: 1px solid #ddd; }
+.row { display: grid; grid-template-columns: 170px 1fr 60px; gap: 10px; margin: 9px 0; }
+button { margin: 12px 8px 12px 0; padding: 6px 14px; }
+</style></head><body>
+<h2>Legal raise distribution: two logistic modes + all-in atom</h2>
+<canvas id="plot" width="1050" height="430"></canvas>
+<div id="controls"></div><button id="reset">Reset</button>
+<button id="sweep">Pause sweep</button>
+<script>
+const N=32, defaults=[.50,.28,.10,.72,.10,.15,.10,.90];
+const specs=[['mode 1 weight',0,1],['mode 1 location',0,1],['mode 1 scale',.02,.50],
+ ['mode 2 location',0,1],['mode 2 scale',.02,.50],['all-in iota',0,1],
+ ['legal minimum',0,.90],['legal maximum',.10,1]];
+const controls=document.getElementById('controls'), sliders=[];
+specs.forEach((s,i)=>{let d=document.createElement('div'); d.className='row';
+ d.innerHTML=`<label>${s[0]}</label><input type="range" min="${s[1]}" max="${s[2]}" step=".01" value="${defaults[i]}"><output></output>`;
+ controls.appendChild(d); let input=d.querySelector('input'), out=d.querySelector('output');
+ input.oninput=()=>draw(); sliders.push(input);});
+function logistic(x,mu,scale){return 1/(1+Math.exp(-(x-mu)/scale));}
+function draw(){
+ let v=sliders.map(x=>+x.value), [w,mu1,s1,mu2,s2,iota,a,b]=v, lo=Math.min(a,b), hi=Math.max(a,b);
+ sliders.forEach((x,i)=>x.parentElement.querySelector('output').value=(+x.value).toFixed(2));
+ let p=[], legal=[], lsum=0, qsum=0;
+ for(let i=0;i<N;i++){let x=(i+.5)/N, l=logistic((i+1)/N,mu1,s1)-logistic(i/N,mu1,s1),
+  q=logistic((i+1)/N,mu2,s2)-logistic(i/N,mu2,s2); lsum+=l; qsum+=q; legal[i]=x>=lo&&x<=hi; p[i]=[l,q];}
+ for(let i=0;i<N;i++) p[i]=w*p[i][0]/lsum+(1-w)*p[i][1]/qsum;
+ let z=p.reduce((s,x,i)=>s+(legal[i]?x:0),0); p=p.map((x,i)=>legal[i]?(1-iota)*x/z:0);
+ let last=legal.reduce((last,x,i)=>x?i:last,-1); if(last<0) last=Math.max(0,Math.min(N-1,Math.round((lo+hi)*N/2)));
+ p[last]=(p[last]||0)+iota; let c=document.getElementById('plot'),ctx=c.getContext('2d'), W=c.width,H=c.height;
+ ctx.clearRect(0,0,W,H); ctx.font='12px sans-serif'; ctx.strokeStyle='#999'; ctx.beginPath(); ctx.moveTo(45,H-45);ctx.lineTo(W-15,H-45);ctx.stroke();
+ let ymax=Math.max(.05,...p)*1.15; for(let i=0;i<N;i++){let x=48+i*(W-70)/N, h=p[i]/ymax*(H-75);
+  ctx.fillStyle=legal[i]?'#f58518':'#d9d9d9';ctx.fillRect(x,H-45-h,(W-75)/N-2,h);ctx.fillStyle='#333';
+  if(i%4===0)ctx.fillText(((i+.5)/N).toFixed(2),x,H-25);}
+ ctx.fillText('probability',8,18);ctx.fillText('normalized raise-to amount (largest legal tick = all-in)',W/2-150,H-5);
+}
+document.getElementById('reset').onclick=()=>{sliders.forEach((x,i)=>x.value=defaults[i]);draw();};
+let running=true, frame=0, sweepButton=document.getElementById('sweep');
+sweepButton.onclick=()=>{running=!running;sweepButton.textContent=running?'Pause sweep':'Resume sweep';};
+setInterval(()=>{if(running){let t=(frame++%240)/239;sliders[0].value=.02+.96*(t<.5?2*t:2-2*t);draw();}},45); draw();
+</script></body></html>

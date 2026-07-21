@@ -1,0 +1,55 @@
+checkpoint_dir: runs/nlhe_hu_32bb_full_sequential_rb_from_ckpt_0000020_optimized
+checkpoints: [1110]
+logical_seed: 20260720
+candidates:
+  N: [384, 768, 1536, 3072]
+  B: [32, 64, 128, 256]
+  n: [128, 256, 512, 1024]
+probes:
+  count: 4
+  distribution: rademacher
+public_sampling:
+  superbatches: 8
+  maximum_superbatches: 12
+oracle:
+  initial_samples: 8192
+  maximum_samples: 131072
+  growth_factor: 2
+  independent_seeds: 8
+  calibration_blocks: 2
+  trajectories_per_calibration_block: 384
+  observed_to_predicted_variance_ratio: [0.5, 2.0]
+  component_relative_change: 0.05
+  component_negligible_total_fraction: 0.01
+streaming:
+  trajectories_per_chunk: 16
+  probes_per_chunk: 4
+  maximum_functionals_per_leaf: 40
+  directional_rows_per_batch: 16
+  progress_every_chunks: 8
+smoke:
+  trajectories: 8
+  probes: 2
+  oracle_samples: 256
+timing:
+  warm_repetitions: 5
+  measured_repetitions: 20
+  additive_relative_tolerance: 0.10
+constraints:
+  maximum_allocated_gib: 10.0
+  maximum_seconds: null
+validation:
+  initial_replicates_per_checkpoint: 64
+  maximum_replicates_per_checkpoint: 256
+  predicted_relative_agreement_tolerance: 0.10
+analysis:
+  confidence_level: 0.95
+numerics:
+  jvp_backward_rtol: 0.0005
+  jvp_backward_atol: 0.00001
+  functional_sum_rtol: 0.0001
+  functional_sum_atol: 0.00001
+  deterministic_rerun_rtol: 0.0
+  deterministic_rerun_atol: 0.0
+  allocated_cleanup_tolerance_mib: 16
+out_dir: runs/rao_blackwell_variance_terminal

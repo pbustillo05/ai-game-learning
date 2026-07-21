@@ -80,6 +80,42 @@ def load_pilot(name: str) -> dict[str, object]:
     return sample
 
 
+def load_all_sweep_samples() -> dict[float, list[dict[str, object]]]:
+    """Load every non-pilot sample, deduplicated by ``(beta, repeat)``."""
+
+    keyed: dict[tuple[float, int], dict[str, object]] = {}
+    for name in ("coarse_geometry.json", "extended_geometry.json", "high_geometry.json"):
+        payload = json.loads((EXPERIMENT / name).read_text())
+        for record in payload["records"]:
+            beta = float(record["beta"])
+            for repeat, raw in enumerate(record["samples"]):
+                sample = dict(raw)
+                sample.setdefault("beta", beta)
+                sample.setdefault("repeat", repeat)
+                sample.setdefault("stop_cutoff_reached", 0.0)
+                sample.setdefault("pending_nodes", 0.0)
+                keyed[(beta, repeat)] = sample
+    for name in (
+        "fixed_beta_stop10k_coarse64.json.samples.jsonl",
+        "fixed_beta_stop50k_coarse64.json.samples.jsonl",
+        "fixed_beta_stop50k_b225_resume39_streets.json.samples.jsonl",
+        "fixed_beta_stop50k_b250_400_coarse64_streets.json.samples.jsonl",
+    ):
+        path = EXPERIMENT / name
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            try:
+                sample = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            keyed[(float(sample["beta"]), int(sample["repeat"]))] = sample
+    grouped: dict[float, list[dict[str, object]]] = {}
+    for (beta, _), sample in sorted(keyed.items()):
+        grouped.setdefault(beta, []).append(sample)
+    return grouped
+
+
 def canvas(title: str, subtitle: str) -> tuple[Image.Image, ImageDraw.ImageDraw]:
     image = Image.new("RGB", (1800, 1100), BG)
     draw = ImageDraw.Draw(image)
@@ -442,6 +478,202 @@ def plot_per_beta_histograms(samples: dict[float, list[dict[str, object]]]) -> N
     save(image, "04_nodes_per_tree_facets_64.png")
 
 
+def plot_constant_beta_growth(samples: dict[float, list[dict[str, object]]]) -> None:
+    image, draw = canvas(
+        "Constant β has a sharp tree-growth transition",
+        "Each point is one tree · triangles reached the 50k safety stop and are right-censored",
+    )
+    box = (75, 165, 1725, 1015)
+    panel(draw, box)
+    left, top, right, bottom = 165, 225, 1660, 895
+    betas = list(samples)
+    ymin, ymax = 1.0, 60_000.0
+
+    def sx(index: int) -> float:
+        return left + index / max(1, len(betas) - 1) * (right - left)
+
+    def sy(value: float) -> float:
+        value = max(ymin, min(ymax, value))
+        return bottom - (math.log10(value) - math.log10(ymin)) / (
+            math.log10(ymax) - math.log10(ymin)
+        ) * (bottom - top)
+
+    for value, label in ((1, "1"), (10, "10"), (100, "100"), (1000, "1k"), (10_000, "10k"), (50_000, "50k")):
+        y = sy(value)
+        draw.line((left, y, right, y), fill=GRID, width=2)
+        draw.text((left - 18, y), label, fill=MUTED, font=font(18), anchor="rm")
+    dashed_line(draw, (left, sy(10_000)), (right, sy(10_000)), fill=TARGET, width=4)
+    draw.text((right, sy(10_000) - 9), "10k target", fill=TARGET, font=font(18, bold=True), anchor="rb")
+    dashed_line(draw, (left, sy(50_000)), (right, sy(50_000)), fill="#8f1d1d", width=3)
+    draw.text((right, sy(50_000) + 9), "50k censoring boundary", fill="#8f1d1d", font=font(17, bold=True), anchor="ra")
+
+    rng = random.Random(814)
+    median_points = []
+    for index, beta in enumerate(betas):
+        rows = samples[beta]
+        center = sx(index)
+        spread = min(42, (right - left) / max(1, len(betas)) * 0.35)
+        values = [float(row["nodes"]) for row in rows]
+        for row in rows:
+            x = center + rng.uniform(-spread, spread)
+            y = sy(float(row["nodes"]))
+            if row.get("stop_cutoff_reached", 0):
+                draw.polygon(((x, y - 8), (x - 7, y + 7), (x + 7, y + 7)), fill="#c43c39")
+            else:
+                draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill="#4e79a7", outline="#315e85")
+        observed_median = quantile(values, 0.5)
+        median_points.append((center, sy(observed_median)))
+        draw.line((center - 30, sy(observed_median), center + 30, sy(observed_median)), fill=INK, width=5)
+        draw.multiline_text(
+            (center, bottom + 25),
+            f"{beta:g}\nn={len(rows)}",
+            fill=INK,
+            font=font(16),
+            anchor="ma",
+            align="center",
+            spacing=2,
+        )
+    draw.line(median_points, fill=INK, width=2)
+    draw.text((left, 190), "Observed allocated nodes (log scale)", fill=INK, font=font(20, bold=True))
+    draw.ellipse((500, 960, 510, 970), fill="#4e79a7", outline="#315e85")
+    draw.text((525, 965), "completed tree", fill=INK, font=font(18), anchor="lm")
+    draw.polygon(((780, 957), (773, 972), (787, 972)), fill="#c43c39")
+    draw.text((800, 965), "right-censored at 50k", fill=INK, font=font(18), anchor="lm")
+    draw.line((1120, 965, 1175, 965), fill=INK, width=5)
+    draw.text((1190, 965), "observed median", fill=INK, font=font(18), anchor="lm")
+    counts = ", ".join(f"β={beta:g}: {len(rows)}" for beta, rows in samples.items() if beta >= 2.25)
+    footer(draw, f"HU 32 bb · checkpoint 814 · snapshot counts: {counts}")
+    save(image, "05_constant_beta_tree_growth.png")
+
+
+def wilson_interval(successes: int, total: int) -> tuple[float, float]:
+    if total == 0:
+        return 0.0, 0.0
+    z = 1.959963984540054
+    rate = successes / total
+    denominator = 1 + z * z / total
+    center = (rate + z * z / (2 * total)) / denominator
+    half = z * math.sqrt(rate * (1 - rate) / total + z * z / (4 * total * total)) / denominator
+    return center - half, center + half
+
+
+def plot_growth_probabilities(samples: dict[float, list[dict[str, object]]]) -> None:
+    image, draw = canvas(
+        "Probability of tiny, target-sized, and censored trees",
+        "Observed rates with 95% Wilson intervals · cutoff hits imply true size ≥50k",
+    )
+    box = (75, 165, 1725, 1015)
+    panel(draw, box)
+    left, top, right, bottom = 165, 230, 1650, 885
+    betas = list(samples)
+
+    def sx(index: int) -> float:
+        return left + index / max(1, len(betas) - 1) * (right - left)
+
+    def sy(value: float) -> float:
+        return bottom - value * (bottom - top)
+
+    for probability in (0, 0.25, 0.5, 0.75, 1.0):
+        y = sy(probability)
+        draw.line((left, y, right, y), fill=GRID, width=2)
+        draw.text((left - 20, y), f"{probability:.0%}", fill=MUTED, font=font(18), anchor="rm")
+    definitions = (
+        ("tiny: ≤10 nodes", "#6b7785", lambda row: float(row["nodes"]) <= 10),
+        ("target: ≥10k nodes", "#2f8f46", lambda row: float(row["nodes"]) >= 10_000),
+        ("censored: ≥50k nodes", "#c43c39", lambda row: bool(row.get("stop_cutoff_reached", 0))),
+    )
+    for label, color, predicate in definitions:
+        points = []
+        for index, beta in enumerate(betas):
+            rows = samples[beta]
+            successes = sum(predicate(row) for row in rows)
+            rate = successes / len(rows)
+            low, high = wilson_interval(successes, len(rows))
+            x = sx(index)
+            draw.line((x, sy(low), x, sy(high)), fill=color, width=4)
+            draw.line((x - 7, sy(low), x + 7, sy(low)), fill=color, width=3)
+            draw.line((x - 7, sy(high), x + 7, sy(high)), fill=color, width=3)
+            draw.ellipse((x - 7, sy(rate) - 7, x + 7, sy(rate) + 7), fill=PANEL, outline=color, width=4)
+            points.append((x, sy(rate)))
+        draw.line(points, fill=color, width=4)
+    for index, beta in enumerate(betas):
+        draw.multiline_text(
+            (sx(index), bottom + 25), f"{beta:g}\nn={len(samples[beta])}", fill=INK, font=font(16), anchor="ma", align="center"
+        )
+    legend_x = 350
+    for index, (label, color, _) in enumerate(definitions):
+        x = legend_x + index * 420
+        draw.line((x, 965, x + 55, 965), fill=color, width=5)
+        draw.ellipse((x + 21, 958, x + 35, 972), fill=PANEL, outline=color, width=3)
+        draw.text((x + 70, 965), label, fill=INK, font=font(18), anchor="lm")
+    draw.text((left, 195), "Fraction of sampled trees", fill=INK, font=font(20, bold=True))
+    footer(draw, "HU 32 bb · checkpoint 814 · constant β · intervals reflect finite tree count, not censoring uncertainty")
+    save(image, "06_constant_beta_outcome_probabilities.png")
+
+
+def plot_street_distributions(samples: dict[float, list[dict[str, object]]]) -> None:
+    street_labels = ("preflop", "flop", "turn", "river")
+    eligible = {
+        beta: [row for row in rows if all(f"nodes_{street}" in row for street in street_labels)]
+        for beta, rows in samples.items()
+    }
+    eligible = {beta: rows for beta, rows in eligible.items() if rows}
+    image, draw = canvas(
+        "Where constant-β growth accumulates in the poker tree",
+        "Per-tree node counts by street · bars show 10th–90th and 25th–75th percentiles · circles are medians",
+    )
+    box = (75, 165, 1725, 1015)
+    panel(draw, box)
+    left, top, right, bottom = 170, 230, 1650, 885
+    betas = list(eligible)
+    ymin, ymax = 0.8, 60_000.0
+
+    def group_x(index: int) -> float:
+        return left + (index + 0.5) / len(betas) * (right - left)
+
+    def sy(value: float) -> float:
+        value = max(ymin, min(ymax, value))
+        return bottom - (math.log10(value) - math.log10(ymin)) / (
+            math.log10(ymax) - math.log10(ymin)
+        ) * (bottom - top)
+
+    for value, label in ((1, "1"), (10, "10"), (100, "100"), (1000, "1k"), (10_000, "10k"), (50_000, "50k")):
+        y = sy(value)
+        draw.line((left, y, right, y), fill=GRID, width=2)
+        draw.text((left - 18, y), label, fill=MUTED, font=font(18), anchor="rm")
+    offsets = (-120, -40, 40, 120)
+    colors = ("#4e79a7", "#59a14f", "#f28e2b", "#b07aa1")
+    for beta_index, beta in enumerate(betas):
+        rows = eligible[beta]
+        center = group_x(beta_index)
+        for street_index, street in enumerate(street_labels):
+            values = [float(row[f"nodes_{street}"]) for row in rows]
+            q10, q25, q50, q75, q90 = [quantile(values, p) for p in (.1, .25, .5, .75, .9)]
+            x = center + offsets[street_index]
+            color = colors[street_index]
+            draw.line((x, sy(q10), x, sy(q90)), fill=color, width=6)
+            draw.line((x, sy(q25), x, sy(q75)), fill=color, width=18)
+            draw.ellipse((x - 8, sy(q50) - 8, x + 8, sy(q50) + 8), fill=PANEL, outline=color, width=4)
+        censored = sum(bool(row.get("stop_cutoff_reached", 0)) for row in rows)
+        draw.multiline_text(
+            (center, bottom + 28),
+            f"β={beta:g} · n={len(rows)}\ncensored={censored}",
+            fill=INK,
+            font=font(18, bold=True),
+            anchor="ma",
+            align="center",
+            spacing=4,
+        )
+    for index, (street, color) in enumerate(zip(street_labels, colors, strict=True)):
+        x = 380 + index * 300
+        draw.line((x, 970 - 15, x, 970 + 15), fill=color, width=14)
+        draw.ellipse((x - 7, 963, x + 7, 977), fill=PANEL, outline=color, width=3)
+        draw.text((x + 22, 970), street, fill=INK, font=font(18), anchor="lm")
+    draw.text((left, 195), "Allocated nodes per street (log scale)", fill=INK, font=font(20, bold=True))
+    footer(draw, "Counts are measured at natural completion or at the 50k stop; zeros are shown at the plot floor")
+    save(image, "07_nodes_by_street_constant_beta.png")
+
+
 def main() -> None:
     random.seed(0)
     samples = load_completed_samples()
@@ -449,6 +681,10 @@ def main() -> None:
     plot_quantiles(samples)
     plot_cutoff_pilots()
     plot_per_beta_histograms(samples)
+    all_samples = load_all_sweep_samples()
+    plot_constant_beta_growth(all_samples)
+    plot_growth_probabilities(all_samples)
+    plot_street_distributions(all_samples)
     for path in sorted(OUTPUT.glob("*.png")):
         print(path)
 

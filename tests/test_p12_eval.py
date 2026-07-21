@@ -137,7 +137,7 @@ def test_real_sibling_combo_export_matches_every_local_row() -> None:
     package = pytest.importorskip("poker_gpu_evaluator")
     evaluator = package.bind(rank_count=13)
     combo_cards = evaluator.combo_cards
-    assert package.CONTRACT_VERSION == "1"
+    assert package.CONTRACT_VERSION == "2"
     assert combo_cards.dtype == torch.uint8
     assert combo_cards.tolist() == [
         list(hand_cards(combo)) for combo in range(1326)

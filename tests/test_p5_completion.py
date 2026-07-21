@@ -213,7 +213,7 @@ def test_version_contract_and_forbidden_implementation_scan(
 
 def test_real_sibling_bound_contract_when_installed() -> None:
     package = pytest.importorskip("poker_gpu_evaluator")
-    assert package.CONTRACT_VERSION == "1"
+    assert package.CONTRACT_VERSION == "2"
     evaluator = package.bind(rank_count=13)
     expected = torch.triu_indices(52, 52, offset=1).T.to(torch.uint8)
     assert torch.equal(evaluator.combo_cards, expected)
