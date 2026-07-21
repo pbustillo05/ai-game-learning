@@ -57,18 +57,24 @@ $\kappa(\sigma)$ routes player nodes, $\preceq$ is an optional preorder, and
 $\Obj{PartitionSpec}_m$ supplies natural input/model-row domains
 $(\mathcal X_m,\mathcal Y_m,\varphi_m)$, a model boundary, fixed worst-case
 bytes/work per row, and safe batch limits}
-\KwParam{for $\mathsf{branchRB}$ only, public frozen
-$\beta:\mathcal S\setminus\mathcal T^{\mathsf{pre-c}}\to[1,\infty)$}
+\KwParam{for $\mathsf{branchRB}$ only, either a public frozen fixed intensity
+$\beta:\mathcal S\setminus\mathcal T^{\mathsf{pre-c}}\to[1,\infty)$ or frozen
+public $T/C$ heads and the checkpointed log-space KKT controller of
+\texttt{core\_math.tex}; optional scientific queue threshold $M_{\tt safe}$
+and lower-size safeguard $M_{\min}$}
 \KwDef{$\mathcal T_{\mathsf{normal}}=\mathcal T$ and
 $\mathcal T_{\mathsf{seqRB}}=\mathcal T_{\mathsf{branchRB}}
 =\mathcal T^{\mathsf{pre-c}}$;
-$n(s)=1$ in sequential modes and
+$n(s)=1$ in sequential modes.  In $\mathsf{branchRB}$ let
 \[
- n(s)=\lfloor\beta(\ell(s))\rfloor+
+ \widetilde n(s)=\lfloor\beta(\ell(s))\rfloor+
  \operatorname{Bernoulli}\!\left(\beta(\ell(s))-\lfloor\beta(\ell(s))\rfloor;
  K(k,\iota(s),\mathsf{round})\right)
 \]
-in $\mathsf{branchRB}$, including at the distinguished root $\varnothing$}
+including at the distinguished root $\varnothing$.  Set $n(s)=1$ only for a
+player-node batch suppressed by the scientific queue safeguard defined in
+\texttt{core\_math.tex}, and $n(s)=\widetilde n(s)$ otherwise.  Hard byte
+admission never changes either count}
 \KwDef{$\iota(s)$ is a placement-independent logical address.  Every random
 draw uses a disjoint counter key $K(k,\iota(s),u,\mathsf{purpose})$; hence queue
 order, physical pack size, and GPU speed cannot change the sampled object}
@@ -162,8 +168,13 @@ mode-specific compact topology, stable partition tables, and leaf rows}
   }
 
   \If{$f_g=0$}{
+    If branched lower-size refill is required, append fresh root children with
+    new logical ordinals and fully expand them by the ordinary rule; retain the
+    original root degree and pre-refill node boundary, then rewrite final root
+    transition/path masses using the final root degree;
     $\Obj{RolloutStorage}_g\gets\Seal_g(\mathsf m)$; seal all stable $(m,d)$
-    addresses and branched action spans; on seal transaction failure set
+    addresses, target-eligible branched action spans, nominal/executed counts,
+    and protected-root metadata; on seal transaction failure set
     $f_g\gets1$;
     $\operatorname{assert}(\textnormal{no occurrence owns a mutable public-state
       handle})$; compute partition-local fixed decision masses;
@@ -202,7 +213,10 @@ phase ceiling; on failure stop cleanly without changing the sampled object;
 \Else{
   Copy the already stable parent/child-span columns into
   $\Obj{BranchedTreeSpan}$; validate that the unique root is row zero, every
-  child span is contiguous, and every player action span has identical order;
+  child span is contiguous, and every player action span has identical order
+  to its target-eligible child prefix.  Seal $N_0(\varnothing)$ and
+  $|\mathfrak S_0|$ as scalar metadata; refill-only root children are outside
+  the root action span but their descendant decisions remain ordinary rows;
 }
 For each partition and leaf column, allocate exactly the realized dense extent
 required by its dtype/layout and copy chunk spans in stable row order using one
@@ -221,7 +235,8 @@ plus scratch.  Logical payload formulas alone are not an admission bound.}
 \KwIn{stable logical batch $B=(s_j)_{j=1}^b$ of player or chance parents}
 \KwOut{reservation $R$ containing immutable child spans, logical RNG addresses,
 and branched player-action spans}
-$n_j\gets n(s_j)$ for $j=1,\ldots,b$; prefix-sum $(n_j)_j$;
+$\widetilde n_j\gets\widetilde n(s_j)$ and $n_j\gets n(s_j)$ for
+$j=1,\ldots,b$; persist both counts before prefix-summing $(n_j)_j$;
 Reserve exactly $\sum_jn_j$ child occurrences in stable $(j,u)$ order and write
 $\mathtt{childBegin}[s_j]$, $\mathtt{degree}[s_j]=n_j$; fail rather than reduce
 $n_j$ when the hard memory transaction cannot be admitted;

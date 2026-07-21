@@ -114,11 +114,15 @@ aggregation is permitted;
 \label{alg:branched-rb-bounded-targets}
 \DontPrintSemicolon
 \KwIn{one rooted $\Obj{BranchedTreeSpan}$; partition tables; RB leaves}
-\KwDef{For node $s$, its children are the contiguous span
-$[c_s,c_s+n_s)$; at a player node the same order is its action CSR span
-$[a_s,a_s+n_s)$.  A frontier slot is
-$((w_{s,p},m_{s,p})_{p\in\mathcal P})$}
-\KwOut{exact $\mathtt{valueHat}_m[D_m,X_m]$ and, per sampled player edge,
+\KwDef{For node $s$, its final children are the contiguous span
+$[c_s,c_s+n_s)$.  Its target-eligible prefix has length $n_s^{\rm tgt}=n_s$
+except at a refilled root, where $n_\varnothing^{\rm tgt}=N_0(\varnothing)$.
+At a player node the same prefix order is its action CSR span
+$[a_s,a_s+n_s^{\rm tgt})$.  A frontier slot is
+$((w_{s,p},m_{s,p})_{p\in\mathcal P},\mathbf v_s,C_s,\Delta_s)$}
+\KwOut{exact $\mathtt{valueHat}_m[D_m,X_m]$,
+$\mathtt{traceVarianceHat}_m[D_m]$ with mask,
+$\mathtt{costHat}_m[D_m]$, and, per target-eligible sampled player edge,
 $\mathtt{childPosterior}_m[A_m,X_m]$,
 $\mathtt{advantageHat}_m[A_m,X_m]$}
 Compute a deterministic depth-first, postorder-compatible leaf schedule.
@@ -128,18 +132,26 @@ allocate a fixed $F_\star$ slot arena, node-to-slot map, and ready counters
 \ForEach{bounded next leaf microbatch $B$ in that schedule}{
   $C_B\gets\Complete(\Obj{LeafTable}[B])$; insert
   $w_{t,p}=\widehat{\mathbb P}(-_p\mid t)$ and
-  $m_{t,p}=w_{t,p}\odot\widehat V_p(-_p,t)$ into reserved slots;
+  $m_{t,p}=w_{t,p}\odot\widehat V_p(-_p,t)$,
+  $\mathbf v_t=\widehat{\mathbf V}(t)$, and $(C_t,\Delta_t)=(0,0)$
+  into reserved slots;
   aggregate scalar diagnostics and release every other completion result;
   \While{the ready queue is nonempty}{
     Gather a maximum-feasible stable batch of ready parents;
     \ForEach{ready parent $s$ with child slots $u=1,\ldots,n$}{
-      $S_{w,p}\gets\sum_{u=1}^n w_{u,p}$,
-      $S_{m,p}\gets\sum_{u=1}^n m_{u,p}$,
-      $w_{s,p}\gets S_{w,p}/n$, and $m_{s,p}\gets S_{m,p}/n$;
+      Reduce all final children so their slots may be released, but form target
+      sums $S_{w,p},S_{m,p}$ and every decision target only over
+      $u=1,\ldots,n_s^{\rm tgt}$; set $w_{s,p}=S_{w,p}/n_s^{\rm tgt}$ and
+      $m_{s,p}=S_{m,p}/n_s^{\rm tgt}$;
+      Compute $\mathbf v_s$, $C_s$, and $\Delta_s$ by the exact
+      $\widetilde N/N$ recurrences of \texttt{core\_math.tex}, using the
+      protected prefix at the root.  Write $\mathtt{costHat}$; write and mask
+      $\mathtt{traceVarianceHat}$ only when $n_s^{\rm tgt}\geq2$, subtracting
+      the averaged child $\Delta$ correction before clamping as specified;
       \uIf{$s$ is a player decision with address $(m,d)$ and owner $p$}{
         $v^{\rm old}(x)\gets\mathtt{oldV}_m[d,\varphi_m(x)]$;
         $\mathtt{valueHat}_m[d]\gets\Cond(S_{m,p},S_{w,p})$;
-        \For{$u=1,\ldots,n$}{
+        \For{$u=1,\ldots,n_s^{\rm tgt}$}{
           $U_u\gets\Cond(m_{u,p},w_{u,p})$;
           $B_u\gets v^{\rm old}$ if $n=1$, otherwise
           $B_u\gets\lambda\Cond(S_{m,p}-m_{u,p},S_{w,p}-w_{u,p})
@@ -150,21 +162,23 @@ allocate a fixed $F_\star$ slot arena, node-to-slot map, and ready counters
         $m_{s,p}\gets\lambda m_{s,p}+(1-\lambda)w_{s,p}\odot v^{\rm old}$;
         \tcc*[r]{only the owner moment advances its decision clock}
       }
-      Release all $n$ child slots and insert only the contracted parent slot;
+      Release all $n$ final-child slots and insert only the contracted parent slot;
       increment its parent's ready counter;
     }
   }
 }
 Assert the arena contains only $\varnothing$, every leaf/target was written
-once, and $\varnothing$ received no special multiplicity;
+once, the distinguished root used ordinary randomized rounding before refill,
+and refill-only root children produced no root target/action rows;
 \tcc{The node posterior used by value/entropy/reference-KL losses is not stored:
 $\widehat P_d=n_d^{-1}\sum_{a=a_d}^{a_d+n_d-1}
 \mathtt{childPosterior}[a]$ is derived in the loss gather.}
 Assert the outputs and propagated moments equal
 \texttt{core\_math.tex}, Eqs.~\textnormal{(branched-backward-updates)} and
-\textnormal{(branched-targets)} after projecting to the production PPO value,
-advantage, trace-variance, and cost arguments; the optional $Q$ target is
-deliberately deferred;
+\textnormal{(branched-targets)} and the $T/C$, nominal/executed-count, queue
+correction, and protected-root recurrences after projecting to the production
+PPO value, advantage, trace-variance, and cost arguments; the optional $Q$
+target is deliberately deferred;
 \Return{$\Obj{FinalizeTrainingStorage}(\Obj{RolloutStorage})$};
 \end{algorithm}
 

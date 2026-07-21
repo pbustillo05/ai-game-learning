@@ -38,12 +38,15 @@ layout, streaming, and recomputation policy may change; the sampled
 rollout law, completion estimators, $\lambda$-returns, posterior-weighted
 surrogates, clipping, entropy, reference KL, and distributed decision law may
 not.  The algorithms in this directory must deliver the same mathematical
-arguments to every production-v1 loss.  V1 implements the clipped PPO policy
-surrogate, value regression with optional value clipping, entropy, and
-legal-action KL to a frozen reference.  It deliberately defers a separately
-stored $Q$ target/loss, RNaD/NeuRD, $W/S$ auxiliaries, and adaptive branching
-intensity.  The corresponding definitions remain research material in
-\texttt{core\_math.tex}, not latent allocation requirements.
+arguments to every production loss.  Production implements the clipped PPO
+policy surrogate, value regression with optional value clipping, entropy,
+legal-action KL to a frozen reference, and the public trace-variance/cost heads
+used by fixed or dynamic KKT branching.  It deliberately defers a separately
+stored $Q$ target/loss, RNaD/NeuRD, and $W/S$ auxiliaries.  Dynamic branching,
+nominal-versus-executed offspring correction, and protected-cohort root refill
+are current requirements from \texttt{core\_math.tex}; their minimal retained
+and transient fields are specified below rather than inferred from a legacy
+tree representation.
 
 Each partition has an exact loss domain $\mathcal X_m$, a natural model-row
 domain $\mathcal Y_m$, and a fixed architecture map
@@ -113,7 +116,8 @@ revealed.
 
 Let
 \[
- K=R^2,\qquad H=\binom{4R}{2},\qquad b_f=4,\qquad b_i=4.
+ K=R^2,\qquad H=\binom{4R}{2},\qquad
+ b_f=4,\qquad b_i=4,\qquad b_{\rm bool}=1.
 \]
 The model-input byte declarations are
 \begin{align*}
@@ -179,10 +183,10 @@ $A=\sum_mA_m$.
 Object & Row domain & Ownership contract \\
 \midrule
 \endhead
-\Obj{OccurrenceArena} & live rollout occurrences & Mutable public-state handle, active reach/profile, logical RNG address, child reservation, status, stable table address, and sequential root/decision ordinal when applicable; rollout and seal source only. \\
+\Obj{OccurrenceArena} & live rollout occurrences & Mutable public-state handle, active reach/profile, logical RNG address, child reservation, status, stable table address, and sequential root/decision ordinal when applicable.  Branched occurrences also carry nominal/executed counts and transient KKT path/queue scalars until their children commit; rollout and seal source only. \\
 \Obj{SequentialDecisionCSR} & $D$ decisions in $G$ paths & Decision-only chronological paths plus one leaf row per trajectory; chance nodes are absent. \\
-\Obj{BranchedTreeSpan} & $N$ nodes & One rooted tree; every node owns a contiguous child span.  The root uses the ordinary branching rule. \\
-\Obj{DecisionTable[$m$]} & $D_m$ player nodes & Owner, implicit-edge data in sequential modes, natural old-value rows, decision targets, and posterior reference as required by mode. \\
+\Obj{BranchedTreeSpan} & $N$ nodes & One rooted tree; every node owns a contiguous final child span.  The root uses the ordinary branching rule.  Scalar metadata records its protected pre-refill degree and pre-refill node boundary. \\
+\Obj{DecisionTable[$m$]} & $D_m$ player nodes & Owner, implicit-edge data in sequential modes, natural old-value rows, decision targets, and posterior reference as required by mode.  Branched rows also retain frozen public $T/C$ predictions and nominal/executed counts until their target/controller consumers finish. \\
 \Obj{ActionTable[$m$]} & $A_m$ player edges, branched only & CSR pointer, event, natural selected old-log-probability rows, child posterior, and edge targets; no padded action axis. \\
 \Obj{PartitionInputTable[$m$]} & $D_m$, aligned & Immutable natural model input; no all-node public-state reference. \\
 \Obj{LeafTable} & $L$ stopped paths & Normal terminal reward, or RB generated reach plus immutable completion input and RNG key. \\
@@ -258,16 +262,23 @@ Owner & Field & Shape \\
 \midrule
 \Obj{PartitionInputTable[$m$]} & natural model input & $[D_m,I_m]$ bytes \\
 \Obj{DecisionTable[$m$]} & owner; old value & $[D_m]$ int32; $[D_m,Y_m]$ fp32 \\
+& frozen $T,C$; nominal and executed $\widetilde N,N$ & $2[D_m]$ fp32; $2[D_m]$ int32 \\
 & $\mathtt{valueHat}$ & $[D_m,X_m]$ fp32 \\
+& $\mathtt{traceVarianceHat}$, mask; $\mathtt{costHat}$ & $2[D_m]$ fp32; $[D_m]$ bool \\
 \Obj{ActionTable[$m$]} & action pointer; event & $[D_m+1]$, $[A_m]$ int32 \\
 & selected old log probability & $[A_m,Y_m]$ fp32 \\
 & child posterior, advantage & $2[A_m,X_m]$ fp32 \\
 \bottomrule
 \end{tabular}
 \end{center}
-The node posterior is exactly the mean of its sampled child posterior rows and
-is derived in the loss gather.  It is never retained separately.  Fixed-
-intensity PPO v1 stores only the value and advantage arguments above.
+The node posterior is exactly the mean of its target-eligible sampled child
+posterior rows and is derived in the loss gather.  It is never retained
+separately.  $\mathtt{traceVarianceHat}$ is valid only where the protected
+target cohort has at least two children; $\mathtt{costHat}$ is always written.
+Frozen $T/C$ predictions are rollout/target inputs and are dropped at
+finalization unless a registered training loss consumes them.  The learner
+retains the two target rows, mask, and any count column required by that loss or
+diagnostics, never backward $\Delta$, vector-value, or queue-cost scratch.
 
 Every mode stores fp64 $\log Z_m$ for nonempty partitions.  Nonuniform branched
 strata store one alias threshold (fp64) and alias index (int32) per decision;
@@ -297,12 +308,20 @@ survives rollout: normal leaves already own exact terminal rewards.
 Sentinel $-1$ marks an inapplicable field.  Children of every node are
 contiguous, so there is no $\mathtt{childNode}[E]$, duplicated child event, or
 stored $\nu[E]$: $\nu=1/\mathtt{degree}$ is implicit.  At a player node the
-action span has the same order as the child span.
+action span has the same order as the target-eligible prefix of the child span.
+Normally that prefix is complete.  Only at a refilled root it has length
+$N_0(\varnothing)<N_+(\varnothing)=\mathtt{degree}[0]$; added root children
+have no root action rows, while decisions below their subtrees remain ordinary
+learning rows.  Two scalar int32 metadata values store
+$\mathtt{rootTargetDegree}=N_0(\varnothing)$ and
+$\mathtt{preRefillNodeCount}=|\mathfrak S_0|$.  Final root transition mass is
+$1/N_+(\varnothing)$ and descendant decision masses use recomputed final path
+mass; root targets alone use the protected prefix.
 
 Thus the finalized topology sizes are exactly
 \[
  T_{\rm seq}=b_i(2D+2G+1),\qquad
- T_{\rm branch}=6b_iN.
+ T_{\rm branch}=6b_iN+2b_i.
 \]
 
 \section{Write times and lifetime schedule}
@@ -322,9 +341,9 @@ memo exists.
 Phase & Resident & Released before next phase \\
 \midrule
 \endhead
-Rollout & read-only $\theta_k$; mutable public states; occurrence arena; queues; active reaches/profiles; growing chunked input/old/action/leaf tables; one bounded physical pack & each physical output immediately; then queues, active rows, and mutable states \\
+Rollout & read-only $\theta_k$; mutable public states; occurrence arena; queues; active reaches/profiles; growing chunked input/old/action/leaf tables; transient KKT path factors and queue-cost forecast; one bounded physical pack & each physical output immediately; then queues, active rows, mutable states, KKT path factors, and queue-cost scratch \\
 Seal & rollout source-chunk capacities; exact contiguous topology/input/old/action/leaf destinations; bounded copy/scan scratch & source chunks and seal scratch after synchronized validation \\
-Targets & compact topology; partition input/old tables; leaf table; final target arrays; one completion microbatch; sequential carries or prebounded branched slot arena & every extra completion result immediately; reduced slots immediately; then leaf table, topology, old log weights, validity flags, and target scratch \\
+Targets & compact topology and protected-root metadata; partition input/old tables; leaf table; final target arrays; one completion microbatch; sequential carries or one prebounded branched slot arena containing posterior/value moments and transient vector-value/$C/\Delta$ rows & every extra completion result immediately; reduced slots immediately; then leaf table, topology, frozen control predictions, validity flags, and target scratch \\
 Optimization & immutable training storage; optional selected reference caches; model/reference/optimizer; flat gradient SUM buffer; one reusable bounded physical-subspan arena & each subspan's graph, gathers, reductions, and uncached reference output immediately after backward; then reference cache and training storage after the final optimizer step \\
 \bottomrule
 \end{longtable}
@@ -391,7 +410,7 @@ training stores are
   &=\sum_mD_m(I_m+2b_fY_m+b_fX_m)
     +M_{\rm post}^{\rm seq}+C_{\rm seqRB}+M_{\rm sample},\\
 M_{\rm branchRB}
-  &=\sum_mD_m(I_m+b_fY_m+b_fX_m)\\
+  &=\sum_mD_m(I_m+b_fY_m+b_fX_m+2b_f+b_i+b_{\rm bool})\\
   &\quad+\sum_mA_m(b_fY_m+2b_fX_m)
     +C_{\rm branch}+M_{\rm sample}.
 \end{align*}
