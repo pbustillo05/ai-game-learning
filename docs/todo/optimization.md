@@ -1,8 +1,9 @@
 # Rollout optimization program
 
 Status: eager-rollout stopping point accepted 2026-07-22. The 2,560-start
-production baseline is now established. The next pass should start with
-history-shape stabilization and a full dequeue-to-enqueue execution boundary.
+production baseline is now established. History-based queue subdivision is
+deferred; the next pass should start with the per-card memory envelope or the
+full dequeue-to-enqueue execution boundary.
 
 This document is the performance decision log and experiment queue. It is not
 authority for sampling, estimator, target, or storage-lifetime semantics.
@@ -170,24 +171,25 @@ experiment is not accidentally repeated. Status must be exactly `Open`,
 
 | ROI | Idea | Status | Evidence or acceptance gate |
 |---:|---|---|---|
-| 1 | Bucket history at 8/16/32/42 tokens and replace dynamic recycling with fixed-capacity device worklists | Open | History still runs six binary-lift levels over width 42 and uses dynamic `unique`/boolean compaction; require fewer launches/syncs and unchanged lifetime |
+| 1 | Use the 10 GB card envelope independently of participating rank count | Open | The conservative multi-card profile caused about 20 learner subspans/step versus two in the historical geometry; require unchanged loss/topology and no more than 10 GB |
 | 2 | Build an allocation-free dequeue-to-enqueue pack and compile/capture it per exact family and row bucket | Open | About 790 launches/decision in the bounded profile; require at least 15% rollout gain, bounded graph workspaces, and unchanged logical RNG |
 | 3 | Fuse remaining transition, reach, routing, and retained-write preprocessing | Open | Public/legal/history and selected logp are already reused; require at least 15% for a complex fused implementation |
 | 4 | Finish and re-baseline vectorized CUDA target recurrences | Open | Require exact targets, no per-node D2H, and at least 2x target speedup; especially relevant for branching |
-| 5 | Use the 10 GB card envelope independently of participating rank count | Open | The conservative multi-card profile caused about 20 learner subspans/step versus two in the historical geometry; require unchanged loss/topology and no more than 10 GB |
-| 6 | Capture learner gather + forward + loss + backward by partition/shape | Open | Require at least 15% learner compute gain with identical gradients and fixed rows/step |
-| 7 | Add policy-only reference forward/cache | Open | Reference cache had a 7.59 s ceiling and retains unused value/branching outputs; require matching KL and lower bytes/time |
-| 8 | Gate detailed CUDA events and fuse finite/norm/clip reductions | Open | Preserve skip/clip semantics while reducing launches and host decisions |
-| 9 | Precompute or bit-pack immutable learner descriptors | Open | Accept only with net admitted-byte benefit and faster sampled subspans |
-| 10 | Keep active preflop reach in natural 169-class form until one bounded flop expansion | Open | Require exact reach and sampling equivalence |
+| 5 | Capture learner gather + forward + loss + backward by partition/shape | Open | Require at least 15% learner compute gain with identical gradients and fixed rows/step |
+| 6 | Add policy-only reference forward/cache | Open | Reference cache had a 7.59 s ceiling and retains unused value/branching outputs; require matching KL and lower bytes/time |
+| 7 | Gate detailed CUDA events and fuse finite/norm/clip reductions | Open | Preserve skip/clip semantics while reducing launches and host decisions |
+| 8 | Precompute or bit-pack immutable learner descriptors | Open | Accept only with net admitted-byte benefit and faster sampled subspans |
+| 9 | Keep active preflop reach in natural 169-class form until one bounded flop expansion | Open | Require exact reach and sampling equivalence |
+| 10 | Bucket rollout history at 8/16/32/42 tokens | Open | Deferred: another queue dimension can fragment higher-player workloads into underfilled calls; require a multi-player packing study before implementation |
 | 11 | Overlap gradient communication with final backward buckets | Open | Only a 3.16 s measured ceiling; require identical reduced flat gradients |
 | 12 | Replace the allocator `empty_cache()` boundary with measured reusable-space admission | Open | Require no OOM regression across adversarial phase closures |
 | 13 | Deterministic small-k chance selection instead of sorting all 52 scores | Open | Preserve the exact counter-key sampling law or obtain explicit approval for an equivalent law |
+| 14 | Replace dynamic history recycling with fixed-capacity device worklists | Open | Separate large ownership rewrite; require explicit go-ahead, shared-ancestor safety, bounded rollback, fewer launches/syncs, and unchanged last-consumer lifetime |
 | — | Dense recyclable live-state slab | Implemented in `d95b7d3` | Dominant regression fixed; mutable capacity remains proportional to the admitted live frontier, not total nodes |
 | — | Tune production family width | Implemented in `be0b009` | Width 84 selected; width 88 was only 1.5% faster and left about 158 MB below 10 GB |
 | — | Direct contiguous append commit | Implemented in `5ecfeb4` | About 1.1% matched gain with unchanged ownership |
 | — | Trim generic multi-page gather | Implemented in `cf6bc34` | About 0.35% matched gain; small but essentially free |
-| — | Split physical postflop execution by exact street | Implemented in `83aab85` | About 5.6% fewer padded pairs at family 64 and about 4.9% lower rollout in the progression |
+| — | Split physical postflop execution by exact street | Implemented in `83aab85` | About 5.6% fewer padded pairs at family 64 and about 4.9% lower rollout for HU; do not add more queue dimensions without a higher-player packing study |
 | — | Reuse public/history/legal representation and selected policy logp within a pack | Implemented in `83aab85` | Removes duplicate encoding/log-probability work without extending state lifetime |
 | — | Remove dynamic fold compaction and its host synchronization | Implemented in `83aab85` | Fixed-width masked update was about 1% faster in the matched sample |
 | — | Commit immediate unsplit child batches contiguously | Implemented in `48ce2a3` | Median 3.827 versus 3.846 ms/decision; a small, consistent, essentially free hot-path simplification |
@@ -352,15 +354,24 @@ The three storage domains deliberately differ:
 
 ## Notes for the top open ideas
 
-### History shapes and recycling
+### History queues and recycling (deferred)
 
 History currently materializes maximum width 42 for every new policy pack and
 performs six binary-lift levels. Immediate decision retention now reuses that
 packed history, but recycling still uses boolean-indexed dynamic tensors,
-`unique`, Python recursion, and `numel()`-dependent control. Test immutable
-8/16/32/42 buckets or an incremental compact descriptor plus fixed-capacity
-device worklists. Do not create a global history capacity beyond the last
-consumer.
+`unique`, a Python loop, and `numel()`-dependent control. Physical execution
+subfamilies do not change the stable pre/post learner partitions, but history
+buckets would add another queue dimension. At higher player counts that can
+produce many tiny queues and underfilled model calls, so do not implement it
+until a multi-player packing study shows a net benefit.
+
+Replacing the linked/refcount history owner with fixed-capacity device
+worklists is a separate large rewrite, estimated at roughly 400--700 production
+lines plus dedicated CUDA ownership tests. It must handle repeated branched
+parents, shared-ancestor decrements, root-sentinel lifetime, allocation
+rollback, and reuse after the true last consumer. Do not bundle it with history
+bucketing or start it without explicit approval. Any replacement must keep
+mutable history capacity proportional to the admitted live frontier.
 
 ### Full rollout pack compilation/capture
 
