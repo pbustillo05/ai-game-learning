@@ -143,6 +143,14 @@ billion padded attention pairs, and the same 4.61 / 9.06 GB peak.  This is a
 1.1% rollout reduction with no page-size, ownership, or memory-accounting
 change.
 
+Multi-page arbitrary gathers now seed their result from the first page instead
+of allocating zeros and merging that page through an additional `where`.  A
+simultaneous same-source production A/B measured 31.953 s for the old gather
+and 31.840 s for the new gather with exactly 8,253 decisions, 118 model calls,
+and 32.258 billion padded pairs in both arms.  The 0.35% rollout reduction is
+small, but peak reservation also fell from 9,055,502,336 to 9,015,656,448
+bytes and the change adds no state or lifetime complexity.
+
 Sequential target construction and especially branched target construction
 still contain or recently contained host-driven recurrences. A concurrent
 dirty-worktree change began vectorizing sequential targets while these

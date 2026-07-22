@@ -517,13 +517,17 @@ class PagedTensorArena:
             # dense-pack read for a single resolved live-state slab and avoids
             # allocating/merging one candidate tensor per page.
             return self._pages[0][name].index_select(0, rows)
-        output = torch.zeros(
-            (rows.numel(), *spec.shape), dtype=spec.dtype, device=self.device
-        )
+        if rows.numel() == 0:
+            return torch.empty(
+                (0, *spec.shape), dtype=spec.dtype, device=self.device
+            )
         page_id = torch.div(rows, self.page_rows, rounding_mode="floor")
         offset = torch.remainder(rows, self.page_rows)
+        first_columns = self._pages[0]
+        first_length = self._lengths[0]
+        output = first_columns[name][offset.clamp_max(first_length - 1)]
         for index, (columns, length) in enumerate(
-            zip(self._pages, self._lengths, strict=True)
+            zip(self._pages[1:], self._lengths[1:], strict=True), start=1
         ):
             local = offset.clamp_max(length - 1)
             candidate = columns[name][local]
