@@ -3,8 +3,11 @@ from types import SimpleNamespace
 import torch
 
 from pbg.games.poker.adapter import PokerGame, PokerPolicyAdapter
-from pbg.games.poker.cards import hand_index
+from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.engine import CHECK_CALL, NLHEEngine, PokerConfig
+
+
+GEOMETRY = DeckGeometry(13)
 
 
 def _raw(batch=1):
@@ -107,7 +110,10 @@ def test_chance_draw_uses_only_profile_and_board_complement():
     engine = NLHEEngine(PokerConfig(n_players=2))
     game = PokerGame(engine, profile_sampler=object(), showdown_evaluator=object(), partition_adapter=object())
     chance = _advance_checks(engine, engine.new_hand(0))
-    profiles = torch.tensor([[hand_index(0, 1), hand_index(2, 3)]], dtype=torch.int32)
+    profiles = torch.tensor(
+        [[GEOMETRY.hand_index(0, 1), GEOMETRY.hand_index(2, 3)]],
+        dtype=torch.int32,
+    )
     generator = torch.Generator().manual_seed(73)
     seen = set()
     for _ in range(300):
@@ -137,7 +143,10 @@ def test_fixed_showdown_crosses_bound_api_and_uses_evaluator_payoff():
                   torch.tensor([[24]], dtype=torch.int16)):
         ref = int(engine.deal(torch.tensor([ref], dtype=torch.int32), cards)[0])
         ref = _advance_checks(engine, ref)
-    profile = torch.tensor([[hand_index(0, 1), hand_index(2, 3)]], dtype=torch.int32)
+    profile = torch.tensor(
+        [[GEOMETRY.hand_index(0, 1), GEOMETRY.hand_index(2, 3)]],
+        dtype=torch.int32,
+    )
     payoff = game.reward(profile, torch.tensor([ref], dtype=torch.int32))
     assert len(fake.calls) == 1
     assert fake.calls[0]["board_cards"].shape == (1, 5)

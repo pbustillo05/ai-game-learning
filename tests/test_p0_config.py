@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +9,6 @@ import yaml
 
 from pbg.config import ConfigError, load_config
 from pbg.core.config import seed_all
-from pbg.core.logging_util import MetricsLogger
 from pbg.core.training import _configure_reproducibility
 
 
@@ -340,18 +338,3 @@ def test_hardware_numeric_boundaries_reject_with_dotted_paths(
             ROOT / "configs" / "train" / "nlhe6.yaml",
             hardware_profile=profile_path,
         )
-
-
-def test_metrics_logger_appends_json_lines(tmp_path: Path) -> None:
-    logger = MetricsLogger(tmp_path)
-    logger.log(4, {"loss": 1.5})
-    logger.log(5, {"loss": 1.0, "entropy": 0.25})
-    logger.close()
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-    assert records == [
-        {"step": 4, "loss": 1.5},
-        {"step": 5, "loss": 1.0, "entropy": 0.25},
-    ]

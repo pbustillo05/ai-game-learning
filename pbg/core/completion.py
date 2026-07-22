@@ -16,17 +16,6 @@ from torch import Tensor
 
 
 @dataclass
-class CompletionStats:
-    """Completion statistics for one leaf (all floating tensors are fp32)."""
-
-    p_hat: Tensor  # [P_max,X_max]
-    v_hat: Tensor  # [P_max,X_max]
-    vvec_hat: Tensor  # [P_max]
-    u_hat: Tensor  # []
-    n_eff: Tensor  # []
-
-
-@dataclass
 class BatchedCompletionStats:
     """Completion statistics for ``B`` leaves.
 
@@ -125,21 +114,6 @@ class BatchedCompletionStats:
             v_hat=self.v_hat,
             metadata=metadata,
         )
-
-    def row(self, index: int) -> CompletionStats:
-        """Return the five learning statistics for one batch row."""
-
-        if self.vvec_hat is None or self.u_hat is None or self.n_eff is None:
-            raise RuntimeError("learning-only completion rows omit diagnostic moments")
-
-        return CompletionStats(
-            p_hat=self.p_hat[index],
-            v_hat=self.v_hat[index],
-            vvec_hat=self.vvec_hat[index],
-            u_hat=self.u_hat[index],
-            n_eff=self.n_eff[index],
-        )
-
 
 @dataclass
 class ReachView:

@@ -779,49 +779,6 @@ def stable_partition_masked(
     )
 
 
-class ReusableStagingSlabs:
-    """Preallocated family staging tensors with exact byte accounting."""
-
-    def __init__(
-        self,
-        capacity: int,
-        specs: Mapping[str, ArenaField],
-        device: torch.device | str,
-        *,
-        accountant: ByteAccountant | None = None,
-        label: str = "staging_slabs",
-    ) -> None:
-        if isinstance(capacity, bool) or capacity <= 0:
-            raise ValueError("staging capacity must be a positive integer")
-        if not specs:
-            raise ValueError("at least one staging slab is required")
-        self.capacity = int(capacity)
-        self.device = torch.device(device)
-        self.specs = dict(specs)
-        self.reserved_bytes = capacity * sum(spec.row_bytes for spec in specs.values())
-        if accountant is not None:
-            accountant.reserve(label, self.reserved_bytes)
-        try:
-            self.tensors = {
-                name: torch.empty(
-                    (capacity, *spec.shape), dtype=spec.dtype, device=self.device
-                )
-                for name, spec in specs.items()
-            }
-        except BaseException:
-            if accountant is not None:
-                accountant.release(label)
-            raise
-
-    def view(self, name: str, rows: int) -> Tensor:
-        if isinstance(rows, bool) or rows < 0 or rows > self.capacity:
-            raise ValueError("staging view rows are outside slab capacity")
-        try:
-            return self.tensors[name][:rows]
-        except KeyError as exc:
-            raise KeyError(f"unknown staging slab {name!r}") from exc
-
-
 class DrawPurpose(IntEnum):
     """Disjoint counter-based RNG namespaces from the rollout pseudocode."""
 
@@ -923,19 +880,6 @@ def logical_uniform(keys: Tensor, *, dtype: torch.dtype = torch.float32) -> Tens
     # Use 24 high bits: exactly representable in fp32 and identical on CPU/CUDA.
     mantissa = torch.bitwise_and(keys >> 39, (1 << 24) - 1).to(torch.float32)
     return ((mantissa + 0.5) * (1.0 / (1 << 24))).to(dtype)
-
-
-def logical_categorical(probability: Tensor, keys: Tensor) -> Tensor:
-    """Sample one categorical index per row from logical-address keys."""
-
-    if probability.ndim != 2 or keys.shape != probability.shape[:1]:
-        raise ValueError("probability must be [B,E] and keys [B]")
-    if probability.device != keys.device:
-        raise ValueError("probabilities and logical keys must share a device")
-    valid = torch.isfinite(probability).all() & (probability >= 0).all()
-    mass = probability.sum(1)
-    _device_assert(valid & (mass > 0).all(), "categorical rows must be finite and positive")
-    return logical_categorical_from_valid_probability(probability, keys, mass=mass)
 
 
 def logical_categorical_from_valid_probability(

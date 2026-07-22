@@ -18,7 +18,6 @@ from torch import Tensor
 
 N_CARDS = 52
 N_HANDS = 1326
-N_CLASSES = 169
 
 CATEGORY_NAMES = (
     "high_card",
@@ -32,7 +31,6 @@ CATEGORY_NAMES = (
     "straight_flush",
 )
 CONVENTIONAL_STRENGTH = tuple(reversed(CATEGORY_NAMES))
-DECK_GEOMETRY_VERSION = "compact-high-ranks-v1"
 
 
 @dataclass(frozen=True)
@@ -204,26 +202,6 @@ class DeckGeometry:
         return conflict[0] if squeeze else conflict
 
 
-STANDARD_DECK = DeckGeometry(13)
-
-
-def _check_card(card: int) -> None:
-    if isinstance(card, bool) or not isinstance(card, int) or not 0 <= card < N_CARDS:
-        raise ValueError("card ids must be integers in [0, 52)")
-
-
-def hand_index(a: int, b: int) -> int:
-    """Return the lexicographic id of the unordered two-card hand ``{a,b}``."""
-
-    _check_card(a)
-    _check_card(b)
-    if a == b:
-        raise ValueError("a hand must contain two distinct cards")
-    if a > b:
-        a, b = b, a
-    return a * 51 - a * (a - 1) // 2 + b - a - 1
-
-
 _HAND_CARDS: tuple[tuple[int, int], ...] = tuple(
     (a, b) for a in range(N_CARDS) for b in range(a + 1, N_CARDS)
 )
@@ -259,57 +237,6 @@ def validate_evaluator_combo_cards(
             "bound evaluator combo_cards is incompatible with the local "
             "lexicographic hand_index/hand_cards mapping"
         )
-
-
-def _class_id(a: int, b: int) -> int:
-    rank_a, suit_a = divmod(a, 4)
-    rank_b, suit_b = divmod(b, 4)
-    high, low = max(rank_a, rank_b), min(rank_a, rank_b)
-    high_pos, low_pos = 12 - high, 12 - low
-    if high == low:
-        return high_pos * 13 + high_pos
-    if suit_a == suit_b:
-        return high_pos * 13 + low_pos
-    return low_pos * 13 + high_pos
-
-
-_CLASS_OF_HAND: tuple[int, ...] = tuple(_class_id(a, b) for a, b in _HAND_CARDS)
-_CLASS_MEMBERS: tuple[tuple[int, ...], ...] = tuple(
-    tuple(h for h, class_id in enumerate(_CLASS_OF_HAND) if class_id == k)
-    for k in range(N_CLASSES)
-)
-
-
-def class_of_hand(h: int) -> int:
-    """Map a combo to its standard ``AA, AKs, ..., 22`` 13x13 class id."""
-
-    hand_cards(h)  # validation
-    return _CLASS_OF_HAND[h]
-
-
-def class_members(k: int) -> list[int]:
-    """Return combo ids in preflop class ``k`` in lexicographic order."""
-
-    if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k < N_CLASSES:
-        raise ValueError("class ids must be integers in [0, 169)")
-    return list(_CLASS_MEMBERS[k])
-
-
-def class_size(k: int) -> int:
-    """Return 6 for a pair, 4 for suited, and 12 for offsuit classes."""
-
-    return len(class_members(k))
-
-
-def suit_perm_apply(perm: tuple[int, int, int, int], h: int) -> int:
-    """Apply a permutation of suits to a combo id."""
-
-    if tuple(sorted(perm)) != (0, 1, 2, 3):
-        raise ValueError("perm must be a permutation of (0, 1, 2, 3)")
-    a, b = hand_cards(h)
-    mapped_a = 4 * (a // 4) + perm[a % 4]
-    mapped_b = 4 * (b // 4) + perm[b % 4]
-    return hand_index(mapped_a, mapped_b)
 
 
 def board_conflict_mask(board: Tensor) -> Tensor:

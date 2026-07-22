@@ -6,52 +6,44 @@ import pytest
 import torch
 
 from pbg.games.poker.cards import (
-    N_CLASSES,
+    DeckGeometry,
     N_HANDS,
     board_conflict_mask,
-    class_members,
-    class_of_hand,
-    class_size,
     hand_cards,
-    hand_index,
     sample_uniform_complement,
-    suit_perm_apply,
 )
+
+
+GEOMETRY = DeckGeometry(13)
 
 
 def test_complete_combo_map_and_preflop_classes() -> None:
     seen: set[int] = set()
     for a in range(52):
         for b in range(a + 1, 52):
-            h = hand_index(a, b)
+            h = GEOMETRY.hand_index(a, b)
             assert hand_cards(h) == (a, b)
-            assert hand_index(b, a) == h
+            assert GEOMETRY.hand_index(b, a) == h
             seen.add(h)
     assert seen == set(range(N_HANDS))
 
-    members = [h for k in range(N_CLASSES) for h in class_members(k)]
+    members = [h for k in range(GEOMETRY.n_classes) for h in GEOMETRY.class_members(k)]
     assert sorted(members) == list(range(N_HANDS))
-    for k in range(N_CLASSES):
-        assert all(class_of_hand(h) == k for h in class_members(k))
-    assert Counter(class_size(k) for k in range(N_CLASSES)) == {4: 78, 6: 13, 12: 78}
+    for k in range(GEOMETRY.n_classes):
+        assert all(GEOMETRY.class_of_combo[h] == k for h in GEOMETRY.class_members(k))
+    assert Counter(
+        len(GEOMETRY.class_members(k)) for k in range(GEOMETRY.n_classes)
+    ) == {
+        4: 78,
+        6: 13,
+        12: 78,
+    }
 
     # Standard matrix orientation: AA=0, AKs=1, AKo=13, 22=168.
-    assert class_of_hand(hand_index(48, 49)) == 0
-    assert class_of_hand(hand_index(44, 48)) == 1
-    assert class_of_hand(hand_index(45, 48)) == 13
-    assert class_of_hand(hand_index(0, 1)) == 168
-
-
-def test_suit_action_is_a_bijection_and_composes() -> None:
-    first = (1, 0, 3, 2)
-    second = (2, 3, 1, 0)
-    composed = tuple(second[first[suit]] for suit in range(4))
-    mapped = [suit_perm_apply(first, h) for h in range(N_HANDS)]
-    assert sorted(mapped) == list(range(N_HANDS))
-    for h in range(N_HANDS):
-        assert suit_perm_apply(second, suit_perm_apply(first, h)) == suit_perm_apply(
-            composed, h
-        )
+    assert GEOMETRY.class_of_combo[GEOMETRY.hand_index(48, 49)] == 0
+    assert GEOMETRY.class_of_combo[GEOMETRY.hand_index(44, 48)] == 1
+    assert GEOMETRY.class_of_combo[GEOMETRY.hand_index(45, 48)] == 13
+    assert GEOMETRY.class_of_combo[GEOMETRY.hand_index(0, 1)] == 168
 
 
 def test_board_conflict_mask_supports_local_and_boundary_padding() -> None:
@@ -94,4 +86,3 @@ def test_complement_sampler_legality_reproducibility_and_uniformity() -> None:
     expected = n / 50
     # Six standard deviations plus a small discrete margin.
     assert float((frequency - expected).abs().max()) < 6 * (expected**0.5) + 3
-

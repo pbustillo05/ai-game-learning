@@ -20,7 +20,6 @@ from pbg.core.learner import (
     ReferenceCacheCandidate,
     ReusableIndexBuffer,
     allocate_fixed_statistical_counts,
-    allocate_statistical_counts,
     global_stratum_alphas,
     mode_loss,
     select_reference_cache_set,
@@ -238,19 +237,6 @@ def test_arbitrary_index_draws_alias_distribution_and_reusable_storage() -> None
     observed = torch.bincount(draws.long(), minlength=3).float() / draws.numel()
     expected = torch.tensor([0.4 / 3, 0.8 / 3, 1 - 1.2 / 3])
     assert torch.allclose(observed, expected, atol=0.006, rtol=0)
-
-
-def test_statistical_allocation_is_variance_time_based_and_not_shape_quantized() -> None:
-    counts = allocate_statistical_counts(
-        torch.tensor([0.7, 0.3], dtype=torch.float64),
-        torch.tensor([2.0, 1.0], dtype=torch.float64),
-        torch.tensor([1.0, 2.0], dtype=torch.float64),
-        19.0,
-    )
-    assert counts.dtype == torch.int32
-    assert int((counts * torch.tensor([1, 2], dtype=torch.int32)).sum()) <= 19
-    assert all(int(value) > 0 for value in counts)
-    assert any(int(value) % 32 for value in counts)
 
 
 def test_physical_plan_preserves_order_repeats_and_one_row_tail() -> None:

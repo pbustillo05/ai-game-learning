@@ -742,10 +742,3 @@ def finalize_training_storage(storage: TrainingStorage) -> TrainingStorage:
                     f"training action storage retained transient fields {sorted(overlap)}"
                 )
     return storage
-
-
-# Algorithm-style public aliases used by design documents and callers.
-BuildNormalTargets = build_normal_targets
-BuildSequentialRBTargets = build_sequential_rb_targets
-BuildBranchedRBTargets = build_branched_rb_targets
-FinalizeTrainingStorage = finalize_training_storage

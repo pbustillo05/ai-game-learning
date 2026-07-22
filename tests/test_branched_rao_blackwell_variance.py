@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from pbg.core.game import CHANCE, PRETERM
-from pbg.core.tree import DiagnosticTreeBuilder
+from tests.tree_fixture import DiagnosticTreeBuilder
 from pbg.eval.branched_rao_blackwell_variance import (
     _propagate_functional_coefficients,
     _tree_layout,

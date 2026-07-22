@@ -17,7 +17,6 @@ from pbg.games.poker.model.incidence import (
     build_compact_map,
     compact_gather,
     compact_scatter,
-    permute_rows,
 )
 from pbg.games.poker.model.preflop import PokerModelConfig, PokerPublicBatch, PolicyOutput
 from pbg.games.poker.model.primitives import FFN, LN, MHA
@@ -108,50 +107,6 @@ def _summary_fields(
             row = flat[:, None, None, :].expand(-1, players, compact, -1)
         result.append(row)
     return torch.cat(result, dim=-1) if result else None
-
-
-def suit_row_permutation(
-    permutation: tuple[int, int, int, int],
-    device: torch.device | str | None = None,
-    *,
-    rank_count: int = 13,
-) -> Tensor:
-    """Return the old-to-new combo-row map for a suit relabeling."""
-
-    if tuple(sorted(permutation)) != (0, 1, 2, 3):
-        raise ValueError("permutation must contain each suit exactly once")
-    geometry = DeckGeometry(rank_count)
-    cards = torch.tensor(geometry.combo_cards, dtype=torch.long)
-    mapped = (cards // 4) * 4 + torch.tensor(permutation)[cards % 4]
-    row = torch.tensor(
-        [geometry.hand_index(int(a), int(b)) for a, b in mapped],
-        dtype=torch.long,
-    )
-    return row.to(device=device, dtype=torch.long)
-
-
-def permute_suit_representation(
-    board: Tensor,
-    row_tensors: Mapping[str, Tensor],
-    permutation: tuple[int, int, int, int],
-    *,
-    row_dim: int = 1,
-    rank_count: int = 13,
-) -> tuple[Tensor, dict[str, Tensor]]:
-    """Relabel board ids and fixed-width combo-row tensors consistently."""
-
-    row_map = suit_row_permutation(
-        permutation, board.device, rank_count=rank_count
-    )
-    valid = board >= 0
-    mapped_board = board.clone()
-    mapped_board[valid] = (board[valid] // 4) * 4 + torch.tensor(
-        permutation, dtype=board.dtype, device=board.device
-    )[board[valid] % 4]
-    return mapped_board, {
-        name: permute_rows(value, row_map.to(value.device), dim=row_dim)
-        for name, value in row_tensors.items()
-    }
 
 
 class PostflopNet(nn.Module):

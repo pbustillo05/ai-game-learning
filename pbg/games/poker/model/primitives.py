@@ -165,19 +165,6 @@ class MHA(nn.Module):
             raise ValueError("all attention tensors must be on one device")
         return key_bias, key_mask
 
-    def _sdpa_attention(self, q_head: Tensor, k_head: Tensor, v_head: Tensor, key_mask: Tensor) -> Tensor:
-        """Return bias-free mask-only attention heads ``[B,H,Nq,Dh]``."""
-
-        temperature = self.temperature.to(dtype=q_head.dtype)[None, :, None, None]
-        allowed = key_mask[:, None, None, :]
-        return F.scaled_dot_product_attention(
-            q_head / temperature,
-            k_head,
-            v_head,
-            attn_mask=allowed,
-            dropout_p=0.0,
-        )
-
     def _sdpa_biased_attention(
         self,
         q_head: Tensor,
@@ -290,20 +277,6 @@ class MHA(nn.Module):
         return _compiled_flex(self.d_head)(
             q_head / temperature, k_head, v_head, key_bias, key_mask
         )
-
-    def attention_weights(
-        self,
-        q: Tensor,
-        kv: Tensor,
-        key_bias: Tensor | None,
-        key_mask: Tensor | None,
-    ) -> Tensor:
-        """Materialize attention probabilities ``[B,H,Nq,Nk]`` for diagnostics."""
-
-        key_bias, key_mask = self._validate(q, kv, key_bias, key_mask)
-        q_head, k_head, v_head = self._project(q, kv)
-        _, probability = self._explicit_attention(q_head, k_head, v_head, key_bias, key_mask)
-        return probability
 
     def forward(
         self,

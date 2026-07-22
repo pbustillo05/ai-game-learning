@@ -104,26 +104,6 @@ def dlogistic_tick(n_ticks: int, mu: Tensor, s: Tensor) -> Tensor:
     return probability.to(torch.promote_types(mu.dtype, s.dtype))
 
 
-def raise_tick_probs(
-    omega: Tensor,
-    mu: Tensor,
-    s: Tensor,
-    iota: Tensor,
-    n_ticks: int,
-) -> Tensor:
-    """Compose the logistic mixture and all-in atom as ``[...,n_ticks]``."""
-
-    if omega.shape != mu.shape or omega.shape != s.shape:
-        raise ValueError("omega, mu, and s must have identical [...,M] shapes")
-    if iota.shape != omega.shape[:-1]:
-        raise ValueError("iota must have shape omega.shape[:-1]")
-    logistic = dlogistic_tick(n_ticks, mu, s)
-    mixture = (omega[..., None] * logistic).sum(dim=-2)
-    allin = torch.zeros_like(mixture)
-    allin[..., -1] = 1.0
-    return (1.0 - iota[..., None]) * mixture + iota[..., None] * allin
-
-
 class ValueHead(nn.Module):
     """Emit one scalar value per actor private-type row."""
 

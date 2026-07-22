@@ -194,7 +194,7 @@ V̂vec=**R**, and Û=‖**R**‖₂² exactly once P̂ has been obtained.
 
 ## 7. BranchedValue — backward propagation
 
-Inputs: labeled stored tree 𝐒; leaf `CompletionStats`; frozen actor-type
+Inputs: labeled stored tree 𝐒; sealed leaf completion rows; frozen actor-type
 value heads V^{θ_k}(x_p,σ); horizon λ ∈ [0,1]. Optional public moment output
 heads can be instantiated, but this reducer emits no targets for them and no
 registered production loss or branching controller consumes them.
@@ -203,7 +203,7 @@ Per-node working state is posterior mass `P̂ [P,X]` and posterior-weighted
 return mass `M̂ [P,X]`. Conditional values are formed only when emitted.
 
 ```
-initialize at every PRETERM leaf from CompletionStats
+initialize at every PRETERM leaf from its sealed completion row
     P̂_p(x,t) = leaf posterior mass
     M̂_p(x,t) = P̂_p(x,t) * leaf conditional reward estimate
 for σ in reverse topological order (children before parents), σ not a leaf:

@@ -220,19 +220,3 @@ def compact_scatter(
             device=values.device,
         )
     return output.permute(inverse)
-
-
-def permute_rows(values: Tensor, old_to_new: Tensor, dim: int = 1) -> Tensor:
-    """Apply a supplied bijective row map without interpreting its semantics."""
-
-    if old_to_new.ndim != 1 or old_to_new.dtype not in (torch.int32, torch.int64):
-        raise TypeError("old_to_new must be an integer vector")
-    dim = dim % values.ndim
-    if values.shape[dim] != old_to_new.numel():
-        raise ValueError("row-map length does not match values")
-    expected = torch.arange(old_to_new.numel(), device=old_to_new.device)
-    if not torch.equal(torch.sort(old_to_new.long()).values, expected):
-        raise ValueError("old_to_new must be a bijection")
-    inverse = torch.empty_like(old_to_new, dtype=torch.long)
-    inverse[old_to_new.long()] = expected
-    return values.index_select(dim, inverse.to(values.device))

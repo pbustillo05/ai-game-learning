@@ -33,7 +33,7 @@ from pbg.core.targets import (
     plan_branched_frontier,
 )
 from pbg.core.topology import BranchedTreeSpan, SequentialDecisionCSR
-from pbg.games.poker.partitions import assert_poker_storage_widths, poker_partition_specs
+from pbg.games.poker.partitions import poker_partition_specs
 
 
 def _sealed(schema: TensorSchema, **columns: torch.Tensor) -> SealedTensorBlock:
@@ -601,13 +601,7 @@ def test_full_deck_poker_natural_model_and_exact_target_widths() -> None:
         assert post.model_width == post.exact_width == 1326
         assert post.input_schema.by_name["range_weights"].shape == (live, 1326)
         assert ("folded_summary_ref" in post.input_schema.by_name) == (live < 6)
-    assert_poker_storage_widths(
-        specs,
-        partition_id=0,
-        model_rows=torch.zeros(3, 169),
-        exact_rows=torch.zeros(3, 1326),
-    )
+    specs[0].assert_model_width(torch.zeros(3, 169))
+    specs[0].assert_exact_width(torch.zeros(3, 1326))
     with pytest.raises(ValueError, match="natural model width 169"):
-        assert_poker_storage_widths(
-            specs, partition_id=0, model_rows=torch.zeros(3, 1326)
-        )
+        specs[0].assert_model_width(torch.zeros(3, 1326))

@@ -2,6 +2,9 @@
 
 Active audit documents describe the sole production NLHE implementation:
 
+- [`reachability_cleanup_20260722.md`](reachability_cleanup_20260722.md)
+  records the high-confidence stale-code deletion pass performed from the
+  comprehensive audit's production-reachability inventory.
 - [`repo_audit_20260721/`](repo_audit_20260721/) is the current comprehensive
   repository audit. Its verdict is **not ready**: two implementation blockers,
   one BR-certification blocker, and the canonical C01--C18 findings remain.

@@ -829,26 +829,6 @@ def _memory_limit(
     return min(free_bytes - reserve, absolute) if account_current_free else absolute
 
 
-def _memory_operating_ceiling(
-    cfg: RootConfig, device: torch.device, current_reserved_bytes: int
-) -> int:
-    """Return the absolute PyTorch-reservation ceiling under current driver use.
-
-    The configured reserve is the bootstrap safety artifact.  Unlike a static
-    percentage check, this ceiling contracts immediately when another context
-    consumes driver memory: only current PyTorch reservation plus genuinely
-    free bytes above the bootstrap guard are admissible.
-    """
-
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-    absolute = _memory_limit(cfg, device, account_current_free=False)
-    driver_guard = max(0, total_bytes - absolute)
-    externally_feasible = current_reserved_bytes + max(
-        0, free_bytes - driver_guard
-    )
-    return min(absolute, externally_feasible)
-
-
 def _validate_memory_preflight(
     cfg: RootConfig, device: torch.device, plan: dict[str, int]
 ) -> None:
@@ -1444,18 +1424,6 @@ def _natural_partition_set(cfg: RootConfig, bundle: GameBundle):
     if not callable(factory):
         raise TypeError("rollout backend does not expose training partition specs")
     return factory()
-
-
-def _sealed_input_block(spec: Any, columns: Mapping[str, Tensor]) -> SealedTensorBlock:
-    rows = next(iter(columns.values())).shape[0]
-    block = SealedTensorBlock(
-        spec.input_schema,
-        columns,
-        rows,
-        spec.input_schema.capacity_bytes(rows, chunks=int(rows > 0)),
-    )
-    block.assert_exact_payload()
-    return block
 
 
 def _sealed_dynamic_block(

@@ -26,10 +26,6 @@ _ADDITIVE_COUNTERS = (
     "padded_token_pairs",
     "forced_drains",
     "forced_drain_rows",
-    "cache_lookups",
-    "cache_hits",
-    "cache_evictions",
-    "cache_saved_rows",
     "evaluator_calls",
     "evaluator_rows",
     "evaluator_rejection_work",
@@ -43,14 +39,11 @@ _ADDITIVE_COUNTERS = (
     "h2d_bytes",
     "d2h_transfers",
     "d2h_bytes",
-    "completion_batches",
-    "completion_rows",
     "target_bytes",
     "collective_calls",
     "collective_bytes",
     "collective_seconds",
     "collective_exposed_seconds",
-    "rank_wait_seconds",
 )
 
 _MAXIMUM_COUNTERS = (
@@ -232,23 +225,6 @@ class ExecutionMetrics:
             self.add("forced_drains", 1, stratum=destination)
             self.add("forced_drain_rows", rows, stratum=destination)
 
-    def record_cache(
-        self,
-        *,
-        lookups: int = 0,
-        hits: int = 0,
-        evictions: int = 0,
-        saved_rows: int = 0,
-    ) -> None:
-        """Record exact frozen-forward/reference cache activity."""
-
-        if hits > lookups:
-            raise ValueError("cache hits cannot exceed lookups in one update")
-        self.add("cache_lookups", lookups)
-        self.add("cache_hits", hits)
-        self.add("cache_evictions", evictions)
-        self.add("cache_saved_rows", saved_rows)
-
     def record_evaluator(self, *, rows: int, rejection_work: int = 0) -> None:
         self.add("evaluator_calls", 1)
         self.add("evaluator_rows", rows)
@@ -297,10 +273,6 @@ class ExecutionMetrics:
         self.add(f"{direction}_transfers", 1)
         self.add(f"{direction}_bytes", nbytes)
 
-    def record_completion(self, *, rows: int) -> None:
-        self.add("completion_batches", 1)
-        self.add("completion_rows", rows)
-
     def record_target_bytes(self, value: int) -> None:
         self.add("target_bytes", value)
         self.maximum("target_bytes_max", value)
@@ -312,9 +284,6 @@ class ExecutionMetrics:
         self.add("collective_bytes", nbytes)
         self.add("collective_seconds", seconds)
         self.add("collective_exposed_seconds", exposed_seconds)
-
-    def record_rank_wait(self, *, seconds: float) -> None:
-        self.add("rank_wait_seconds", seconds)
 
     def snapshot(self, *, prefix: str = "execution_") -> dict[str, float]:
         """Return a complete scalar snapshot, including zero-valued base fields."""

@@ -48,17 +48,6 @@ def _job_path(config: Mapping[str, Any], kind: str, beta: float, repeat: int) ->
     return Path(str(config["out_dir"])) / kind / beta_key(beta) / f"{repeat:03d}.{suffix}"
 
 
-def _load_geometry(config: Mapping[str, Any], beta: float) -> list[dict[str, Any]]:
-    count = int(config["stages"]["geometry_repeats"])
-    records = []
-    for repeat in range(count):
-        path = _job_path(config, "geometry", beta, repeat)
-        if not path.exists():
-            raise RuntimeError(f"missing geometry job {path}")
-        records.append(json.loads(path.read_text(encoding="utf-8")))
-    return records
-
-
 def _load_moments(config: Mapping[str, Any], beta: float, count: int | None = None) -> list[dict[str, Any]]:
     directory = _job_path(config, "moments", beta, 0).parent
     paths = sorted(directory.glob("*.pt"))

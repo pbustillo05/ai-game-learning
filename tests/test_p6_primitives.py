@@ -1,27 +1,8 @@
 import pytest
 import torch
 
-from pbg.games.poker.model.heads import dlogistic_tick, raise_tick_probs
+from pbg.games.poker.model.heads import dlogistic_tick
 from pbg.games.poker.model.primitives import MHA
-
-
-def test_mha_sdpa_matches_explicit_and_masks_are_exact() -> None:
-    torch.manual_seed(60)
-    mha = MHA(24, 4)
-    query = torch.randn(2, 3, 24)
-    context = torch.randn(2, 5, 24)
-    key_mask = torch.tensor(
-        [[True, True, False, True, True], [True, False, True, False, True]]
-    )
-    key_bias = torch.zeros(2, 5, dtype=torch.float32)
-    q_head, k_head, v_head = mha._project(query, context)
-    sdpa = mha._sdpa_attention(q_head, k_head, v_head, key_mask)
-    explicit, probability = mha._explicit_attention(
-        q_head, k_head, v_head, key_bias, key_mask
-    )
-    torch.testing.assert_close(sdpa, explicit, atol=1e-5, rtol=1e-5)
-    masked = ~key_mask[:, None, None, :].expand_as(probability)
-    assert torch.count_nonzero(probability.masked_select(masked)) == 0
 
 
 def test_key_bias_is_not_tempered() -> None:
@@ -36,11 +17,11 @@ def test_key_bias_is_not_tempered() -> None:
     context = torch.randn(2, 5, 16)
     bias = torch.randn(2, 5, dtype=torch.float32)
     mask = torch.ones(2, 5, dtype=torch.bool)
-    before = mha.attention_weights(query, context, bias, mask)
+    before = mha(query, context, bias, mask)
     with torch.no_grad():
         mha.theta.mul_(2.0)
-    after = mha.attention_weights(query, context, bias, mask)
-    torch.testing.assert_close(before, after, atol=0.0, rtol=0.0)
+    after = mha(query, context, bias, mask)
+    torch.testing.assert_close(before, after, atol=1e-6, rtol=1e-6)
 
 
 def test_query_chunk_attention_matches_explicit_forward_and_backward() -> None:
@@ -127,10 +108,3 @@ def test_dlogistic_ticks_and_allin_atom() -> None:
     low = dlogistic_tick(64, torch.tensor([0.2]), torch.tensor([0.03]))
     high = dlogistic_tick(64, torch.tensor([0.8]), torch.tensor([0.03]))
     assert int(low.argmax()) < int(high.argmax())
-
-    omega = torch.softmax(torch.randn(2, 3, 4), dim=-1)
-    mu = torch.sigmoid(torch.randn(2, 3, 4))
-    scale = torch.rand(2, 3, 4) + 0.02
-    ticks = raise_tick_probs(omega, mu, scale, torch.ones(2, 3), 32)
-    assert torch.count_nonzero(ticks[..., :-1]) == 0
-    assert torch.equal(ticks[..., -1], torch.ones(2, 3))

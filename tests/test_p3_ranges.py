@@ -3,19 +3,25 @@ from __future__ import annotations
 import torch
 
 from pbg.games.poker.cards import (
-    N_CLASSES,
+    DeckGeometry,
     N_HANDS,
     board_conflict_mask,
-    class_members,
-    hand_index,
 )
 from pbg.games.poker.ranges import LINE_META_SIZE, RangeState
+
+
+GEOMETRY = DeckGeometry(13)
 
 
 def test_scripted_action_updates_match_fp64_bayes_numerators() -> None:
     state = RangeState(2, 3)
     hands = torch.tensor(
-        [hand_index(0, 1), hand_index(4, 5), hand_index(8, 9), hand_index(12, 13)]
+        [
+            GEOMETRY.hand_index(0, 1),
+            GEOMETRY.hand_index(4, 5),
+            GEOMETRY.hand_index(8, 9),
+            GEOMETRY.hand_index(12, 13),
+        ]
     )
     state.log_r.fill_(-torch.inf)
     state.log_r[:, :, hands] = 0.0
@@ -101,14 +107,22 @@ def test_class_aggregation_matches_brute_sums_and_uniform_class_sizes() -> None:
     state = RangeState(1, 2)
     uniform = state.to_class(torch.tensor([0]))
     expected = torch.tensor(
-        [len(class_members(k)) / N_HANDS for k in range(N_CLASSES)]
+        [
+            len(GEOMETRY.class_members(k)) / N_HANDS
+            for k in range(GEOMETRY.n_classes)
+        ]
     )
     assert torch.allclose(uniform[0, 0], expected, atol=1e-7, rtol=0)
 
     state.log_r[0, 1] = torch.linspace(-2.0, 2.0, N_HANDS)
     combo = state.normalized(torch.tensor([0]), torch.tensor([1]))[0]
     classes = state.to_class(torch.tensor([0]))[0, 1]
-    brute = torch.stack([combo[class_members(k)].sum() for k in range(N_CLASSES)])
+    brute = torch.stack(
+        [
+            combo[list(GEOMETRY.class_members(k))].sum()
+            for k in range(GEOMETRY.n_classes)
+        ]
+    )
     assert torch.allclose(classes, brute, atol=1e-7, rtol=0)
     assert torch.allclose(classes.sum(), torch.tensor(1.0))
 

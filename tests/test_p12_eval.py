@@ -13,8 +13,11 @@ from torch import nn
 from pbg.config import load_config
 from pbg.eval import arena as arena_module
 from pbg.eval.arena import arena
-from pbg.games.poker.cards import hand_index, hand_cards
+from pbg.games.poker.cards import DeckGeometry, hand_cards
 from pbg.games.poker.model.preflop import PolicyOutput
+
+
+GEOMETRY = DeckGeometry(13)
 
 
 @dataclass(frozen=True)
@@ -62,7 +65,10 @@ def _install_fake_sibling(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         calls["profiles"] = kwargs
         samples = kwargs["n_samples"]
         players = kwargs["range_weights"].shape[1]
-        combos = [hand_index(2 * seat, 2 * seat + 1) for seat in range(players)]
+        combos = [
+            GEOMETRY.hand_index(2 * seat, 2 * seat + 1)
+            for seat in range(players)
+        ]
         profile = torch.tensor(combos, dtype=torch.int32).view(1, 1, players)
         profile = profile.expand(1, samples, players).clone()
         return profile

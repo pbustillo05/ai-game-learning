@@ -8,11 +8,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from pbg.core.distributed import (
-    global_mass_objective,
-    stratum_objective_scale,
-    weighted_decision_stats,
-)
 from pbg.core.observability import ExecutionMetrics
 from pbg.core.execution import (
     DONE,
@@ -24,11 +19,9 @@ from pbg.core.execution import (
     ChunkedOccurrenceArena,
     DeviceWorkQueue,
     DrawPurpose,
-    ReusableStagingSlabs,
     TrajectoryAdmissionPlan,
     arena_fields,
     child_path_keys,
-    logical_categorical,
     logical_categorical_from_valid_probability,
     logical_rng_keys,
     stable_partition_masked,
@@ -121,21 +114,6 @@ def test_memory_calibration_reports_actual_hard_headroom_without_synthetic_margi
     assert metrics["memory_hard_limit_exceeded"] == 0.0
 
 
-def test_global_mass_objective_uses_exact_unequal_rank_mass() -> None:
-    theta = torch.tensor(2.0, dtype=torch.float64, requires_grad=True)
-    rank0 = weighted_decision_stats(theta * torch.tensor([0.0]), torch.ones(1))
-    rank1 = weighted_decision_stats(theta * torch.ones(3), torch.ones(3))
-    numerators = torch.stack((rank0.numerator, rank1.numerator))
-    masses = torch.stack((rank0.mass, rank1.mass))
-
-    objective = global_mass_objective(numerators, masses)
-    objective.backward()
-
-    assert float(objective.detach()) == pytest.approx(1.5)
-    assert float(theta.grad) == pytest.approx(0.75)
-    assert float(stratum_objective_scale(masses[1], masses.sum())) == pytest.approx(0.75)
-
-
 def test_execution_metrics_are_lossless_and_match_hand_counts() -> None:
     metrics = ExecutionMetrics()
     for _ in range(5_000):
@@ -151,13 +129,10 @@ def test_execution_metrics_are_lossless_and_match_hand_counts() -> None:
     metrics.record_queue("post_3", depth=7, oldest_age=2.5)
     metrics.record_queue("post_3", depth=4, oldest_age=3.0)
     metrics.add("forced_drains", 2)
-    metrics.record_cache(lookups=9, hits=4, evictions=1, saved_rows=4)
     metrics.record_evaluator(rows=11)
-    metrics.record_completion(rows=6)
     metrics.record_target_bytes(120)
     metrics.record_target_bytes(80)
     metrics.record_collective(nbytes=256, seconds=0.125)
-    metrics.record_rank_wait(seconds=0.25)
     snapshot = metrics.snapshot()
 
     assert snapshot["execution_model_calls"] == 5_000
@@ -171,13 +146,10 @@ def test_execution_metrics_are_lossless_and_match_hand_counts() -> None:
     assert snapshot["execution_policy_pack_padded_token_pairs"] == 3_100
     assert snapshot["execution_queue_depth_max"] == 7
     assert snapshot["execution_queue_oldest_age_max"] == 3.0
-    assert snapshot["execution_cache_hits"] == 4
     assert snapshot["execution_evaluator_rows"] == 11
-    assert snapshot["execution_completion_rows"] == 6
     assert snapshot["execution_target_bytes"] == 200
     assert snapshot["execution_target_bytes_max"] == 120
     assert snapshot["execution_collective_bytes"] == 256
-    assert snapshot["execution_rank_wait_seconds"] == 0.25
 
 
 def test_declared_control_sync_and_transfers_are_accounted_separately() -> None:
@@ -459,21 +431,6 @@ def test_work_queue_age_tracks_oldest_live_enqueue_without_device_reads() -> Non
         queue.enqueue(torch.empty(0, dtype=torch.int64), logical_time=9)
 
 
-def test_reusable_staging_slabs_reserve_exact_bytes() -> None:
-    specs = {
-        "inputs": ArenaField(torch.float32, (3,)),
-        "indices": ArenaField(torch.int32),
-    }
-    expected = 5 * (3 * 4 + 4)
-    accountant = ByteAccountant(expected)
-    slabs = ReusableStagingSlabs(5, specs, "cpu", accountant=accountant)
-    assert slabs.reserved_bytes == expected
-    assert accountant.reserved_bytes == expected
-    assert slabs.view("inputs", 2).shape == (2, 3)
-    with pytest.raises(ValueError):
-        slabs.view("inputs", 6)
-
-
 def test_safe_admit_reserves_retained_and_max_inflight_before_live_rows() -> None:
     plan = TrajectoryAdmissionPlan(
         limit_bytes=1_000,
@@ -548,8 +505,10 @@ def test_logical_rng_is_invariant_to_schedule_and_gpu_assignment() -> None:
     assert not torch.equal(keys, posterior)
     probability = torch.tensor([[0.2, 0.8]]).expand(4, -1)
     assert torch.equal(
-        logical_categorical(probability, keys),
-        logical_categorical(probability[permutation], scheduled)[permutation.argsort()],
+        logical_categorical_from_valid_probability(probability, keys),
+        logical_categorical_from_valid_probability(
+            probability[permutation], scheduled
+        )[permutation.argsort()],
     )
 
 
@@ -578,16 +537,11 @@ def test_logical_rng_namespaces_and_draw_ordinals_are_disjoint_on_address_grid()
     unnormalized = torch.tensor([[1.0, 3.0], [7.0, 2.0]])
     sample_keys = keys[:2]
     assert torch.equal(
-        logical_categorical(unnormalized, sample_keys),
-        logical_categorical(
+        logical_categorical_from_valid_probability(unnormalized, sample_keys),
+        logical_categorical_from_valid_probability(
             unnormalized / unnormalized.sum(1, keepdim=True), sample_keys
         ),
     )
-    assert torch.equal(
-        logical_categorical(unnormalized, sample_keys),
-        logical_categorical_from_valid_probability(unnormalized, sample_keys),
-    )
-
 
 
 def test_queue_hot_primitives_have_no_explicit_scalar_host_transfer() -> None:
@@ -602,7 +556,6 @@ def test_queue_hot_primitives_have_no_explicit_scalar_host_transfer() -> None:
         DeviceWorkQueue.peek,
         DeviceWorkQueue.dequeue,
         logical_rng_keys,
-        logical_categorical,
         logical_categorical_from_valid_probability,
         stable_partition_masked,
     ):
@@ -658,7 +611,7 @@ def test_cuda_queue_arena_and_rng_execute_transactionally() -> None:
         purpose=DrawPurpose.ACTION,
     )
     probability = torch.tensor([[0.25, 0.75]], device=device).expand(8, -1)
-    samples = logical_categorical(probability, keys)
+    samples = logical_categorical_from_valid_probability(probability, keys)
     partition = stable_partition_masked(
         handles,
         torch.tensor([0, 1, 0, 2, 1, 0, 2, 1], dtype=torch.int32, device=device),

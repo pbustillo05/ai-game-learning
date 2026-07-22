@@ -145,19 +145,3 @@ def poker_partition_specs(
             )
         )
     return PartitionSet(tuple(specs))
-
-
-def assert_poker_storage_widths(
-    specs: PartitionSet,
-    *,
-    partition_id: int,
-    model_rows: Tensor | None = None,
-    exact_rows: Tensor | None = None,
-) -> None:
-    """Hard store/cache-boundary assertions used outside model internals."""
-
-    spec = specs[partition_id]
-    if model_rows is not None:
-        spec.assert_model_width(model_rows)
-    if exact_rows is not None:
-        spec.assert_exact_width(exact_rows)

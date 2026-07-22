@@ -150,65 +150,6 @@ def global_stratum_alphas(all_log_z: Tensor) -> Tensor:
     )
 
 
-def allocate_statistical_counts(
-    alpha: Tensor,
-    variance: Tensor,
-    seconds_per_draw: Tensor,
-    time_budget: float,
-    *,
-    maximum_counts: Tensor | None = None,
-) -> Tensor:
-    """Deterministically minimize the lagged stratified variance proxy.
-
-    Counts begin at one for every positive-mass stratum.  Remaining measured
-    time is assigned one draw at a time by exact marginal variance reduction
-    per second.  The resulting integers have no physical-shape quantization.
-    """
-
-    if alpha.ndim != 1 or variance.shape != alpha.shape or seconds_per_draw.shape != alpha.shape:
-        raise ValueError("statistical allocation inputs must be aligned vectors")
-    if not bool(torch.isfinite(alpha).all()) or bool((alpha < 0).any()):
-        raise ValueError("alpha must be finite and nonnegative")
-    if not bool(torch.isfinite(variance).all()) or bool((variance < 0).any()):
-        raise ValueError("lagged variances must be finite and nonnegative")
-    if not bool(torch.isfinite(seconds_per_draw).all()) or bool((seconds_per_draw <= 0).any()):
-        raise ValueError("measured draw costs must be finite and positive")
-    if not math.isfinite(time_budget) or time_budget < 0:
-        raise ValueError("statistical time budget must be finite and nonnegative")
-    active = alpha > 0
-    counts = active.to(torch.int64)
-    minimum_time = float((seconds_per_draw * active).sum())
-    if minimum_time > time_budget + 1e-12:
-        raise ValueError("time budget cannot give every positive-mass stratum one draw")
-    if maximum_counts is None:
-        cheapest = float(seconds_per_draw.min())
-        cap = max(1, math.floor(time_budget / cheapest))
-        maximum_counts = torch.full_like(counts, cap)
-    else:
-        maximum_counts = maximum_counts.to(device=counts.device, dtype=torch.int64)
-        if maximum_counts.shape != counts.shape or bool((maximum_counts < counts).any()):
-            raise ValueError("maximum counts cannot exclude required singleton draws")
-    spent = minimum_time
-    score_numerator = alpha.square() * variance
-    while True:
-        eligible = active & (counts < maximum_counts)
-        affordable = spent + seconds_per_draw <= time_budget + 1e-12
-        eligible &= affordable
-        if not bool(eligible.any()):
-            break
-        current = counts.clamp_min(1).to(alpha)
-        marginal = score_numerator * (1.0 / current - 1.0 / (current + 1.0))
-        score = torch.where(
-            eligible,
-            marginal / seconds_per_draw,
-            torch.full_like(marginal, -torch.inf),
-        )
-        chosen = int(torch.argmax(score))
-        counts[chosen] += 1
-        spent += float(seconds_per_draw[chosen])
-    return counts.to(torch.int32)
-
-
 def allocate_fixed_statistical_counts(
     mass: Tensor,
     variance: Tensor,
@@ -873,11 +814,6 @@ def mode_loss(
         }
     )
     return ModeLossResult(per_decision, stats)
-
-
-ModeLoss = mode_loss
-
-
 @dataclass(frozen=True)
 class DistributedLearnerConfig:
     """Measured execution inputs for one fixed-rollout update."""
@@ -1478,6 +1414,3 @@ class DistributedFixedRolloutUpdate:
             )
         caches.clear()
         return DistributedUpdateResult(tuple(steps), MappingProxyType(metrics))
-
-
-distributed_fixed_rollout_update = DistributedFixedRolloutUpdate

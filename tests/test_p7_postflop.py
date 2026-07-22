@@ -11,8 +11,6 @@ from pbg.games.poker.model.incidence import (
 from pbg.games.poker.model.postflop import (
     PostflopMasks,
     PostflopNet,
-    permute_suit_representation,
-    suit_row_permutation,
 )
 from pbg.games.poker.model.preflop import PokerModelConfig, PokerPublicBatch
 
@@ -89,17 +87,6 @@ def test_configured_summary_accepts_absent_fields_as_zeros():
     model = PostflopNet(_cfg(summary_dim=3))
     output = model(pub, ranges, masks=masks)
     assert torch.isfinite(output.v).all()
-
-
-def test_suit_representation_relabels_board_and_rows_consistently():
-    permutation = (2, 0, 3, 1)
-    row_map = suit_row_permutation(permutation)
-    assert torch.unique(row_map).numel() == 1326
-    board = torch.tensor([[0, 5, 10, -1, -1]])
-    rows = torch.arange(1326)[None]
-    mapped_board, mapped = permute_suit_representation(board, {"rows": rows}, permutation)
-    assert mapped_board.tolist() == [[2, 4, 11, -1, -1]]
-    assert torch.equal(mapped["rows"][0, row_map], rows[0])
 
 
 def test_incidence_residual_exact_card_identical_and_own_channels():
