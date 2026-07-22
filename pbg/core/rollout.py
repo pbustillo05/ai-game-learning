@@ -557,6 +557,7 @@ def _sample_trees_sequential(
                 stopped_nodes = routed.candidate_handles[-1, :stopped].to(torch.int32)
                 stopped_rows = stopped_nodes.to(torch.int64)
                 stopped_states = buffer.state_ref[stopped_rows].to(torch.int32)
+                stopped_owners = buffer.owner[stopped_rows].to(torch.int32)
                 stopped_reach = reach_rows_for(stopped_nodes).detach().clone()
                 leaf_address = arena.gather_many(
                     ("trajectory_id", "path_key"), stopped_rows
@@ -581,16 +582,20 @@ def _sample_trees_sequential(
                             purpose=DrawPurpose.COMPLETION,
                         )
                         tree_ids = buffer.tree_id[stopped_rows].to(torch.int64)
-                        capture_leaf = capture(
-                            stopped_states, root_profiles[tree_ids], keys
-                        )
-                        if probe_enabled and mode != "normal":
-                            capture_rb = getattr(backend, "capture_rb_leaf", None)
-                            if callable(capture_rb):
-                                capture_leaf = {
-                                    **capture_leaf,
-                                    **capture_rb(stopped_states, stopped_reach),
-                                }
+                        if probe_enabled:
+                            assert probe_seats is not None
+                            capture_leaf = capture(
+                                stopped_states,
+                                stopped_reach,
+                                root_profiles[tree_ids],
+                                keys,
+                                stopped_owners,
+                                probe_seats[tree_ids],
+                            )
+                        else:
+                            capture_leaf = capture(
+                                stopped_states, root_profiles[tree_ids], keys
+                            )
                 else:
                     capture = getattr(backend, "capture_rb_leaf", None)
                     if callable(capture):

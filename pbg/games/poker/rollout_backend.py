@@ -2588,26 +2588,72 @@ class PokerRolloutBackend:
         }
 
     def capture_probe_leaf(
-        self, states: Tensor, profiles: Tensor, keys: Tensor
+        self,
+        states: Tensor,
+        reach: Tensor,
+        profiles: Tensor,
+        keys: Tensor,
+        owners: Tensor,
+        selected_seats: Tensor,
     ) -> dict[str, Tensor]:
-        """Settle ordinary and probe-cutoff leaves before state recycling."""
+        """Materialize ordinary and explicit probe-cutoff leaves at last use."""
 
-        owner = self.classify(states)
-        reward = torch.empty(
+        self._validate_handles(states)
+        batch = states.numel()
+        if reach.ndim != 3 or reach.shape[:2] != (batch, self.n_players):
+            raise ValueError("probe leaf reach must have shape [B,P,X]")
+        if profiles.shape != (batch, self.n_players):
+            raise ValueError("probe leaf profiles must have shape [B,P]")
+        if keys.shape != states.shape or keys.dtype != torch.int64:
+            raise ValueError("probe leaf keys must be int64 [B]")
+        if owners.shape != states.shape or owners.dtype != torch.int32:
+            raise ValueError("probe leaf owners must be int32 [B]")
+        if selected_seats.shape != states.shape or selected_seats.dtype != torch.int32:
+            raise ValueError("selected probe seats must be int32 [B]")
+        if any(
+            value.device != self.device
+            for value in (reach, profiles, keys, owners, selected_seats)
+        ):
+            raise ValueError("probe leaf inputs must be device-local")
+        if bool(((selected_seats < 0) | (selected_seats >= self.n_players)).any()):
+            raise ValueError("selected probe seats are out of range")
+
+        classified = self.classify(states)
+        cutoff = owners == PROBE_FOLD
+        if bool((~cutoff & (owners != classified)).any()):
+            raise ValueError("ordinary probe leaf owner disagrees with poker state")
+
+        reward = torch.zeros(
             (states.numel(), self.n_players),
             dtype=torch.float32,
             device=self.device,
         )
-        cutoff = owner == PROBE_FOLD
+        rows = states.to(torch.int64)
+        selected = selected_seats.to(torch.int64)
+        fold_payoff = self.states.fold_payoff[rows].detach().to(torch.float32).clone()
         if bool(cutoff.any()):
-            rows = states[cutoff].to(torch.int64)
-            reward[cutoff] = -self.states.committed_total[rows].to(torch.float32)
+            positions = cutoff.nonzero(as_tuple=False).squeeze(1)
+            cutoff_rows = rows[positions]
+            cutoff_seats = selected[positions]
+            payoff = -self.states.committed_total[
+                cutoff_rows, cutoff_seats
+            ].to(torch.float32)
+            reward[positions, cutoff_seats] = payoff
+            fold_payoff[positions] = 0.0
+            fold_payoff[positions, cutoff_seats] = payoff
         ordinary = ~cutoff
         if bool(ordinary.any()):
             reward[ordinary] = self.sampled_terminal_reward_keyed(
                 states[ordinary], profiles[ordinary], keys[ordinary]
             ).to(torch.float32)
-        return {"reward": reward.detach()}
+        completion = self.completion_inputs(states, reach)
+        completion.pop("range_weights")
+        return {
+            "reward": reward.detach(),
+            "owner": owners.detach(),
+            "fold_payoff": fold_payoff,
+            **{name: value.detach() for name, value in completion.items()},
+        }
 
     def reward(self, profiles: Tensor, terminal_states: Tensor) -> Tensor:
         """Return locally known fold payoff rows ``[B,P]``."""

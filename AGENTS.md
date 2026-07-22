@@ -80,6 +80,21 @@ This repo is often used on a shared GPU server, and we must used these GPUs for 
 Do use the GPUs but be conservative:
 - Do NOT modify servers in the other repo (GPU-evaluator). You should only treat it as read only
 - Use a virtualenv for Python work. Do not install packages into the server's system Python. Prefer one persistent user-level venv shared by the poker repos (there should be one available at `/home/pablob/.venvs/poker` and if unavailable, ask the user to create it), so dependencies are not reinstalled every session.
+- The shared venv owns the CUDA toolkit; it is not installed under
+  `/usr/local/cuda`. Before compiling or loading CUDA extensions, activate the
+  venv and export its toolkit location:
+  ```bash
+  source /home/pablob/.venvs/poker/bin/activate
+  export CUDA_HOME=/home/pablob/.venvs/poker/lib/python3.10/site-packages/nvidia/cu13
+  export PATH="$VIRTUAL_ENV/bin:$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
+  ```
+  In particular, `nvcc` is at
+  `/home/pablob/.venvs/poker/lib/python3.10/site-packages/nvidia/cu13/bin/nvcc`
+  and `ninja` is at `/home/pablob/.venvs/poker/bin/ninja`. Do not report either
+  as missing until those exact locations have been checked with the environment
+  above; invoking the venv's Python by absolute path does not itself add the
+  venv's `bin` directory to `PATH`.
 - Check GPU state before CUDA work with `nvidia-smi`. If sandboxed access fails, request explicit approval rather than guessing.
 - Do not touch other users' GPU jobs. After checking GPU state, make sure to only launch tasks in idle available GPUs.
 - After a GPU task is done, make sure the GPU has returned to a clean idle state, without any strange lingering workload or memory usage.
