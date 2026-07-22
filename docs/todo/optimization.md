@@ -1,9 +1,11 @@
 # Rollout optimization program
 
 Status: eager-rollout stopping point accepted 2026-07-22. The 2,560-start
-production baseline is now established. History-based queue subdivision is
-deferred; the next pass should start with the per-card memory envelope or the
-full dequeue-to-enqueue execution boundary.
+production baseline and per-card envelope are established. History-based queue
+subdivision and the full dequeue-to-enqueue execution boundary are user-deferred.
+An easier-candidate sweep of direct single-policy execution, isolated fullgraph
+compilation, and static model CUDA graphs found no acceptable production change;
+the rejected paths and evidence are recorded below.
 
 This document is the performance decision log and experiment queue. It is not
 authority for sampling, estimator, target, or storage-lifetime semantics.
@@ -173,19 +175,19 @@ experiment is not accidentally repeated. Status must be exactly `Open`,
 
 | ROI | Idea | Status | Evidence or acceptance gate |
 |---:|---|---|---|
-| 1 | Build an allocation-free dequeue-to-enqueue pack and compile/capture it per exact family and row bucket | Open | About 790 launches/decision in the bounded profile; require at least 15% rollout gain, bounded graph workspaces, and unchanged logical RNG |
-| 2 | Fuse remaining transition, reach, routing, and retained-write preprocessing | Open | Public/legal/history and selected logp are already reused; require at least 15% for a complex fused implementation |
-| 3 | Finish and re-baseline vectorized CUDA target recurrences | Open | Require exact targets, no per-node D2H, and at least 2x target speedup; especially relevant for branching |
-| 4 | Capture learner gather + forward + loss + backward by partition/shape | Open | Require at least 15% learner compute gain with identical gradients and fixed rows/step |
-| 5 | Add policy-only reference forward/cache | Open | Reference cache had a 7.59 s ceiling and retains unused value/branching outputs; require matching KL and lower bytes/time |
-| 6 | Gate detailed CUDA events and fuse finite/norm/clip reductions | Open | Preserve skip/clip semantics while reducing launches and host decisions |
-| 7 | Precompute or bit-pack immutable learner descriptors | Open | Accept only with net admitted-byte benefit and faster sampled subspans |
-| 8 | Keep active preflop reach in natural 169-class form until one bounded flop expansion | Open | Require exact reach and sampling equivalence |
-| 9 | Bucket rollout history at 8/16/32/42 tokens | Open | Deferred: another queue dimension can fragment higher-player workloads into underfilled calls; require a multi-player packing study before implementation |
-| 10 | Overlap gradient communication with final backward buckets | Open | Only a 3.16 s measured ceiling; require identical reduced flat gradients |
-| 11 | Replace the allocator `empty_cache()` boundary with measured reusable-space admission | Open | Require no OOM regression across adversarial phase closures |
-| 12 | Deterministic small-k chance selection instead of sorting all 52 scores | Open | Preserve the exact counter-key sampling law or obtain explicit approval for an equivalent law |
-| 13 | Replace dynamic history recycling with fixed-capacity device worklists | Open | Separate large ownership rewrite; require explicit go-ahead, shared-ancestor safety, bounded rollback, fewer launches/syncs, and unchanged last-consumer lifetime |
+| 1 | Fuse remaining transition, reach, routing, and retained-write preprocessing | Open | Public/legal/history and selected logp are already reused; require at least 15% for a complex fused implementation |
+| 2 | Finish and re-baseline vectorized CUDA target recurrences | Open | Require exact targets, no per-node D2H, and at least 2x target speedup; especially relevant for branching |
+| 3 | Capture learner gather + forward + loss + backward by partition/shape | Open | Require at least 15% learner compute gain with identical gradients and fixed rows/step |
+| 4 | Add policy-only reference forward/cache | Open | Reference cache had a 7.59 s ceiling and retains unused value/branching outputs; require matching KL and lower bytes/time |
+| 5 | Gate detailed CUDA events and fuse finite/norm/clip reductions | Open | Preserve skip/clip semantics while reducing launches and host decisions |
+| 6 | Precompute or bit-pack immutable learner descriptors | Open | Accept only with net admitted-byte benefit and faster sampled subspans |
+| 7 | Keep active preflop reach in natural 169-class form until one bounded flop expansion | Open | Require exact reach and sampling equivalence |
+| 8 | Bucket rollout history at 8/16/32/42 tokens | Open | Deferred: another queue dimension can fragment higher-player workloads into underfilled calls; require a multi-player packing study before implementation |
+| 9 | Overlap gradient communication with final backward buckets | Open | Only a 3.16 s measured ceiling; require identical reduced flat gradients |
+| 10 | Replace the allocator `empty_cache()` boundary with measured reusable-space admission | Open | Require no OOM regression across adversarial phase closures |
+| 11 | Deterministic small-k chance selection instead of sorting all 52 scores | Open | Preserve the exact counter-key sampling law or obtain explicit approval for an equivalent law |
+| 12 | Replace dynamic history recycling with fixed-capacity device worklists | Open | Separate large ownership rewrite; require explicit go-ahead, shared-ancestor safety, bounded rollback, fewer launches/syncs, and unchanged last-consumer lifetime |
+| — | Build an allocation-free dequeue-to-enqueue pack and compile/capture it per exact family and row bucket | Open | User-deferred 2026-07-22; do not start without renewed explicit go-ahead. About 790 launches/decision came from a small wall-time-distorted profile; require a production-shape launch profile, at least 15% rollout gain, bounded graph workspaces, and unchanged logical RNG |
 | — | Dense recyclable live-state slab | Implemented in `d95b7d3` | Dominant regression fixed; mutable capacity remains proportional to the admitted live frontier, not total nodes |
 | — | Tune production family width | Implemented in `be0b009` | Width 84 selected; width 88 was only 1.5% faster and left about 158 MB below 10 GB |
 | — | Direct contiguous append commit | Implemented in `5ecfeb4` | About 1.1% matched gain with unchanged ownership |
@@ -199,6 +201,9 @@ experiment is not accidentally repeated. Status must be exactly `Open`,
 | — | Use 4,096-row cold-storage chunks | Rejected | Only about 0.3% faster than the bounded derived chunk |
 | — | Flexible/automatic attention dispatch | Rejected | 56.078 s versus about 31.86 s with SDPA |
 | — | Widen active trajectory window without widening family packs | Rejected | Active windows 32 and 64 were effectively tied once family packs filled |
+| — | Bypass mixed-role staging for ordinary single-policy rollout | Rejected | Exact paired work but 0.41--0.65% slower at 2,560 starts; saved only about 0.9 MB peak allocation |
+| — | Compile the fixed-width history materializer | Rejected | Plain fullgraph was 1.23--1.59% slower; reduce-overhead was 1.60--3.21% slower and recorded nine dynamic CUDA graphs with up to about 189 MB extra reservation |
+| — | Compile/capture isolated full-row inference models | Rejected | Static Inductor reduced matched-shape rollout time/decision by 15.5--16.3% but changed sampled actions/topology in every repeat; dynamic Inductor failed real-shape code generation. Eager-kernel CUDA graphs exhausted the admitted downstream workspace, and preflop-only capture left 759 MB reserved at teardown |
 | — | Optimize scheduler control transfers or sealing first | Rejected | Scheduler control was 4.4 ms and sealing about 13 ms per full iteration |
 | — | Whole-iteration CUDA graph | Rejected | Conflicts with bounded dynamic realized work; capture fixed pack shapes instead |
 | — | Move poker transitions to CPU | Rejected | Violates the accelerator-only hot-path contract and adds strict device/host dependencies |
@@ -291,6 +296,55 @@ world size 3, SDPA, 65,536 training tokens, 83,886,080 training token pairs,
 0.945 maximum memory fraction, 0.5 GiB reserve, and 10,464,919,552 usable bytes
 per card. This is a capability/correctness smoke, not end-to-end throughput
 evidence.
+
+### Easier-candidate compile/allocation sweep
+
+After deferring the full dequeue-to-enqueue ownership rewrite, a fresh paired
+sweep used the same required 2,560-start workload on one idle RTX 2080 Ti. The
+source checkpoint and wrapper retained their documented SHA-256 identities, and
+all 366 model tensors were exactly equal. Repeat seeds were 104830, 209559, and
+314288. The fresh eager baseline was:
+
+| Repeat | Decisions | Calls | Padded pairs | Rollout | ms/decision | Peak allocated/reserved |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 10,316 | 147 | 40.625 B | 38.824 s | 3.763 | 4.624/8.850 GB |
+| 2 | 9,747 | 149 | 37.491 B | 37.106 s | 3.807 | 4.625/8.871 GB |
+| 3 | 10,201 | 144 | 39.913 B | 38.609 s | 3.785 | 4.625/8.921 GB |
+
+The following candidates were rejected and removed:
+
+- A direct ordinary single-policy branch removed identity advanced-index
+  gathers and result scatter buffers while retaining the general mixed-policy
+  probe path. It preserved decisions, nodes, calls, and padded work exactly in
+  all repeats but measured 3.788, 3.823, and 3.804 ms/decision: regressions of
+  0.41--0.65%. Peak allocation fell by only about 0.9 MB.
+- `torch.compile(fullgraph=True, dynamic=True)` on fixed-width history packing
+  measured 3.824, 3.858, and 3.832 ms/decision, 1.23--1.59% slower on the two
+  exact paired repeats. The middle repeat produced the historically documented
+  9,745 decisions rather than the fresh eager run's anomalous 9,747, so it is
+  not paired evidence. `mode="reduce-overhead"` was worse at 3.825, 3.933, and
+  3.868 ms/decision; it recorded nine input-size CUDA graphs and increased peak
+  reservation by as much as about 189 MB.
+- Dynamic fullgraph compilation of the real inference models failed Inductor
+  code generation with `CantSplit` on production postflop and later preflop tail
+  shapes. Restricting Inductor to static 84-row exact-family calls completed and
+  measured 3.181, 3.205, and 3.168 ms/decision, a nominal 15.5--16.3% time
+  reduction, but changed sampled actions and topology in every repeat: decisions
+  became 10,308, 9,743, and 10,185 and calls/padded work also changed. This is a
+  semantic failure, not an optimization result.
+- Static `cudagraphs` replay of the original eager model operators avoided the
+  Inductor numerical change, but capturing all exact families retained enough
+  workspace that no completion/backward workspace remained under the hard
+  envelope. Preflop-only capture fit during execution but failed teardown with
+  759,169,024 bytes still reserved versus the roughly 130 MB eager framework
+  context. No graph implementation remains in production.
+
+The focused sequential-RB CUDA test and three-player mixed-policy probe test
+passed for the direct-path candidate before its performance rejection. The
+compiled-history and model candidates also passed the focused sequential-RB
+CUDA test before the production-scale gates exposed their time, semantics, or
+memory failures. GPU 0 returned to its 6 MiB display-only idle state after each
+completed or failed experiment.
 
 ### Root-cause bisection
 
@@ -409,6 +463,9 @@ bucketing or start it without explicit approval. Any replacement must keep
 mutable history capacity proportional to the admitted live frontier.
 
 ### Full rollout pack compilation/capture
+
+This item is user-deferred as of 2026-07-22. Do not begin the ownership rewrite
+or an implementation spike without renewed explicit approval.
 
 The desired fixed-shape unit is:
 
