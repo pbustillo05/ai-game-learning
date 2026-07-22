@@ -1,6 +1,8 @@
 # Implementation prompt: restore the authoritative storage lifecycle without losing dynamic branching
 
-You are working in `/home/pablob/ai-game-learning`. Treat this as a substantial implementation and validation task, not as an audit-only exercise. Work through the production call graph, implement the migration, run conservative CPU and GPU validation, update the current documentation, and leave a coherent commit. Do not stop after adding abstractions or tests that are disconnected from training.
+You are working in `/home/pablob/ai-game-learning`. Treat this as a substantial implementation and validation task, not as an audit-only exercise. Work through the production call graph, implement the migration, run conservative CPU and GPU validation, update the current documentation, and leave a coherent phase-by-phase commit chain. Do not stop after adding abstractions or tests that are disconnected from training.
+
+Run this as one persistent goal spanning all phases below. Do not interpret “one goal” as one unreviewable final diff: phase-boundary commits are mandatory. Continue autonomously through compaction/context renewal and use the repository history plus the phase handoff records to resume exactly where the preceding phase ended. Do not declare the goal complete until every phase, cleanup gate, and CPU/GPU acceptance requirement has passed.
 
 ## Objective
 
@@ -100,6 +102,146 @@ Commit history shows the disconnect:
 - `79a354b` and the current uncommitted changes added dynamic KKT branching, $T/C$ heads, queue correction, and root refill on top of the still-legacy branched rollout and `NodeTargets` path.
 
 The result is two architectures in one repository: well-tested new storage/target primitives, and a production path that still constructs large legacy owners before converting them at the end.
+
+## Preservation baseline: migrate forward from `1cde6de`, never revert wholesale
+
+The implementation baseline for this task is commit `1cde6de` (`Pre-refactor fix commit`) and its descendants, not `04bd089`, `8d94724`, or any other historical refactor commit. Historical commits are evidence about intent and regressions; they are not source snapshots to restore over current files.
+
+Do not use whole-file checkout, wholesale revert, or broad cherry-pick from an old refactor commit to implement this task. Build the correct storage lifecycle forward from the current baseline. Before replacing a current module, inspect its history and migrate every still-supported behavior and test that is independent of the retired allocation model.
+
+Deletion means removal of superseded representations after their consumers and useful behavior have migrated. It does not authorize removing newer scientific, performance, evaluator, serving, observability, checkpoint, or experiment functionality merely because it currently touches a legacy class.
+
+If a behavior below appears incompatible with the new lifecycle, stop and report the concrete conflict to the user. Do not silently choose either deletion or preservation.
+
+### Required preservation ledger
+
+Use this as a minimum ledger. Expand it during the initial history audit if later commits or current files contain additional behavior.
+
+#### Sealed-storage and learner refactor: `04bd089`, `86756b8`, `8d94724`
+
+Preserve and make genuinely production-active:
+
+- immutable `PartitionSpec`/`CompletionSpec` boundaries and game-neutral routing;
+- exact versus natural domains and the fixed $H\to K$ quotient;
+- schema-derived storage/accounting concepts and stable row ids;
+- compact sequential and branched topology types;
+- the mathematical target builders in `pbg/core/targets.py`, extended for current dynamic branching;
+- immutable `TrainingStorage` and per-partition sampling metadata;
+- global stratum-mass normalization, bounded physical learner subspans, optional transactionally admitted reference caches, and flat fp32 gradient SUM semantics;
+- the common per-GPU sequential memory controller, after replacing its legacy capacity model.
+
+Delete only the compatibility wiring that prevented these objects from becoming the sole production path.
+
+#### Learner and model performance work: `537700f`
+
+Preserve or revalidate with equal-or-better measured behavior:
+
+- mass/variance/cost-aware fixed statistical-count allocation with every positive-mass stratum covered;
+- fused policy log-probability/entropy/reference-KL computation through the adapter;
+- sampled-row reference caching, pre-drawn learner indices, and cache rollback without changing RNG state or targets;
+- separately planned reference-cache build shapes and reference build telemetry;
+- stable physical planning and one-row-tail correctness;
+- CUDA phase timing and learner observability;
+- SDPA/fused attention support, exact additive reach/key bias, configurable attention backend/query chunking, and bounded workspace estimates matched to the selected backend;
+- trained initialization from a checkpoint and its separation from full resume;
+- hardware-token and token-pair limits, calibrated physical row caps, and the throughput work recorded in the 2026-07-17 optimization audits;
+- the fused-attention and distributed-learner tests that express these behaviors.
+
+Do not restore the slower pre-`537700f` learner/model path merely because its allocation story is simpler. Replace any invalid heuristic memory estimate with measurement/schema-based admission while preserving the execution optimization.
+
+#### Configuration cleanup: `567d913` and `81f4cdd`
+
+- Do not resurrect configs already removed as stale.
+- Preserve repository ignore/hygiene changes and keep generated TeX/run artifacts out of commits.
+
+#### Apple Silicon inference: `6fc518c`
+
+Preserve MPS serving/export/inference support. It is orthogonal to CUDA rollout storage. Changes to shared model or checkpoint interfaces must keep the existing MPS inference tests and artifact contract passing.
+
+#### Branching tools and duplicate-preserving sampling: `818aa17`
+
+Preserve:
+
+- duplicate-preserving labeled child semantics;
+- logical child identity even when public event labels coincide;
+- branching sweep, plotting, and resumable sweep functionality where still scientifically current;
+- topology/RNG tests that enforce those semantics.
+
+Migrate these tools to the sole rollout/storage API rather than retaining a second legacy sampler for them.
+
+#### Poker evaluator contract v1: `2429ab6`
+
+Preserve the complete evaluator-contract migration, not merely the fact that a sibling evaluator is called:
+
+- compact-deck $R=4,\ldots,13$ geometry;
+- the current card/range/folded-summary/completion dtypes and layouts;
+- evaluator-owned posterior, equity, showdown, and folded-summary work;
+- current CPU/CUDA backend selection and contract validation;
+- current impossible-hand, board-blocking, live-seat, and folded-player behavior;
+- the integration tests added or updated by this commit.
+
+The sibling repository remains read-only. Do not reintroduce an older evaluator API or local poker completion implementation during storage migration.
+
+#### Vectorized validation: `b94941c`
+
+The legacy `TreeBatch` type may disappear, but preserve its performance lesson and validation strength:
+
+- topology validation must remain vectorized/bounded on CUDA;
+- do not introduce per-node or per-edge host scalar reads;
+- retain equivalent parent/child, depth/player-clock, path-mass, root, and contiguous-span validation in the new topology.
+
+#### Explicit fixed/dynamic branching and KKT heads: `79a354b`
+
+Preserve:
+
+- explicit `fixed` versus `dynamic` branching configuration and rejection of ambiguous combinations;
+- `AdaptiveKKTController`, checkpoint/resume state, warmup, log-space $\kappa$ update, beta clipping, and deterministic rank behavior;
+- public $T/C$ model heads, their initialization/migration behavior, positive parameterizations, targets, masks, losses, and inference/training boundary;
+- nominal versus executed child counts and queue-safeguard corrections;
+- no-private-tilting and rank-addressed logical RNG invariants;
+- current model/input shape tests for preflop and postflop branching heads.
+
+These features must move into the new schemas and target builder; they must not be quarantined with the legacy `NodeTargets` implementation.
+
+#### Current variance theory and experiments: `3f594c7`, `8573a84`
+
+Preserve:
+
+- the current `core_math.tex` variance analysis as authority;
+- sequential and branched Rao--Blackwell variance experiment CLIs;
+- evaluator modules, calibration modes, configuration files, tests, plotting inputs, and logical sampling semantics;
+- loss-breakdown and raise-distribution diagnostic tooling where it remains active.
+
+Migrate experiment data access to `RolloutStorage`/`TrainingStorage` views or a new read-only diagnostics interface. Do not retain legacy reach/tree allocators solely for experiments, and do not delete the experiments merely because their current adapters depend on those allocators.
+
+#### Pre-refactor fixes and current work: `1cde6de`
+
+Preserve every independent improvement in the immediate baseline, especially:
+
+- lower tree-size root refill with fresh logical ordinals, protected ordinary-root cohort, final root masses, protected root targets, and corrected counterfactual size observation;
+- `branching_min_nodes` behavior while migrating it away from `node_budget` to the new byte-safe contract;
+- utility normalization (`none`/`stack`) applied consistently to normal terminal rewards and RB completion values;
+- exact value-head unit conversion when initializing across utility conventions;
+- initialization checkpoint game-identity validation, SHA-256 provenance, converted-tensor metadata, and checkpoint round-trip of initialization metadata;
+- explicit entropy-decay horizon with legacy fallback behavior;
+- per-step gradient norm, clipping, finite/nonfinite, and optimizer-step diagnostics;
+- normalized-loss smoke/pilot configurations and their recorded audit evidence;
+- root-refill, utility-normalization, loss, configuration, performance-gate, and learner tests added in this commit;
+- the dynamic-beta and node-budget audits as current design evidence;
+- the strengthened `AGENTS.md` authority/drift rules and this implementation prompt.
+
+When `branching_min_nodes` or another preserved feature currently names `node_budget`, migrate its safety condition and configuration explicitly; do not delete the feature as collateral damage from deleting the old field.
+
+### Preservation proof required before deletion
+
+Before deleting each legacy class or module, maintain a migration table with:
+
+| Retired artifact | Current consumers | New owner/API | Preserved behaviors/tests | Deletion evidence |
+|---|---|---|---|---|
+
+For every post-refactor behavior above, identify at least one direct test or acceptance measurement on the new path. A symbol search showing that the old code disappeared is necessary but not sufficient; the replacement must demonstrate semantic and, for performance work, measured continuity.
+
+At final acceptance, compare the supported feature/config/CLI/test inventory at `1cde6de` with the final commit. Any removed user-facing capability must be listed and explicitly approved by the user. Internal retired types do not need compatibility, but their still-supported consumers and semantics do.
 
 ### Production phase order is wrong
 
@@ -333,20 +475,47 @@ Keep the useful `pbg/core/learner.py` machinery, but verify its input no longer 
 
 ## Implementation strategy
 
-Use incremental, testable vertical slices while keeping one final architecture.
+Use six incremental, testable vertical phases while keeping one final architecture.
 
-1. Add call-graph and ownership tests that expose the current compatibility path.
-2. Reconcile the pseudocode schemas with dynamic branching and root refill.
-3. Introduce the common byte-admitted page store and migrate compact topology/controller columns.
-4. Migrate poker state/public/history access to append/gather/release APIs and sparse summary anchors.
-5. Make normal production rollout produce real `RolloutStorage`; wire normal target building and remove its legacy dataset path.
-6. Migrate sequential RB, including natural decision inputs, exact leaf completion rows, decision-only CSR, posterior deduplication, and target streaming.
-7. Migrate branched RB with ragged actions, bounded frontier, KKT $T/C$, queue correction, and protected root refill.
-8. Delete production compatibility conversion and legacy allocation/config surfaces.
-9. Rebuild phase prediction/checkpoint migration from schemas.
-10. Validate, profile, optimize only measured physical bottlenecks, and update current documentation/audits.
+1. **Authority, characterization, and deletion plan.** Add call-graph and ownership tests that expose the current compatibility path; reconcile the pseudocode schemas with dynamic branching and root refill; complete the preservation ledger and per-artifact migration/deletion table.
+2. **Storage foundation and poker ownership.** Introduce the common byte-admitted page store and compact topology/controller columns; migrate poker state/public/history ownership to live recyclable slots plus immutable decision inputs; implement sparse summary anchors and exact admitted sealing.
+3. **Normal and sequential-RB production migration.** Make normal production rollout produce real `RolloutStorage`; wire normal targets and remove its legacy dataset path; migrate sequential RB natural decision inputs, exact leaf completion rows, decision-only CSR, posterior deduplication, and streamed targets; delete the sequential legacy owners after their last consumers migrate.
+4. **Fixed and dynamic branched production migration.** Migrate branched RB to paged topology/live reaches, ragged actions, bounded frontier targets, KKT $T/C$, nominal/executed queue correction, protected root refill, and the branched memory-safety contract; delete the branched legacy owners after all tools and tests migrate.
+5. **Sole-path cleanup, configuration, and memory control.** Delete the post-hoc compatibility conversion and remaining legacy allocation/configuration surfaces; retire `node_budget`; rebuild four-phase prediction and checkpoint/config migration from schemas; migrate benchmarks, probes, variance tools, and evaluation consumers to the sole APIs; make the static deletion gates clean.
+6. **Full acceptance, profiling, and documentation.** Run full feasible CPU/distributed tests and conservative staged GPU validation/soaks; profile equal-semantics performance and fix evidence-backed regressions without changing estimators; complete current audits, training documentation, preservation comparison, final idle-GPU proof, and release verdict.
 
 Temporary adapters are acceptable only inside an actively developed vertical slice and must be removed in the same final migration. The final production path may not allocate both representations. Do not declare success while `_seal_iteration_training_storage` still converts legacy `NodeTargets`, or while `TrainingStorage.state_ref` keeps the all-node state store alive.
+
+### Mandatory phase commits and handoffs
+
+The goal must be implemented as a sequence of independently reviewable commits. Do not accumulate the entire migration in one commit, squash the phase history, or postpone commits until final acceptance.
+
+At the end of every numbered phase above:
+
+1. Finish the phase's production code, migrations, tests, and directly affected documentation; do not commit a deliberately broken intermediate state.
+2. Run the focused CPU tests and static/source gates relevant to that phase. Run a tiny GPU check only when the phase first changes a CUDA production path and the repository GPU rules permit it.
+3. Inspect `git status`, `git diff`, and the complete staged diff. Preserve unrelated user work and ensure generated artifacts, run outputs, and checkpoints are excluded.
+4. Write or update a concise phase handoff under `docs/audit/restore_storage_lifecycle/` containing:
+   - completed requirements;
+   - files/classes deleted and new ownership boundaries;
+   - exact test commands and results;
+   - preservation-ledger entries validated;
+   - known temporary adapters or remaining legacy consumers;
+   - the phase's starting baseline/parent commit and the next phase's starting conditions.
+5. Commit the phase with a descriptive message. The commit itself contains its handoff; do not amend it merely to write its own hash into that file. Record all phase commit hashes in the final acceptance index after the chain exists. Suggested messages are:
+   - phase 1: `test(core): define storage migration and ownership gates`;
+   - phase 2: `refactor(core): add byte-admitted rollout storage`;
+   - phase 3: `refactor(core): migrate sequential rollout storage`;
+   - phase 4: `refactor(core): migrate dynamic branched storage`;
+   - phase 5: `refactor(core): retire legacy rollout capacity`;
+   - phase 6: `test(core): validate sole memory-safe training pipeline`.
+6. Verify the worktree is clean before starting the next phase. The only permitted exception is a clearly identified pre-existing unrelated user change that was present at goal start and is recorded in every handoff; do not mix it into phase commits.
+
+If a phase cannot be made test-clean, do not hide the failure in a checkpoint commit and continue. Diagnose and fix it within the phase, or report the concrete blocker under the goal's blocking rules. A commit that merely adds failing characterization tests is allowed only when the same commit marks them explicitly as expected failures that do not make the normal suite red, and the immediately following phase must remove that marker when the replacement path lands.
+
+After each commit, re-read the master prompt's remaining requirements and preservation ledger. Use the committed phase boundary as the recovery point for any context compaction or process interruption; never reconstruct progress by checking out an older refactor snapshot.
+
+Before final acceptance, write the ordered phase names and commit hashes into the handoff index, verify that they form a comprehensible chain from baseline `1cde6de`, verify that no phase was silently squashed, and verify that every temporary adapter introduced by an earlier phase was removed by a later committed phase.
 
 ## Mandatory codebase cleanup and sole-implementation gate
 

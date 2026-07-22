@@ -15,6 +15,90 @@ Those numbers are the sequential RB baseline. CPU scheduler control is already
 negligible there. The leaks are GPU launch overhead, duplicated tensor work,
 poor postflop packing, immutable preprocessing, and exposed communication.
 
+## 2026-07-21 bounded packing sweep
+
+This follow-up was measured at commit `b55df976e80b` on one otherwise idle RTX
+2080 Ti. Every process was restricted to GPU 0, teardown was checked with
+`nvidia-smi`, and the card returned to 6 MiB / 0% utilization after the sweep.
+The workload used HU 32 bb sequential RB, 128 roots, 16 completion samples,
+one 16-row optimizer update, one warmup, and three timed repeats. The model was
+freshly initialized with the benchmark's fixed initialization protocol. These
+are throughput diagnostics, not trained-policy loss measurements.
+
+The table reports medians. Changing physical pack width can change borderline
+fp16 actions, so the realized topology is close but not bit-identical across
+every row. Compare rollout milliseconds per decision and model-call pressure,
+not raw iteration seconds alone.
+
+| Family rows | Active trajectories | Decisions | Rollout seconds | Rollout ms/decision | Model calls | Peak allocated / reserved |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 64 | 396 | 5.273 | 13.316 | 34 | 1.01 / 1.56 GiB |
+| 32 | 64 | 396 | 3.742 | 9.449 | 23 | 1.81 / 2.97 GiB |
+| 64 | 16 | 394 | 3.715 | 9.429 | 21 | 1.92 / 3.33 GiB |
+| 64 | 32 | 394 | 3.564 | 9.046 | 21 | 1.94 / 3.34 GiB |
+| 64 | 64 | 408 | 3.743 | 9.175 | 20 | 2.13 / 3.69 GiB |
+
+The 16- and 32-row/64-active samples performed the same median 958.9 million
+postflop padded attention pairs. The 16-row case was nevertheless about 41%
+slower per decision and made 34 rather than 23 model calls. This is a real
+launch/packing cliff, not extra attention work. A physical family below 32 rows
+should therefore be a tail shape, never the steady-state target, on this GPU.
+
+At this small workload, 32 active trajectories with 64-row physical families
+was the best stable point. Moving from 32 to 64 active trajectories did not
+improve median time per decision and increased peak allocation by about 10%.
+This does **not** supersede the production-width calibration at thousands of
+roots; it says that wider active windows must be justified by measured pack
+fill rather than assumed to help.
+
+A matching normal-mode point at family 64 / active 32 realized 418 decisions
+and spent 3.850 of 4.364 seconds in rollout (88.2%), at 96.9 decisions/s. The
+sequential-RB point spent 3.564 of 4.191 seconds in rollout (85.0%), at 94.0
+decisions/s. Seal plus target construction remained below 0.23 seconds and the
+one-update learner path below 0.39 seconds. Scheduler synchronization was only
+0.54--0.60 ms. The next optimization should still attack policy/model work
+inside rollout rather than scheduler control, sealing, or target propagation.
+
+The bounded branched probe cannot be used as a stable throughput baseline. Its
+three repeats produced 66, 74, and 2 nodes because the sequential base model
+has randomly initialized branching heads. The median sample used 18 model
+calls for only 36 decisions and spent 2.043 seconds in rollout, which is useful
+as evidence of small-pack overhead but not as an estimate for a trained
+branched policy. Future branched gates must use a trained T/C checkpoint or a
+fixed replayable topology and must stratify tiny/natural/cutoff-closed trees.
+
+### Measurement and harness findings
+
+- Full-iteration `torch.profiler` with CPU+CUDA activities, shapes, and memory
+  is unsafe here. Two completed 128-root traces each spent minutes constructing
+  the event tree, consumed 16--19 GiB of host RAM, and retained a 264 MiB CUDA
+  context. Both were terminated explicitly and all memory was recovered. Use
+  narrow scheduled windows, disable shape/memory recording unless required,
+  or add the CUDA-event buckets proposed below. Do not profile a complete
+  warmup-plus-iteration with every operator event.
+- `benchmarks/workloads.yaml` has drifted from the current CLI: it references a
+  missing `configs/benchmarks/nlhe_hu_short.yaml` and retired `--n-trees` and
+  `--node-budget` arguments. Repair that manifest before treating it as an
+  automated performance gate. Current bounded commands must use
+  `--roots-per-gpu` plus the schema's byte-admitted storage controls.
+- The benchmark correctly releases CUDA storage, but process setup and teardown
+  are a material fraction of tiny runs. Keep warmups and at least three timed
+  repeats, and report per-decision timing alongside iteration totals.
+
+### Ranking corrections from the sweep
+
+1. Preserve 32 rows as the measured steady-state floor and treat 16/8 rows as
+   tail graph shapes. Stable compiled/captured shapes remain high ROI.
+2. Do not prioritize a wider active-trajectory window until a production-width
+   profile shows it increases full postflop packs; 32 and 64 were effectively
+   tied here while 64 used more memory.
+3. Street-specific postflop compaction remains independent and high ROI: the
+   sweep changed call pressure but left padded postflop attention work near
+   one billion pairs per sample.
+4. Add lightweight component CUDA timing before attempting another general
+   operator trace. The profiler failure demonstrates that instrumentation must
+   itself be bounded.
+
 ## Fixed-$\beta$ branching benchmark
 
 Measured on 2026-07-21 on one idle RTX 2080 Ti using checkpoint 1110 from
@@ -493,7 +577,10 @@ should precede B1–B4.
 
 I would run the next optimization session in this order:
 
-1. Add CUDA-event buckets inside rollout for model, policy composition, reach update, poker transition, chance, and queue work.
+1. Add bounded aggregate CUDA-event buckets inside rollout for model, policy
+   composition, reach update, poker transition, chance, and queue work. Reuse
+   fixed instrumentation and enable it only for a short scheduled window; do
+   not retain every operator or create thousands of event objects.
 2. Fuse legal-policy/action/logp/reach work into one rollout-step function.
 3. Compile that function for pre-64 and post-64/32/16/8.
 4. Capture learner forward/loss/backward for its four observed physical shapes.

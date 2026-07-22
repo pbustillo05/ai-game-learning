@@ -103,3 +103,19 @@ the bounded BR trend probe remains intentionally outside this release gate.
   raw promotion comparisons, and historical prompts.
 
 `IMPLEMENTATION_NOTES.md` is a historical ledger, not a current contract.
+
+## Maintenance audit
+
+Generate a conservative production-reachability review list with:
+
+```bash
+/home/pablob/.venvs/poker/bin/python tools/audit_reachability.py --git
+```
+
+Installed commands, `python -m` guards, repository launchers, and the short
+declared public-API list seed the graph. Tests, tools, and documentation are
+reported as independent retention evidence; they do not silently make an
+object production-reachable. `HIGH`, `DOCS_ONLY`, and `REVIEW` are triage
+levels, never permission to delete. Use `--json` for a machine-readable report,
+`--root`/`--roots-file` for external consumers, and `--no-public-roots` to audit
+only discovered launch surfaces.

@@ -2,9 +2,14 @@
 
 Active audit documents describe the sole production NLHE implementation:
 
+- [`repo_audit_20260721/`](repo_audit_20260721/) is the current comprehensive
+  repository audit. Its verdict is **not ready**: two implementation blockers,
+  one BR-certification blocker, and the canonical C01--C18 findings remain.
+
 - [`restore_storage_lifecycle/phase_6_acceptance.md`](restore_storage_lifecycle/phase_6_acceptance.md)
   is the current CPU/GPU verdict and links the ordered six-phase restoration
-  chain.
+  chain. It is retained as pre-audit migration evidence rather than the current
+  repository-wide verdict.
 - [`restore_storage_lifecycle/`](restore_storage_lifecycle/) records each
   reviewable phase boundary from authority reconciliation through sole-path
   cleanup and acceptance.
