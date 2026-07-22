@@ -73,7 +73,7 @@ detached `tmux` session:
 ```bash
 tools/run-training.sh \
   --config configs/train/nlhe_hu_32bb_sequential_rb_candidate.yaml \
-  --hardware-profile configs/hardware/local_2x2080ti_12h.yaml \
+  --hardware-profile configs/hardware/local_3x2080ti.yaml \
   --run-dir runs/nlhe_hu_32bb_sequential_rb \
   --gpus 0,1 --resume runs/nlhe_hu_32bb_sequential_rb/ckpt_0000010.pt \
   --tmux

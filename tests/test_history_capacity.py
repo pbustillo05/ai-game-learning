@@ -54,4 +54,4 @@ def test_worst_history_attention_footprint_is_checked_against_profile(tmp_path: 
     )
     assert width > 8192
     with pytest.raises(ConfigError, match=r"hardware\.training_max_tokens"):
-        load_config(path, hardware_profile="local_3x2080ti")
+        load_config(path, hardware_profile="quest_slurm")

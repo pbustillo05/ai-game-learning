@@ -14,7 +14,7 @@ experiment=runs/experiments/branching_hu32_ckpt814
 common=(
   --config configs/train/nlhe_hu_32bb_rb.yaml
   --checkpoint "$checkpoint"
-  --hardware-profile configs/hardware/local_2x2080ti.yaml
+  --hardware-profile configs/hardware/local_3x2080ti.yaml
   --device cuda:0
   --repeats 64
   --node-budget 70000

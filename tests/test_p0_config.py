@@ -39,7 +39,7 @@ def test_hardware_profile_is_composed_without_changing_scientific_config() -> No
     assert cfg.hardware is not None
     assert cfg.hardware.name == "local_3x2080ti"
     assert cfg.hardware.expected_compute_capability == (7, 5)
-    assert cfg.hardware.training_max_tokens == 8192
+    assert cfg.hardware.training_max_tokens == 65536
     assert cfg.training.minibatch_size == 128
 
 

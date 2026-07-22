@@ -10,19 +10,18 @@ This is the current baseline hardware target.
 
 - One dedicated always-on server.
 - `3 x NVIDIA GeForce RTX 2080 Ti` GPUs, available 24 x 7.
-- Treat each GPU as an 11 GB VRAM class device. Detect exact usable memory at
-  runtime and leave headroom for evaluator kernels, rollout buffers, and logging.
+- Treat each GPU as an independent 11 GB VRAM class device with the same
+  approximately 10 GB PBG envelope whether one, two, or three ranks
+  participate. Detect exact usable memory at runtime and leave headroom for
+  CUDA/NCCL state, evaluator kernels, allocator variance, and display use.
 - CUDA architecture target: Turing / `sm_75`.
 - Do not assume cluster scheduling, preemption, shared filesystem semantics, or
   fast inter-node networking.
-- Treat attention memory as tight. Model code must run with compact postflop
-  valid-row tokenization and a non-FlashAttention fallback on this profile.
-  FlashAttention may be used only when the installed package, CUDA stack, GPU,
-  and required MHA bias/mask pattern support it. PyTorch SDPA or chunked dense
-  attention must remain available for smoke tests and debugging.
-- Multi-GPU training should work on one process per GPU with a generic backend
-  such as NCCL when available, but the first runnable baseline may use one GPU
-  plus CPU rollout workers if memory pressure is high.
+- Use the validated PyTorch SDPA path for production attention on this profile;
+  automatic/FlexAttention dispatch is not the production baseline.
+- Multi-GPU training uses one process per GPU with CUDA/NCCL. Production
+  rollout, model, targets, completion, and learner work remain on the selected
+  accelerator; there are no CPU rollout workers or CPU fallbacks.
 - The default implementation profile, tests, smoke runs, and initial paper
   timing logs should use this profile unless explicitly overridden.
 

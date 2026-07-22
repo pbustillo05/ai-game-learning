@@ -1,13 +1,22 @@
 name: local_3x2080ti
 scheduler: none
-attention_backend: auto
+attention_backend: sdpa
 query_chunk_size: 128
-training_max_tokens: 8192
-training_max_token_pairs: 67108864
+# This is a per-card envelope, independent of whether one, two, or three local
+# ranks participate. Validated on full-deck HU 32 bb: 53 preflop and 11
+# postflop statistical rows fit as two physical subspans. The 232-step probe
+# peaked at 3.84 GB learner-reserved memory and 6.80 GB iteration-reserved
+# memory, below the independent card ceiling and reserve.
+training_max_tokens: 65536
+training_max_token_pairs: 83886080
 inference_max_tokens: 16384
 inference_max_token_pairs: 134217728
-reserve_vram_gib: 2.0
-max_memory_fraction: 0.82
+# CUDA reports 10.57 GiB (11,264 MiB) per card. Cap every participating card
+# at about 10.0 GiB, leaving roughly 0.58 GiB for CUDA/NCCL state, allocator
+# variance, and display use. The fractional cap is the tighter constraint on
+# the observed devices (9.99 GiB).
+reserve_vram_gib: 0.5
+max_memory_fraction: 0.945
 max_devices: 3
 expected_compute_capability: [7, 5]
 min_vram_gib: 10.0
