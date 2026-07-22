@@ -81,6 +81,43 @@ def test_paged_edges_keep_stable_parent_local_ordinals_without_legacy_finalize()
     assert torch.equal(buffer.edge_weight[edge_rows], torch.tensor([1.0, 0.25, 0.75]))
 
 
+def test_child_addresses_can_be_reserved_before_physical_materialization() -> None:
+    buffer = PagedRolloutTopology(1, 2, "cpu", page_rows=2)
+    root = buffer.add_roots(
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+    )
+    children, edges = buffer.reserve_children(root.expand(3), torch.full((3,), 1 / 3))
+
+    assert children.tolist() == [1, 2, 3]
+    assert edges.tolist() == [0, 1, 2]
+    assert buffer.child_count[root.to(torch.int64)].tolist() == [3]
+    assert buffer.state_ref[children.to(torch.int64)].tolist() == [-1, -1, -1]
+
+    buffer.commit_children(
+        children[:2],
+        edges[:2],
+        torch.tensor([10, 11], dtype=torch.int32),
+        torch.tensor([1, TERMINAL], dtype=torch.int32),
+        torch.tensor([100, 101], dtype=torch.int32),
+    )
+    buffer.commit_children(
+        children[2:],
+        edges[2:],
+        torch.tensor([12], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([102], dtype=torch.int32),
+    )
+
+    assert buffer.state_ref[children.to(torch.int64)].tolist() == [10, 11, 12]
+    assert buffer.child_event[edges.to(torch.int64)].tolist() == [100, 101, 102]
+    assert buffer.depth_p[children.to(torch.int64)].tolist() == [
+        [1, 1],
+        [1, 0],
+        [2, 0],
+    ]
+
+
 def test_child_wave_page_admission_rolls_back_every_owner_before_mutation() -> None:
     node_page = PagedRolloutTopology.node_schema(2).capacity_bytes(1, chunks=1)
     edge_page = PagedRolloutTopology.edge_schema().capacity_bytes(1, chunks=1)

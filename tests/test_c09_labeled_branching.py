@@ -74,6 +74,9 @@ class _LabeledBackend:
         self.two_levels = two_levels
         self.forward_batch_sizes: list[int] = []
         self.actual_cost_batch_sizes: list[int] = []
+        self.profile_batch_sizes: list[int] = []
+        self.step_batch_sizes: list[int] = []
+        self.reach_update_batch_sizes: list[int] = []
 
     def _initial_state_batch(self, n: int) -> Tensor:
         return torch.zeros(n, dtype=torch.int32)
@@ -115,6 +118,7 @@ class _LabeledBackend:
         self, states: Tensor, reach: Tensor, gen: torch.Generator
     ) -> Tensor:
         del reach
+        self.profile_batch_sizes.append(int(states.numel()))
         draw = torch.randint(2, (states.shape[0],), generator=gen, device=states.device)
         return torch.stack((draw, torch.zeros_like(draw)), dim=1).to(torch.int32)
 
@@ -134,12 +138,14 @@ class _LabeledBackend:
 
     def step(self, states: Tensor, events: EventBatch) -> Tensor:
         del events
+        self.step_batch_sizes.append(int(states.numel()))
         return states + 1
 
     def reach_update(
         self, reach: Tensor, states: Tensor, events: EventBatch, policy_out: _Output | None
     ) -> Tensor:
         del states, events, policy_out
+        self.reach_update_batch_sizes.append(int(reach.shape[0]))
         return reach.clone()
 
     def beta_fn(self, states: Tensor) -> Tensor:
@@ -190,12 +196,17 @@ class _LabeledBackend:
 
 
 def _cfg(
-    root_count: int, beta: float, execution_memory_bytes: int = 1 << 20
+    root_count: int,
+    beta: float,
+    execution_memory_bytes: int = 1 << 20,
+    *,
+    family_batch_rows: int | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         roots_per_gpu=root_count,
         storage_page_rows=8,
         execution_memory_bytes=execution_memory_bytes,
+        family_batch_rows=family_batch_rows,
         branching_mode="fixed",
         adaptive_kkt=None,
     )
@@ -269,6 +280,42 @@ def test_branched_dispatches_actual_cost_family_blocks() -> None:
     assert backend.actual_cost_batch_sizes == [1, 2]
     assert backend.forward_batch_sizes == [1, 2]
     assert sample.action_ptr.tolist() == [0, 2, 4, 6]
+
+
+def test_child_materialization_is_bounded_and_physical_plan_invariant() -> None:
+    narrow_backend = _LabeledBackend(4.0, two_levels=True)
+    wide_backend = _LabeledBackend(4.0, two_levels=True)
+    narrow = _sample(
+        narrow_backend, _cfg(1, 4.0, family_batch_rows=2), seed=31
+    )
+    wide = _sample(
+        wide_backend, _cfg(1, 4.0, family_batch_rows=3), seed=31
+    )
+
+    assert narrow_backend.profile_batch_sizes
+    assert max(narrow_backend.profile_batch_sizes) <= 2
+    assert max(narrow_backend.step_batch_sizes) <= 2
+    assert max(narrow_backend.reach_update_batch_sizes) <= 2
+    assert max(wide_backend.profile_batch_sizes) <= 3
+    assert 2 in narrow_backend.profile_batch_sizes
+    assert 3 in wide_backend.profile_batch_sizes
+
+    for name in (
+        "parent",
+        "child_begin",
+        "degree",
+        "decision_partition",
+        "decision_row",
+        "leaf_row",
+        "nominal_degree",
+    ):
+        assert torch.equal(getattr(narrow.topology, name), getattr(wide.topology, name))
+    assert torch.equal(narrow.action_ptr, wide.action_ptr)
+    assert torch.equal(narrow.action_source["event"], wide.action_source["event"])
+    assert torch.equal(
+        narrow.action_source["old_logp"], wide.action_source["old_logp"]
+    )
+    assert torch.equal(narrow.leaf_source["path_key"], wide.leaf_source["path_key"])
 
 
 def test_upper_cutoff_switches_later_expansions_to_spines() -> None:

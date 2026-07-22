@@ -149,6 +149,11 @@ def _sample_branched_tree_impl(
     x_sizes = tuple(int(value) for value in backend.x_sizes)
     x_max = max(x_sizes)
     page_rows = int(getattr(rollout_cfg, "storage_page_rows", None) or 256)
+    child_pack_rows = int(
+        getattr(rollout_cfg, "family_batch_rows", None) or page_rows
+    )
+    if child_pack_rows <= 0:
+        raise ValueError("branched physical child rows must be positive")
     execution_limit = int(
         getattr(rollout_cfg, "execution_memory_bytes", None) or (1 << 30)
     )
@@ -545,156 +550,216 @@ def _sample_branched_tree_impl(
                 nodes.to(torch.int32),
                 capture_inputs(family, states, reaches),
             )
-        parent_positions = torch.repeat_interleave(
-            torch.arange(nodes.numel(), device=device),
-            offspring,
-            output_size=total,
-        )
-        parents = nodes[parent_positions].to(torch.int32)
-        child_states = states[parent_positions]
-        child_reach = reaches[parent_positions]
         prefix = torch.empty_like(offspring)
         prefix[0] = 0
         prefix[1:] = offspring.cumsum(0)[:-1]
+        child_ends = prefix + offspring
         prior_children = buffer.child_count[rows].to(torch.int64)
-        ordinal = (
-            torch.arange(total, device=device)
-            - prefix[parent_positions]
-            + 1
-            + prior_children[parent_positions]
-        )
         parent_paths = arena.gather_many(("path_key",), rows)["path_key"]
-        expanded_paths = parent_paths[parent_positions]
-        posterior_keys = logical_rng_keys(
-            seed=logical_seed,
-            iteration=iteration,
-            trajectory=torch.full_like(expanded_paths, tree_address),
-            path=expanded_paths,
-            draw=ordinal,
-            purpose=DrawPurpose.POSTERIOR,
-        )
-        profiles = _sample_profiles_logical(
-            backend, child_states, child_reach, posterior_keys, gen
-        )
-        child_output = None
-        if family is not None:
-            assert output is not None
-            child_output = _index_policy_output(output, parent_positions)
-        event_keys = logical_rng_keys(
-            seed=logical_seed,
-            iteration=iteration,
-            trajectory=torch.full_like(expanded_paths, tree_address),
-            path=expanded_paths,
-            draw=ordinal,
-            purpose=(DrawPurpose.ACTION if family is not None else DrawPurpose.CHANCE),
-        )
-        events = _sample_events_logical(
-            backend,
-            child_states,
-            profiles,
-            child_output,
-            bundle.policy_adapter,
-            event_keys,
-            gen,
-        )
-        if family is None:
-            step_batch = getattr(backend, "step_chance_batch", backend.step)
-        else:
-            step_batch = getattr(backend, "step_player_batch", backend.step)
-        next_states = step_batch(child_states, events)
-        next_reach = backend.reach_update(
-            child_reach, child_states, events, child_output
-        )
-        next_owner = backend.classify(next_states).to(torch.int32)
+        if (
+            forced_edge_weight is not None
+            and not 0.0 < float(forced_edge_weight) <= 1.0
+        ):
+            raise ValueError("forced edge weight must lie in (0,1]")
+
+        def logical_child_subspan(start: int, end: int) -> tuple[Tensor, Tensor, Tensor]:
+            logical = torch.arange(start, end, dtype=torch.int64, device=device)
+            parent_positions = torch.searchsorted(child_ends, logical, right=True)
+            ordinal = (
+                logical
+                - prefix[parent_positions]
+                + 1
+                + prior_children[parent_positions]
+            )
+            return logical, parent_positions, ordinal
+
+        # Fix every topology, occurrence, reach, controller, and RNG address
+        # before the first posterior/event draw.  Only scalar address vectors are
+        # live here; dense child state/reach/profile work is staged below.
+        first_child = buffer.node_count
         first_edge = buffer.edge_count
-        if forced_edge_weight is None:
-            weights = offspring[parent_positions].reciprocal().to(torch.float32)
-        else:
-            if not 0.0 < float(forced_edge_weight) <= 1.0:
-                raise ValueError("forced edge weight must lie in (0,1]")
-            weights = torch.full(
-                (total,), float(forced_edge_weight), dtype=torch.float32, device=device
-            )
-        children = buffer.append_children(
-            parents, next_states, next_owner, events.public_id, weights
-        )
-        control_rows = control_arena.append(
-            {
-                "nominal_count": torch.zeros(total, dtype=torch.int32, device=device),
-                "beta": torch.zeros(total, dtype=torch.float32, device=device),
-                "log_player_sum": torch.full(
-                    (total,), -torch.inf, dtype=torch.float32, device=device
-                ),
-                "log_ancestor_product": torch.zeros(total, device=device),
-                "queue_cost": torch.zeros(total, device=device),
-            }
-        )
-        if not torch.equal(control_rows.to(torch.int32), children):
-            raise RuntimeError("branched controller rows lost topology alignment")
-        child_handles = arena.allocate(total)
-        if device.type == "cuda":
-            torch._assert_async(
-                (child_handles == children.to(torch.int64)).all(),
-                "branched occurrence and child handles diverged",
-            )
-        elif not torch.equal(child_handles, children.to(torch.int64)):
-            raise RuntimeError("branched occurrence and child handles diverged")
-        child_reach_handles = reach_pool.allocate(total)
-        reach_pool.write(child_reach_handles, {"log_reach": next_reach})
-        arena.scatter_many(
-            child_handles,
-            {
-                "path_key": child_path_keys(expanded_paths, ordinal),
-                "reach_handle": child_reach_handles,
-            },
-        )
-        child_log_sum, child_log_product = child_path_factors(
-            log_player_sum[rows][parent_positions],
-            log_ancestor_product[rows][parent_positions],
-            beta_rows[rows][parent_positions],
-            (next_owner >= 0) & (next_owner < p_max),
-        )
-        log_player_sum[children.to(torch.int64)] = child_log_sum
-        log_ancestor_product[children.to(torch.int64)] = child_log_product
-        if family is not None:
-            assert output is not None and child_output is not None
-            legal_ids, legal_mask = backend.legal_events(child_states)
-            edge_logp = _selected_policy_logp(
-                bundle.policy_adapter,
-                child_output,
-                events.public_id[:, None],
-                legal_ids,
-                legal_mask,
-            ).detach()[:, 0]
-            policy_edge_rows.append(
-                {
-                    "edge_id": torch.arange(
-                    first_edge,
-                    first_edge + total,
-                    dtype=torch.int64,
+        for start in range(0, total, child_pack_rows):
+            end = min(start + child_pack_rows, total)
+            _, parent_positions, ordinal = logical_child_subspan(start, end)
+            parents = nodes[parent_positions].to(torch.int32)
+            if forced_edge_weight is None:
+                weights = offspring[parent_positions].reciprocal().to(torch.float32)
+            else:
+                weights = torch.full(
+                    (end - start,),
+                    float(forced_edge_weight),
+                    dtype=torch.float32,
                     device=device,
+                )
+            children, edge_rows = buffer.reserve_children(parents, weights)
+            expected_children = torch.arange(
+                first_child + start,
+                first_child + end,
+                dtype=torch.int32,
+                device=device,
+            )
+            expected_edges = torch.arange(
+                first_edge + start,
+                first_edge + end,
+                dtype=torch.int32,
+                device=device,
+            )
+            if not torch.equal(children, expected_children) or not torch.equal(
+                edge_rows, expected_edges
+            ):
+                raise RuntimeError("branched logical child reservation lost stable order")
+            control_rows = control_arena.append(
+                {
+                    "nominal_count": torch.zeros(
+                        end - start, dtype=torch.int32, device=device
                     ),
-                    "old_logp": edge_logp.to(torch.float32),
+                    "beta": torch.zeros(
+                        end - start, dtype=torch.float32, device=device
+                    ),
+                    "log_player_sum": torch.full(
+                        (end - start,), -torch.inf, dtype=torch.float32, device=device
+                    ),
+                    "log_ancestor_product": torch.zeros(end - start, device=device),
+                    "queue_cost": torch.zeros(end - start, device=device),
                 }
             )
-            if record_policy_node:
-                output_t = getattr(output, "t", None)
-                output_c = getattr(output, "c", None)
-                policy_node_rows.append(
+            if not torch.equal(control_rows.to(torch.int32), children):
+                raise RuntimeError("branched controller rows lost topology alignment")
+            child_handles = arena.allocate(end - start)
+            if device.type == "cuda":
+                torch._assert_async(
+                    (child_handles == children.to(torch.int64)).all(),
+                    "branched occurrence and child handles diverged",
+                )
+            elif not torch.equal(child_handles, children.to(torch.int64)):
+                raise RuntimeError("branched occurrence and child handles diverged")
+            child_reach_handles = reach_pool.allocate(end - start)
+            expanded_paths = parent_paths[parent_positions]
+            arena.scatter_many(
+                child_handles,
+                {
+                    "path_key": child_path_keys(expanded_paths, ordinal),
+                    "reach_handle": child_reach_handles,
+                },
+            )
+
+        for start in range(0, total, child_pack_rows):
+            end = min(start + child_pack_rows, total)
+            _, parent_positions, ordinal = logical_child_subspan(start, end)
+            children = torch.arange(
+                first_child + start,
+                first_child + end,
+                dtype=torch.int32,
+                device=device,
+            )
+            edge_rows = torch.arange(
+                first_edge + start,
+                first_edge + end,
+                dtype=torch.int32,
+                device=device,
+            )
+            child_states = states[parent_positions]
+            child_reach = reaches[parent_positions]
+            expanded_paths = parent_paths[parent_positions]
+            posterior_keys = logical_rng_keys(
+                seed=logical_seed,
+                iteration=iteration,
+                trajectory=torch.full_like(expanded_paths, tree_address),
+                path=expanded_paths,
+                draw=ordinal,
+                purpose=DrawPurpose.POSTERIOR,
+            )
+            profiles = _sample_profiles_logical(
+                backend, child_states, child_reach, posterior_keys, gen
+            )
+            child_output = None
+            if family is not None:
+                assert output is not None
+                child_output = _index_policy_output(output, parent_positions)
+            event_keys = logical_rng_keys(
+                seed=logical_seed,
+                iteration=iteration,
+                trajectory=torch.full_like(expanded_paths, tree_address),
+                path=expanded_paths,
+                draw=ordinal,
+                purpose=(
+                    DrawPurpose.ACTION if family is not None else DrawPurpose.CHANCE
+                ),
+            )
+            events = _sample_events_logical(
+                backend,
+                child_states,
+                profiles,
+                child_output,
+                bundle.policy_adapter,
+                event_keys,
+                gen,
+            )
+            if family is None:
+                step_batch = getattr(backend, "step_chance_batch", backend.step)
+            else:
+                step_batch = getattr(backend, "step_player_batch", backend.step)
+            next_states = step_batch(child_states, events)
+            next_reach = backend.reach_update(
+                child_reach, child_states, events, child_output
+            )
+            next_owner = backend.classify(next_states).to(torch.int32)
+            buffer.commit_children(
+                children, edge_rows, next_states, next_owner, events.public_id
+            )
+            child_reach_handles = arena.gather_many(
+                ("reach_handle",), children.to(torch.int64)
+            )["reach_handle"]
+            reach_pool.write(child_reach_handles, {"log_reach": next_reach})
+            child_log_sum, child_log_product = child_path_factors(
+                log_player_sum[rows][parent_positions],
+                log_ancestor_product[rows][parent_positions],
+                beta_rows[rows][parent_positions],
+                (next_owner >= 0) & (next_owner < p_max),
+            )
+            log_player_sum[children.to(torch.int64)] = child_log_sum
+            log_ancestor_product[children.to(torch.int64)] = child_log_product
+            if family is not None:
+                assert child_output is not None
+                legal_ids, legal_mask = backend.legal_events(child_states)
+                edge_logp = _selected_policy_logp(
+                    bundle.policy_adapter,
+                    child_output,
+                    events.public_id[:, None],
+                    legal_ids,
+                    legal_mask,
+                ).detach()[:, 0]
+                policy_edge_rows.append(
                     {
-                        "node_id": nodes.to(torch.int32),
-                        "old_v": output.v.detach().to(torch.float32),
-                        **(
-                            {}
-                            if output_t is None or output_c is None
-                            else {
-                                "old_t": output_t.detach().to(torch.float32),
-                                "old_c": output_c.detach().to(torch.float32),
-                            }
-                        ),
+                        "edge_id": edge_rows.to(torch.int64),
+                        "old_logp": edge_logp.to(torch.float32),
                     }
                 )
-                DeviceWorkQueue.mark_done(arena, rows)
+        children = torch.arange(
+            first_child,
+            first_child + total,
+            dtype=torch.int32,
+            device=device,
+        )
+        if family is not None and record_policy_node:
+            assert output is not None
+            output_t = getattr(output, "t", None)
+            output_c = getattr(output, "c", None)
+            policy_node_rows.append(
+                {
+                    "node_id": nodes.to(torch.int32),
+                    "old_v": output.v.detach().to(torch.float32),
+                    **(
+                        {}
+                        if output_t is None or output_c is None
+                        else {
+                            "old_t": output_t.detach().to(torch.float32),
+                            "old_c": output_c.detach().to(torch.float32),
+                        }
+                    ),
+                }
+            )
+            DeviceWorkQueue.mark_done(arena, rows)
         releasable = nodes[nodes != 0]
         if releasable.numel():
             release_reaches(releasable)

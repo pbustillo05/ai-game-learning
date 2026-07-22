@@ -133,14 +133,16 @@ class PagedRolloutTopology:
     append_roots = add_roots
 
     def require_child_capacity(self, count: int | Tensor) -> None:
-        """Validate a wave count; append admits its realized page extents."""
+        """Transactionally admit node and edge pages for a logical child wave."""
 
         if isinstance(count, Tensor):
             if count.numel() != 1:
                 raise ValueError("child count must be scalar")
             torch._assert_async(count >= 0, "child count must be nonnegative")
+            count = int(count)
         elif isinstance(count, bool) or int(count) < 0:
             raise ValueError("child count must be nonnegative")
+        admit_arena_growth({self.nodes: int(count), self.edges: int(count)})
 
     def append_children(
         self,
@@ -150,13 +152,41 @@ class PagedRolloutTopology:
         events: Tensor,
         weights: Tensor,
     ) -> Tensor:
+        """Reserve and immediately commit one child batch.
+
+        Rollout paths which split logical child work across physical subspans use
+        :meth:`reserve_children` and :meth:`commit_children` separately.  This
+        convenience boundary remains useful for callers whose logical and
+        physical batches are identical.
+        """
+
         count = int(parents.numel())
         if any(value.shape != (count,) for value in (states, owners, events, weights)):
             raise ValueError("child append tensors must all have shape [C_new]")
-        if any(value.device != self.device for value in (parents, states, owners, events, weights)):
+        if any(
+            value.device != self.device
+            for value in (parents, states, owners, events, weights)
+        ):
             raise ValueError("child append tensors must be on the topology device")
+        nodes, edges = self.reserve_children(parents, weights)
+        self.commit_children(nodes, edges, states, owners, events)
+        return nodes
+
+    def reserve_children(
+        self,
+        parents: Tensor,
+        weights: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Publish stable child/edge addresses without materializing children."""
+
+        count = int(parents.numel())
+        if weights.shape != (count,):
+            raise ValueError("child reservation tensors must all have shape [C_new]")
+        if parents.device != self.device or weights.device != self.device:
+            raise ValueError("child reservation tensors must be on the topology device")
         if count == 0:
-            return torch.empty(0, dtype=torch.int32, device=self.device)
+            empty = torch.empty(0, dtype=torch.int32, device=self.device)
+            return empty, empty
         admit_arena_growth({self.nodes: count, self.edges: count})
         parent_rows = parents.to(torch.int64)
         parent_tree = self.tree_id[parent_rows]
@@ -172,14 +202,6 @@ class PagedRolloutTopology:
             )
         group_start = torch.cummax(group_start, dim=0).values
         local_ordinal = local_rows - group_start
-        child_owner = owners.to(torch.int64)
-        player = (child_owner >= 0) & (child_owner < self.n_players)
-        increments = torch.zeros_like(parent_depth)
-        increments.scatter_(
-            1,
-            child_owner.clamp(0, self.n_players - 1)[:, None],
-            player.to(torch.int32)[:, None],
-        )
         expected_nodes = torch.arange(
             self.node_count,
             self.node_count + count,
@@ -190,31 +212,82 @@ class PagedRolloutTopology:
             {
                 "parent": parents.to(torch.int32),
                 "tree_id": parent_tree.to(torch.int32),
-                "owner": owners.to(torch.int32),
-                "state_ref": states.to(torch.int32),
-                "depth_p": parent_depth + increments,
-                "depth_player": parent_player_depth + player.to(torch.int32),
+                "owner": torch.full(
+                    (count,), -1, dtype=torch.int32, device=self.device
+                ),
+                "state_ref": torch.full(
+                    (count,), -1, dtype=torch.int32, device=self.device
+                ),
+                "depth_p": parent_depth,
+                "depth_player": parent_player_depth,
                 "path_weight": parent_weight * weights.float(),
                 "child_count": torch.zeros(count, dtype=torch.int32, device=self.device),
             }
         ).to(torch.int32)
         if not torch.equal(nodes, expected_nodes):
             raise RuntimeError("paged topology node ids lost monotone order")
-        self.edges.append(
+        edges = self.edges.append(
             {
                 "edge_parent": parents.to(torch.int32),
                 "edge_ordinal": current_count + local_ordinal,
                 "child_node": nodes,
-                "child_event": events.to(torch.int32),
+                "child_event": torch.full(
+                    (count,), -1, dtype=torch.int32, device=self.device
+                ),
                 "edge_weight": weights.float(),
             }
-        )
+        ).to(torch.int32)
         unique_parents, run_counts = torch.unique_consecutive(
             parent_rows, return_counts=True
         )
         updated = self.child_count[unique_parents] + run_counts.to(torch.int32)
         self.nodes.write(unique_parents, {"child_count": updated})
-        return nodes
+        return nodes, edges
+
+    def commit_children(
+        self,
+        nodes: Tensor,
+        edges: Tensor,
+        states: Tensor,
+        owners: Tensor,
+        events: Tensor,
+    ) -> None:
+        """Fill one physical subspan of previously reserved child rows."""
+
+        count = int(nodes.numel())
+        if any(value.shape != (count,) for value in (edges, states, owners, events)):
+            raise ValueError("child commit tensors must all have shape [C_subspan]")
+        if any(
+            value.device != self.device
+            for value in (nodes, edges, states, owners, events)
+        ):
+            raise ValueError("child commit tensors must be on the topology device")
+        if count == 0:
+            return
+        node_rows = nodes.to(torch.int64)
+        parent_rows = self.parent[node_rows].to(torch.int64)
+        parent_depth = self.depth_p[parent_rows]
+        child_owner = owners.to(torch.int64)
+        player = (child_owner >= 0) & (child_owner < self.n_players)
+        increments = torch.zeros_like(parent_depth)
+        increments.scatter_(
+            1,
+            child_owner.clamp(0, self.n_players - 1)[:, None],
+            player.to(torch.int32)[:, None],
+        )
+        self.nodes.write(
+            node_rows,
+            {
+                "owner": owners.to(torch.int32),
+                "state_ref": states.to(torch.int32),
+                "depth_p": parent_depth + increments,
+                "depth_player": self.depth_player[parent_rows]
+                + player.to(torch.int32),
+            },
+        )
+        self.edges.write(
+            edges.to(torch.int64), {"child_event": events.to(torch.int32)}
+        )
 
     def release(self) -> None:
         self.nodes.release()
