@@ -13,7 +13,7 @@ five-mode certification, or performance-gate standard.
 |---|---|---|---|
 | C01 | Confirmed defect — blocker | Direct compact seal and a complete hard seal transaction are absent; production first creates `SampledTree` and then converts while both representations overlap. | `AUD-RSQ-001/002`, `AUD-RD-003`, seal part of `HIST-OOM-01`, `PERF-002/007` |
 | C02 | Confirmed defect — blocker | Mandatory rank-local failures lack common terminal agreement and can strand peers in collectives. | `AUD-TL-001` |
-| C03 | Authority gap — certification blocker | BR has no authoritative response class, seat law, objective, stopping/cutoff, or estimator. | `A-01`, `EVAL-001`, authority part of `MODE-007` |
+| C03 | Fixed in d407d8e4f80e6e01b702ccbf707e7659bafc09e7 | BR has no authoritative response class, seat law, objective, stopping/cutoff, or estimator. | `A-01`, `EVAL-001`, authority part of `MODE-007` |
 | C04 | Confirmed defect — high | Multi-player BR early-fold settlement is broken; BR also lacks a CUDA acceptance gate. | `TRACE-001`, `EVAL-002`, correctness/test part of `MODE-007` |
 | C05 | Confirmed defect — high | Inferred/handwritten rollout schemas, preflop exact-width model carriers, and late logical-address reservation violate immutable natural storage. | `AUD-RSQ-003/004/006` |
 | C06 | Confirmed defect — high | Branched child transient materialization scales with logical offspring instead of bounded physical subspans. | `AUD-RSQ-005`, part of `AUD-RSQ-006`, `PERF-003` |
