@@ -17,7 +17,7 @@ five-mode certification, or performance-gate standard.
 | C04 | Confirmed defect — high | Multi-player BR early-fold settlement is broken; BR also lacks a CUDA acceptance gate. | `TRACE-001`, `EVAL-002`, correctness/test part of `MODE-007` |
 | C05 | Confirmed defect — high | Inferred/handwritten rollout schemas, preflop exact-width model carriers, and late logical-address reservation violate immutable natural storage. | `AUD-RSQ-003/004/006` |
 | C06 | Confirmed defect — high | Branched child transient materialization scales with logical offspring instead of bounded physical subspans. | `AUD-RSQ-005`, part of `AUD-RSQ-006`, `PERF-003` |
-| C07 | Confirmed defect — high | Queue policy/accounting and the common fixed/warmup scientific safeguard differ from authority. | `AUD-RSQ-007/008/009`, fixed/warmup `HIST-OOM-01`, `PERF-007` |
+| C07 | Fixed in a78deab51699416d36f785a53c6ef0f251efb43d | Queue policy/accounting and the common fixed/warmup scientific safeguard differ from authority. | `AUD-RSQ-007/008/009`, fixed/warmup `HIST-OOM-01`, `PERF-007` |
 | C08 | Confirmed defect — high | Core training/BR accepts CPU and Gloo instead of requiring NVIDIA CUDA/NCCL. | `MODE-001`, `AUD-TL-005`, CUDA part of `EVAL-002` |
 | C09 | Confirmed defect — high | Folded summaries use forbidden neutral `post_P`, duplicate per-pack ownership, and omit mandatory cache bytes from the ledger. | `POKER-001/002`, `AUD-MODEL-002`, `PERF-007` |
 | C10 | Confirmed defect — high, plus authority-path gap | Production accepts evaluator v1 although the current sibling package/launcher requires v2; the named binding document is missing. | `POKER-003`; `POKER-008` documents the path gap |
