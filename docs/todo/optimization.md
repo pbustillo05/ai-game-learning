@@ -134,6 +134,15 @@ for identical 8,087 decisions and 33.149 billion padded attention pairs).
 Keep that experiment provisional until a settled paired median demonstrates a
 gain; do not credit it in the cumulative speedup.
 
+Append-only arena commits now bypass generic arbitrary-row page matching when
+the host cursor already proves that the reserved span is contiguous.  A
+same-source monkeypatched control at family 84 measured 32.368 s with the old
+`reserve_rows` plus generic `write` path and 32.011 s with direct page-slice
+commits.  Both arms produced exactly 8,253 decisions, 118 model calls, 32.258
+billion padded attention pairs, and the same 4.61 / 9.06 GB peak.  This is a
+1.1% rollout reduction with no page-size, ownership, or memory-accounting
+change.
+
 Sequential target construction and especially branched target construction
 still contain or recently contained host-driven recurrences. A concurrent
 dirty-worktree change began vectorizing sequential targets while these

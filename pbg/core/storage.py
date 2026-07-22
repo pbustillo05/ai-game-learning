@@ -391,9 +391,59 @@ class PagedTensorArena:
                 raise ValueError(f"append value for {spec.name!r} violates its schema")
             if value.device != self.device:
                 raise ValueError("append tensors must already be on the arena device")
+        start = self._size
         ids = self.reserve_rows(count)
-        self.write(ids, values)
+        self.write_contiguous(start, values)
         return ids
+
+    def write_contiguous(self, start: int, values: Mapping[str, Tensor]) -> None:
+        """Commit one host-known contiguous span without device page routing.
+
+        Append-only rollout owners reserve monotone logical addresses.  Their
+        page intersections are therefore fully determined by immutable schema
+        metadata and the host cursor; building a CUDA ``[rows, page_rows]``
+        match matrix for those writes is unnecessary.  Arbitrary recyclable or
+        update rows continue to use :meth:`write`.
+        """
+
+        self._check_live()
+        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            raise ValueError("contiguous write start must be a nonnegative integer")
+        counts = {int(value.shape[0]) for value in values.values() if value.ndim >= 1}
+        if len(counts) != 1:
+            raise ValueError("contiguous write columns must have one leading extent")
+        count = counts.pop()
+        stop = start + count
+        if stop > self._size:
+            raise ValueError("contiguous write exceeds reserved logical rows")
+        for name, value in values.items():
+            try:
+                spec = self.schema.by_name[name]
+            except KeyError as exc:
+                raise KeyError(f"unknown schema field {name!r}") from exc
+            if tuple(value.shape) != (count, *spec.shape) or value.dtype != spec.dtype:
+                raise ValueError(f"contiguous write value for {name!r} violates its schema")
+            if value.device != self.device:
+                raise ValueError("contiguous write tensors must already be on the arena device")
+        source_start = 0
+        page_start = 0
+        for columns, length in zip(self._pages, self._lengths, strict=True):
+            page_stop = page_start + length
+            write_start = max(start, page_start)
+            write_stop = min(stop, page_stop)
+            if write_start < write_stop:
+                rows = write_stop - write_start
+                local_start = write_start - page_start
+                for name, value in values.items():
+                    columns[name][local_start : local_start + rows].copy_(
+                        value[source_start : source_start + rows]
+                    )
+                source_start += rows
+            page_start = page_stop
+            if page_start >= stop:
+                break
+        if source_start != count:
+            raise RuntimeError("contiguous write did not cover its reserved span")
 
     def write(self, rows: Tensor, values: Mapping[str, Tensor]) -> None:
         """Populate already-reserved unique logical rows."""
