@@ -114,7 +114,15 @@ by physical subspans; it never computes per-example parameter gradients or
 copies a full gradient buffer}
 \KwOut{identical $\theta_{k+1}$ and optimizer state on every GPU}
 
-\ForEach{$g\in\mathcal G$ \textbf{as soon as its target builder finishes}}{
+\ForEach{$g\in\mathcal G$ \textbf{after its target builder finishes}}{
+  First prove that the mandatory uncached singleton path fits; set a terminal
+  local failure flag on any validation, planning, or singleton-forward failure;
+}
+All ranks perform one common-order terminal agreement.  If any rank failed,
+release every current training store, checkpoint the last completed iteration,
+and stop; no rank launches a mass collective or rerolls the failed iteration;
+
+\ForEach{$g\in\mathcal G$ \textbf{after the terminal agreement succeeds}}{
   Read $(\log Z_{g,m},\Obj{AliasTable}_{g,m})_m$; verify their decision domains
   and launch $\mathcal Z^\star\gets\IAllGather((\log Z_{g,m})_m)$ in the common
   collective order without an explicit preceding barrier;
@@ -123,9 +131,8 @@ copies a full gradient buffer}
 }
 
 \ForEach{$g\in\mathcal G$ \textbf{in parallel while the reduction progresses}}{
-  First prove that the uncached singleton path fits; otherwise checkpoint and
-  stop cleanly without resampling the rollout.  For each $m$, measure retained
-  reference-output bytes $R_{g,m}$ and predict total learner time, including
+  For each $m$, measure retained reference-output bytes $R_{g,m}$ and predict
+  total learner time, including
   cache construction and any physical-plan changes.  Select a subset
   \[
     \mathcal C_g\in\operatorname*{arg\,min}_{C\subseteq\mathcal M}
@@ -197,7 +204,12 @@ $\theta\gets\theta_k$;
       subspan, globally sort decisions, inspect the meaning of $m$, or permute
       exact private-state rows;
     }
+    Any mandatory local planning, forward, loss, or backward failure sets the
+    step's terminal local failure flag after releasing its transient owners;
   }
+  All ranks perform the next common-order terminal agreement.  If any rank
+  failed, no rank enters the gradient SUM; release current stores and terminate
+  from the last completed checkpoint;
   $G\gets\AllReduceSum((G_g)_g)$ with no division by $|\mathcal G|$;
   derive the identical nonfinite decision from $G$, unscale once, apply the
   common global clipping rule once, and perform the identical optimizer/loss-scale

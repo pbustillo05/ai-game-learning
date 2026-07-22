@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 import json
 import math
 import os
@@ -12,6 +13,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from pbg.core.distributed_failure import (
+    DistributedFailureAgreement,
+    DistributedPhaseFailure,
+)
 from pbg.core.learner import (
     DistributedFixedRolloutUpdate,
     DistributedLearnerConfig,
@@ -55,6 +60,17 @@ class _Model(torch.nn.Module):
         v = self.weight * rows
         logits = torch.stack((self.weight * rows, -self.weight * rows), -1)
         return _Output(logits, v)
+
+
+class _FailingModel(_Model):
+    def __init__(self, value: float, *, fail_forward: bool) -> None:
+        super().__init__(value)
+        self.fail_forward = fail_forward
+
+    def output(self, inputs):
+        if self.fail_forward:
+            raise RuntimeError("injected rank-local forward failure")
+        return super().output(inputs)
 
 
 class _Adapter:
@@ -664,3 +680,151 @@ def test_two_cuda_unequal_strata_exact_sum(tmp_path: Path, mode: str) -> None:
     assert records[0]["weight"] == pytest.approx(records[1]["weight"], abs=0)
     assert [record["mass"] for record in records] == pytest.approx([0.25, 0.75])
     assert [record["rows"] for record in records] == [3.0, 4.0]
+
+
+def _two_cuda_asymmetric_failure_worker(
+    rank: int, world: int, port: int, output_dir: str, failure_phase: str
+) -> None:
+    os.environ.update(
+        {
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world),
+            "LOCAL_RANK": str(rank),
+            "NCCL_SOCKET_IFNAME": "lo",
+            "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+        }
+    )
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=world,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        if failure_phase == "before_targets":
+            import pbg.core.training as training_module
+
+            model = _Model(0.0).to(rank)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+            cfg = SimpleNamespace(
+                hardware=SimpleNamespace(precision="fp32"),
+                rollout=SimpleNamespace(roots_per_gpu=1),
+            )
+            bundle = SimpleNamespace(
+                model=model,
+                rollout_backend=SimpleNamespace(execution_metrics=None),
+            )
+
+            def injected_build(*args, **kwargs):
+                del args, kwargs
+                if rank == 1:
+                    raise RuntimeError("injected rank-local target failure")
+                return object()
+
+            training_module._build_iteration_data = injected_build
+            agreement = DistributedFailureAgreement(torch.device("cuda", rank))
+            try:
+                training_module._one_iteration(
+                    cfg,
+                    bundle,
+                    optimizer,
+                    torch.amp.GradScaler("cuda", enabled=False),
+                    torch.Generator(device=torch.device("cuda", rank)),
+                    0,
+                    failure_agreement=agreement,
+                )
+            except DistributedPhaseFailure as exc:
+                record = {
+                    "phase": exc.phase,
+                    "failing_rank": exc.failing_rank,
+                    "weight": float(model.weight.detach()),
+                }
+            else:
+                record = {"unexpected_success": True}
+            Path(
+                output_dir, f"failure_{failure_phase}_rank_{rank}.json"
+            ).write_text(json.dumps(record), encoding="utf-8")
+            return
+
+        storage, specs, _ = _fixture("normal", rows=2)
+        storage = _storage_to(storage, torch.device("cuda", rank))
+        model = _FailingModel(
+            0.0,
+            fail_forward=failure_phase == "before_backward" and rank == 1,
+        ).to(rank)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        learner = DistributedFixedRolloutUpdate(
+            model,
+            optimizer,
+            torch.amp.GradScaler("cuda", enabled=False),
+            specs,
+            _Adapter(),
+            _loss_cfg(c_kl=0.0, c_h=0.0, value_loss="mse"),
+            DistributedLearnerConfig(
+                statistical_counts={0: 2},
+                physical_shapes={0: (PhysicalShape(1, 4096),)},
+                available_transient_bytes=8192,
+            ),
+        )
+        if failure_phase == "before_mass" and rank == 1:
+            def fail_plan(*args, **kwargs):
+                del args, kwargs
+                raise RuntimeError("injected rank-local singleton failure")
+
+            learner._planners[0].plan = fail_plan
+        try:
+            learner(
+                storage,
+                torch.Generator(device=torch.device("cuda", rank)).manual_seed(
+                    30 + rank
+                ),
+                grad_clip=100.0,
+            )
+        except DistributedPhaseFailure as exc:
+            record = {
+                "phase": exc.phase,
+                "failing_rank": exc.failing_rank,
+                "weight": float(model.weight.detach()),
+            }
+        else:
+            record = {"unexpected_success": True}
+        Path(output_dir, f"failure_{failure_phase}_rank_{rank}.json").write_text(
+            json.dumps(record), encoding="utf-8"
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two CUDA GPUs unavailable")
+@pytest.mark.parametrize(
+    "failure_phase", ("before_targets", "before_mass", "before_backward")
+)
+def test_two_cuda_asymmetric_mandatory_failure_is_rank_common(
+    tmp_path: Path, failure_phase: str
+) -> None:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    torch.multiprocessing.spawn(
+        _two_cuda_asymmetric_failure_worker,
+        args=(2, port, str(tmp_path), failure_phase),
+        nprocs=2,
+        join=True,
+    )
+    records = [
+        json.loads(
+            (tmp_path / f"failure_{failure_phase}_rank_{rank}.json").read_text()
+        )
+        for rank in range(2)
+    ]
+    expected_phase = {
+        "before_targets": "rollout, seal, completion, and targets",
+        "before_mass": "mandatory learner singleton feasibility",
+        "before_backward": "local backward step 0",
+    }[failure_phase]
+    assert [record["failing_rank"] for record in records] == [1, 1]
+    assert [record["phase"] for record in records] == [expected_phase, expected_phase]
+    assert [record["weight"] for record in records] == [0.0, 0.0]

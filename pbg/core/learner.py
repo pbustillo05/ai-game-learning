@@ -19,6 +19,7 @@ import torch.distributed as dist
 from torch import Tensor, nn
 
 from pbg.core.adaptive_branching import gamma_deviance
+from pbg.core.distributed_failure import DistributedFailureAgreement
 from pbg.core.losses import _entropy_coefficient
 from pbg.core.optimization import (
     FlatGradientBuffer,
@@ -871,6 +872,7 @@ class DistributedFixedRolloutUpdate:
         *,
         reference_model: nn.Module | None = None,
         group: Any | None = None,
+        failure_agreement: DistributedFailureAgreement | None = None,
     ) -> None:
         self.model = model.module if hasattr(model, "module") else model
         self.optimizer = optimizer
@@ -881,6 +883,10 @@ class DistributedFixedRolloutUpdate:
         self.config = config
         self.reference_model = reference_model
         self.group = group
+        self.failure_agreement = failure_agreement or DistributedFailureAgreement(
+            next(self.model.parameters()).device,
+            group=group,
+        )
         self.flat_gradient = FlatGradientBuffer(self.model)
         self.index_buffer = ReusableIndexBuffer(
             max(config.statistical_counts.values()),
@@ -1045,36 +1051,51 @@ class DistributedFixedRolloutUpdate:
         iteration: int = 0,
         grad_clip: float = math.inf,
     ) -> DistributedUpdateResult:
-        validate_learner_input(storage, self.partitions)
-        if optimizer_steps <= 0:
-            raise ValueError("optimizer_steps must be positive")
-        exchange = begin_log_mass_exchange(storage, self.partitions, group=self.group)
-        # Prove the mandatory uncached singleton path before cache reservation
-        # or any learner random draw.  A failure is a clean no-reroll stop.
-        singleton = torch.zeros(1, dtype=torch.int32, device=self.index_buffer.tensor.device)
-        for partition_id, partition in storage.partitions.items():
-            if partition.inputs.rows:
-                self._planners[partition_id].plan(
-                    singleton, self.config.available_transient_bytes
-                )
-        reference_singleton_rows = 0
-        singleton_output_bytes: dict[int, int] = {}
-        if float(getattr(self.loss_cfg, "c_kl", 0.0)) > 0.0:
-            if self.reference_model is None:
-                raise ValueError("positive reference KL requires reference_model")
-            singleton_rows = singleton.long()
+        def prove_mandatory_feasibility() -> tuple[Tensor, int, dict[int, int]]:
+            validate_learner_input(storage, self.partitions)
+            if optimizer_steps <= 0:
+                raise ValueError("optimizer_steps must be positive")
+            # This tensor and every uncached singleton forward must fit before
+            # any rank is allowed to launch the mass collective.
+            singleton = torch.zeros(
+                1, dtype=torch.int32, device=self.index_buffer.tensor.device
+            )
             for partition_id, partition in storage.partitions.items():
-                if not partition.inputs.rows:
-                    continue
-                with torch.no_grad():
-                    singleton_output = self._forward_partition(
-                        self.partitions[partition_id],
-                        self.reference_model,
-                        _gather_inputs(partition, singleton_rows),
+                if partition.inputs.rows:
+                    self._planners[partition_id].plan(
+                        singleton, self.config.available_transient_bytes
                     )
-                reference_singleton_rows += 1
-                singleton_output_bytes[partition_id] = output_nbytes(singleton_output)
-                del singleton_output
+            reference_singleton_rows = 0
+            singleton_output_bytes: dict[int, int] = {}
+            if float(getattr(self.loss_cfg, "c_kl", 0.0)) > 0.0:
+                if self.reference_model is None:
+                    raise ValueError("positive reference KL requires reference_model")
+                singleton_rows = singleton.long()
+                for partition_id, partition in storage.partitions.items():
+                    if not partition.inputs.rows:
+                        continue
+                    with torch.no_grad():
+                        singleton_output = self._forward_partition(
+                            self.partitions[partition_id],
+                            self.reference_model,
+                            _gather_inputs(partition, singleton_rows),
+                        )
+                    reference_singleton_rows += 1
+                    singleton_output_bytes[partition_id] = output_nbytes(
+                        singleton_output
+                    )
+                    del singleton_output
+            return singleton, reference_singleton_rows, singleton_output_bytes
+
+        singleton, reference_singleton_rows, singleton_output_bytes = (
+            self.failure_agreement.run(
+                "mandatory learner singleton feasibility",
+                prove_mandatory_feasibility,
+            )
+        )
+        exchange = begin_log_mass_exchange(
+            storage, self.partitions, group=self.group
+        )
         predrawn: dict[int, Tensor] | None = None
         cache_rows: dict[int, Tensor] | None = None
         if self.config.sampled_reference_cache and singleton_output_bytes:
@@ -1194,9 +1215,15 @@ class DistributedFixedRolloutUpdate:
             ended.record()
             timing_events.setdefault(name, []).append((started, ended))
 
-        if cuda_device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(cuda_device)
-        for step_index in range(optimizer_steps):
+        def accumulate_local_step(step_index: int) -> None:
+            nonlocal sampled_total
+            nonlocal physical_total
+            nonlocal tail_total
+            nonlocal model_rows
+            nonlocal reference_rows
+            nonlocal objective_mass
+            nonlocal activation_checkpointed
+            nonlocal ratio_maximum
             self.flat_gradient.zero_()
             for position, partition_spec in enumerate(self.partitions.specs):
                 partition_id = partition_spec.partition_id
@@ -1317,6 +1344,14 @@ class DistributedFixedRolloutUpdate:
                     self.scaler.scale(contribution).backward()
                     timing_end("backward", phase_event)
                     del result, contribution, output, reference_output, inputs, rows
+
+        if cuda_device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(cuda_device)
+        for step_index in range(optimizer_steps):
+            self.failure_agreement.run(
+                f"local backward step {step_index}",
+                lambda step_index=step_index: accumulate_local_step(step_index),
+            )
             phase_event = timing_start()
             finite = sync_scaled_gradients(
                 dist.get_world_size(self.group)
@@ -1326,15 +1361,17 @@ class DistributedFixedRolloutUpdate:
             )
             timing_end("gradient_sync", phase_event)
             phase_event = timing_start()
-            steps.append(
-                finite_gated_optimizer_step(
+            step = self.failure_agreement.run(
+                f"optimizer transition step {step_index}",
+                lambda: finite_gated_optimizer_step(
                     self.model,
                     self.optimizer,
                     self.scaler,
                     gradients_finite=finite,
                     grad_clip=grad_clip,
-                )
+                ),
             )
+            steps.append(step)
             timing_end("optimizer_update", phase_event)
         metrics.update(
             {

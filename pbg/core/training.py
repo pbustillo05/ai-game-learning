@@ -38,6 +38,10 @@ from pbg.core.checkpointing import (
     save_checkpoint,
 )
 from pbg.core.game import GameBundle
+from pbg.core.distributed_failure import (
+    DistributedFailureAgreement,
+    DistributedPhaseFailure,
+)
 from pbg.core.learner import (
     allocate_fixed_statistical_counts,
     DistributedFixedRolloutUpdate,
@@ -1039,14 +1043,28 @@ def _record_branched_controller_metrics(
                 * old_c[original]
             ).sum()
         )
-    if dist.is_available() and dist.is_initialized():
-        shared = torch.tensor(counterfactual, dtype=torch.float64, device=device)
-        dist.all_reduce(shared, op=dist.ReduceOp.SUM)
-        counterfactual = float(shared) / dist.get_world_size()
-    profile_metrics["counterfactual_tree_size"] = counterfactual
+    del device
+    profile_metrics["counterfactual_tree_size_local"] = counterfactual
     if controller is None:
         raise RuntimeError("adaptive rollout has no KKT controller")
-    profile_metrics.update(controller.observe(counterfactual))
+
+
+def _commit_branched_controller_observation(
+    metrics: dict[str, float],
+    device: torch.device,
+    agreement: DistributedFailureAgreement,
+) -> None:
+    """Synchronize KKT evidence only after every rank sealed valid targets."""
+
+    local = metrics.pop("counterfactual_tree_size_local", None)
+    if local is None:
+        return
+    shared = torch.tensor(local, dtype=torch.float64, device=device)
+    if agreement.distributed:
+        dist.all_reduce(shared, op=dist.ReduceOp.SUM)
+        shared.div_(dist.get_world_size(agreement.group))
+    counterfactual = float(shared)
+    metrics["counterfactual_tree_size"] = counterfactual
 
 
 def _build_iteration_data(
@@ -2088,6 +2106,7 @@ def _one_iteration(
     validate_identity: bool = False,
     branching_controller: Any | None = None,
     branching_diagnostic_limits: Any | None = None,
+    failure_agreement: DistributedFailureAgreement | None = None,
 ) -> dict[str, Any]:
     execution_metrics = getattr(bundle.rollout_backend, "execution_metrics", None)
     if execution_metrics is not None:
@@ -2095,6 +2114,7 @@ def _one_iteration(
     model = bundle.model
     source = model.module if hasattr(model, "module") else model
     device = next(model.parameters()).device
+    agreement = failure_agreement or DistributedFailureAgreement(device)
     memory_ledger = MemoryLedger(device)
     memory_metrics: dict[str, float] = {}
     if device.type == "cuda":
@@ -2115,14 +2135,22 @@ def _one_iteration(
     amp_enabled, amp_dtype = _precision(cfg, device)
     total_trajectories = int(cfg.rollout.roots_per_gpu)
     identity_metrics: dict[str, float] = {}
-    data = _build_iteration_data(
-        cfg,
-        bundle,
-        torch_gen,
-        profile=profile,
-        iteration=iteration,
-        branching_controller=branching_controller,
-        branching_diagnostic_limits=branching_diagnostic_limits,
+    data = agreement.run(
+        "rollout, seal, completion, and targets",
+        lambda: _build_iteration_data(
+            cfg,
+            bundle,
+            torch_gen,
+            profile=profile,
+            iteration=iteration,
+            branching_controller=branching_controller,
+            branching_diagnostic_limits=branching_diagnostic_limits,
+        ),
+    )
+    _commit_branched_controller_observation(
+        data.profile_metrics,
+        device,
+        agreement,
     )
     if profile:
         memory_metrics.update(
@@ -2314,15 +2342,19 @@ def _one_iteration(
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
     optimization_started = time.perf_counter()
-    learner = DistributedFixedRolloutUpdate(
-        source,
-        optimizer,
-        scaler,
-        partition_specs,
-        bundle.policy_adapter,
-        cfg.loss,
-        learner_cfg,
-        reference_model=reference_model,
+    learner = agreement.run(
+        "learner construction",
+        lambda: DistributedFixedRolloutUpdate(
+            source,
+            optimizer,
+            scaler,
+            partition_specs,
+            bundle.policy_adapter,
+            cfg.loss,
+            learner_cfg,
+            reference_model=reference_model,
+            failure_agreement=agreement,
+        ),
     )
     if cfg.training.ppo_epochs is None:
         update_steps = optimizer_steps_this_iteration
@@ -2409,6 +2441,18 @@ def _one_iteration(
         metrics["policy_max_padded_token_pairs"] = snapshot[
             "execution_padded_token_pairs_max"
         ]
+    counterfactual = metrics.get("counterfactual_tree_size")
+    if counterfactual is not None:
+
+        def commit_controller_observation() -> None:
+            if branching_controller is None:
+                raise RuntimeError("adaptive rollout has no KKT controller")
+            metrics.update(branching_controller.observe(counterfactual))
+
+        agreement.run(
+            "adaptive KKT controller commit",
+            commit_controller_observation,
+        )
     del learner, storage
     return metrics
 
@@ -2853,6 +2897,7 @@ def run_training(
         run_id = identity[0]
         dist.barrier()
     assert run_id is not None
+    failure_agreement = DistributedFailureAgreement(device)
 
     for iteration in range(start_iteration, cfg.training.iters):
         if memory_controller is not None:
@@ -2919,18 +2964,110 @@ def run_training(
             reference_model.load_state_dict(source_model.state_dict())
             reference_model.eval()
             reference_iteration = iteration
-        metrics = _one_iteration(
-            local_cfg,
-            bundle,
-            optimizer,
-            scaler,
-            torch_gen,
-            iteration,
-            profile=True,
-            reference_model=reference_model,
-            validate_identity=iteration == start_iteration,
-            branching_controller=branching_controller,
-        )
+        try:
+            metrics = failure_agreement.run(
+                "iteration execution",
+                lambda: _one_iteration(
+                    local_cfg,
+                    bundle,
+                    optimizer,
+                    scaler,
+                    torch_gen,
+                    iteration,
+                    profile=True,
+                    reference_model=reference_model,
+                    validate_identity=iteration == start_iteration,
+                    branching_controller=branching_controller,
+                    failure_agreement=failure_agreement,
+                ),
+            )
+        except DistributedPhaseFailure as exc:
+            # Every rank reaches this path with the same phase and first-failing
+            # rank.  The audited mandatory boundaries precede the first update,
+            # so their current model/optimizer state is exactly the last
+            # completed iteration and can be checkpointed without rollback.
+            checkpoint_safe = exc.phase in {
+                "rollout, seal, completion, and targets",
+                "adaptive KKT controller observation",
+                "learner construction",
+                "mandatory learner singleton feasibility",
+                "local backward step 0",
+            }
+            local_rng_state = _capture_rng_state(torch_gen, np_gen)
+            if world > 1:
+                gathered_failure: list[dict[str, Any] | None] | None = (
+                    [None] * world if rank == 0 else None
+                )
+                dist.gather_object(local_rng_state, gathered_failure, dst=0)
+                gathered_details: list[str | None] | None = (
+                    [None] * world if rank == 0 else None
+                )
+                dist.gather_object(exc.local_detail, gathered_details, dst=0)
+                rank_rng_states = (
+                    None
+                    if rank != 0
+                    else [
+                        item
+                        for item in gathered_failure or []
+                        if item is not None
+                    ]
+                )
+                failure_detail = (
+                    None
+                    if rank != 0 or gathered_details is None
+                    else gathered_details[exc.failing_rank]
+                )
+            else:
+                rank_rng_states = [local_rng_state]
+                failure_detail = exc.local_detail
+            checkpoint_name: str | None = None
+            if rank == 0 and checkpoint_safe:
+                checkpoint_name = f"ckpt_terminal_stop_{iteration:07d}.pt"
+                save_checkpoint(
+                    out_dir / checkpoint_name,
+                    bundle.model,
+                    optimizer,
+                    scaler,
+                    iteration,
+                    cfg,
+                    torch_gen,
+                    np_gen,
+                    run_id=run_id,
+                    rank_rng_states=rank_rng_states,
+                    reference_model=reference_model,
+                    reference_iteration=reference_iteration,
+                    adaptive_work_state=(
+                        None
+                        if memory_controller is None
+                        else memory_controller.state_dict()
+                    ),
+                    branching_controller_state=(
+                        None
+                        if branching_controller is None
+                        else branching_controller.state_dict()
+                    ),
+                    probe_target=probe_target,
+                    logical_work=logical_work,
+                    initialization=initialization_metadata,
+                )
+            if rank == 0:
+                (out_dir / "terminal_stop.json").write_text(
+                    json.dumps(
+                        {
+                            "iter": iteration,
+                            "run_id": run_id,
+                            "phase": exc.phase,
+                            "failing_rank": exc.failing_rank,
+                            "detail": failure_detail,
+                            "checkpoint": checkpoint_name,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            break
         if resume_path is not None and iteration == start_iteration:
             for key in tuple(metrics):
                 if key.startswith("identity_"):
