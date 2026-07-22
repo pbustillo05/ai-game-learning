@@ -105,6 +105,35 @@ ownership or statistical work.
 Focused CPU gates after this milestone passed 101 tests with seven CUDA-only
 skips.  CUDA benchmark teardown left no compute process resident.
 
+### Follow-on rollout width result
+
+The production family-width gate was rerun after the dense-state milestone on
+the same live source snapshot, using the schema-migrated copy of checkpoint
+1110, 2,048 starts, repeat seed 104830, 1,024 completion samples, and one warmup
+per arm.  GPUs 0 and 2 ran the 64- and 88-row arms concurrently; the 84-row arm
+then ran on GPU 0.
+
+| Family rows | Decisions | Model calls | Rollout | ms/decision | Peak allocated / reserved |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 8,233 | 141 | 36.228 s | 4.400 | 3.63 / 6.62 GB |
+| 84 | 8,283 | 112 | 33.723 s | 4.071 | 4.60 / 9.05 GB |
+| 88 | 8,262 | 107 | 33.118 s | 4.008 | 4.80 / 9.84 GB |
+
+Family 84 is the production choice for the 2080 Ti profile.  It reduces
+rollout time per decision by 7.5% and raises end-to-end throughput by 7.6%
+relative to 64 rows while retaining about 955 MB below the decimal 10 GB
+ceiling.  Family 88 is 1.5% faster than 84 but leaves only about 158 MB and is
+therefore retained as an aggressive diagnostic point, not the default.  The
+live-state slab forecast now covers the adaptive controller's configured
+maximum root frontier plus one family pack, so controller widening cannot
+silently fall back to multi-page hot state.
+
+The first production sample of combined public/history, legal-mask, and
+selected-log-probability reuse did not improve rollout (36.45 s versus 35.95 s
+for identical 8,087 decisions and 33.149 billion padded attention pairs).
+Keep that experiment provisional until a settled paired median demonstrates a
+gain; do not credit it in the cumulative speedup.
+
 Sequential target construction and especially branched target construction
 still contain or recently contained host-driven recurrences. A concurrent
 dirty-worktree change began vectorizing sequential targets while these

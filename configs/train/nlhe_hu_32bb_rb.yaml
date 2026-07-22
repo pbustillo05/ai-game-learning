@@ -10,10 +10,11 @@ rollout:
   sequential_roots_per_gpu_initial: 2560
   beta: null
   # Exact HU 32 bb bound: 39 player nodes + 3 chance nodes + 1 terminal leaf.
-  # Keep rollout queue packs at 64 rows. A 128-row probe exhausted the guarded
-  # completion workspace after rollout; larger learner minibatches are split
-  # independently into the validated physical SDPA shapes.
-  family_batch_rows: 64
+  # Production-scale checkpoint-1110 A/B testing selected 84-row rollout packs:
+  # they cut rollout time/decision by 7.5% versus 64 while reserving 9.05 GB.
+  # Eighty-eight rows were another 1.5% faster but left only 158 MB below the
+  # decimal 10 GB ceiling. Learner minibatches are split independently.
+  family_batch_rows: 84
   max_active_trajectories: 64
   storage_page_rows: 256
   # The execution arena is separately bounded from retained training storage.

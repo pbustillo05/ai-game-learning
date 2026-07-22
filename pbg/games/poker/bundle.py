@@ -742,8 +742,12 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     # reach their last consumer.  Use that exact live-frontier bound as one
     # dense recyclable slab; retained append-only stores keep their separately
     # configured page geometry.
+    configured_frontier = max(
+        resident_trees,
+        int(cfg.rollout.sequential_roots_per_gpu_maximum or resident_trees),
+    )
     live_state_rows = (
-        resident_trees + int(cfg.rollout.family_batch_rows or 256)
+        configured_frontier + int(cfg.rollout.family_batch_rows or 256)
         if sequential
         else int(cfg.rollout.storage_page_rows or 256)
     )
