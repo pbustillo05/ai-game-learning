@@ -733,6 +733,158 @@ Other methods such as rejection sampling or MCMC were found to be less efficient
 \Return $(\theta_k)_{k\geq 0}$
 \end{algorithm}
 
+\subsection{Shared-Seat Approximate-Response Probes}
+\label{subsec:shared-seat-approximate-response}
+
+This subsection defines the fifth production workflow.  It is deliberately an
+\emph{approximate-response probe}, not an exact best-response solver and not a
+certificate that a target profile is near equilibrium.
+
+Fix a target strategy profile $\bar\pi$.  Let $\Theta$ be the configured neural
+parameter space and let
+\begin{equation}\label{eq:shared-response-class}
+  \Pi_{\mathrm{shared}}
+  :=\left\{(\pi_p^\theta)_{p\in\mathcal P}:\theta\in\Theta\right\}.
+\end{equation}
+All seats share the same parameter vector and architecture; the acting seat and
+public state are model inputs.  Thus this is one seat-conditioned response
+class, not $|\mathcal P|$ independently parameterized response classes.
+
+For any behavioral deviation $\nu_p$ by player $p$, define
+\begin{equation}\label{eq:unilateral-gain}
+  g_p(\nu_p;\bar\pi)
+  :=J_p(\nu_p,\bar\pi_{-p})-J_p(\bar\pi),
+\end{equation}
+and define the exact best-response gain and NashConv using the full behavioral
+strategy class $\Pi_p$:
+\begin{equation}\label{eq:exact-br-and-nashconv}
+  g_p^*(\bar\pi)
+  :=\sup_{\nu_p\in\Pi_p}g_p(\nu_p;\bar\pi),
+  \qquad
+  \operatorname{NashConv}(\bar\pi)
+  :=\sum_{p\in\mathcal P}g_p^*(\bar\pi).
+\end{equation}
+For a shared probe parameter $\theta$, write
+\begin{equation}\label{eq:shared-probe-gain-objective}
+  g_p(\theta;\bar\pi):=g_p(\pi_p^\theta;\bar\pi),
+  \qquad
+  G_{\mathrm{shared}}(\theta;\bar\pi)
+  :=\frac1{|\mathcal P|}\sum_{p\in\mathcal P}g_p(\theta;\bar\pi).
+\end{equation}
+Every $\pi_p^\theta$ is a valid unilateral deviation, so for every fixed
+$\theta$,
+\begin{equation}\label{eq:shared-probe-lower-bound}
+  \sum_{p\in\mathcal P}g_p(\theta;\bar\pi)
+  \leq \operatorname{NashConv}(\bar\pi).
+\end{equation}
+The left side may be negative and remains a lower bound.  No maximum over
+$\Theta$, no finite optimization run, and no Monte Carlo estimate may be called
+an exact best response.
+
+\paragraph{Training seat law and mixed rollout.}
+Independently for every logical root $i$, before private-state or public-event
+sampling, draw
+\begin{equation}\label{eq:probe-seat-law}
+  I_i\sim\mathsf{Unif}(\mathcal P)
+\end{equation}
+from the counter-based logical key assigned to that root.  The draw is
+independent of queue order, physical batching, and GPU placement.  At training
+iteration $k$, root $i$ uses the mixed profile
+\begin{equation}\label{eq:mixed-probe-rollout-profile}
+  \rho^{k,i}_p
+  :=
+  \begin{cases}[l"l]
+    \pi_p^{\theta_k},&p=I_i,\\
+    \bar\pi_p,&p\neq I_i.
+  \end{cases}
+\end{equation}
+The target $\bar\pi$ is frozen and identified by its checkpoint content hash.
+Only decisions owned by $I_i$ enter the retained decision law; opponent
+forwards, actions, and reach updates affect successors but never create
+training rows.
+
+Let $\mathcal D_i$ be the selected-seat decisions retained from root $i$.
+Conditionally on a fixed rollout batch, the learner samples uniformly from the
+pooled set $\bigsqcup_i\mathcal D_i$ and applies exactly the sequential-RB PPO
+loss: clipped policy surrogate, actor-type value regression with the configured
+value clipping, entropy, and optional legal-action reference KL, all integrated
+against the selected seat's completion posterior.  Equivalently, its frozen
+batch objective is
+\begin{equation}\label{eq:shared-probe-empirical-loss}
+  \widehat l_{\mathrm{probe},k}(\theta)
+  :=
+  \frac{1}{\sum_i|\mathcal D_i|}
+  \sum_i\sum_{d\in\mathcal D_i}
+  \sum_{x_{I_i}\in\mathcal X_{I_i}}
+  \widehat{\mathbb P}_d(x_{I_i})
+  \mathcal L_{\mathrm{seqRB},d}(\theta,x_{I_i}).
+\end{equation}
+The root seat law gives every seat equal ex ante representation, but the
+normalization by the realized pooled decision count weights the resulting
+state occupancies by retained decisions.  Consequently
+\autoref{eq:shared-probe-empirical-loss} is the declared optimization surrogate,
+not an unbiased estimator of $G_{\mathrm{shared}}$ or its gradient.  PPO
+clipping, value regression, entropy, reference KL, finite batches, and repeated
+optimization introduce further surrogate effects.  Any other root-versus-row
+weighting is a different response-training contract.
+
+Training terminates only at the configured iteration and optimizer-step budget.
+If the final parameters are $\widehat\theta_K$, the result is the finite-budget
+shared approximate response $\pi^{\widehat\theta_K}$.  Logical trajectories,
+completion samples, minibatches, optimizer steps, target hash, and initialization
+rule are part of its reportable scientific identity.  There is no convergence,
+exploitability, or optimality stopping certificate.
+
+\paragraph{Public fold cutoff.}
+An early selected-seat cutoff is permitted only when there is a publicly
+measurable stopping set $\mathcal F_p$ and payoff $F_p$ such that
+\begin{equation}\label{eq:probe-public-cutoff}
+  R_p(x,\tau)=F_p(\sigma)
+  \quad\textnormal{for every }\sigma\in\mathcal F_p,
+  \ x\textnormal{ compatible with }\sigma,
+  \textnormal{ and terminal }\tau\succeq\sigma.
+\end{equation}
+In equal-stack cash poker, $\mathcal F_p$ is the set of public states immediately
+after $p$ folds and
+\begin{equation}\label{eq:poker-probe-fold-payoff}
+  F_p(\sigma)=-\operatorname{Committed}_p(\sigma).
+\end{equation}
+The rollout stops at the first such state because later opponents cannot change
+$p$'s payoff.  This is a synthetic probe leaf, not necessarily a terminal poker
+state.  Its immutable capture must carry the cutoff identity and selected seat
+until it has written $F_p$ and the selected posterior/value contract; these
+facts may never be reconstructed by reclassifying the underlying game state.
+No opponent decision after the cutoff is sampled or retained.
+
+\paragraph{Paired lower-bound evaluation.}
+Evaluation freezes both $\widehat\theta_K$ and $\bar\pi$.  Each consecutive
+block of $|\mathcal P|^2$ logical roots contains every
+$(\textnormal{probe seat},\textnormal{button position})$ pair exactly once.
+For each root $j$, run the mixed profile
+$(\pi_{I_j}^{\widehat\theta_K},\bar\pi_{-I_j})$ and the baseline $\bar\pi$
+with the same root identity and counter-key namespaces.  The root-private draw
+is shared; matching logical addresses reuse keys, while genuinely divergent
+paths use their own keyed chance/completion draws.  Record
+\begin{equation}\label{eq:paired-probe-difference}
+  D_j:=R_{I_j}^{\mathrm{mixed},j}-R_{I_j}^{\mathrm{baseline},j}.
+\end{equation}
+With $M_p=\#\{j:I_j=p\}$, define
+\begin{equation}\label{eq:approximate-nashconv-estimator}
+  \widehat g_p:=\frac1{M_p}\sum_{j:I_j=p}D_j,
+  \qquad
+  \widehat{\operatorname{NashConv}}_{\mathrm{probe}}
+  :=\sum_{p\in\mathcal P}\widehat g_p
+  =|\mathcal P|\frac1{\sum_pM_p}\sum_jD_j.
+\end{equation}
+The equality on the right requires the mandated balanced seat counts.  For a
+fixed probe checkpoint, $\widehat g_p$ estimates
+$g_p(\widehat\theta_K;\bar\pi)$, so the sum estimates the lower-bound quantity
+in \autoref{eq:shared-probe-lower-bound}.  The paired Student-$t$ interval
+quantifies evaluation sampling error only; it does not include response-class
+restriction or optimization error.  Reports must therefore use
+``shared approximate response'', ``probe gain'', and ``approximate NashConv
+lower bound'', never ``exact BR'' or unqualified ``NashConv''.
+
 \subsection{Variance-Guided Branching}\label{subsec:variance-guided-branching}
 
 Rao--Blackwellization integrates potential private states knowing a public terminal trajectory.

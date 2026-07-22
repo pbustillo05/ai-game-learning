@@ -10,11 +10,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 from torch import Tensor
 
 from pbg.config import load_config_mapping
+from pbg.core.br import (
+    SHARED_RESPONSE_SEMANTICS,
+    balanced_evaluation_probe_seats,
+    paired_probe_statistics,
+)
 from pbg.core.execution import DrawPurpose
 from pbg.core.game import PROBE_FOLD, GameBundle
 from pbg.core.rollout import (
@@ -50,6 +54,7 @@ def _student_t_critical(df: int) -> float:
 class BRProbeReport:
     """Paired approximate-exploitability lower-bound report."""
 
+    semantics: str
     mean_gain_bb_per_hand: float
     ci95_bb_per_hand: float
     mean_gain_bb100: float
@@ -125,6 +130,10 @@ def evaluate_br_probe(
     target_meta = probe_payload.get("probe_target")
     if not isinstance(target_meta, dict) or not target_meta.get("sha256"):
         raise ValueError("probe checkpoint has no hash-bound target metadata")
+    if target_meta.get("semantics") != SHARED_RESPONSE_SEMANTICS:
+        raise ValueError(
+            "probe checkpoint does not declare the current shared-response semantics"
+        )
     target_path = Path(target_checkpoint or target_meta.get("path", ""))
     if not target_path.is_file():
         raise ValueError("target checkpoint path is unavailable; pass target_checkpoint")
@@ -169,7 +178,7 @@ def evaluate_br_probe(
     for first in range(0, n_hands, batch_size):
         count = min(batch_size, n_hands - first)
         ids = torch.arange(first, first + count, device=requested, dtype=torch.int64)
-        seats = torch.remainder(ids // players, players).to(torch.int32)
+        seats = balanced_evaluation_probe_seats(ids, players)
         cfg.rollout.roots_per_gpu = count
         cfg.rollout.trajectory_start_index = first
         cfg.rollout.probe_seats = seats
@@ -193,19 +202,22 @@ def evaluate_br_probe(
         differences.append((mixed_reward - baseline_reward).detach().cpu())
         seat_rows.append(seats.cpu())
 
-    values = torch.cat(differences).double().numpy()
-    all_seats = torch.cat(seat_rows).numpy()
-    mean = float(values.mean())
-    standard_error = float(values.std(ddof=1) / math.sqrt(values.size))
-    ci95 = _student_t_critical(values.size - 1) * standard_error
-    per_seat = [float(values[all_seats == seat].mean()) for seat in range(players)]
+    values = torch.cat(differences).double()
+    all_seats = torch.cat(seat_rows)
+    statistics = paired_probe_statistics(values, all_seats, players)
+    mean = statistics.mean_gain
+    ci95 = _student_t_critical(values.numel() - 1) * statistics.standard_error
+    per_seat = list(statistics.per_seat_gain)
     logical_work = probe_payload.get("logical_work") or {}
     return BRProbeReport(
+        semantics=SHARED_RESPONSE_SEMANTICS,
         mean_gain_bb_per_hand=mean,
         ci95_bb_per_hand=ci95,
         mean_gain_bb100=100.0 * mean,
         ci95_bb100=100.0 * ci95,
-        approximate_nashconv_bb_per_hand=players * mean,
+        approximate_nashconv_bb_per_hand=(
+            statistics.approximate_nashconv_lower_bound
+        ),
         per_seat_gain_bb_per_hand=per_seat,
         n_deals=n_hands,
         n_replays=2 * n_hands,

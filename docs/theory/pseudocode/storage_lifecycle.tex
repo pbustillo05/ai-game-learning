@@ -253,6 +253,17 @@ Owner & Field & Shape \\
 The parent and unique-child posterior of every decision are the same referenced
 completion row.  V1 stores no separate $Q$ target and exposes no $Q$ loss.
 
+The shared-seat approximate-response probe in
+\texttt{shared\_response\_probe.tex} uses this exact storage family.  Its
+root-local selected seat, frozen-opponent outputs, opponent model inputs, and
+synthetic-cutoff control are rollout-phase owners, not additional retained
+fields.  Only selected-seat decisions are appended.  At an early public fold,
+the cutoff identity and selected seat remain live until the leaf transaction
+has written the explicit synthetic owner, selected fold payoff, and immutable
+completion inputs; they are then released.  The final
+\Obj{TrainingStorage} schema is unchanged and contains no opponent row or probe
+control from which discarded rollout state could be reconstructed.
+
 \subsection*{Branched RB}
 
 \begin{center}

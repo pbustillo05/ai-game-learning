@@ -50,6 +50,10 @@ $\mathsf m\in\{\mathsf{normal},\mathsf{seqRB},\mathsf{branchRB}\}$;
 GPU set $\mathcal G$; in sequential modes the common per-GPU root width $G_k$
 chosen before current draws by \Obj{ChooseSequentialRootWidth} in
 \texttt{sequential\_memory\_control.tex}}
+\KwParam{the shared approximate-response semantic overlay is defined by
+\texttt{shared\_response\_probe.tex}.  It uses the $\mathsf{seqRB}$ topology,
+completion, queue, admission, and seal contracts here, while overriding role
+forwarding and row capture so only the root-selected seat is retained}
 \KwParam{finite opaque partition interface
 $\mathfrak M=(\mathcal M,\kappa,\preceq,
 (\Obj{PartitionSpec}_m)_{m\in\mathcal M})$:

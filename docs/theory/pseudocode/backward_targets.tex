@@ -78,6 +78,10 @@ decision and one shared completion posterior row per $(\textnormal{trajectory},p
 Allocate $\mathtt{lambdaReturn}_m[D_m,X_m]$, an append-only
 $\Obj{SequentialPosteriorPool}$, int32 $\mathtt{posteriorRef}_m[D_m]$, and
 exactly-once validity bits;
+\tcc{Under the shared-response overlay, every retained decision owner is its
+root's selected seat, opponent decisions are absent, and a synthetic public-fold
+leaf supplies that selected seat's fixed payoff and posterior through the same
+immutable RB leaf fields.}
 \ForEach{bounded trajectory/leaf microbatch $I$ \textbf{on device}}{
   $C_I\gets\Complete(\Obj{LeafTable}[\mathtt{leafRow}[I]])$;
   Extract only $w_{i,p}=\widehat{\mathbb P}(-_p\mid\Tau_i^{\mathsf{pre-c}})$ and

@@ -1,0 +1,136 @@
+\documentclass[10pt,varwidth=190mm,border=1mm]{standalone}
+\makeatletter
+\IfFileExists{preamble/preamble.tex}{
+  \def\theoryroot{}
+}{
+  \IfFileExists{../preamble/preamble.tex}{
+    \def\theoryroot{../}
+  }{
+    \IfFileExists{docs/theory/preamble/preamble.tex}{
+      \def\theoryroot{docs/theory/}
+    }{
+      \PackageError{shared_response_probe}{Cannot locate docs/theory/preamble/preamble.tex}{}
+    }
+  }
+}
+\edef\input@path{{\theoryroot}}
+\makeatother
+\input{\theoryroot preamble/preamble}
+
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0pt}
+\setlength{\algomargin}{1em}
+\SetAlFnt{\footnotesize}
+\SetAlCapFnt{\footnotesize\bfseries}
+\SetAlCapNameFnt{\footnotesize\bfseries}
+\SetAlCapSkip{0.35em}
+\newcommand{\Obj}[1]{\texttt{#1}}
+\newcommand{\Release}{\operatorname{\texttt{Release}}}
+\newcommand{\Hash}{\operatorname{\texttt{SHA256}}}
+
+\begin{document}
+
+\begin{algorithm}[H]
+\caption{$\Obj{TrainingStorage}_g\gets
+\Obj{SharedResponseRollout}(\theta_k,\bar\theta,G_k)$}
+\label{alg:shared-response-rollout}
+\DontPrintSemicolon
+\KwIn{one trainable shared response $\pi^{\theta_k}$; one read-only target
+$\bar\pi=\pi^{\bar\theta}$ bound to its content hash; the sequential-RB
+partition, queue, admission, logical-RNG, and completion contracts}
+\KwOut{ordinary sequential-RB training storage containing selected-seat rows only}
+
+Allocate exactly the sequential-RB owners admitted by immutable schemas and
+realized work; keep $\bar\theta$ read-only for the entire run;
+\For{$i=0,\ldots,G_k-1$}{
+  Draw $I_i\sim\mathsf{Unif}(\mathcal P)$ from
+  $K(k,i,\mathsf{probeSeat})$ before private-state and event draws;
+  Attach $I_i$ to the live root owner; it remains phase-local rollout control;
+}
+Run the family-scheduled sequential queue from
+\texttt{family\_scheduled\_rollout.tex}, with these role overrides:
+\begin{enumerate}[label=(\roman*)]
+  \item when a player occurrence $s$ from root $i$ has
+  $o(\ell(s))=I_i$, forward $\pi^{\theta_k}$ and append its natural input,
+  owner, sampled event, old log probability, and old value;
+  \item otherwise forward $\bar\pi$ and use its sampled event and reach update
+  only to materialize the successor; append no decision/model row;
+  \item after a selected-seat action, test the game-owned public cutoff predicate.
+  If it holds, write the synthetic owner $\mathsf{PROBE\_FOLD}$ on the occurrence;
+  never attempt to derive that owner from the underlying game-state phase.
+\end{enumerate}
+At each stopped leaf, capture in one last-consumer transaction the occurrence
+owner, $I_i$, stopped reach, logical completion key, and immutable completion
+inputs.  At a synthetic cutoff write only the selected payoff
+$F_{I_i}(\ell(s))$ from Eq.~\textnormal{(probe-public-cutoff)}; at an ordinary
+leaf use ordinary sequential-RB settlement.  Release the mutable state, root
+profile, selected-seat control, and opponent transient immediately after their
+last captured consumer;
+
+Seal one $\Obj{SequentialDecisionCSR}$ and one leaf per root.  Build targets by
+$\Obj{BuildSequentialRBTargets}$ and finalize by the ordinary sequential-RB
+schema.  Assert every retained decision owner equals its root's selected seat,
+no opponent row exists, every synthetic cutoff retains its explicit owner and
+selected payoff, and no selected-seat/root-profile control crosses into
+$\Obj{TrainingStorage}$;
+\Return{$\Obj{TrainingStorage}_g$};
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\widehat\theta_K\gets
+\Obj{TrainSharedApproximateResponse}(\theta_0,\bar\theta)$}
+\label{alg:train-shared-approximate-response}
+\DontPrintSemicolon
+\KwIn{hash-bound target checkpoint $\bar\theta$; configured initialization
+$\theta_0$; fixed iteration count $K$ and optimizer steps per iteration}
+\KwOut{finite-budget shared approximate response $\widehat\theta_K$ and work ledger}
+
+Verify the target content hash and identical game tuple $(P,S,R)$ before model
+or rollout allocation; initialize the shared response randomly or from
+$\bar\theta$ exactly as configured;
+\For{$k=0,\ldots,K-1$}{
+  Build selected-only stores with
+  $\Obj{SharedResponseRollout}(\theta_k,\bar\theta,G_k)$ on every rank;
+  Apply $\Obj{DistributedFixedRolloutUpdate}$ with mode $\mathsf{seqRB}$ and
+  Eq.~\textnormal{(shared-probe-empirical-loss)}; update only $\theta_k$;
+  Add exact logical trajectories, completion samples, minibatches, and
+  optimizer steps to the checkpointed work ledger;
+}
+Store $\widehat\theta_K=\theta_K$, the
+\texttt{shared\_seat\_approximate\_response\_v1} semantics identifier, target
+hash, initialization rule, scientific configuration, RNG state, optimizer
+state, and work ledger;
+\tcc{Budget exhaustion is the only stopping rule.  Do not emit a convergence,
+best-response, exploitability, or NashConv certificate.}
+\Return{$\widehat\theta_K$ and ledger};
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\Obj{Report}\gets
+\Obj{EvaluateSharedApproximateResponse}(\widehat\theta_K,\bar\theta,H)$}
+\label{alg:evaluate-shared-approximate-response}
+\DontPrintSemicolon
+\KwIn{fixed probe and hash-matched target; $H>1$ divisible by $P^2$}
+\KwOut{paired shared-response lower-bound report}
+
+Assign every consecutive $P^2$ roots to all
+$(\textnormal{selected seat},\textnormal{button})$ pairs exactly once;
+\ForEach{bounded evaluation root batch}{
+  Run the selected-seat mixed profile and the all-target baseline with the same
+  root identities and logical RNG namespaces; matching logical addresses reuse
+  keys, while genuinely divergent paths retain their own keyed draws;
+  Record paired selected-seat differences $D_j$ and release both rollouts;
+}
+Compute each $\widehat g_p$ and
+$\widehat{\operatorname{NashConv}}_{\rm probe}=\sum_p\widehat g_p$ exactly as
+Eq.~\textnormal{(approximate-nashconv-estimator)}.  Assert every seat count is
+equal and positive and the sum equals $P$ times the overall balanced mean;
+Compute the paired Student-$t$ interval over $(D_j)_j$ and label it evaluation
+sampling uncertainty only;
+Report per-seat gains, approximate NashConv lower bound, hashes, seed, paired
+evaluation work, training logical-work ledger, and wall time;
+\Return{$\Obj{Report}$};
+\end{algorithm}
+
+\end{document}

@@ -87,11 +87,15 @@ Every active scientific YAML uses direct `game.n_players`, `stack_bb`, and
 - `docs/theory/pseudocode/distributed_update.tex` — partition-local sampling,
   aligned minibatch materialization, distributed update, and final storage
   release law.
+- `docs/theory/pseudocode/shared_response_probe.tex` — selected-seat response
+  rollout, finite-budget training, and paired lower-bound evaluation overlay.
 
-Together these four sources (and their tracked PDFs) are the decision-complete
+Together these five sources (and their tracked PDFs) are the decision-complete
 implementation specification: storage ownership is defined once in
 `storage_lifecycle.tex`, while the other three documents govern consecutive
-lifecycle phases and must use its exact future Python object names.
+lifecycle phases and must use its exact future Python object names; the response
+overlay reuses those sequential-RB contracts without defining another storage
+family.
 - `docs/core_algorithms.md` — implementation mapping for all three modes.
 - `docs/poker.md` — NLHE/evaluator/model details.
 - `docs/training_and_evaluation.md` — operational guide.

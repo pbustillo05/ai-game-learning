@@ -43,6 +43,10 @@
 \KwParam{immutable GPU-local stores produced by the matching target builder;
 opaque $(\Obj{PartitionSpec}_m)_{m\in\mathcal M}$;
 $\mathsf m\in\{\mathsf{normal},\mathsf{seqRB},\mathsf{branchRB}\}$}
+\KwParam{the shared approximate-response workflow uses $\mathsf m=\mathsf{seqRB}$
+with selected-seat-only rows produced by
+\texttt{shared\_response\_probe.tex}; it introduces no fourth loss/storage
+representation}
 \KwParam{the production-v1 loss family: clipped PPO policy surrogate, value
 regression with optional value clipping, entropy, and legal-action KL to an
 optional frozen reference $\pi^{\theta_{\rm ref(k)}}$; synchronous optimizer,

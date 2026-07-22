@@ -210,6 +210,22 @@ size and factorized action-head size may differ. Probe checkpoints record the
 resolved target SHA-256; resume and evaluation reject changed target contents,
 while allowing the target file to be moved.
 
+This workflow is the `shared_seat_approximate_response_v1` contract from
+`docs/theory/core_math.tex`. Each logical training root draws one probe seat
+uniformly with a schedule-independent key. The trainable model acts only for
+that seat, the hash-bound target acts for every other seat, and only probe-seat
+decisions enter the sequential-RB PPO loss. All seats share one parameter
+vector; this is not a collection of independently optimized per-seat responses.
+Training stops at the configured iteration/optimizer budget and carries no
+convergence or exact-best-response claim. New probe checkpoints record this
+semantics version and resume/evaluation reject unversioned or mismatched probe
+checkpoints.
+
+When the probe folds, rollout stops because its payoff is already the negative
+amount it committed. This is an explicit synthetic cutoff even when opponents
+continue playing; it must not be inferred by treating the poker state as
+terminal.
+
 Evaluate one or more probe checkpoints with paired GPU rollouts (heads-up
 example):
 
@@ -221,7 +237,11 @@ pbg-br-eval --probe runs/probe/ckpt_0000100.pt \
 `--hands` and `--batch-size` must be multiples of $P^2$ so exploiter seats and
 button positions are exactly balanced. The headline mean unilateral gain is
 an approximate exploitability lower bound; the report also includes its paired
-confidence interval, per-seat gains, and approximate NashConv.
+confidence interval, per-seat gains, and the approximate NashConv lower bound
+defined as the sum of those per-seat gains. Evaluation balances every
+`(probe seat, button)` pair in blocks of $P^2$. The confidence interval covers
+paired evaluation sampling error only; it does not cover neural response-class
+restriction or finite-optimization error.
 It also records paired evaluation work and wall time plus the probe
 checkpoint's cumulative logical trajectories, completion samples, minibatches,
 and optimizer steps. If omitted, `--batch-size` is chosen automatically as a

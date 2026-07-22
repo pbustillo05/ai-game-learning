@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from pbg.core.br import training_probe_seats
 from pbg.core.game import CHANCE, PRETERM, PROBE_FOLD, TERMINAL, EventBatch, GameBundle
 from pbg.core.execution import (
     DONE,
@@ -377,7 +378,7 @@ def _sample_trees_sequential(
                 draw=0,
                 purpose=DrawPurpose.PROBE_SEAT,
             )
-            probe_seats = torch.remainder(seat_keys, p_max).to(torch.int32)
+            probe_seats = training_probe_seats(seat_keys, p_max)
     arena.scatter_many(
         root_handles,
         {

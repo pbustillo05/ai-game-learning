@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 
+from pbg.core.br import SHARED_RESPONSE_SEMANTICS
 from pbg.core.config import RootConfig, seed_all
 from pbg.core.adaptive_branching import AdaptiveKKTController
 from pbg.core.checkpointing import (
@@ -2512,6 +2513,7 @@ def run_training(
         if target_game != expected_game:
             raise RuntimeError("probe and target checkpoints must use identical (P,S,R)")
         probe_target = {
+            "semantics": SHARED_RESPONSE_SEMANTICS,
             "sha256": actual_sha256,
             "path": str(target_path),
             "run_id": target_payload.get("run_id"),
@@ -2657,7 +2659,11 @@ def run_training(
             }
         if cfg.probe is not None:
             stored_target = checkpoint_metadata.get("probe_target")
-            if stored_target is None or stored_target.get("sha256") != cfg.probe.target_sha256:
+            if stored_target is None:
+                raise RuntimeError("resume checkpoint has no probe target metadata")
+            if stored_target.get("semantics") != SHARED_RESPONSE_SEMANTICS:
+                raise RuntimeError("resume checkpoint has incompatible probe semantics")
+            if stored_target.get("sha256") != cfg.probe.target_sha256:
                 raise RuntimeError("resume probe target hash does not match checkpoint")
         if not compatible_scientific_configs(
             checkpoint_metadata["cfg_dict"], _scientific_config(cfg)

@@ -12,6 +12,7 @@ import torch
 import yaml
 
 from pbg.config import ConfigError, load_config
+from pbg.core.br import SHARED_RESPONSE_SEMANTICS
 from pbg.core.checkpointing import scientific_config
 from pbg.core.game import PROBE_FOLD, EventBatch
 from pbg.core.rollout import ProbeRollout, sample_trees_sequential
@@ -171,6 +172,7 @@ def test_three_player_probe_fold_cuda_train_resume_and_evaluate(tmp_path: Path) 
     train(cfg)
     checkpoint = Path(cfg.training.out_dir) / "ckpt_0000001.pt"
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    assert payload["probe_target"]["semantics"] == SHARED_RESPONSE_SEMANTICS
     assert payload["probe_target"]["sha256"] == digest
     assert payload["logical_work"]["optimizer_steps"] == 1
 
@@ -186,4 +188,5 @@ def test_three_player_probe_fold_cuda_train_resume_and_evaluate(tmp_path: Path) 
         seed=11,
         device="cuda:0",
     )
+    assert report.semantics == SHARED_RESPONSE_SEMANTICS
     assert math.isfinite(report.mean_gain_bb_per_hand)
