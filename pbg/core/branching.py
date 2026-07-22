@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass
+import math
 from typing import Any, Mapping
 
 import torch
@@ -118,6 +119,7 @@ def _sample_branched_tree_impl(
         child_path_keys,
         logical_rng_keys,
         logical_uniform,
+        select_work_queue,
         stable_partition_masked,
     )
     from pbg.core.storage import (
@@ -258,9 +260,24 @@ def _sample_branched_tree_impl(
         )["reach_handle"]
         reach_pool.release_rows(handles)
     family_names, family_values, family_priorities = _family_spec(backend)
-    queue_limit = max(1, execution_limit // max(8 * len(family_names), 8))
+    queue_limit = getattr(rollout_cfg, "queue_capacity_rows", None)
+    if (
+        isinstance(queue_limit, bool)
+        or not isinstance(queue_limit, int)
+        or queue_limit <= 0
+    ):
+        raise ValueError("branched rollout requires positive queue_capacity_rows")
+    if child_pack_rows > queue_limit:
+        raise ValueError("family_batch_rows cannot exceed queue_capacity_rows")
     queues = {
-        name: DeviceWorkQueue(queue_limit, device) for name in family_names
+        name: DeviceWorkQueue(
+            queue_limit,
+            device,
+            staging_rows=child_pack_rows,
+            accountant=accountant,
+            label=f"branched_queue_{name}",
+        )
+        for name in family_names
     }
     metrics = getattr(backend, "execution_metrics", None)
     actual_cost_forward = getattr(
@@ -307,6 +324,14 @@ def _sample_branched_tree_impl(
     )
     if dynamic_active and controller is None:
         raise ValueError("dynamic branching after warmup requires controller state")
+    safe_tree_size = getattr(rollout_cfg, "safe_tree_size", None)
+    if safe_tree_size is not None and (
+        isinstance(safe_tree_size, bool)
+        or not math.isfinite(float(safe_tree_size))
+        or float(safe_tree_size) < 1.0
+    ):
+        raise ValueError("safe_tree_size must be finite and at least one")
+    queue_pressure_active = safe_tree_size is not None
     control_arena = PagedTensorArena(
         TensorSchema(
             "branched_controller_rows",
@@ -474,10 +499,10 @@ def _sample_branched_tree_impl(
         nominal = randomized_round(beta, logical_uniform(keys))
         offspring = nominal
         safeguard = bool(
-            dynamic_active
-            and family is not None
+            family is not None
+            and queue_pressure_active
             and buffer.node_count + frontier_cost_forecast
-            > float(adaptive_cfg.safe_tree_size)
+            > float(safe_tree_size)
         )
         if safeguard:
             offspring = torch.ones_like(nominal)
@@ -502,7 +527,7 @@ def _sample_branched_tree_impl(
         admit_child_wave(total)
         nominal_count[rows] = nominal.to(torch.int32)
         beta_rows[rows] = beta.detach().to(torch.float32)
-        if dynamic_active and diagnostics is not None:
+        if queue_pressure_active and diagnostics is not None:
             diagnostics["safeguard_batches"] = diagnostics.get("safeguard_batches", 0) + int(safeguard)
             diagnostics["safeguard_suppressed_children"] = diagnostics.get(
                 "safeguard_suppressed_children", 0
@@ -812,14 +837,14 @@ def _sample_branched_tree_impl(
                         arena=arena,
                         logical_time=scheduler_step,
                     )
-                    if dynamic_active:
+                    if queue_pressure_active:
                         qrows = queued.to(torch.int64)
                         qstates = buffer.state_ref[qrows]
                         qout = actual_cost_forward(
                             bundle.model, name, qstates, reaches_for(queued)
                         )
                         if qout.c is None:
-                            raise RuntimeError("adaptive KKT queue accounting requires C head")
+                            raise RuntimeError("queue-pressure accounting requires C head")
                         queue_cost[qrows] = qout.c.detach().float()
                         queue_cost_total += read_float_control(
                             qout.c.detach().float().sum()
@@ -867,31 +892,22 @@ def _sample_branched_tree_impl(
         while any(queue.host_count for queue in queues.values()):
             stop_if_cutoff_reached()
             scheduler_step += 1
-            nonempty = [name for name in family_names if queues[name].host_count]
-            upstream = min(
-                family_priorities[family_names.index(name)] for name in nonempty
+            selection = select_work_queue(
+                family_names,
+                family_priorities,
+                queues,
+                child_pack_rows,
+                allow_partial=True,
+                logical_time=scheduler_step,
             )
-            eligible = [
-                name
-                for name in nonempty
-                if family_priorities[family_names.index(name)] == upstream
-            ]
-            family = max(
-                eligible,
-                key=lambda name: (
-                    queues[name].host_count,
-                    queues[name].oldest_age(scheduler_step),
-                    -family_names.index(name),
-                ),
-            )
+            if selection is None:
+                raise RuntimeError("branched queue scheduler lost nonempty work")
+            family = selection.family
             queue = queues[family]
-            configured_rows = int(
-                getattr(rollout_cfg, "family_batch_rows", None) or queue.host_count
-            )
-            count = min(queue.host_count, configured_rows)
+            count = selection.rows
             frontier_cost_forecast = queue_cost_total
             nodes = queue.dequeue(count, arena=arena).to(torch.int32)
-            if dynamic_active:
+            if queue_pressure_active:
                 # This synchronization is co-located with the scheduler's existing
                 # host control boundary and keeps R_F incremental.
                 removed = read_float_control(queue_cost[nodes.to(torch.int64)].sum())
@@ -944,6 +960,9 @@ def _sample_branched_tree_impl(
                 "root_final_child_count": int(buffer.child_count[0]),
             }
         )
+
+    for queue in queues.values():
+        queue.release()
 
     release_reaches(root_nodes)
     release_states = getattr(backend, "release_state_rows", None)

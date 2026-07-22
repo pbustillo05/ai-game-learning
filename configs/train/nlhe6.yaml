@@ -5,6 +5,8 @@ game:
 rollout:
   sequential_roots_per_gpu_initial: 1
   branching_mode: fixed
+  safe_tree_size: 3800.0
+  queue_capacity_rows: 4096
   beta:
     default: 1.0
     preflop: 1.0

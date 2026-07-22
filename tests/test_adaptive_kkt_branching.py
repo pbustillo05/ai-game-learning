@@ -121,7 +121,6 @@ def test_branching_modes_are_explicit_typed_and_fail_early() -> None:
         "beta_max": 4.0,
         "warmup_iters": 10,
         "target_tree_size": 3000.0,
-        "safe_tree_size": 3800.0,
         "kappa_initial": 1.0,
         "kappa_min": 1.0e-4,
         "kappa_max": 1.0e4,
@@ -133,6 +132,16 @@ def test_branching_modes_are_explicit_typed_and_fail_early() -> None:
     assert cfg.rollout.branching_mode == "dynamic"
     assert cfg.rollout.adaptive_kkt is not None
     assert cfg.rollout.adaptive_kkt.warmup_iters == 10
+
+    bad = copy.deepcopy(raw)
+    bad["rollout"]["adaptive_kkt"]["safe_tree_size"] = 3800.0
+    with pytest.raises(ConfigError, match="adaptive_kkt.safe_tree_size.*unknown"):
+        load_config_mapping(bad)
+
+    bad = copy.deepcopy(raw)
+    bad["rollout"].pop("queue_capacity_rows")
+    with pytest.raises(ConfigError, match="queue_capacity_rows.*requires"):
+        load_config_mapping(bad)
 
     bad = copy.deepcopy(raw)
     bad["rollout"]["adaptive_kkt"]["enabled"] = True
@@ -277,14 +286,15 @@ def test_fixed_and_dynamic_warmup_ignore_heads_then_dynamic_uses_them() -> None:
     backend = _LabeledBackend(1.0, two_levels=True)
     bundle = GameBundle(_AdaptiveModel(), backend, _Adapter(), None)
     fixed_cfg = SimpleNamespace(
-        roots_per_gpu=1, storage_page_rows=32, branching_mode="fixed", adaptive_kkt=None
+        roots_per_gpu=1, storage_page_rows=32, branching_mode="fixed",
+        adaptive_kkt=None, safe_tree_size=None, queue_capacity_rows=64,
     )
     dynamic = SimpleNamespace(
-        warmup_iters=3, beta_max=3.0, safe_tree_size=1000.0
+        warmup_iters=3, beta_max=3.0
     )
     dynamic_cfg = SimpleNamespace(
         roots_per_gpu=1, storage_page_rows=32, branching_mode="dynamic",
-        adaptive_kkt=dynamic,
+        adaptive_kkt=dynamic, safe_tree_size=None, queue_capacity_rows=64,
     )
     controller = AdaptiveKKTController(
         target_tree_size=20.0,
@@ -325,13 +335,14 @@ def test_queue_safeguard_is_batch_local_recovers_and_retains_counterfactual_coun
     adaptive = SimpleNamespace(
         warmup_iters=0,
         beta_max=3.0,
-        safe_tree_size=5.0,
     )
     cfg = SimpleNamespace(
         roots_per_gpu=1,
         storage_page_rows=32,
         branching_mode="dynamic",
         adaptive_kkt=adaptive,
+        safe_tree_size=5.0,
+        queue_capacity_rows=64,
     )
     controller = AdaptiveKKTController(
         target_tree_size=20.0,
@@ -358,6 +369,32 @@ def test_queue_safeguard_is_batch_local_recovers_and_retains_counterfactual_coun
           - sample.decision_aux["executed_child_count"].float()) * old_c).sum()
     )
     assert counterfactual == pytest.approx(float(sample.node_count) + 20.0)
+
+
+@pytest.mark.parametrize(("mode", "iteration"), (("fixed", 20), ("dynamic", 0)))
+def test_queue_safeguard_applies_in_fixed_mode_and_dynamic_warmup(
+    mode: str, iteration: int
+) -> None:
+    adaptive = None
+    if mode == "dynamic":
+        adaptive = SimpleNamespace(warmup_iters=3, beta_max=3.0)
+    cfg = SimpleNamespace(
+        roots_per_gpu=1,
+        storage_page_rows=32,
+        branching_mode=mode,
+        adaptive_kkt=adaptive,
+        safe_tree_size=5.0,
+        queue_capacity_rows=64,
+    )
+    sample = sample_branched_tree(
+        GameBundle(_AdaptiveModel(), _LabeledBackend(3.0, two_levels=True), _Adapter(), None),
+        cfg,
+        torch.Generator().manual_seed(9),
+        iteration=iteration,
+    )
+    assert sample.topology.degree[0].item() == 1
+    assert sample.topology.nominal_degree[0].item() == 3
+    assert sample.branching_diagnostics["safeguard_batches"] >= 1
 
 
 @dataclass

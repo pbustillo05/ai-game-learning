@@ -22,6 +22,7 @@ from pbg.core.execution import (
     arena_fields,
     child_path_keys,
     logical_rng_keys,
+    select_work_queue,
     stable_partition_masked,
 )
 from pbg.core.tree import PagedRolloutTopology
@@ -406,7 +407,13 @@ def _sample_trees_sequential(
 
     family_names, family_values, family_priorities = _family_spec(backend)
     queues = {
-        name: DeviceWorkQueue(start_count, device) for name in family_names
+        name: DeviceWorkQueue(
+            start_count,
+            device,
+            staging_rows=min(start_count, batch_rows),
+            label=f"sequential_queue_{name}",
+        )
+        for name in family_names
     }
     actual_cost_forward = getattr(
         backend, "policy_forward_family_actual_cost", None
@@ -459,17 +466,6 @@ def _sample_trees_sequential(
         else:
             host = counts
         return tuple(int(value) for value in host.tolist())
-
-    def planned_family_pack(name: str) -> tuple[int, float, bool]:
-        """Return logical rows, batch fill, and full-threshold status."""
-
-        queue = queues[name]
-        if queue.host_count == 0:
-            return 0, 0.0, False
-        selected = min(queue.host_count, batch_rows)
-        fill = selected / float(batch_rows)
-        full_threshold = selected == batch_rows
-        return selected, fill, full_threshold
 
     def record_queues() -> None:
         if metrics is None:
@@ -676,33 +672,15 @@ def _sample_trees_sequential(
         if scheduler_steps > start_count * (int(backend.max_rollout_steps) + 2):
             raise RuntimeError("family-scheduled rollout scheduler exceeded its progress bound")
 
-        family_plans = {
-            name: planned_family_pack(name)
-            for name in family_names
-            if queues[name].host_count
-        }
-        full = [name for name, plan in family_plans.items() if plan[2]]
-        selected_family: str | None = None
-        if full:
-            # family_names is a topological priority order; within the first
-            # priority layer the fullest work queue wins with stable ties.
-            upstream = min(
-                family_priorities[family_names.index(name)] for name in full
-            )
-            eligible = [
-                name
-                for name in full
-                if family_priorities[family_names.index(name)] == upstream
-            ]
-            selected_family = max(
-                eligible,
-                key=lambda name: (
-                    queues[name].host_count / max(family_plans[name][0], 1),
-                    queues[name].oldest_age(scheduler_steps),
-                    -family_names.index(name),
-                ),
-            )
-        elif admitted < start_count and (
+        selection = select_work_queue(
+            family_names,
+            family_priorities,
+            queues,
+            batch_rows,
+            allow_partial=False,
+            logical_time=scheduler_steps,
+        )
+        if selection is None and admitted < start_count and (
             safe_count := admission_plan.safe_admit(
                 active_starts=active_starts,
                 unstarted=start_count - admitted,
@@ -740,25 +718,21 @@ def _sample_trees_sequential(
             admitted = stop
             continue
         else:
-            nonempty = [name for name in family_names if queues[name].host_count]
-            if not nonempty:
+            if selection is None:
+                selection = select_work_queue(
+                    family_names,
+                    family_priorities,
+                    queues,
+                    batch_rows,
+                    allow_partial=True,
+                    logical_time=scheduler_steps,
+                )
+            if selection is None:
                 break
-            selected_family = max(
-                nonempty,
-                key=lambda name: (
-                    family_plans[name][1],
-                    queues[name].oldest_age(scheduler_steps),
-                    -family_priorities[family_names.index(name)],
-                    -family_names.index(name),
-                ),
-            )
-            forced_drain = True
-
-        if full:
-            forced_drain = False
-
+        selected_family = selection.family
+        forced_drain = selection.forced_partial
         queue = queues[selected_family]
-        count = family_plans[selected_family][0]
+        count = selection.rows
         batch_nodes = queue.dequeue(count, arena=arena).to(torch.int32)
         if metrics is not None and forced_drain:
             metrics.record_forced_drain(selected_family, rows=count)
@@ -892,6 +866,8 @@ def _sample_trees_sequential(
         raise RuntimeError(
             "family-scheduled rollout terminated with incomplete trajectory admission/accounting"
         )
+    for queue in queues.values():
+        queue.release()
     if not leaf_rows.rows or leaf_rows.arena is None:
         raise RuntimeError("sequential rollout produced no stopped-leaf rows")
     leaf_root = leaf_rows.arena.gather(

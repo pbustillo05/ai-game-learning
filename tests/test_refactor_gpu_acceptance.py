@@ -26,6 +26,8 @@ def _tiny_config(mode: str, *, branching_mode: str = "fixed"):
     if mode == "normal":
         cfg.rollout.branching_mode = None
         cfg.rollout.beta = None
+        cfg.rollout.safe_tree_size = None
+        cfg.rollout.queue_capacity_rows = None
         cfg.completion.n_samples = None
         cfg.loss.name = "ppo"
         cfg.loss.c_t = 0.0
@@ -33,6 +35,8 @@ def _tiny_config(mode: str, *, branching_mode: str = "fixed"):
     elif mode == "rao_blackwell":
         cfg.rollout.branching_mode = None
         cfg.rollout.beta = None
+        cfg.rollout.safe_tree_size = None
+        cfg.rollout.queue_capacity_rows = None
         cfg.loss.name = "rb_ppo"
         cfg.loss.c_t = 0.0
         cfg.loss.c_c = 0.0
@@ -46,7 +50,6 @@ def _tiny_config(mode: str, *, branching_mode: str = "fixed"):
                 beta_max=1.0,
                 warmup_iters=0,
                 target_tree_size=4.0,
-                safe_tree_size=16.0,
                 kappa_initial=1.0,
                 kappa_min=0.1,
                 kappa_max=10.0,
@@ -54,6 +57,8 @@ def _tiny_config(mode: str, *, branching_mode: str = "fixed"):
                 eta_kappa=0.1,
             )
         )
+        cfg.rollout.safe_tree_size = 16.0
+        cfg.rollout.queue_capacity_rows = 64
         cfg.loss.name = "rb_ppo"
         cfg.loss.c_t = 1.0
         cfg.loss.c_c = 1.0
@@ -243,7 +248,7 @@ def test_tiny_branched_gpu_safety_soak_exercises_scientific_controls(
     else:
         assert cfg.rollout.adaptive_kkt is not None
         cfg.rollout.adaptive_kkt.beta_max = 2.0
-        cfg.rollout.adaptive_kkt.safe_tree_size = 1.0
+        cfg.rollout.safe_tree_size = 1.0
         cfg.rollout.adaptive_kkt.kappa_initial = 10.0
         cfg.rollout.adaptive_kkt.kappa_max = 10.0
     cfg.training.iters = 2
@@ -368,7 +373,7 @@ def _two_gpu_dynamic_branched_worker(
     cfg.rollout.storage_page_rows = 8
     assert cfg.rollout.adaptive_kkt is not None
     cfg.rollout.adaptive_kkt.beta_max = 2.0
-    cfg.rollout.adaptive_kkt.safe_tree_size = 1.0
+    cfg.rollout.safe_tree_size = 1.0
     cfg.rollout.adaptive_kkt.kappa_initial = 10.0
     cfg.rollout.adaptive_kkt.kappa_max = 10.0
     cfg.completion.n_samples = 4

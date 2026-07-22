@@ -28,12 +28,11 @@ class GameConfig:
 
 @dataclass
 class AdaptiveKKTConfig:
-    """Dynamic public branching and queue-pressure control parameters."""
+    """Dynamic public branching controller parameters."""
 
     beta_max: float
     warmup_iters: int
     target_tree_size: float
-    safe_tree_size: float
     kappa_initial: float
     kappa_min: float
     kappa_max: float
@@ -65,6 +64,8 @@ class RolloutConfig:
     memory_prediction_z: float = 3.0
     adaptive_kkt: AdaptiveKKTConfig | None = None
     branching_min_nodes: int | None = None
+    safe_tree_size: float | None = None
+    queue_capacity_rows: int | None = None
 
     def __post_init__(self) -> None:
         self.roots_per_gpu = int(self.sequential_roots_per_gpu_initial)
@@ -329,6 +330,21 @@ def _validate_config(cfg: RootConfig) -> None:
             raise ConfigError(
                 "root.rollout.branching_min_nodes: expected an integer greater than one"
             )
+        queue_capacity = cfg.rollout.queue_capacity_rows
+        if (
+            isinstance(queue_capacity, bool)
+            or not isinstance(queue_capacity, int)
+            or queue_capacity <= 0
+        ):
+            raise ConfigError(
+                "root.rollout.queue_capacity_rows: branched_rao_blackwell requires "
+                "a positive integer"
+            )
+        safe_tree_size = cfg.rollout.safe_tree_size
+        if safe_tree_size is not None:
+            positive("root.rollout.safe_tree_size", safe_tree_size)
+            if safe_tree_size < 1.0:
+                raise ConfigError("root.rollout.safe_tree_size: must be at least one")
     else:
         if cfg.rollout.branching_mode is not None:
             raise ConfigError(
@@ -342,6 +358,14 @@ def _validate_config(cfg: RootConfig) -> None:
             raise ConfigError(
                 "root.rollout.branching_min_nodes: only valid for branched_rao_blackwell"
             )
+        if cfg.rollout.safe_tree_size is not None:
+            raise ConfigError(
+                "root.rollout.safe_tree_size: only valid for branched_rao_blackwell"
+            )
+        if cfg.rollout.queue_capacity_rows is not None:
+            raise ConfigError(
+                "root.rollout.queue_capacity_rows: only valid for branched_rao_blackwell"
+            )
     adaptive = cfg.rollout.adaptive_kkt
     if cfg.rollout.branching_mode == "dynamic" and adaptive is None:
         raise ConfigError(
@@ -353,7 +377,7 @@ def _validate_config(cfg: RootConfig) -> None:
         )
     if adaptive is not None:
         for name in (
-            "beta_max", "target_tree_size", "safe_tree_size", "kappa_initial",
+            "beta_max", "target_tree_size", "kappa_initial",
             "kappa_min", "kappa_max", "gamma_kappa", "eta_kappa",
         ):
             positive(f"root.rollout.adaptive_kkt.{name}", getattr(adaptive, name))
@@ -363,8 +387,6 @@ def _validate_config(cfg: RootConfig) -> None:
             )
         if adaptive.beta_max < 1.0:
             raise ConfigError("root.rollout.adaptive_kkt.beta_max: must be at least one")
-        if adaptive.safe_tree_size < 1.0:
-            raise ConfigError("root.rollout.adaptive_kkt.safe_tree_size: must be at least one")
         if not adaptive.kappa_min <= adaptive.kappa_initial <= adaptive.kappa_max:
             raise ConfigError(
                 "root.rollout.adaptive_kkt kappa values must satisfy min <= initial <= max"

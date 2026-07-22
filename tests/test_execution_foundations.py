@@ -24,6 +24,7 @@ from pbg.core.execution import (
     child_path_keys,
     logical_categorical_from_valid_probability,
     logical_rng_keys,
+    select_work_queue,
     stable_partition_masked,
 )
 from pbg.core.training import (
@@ -431,6 +432,53 @@ def test_work_queue_age_tracks_oldest_live_enqueue_without_device_reads() -> Non
         queue.enqueue(torch.empty(0, dtype=torch.int64), logical_time=9)
 
 
+def test_work_queue_capacity_and_prefix_staging_are_exactly_accounted() -> None:
+    accountant = ByteAccountant(10_000)
+    queue = DeviceWorkQueue(
+        6,
+        "cpu",
+        staging_rows=4,
+        accountant=accountant,
+        label="test_queue",
+    )
+    assert queue.reserved_bytes == (6 + 4 + 1) * 8
+    assert accountant.reserved_bytes == queue.reserved_bytes
+
+    queue.enqueue(torch.tensor([0, 1, 2, 3], dtype=torch.int64))
+    assert torch.equal(queue.dequeue(3), torch.tensor([0, 1, 2]))
+    queue.enqueue(torch.tensor([4, 5, 6, 7], dtype=torch.int64))
+    assert torch.equal(queue.dequeue(4), torch.tensor([3, 4, 5, 6]))
+    assert torch.equal(queue.dequeue(1), torch.tensor([7]))
+    queue.release()
+    assert accountant.reserved_bytes == 0
+
+
+def test_queue_scheduler_is_globally_full_first_then_preorder_fill_age() -> None:
+    names = ("upstream", "downstream")
+    priorities = (0, 1)
+    queues = {name: DeviceWorkQueue(8, "cpu", staging_rows=3) for name in names}
+    queues["upstream"].enqueue(torch.tensor([0, 1], dtype=torch.int64), logical_time=0)
+    queues["downstream"].enqueue(
+        torch.tensor([2, 3, 4], dtype=torch.int64), logical_time=1
+    )
+    selected = select_work_queue(
+        names, priorities, queues, 3, allow_partial=False, logical_time=2
+    )
+    assert selected is not None
+    assert (selected.family, selected.rows, selected.forced_partial) == (
+        "downstream", 3, False
+    )
+
+    queues["downstream"].dequeue(3)
+    selected = select_work_queue(
+        names, priorities, queues, 3, allow_partial=True, logical_time=3
+    )
+    assert selected is not None
+    assert (selected.family, selected.rows, selected.forced_partial) == (
+        "upstream", 2, True
+    )
+
+
 def test_safe_admit_reserves_retained_and_max_inflight_before_live_rows() -> None:
     plan = TrajectoryAdmissionPlan(
         limit_bytes=1_000,
@@ -598,6 +646,9 @@ def test_cuda_queue_arena_and_rng_execute_transactionally() -> None:
     queue.enqueue(handles[:5], arena=arena)
     first = queue.dequeue(3, arena=arena)
     DeviceWorkQueue.mark_done(arena, first)
+    # A dequeued prefix is the queue's bounded staging view and is valid only
+    # through its last consumer; preserve the test observation before reuse.
+    first_observed = first.cpu()
     queue.enqueue(handles[5:8], arena=arena)  # force ring wraparound
     wrapped = queue.dequeue(5, arena=arena)
     DeviceWorkQueue.mark_done(arena, wrapped)
@@ -620,7 +671,7 @@ def test_cuda_queue_arena_and_rng_execute_transactionally() -> None:
     torch.cuda.synchronize(device)
 
     assert torch.equal(arena.gather("state_ref", handles).cpu(), states.cpu())
-    assert torch.equal(first.cpu(), torch.tensor([0, 1, 2]))
+    assert torch.equal(first_observed, torch.tensor([0, 1, 2]))
     assert torch.equal(wrapped.cpu(), torch.tensor([3, 4, 5, 6, 7]))
     assert torch.equal(
         arena.gather("status", handles).cpu(), torch.full((8,), DONE)

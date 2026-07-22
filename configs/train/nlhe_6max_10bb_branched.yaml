@@ -5,6 +5,8 @@ game:
 rollout:
   sequential_roots_per_gpu_initial: 1
   branching_mode: fixed
+  safe_tree_size: 3800.0
+  queue_capacity_rows: 4096
   beta:
     # A 600-iteration launch gate at 1.10 doubled mean decision coverage while
     # keeping the largest observed tree at 681/4,096 nodes.  The old 1.25

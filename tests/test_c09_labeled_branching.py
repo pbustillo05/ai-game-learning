@@ -209,6 +209,8 @@ def _cfg(
         family_batch_rows=family_batch_rows,
         branching_mode="fixed",
         adaptive_kkt=None,
+        safe_tree_size=None,
+        queue_capacity_rows=256,
     )
 
 

@@ -594,29 +594,70 @@ class ChunkedOccurrenceArena:
 
 
 class DeviceWorkQueue:
-    """Live-frontier insertion order stored only in realized device batches."""
+    """Admitted device ring with one bounded reusable dequeue prefix."""
 
     def __init__(
         self,
         maximum_live_rows: int | None,
         device: torch.device | str,
+        *,
+        staging_rows: int | None = None,
+        accountant: ByteAccountant | None = None,
+        label: str = "work_queue",
     ) -> None:
-        if maximum_live_rows is not None and (
-            isinstance(maximum_live_rows, bool) or maximum_live_rows <= 0
+        if (
+            maximum_live_rows is None
+            or isinstance(maximum_live_rows, bool)
+            or maximum_live_rows <= 0
         ):
-            raise ValueError("maximum live queue rows must be positive or None")
-        self.maximum_live_rows = maximum_live_rows
+            raise ValueError("maximum live queue rows must be positive")
+        if staging_rows is None:
+            staging_rows = maximum_live_rows
+        if isinstance(staging_rows, bool) or not 0 < staging_rows <= maximum_live_rows:
+            raise ValueError("queue staging rows must lie within queue capacity")
+        if not label:
+            raise ValueError("queue label must be nonempty")
+        self.maximum_live_rows = int(maximum_live_rows)
+        self.staging_rows = int(staging_rows)
         self.device = torch.device(device)
-        self.count = torch.zeros((), dtype=torch.int64, device=self.device)
-        self._batches: deque[Tensor] = deque()
+        self.accountant = accountant
+        self.label = label
+        self._reservation_labels = (
+            f"{label}_handles",
+            f"{label}_staging",
+            f"{label}_count",
+        )
+        reservations = {
+            self._reservation_labels[0]: self.maximum_live_rows * 8,
+            self._reservation_labels[1]: self.staging_rows * 8,
+            self._reservation_labels[2]: 8,
+        }
+        if accountant is not None:
+            accountant.reserve_many(reservations)
+        try:
+            self._handles = torch.empty(
+                self.maximum_live_rows, dtype=torch.int64, device=self.device
+            )
+            self._staging = torch.empty(
+                self.staging_rows, dtype=torch.int64, device=self.device
+            )
+            self.count = torch.zeros((), dtype=torch.int64, device=self.device)
+        except BaseException:
+            if accountant is not None:
+                accountant.release_many(self._reservation_labels)
+            raise
+        self._reserved_bytes = sum(reservations.values())
+        self._head = 0
+        self._tail = 0
         self._host_count = 0
         self._age_runs: deque[tuple[int, int]] = deque()
         self._last_logical_time = 0
         self.high_water_rows = 0
+        self._released = False
 
     @property
     def reserved_bytes(self) -> int:
-        return sum(batch.numel() * batch.element_size() for batch in self._batches) + 8
+        return self._reserved_bytes
 
     @property
     def host_count(self) -> int:
@@ -639,9 +680,10 @@ class DeviceWorkQueue:
         arena: ChunkedOccurrenceArena | None = None,
         logical_time: int = 0,
     ) -> None:
-        handles = handles.to(device=self.device, dtype=torch.int64)
-        if handles.ndim != 1:
-            raise ValueError("work handles must be one-dimensional")
+        if self._released:
+            raise RuntimeError("work queue has been released")
+        if handles.ndim != 1 or handles.dtype != torch.int64 or handles.device != self.device:
+            raise ValueError("work handles must be device-local int64 [B]")
         if isinstance(logical_time, bool) or logical_time < self._last_logical_time:
             raise ValueError("queue logical times must be nonnegative and monotone")
         added = int(handles.numel())
@@ -654,9 +696,21 @@ class DeviceWorkQueue:
                 f"depth={self._host_count}, added={added}"
             )
         if arena is not None:
+            # Write outside the live ring before publishing the queue/status
+            # transition.  A failed status check leaves logical queue state
+            # unchanged and the overwritten slots remain unreachable.
+            first = min(added, self.maximum_live_rows - self._tail)
+            self._handles[self._tail : self._tail + first].copy_(handles[:first])
+            if first < added:
+                self._handles[: added - first].copy_(handles[first:])
             arena.transition(handles, NEW, QUEUED)
+        elif added:
+            first = min(added, self.maximum_live_rows - self._tail)
+            self._handles[self._tail : self._tail + first].copy_(handles[:first])
+            if first < added:
+                self._handles[: added - first].copy_(handles[first:])
         if added:
-            self._batches.append(handles.clone())
+            self._tail = (self._tail + added) % self.maximum_live_rows
         self.count.add_(added)
         self._host_count += added
         self.high_water_rows = max(self.high_water_rows, self._host_count)
@@ -669,20 +723,21 @@ class DeviceWorkQueue:
                 self._age_runs.append((added, int(logical_time)))
 
     def peek(self, count: int | None = None) -> Tensor:
+        if self._released:
+            raise RuntimeError("work queue has been released")
         selected = self._host_count if count is None else int(count)
         if selected < 0 or selected > self._host_count:
             raise ValueError("peek count is outside the live insertion-order depth")
-        pieces: list[Tensor] = []
-        remaining = selected
-        for batch in self._batches:
-            if remaining == 0:
-                break
-            take = min(remaining, int(batch.numel()))
-            pieces.append(batch[:take])
-            remaining -= take
-        if not pieces:
-            return torch.empty(0, dtype=torch.int64, device=self.device)
-        return pieces[0].clone() if len(pieces) == 1 else torch.cat(pieces)
+        if selected > self.staging_rows:
+            raise MemoryError(
+                "dequeue prefix exceeds admitted reusable staging: "
+                f"selected={selected}, staging_rows={self.staging_rows}"
+            )
+        first = min(selected, self.maximum_live_rows - self._head)
+        self._staging[:first].copy_(self._handles[self._head : self._head + first])
+        if first < selected:
+            self._staging[first:selected].copy_(self._handles[: selected - first])
+        return self._staging[:selected]
 
     def dequeue(
         self,
@@ -695,13 +750,7 @@ class DeviceWorkQueue:
         handles = self.peek(count)
         if arena is not None:
             arena.transition(handles, QUEUED, EVALUATING)
-        remaining = int(count)
-        while remaining:
-            batch = self._batches.popleft()
-            consumed = min(remaining, int(batch.numel()))
-            remaining -= consumed
-            if consumed < batch.numel():
-                self._batches.appendleft(batch[consumed:])
+        self._head = (self._head + int(count)) % self.maximum_live_rows
         self.count.sub_(count)
         self._host_count -= count
         remaining = int(count)
@@ -713,9 +762,87 @@ class DeviceWorkQueue:
                 self._age_runs.appendleft((run_count - consumed, timestamp))
         return handles
 
+    def release(self) -> None:
+        """Release queue capacity after its final rollout consumer."""
+
+        if self._released:
+            raise RuntimeError("work queue has already been released")
+        if self._host_count:
+            raise RuntimeError("cannot release a nonempty work queue")
+        self._handles = torch.empty(0, dtype=torch.int64, device=self.device)
+        self._staging = torch.empty(0, dtype=torch.int64, device=self.device)
+        if self.accountant is not None:
+            self.accountant.release_many(self._reservation_labels)
+        self._reserved_bytes = 0
+        self._released = True
+
     @staticmethod
     def mark_done(arena: ChunkedOccurrenceArena, handles: Tensor) -> None:
         arena.transition(handles, EVALUATING, DONE)
+
+
+@dataclass(frozen=True)
+class QueueSelection:
+    family: str
+    rows: int
+    forced_partial: bool
+
+
+def select_work_queue(
+    family_names: tuple[str, ...],
+    family_priorities: tuple[int, ...],
+    queues: Mapping[str, DeviceWorkQueue],
+    batch_rows: int,
+    *,
+    allow_partial: bool,
+    logical_time: int,
+) -> QueueSelection | None:
+    """Apply the authoritative full-first, then preorder/load/age policy."""
+
+    if len(family_names) != len(family_priorities):
+        raise ValueError("queue families and priorities must have equal length")
+    if isinstance(batch_rows, bool) or batch_rows <= 0:
+        raise ValueError("queue batch rows must be positive")
+    nonempty = [name for name in family_names if queues[name].host_count]
+    if not nonempty:
+        return None
+    full = [name for name in nonempty if queues[name].host_count >= batch_rows]
+    candidates = full
+    forced_partial = False
+    if not candidates:
+        if not allow_partial:
+            return None
+        minimum_layer = min(
+            family_priorities[family_names.index(name)] for name in nonempty
+        )
+        candidates = [
+            name
+            for name in nonempty
+            if family_priorities[family_names.index(name)] == minimum_layer
+        ]
+        forced_partial = True
+    else:
+        minimum_layer = min(
+            family_priorities[family_names.index(name)] for name in candidates
+        )
+        candidates = [
+            name
+            for name in candidates
+            if family_priorities[family_names.index(name)] == minimum_layer
+        ]
+    family = max(
+        candidates,
+        key=lambda name: (
+            queues[name].host_count / float(batch_rows),
+            queues[name].oldest_age(logical_time),
+            -family_names.index(name),
+        ),
+    )
+    return QueueSelection(
+        family=family,
+        rows=min(queues[family].host_count, batch_rows),
+        forced_partial=forced_partial,
+    )
 
 
 @dataclass(frozen=True)
