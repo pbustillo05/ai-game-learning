@@ -28,7 +28,8 @@ restore it to approximately 257 decisions/s on the historical-continuity gate:
 This is about a 64% rollout-time reduction and 2.8x raw throughput improvement
 against the audited regression. It is within about 1% of the pre-refactor raw
 record. The first required 2,560-start gate subsequently established a 3.827
-ms/decision current baseline, or 261.3 decisions/s. End-to-end two-rank
+ms/decision baseline; the five-repeat per-card-profile gate refined the current
+median to 3.798 ms/decision, or 263.3 decisions/s. End-to-end two-rank
 performance at a fixed learner/fresh ratio has not yet been re-established.
 
 ## Mandatory production benchmark contract
@@ -42,7 +43,7 @@ debugging correctness, crashes, and gross regressions.
 |---|---|
 | Game/mode | HU NLHE, 32 bb, 13 ranks, sequential Rao--Blackwell |
 | Config | `configs/train/nlhe_hu_32bb_rb.yaml` |
-| Hardware profile | `local_2x2080ti` (explicit SDPA selection) |
+| Hardware profile | `local_3x2080ti` (per-card 10 GB envelope and explicit SDPA) |
 | Device | CUDA on one otherwise idle RTX 2080 Ti for the rollout gate |
 | Trajectory starts | 2,560 per GPU, the configured production value; never below 2,500 |
 | Checkpoint | Highest-numbered checkpoint in `runs/nlhe_hu_32bb_full_sequential_rb`; currently `ckpt_0001110.pt` |
@@ -79,7 +80,7 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
 CUDA_VISIBLE_DEVICES=1 python -m pbg.cli.benchmark \
   --config configs/train/nlhe_hu_32bb_rb.yaml \
   --checkpoint /tmp/pbg_ckpt_0001110_v6_benchmark.pt \
-  --hardware-profile local_2x2080ti \
+  --hardware-profile local_3x2080ti \
   --device cuda \
   --mode rao_blackwell \
   --roots-per-gpu 2560 \
@@ -136,7 +137,7 @@ and checkpoints realize different tree lengths.
 
 | Gate | Time to beat | Equivalent throughput | Notes |
 |---|---:|---:|---|
-| Current eager baseline | **3.827 ms/decision** | **261.3 decisions/s** | Median at the required 2,560 starts after `48ce2a3` |
+| Current eager baseline | **3.798 ms/decision** | **263.3 decisions/s** | Five-repeat median at the required 2,560 starts after `413a085` |
 | Pre-refactor raw rollout record | **3.863 ms/decision** | **258.9 decisions/s** | 19.51 s for 5,051 decisions on July 17 |
 | Rollout stretch target | **3.090 ms/decision** | **323.6 decisions/s** | 25% above the pre-refactor raw rate |
 | Historical end-to-end record | n/a | **123.4 global fresh decisions/s** | Two ranks; must match learner/fresh ratio before comparison |
@@ -159,6 +160,7 @@ seconds/decision and include the raw counts.
 | `cf6bc34` | Leaner multi-page gathers | Removed the zero-seed/first-page merge; about 0.35% and lower reservation in the paired sample |
 | `83aab85` | Finish eager rollout pass | Exact-street execution queues, pack-local public/legal/history and selected-logp reuse, fixed-width transition updates, and the final benchmark record |
 | `48ce2a3` | Immediate child commit fast-path | Used host-proven contiguous cursors for the unsplit sequential child commit; 0.26--0.50% paired gain at 2,560 starts |
+| `413a085` | Per-card 2080 Ti envelope | Made the validated 10 GB/SDPA limits independent of one-, two-, or three-rank participation and removed the redundant two-rank production profile |
 
 Commit `f0b049b` occurred during the sweep but is a compatibility-schema
 cleanup, not a credited performance optimization.
@@ -171,20 +173,19 @@ experiment is not accidentally repeated. Status must be exactly `Open`,
 
 | ROI | Idea | Status | Evidence or acceptance gate |
 |---:|---|---|---|
-| 1 | Use the 10 GB card envelope independently of participating rank count | Open | The conservative multi-card profile caused about 20 learner subspans/step versus two in the historical geometry; require unchanged loss/topology and no more than 10 GB |
-| 2 | Build an allocation-free dequeue-to-enqueue pack and compile/capture it per exact family and row bucket | Open | About 790 launches/decision in the bounded profile; require at least 15% rollout gain, bounded graph workspaces, and unchanged logical RNG |
-| 3 | Fuse remaining transition, reach, routing, and retained-write preprocessing | Open | Public/legal/history and selected logp are already reused; require at least 15% for a complex fused implementation |
-| 4 | Finish and re-baseline vectorized CUDA target recurrences | Open | Require exact targets, no per-node D2H, and at least 2x target speedup; especially relevant for branching |
-| 5 | Capture learner gather + forward + loss + backward by partition/shape | Open | Require at least 15% learner compute gain with identical gradients and fixed rows/step |
-| 6 | Add policy-only reference forward/cache | Open | Reference cache had a 7.59 s ceiling and retains unused value/branching outputs; require matching KL and lower bytes/time |
-| 7 | Gate detailed CUDA events and fuse finite/norm/clip reductions | Open | Preserve skip/clip semantics while reducing launches and host decisions |
-| 8 | Precompute or bit-pack immutable learner descriptors | Open | Accept only with net admitted-byte benefit and faster sampled subspans |
-| 9 | Keep active preflop reach in natural 169-class form until one bounded flop expansion | Open | Require exact reach and sampling equivalence |
-| 10 | Bucket rollout history at 8/16/32/42 tokens | Open | Deferred: another queue dimension can fragment higher-player workloads into underfilled calls; require a multi-player packing study before implementation |
-| 11 | Overlap gradient communication with final backward buckets | Open | Only a 3.16 s measured ceiling; require identical reduced flat gradients |
-| 12 | Replace the allocator `empty_cache()` boundary with measured reusable-space admission | Open | Require no OOM regression across adversarial phase closures |
-| 13 | Deterministic small-k chance selection instead of sorting all 52 scores | Open | Preserve the exact counter-key sampling law or obtain explicit approval for an equivalent law |
-| 14 | Replace dynamic history recycling with fixed-capacity device worklists | Open | Separate large ownership rewrite; require explicit go-ahead, shared-ancestor safety, bounded rollback, fewer launches/syncs, and unchanged last-consumer lifetime |
+| 1 | Build an allocation-free dequeue-to-enqueue pack and compile/capture it per exact family and row bucket | Open | About 790 launches/decision in the bounded profile; require at least 15% rollout gain, bounded graph workspaces, and unchanged logical RNG |
+| 2 | Fuse remaining transition, reach, routing, and retained-write preprocessing | Open | Public/legal/history and selected logp are already reused; require at least 15% for a complex fused implementation |
+| 3 | Finish and re-baseline vectorized CUDA target recurrences | Open | Require exact targets, no per-node D2H, and at least 2x target speedup; especially relevant for branching |
+| 4 | Capture learner gather + forward + loss + backward by partition/shape | Open | Require at least 15% learner compute gain with identical gradients and fixed rows/step |
+| 5 | Add policy-only reference forward/cache | Open | Reference cache had a 7.59 s ceiling and retains unused value/branching outputs; require matching KL and lower bytes/time |
+| 6 | Gate detailed CUDA events and fuse finite/norm/clip reductions | Open | Preserve skip/clip semantics while reducing launches and host decisions |
+| 7 | Precompute or bit-pack immutable learner descriptors | Open | Accept only with net admitted-byte benefit and faster sampled subspans |
+| 8 | Keep active preflop reach in natural 169-class form until one bounded flop expansion | Open | Require exact reach and sampling equivalence |
+| 9 | Bucket rollout history at 8/16/32/42 tokens | Open | Deferred: another queue dimension can fragment higher-player workloads into underfilled calls; require a multi-player packing study before implementation |
+| 10 | Overlap gradient communication with final backward buckets | Open | Only a 3.16 s measured ceiling; require identical reduced flat gradients |
+| 11 | Replace the allocator `empty_cache()` boundary with measured reusable-space admission | Open | Require no OOM regression across adversarial phase closures |
+| 12 | Deterministic small-k chance selection instead of sorting all 52 scores | Open | Preserve the exact counter-key sampling law or obtain explicit approval for an equivalent law |
+| 13 | Replace dynamic history recycling with fixed-capacity device worklists | Open | Separate large ownership rewrite; require explicit go-ahead, shared-ancestor safety, bounded rollback, fewer launches/syncs, and unchanged last-consumer lifetime |
 | — | Dense recyclable live-state slab | Implemented in `d95b7d3` | Dominant regression fixed; mutable capacity remains proportional to the admitted live frontier, not total nodes |
 | — | Tune production family width | Implemented in `be0b009` | Width 84 selected; width 88 was only 1.5% faster and left about 158 MB below 10 GB |
 | — | Direct contiguous append commit | Implemented in `5ecfeb4` | About 1.1% matched gain with unchanged ownership |
@@ -193,6 +194,7 @@ experiment is not accidentally repeated. Status must be exactly `Open`,
 | — | Reuse public/history/legal representation and selected policy logp within a pack | Implemented in `83aab85` | Removes duplicate encoding/log-probability work without extending state lifetime |
 | — | Remove dynamic fold compaction and its host synchronization | Implemented in `83aab85` | Fixed-width masked update was about 1% faster in the matched sample |
 | — | Commit immediate unsplit child batches contiguously | Implemented in `48ce2a3` | Median 3.827 versus 3.846 ms/decision; a small, consistent, essentially free hot-path simplification |
+| — | Use the 10 GB card envelope independently of participating rank count | Implemented in `413a085` | Five-repeat median 3.798 ms/decision, 8.85--8.96 GB peak reserved, and a clean three-rank CUDA/NCCL smoke under the same per-card limits |
 | — | Raise production width to 88 or 96 | Rejected | Faster, but 88 reserved 9.84 GB and 96 reserved 10.497 GB; insufficient 2080 Ti headroom |
 | — | Use 4,096-row cold-storage chunks | Rejected | Only about 0.3% faster than the bounded derived chunk |
 | — | Flexible/automatic attention dispatch | Rejected | 56.078 s versus about 31.86 s with SDPA |
@@ -256,6 +258,39 @@ An earlier invocation without `--hardware-profile local_2x2080ti` measured
 6.635--6.695 ms/decision because it selected automatic/FlexAttention. That is
 invalid baseline evidence and led to the explicit-profile contract correction
 above.
+
+### Per-card profile gate
+
+Commit `413a085` moved the already validated 10 GB/SDPA limits into the sole
+production `local_3x2080ti` profile and removed the redundant
+`local_2x2080ti` production profile. Rank count now limits only how many local
+cards may participate; it does not shrink the token or memory envelope on each
+card.
+
+The required five-repeat 2,560-start gate produced:
+
+| Repeat | Decisions | Calls | Padded pairs | Rollout | ms/decision | Peak allocated/reserved |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 10,316 | 147 | 40.625 B | 38.968 s | 3.777 | 4.624/8.850 GB |
+| 2 | 9,745 | 149 | 37.480 B | 37.138 s | 3.811 | 4.625/8.871 GB |
+| 3 | 10,201 | 144 | 39.913 B | 38.679 s | 3.792 | 4.625/8.921 GB |
+| 4 | 10,161 | 145 | 39.674 B | 38.596 s | 3.798 | 4.626/8.961 GB |
+| 5 | 10,223 | 147 | 40.217 B | 39.154 s | 3.830 | 4.630/8.961 GB |
+
+The median was 3.798 ms/decision and every repeat used five learner physical
+subspans for its one isolation step. The first three repeat seeds reproduced
+the earlier profile's decisions, nodes, leaves, calls, and padded pairs
+exactly. Teardown left 17.4 MB allocated and 130.0 MB reserved, with the card
+back at its 6 MiB display-only idle state.
+
+A separate three-rank CUDA/NCCL smoke used 128 starts/rank, 16 completion
+samples, and one synchronized optimizer step. It completed with finite reduced
+gradients, 1.376 GB maximum rank-local reservation, zero hard-limit violations,
+and all three cards back at display-only idle. Its hardware record confirmed
+world size 3, SDPA, 65,536 training tokens, 83,886,080 training token pairs,
+0.945 maximum memory fraction, 0.5 GiB reserve, and 10,464,919,552 usable bytes
+per card. This is a capability/correctness smoke, not end-to-end throughput
+evidence.
 
 ### Root-cause bisection
 
