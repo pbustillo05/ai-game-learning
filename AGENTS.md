@@ -6,16 +6,36 @@ This repository implements and tests a GPU-oriented framework for learning
 strategies in imperfect-information games, with configurable NLHE cash poker
 as its sole active game.
 
+## GPU-accelerator-only execution
+
+- Production execution is intentionally GPU-accelerator-only. The only valid
+  execution-device backends are `cuda` and `mps`; do not add or restore `cpu`,
+  `auto`, implicit device selection, or fallback to CPU or another backend.
+- CUDA supports every production workflow. Training, distributed training,
+  best-response evaluation, performance benchmarks, variance runners, and
+  inference must execute on CUDA when those workflows require operations not
+  available on MPS. Distributed training is CUDA/NCCL-only.
+- MPS is a valid backend, but is currently implemented only for the supported
+  inference paths. MPS training and evaluator-dependent inference operations
+  that contract v2 does not provide must fail clearly instead of staging work
+  through CPU.
+- CPU remains appropriate only for small orchestration work such as parsing
+  configuration, checkpoint I/O, hashing, deterministic seed construction, and
+  report formatting. It must not own production rollout state, model forwards,
+  losses, backward passes, optimizer state, posterior/completion work, or
+  showdown evaluation.
+- All changes must be tested with CUDA, escalating approval outside the sandbox if needed.
+
 ## Where to find things
 
-- `docs/theory/`: authoritative mathematics and ultimate source of design choices here.
+- `docs/theory/`: authoritative mathematics and ultimate source of design choices here. You must ask for explicit approval to modify anything there.
   `core_math.tex` is the mathematical abstraction, `MHA_model.md` is the model architecture and `pseudocode/` contains multi-GPU training implementation design.
 - `pbg/core/`: generic rollout, branching, value, loss, and training code.
 - `pbg/games/poker/`: NLHE-specific implementation.
 - `archive/synthetic_games/`: inert historical Kuhn/Leduc/synthetic snapshot;
   it is not importable and is excluded from CI.
 - `tests/`: behavior and contract tests.
-- `/home/pablob/poker-gpu-evaluator/docs/api_pbg.md` (read-only rights, you are not authorized to modify that file): binding interface to the sibling poker evaluator. We **have** to use that sibling repo for posterior sampling and Monte Carlo equity/posterior simulations.
+- `/home/pablob/poker-gpu-evaluator/docs/api.md` (read-only rights, you are not authorized to modify that file): binding interface to the sibling poker evaluator. We **have** to use that sibling repo for posterior sampling and Monte Carlo equity/posterior simulations.
 - `IMPLEMENTATION_NOTES.md`: historical implementation ledger; use
   `docs/audit/` for current readiness and open issues.
 - In Markdown, write math with `$...$` and `$$...$$` rather than `\(...\)` or `\[...\]` so it renders in VS Code.
@@ -46,10 +66,6 @@ as its sole active game.
   drifting. If you discover that existing code has already drifted, surface it
   explicitly and treat reconciliation or an explicit user decision as part of
   the task.
-- When mathematics evolves, update the implementation pseudocode and storage
-  schemas alongside the code so the authorities remain mutually consistent.
-  Tests must cover structural ownership/lifetime invariants, not only numerical
-  outputs or successful end-to-end execution.
 
 ## PBG tree terminology and rollout convention
 
@@ -76,13 +92,11 @@ as its sole active game.
 
 ## Shared server hygiene
 
-This repo is often used on a shared GPU server, and we must used these GPUs for testing, before doing any serious runs.
-Do use the GPUs but be conservative:
-- Do NOT modify servers in the other repo (GPU-evaluator). You should only treat it as read only
-- Use a virtualenv for Python work. Do not install packages into the server's system Python. Prefer one persistent user-level venv shared by the poker repos (there should be one available at `/home/pablob/.venvs/poker` and if unavailable, ask the user to create it), so dependencies are not reinstalled every session.
-- The shared venv owns the CUDA toolkit; it is not installed under
-  `/usr/local/cuda`. Before compiling or loading CUDA extensions, activate the
-  venv and export its toolkit location:
+This repo is on a shared GPU server, and we must use these GPUs for testing, after any changes, escalading sandbox approval if needed.
+Follow these rules:
+- Use `/home/pablob/.venvs/poker` for Python work.
+- The shared venv owns the CUDA toolkit; it is not installed under `/usr/local/cuda`.
+  Before compiling or loading CUDA extensions, activate the venv and export its toolkit location:
   ```bash
   source /home/pablob/.venvs/poker/bin/activate
   export CUDA_HOME=/home/pablob/.venvs/poker/lib/python3.10/site-packages/nvidia/cu13
@@ -95,10 +109,7 @@ Do use the GPUs but be conservative:
   as missing until those exact locations have been checked with the environment
   above; invoking the venv's Python by absolute path does not itself add the
   venv's `bin` directory to `PATH`.
-- Check GPU state before CUDA work with `nvidia-smi`. If sandboxed access fails, request explicit approval rather than guessing.
+- Check GPU state before CUDA work with `nvidia-smi`.
 - Do not touch other users' GPU jobs. After checking GPU state, make sure to only launch tasks in idle available GPUs.
 - After a GPU task is done, make sure the GPU has returned to a clean idle state, without any strange lingering workload or memory usage.
-- Avoid OOM at all cost. Stage CUDA tests from tiny smoke runs to larger benchmarks, watch memory between runs, precompute estimated memory usage before anything sizable, and keep batch sizes/partials modest until usage is known. An OOM can require someone to physically reset the server, which is remote and difficult to access.
 - Prefer commands that make resource targeting explicit.
-
-You are by default approved and encouraged by the user to use the GPUs, as long you respect these rules. Escalate approval requests if the sandbox prevents you from using them.

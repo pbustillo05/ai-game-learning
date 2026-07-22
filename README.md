@@ -1,9 +1,19 @@
 # GPU NLHE strategy learning
 
-`pbg` is a GPU-oriented framework for learning strategies in configurable
+`pbg` is a GPU-accelerator-only framework for learning strategies in configurable
 imperfect-information no-limit Hold'em cash games. NLHE is the sole active
 game. Retired Kuhn, Leduc, and synthetic implementations are inert history
 under `archive/synthetic_games/`.
+
+Production execution deliberately supports exactly two device backends:
+`cuda` and `mps`. CUDA supports all production workflows and is required for
+training, distributed CUDA/NCCL execution, best-response evaluation, and other
+evaluator-heavy jobs. MPS is currently implemented for supported inference
+paths only; unsupported MPS operations fail explicitly. CPU and other execution
+backends are intentionally unsupported, and the runtime never selects them or
+falls back to them when an accelerator is unavailable. CPU may still perform
+small host-side orchestration such as configuration parsing, checkpoint I/O,
+hashing, seed construction, and report formatting.
 
 ## Production surface
 
@@ -28,8 +38,8 @@ fallback.
 ```text
 pbg.config / pbg.runtime     strict NLHE composition
   pbg.core                   generic execution, rollout, values, loss, training
-  pbg.games.poker            NLHE engine, model, tensor backend, evaluator API
-  pbg.eval                   offline duplicate-deal arena
+  pbg.games.poker            NLHE rules, model, tensor backend, evaluator API
+  pbg.eval                   accelerator-native evaluation and variance probes
 ```
 
 The active iteration is:
@@ -40,8 +50,9 @@ frozen model -> family-scheduled trajectories or one labeled tree/rank
              -> compact aligned targets -> globally scaled learner update
 ```
 
-There is no game selector, rollout executor selector, wavefront compatibility
-path, or active legacy-game package.
+There is no game selector, execution-device auto-selection, CPU fallback,
+rollout executor selector, wavefront compatibility path, or active legacy-game
+package.
 
 ## Environment
 

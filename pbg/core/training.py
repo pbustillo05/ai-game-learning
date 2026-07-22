@@ -656,11 +656,12 @@ def _analytical_memory_plan(
         exact(schema, action_rows) for schema in action_schemas
     )
 
+    leaf_mode = "probe" if getattr(cfg, "probe", None) is not None else mode
     source_leaf_schema = stopped_leaf_source_schema(
-        mode, players=players, exact_width=exact_width
+        leaf_mode, players=players, exact_width=exact_width
     )
     destination_leaf_schema = rollout_leaf_schema(
-        mode, players=players, exact_width=exact_width
+        leaf_mode, players=players, exact_width=exact_width
     )
     leaf_source = paged(source_leaf_schema, leaf_rows)
     leaf_destination = exact(destination_leaf_schema, leaf_rows)
@@ -1512,6 +1513,7 @@ def _seal_sequential_rollout_storage(
     """
 
     probe = sampled if isinstance(sampled, ProbeRollout) else None
+    selected_completion = probe is not None
     sample = probe.sample if probe is not None else sampled
     if not isinstance(sample, SealedRolloutSample):
         raise TypeError("sequential seal requires a directly sealed rollout sample")
@@ -1624,6 +1626,7 @@ def _seal_sequential_rollout_storage(
                 "owner",
                 "fold_payoff",
                 "reward",
+                "selected_owner",
             }
         }
         completion_inputs["range_weights"] = backend.range_weights_from_log_reach(
@@ -1645,19 +1648,34 @@ def _seal_sequential_rollout_storage(
             "fold_payoff": fold_payoff.detach().to(torch.float32),
             **{name: value.detach() for name, value in completion_inputs.items()},
         }
+        if selected_completion:
+            assert probe is not None
+            selected_owner = captured_leaf["selected_owner"].detach().to(torch.int32)
+            if selected_owner.shape != leaf_owner.shape:
+                raise ValueError("probe selected owners must align with leaf rows")
+            torch._assert_async(
+                (selected_owner == probe.seats.to(torch.int32)).all(),
+                "probe leaf selected owner disagrees with root selection",
+            )
+            leaf_columns["selected_owner"] = selected_owner
         leaves = _sealed_dynamic_block(
-            "sequential_rb_leaf",
+            "probe_leaf" if selected_completion else "sequential_rb_leaf",
             leaf_columns,
             schema=rollout_leaf_schema(
-                "sequential_rb",
+                "probe" if selected_completion else "sequential_rb",
                 players=backend.n_players,
                 exact_width=backend.n_hands,
             ),
         )
         service = bundle.completion_backend
-        complete_sealed = getattr(service, "complete_sealed", None)
+        completion_method = (
+            "complete_selected_sealed" if selected_completion else "complete_sealed"
+        )
+        complete_sealed = getattr(service, completion_method, None)
         if not callable(complete_sealed):
-            raise TypeError("completion backend lacks immutable-leaf completion")
+            raise TypeError(
+                f"completion backend lacks immutable {completion_method} completion"
+            )
 
         def complete_leaf_rows(
             columns: Mapping[str, Tensor], *, rows: Tensor
@@ -1682,13 +1700,29 @@ def _seal_sequential_rollout_storage(
             )
             return scaled
 
+        completion_samples = int(cfg.completion.n_samples)
+
+        def completion_workspace(count: int) -> int:
+            rows = int(count)
+            hands = int(backend.n_hands)
+            players = int(backend.n_players)
+            ordinary = rows * hands * 12 * players
+            if not selected_completion:
+                return ordinary
+            compact_output = rows * hands * 8
+            terminal_sampling = rows * (
+                hands * 12 + completion_samples * players * 4
+            )
+            return max(ordinary + compact_output, terminal_sampling)
+
         completion = CompletionSpec(
             tuple(leaf_columns),
             ("range_weights",),
             ("p_hat", "v_hat"),
             complete_leaf_rows,
-            lambda count: int(count) * backend.n_players * backend.n_hands * 12,
+            completion_workspace,
             key_fields=("completion_key",),
+            selected_owner_field=("selected_owner" if selected_completion else None),
         )
         mode = "sequential_rb"
 

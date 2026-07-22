@@ -43,6 +43,15 @@ def main() -> None:
         default=None,
         help="suppress further duplication near this fixed-mode node ceiling",
     )
+    parser.add_argument(
+        "--branching-queue-capacity-rows",
+        type=int,
+        default=None,
+        help=(
+            "required finite queue capacity when benchmarking branched mode "
+            "from a sequential config"
+        ),
+    )
     parser.add_argument("--family-batch-rows", type=int, default=None)
     parser.add_argument("--max-active-trajectories", type=int, default=None)
     parser.add_argument("--storage-page-rows", type=int, default=None)
@@ -66,6 +75,11 @@ def main() -> None:
             parser.error(
                 "--branching-upper-cutoff-nodes must be greater than one"
             )
+    if (
+        args.branching_queue_capacity_rows is not None
+        and args.branching_queue_capacity_rows <= 0
+    ):
+        parser.error("--branching-queue-capacity-rows must be positive")
     if args.family_batch_rows is not None:
         cfg.rollout.family_batch_rows = args.family_batch_rows
     if args.max_active_trajectories is not None:
@@ -88,6 +102,7 @@ def main() -> None:
         device=args.device,
         checkpoint=args.checkpoint,
         branching_upper_cutoff_nodes=args.branching_upper_cutoff_nodes,
+        branching_queue_capacity_rows=args.branching_queue_capacity_rows,
     )
     encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output:

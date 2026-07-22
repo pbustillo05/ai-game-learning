@@ -72,6 +72,15 @@ _EPS = 1e-6
 _CHANCE_OFFSETS = (100_000, 200_000, 300_000)
 
 
+def _require_device(condition: Tensor, message: str) -> None:
+    """Validate a scalar condition without synchronizing CUDA to Python."""
+
+    if condition.device.type == "cuda":
+        torch._assert_async(condition, message)
+    elif not bool(condition):
+        raise ValueError(message)
+
+
 @dataclass(frozen=True)
 class PokerFoldedSummaryCapture:
     """Pack-local inputs for summaries not yet owned by the rollout store."""
@@ -2123,8 +2132,10 @@ class PokerRolloutBackend:
             expected = (batch_size, self.n_players, self.n_classes)
             if tuple(natural.shape) != expected:
                 raise ValueError(f"preflop natural ranges must have shape {expected}")
-            if not bool((pub.street == 0).all()):
-                raise ValueError("preflop partition contains a postflop state")
+            _require_device(
+                (pub.street == 0).all(),
+                "preflop partition contains a postflop state",
+            )
             source = frozen_model.module if hasattr(frozen_model, "module") else frozen_model
             output = source.preflop(
                 pub,
@@ -2142,8 +2153,10 @@ class PokerRolloutBackend:
                 raise ValueError(f"postflop natural ranges must have shape {expected}")
             status = pub.status
             actual_live = (status != FOLDED).sum(1)
-            if not bool(((pub.street != 0) & (actual_live == live)).all()):
-                raise ValueError("postflop partition router/domain mismatch")
+            _require_device(
+                ((pub.street != 0) & (actual_live == live)).all(),
+                "postflop partition router/domain mismatch",
+            )
             live_seat_ids = torch.where(
                 status != FOLDED,
                 torch.arange(self.n_players, device=self.device)[None],
@@ -2619,7 +2632,9 @@ class PokerRolloutBackend:
                     ),
                     folder_count=self.n_players - n_live,
                 )
-            return cache.gather(keys, folder_count=self.n_players - n_live)
+            return cache.gather(
+                keys, folder_count=self.n_players - n_live
+            )
         hits = self.partition_summary_cache.contains(keys)
         compute_mask = ~hits
         # Cached rows may arrive after folded full reaches were discarded. Give
@@ -2844,6 +2859,7 @@ class PokerRolloutBackend:
         return {
             "reward": reward.detach(),
             "owner": owners.detach(),
+            "selected_owner": selected_seats.detach(),
             "fold_payoff": fold_payoff,
             **{name: value.detach() for name, value in completion.items()},
         }

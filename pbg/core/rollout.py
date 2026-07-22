@@ -436,7 +436,9 @@ def _sample_trees_sequential(
     logical_seed = _logical_seed(cfg, gen)
     training_mode = getattr(getattr(cfg, "training", None), "mode", None)
     source_mode = (
-        "normal" if training_mode == "normal" and not probe_enabled else "sequential_rb"
+        "normal"
+        if (training_mode == "normal" or return_profiles) and not probe_enabled
+        else "sequential_rb"
     )
     decision_input_store = begin_captures(mode=source_mode)
     leaf_schema_factory = getattr(backend, "rollout_leaf_source_schema", None)

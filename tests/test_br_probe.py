@@ -14,9 +14,10 @@ import yaml
 from pbg.config import ConfigError, load_config
 from pbg.core.br import SHARED_RESPONSE_SEMANTICS
 from pbg.core.checkpointing import scientific_config
-from pbg.core.game import PROBE_FOLD, EventBatch
+from pbg.core.game import PRETERM, PROBE_FOLD, EventBatch
 from pbg.core.rollout import ProbeRollout, sample_trees_sequential
-from pbg.core.training import _build_iteration_data
+from pbg.core.training import _build_iteration_data, _seal_sequential_rollout_storage
+from pbg.core.utility import utility_scale
 from pbg.eval.br_probe import evaluate_br_probe
 from pbg.games.poker.bundle import build_bundle
 from pbg.runtime import train
@@ -156,6 +157,72 @@ def test_three_player_probe_fold_cuda_train_resume_and_evaluate(tmp_path: Path) 
     reward = sampled.sample.leaf_source["reward"][0]
     assert reward[0].item() == 0.0
     assert not bool(reward[1:].any())
+
+    rollout, _, completion, _ = _seal_sequential_rollout_storage(
+        cfg,
+        initial,
+        sampled,
+        iteration=0,
+        gen=torch.Generator(device=device).manual_seed(7),
+    )
+    assert completion is not None
+    assert completion.selected_owner_field == "selected_owner"
+    assert torch.equal(
+        rollout.leaves["selected_owner"], torch.tensor([0], device=device)
+    )
+    rows = torch.tensor([0], dtype=torch.int64, device=device)
+    compact = completion.complete(rollout.leaves.columns, rows=rows)
+    dense = initial.completion_backend.complete_sealed(
+        initial.rollout_backend,
+        rollout.leaves.columns,
+        rows=rows,
+        n_samples=int(cfg.completion.n_samples),
+    ).for_learning()
+    assert compact.p_hat.shape == (1, 1, initial.rollout_backend.n_hands)
+    assert compact.v_hat.shape == compact.p_hat.shape
+    assert dense.p_hat.shape[1] == 3
+    assert torch.equal(compact.p_hat[:, 0], dense.p_hat[:, 0])
+    assert torch.equal(
+        compact.v_hat[:, 0], dense.v_hat[:, 0] * utility_scale(cfg)
+    )
+    assert completion.workspace_bound(1) >= (
+        3 * initial.rollout_backend.n_hands * 12
+        + initial.rollout_backend.n_hands * 8
+    )
+
+    hands = initial.rollout_backend.n_hands
+    preterminal_leaves = {
+        "owner": torch.tensor([PRETERM], dtype=torch.int32, device=device),
+        "selected_owner": torch.tensor([2], dtype=torch.int32, device=device),
+        "range_weights": torch.ones((1, 3, hands), device=device),
+        "completion_key": torch.tensor([91], dtype=torch.int64, device=device),
+        "board_cards": torch.full((1, 5), 255, dtype=torch.uint8, device=device),
+        "stratum_level": torch.zeros((1, 3), dtype=torch.int32, device=device),
+        "payoff_baseline": torch.zeros((1, 3), device=device),
+        "stratum_amount": torch.tensor([[3.0, 0.0, 0.0]], device=device),
+        "fold_payoff": torch.zeros((1, 3), device=device),
+    }
+    selected_preterminal = initial.completion_backend.complete_selected_sealed(
+        initial.rollout_backend,
+        preterminal_leaves,
+        rows=rows,
+        n_samples=4,
+    ).for_learning()
+    dense_preterminal = initial.completion_backend.complete_sealed(
+        initial.rollout_backend,
+        preterminal_leaves,
+        rows=rows,
+        n_samples=4,
+    ).for_learning()
+    assert selected_preterminal.p_hat.shape == (1, 1, hands)
+    assert torch.equal(
+        selected_preterminal.p_hat[:, 0], dense_preterminal.p_hat[:, 2]
+    )
+    assert torch.equal(
+        selected_preterminal.v_hat[:, 0], dense_preterminal.v_hat[:, 2]
+    )
+    del compact, dense, rollout, completion
+    del selected_preterminal, dense_preterminal, preterminal_leaves
 
     target = tmp_path / "target.pt"
     target_config = scientific_config(cfg)

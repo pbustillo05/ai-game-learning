@@ -728,19 +728,35 @@ def mode_loss(
         ptr = _column(actions, "action_ptr").long()
         starts = ptr[rows]
         counts = ptr[rows + 1] - starts
-        if bool((counts <= 0).any()):
-            raise ValueError("every branched decision requires a sampled action")
-        decision_index = torch.repeat_interleave(
-            torch.arange(rows.numel(), device=rows.device), counts
+        torch._assert_async(
+            (counts > 0).all(),
+            "every branched decision requires a sampled action",
         )
-        cumulative = counts.cumsum(0)
-        local_offset = torch.arange(cumulative[-1], device=rows.device) - torch.repeat_interleave(
-            cumulative - counts, counts
+        maximum = partition.max_actions_per_decision
+        if maximum is None or maximum <= 0:
+            raise ValueError("branched partition omitted its immutable action bound")
+        torch._assert_async(
+            (counts <= maximum).all(),
+            "sampled action span exceeds the immutable partition bound",
         )
-        action_rows = torch.repeat_interleave(starts, counts) + local_offset
+        slots = torch.arange(maximum, device=rows.device)
+        active = slots[None] < counts[:, None]
+        padded_action_rows = starts[:, None] + slots[None]
+        safe_action_rows = padded_action_rows.clamp_max(
+            _column(actions, "event").numel() - 1
+        )
+        action_rows = safe_action_rows.flatten()
+        active_rows = active.flatten()
+        decision_index = (
+            torch.arange(rows.numel(), device=rows.device)[:, None]
+            .expand(-1, maximum)
+            .flatten()
+        )
         child_posterior = _column(actions, "child_posterior")[action_rows].to(exact_value)
-        weight = torch.zeros_like(exact_value)
-        weight.index_add_(0, decision_index, child_posterior)
+        child_posterior = torch.where(
+            active_rows[:, None], child_posterior, torch.zeros_like(child_posterior)
+        )
+        weight = child_posterior.reshape(rows.numel(), maximum, -1).sum(1)
         weight = weight / counts[:, None].to(weight)
         events = _column(actions, "event")[action_rows].long()[:, None]
         # Policy output is per decision; repeat natural rows only for this
@@ -763,9 +779,11 @@ def mode_loss(
             action_logp, old_action_logp, advantage, eps
         )
         action_policy = (child_posterior * policy_element).sum(1)
-        policy = torch.zeros(rows.numel(), dtype=action_policy.dtype, device=rows.device)
-        policy.index_add_(0, decision_index, action_policy)
-        policy = policy / counts.to(policy)
+        policy = action_policy.reshape(rows.numel(), maximum).sum(1) / counts.to(
+            action_policy
+        )
+        ratio = torch.where(active_rows[:, None], ratio, torch.ones_like(ratio))
+        was_clipped = active_rows[:, None] & was_clipped
         target = _column(columns, "value_hat")[rows].to(exact_value)
         old_value_natural = _column(columns, "old_value", "old_v")[rows].to(exact_value)
         value = (weight * value_elements(target, old_value_natural)).sum(1)
@@ -799,7 +817,7 @@ def mode_loss(
 
     stats = MappingProxyType(
         {
-            "rows": per_decision.new_tensor(per_decision.numel()),
+            "rows": per_decision.new_ones(()) * per_decision.numel(),
             "loss_sum": per_decision.detach().sum(),
             "policy_sum": policy.detach().sum(),
             "value_sum": value.detach().sum(),

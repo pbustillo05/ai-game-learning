@@ -70,7 +70,7 @@ def _validate_lambda(lam: float) -> float:
 
 def _phi_exact(old_value: Tensor, mapping: tuple[int, ...]) -> Tensor:
     index = torch.tensor(mapping, dtype=torch.int64, device=old_value.device)
-    return old_value[index]
+    return old_value[..., index]
 
 
 def _walker_alias(weights: Tensor) -> tuple[Tensor, Tensor]:
@@ -134,6 +134,188 @@ def _base_columns(block: Any) -> dict[str, Tensor]:
     return {name: value.detach() for name, value in block.decisions.columns.items()}
 
 
+def _host_csr_pointer(pointer: Tensor) -> Tensor:
+    """Copy one compact CSR pointer at a declared structural control boundary.
+
+    Target payloads and recurrences remain on the accelerator.  This single
+    bulk transfer supplies Python only with bounded trajectory-batch extents;
+    it replaces per-trajectory/per-decision CUDA scalar extraction.
+    """
+
+    return pointer.detach().to(device="cpu", dtype=torch.int64)
+
+
+def _flat_partition_layout(
+    rollout: RolloutStorage,
+    *,
+    device: torch.device,
+) -> tuple[dict[int, int], Tensor, int]:
+    """Return immutable partition offsets and a device lookup table."""
+
+    offsets: dict[int, int] = {}
+    total = 0
+    for partition_id, block in rollout.partitions.items():
+        offsets[partition_id] = total
+        total += block.decisions.rows
+    if not offsets:
+        raise ValueError("target construction requires at least one partition")
+    lookup = torch.full(
+        (max(offsets) + 1,), -1, dtype=torch.int64, device=device
+    )
+    for partition_id, offset in offsets.items():
+        lookup[partition_id] = offset
+    return offsets, lookup, total
+
+
+def _batch_addresses(
+    topology: SequentialDecisionCSR,
+    pointer_host: Tensor,
+    first: int,
+    stop: int,
+) -> tuple[int, int, Tensor, Tensor, Tensor]:
+    """Return one bounded trajectory batch's device-local CSR addresses."""
+
+    begin_ordinal = int(pointer_host[first])
+    stop_ordinal = int(pointer_host[stop])
+    count = stop_ordinal - begin_ordinal
+    counts = (
+        topology.trajectory_ptr[first + 1 : stop + 1]
+        - topology.trajectory_ptr[first:stop]
+    ).to(torch.int64)
+    trajectory = torch.repeat_interleave(
+        torch.arange(first, stop, dtype=torch.int64, device=counts.device),
+        counts,
+        output_size=count,
+    )
+    return (
+        begin_ordinal,
+        stop_ordinal,
+        trajectory,
+        topology.decision_partition[begin_ordinal:stop_ordinal].to(torch.int64),
+        topology.decision_row[begin_ordinal:stop_ordinal].to(torch.int64),
+    )
+
+
+def _gather_batch_owner(
+    rollout: RolloutStorage,
+    partition: Tensor,
+    row: Tensor,
+) -> Tensor:
+    """Gather partitioned owners without data-dependent CUDA output shapes."""
+
+    owner = torch.zeros(row.numel(), dtype=torch.int64, device=row.device)
+    covered = torch.zeros(row.numel(), dtype=torch.bool, device=row.device)
+    for partition_id, block in rollout.partitions.items():
+        if block.decisions.rows == 0:
+            continue
+        matches = partition == partition_id
+        safe_row = torch.where(matches, row, torch.zeros_like(row))
+        candidate = _column(block.decisions, "owner")[safe_row].to(torch.int64)
+        owner = torch.where(matches, candidate, owner)
+        covered |= matches
+    torch._assert_async(covered.all(), "sequential target address has no partition")
+    return owner
+
+
+def _gather_batch_old_value(
+    rollout: RolloutStorage,
+    partitions: PartitionSet,
+    partition: Tensor,
+    row: Tensor,
+    *,
+    exact_width: int | None,
+) -> Tensor:
+    """Gather scalar or exact-expanded old values in ordinal order."""
+
+    shape = (row.numel(),) if exact_width is None else (row.numel(), exact_width)
+    old_value = torch.zeros(shape, dtype=torch.float32, device=row.device)
+    covered = torch.zeros(row.numel(), dtype=torch.bool, device=row.device)
+    for partition_id, block in rollout.partitions.items():
+        if block.decisions.rows == 0:
+            continue
+        matches = partition == partition_id
+        safe_row = torch.where(matches, row, torch.zeros_like(row))
+        candidate = _column(block.decisions, "old_value", "oldV")[safe_row].float()
+        if exact_width is not None:
+            partitions[partition_id].assert_model_width(candidate)
+            candidate = _phi_exact(candidate, partitions[partition_id].exact_to_model)
+        mask = matches.reshape((matches.numel(),) + (1,) * (candidate.ndim - 1))
+        old_value = torch.where(mask, candidate, old_value)
+        covered |= matches
+    torch._assert_async(covered.all(), "sequential target value has no partition")
+    return old_value
+
+
+def _player_clock_segmented_targets(
+    old_value: Tensor,
+    terminal_value: Tensor,
+    trajectory: Tensor,
+    owner: Tensor,
+    lam: float,
+) -> Tensor:
+    """Evaluate the player-clock recurrence with a device segmented scan.
+
+    Binary pointer jumping composes the affine updates belonging to later
+    decisions of the same ``(trajectory, owner)``.  It uses logarithmically
+    many device operations and never extracts an accelerator scalar.
+    """
+
+    count = owner.numel()
+    if count == 0:
+        return old_value.clone()
+    n_players = terminal_value.shape[1]
+    key = trajectory * n_players + owner
+    order = torch.argsort(key, stable=True)
+    ordered_key = key[order]
+    successor = torch.full((count,), -1, dtype=torch.int64, device=owner.device)
+    if count > 1:
+        same = ordered_key[:-1] == ordered_key[1:]
+        successor[order[:-1]] = torch.where(
+            same, order[1:], torch.full_like(order[:-1], -1)
+        )
+
+    linked = successor >= 0
+    safe_successor = successor.clamp_min(0)
+    coefficient = torch.where(
+        linked,
+        torch.full((count,), lam, dtype=old_value.dtype, device=old_value.device),
+        torch.ones(count, dtype=old_value.dtype, device=old_value.device),
+    )
+    linked_shape = (count,) + (1,) * (old_value.ndim - 1)
+    intercept = torch.where(
+        linked.reshape(linked_shape),
+        (1.0 - lam) * old_value[safe_successor],
+        torch.zeros_like(old_value),
+    )
+    link = successor
+    for _ in range(max(1, count.bit_length())):
+        has_link = link >= 0
+        safe_link = link.clamp_min(0)
+        next_coefficient = coefficient[safe_link]
+        next_intercept = intercept[safe_link]
+        combined_intercept = intercept + coefficient.reshape(linked_shape) * next_intercept
+        coefficient = torch.where(
+            has_link, coefficient * next_coefficient, coefficient
+        )
+        intercept = torch.where(
+            has_link.reshape(linked_shape), combined_intercept, intercept
+        )
+        link = torch.where(has_link, link[safe_link], link)
+
+    terminal = terminal_value[trajectory, owner]
+    return coefficient.reshape(linked_shape) * terminal + intercept
+
+
+def _flat_destinations(
+    partition: Tensor,
+    row: Tensor,
+    offset_lookup: Tensor,
+) -> Tensor:
+    offset = offset_lookup[partition]
+    torch._assert_async((offset >= 0).all(), "unknown sequential target partition")
+    return offset + row
+
+
 def build_normal_targets(
     rollout: RolloutStorage,
     partitions: PartitionSet,
@@ -156,36 +338,34 @@ def build_normal_targets(
     reward = _column(rollout.leaves, "reward", "terminal_reward").float()
     if reward.ndim != 2:
         raise ValueError("normal leaf reward must be fp32 [L,P]")
-    returns = {
-        partition_id: torch.empty(
-            block.decisions.rows, dtype=torch.float32, device=reward.device
-        )
-        for partition_id, block in rollout.partitions.items()
-    }
-    valid = {
-        partition_id: torch.zeros(block.decisions.rows, dtype=torch.bool, device=reward.device)
-        for partition_id, block in rollout.partitions.items()
-    }
+    offsets, offset_lookup, decision_count = _flat_partition_layout(
+        rollout, device=reward.device
+    )
+    flat_return = torch.empty(decision_count, dtype=torch.float32, device=reward.device)
+    valid = torch.zeros(decision_count, dtype=torch.bool, device=reward.device)
+    pointer_host = _host_csr_pointer(topology.trajectory_ptr)
     for first in range(0, topology.roots, trajectory_batch_rows):
-        for trajectory in range(first, min(first + trajectory_batch_rows, topology.roots)):
-            carry = reward[int(topology.leaf_row[trajectory])].clone()
-            begin = int(topology.trajectory_ptr[trajectory])
-            stop = int(topology.trajectory_ptr[trajectory + 1])
-            for ordinal in range(stop - 1, begin - 1, -1):
-                partition_id = int(topology.decision_partition[ordinal])
-                row = int(topology.decision_row[ordinal])
-                block = rollout.partitions[partition_id]
-                owner = int(_column(block.decisions, "owner")[row])
-                old_value = float(_column(block.decisions, "old_value", "oldV")[row])
-                returns[partition_id][row] = carry[owner]
-                valid[partition_id][row] = True
-                carry[owner] = lam * carry[owner] + (1.0 - lam) * old_value
+        batch_stop = min(first + trajectory_batch_rows, topology.roots)
+        _, _, trajectory, partition, row = _batch_addresses(
+            topology, pointer_host, first, batch_stop
+        )
+        owner = _gather_batch_owner(rollout, partition, row)
+        old_value = _gather_batch_old_value(
+            rollout, partitions, partition, row, exact_width=None
+        )
+        terminal = reward[topology.leaf_row[first:batch_stop].to(torch.int64)]
+        target = _player_clock_segmented_targets(
+            old_value, terminal, trajectory - first, owner, lam
+        )
+        destination = _flat_destinations(partition, row, offset_lookup)
+        flat_return[destination] = target
+        valid[destination] = True
+    torch._assert_async(valid.all(), "normal target builder did not write every decision once")
     training: dict[int, TrainingPartition] = {}
     for partition_id, block in rollout.partitions.items():
-        if not bool(valid[partition_id].all()):
-            raise RuntimeError("normal target builder did not write every decision once")
         columns = _base_columns(block)
-        columns["lambda_return"] = returns[partition_id]
+        begin = offsets[partition_id]
+        columns["lambda_return"] = flat_return[begin : begin + block.decisions.rows]
         # Algebraic duplicates are explicitly absent.
         columns.pop("advantage", None)
         columns.pop("v_target", None)
@@ -229,41 +409,98 @@ def build_sequential_rb_targets(
     exact_width = widths.pop()
     first_block = next(iter(rollout.partitions.values()))
     device = next(iter(first_block.decisions.columns.values())).device
-    returns = {
-        key: torch.empty((value.decisions.rows, exact_width), dtype=torch.float32, device=device)
-        for key, value in rollout.partitions.items()
-    }
-    refs = {
-        key: torch.full((value.decisions.rows,), -1, dtype=torch.int32, device=device)
-        for key, value in rollout.partitions.items()
-    }
-    valid = {
-        key: torch.zeros(value.decisions.rows, dtype=torch.bool, device=device)
-        for key, value in rollout.partitions.items()
-    }
-    pool_trajectory: list[int] = []
-    pool_player: list[int] = []
-    pair_ref: dict[tuple[int, int], int] = {}
-
-    # Topology and owner columns are already sealed, so determine the exact
-    # posterior-pool extent before completion allocates any exact-hand rows.
-    # Python retains only scalar address metadata, never tensor payload.
-    for trajectory in range(topology.roots):
-        begin = int(topology.trajectory_ptr[trajectory])
-        stop = int(topology.trajectory_ptr[trajectory + 1])
-        for ordinal in range(begin, stop):
-            partition_id = int(topology.decision_partition[ordinal])
-            row = int(topology.decision_row[ordinal])
-            owner = int(_column(rollout.partitions[partition_id].decisions, "owner")[row])
-            pair = (trajectory, owner)
-            if pair not in pair_ref:
-                pair_ref[pair] = len(pool_trajectory)
-                pool_trajectory.append(trajectory)
-                pool_player.append(owner)
-    posterior_tensor = torch.empty(
-        (len(pair_ref), exact_width), dtype=torch.float32, device=device
+    offsets, offset_lookup, decision_count = _flat_partition_layout(
+        rollout, device=device
     )
-    pool_valid = torch.zeros(len(pair_ref), dtype=torch.bool, device=device)
+    flat_return = torch.empty(
+        (decision_count, exact_width), dtype=torch.float32, device=device
+    )
+    flat_ref = torch.full((decision_count,), -1, dtype=torch.int32, device=device)
+    valid = torch.zeros(decision_count, dtype=torch.bool, device=device)
+    pointer_host = _host_csr_pointer(topology.trajectory_ptr)
+
+    # Mark the exact set of required (trajectory, player) posterior rows using
+    # bounded device batches.  P is a run constant (2..6), so this structural
+    # bitmap remains independent of the exact-hand width.
+    if decision_count == 0:
+        raise ValueError("sequential RB target construction requires a decision")
+    # Owners are immutable scalar address metadata.  One bulk copy determines
+    # the compact player bitmap width without inspecting CUDA values in a loop.
+    owner_structure = torch.empty(
+        decision_count, dtype=torch.int64, device=device
+    )
+    for partition_id, block in rollout.partitions.items():
+        begin = offsets[partition_id]
+        owner_structure[begin : begin + block.decisions.rows] = _column(
+            block.decisions, "owner"
+        )
+    owner_host = owner_structure.to(device="cpu")
+    del owner_structure
+    selected_owner_field = completion.selected_owner_field
+    selected_owner = None
+    if selected_owner_field is not None:
+        selected_owner = _column(rollout.leaves, selected_owner_field).to(torch.int64)
+        if selected_owner.shape != (rollout.leaves.rows,):
+            raise ValueError("selected completion owners must be leaf-aligned [L]")
+        selected_owner_host = selected_owner.detach().to(device="cpu")
+        n_players = max(int(owner_host.max()), int(selected_owner_host.max())) + 1
+    else:
+        n_players = int(owner_host.max()) + 1
+    required = torch.zeros(
+        (topology.roots, n_players), dtype=torch.bool, device=device
+    )
+    for first in range(0, topology.roots, leaf_microbatch_rows):
+        batch_stop = min(first + leaf_microbatch_rows, topology.roots)
+        _, _, trajectory, partition, row = _batch_addresses(
+            topology, pointer_host, first, batch_stop
+        )
+        owner = _gather_batch_owner(rollout, partition, row)
+        required[trajectory, owner] = True
+    if selected_owner is not None:
+        trajectory_selected = selected_owner[
+            topology.leaf_row.to(torch.int64)
+        ]
+        torch._assert_async(
+            ((trajectory_selected >= 0) & (trajectory_selected < n_players)).all(),
+            "selected completion owner is out of range",
+        )
+        selected_required = required.gather(
+            1, trajectory_selected[:, None]
+        ).squeeze(1)
+        retained_count = required.sum(1)
+        torch._assert_async(
+            (
+                (retained_count <= 1)
+                & ((retained_count == 0) | selected_required)
+            ).all(),
+            "probe trajectories must retain decisions for only their selected owner",
+        )
+    pool_counts = required.sum(1, dtype=torch.int64)
+    pool_ptr = torch.empty(topology.roots + 1, dtype=torch.int64, device=device)
+    pool_ptr[0] = 0
+    pool_ptr[1:] = pool_counts.cumsum(0)
+    # Exact allocation requires one scalar total.  Transfer the complete small
+    # pointer once so this is an explicit bounded allocation boundary, not a
+    # synchronization in a trajectory or decision loop.
+    pool_ptr_host = _host_csr_pointer(pool_ptr)
+    pool_rows = int(pool_ptr_host[-1])
+    required_flat = required.flatten()
+    required_order = torch.argsort((~required_flat).to(torch.int8), stable=True)[
+        :pool_rows
+    ]
+    pool_trajectory = torch.div(
+        required_order, n_players, rounding_mode="floor"
+    ).to(torch.int32)
+    pool_player = torch.remainder(required_order, n_players).to(torch.int32)
+    pair_ref = torch.full_like(required_flat, -1, dtype=torch.int32)
+    pair_ref[required_order] = torch.arange(
+        pool_rows, dtype=torch.int32, device=device
+    )
+    pair_ref = pair_ref.reshape(topology.roots, n_players)
+    posterior_tensor = torch.empty(
+        (pool_rows, exact_width), dtype=torch.float32, device=device
+    )
+    pool_valid = torch.zeros(pool_rows, dtype=torch.bool, device=device)
 
     for first in range(0, topology.roots, leaf_microbatch_rows):
         trajectories = torch.arange(
@@ -278,53 +515,61 @@ def build_sequential_rb_targets(
             raise ValueError("completion p_hat/v_hat must be matching [B,P,X]")
         if posterior.shape[0] != trajectories.numel() or posterior.shape[2] != exact_width:
             raise ValueError("completion output violates the canonical exact domain")
-        for local, trajectory_tensor in enumerate(trajectories):
-            trajectory = int(trajectory_tensor)
-            begin = int(topology.trajectory_ptr[trajectory])
-            stop = int(topology.trajectory_ptr[trajectory + 1])
-            required_players = []
-            for ordinal in range(begin, stop):
-                partition_id = int(topology.decision_partition[ordinal])
-                row = int(topology.decision_row[ordinal])
-                owner = int(_column(rollout.partitions[partition_id].decisions, "owner")[row])
-                if owner not in required_players:
-                    required_players.append(owner)
-            moment = posterior[local] * value[local]
-            for owner in required_players:
-                pool_row = pair_ref[(trajectory, owner)]
-                if bool(pool_valid[pool_row]):
-                    raise RuntimeError("trajectory/player posterior was written more than once")
-                posterior_tensor[pool_row] = posterior[local, owner]
-                pool_valid[pool_row] = True
-            for ordinal in range(stop - 1, begin - 1, -1):
-                partition_id = int(topology.decision_partition[ordinal])
-                row = int(topology.decision_row[ordinal])
-                spec = partitions[partition_id]
-                block = rollout.partitions[partition_id]
-                owner = int(_column(block.decisions, "owner")[row])
-                mass = posterior[local, owner]
-                returns[partition_id][row] = conditionalize(moment[owner], mass)
-                refs[partition_id][row] = pair_ref[(trajectory, owner)]
-                valid[partition_id][row] = True
-                old_value = _column(block.decisions, "old_value", "oldV")[row].float()
-                spec.assert_model_width(old_value)
-                exact_old = _phi_exact(old_value, spec.exact_to_model)
-                moment[owner] = lam * moment[owner] + (1.0 - lam) * mass * exact_old
+        if selected_owner is not None and posterior.shape[1] != 1:
+            raise ValueError("selected completion must return exactly one player row")
+        pool_begin = int(pool_ptr_host[first])
+        pool_stop = int(pool_ptr_host[min(first + leaf_microbatch_rows, topology.roots)])
+        batch_pool_player = pool_player[pool_begin:pool_stop].to(torch.int64)
+        batch_pool_trajectory = (
+            pool_trajectory[pool_begin:pool_stop].to(torch.int64) - first
+        )
+        output_player = (
+            torch.zeros_like(batch_pool_player)
+            if selected_owner is not None
+            else batch_pool_player
+        )
+        posterior_tensor[pool_begin:pool_stop] = posterior[
+            batch_pool_trajectory, output_player
+        ]
+        pool_valid[pool_begin:pool_stop] = True
+
+        batch_stop = min(first + leaf_microbatch_rows, topology.roots)
+        _, _, trajectory, partition, row = _batch_addresses(
+            topology, pointer_host, first, batch_stop
+        )
+        local_trajectory = trajectory - first
+        owner = _gather_batch_owner(rollout, partition, row)
+        old_value = _gather_batch_old_value(
+            rollout, partitions, partition, row, exact_width=exact_width
+        )
+        target_owner = torch.zeros_like(owner) if selected_owner is not None else owner
+        support = posterior[local_trajectory, target_owner] > 0
+        old_value = torch.where(support, old_value, torch.zeros_like(old_value))
+        terminal = torch.where(
+            posterior > 0, value, torch.zeros_like(value)
+        )
+        target = _player_clock_segmented_targets(
+            old_value, terminal, local_trajectory, target_owner, lam
+        )
+        destination = _flat_destinations(partition, row, offset_lookup)
+        flat_return[destination] = target
+        flat_ref[destination] = pair_ref[trajectory, owner]
+        valid[destination] = True
         del completed, posterior, value
-    if not bool(pool_valid.all()):
-        raise RuntimeError("sequential posterior pool has unwritten rows")
+    torch._assert_async(pool_valid.all(), "sequential posterior pool has unwritten rows")
+    torch._assert_async(valid.all(), "sequential RB target builder missed a decision")
     pool = SequentialPosteriorPool(
         posterior_tensor,
-        torch.tensor(pool_trajectory, dtype=torch.int32, device=device),
-        torch.tensor(pool_player, dtype=torch.int32, device=device),
+        pool_trajectory,
+        pool_player,
     )
     training: dict[int, TrainingPartition] = {}
     for partition_id, block in rollout.partitions.items():
-        if not bool(valid[partition_id].all()):
-            raise RuntimeError("sequential RB target builder missed a decision")
+        begin = offsets[partition_id]
+        stop = begin + block.decisions.rows
         columns = _base_columns(block)
-        columns["posterior_ref"] = refs[partition_id]
-        columns["lambda_return"] = returns[partition_id]
+        columns["posterior_ref"] = flat_ref[begin:stop]
+        columns["lambda_return"] = flat_return[begin:stop]
         for forbidden in ("advantage", "v_target", "q_hat", "parent_posterior"):
             columns.pop(forbidden, None)
         training[partition_id] = TrainingPartition(
@@ -704,11 +949,16 @@ def build_branched_rb_targets(
         action_columns["child_posterior"] = child_posterior[partition_id]
         action_columns["advantage_hat"] = advantage[partition_id]
         action_columns["action_ptr"] = block.action_ptr
+        pointer = action_ptr_host[partition_id]
+        max_actions_per_decision = (
+            int((pointer[1:] - pointer[:-1]).max()) if block.decisions.rows else 0
+        )
         training[partition_id] = TrainingPartition(
             partition_id,
             block.inputs,
             columns,
             action_columns,
+            max_actions_per_decision,
             input_pools=block.input_pools,
         )
     return TrainingStorage(

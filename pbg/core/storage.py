@@ -1184,6 +1184,7 @@ class TrainingPartition:
     inputs: SealedTensorBlock
     columns: Mapping[str, Tensor]
     action_columns: Mapping[str, Tensor] | None = None
+    max_actions_per_decision: int | None = None
     input_pools: Mapping[str, SealedTensorBlock] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -1219,7 +1220,30 @@ class TrainingPartition:
                     or bool((ptr[1:] < ptr[:-1]).any())
                 ):
                     raise ValueError("training action_ptr is not valid CSR")
+                maximum = self.max_actions_per_decision
+                if maximum is None:
+                    maximum = (
+                        int((ptr[1:] - ptr[:-1]).max()) if rows else 0
+                    )
+                if (
+                    isinstance(maximum, bool)
+                    or not isinstance(maximum, int)
+                    or maximum < 0
+                    or (rows > 0 and maximum <= 0)
+                ):
+                    raise ValueError(
+                        "max_actions_per_decision must bound every branched row"
+                    )
+                torch._assert_async(
+                    ((ptr[1:] - ptr[:-1]) <= maximum).all(),
+                    "branched action span exceeds its immutable maximum",
+                )
+                object.__setattr__(self, "max_actions_per_decision", maximum)
             object.__setattr__(self, "action_columns", action_columns)
+        else:
+            if self.max_actions_per_decision not in (None, 0):
+                raise ValueError("sequential partitions cannot declare action spans")
+            object.__setattr__(self, "max_actions_per_decision", 0)
         pools = MappingProxyType(dict(self.input_pools))
         for name, block in pools.items():
             if not name or not isinstance(block, SealedTensorBlock):
@@ -1603,8 +1627,13 @@ def stopped_leaf_source_schema(mode: str, *, players: int, exact_width: int) -> 
     elif mode in {"sequential_rb", "branched_rb", "probe"}:
         fields.extend(_rb_completion_public_fields(players))
         if mode == "probe":
-            fields.append(
-                TensorFieldSchema("reward", torch.float32, (players,), alignment=16)
+            fields.extend(
+                (
+                    TensorFieldSchema("selected_owner", torch.int32, alignment=4),
+                    TensorFieldSchema(
+                        "reward", torch.float32, (players,), alignment=16
+                    ),
+                )
             )
     else:
         raise ValueError("unknown rollout mode")
@@ -1631,7 +1660,7 @@ def rollout_leaf_schema(mode: str, *, players: int, exact_width: int) -> TensorS
         fields = (
             TensorFieldSchema("reward", torch.float32, (players,), alignment=16),
         )
-    elif mode in {"sequential_rb", "branched_rb"}:
+    elif mode in {"sequential_rb", "branched_rb", "probe"}:
         fields = (
             *_rb_completion_public_fields(players),
             TensorFieldSchema("completion_key", torch.int64, alignment=8),
@@ -1642,6 +1671,11 @@ def rollout_leaf_schema(mode: str, *, players: int, exact_width: int) -> TensorS
                 alignment=16,
             ),
         )
+        if mode == "probe":
+            fields = (
+                *fields,
+                TensorFieldSchema("selected_owner", torch.int32, alignment=4),
+            )
     else:
         raise ValueError("unknown rollout mode")
     return TensorSchema(f"{mode}_leaf", fields)

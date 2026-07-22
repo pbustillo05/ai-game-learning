@@ -96,6 +96,20 @@ def _inputs(device: torch.device | str = "cpu") -> tuple[torch.Tensor, torch.Ten
     return board, live, folded
 
 
+def test_every_production_evaluator_facade_rejects_contract_v1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake(monkeypatch, version="1")
+    from pbg.games.poker.folded import PokerGPUPartitionAdapter
+    from pbg.games.poker.mc import _load_evaluator
+
+    expected = r"expected CONTRACT_VERSION '2', got '1'"
+    with pytest.raises(RuntimeError, match=expected):
+        _load_evaluator(13)
+    with pytest.raises(RuntimeError, match=expected):
+        PokerGPUPartitionAdapter()._bound_evaluator()
+
+
 
 def test_no_folder_summary_is_forbidden_and_skips_evaluator(
     monkeypatch: pytest.MonkeyPatch,

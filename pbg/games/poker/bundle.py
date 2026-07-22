@@ -11,7 +11,7 @@ from torch import Tensor
 
 from pbg.core.completion import BatchedCompletionStats
 from pbg.core.config import RootConfig
-from pbg.core.game import PRETERM, PROBE_FOLD, GameBundle
+from pbg.core.game import PRETERM, GameBundle
 from pbg.core.tree import PagedRolloutTopology
 from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
 from pbg.games.poker.cards import DeckGeometry
@@ -211,7 +211,11 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
     ) -> BatchedCompletionStats:
         """Complete immutable leaf rows without a tree or mutable state owner."""
 
-        if isinstance(n_samples, bool) or not isinstance(n_samples, int) or n_samples <= 0:
+        if (
+            isinstance(n_samples, bool)
+            or not isinstance(n_samples, int)
+            or n_samples <= 0
+        ):
             raise ValueError("n_samples must be a positive integer")
         rows = rows.to(device=game.device, dtype=torch.int64)
         owner = leaves["owner"][rows]
@@ -297,83 +301,129 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
             metadata=metadata,
         )
 
-    def complete_selected_keyed(
+    def complete_selected_sealed(
         self,
         game: Any,
-        tree: Any,
-        node_ids: Tensor,
-        reach: Any,
+        leaves: Mapping[str, Tensor],
+        *,
+        rows: Tensor,
         n_samples: int,
-        keys: Tensor,
-        players: Tensor,
     ) -> BatchedCompletionStats:
-        """Complete only one selected player's posterior/value per leaf."""
+        """Complete one immutable selected-owner row per probe leaf.
 
-        rows = _reach_rows(reach)
-        batch = int(node_ids.numel())
-        if players.shape != node_ids.shape or players.device != rows.device:
-            raise ValueError("selected completion players must be device-local [B]")
-        p_hat = torch.zeros_like(rows, dtype=torch.float32)
+        The contract-v2 evaluator currently exposes all-player batched
+        completion.  Pre-terminal rows are therefore projected immediately at
+        this boundary; public fold terminals avoid dense all-player outputs
+        altogether.
+        """
+
+        if (
+            isinstance(n_samples, bool)
+            or not isinstance(n_samples, int)
+            or n_samples <= 0
+        ):
+            raise ValueError("n_samples must be a positive integer")
+        rows = rows.to(device=game.device, dtype=torch.int64)
+        owner = leaves["owner"][rows]
+        selected = leaves["selected_owner"][rows].to(torch.int64)
+        range_weights = leaves["range_weights"][rows].to(torch.float32)
+        keys = leaves["completion_key"][rows].to(torch.int64).contiguous()
+        batch, players, n_hands = range_weights.shape
+        if selected.shape != (batch,) or selected.device != game.device:
+            raise ValueError("selected completion owners must be device-local [B]")
+        torch._assert_async(
+            ((selected >= 0) & (selected < players)).all(),
+            "selected completion owner is out of range",
+        )
+        p_hat = torch.zeros(
+            (batch, 1, n_hands), dtype=torch.float32, device=game.device
+        )
         v_hat = torch.zeros_like(p_hat)
-        owners = tree.owner[node_ids.to(tree.owner.device, dtype=torch.int64)]
-        cutoff_mask = owners == PROBE_FOLD
-        ordinary_mask = ~cutoff_mask
+        n_eff = torch.zeros(batch, dtype=torch.float32, device=game.device)
+        metadata: dict[str, object] = {
+            "device": str(game.device),
+            "fold_completion": "joint_profiles",
+            "storage": "immutable_selected_leaf_rows",
+            "selected_player": True,
+            "evaluator_projection": "all_player_to_selected",
+        }
 
-        if bool(ordinary_mask.any()):
-            positions = ordinary_mask.nonzero(as_tuple=False).squeeze(1)
-            completed = self._complete_impl(
-                game,
-                tree,
-                node_ids[positions],
-                rows[positions],
-                n_samples,
-                gen=None,
-                keys=keys[positions],
+        preterm = (owner == PRETERM).nonzero(as_tuple=False).squeeze(1)
+        if preterm.numel():
+            evaluator = self._bound_evaluator()
+            result = evaluator.complete(
+                board_cards=leaves["board_cards"][rows][preterm].contiguous(),
+                range_weights=range_weights[preterm].contiguous(),
+                stratum_level=leaves["stratum_level"][rows][preterm].contiguous(),
+                payoff_baseline=leaves["payoff_baseline"][rows][preterm].contiguous(),
+                stratum_amount=leaves["stratum_amount"][rows][preterm].contiguous(),
+                n_samples=n_samples,
+                seed=keys[preterm],
             )
-            selected = players[positions].to(torch.int64)
-            target_rows = torch.arange(positions.numel(), device=rows.device)
-            p_hat[positions, selected] = completed.p_hat[target_rows, selected]
-            v_hat[positions, selected] = completed.v_hat[target_rows, selected]
+            stats = self._validate_result(
+                result,
+                preterm.numel(),
+                players,
+                game.device,
+                _evaluator_metadata(evaluator),
+            )
+            local = torch.arange(preterm.numel(), device=game.device)
+            preterm_selected = selected[preterm]
+            p_hat[preterm, 0] = stats.p_hat[local, preterm_selected]
+            v_hat[preterm, 0] = stats.v_hat[local, preterm_selected]
+            assert stats.n_eff is not None
+            n_eff[preterm] = stats.n_eff
+            metadata.update(
+                {f"showdown_{key}": value for key, value in stats.metadata.items()}
+            )
 
-        if bool(cutoff_mask.any()):
-            positions = cutoff_mask.nonzero(as_tuple=False).squeeze(1)
-            state_refs = tree.state_ref[
-                node_ids[positions].to(tree.state_ref.device, dtype=torch.int64)
-            ]
-            selected_reach = rows[positions]
+        terminal = (owner != PRETERM).nonzero(as_tuple=False).squeeze(1)
+        if terminal.numel():
+            terminal_weights = range_weights[terminal]
+            log_reach = torch.where(
+                terminal_weights > 0,
+                terminal_weights.log(),
+                torch.full_like(terminal_weights, -torch.inf),
+            )
             dealt = torch.ones(
-                (positions.numel(), game.n_players),
+                (terminal.numel(), players),
                 dtype=torch.bool,
-                device=rows.device,
+                device=game.device,
             )
             profiles = game.profile_sampler.sample_seeded(
-                selected_reach,
-                game.states.board[state_refs.to(torch.int64)],
+                log_reach,
+                leaves["board_cards"][rows][terminal],
                 dealt,
                 n_samples,
-                keys[positions].contiguous(),
+                keys[terminal],
+                board_is_normalized=True,
             )
-            selected = players[positions].to(torch.int64)
+            terminal_selected = selected[terminal]
             combos = profiles.gather(
-                2, selected[:, None, None].expand(-1, n_samples, 1)
+                2, terminal_selected[:, None, None].expand(-1, n_samples, 1)
             ).squeeze(2).to(torch.int64)
             counts = torch.zeros(
-                (positions.numel(), rows.shape[2]),
+                (terminal.numel(), n_hands),
                 dtype=torch.float32,
-                device=rows.device,
+                device=game.device,
             )
             counts.scatter_add_(1, combos, torch.ones_like(combos, dtype=torch.float32))
             posterior = counts / float(n_samples)
-            payoff = -game.states.committed_total[
-                state_refs.to(torch.int64), selected
-            ].to(torch.float32)
-            p_hat[positions, selected] = posterior
-            v_hat[positions, selected] = payoff[:, None] * (posterior > 0)
+            payoff = leaves["fold_payoff"][rows][terminal].gather(
+                1, terminal_selected[:, None]
+            ).squeeze(1).to(torch.float32)
+            p_hat[terminal, 0] = posterior
+            v_hat[terminal, 0] = payoff[:, None] * (posterior > 0)
+            n_eff[terminal] = float(n_samples)
 
+        metrics = getattr(game, "execution_metrics", None)
+        if metrics is not None:
+            metrics.record_evaluator(rows=batch)
         return BatchedCompletionStats(
             p_hat=p_hat,
             v_hat=v_hat,
-            metadata={"device": str(game.device), "selected_player": True},
+            n_eff=n_eff,
+            metadata=metadata,
         )
 
     def _complete_impl(

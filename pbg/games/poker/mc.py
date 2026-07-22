@@ -26,6 +26,19 @@ class EvaluatorContractError(RuntimeError):
     """The sibling returned a value outside its frozen public contract."""
 
 
+def _require_device(
+    predicate: Tensor,
+    message: str,
+    error_type: type[Exception] = ValueError,
+) -> None:
+    """Validate a scalar predicate without synchronizing a CUDA caller."""
+
+    if predicate.device.type == "cuda":
+        torch._assert_async(predicate, message)
+    elif not bool(predicate):
+        raise error_type(message)
+
+
 @dataclass
 class ShowdownResult:
     """Validated evaluator-owned fixed-showdown payoff."""
@@ -118,14 +131,24 @@ def _normalize_board(board_cards: Tensor, rank_count: int = 13) -> Tensor:
     valid = padding | (
         (board_cards >= geometry.first_card) & (board_cards < 52)
     )  # [B,5]
-    if not bool(valid.all()):
-        raise ValueError("board_cards must contain card ids in [0,52), -1, or 255")
+    _require_device(
+        valid.all(), "board_cards must contain card ids in [0,52), -1, or 255"
+    )
     after_padding = padding.to(torch.int32).cumsum(dim=1) > 0  # [B,5]
-    if bool((~padding & after_padding).any()):
-        raise ValueError("real board cards must precede padding")
+    _require_device(
+        (padding | ~after_padding).all(),
+        "real board cards must precede padding",
+    )
     real_counts = (~padding).sum(dim=1)
-    if not bool(((real_counts == 0) | (real_counts == 3) | (real_counts == 4) | (real_counts == 5)).all()):
-        raise ValueError("a board must contain 0, 3, 4, or 5 real cards")
+    _require_device(
+        (
+            (real_counts == 0)
+            | (real_counts == 3)
+            | (real_counts == 4)
+            | (real_counts == 5)
+        ).all(),
+        "a board must contain 0, 3, 4, or 5 real cards",
+    )
     return torch.where(
         padding, torch.full_like(board_cards, PAD_CARD), board_cards
     ).to(dtype=torch.uint8).contiguous()  # [B,5]
@@ -176,11 +199,16 @@ def _linear_reach(
         raise ValueError("dealt_mask must be bool [B,P]")
     if dealt_mask.device != log_rows.device:
         raise ValueError("reach rows and dealt_mask must share a device")
-    if bool(torch.isnan(log_rows[dealt_mask]).any()) or bool(torch.isposinf(log_rows[dealt_mask]).any()):
-        raise ValueError("dealt reach rows may not contain NaN or +inf")
+    finite_input = ~torch.isnan(log_rows) & ~torch.isposinf(log_rows)
+    _require_device(
+        (~dealt_mask[:, :, None] | finite_input).all(),
+        "dealt reach rows may not contain NaN or +inf",
+    )
     row_max = log_rows.max(dim=-1).values  # [B,P]
-    if bool((~torch.isfinite(row_max[dealt_mask])).any()):
-        raise ValueError("every dealt reach row must have positive finite support")
+    _require_device(
+        (~dealt_mask | torch.isfinite(row_max)).all(),
+        "every dealt reach row must have positive finite support",
+    )
     shifted = log_rows - torch.where(dealt_mask, row_max, torch.zeros_like(row_max))[:, :, None]
     weights = torch.where(dealt_mask[:, :, None], shifted.exp(), torch.zeros_like(shifted))
     return weights.to(torch.float32).contiguous()  # [B,P,H]
@@ -323,13 +351,22 @@ class PokerGPURejectionSampler:
         if not combo_ids.is_contiguous():
             raise EvaluatorContractError(f"{op} result must be contiguous")
         inactive = ~dealt_mask[:, None, :].expand_as(combo_ids)
-        if bool((combo_ids[inactive] != -1).any()):
-            raise EvaluatorContractError("sample_joint_profiles must return -1 for undealt seats")
+        _require_device(
+            (~inactive | (combo_ids == -1)).all(),
+            "sample_joint_profiles must return -1 for undealt seats",
+            EvaluatorContractError,
+        )
         dealt = dealt_mask[:, None, :].expand_as(combo_ids)
-        if bool((combo_ids[dealt] < 0).any()):
-            raise EvaluatorContractError("sampled profiles must contain every dealt seat")
-        if bool((combo_ids[dealt] >= DeckGeometry(self.rank_count).n_hands).any()):
-            raise EvaluatorContractError("sampled profile contains an invalid combo id")
+        _require_device(
+            (~dealt | (combo_ids >= 0)).all(),
+            "sampled profiles must contain every dealt seat",
+            EvaluatorContractError,
+        )
+        _require_device(
+            (~dealt | (combo_ids < DeckGeometry(self.rank_count).n_hands)).all(),
+            "sampled profile contains an invalid combo id",
+            EvaluatorContractError,
+        )
         return combo_ids
 
 
@@ -357,8 +394,10 @@ class PokerGPUShowdownEvaluator:
         stratum_amount: Tensor,
     ) -> ShowdownResult:
         board = _normalize_board(board_cards, self.rank_count)
-        if bool((board == PAD_CARD).any()):
-            raise ValueError("fixed showdown requires a final five-card board")
+        _require_device(
+            (board != PAD_CARD).all(),
+            "fixed showdown requires a final five-card board",
+        )
         if combo_ids.dtype != torch.int32 or combo_ids.ndim != 2:
             raise TypeError("combo_ids must be int32 [B,P]")
         batch_size, p_max = combo_ids.shape
@@ -385,8 +424,16 @@ class PokerGPUShowdownEvaluator:
             raise EvaluatorContractError(f"{op} must return float32 [B,P]")
         if payoff.dtype != torch.float32 or payoff.device != board.device:
             raise EvaluatorContractError(f"{op} returned the wrong dtype or device")
-        if not payoff.is_contiguous() or not bool(torch.isfinite(payoff).all()):
+        if not payoff.is_contiguous():
             raise EvaluatorContractError(f"{op} returned an invalid payoff")
-        if bool((payoff.sum(dim=1).abs() > 2e-4).any()):
-            raise EvaluatorContractError(f"{op} returned a non-conserved payoff")
+        _require_device(
+            torch.isfinite(payoff).all(),
+            f"{op} returned an invalid payoff",
+            EvaluatorContractError,
+        )
+        _require_device(
+            (payoff.sum(dim=1).abs() <= 2e-4).all(),
+            f"{op} returned a non-conserved payoff",
+            EvaluatorContractError,
+        )
         return ShowdownResult(payoff, _evaluator_metadata(evaluator))

@@ -30,7 +30,7 @@ Preserve the new KKT/dynamic-$\beta$, $T/C$ heads, nominal-versus-executed child
 
 1. Read `AGENTS.md` and obey it completely.
 2. Inspect `git status` before editing. The current worktree may contain user changes, including ongoing theory and dynamic-branching work. Preserve them and never reset, overwrite, or discard them.
-3. Treat `/home/pablob/poker-gpu-evaluator` as read-only. All poker posterior/equity completion must continue through its documented binding in `/home/pablob/poker-gpu-evaluator/docs/api_pbg.md`.
+3. Treat `/home/pablob/poker-gpu-evaluator` as read-only. All poker posterior/equity completion must continue through its documented binding in `/home/pablob/poker-gpu-evaluator/docs/api.md`.
 4. Use `/home/pablob/.venvs/poker` or `./tools/poker-python`. Never install into system Python.
 5. Before CUDA work, run `nvidia-smi`, use only idle GPUs, set device visibility explicitly, stage tiny runs first, and verify that the selected GPUs return to idle afterward. Never deliberately trigger a CUDA OOM.
 6. Compile changed TeX only into `/tmp`; do not add generated TeX artifacts.
@@ -169,7 +169,7 @@ Preserve:
 
 Migrate these tools to the sole rollout/storage API rather than retaining a second legacy sampler for them.
 
-#### Poker evaluator contract v1: `2429ab6`
+#### Poker evaluator integration (introduced by `2429ab6`; current contract v2)
 
 Preserve the complete evaluator-contract migration, not merely the fact that a sibling evaluator is called:
 
@@ -180,7 +180,9 @@ Preserve the complete evaluator-contract migration, not merely the fact that a s
 - current impossible-hand, board-blocking, live-seat, and folded-player behavior;
 - the integration tests added or updated by this commit.
 
-The sibling repository remains read-only. Do not reintroduce an older evaluator API or local poker completion implementation during storage migration.
+The sibling repository remains read-only. Contract v2 is the sole supported
+production evaluator API; do not reintroduce contract v1 or a local poker
+completion implementation during storage migration.
 
 #### Vectorized validation: `b94941c`
 

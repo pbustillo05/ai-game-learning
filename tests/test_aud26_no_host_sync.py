@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import inspect
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from pbg.core.learner import mode_loss
+from pbg.core.targets import (
+    _player_clock_segmented_targets,
+    build_normal_targets,
+    build_sequential_rb_targets,
+)
 from pbg.core.game import EventBatch
 from pbg.core.execution import ByteAccountant
 from pbg.games.poker.adapter import PokerModelBundle
@@ -20,7 +28,14 @@ from pbg.games.poker.model.incidence import (
 from pbg.games.poker.model_inputs import DeviceHistoryMaterializer
 from pbg.games.poker.partition_cache import DevicePartitionSummaryCache
 from pbg.games.poker.model.primitives import MHA
+from pbg.games.poker.mc import (
+    PokerGPURejectionSampler,
+    PokerGPUShowdownEvaluator,
+    _linear_reach,
+    _normalize_board,
+)
 from pbg.games.poker.rollout_backend import PokerRolloutBackend
+from tests.categorical_policy_fixture import CategoricalPolicyAdapter, PolicyOutput
 
 
 class _DevicePartition:
@@ -66,6 +81,29 @@ class _CountingPartition(_DevicePartition):
         )
 
 
+@dataclass(frozen=True)
+class _EvaluatorInfo:
+    contract_version: str = "2"
+
+
+class _DeviceEvaluator:
+    info = _EvaluatorInfo()
+
+    @staticmethod
+    def sample_joint_profiles(*, board_cards, range_weights, n_samples, **kwargs):
+        del kwargs
+        return torch.zeros(
+            (board_cards.shape[0], n_samples, range_weights.shape[1]),
+            dtype=torch.int32,
+            device=board_cards.device,
+        )
+
+    @staticmethod
+    def evaluate_showdowns(*, board_cards, payoff_baseline, **kwargs):
+        del kwargs
+        return torch.zeros_like(payoff_baseline, device=board_cards.device)
+
+
 def test_cuda_hot_path_implementations_do_not_copy_or_branch_through_host() -> None:
     attention_source = inspect.getsource(MHA.forward)
     assert "count_nonzero" not in attention_source
@@ -82,6 +120,21 @@ def test_cuda_hot_path_implementations_do_not_copy_or_branch_through_host() -> N
     folded_boundary += inspect.getsource(PokerGPUPartitionAdapter._validate_inputs)
     assert "bool(" not in folded_boundary
     assert ".cpu(" not in folded_boundary
+    target_source = inspect.getsource(build_normal_targets)
+    target_source += inspect.getsource(build_sequential_rb_targets)
+    assert "int(topology." not in target_source
+    assert "bool(pool_valid" not in target_source
+    evaluator_source = inspect.getsource(_normalize_board)
+    evaluator_source += inspect.getsource(_linear_reach)
+    evaluator_source += inspect.getsource(PokerGPURejectionSampler.sample_seeded)
+    evaluator_source += inspect.getsource(PokerGPUShowdownEvaluator.evaluate)
+    assert "bool(" not in evaluator_source
+    partition_source = inspect.getsource(PokerRolloutBackend.policy_forward_partition)
+    assert "bool((pub.street" not in partition_source
+    assert "bool(((pub.street" not in partition_source
+    loss_source = inspect.getsource(mode_loss)
+    assert "bool((counts <= 0).any())" not in loss_source
+    assert "torch.arange(cumulative[-1]" not in loss_source
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
@@ -107,6 +160,119 @@ def test_cuda_alias_compaction_and_biased_attention_request_no_host_sync() -> No
     finally:
         torch.cuda.set_sync_debug_mode(previous)
     torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_target_and_evaluator_tensor_controls_request_no_host_sync() -> None:
+    device = torch.device("cuda")
+    old_value = torch.tensor(
+        [10.0, 20.0, 30.0, 40.0], dtype=torch.float32, device=device
+    )
+    terminal = torch.tensor(
+        [[3.0, -3.0], [5.0, -5.0]], dtype=torch.float32, device=device
+    )
+    trajectory = torch.tensor([0, 0, 1, 1], dtype=torch.int64, device=device)
+    owner = torch.tensor([0, 0, 1, 1], dtype=torch.int64, device=device)
+    board = torch.full((2, 5), 255, dtype=torch.uint8, device=device)
+    reach = torch.zeros((2, 2, 1326), dtype=torch.float32, device=device)
+    dealt = torch.ones((2, 2), dtype=torch.bool, device=device)
+    seed = torch.arange(2, dtype=torch.int64, device=device)
+    sampler = PokerGPURejectionSampler()
+    sampler._evaluator = _DeviceEvaluator()
+    showdown = PokerGPUShowdownEvaluator()
+    showdown._evaluator = _DeviceEvaluator()
+    final_board = torch.tensor(
+        [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]],
+        dtype=torch.int16,
+        device=device,
+    )
+    combo_ids = torch.zeros((2, 2), dtype=torch.int32, device=device)
+    stratum_level = torch.zeros((2, 2), dtype=torch.int32, device=device)
+    payoff_baseline = torch.zeros((2, 2), device=device)
+    stratum_amount = torch.ones((2, 1), device=device)
+
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        target = _player_clock_segmented_targets(
+            old_value, terminal, trajectory, owner, 0.5
+        )
+        normalized = _normalize_board(board)
+        linear = _linear_reach(reach, dealt)
+        profiles = sampler.sample_seeded(reach, board, dealt, 3, seed)
+        payoff = showdown.evaluate(
+            board_cards=final_board,
+            combo_ids=combo_ids,
+            stratum_level=stratum_level,
+            payoff_baseline=payoff_baseline,
+            stratum_amount=stratum_amount,
+        ).payoff
+        assert all(
+            value.is_cuda
+            for value in (target, normalized, linear, profiles, payoff)
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    torch.cuda.synchronize(device)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_branched_loss_ragged_action_controls_request_no_host_sync() -> None:
+    device = torch.device("cuda")
+    columns = {
+        "legal_event_ids": torch.tensor(
+            [[0, 1], [0, 1]], dtype=torch.int32, device=device
+        ),
+        "legal_event_mask": torch.ones((2, 2), dtype=torch.bool, device=device),
+        "old_value": torch.zeros((2, 2), device=device),
+        "value_hat": torch.zeros((2, 4), device=device),
+    }
+    actions = {
+        "action_ptr": torch.tensor([0, 1, 3], dtype=torch.int32, device=device),
+        "event": torch.tensor([0, 0, 1], dtype=torch.int32, device=device),
+        "old_log_prob": torch.zeros((3, 2), device=device),
+        "child_posterior": torch.ones((3, 4), device=device),
+        "advantage_hat": torch.zeros((3, 4), device=device),
+    }
+    partition = SimpleNamespace(
+        columns=columns,
+        action_columns=actions,
+        max_actions_per_decision=2,
+    )
+    phi = torch.tensor([0, 0, 1, 1], device=device)
+    spec = SimpleNamespace(phi=lambda device: phi.to(device))
+    output = PolicyOutput(
+        raw=torch.zeros((2, 2, 2), device=device),
+        v=torch.zeros((2, 2), device=device),
+    )
+    cfg = SimpleNamespace(
+        c_v=1.0,
+        c_kl=0.0,
+        clip_eps=0.2,
+        c_h=0.0,
+        entropy_schedule="const",
+        value_loss="mse",
+        clip_eps_v=0.2,
+    )
+    rows = torch.arange(2, device=device)
+
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        result = mode_loss(
+            "branched_rb",
+            spec,
+            SimpleNamespace(posterior_pool=None),
+            partition,
+            rows,
+            output,
+            CategoricalPolicyAdapter(),
+            cfg,
+        )
+        assert result.per_decision.is_cuda
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    torch.cuda.synchronize(device)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
@@ -157,6 +323,7 @@ def test_full_preflop_postflop_policy_inputs_request_no_host_sync() -> None:
             {"cards": torch.tensor([[3, 7, 11]], dtype=torch.int16, device=device)},
         ),
     )
+    sealed_preflop = backend.capture_decision_inputs("pre", root, reach).columns
 
     previous = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode("error")
@@ -165,7 +332,8 @@ def test_full_preflop_postflop_policy_inputs_request_no_host_sync() -> None:
             pre = backend.policy_forward_family(model, "pre", root, reach)
             post = backend.policy_forward_family(model, "post_2", flop, reach)
             cached = backend.policy_forward_family(model, "post_2", flop, reach)
-        assert pre.v.is_cuda and post.v.is_cuda and cached.v.is_cuda
+            sealed = backend.policy_forward_partition(model, 0, sealed_preflop)
+        assert pre.v.is_cuda and post.v.is_cuda and cached.v.is_cuda and sealed.v.is_cuda
     finally:
         torch.cuda.set_sync_debug_mode(previous)
     torch.cuda.synchronize(device)
@@ -184,9 +352,17 @@ def test_folded_summaries_have_sparse_anchor_ownership_and_complete_accounting()
         partition_adapter=partition,
     )
     model_cfg = PokerModelConfig(
-        d_model=4, n_heads=1, n_layers_pre=1, n_layers_post=1,
-        m_raise=1, k_act=4, max_players=3, class_embedding_dim=2,
-        evaluator_summary_dim=0, ffn_hidden=4, folder_beta_rank=4,
+        d_model=4,
+        n_heads=1,
+        n_layers_pre=1,
+        n_layers_post=1,
+        m_raise=1,
+        k_act=4,
+        max_players=3,
+        class_embedding_dim=2,
+        evaluator_summary_dim=0,
+        ffn_hidden=4,
+        folder_beta_rank=4,
         max_history_tokens=32,
     )
     model = PokerModelBundle(
@@ -195,8 +371,11 @@ def test_folded_summaries_have_sparse_anchor_ownership_and_complete_accounting()
     ).to(device).eval()
     backend.register_policy_model(model)
     expected_cache_bytes = DevicePartitionSummaryCache.storage_nbytes(
-        8, n_cards=cfg.geometry.n_cards, beta_rank=model_cfg.folder_beta_rank,
-        max_folders=1, include_anchor=True,
+        8,
+        n_cards=cfg.geometry.n_cards,
+        beta_rank=model_cfg.folder_beta_rank,
+        max_folders=1,
+        include_anchor=True,
     )
     assert expected_cache_bytes > 0
     assert backend.partition_cache_memory_bound() == expected_cache_bytes
@@ -209,6 +388,8 @@ def test_folded_summaries_have_sparse_anchor_ownership_and_complete_accounting()
     accountant = ByteAccountant(1 << 30)
     store = backend.begin_decision_input_captures(accountant=accountant)
 
+    # All-live postflop forwards carry no summary and never invoke the folder
+    # evaluator, even though the model requires summaries when a fold exists.
     state = backend.sequential_start_states(1)
     for _ in range(cfg.n_players):
         state = backend.step_player_batch(
@@ -226,6 +407,8 @@ def test_folded_summaries_have_sparse_anchor_ownership_and_complete_accounting()
         backend.policy_forward_family(model, "post_3", flop_all_live, reach)
     assert partition.calls == 0
 
+    # Two scheduler packs sharing one dependency anchor compute and retain one
+    # summary row; both immutable decision rows reference that sole owner.
     state = backend.sequential_start_states(1)
     for event in (CHECK_CALL, FOLD, CHECK_CALL):
         state = backend.step_player_batch(
@@ -271,6 +454,14 @@ def test_folded_summaries_have_sparse_anchor_ownership_and_complete_accounting()
     assert store.summary_caches[1].size == 1
     assert store.summary_caches[1].allocated_capacity_bytes == expected_cache_bytes
 
+    input_arena = store.input_arenas[1]
+    rows = torch.arange(input_arena.size, device=device)
+    assert input_arena.gather("folded_summary_ref", rows).tolist() == [0, 0]
+    assert accountant.reserved_bytes == (
+        input_arena.allocated_capacity_bytes
+        + store.decision_arenas[1].allocated_capacity_bytes
+        + expected_cache_bytes
+    )
     sealed = backend.seal_decision_input_captures(store)
     assert sealed.input_pools[1]["folded_summary"].rows == 1
     assert sealed.inputs[1].columns["folded_summary_ref"].tolist() == [0, 0]
@@ -281,3 +472,4 @@ def test_folded_summaries_have_sparse_anchor_ownership_and_complete_accounting()
         + sealed.decision_sources[1].allocated_capacity_bytes
         + sealed.input_pools[1]["folded_summary"].allocated_capacity_bytes
     )
+    backend.release_rollout_owners()

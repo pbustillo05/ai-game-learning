@@ -433,7 +433,11 @@ def test_real_mode_loss_reaches_both_heads_and_keeps_targets_detached() -> None:
         "child_posterior": torch.ones((1, 1)),
         "advantage_hat": torch.zeros((1, 1)),
     }
-    partition = SimpleNamespace(columns=columns, action_columns=actions)
+    partition = SimpleNamespace(
+        columns=columns,
+        action_columns=actions,
+        max_actions_per_decision=1,
+    )
     spec = SimpleNamespace(phi=lambda device: torch.tensor([0], device=device))
     storage = SimpleNamespace(posterior_pool=None)
     cfg = SimpleNamespace(

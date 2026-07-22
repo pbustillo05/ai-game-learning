@@ -27,6 +27,7 @@ from pbg.core.storage import (
     rollout_decision_schema,
 )
 from pbg.core.targets import (
+    _player_clock_segmented_targets,
     build_branched_rb_targets,
     build_normal_targets,
     build_sequential_rb_targets,
@@ -308,6 +309,36 @@ def test_normal_streaming_player_clock_lambda_return(lam: float) -> None:
     assert "v_target" not in training.partitions[0].columns
 
 
+def test_device_segmented_player_clock_matches_ordered_reference_and_batching() -> None:
+    lam = 0.37
+    owner = torch.tensor([0, 1, 0, 0, 1, 1, 0, 1, 0], dtype=torch.int64)
+    trajectory = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int64)
+    old_value = torch.tensor(
+        [0.5, -0.3, 1.7, 2.1, -1.2, 0.8, -2.0, 1.1, 3.2]
+    )
+    terminal = torch.tensor([[4.0, -4.0], [7.0, -7.0]])
+
+    expected = torch.empty_like(old_value)
+    for root, (begin, stop) in enumerate(((0, 5), (5, 9))):
+        carry = terminal[root].clone()
+        for ordinal in range(stop - 1, begin - 1, -1):
+            player = int(owner[ordinal])
+            expected[ordinal] = carry[player]
+            carry[player] = lam * carry[player] + (1.0 - lam) * old_value[ordinal]
+
+    actual = _player_clock_segmented_targets(
+        old_value, terminal, trajectory, owner, lam
+    )
+    first = _player_clock_segmented_targets(
+        old_value[:5], terminal[:1], trajectory[:5], owner[:5], lam
+    )
+    second = _player_clock_segmented_targets(
+        old_value[5:], terminal[1:], trajectory[5:] - 1, owner[5:], lam
+    )
+    assert torch.allclose(actual, expected, rtol=1e-6, atol=1e-6)
+    assert torch.allclose(torch.cat((first, second)), actual, rtol=1e-6, atol=1e-6)
+
+
 class _Completion:
     def __init__(self, posterior: torch.Tensor, value: torch.Tensor) -> None:
         self.posterior = posterior
@@ -325,6 +356,69 @@ def _completion(posterior: torch.Tensor, value: torch.Tensor) -> CompletionSpec:
         _Completion(posterior, value),
         0,
         key_fields=("key",),
+    )
+
+
+def test_selected_owner_completion_maps_singleton_output_to_retained_seat() -> None:
+    decision_schema = rollout_decision_schema(
+        "sequential_rb", model_width=2, event_count=3, dynamic_heads=False
+    )
+    decisions = _sealed(
+        decision_schema,
+        owner=torch.tensor([2, 2], dtype=torch.int32),
+        event=torch.tensor([1, 2], dtype=torch.int32),
+        old_value=torch.tensor([[10.0, 20.0], [30.0, 40.0]]),
+        old_log_prob=torch.zeros(2, 2),
+        legal_event_ids=torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.int32),
+        legal_event_mask=torch.ones((2, 3), dtype=torch.bool),
+    )
+    leaf_schema = TensorSchema(
+        "selected_rb_leaf",
+        (
+            TensorFieldSchema("key", torch.int64),
+            TensorFieldSchema("selected_owner", torch.int32),
+        ),
+    )
+    rollout = RolloutStorage(
+        "sequential_rb",
+        {0: PartitionRolloutBlock(0, _input(2), decisions)},
+        SequentialDecisionCSR(
+            torch.tensor([0, 2], dtype=torch.int32),
+            torch.tensor([0, 0], dtype=torch.int32),
+            torch.tensor([0, 1], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+        ),
+        _sealed(
+            leaf_schema,
+            key=torch.tensor([7], dtype=torch.int64),
+            selected_owner=torch.tensor([2], dtype=torch.int32),
+        ),
+    )
+    posterior = torch.tensor([[[1.0, 0.0, 2.0, 1.0]]])
+    value = torch.tensor([[[2.0, 99.0, 4.0, 8.0]]])
+    completion = CompletionSpec(
+        ("key", "selected_owner"),
+        ("exact",),
+        ("p_hat", "v_hat"),
+        _Completion(posterior, value),
+        0,
+        key_fields=("key",),
+        selected_owner_field="selected_owner",
+    )
+
+    training = build_sequential_rb_targets(
+        rollout,
+        _spec(4, 2, (0, 0, 1, 1)),
+        completion,
+        1.0,
+    )
+
+    assert training.posterior_pool is not None
+    assert torch.equal(training.posterior_pool.player, torch.tensor([2], dtype=torch.int32))
+    assert torch.equal(training.posterior_pool.posterior, posterior[:, 0])
+    assert torch.equal(
+        training.partitions[0].columns["lambda_return"],
+        torch.tensor([[2.0, 0.0, 4.0, 8.0], [2.0, 0.0, 4.0, 8.0]]),
     )
 
 

@@ -3,7 +3,8 @@ from __future__ import annotations
 import copy
 import pytest
 
-from pbg.benchmark import compare_benchmark
+from pbg.benchmark import _mode_config, compare_benchmark
+from pbg.config import load_config
 
 
 def _result(speed: float, seconds: float, target_bytes: float) -> dict:
@@ -80,3 +81,29 @@ def test_performance_gate_rejects_logical_rng_version_mismatch() -> None:
     current["workload"]["logical_rng"] = "counter_hash_v2"
     with pytest.raises(ValueError, match="workload"):
         compare_benchmark(current, baseline)
+
+
+def test_benchmark_mode_conversion_closes_branching_controls() -> None:
+    branched = load_config("configs/train/nlhe_6max_10bb_branched.yaml")
+    sequential = _mode_config(branched, "rao_blackwell")
+    assert sequential.rollout.branching_mode is None
+    assert sequential.rollout.beta is None
+    assert sequential.rollout.branching_min_nodes is None
+    assert sequential.rollout.safe_tree_size is None
+    assert sequential.rollout.queue_capacity_rows is None
+    assert sequential.model["use_branching_heads"] is False
+    assert sequential.loss.c_t == 0.0
+    assert sequential.loss.c_c == 0.0
+
+
+def test_benchmark_requires_explicit_queue_capacity_for_synthetic_branching() -> None:
+    sequential = load_config("configs/train/nlhe_hu_32bb_rb.yaml")
+    with pytest.raises(ValueError, match="branching_queue_capacity_rows"):
+        _mode_config(sequential, "branched_rao_blackwell")
+    branched = _mode_config(
+        sequential,
+        "branched_rao_blackwell",
+        branching_queue_capacity_rows=512,
+    )
+    assert branched.rollout.branching_mode == "fixed"
+    assert branched.rollout.queue_capacity_rows == 512

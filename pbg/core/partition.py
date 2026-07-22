@@ -84,6 +84,7 @@ class CompletionSpec:
     complete: CompletionForward
     workspace_bytes: int | Callable[[int], int]
     key_fields: tuple[str, ...] = ("completion_key",)
+    selected_owner_field: str | None = None
 
     def __post_init__(self) -> None:
         for label, values in (
@@ -102,6 +103,13 @@ class CompletionSpec:
             object.__setattr__(self, label, frozen)
         if not set(self.key_fields).issubset(self.leaf_fields):
             raise ValueError("completion key fields must be owned by the leaf schema")
+        if self.selected_owner_field is not None:
+            selected_owner_field = str(self.selected_owner_field)
+            if not selected_owner_field or selected_owner_field not in self.leaf_fields:
+                raise ValueError(
+                    "selected completion owner must name an owned leaf field"
+                )
+            object.__setattr__(self, "selected_owner_field", selected_owner_field)
         if not callable(self.complete):
             raise TypeError("completion boundary must be callable")
         if not callable(self.workspace_bytes):

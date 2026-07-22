@@ -66,7 +66,12 @@ def _benchmark_checkpoint(
     return dict(payload["model"]), metadata
 
 
-def _mode_config(base: RootConfig, mode: str) -> RootConfig:
+def _mode_config(
+    base: RootConfig,
+    mode: str,
+    *,
+    branching_queue_capacity_rows: int | None = None,
+) -> RootConfig:
     if mode not in MODES:
         raise ValueError(f"unknown benchmark mode {mode!r}")
     cfg = copy.deepcopy(base)
@@ -77,6 +82,12 @@ def _mode_config(base: RootConfig, mode: str) -> RootConfig:
         cfg.rollout.beta = None
         cfg.rollout.branching_mode = None
         cfg.rollout.adaptive_kkt = None
+        cfg.rollout.branching_min_nodes = None
+        cfg.rollout.safe_tree_size = None
+        cfg.rollout.queue_capacity_rows = None
+        cfg.model["use_branching_heads"] = False
+        cfg.loss.c_t = 0.0
+        cfg.loss.c_c = 0.0
         cfg.completion.n_samples = None
     elif mode == "rao_blackwell":
         if cfg.loss.name == "ppo":
@@ -84,6 +95,12 @@ def _mode_config(base: RootConfig, mode: str) -> RootConfig:
         cfg.rollout.beta = None
         cfg.rollout.branching_mode = None
         cfg.rollout.adaptive_kkt = None
+        cfg.rollout.branching_min_nodes = None
+        cfg.rollout.safe_tree_size = None
+        cfg.rollout.queue_capacity_rows = None
+        cfg.model["use_branching_heads"] = False
+        cfg.loss.c_t = 0.0
+        cfg.loss.c_c = 0.0
         cfg.completion.n_samples = cfg.completion.n_samples or 64
     else:
         if cfg.loss.name == "ppo":
@@ -92,8 +109,16 @@ def _mode_config(base: RootConfig, mode: str) -> RootConfig:
         # decision count, rather than root count, is the cross-mode normalizer.
         cfg.rollout.roots_per_gpu = 1
         cfg.rollout.beta = cfg.rollout.beta or {"default": 1.5}
-        cfg.rollout.branching_mode = "fixed"
-        cfg.rollout.adaptive_kkt = None
+        if cfg.rollout.branching_mode is None:
+            cfg.rollout.branching_mode = "fixed"
+            cfg.rollout.adaptive_kkt = None
+        if branching_queue_capacity_rows is not None:
+            cfg.rollout.queue_capacity_rows = branching_queue_capacity_rows
+        if cfg.rollout.queue_capacity_rows is None:
+            raise ValueError(
+                "branched benchmarks require a native branched config or an "
+                "explicit branching_queue_capacity_rows"
+            )
         cfg.model["use_branching_heads"] = True
         cfg.loss.c_t = cfg.loss.c_t or 1.0
         cfg.loss.c_c = cfg.loss.c_c or 1.0
@@ -153,6 +178,7 @@ def benchmark_modes(
     device: torch.device | str | None = None,
     checkpoint: str | Path | None = None,
     branching_upper_cutoff_nodes: int | None = None,
+    branching_queue_capacity_rows: int | None = None,
 ) -> dict[str, Any]:
     """Profile modes and return median phase/cost metrics plus raw samples."""
 
@@ -170,7 +196,11 @@ def benchmark_modes(
     results: list[dict[str, Any]] = []
     environment: dict[str, Any] | None = None
     for mode in modes:
-        local = _mode_config(cfg, mode)
+        local = _mode_config(
+            cfg,
+            mode,
+            branching_queue_capacity_rows=branching_queue_capacity_rows,
+        )
         requested = resolve_execution_device(
             cfg.device if device is None else device,
             workload="training benchmark",
@@ -313,6 +343,8 @@ def benchmark_modes(
                     "diagnostic_branching_upper_cutoff_nodes": (
                         diagnostic_limits.upper_nodes
                     ),
+                    "branching_mode": local.rollout.branching_mode,
+                    "queue_capacity_rows": local.rollout.queue_capacity_rows,
                 },
                 "metrics": _median_metrics(samples),
                 "samples": samples,
@@ -373,6 +405,7 @@ def benchmark_modes(
             "family_batch_rows": cfg.rollout.family_batch_rows,
             "max_active_trajectories": cfg.rollout.max_active_trajectories,
             "storage_page_rows": cfg.rollout.storage_page_rows,
+            "branching_queue_capacity_rows": branching_queue_capacity_rows,
             "warmup": warmup,
             "repeats": repeats,
         },
