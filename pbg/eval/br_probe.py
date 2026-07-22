@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 
 from pbg.config import load_config_mapping
+from pbg.core.checkpointing import load_checkpoint_payload
 from pbg.core.br import (
     SHARED_RESPONSE_SEMANTICS,
     balanced_evaluation_probe_seats,
@@ -126,7 +127,7 @@ def evaluate_br_probe(
         )
     started = time.perf_counter()
     probe_path = Path(probe_checkpoint)
-    probe_payload = torch.load(probe_path, map_location="cpu", weights_only=False)
+    probe_payload = load_checkpoint_payload(probe_path)
     target_meta = probe_payload.get("probe_target")
     if not isinstance(target_meta, dict) or not target_meta.get("sha256"):
         raise ValueError("probe checkpoint has no hash-bound target metadata")
@@ -140,7 +141,7 @@ def evaluate_br_probe(
     target_hash = _sha256(target_path)
     if target_hash != target_meta["sha256"]:
         raise ValueError("target checkpoint SHA-256 does not match the probe")
-    target_payload = torch.load(target_path, map_location="cpu", weights_only=False)
+    target_payload = load_checkpoint_payload(target_path)
 
     raw = copy.deepcopy(probe_payload["config"])
     raw.setdefault("training", {})["checkpoint_every"] = 1

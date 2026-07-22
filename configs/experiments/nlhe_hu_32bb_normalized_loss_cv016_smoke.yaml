@@ -29,10 +29,8 @@ model:
   m_raise: 2
   k_act: 5
   s_min: 0.02
-  n_buckets_line: 64
   max_players: 2
   class_embedding_dim: 32
-  evaluator_summary_dim: 0
   ffn_hidden: null
   use_branching_heads: false
   max_history_tokens: 42

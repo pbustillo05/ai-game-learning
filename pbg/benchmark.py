@@ -8,13 +8,13 @@ import hashlib
 import os
 import platform
 import statistics
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterable
 
 import torch
 
 from pbg.core.config import RootConfig, seed_all
+from pbg.core.checkpointing import load_checkpoint_payload
 from pbg.core.branching import BranchingDiagnosticLimits
 from pbg.core.execution import LOGICAL_RNG_VERSION
 from pbg.core.training import (
@@ -50,9 +50,7 @@ def _benchmark_checkpoint(
     if path is None:
         return None, None
     checkpoint = Path(path)
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if not isinstance(payload, Mapping) or not isinstance(payload.get("model"), Mapping):
-        raise ValueError(f"checkpoint {checkpoint} has no model state")
+    payload = load_checkpoint_payload(checkpoint)
     digest = hashlib.sha256()
     with checkpoint.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -227,31 +225,14 @@ def benchmark_modes(
         bundle = build_game_bundle(local, requested)
         device = torch.device(bundle.rollout_backend.device)
         bundle.model.to(device)
-        randomly_initialized_checkpoint_keys: tuple[str, ...] = ()
         if checkpoint_state is not None:
-            incompatible = bundle.model.load_state_dict(
-                checkpoint_state, strict=False
-            )
-            randomly_initialized_checkpoint_keys = tuple(
-                incompatible.missing_keys
-            )
-            unexpected = tuple(incompatible.unexpected_keys)
-            allowed_missing = (
-                local.training.mode == "branched_rao_blackwell"
-                and all(
-                    "branching_heads" in key
-                    for key in randomly_initialized_checkpoint_keys
-                )
-            )
-            if unexpected or (
-                randomly_initialized_checkpoint_keys and not allowed_missing
-            ):
+            try:
+                bundle.model.load_state_dict(checkpoint_state)
+            except RuntimeError as exc:
                 raise RuntimeError(
-                    "checkpoint load may omit only newly initialized branching "
-                    "heads in branched mode; "
-                    f"missing={randomly_initialized_checkpoint_keys}, "
-                    f"unexpected={unexpected}"
-                )
+                    "benchmark checkpoint model architecture does not match the "
+                    "current benchmark mode"
+                ) from exc
         torch_gen, _ = seed_all(local.training.seed, 0, device)
         optimizer_cls = (
             torch.optim.AdamW
@@ -332,9 +313,6 @@ def benchmark_modes(
                     "model_initialization_protocol": initialization_protocol,
                     "model_initialization_seed": local.training.seed,
                     "model_checkpoint": checkpoint_metadata,
-                    "randomly_initialized_checkpoint_keys": list(
-                        randomly_initialized_checkpoint_keys
-                    ),
                     "repeat_seeds": repeat_seeds,
                     "profile_iteration": profile_iteration,
                     "family_batch_rows": local.rollout.family_batch_rows,

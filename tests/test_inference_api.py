@@ -59,24 +59,48 @@ def _artifact(path: Path, n_players: int = 2) -> Path:
     return path
 
 
+def _current_checkpoint(model: torch.nn.Module, config: dict, iteration: int) -> dict:
+    return {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "storage_schema_version": TRAINING_STORAGE_SCHEMA_VERSION,
+        "controller_schema_version": None,
+        "branching_controller_schema_version": None,
+        "model": model.state_dict(),
+        "optimizer": {},
+        "scaler": {},
+        "iteration": iteration,
+        "config": config,
+        "hardware_profile": None,
+        "torch_generator": torch.Generator().get_state(),
+        "numpy_generator": {},
+        "torch_cpu_rng": torch.get_rng_state(),
+        "torch_cuda_rng": None,
+        "run_id": None,
+        "rank_rng_states": None,
+        "reference_model": None,
+        "reference_iteration": None,
+        "adaptive_work_state": None,
+        "branching_controller_state": None,
+        "probe_target": None,
+        "logical_work": None,
+        "initialization": None,
+    }
+
+
 def test_inference_artifact_export_is_model_only(tmp_path: Path) -> None:
     scientific = _scientific()
     cfg = PokerModelConfig.from_dict(scientific["model"])
     geometry = PokerConfig(n_players=2, stack_bb=8.0, rank_count=4).geometry
     model = PokerModelBundle(PreflopNet(cfg, geometry), PostflopNet(cfg, geometry))
     checkpoint = tmp_path / "checkpoint.pt"
-    torch.save(
-        {
-            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
-            "storage_schema_version": TRAINING_STORAGE_SCHEMA_VERSION,
-            "controller_schema_version": None,
-            "model": model.state_dict(),
-            "optimizer": {"large": torch.ones(32)},
-            "iteration": 11,
-            "config": scientific,
-        },
-        checkpoint,
-    )
+    full_config = {
+        **scientific,
+        "training": {"iters": 11},
+        "loss": {"name": "rb_ppo"},
+    }
+    payload = _current_checkpoint(model, full_config, 11)
+    payload["optimizer"] = {"large": torch.ones(32)}
+    torch.save(payload, checkpoint)
     output = tmp_path / "policy.pt"
     report = export_inference_artifact(checkpoint, output)
     payload = torch.load(output, map_location="cpu", weights_only=True)
@@ -94,6 +118,15 @@ def test_inference_artifact_export_is_model_only(tmp_path: Path) -> None:
     normalized = load_inference_source(output)
     assert normalized["iteration"] == 11
     assert normalized["config"] == scientific
+
+
+def test_inference_artifact_rejects_nonhexadecimal_source_hash(tmp_path: Path) -> None:
+    path = _artifact(tmp_path / "policy.pt")
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload["source_checkpoint_sha256"] = "z" * 64
+    torch.save(payload, path)
+    with pytest.raises(RuntimeError, match="hash is invalid"):
+        load_inference_source(path)
 
 
 def test_card_parser_uses_global_compact_deck_ids() -> None:

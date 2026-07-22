@@ -360,7 +360,6 @@ def test_folded_summaries_have_sparse_anchor_ownership_and_complete_accounting()
         k_act=4,
         max_players=3,
         class_embedding_dim=2,
-        evaluator_summary_dim=0,
         ffn_hidden=4,
         folder_beta_rank=4,
         max_history_tokens=32,

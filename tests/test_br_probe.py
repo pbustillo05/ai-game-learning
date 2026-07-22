@@ -8,12 +8,13 @@ import shutil
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
 import torch
 import yaml
 
 from pbg.config import ConfigError, load_config
 from pbg.core.br import SHARED_RESPONSE_SEMANTICS
-from pbg.core.checkpointing import scientific_config
+from pbg.core.checkpointing import save_checkpoint, scientific_config
 from pbg.core.game import PRETERM, PROBE_FOLD, EventBatch
 from pbg.core.rollout import ProbeRollout, sample_trees_sequential
 from pbg.core.training import _build_iteration_data, _seal_sequential_rollout_storage
@@ -225,11 +226,19 @@ def test_three_player_probe_fold_cuda_train_resume_and_evaluate(tmp_path: Path) 
     del selected_preterminal, dense_preterminal, preterminal_leaves
 
     target = tmp_path / "target.pt"
-    target_config = scientific_config(cfg)
-    target_config.pop("probe")
-    torch.save(
-        {"model": initial.model.state_dict(), "config": target_config, "iteration": 0},
+    target_cfg = copy.deepcopy(cfg)
+    target_cfg.probe = None
+    target_optimizer = torch.optim.Adam(initial.model.parameters(), lr=cfg.training.lr)
+    target_scaler = torch.amp.GradScaler("cuda", enabled=False)
+    save_checkpoint(
         target,
+        initial.model,
+        target_optimizer,
+        target_scaler,
+        0,
+        target_cfg,
+        torch.Generator(device=device).manual_seed(19),
+        np.random.default_rng(23),
     )
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     cfg.probe.target_sha256 = digest

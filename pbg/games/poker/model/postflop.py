@@ -52,63 +52,6 @@ def _require_device(condition: Tensor, message: str) -> None:
         raise ValueError(message)
 
 
-def _summary_fields(
-    summary: Tensor | Mapping[str, Tensor] | PartitionSummaryBatch | None,
-    mapping: CompactMap,
-    players: int,
-    dtype: torch.dtype,
-) -> Tensor | None:
-    """Turn supplied fields into generic compact row features ``[B,P,Q,S]``."""
-
-    if summary is None:
-        return None
-    if isinstance(summary, PartitionSummaryBatch) or hasattr(summary, "fields"):
-        summary = summary.fields
-    semantic = {
-        "base_log_z", "single_card_log_ratio", "pair_card_log_ratio", "output_valid",
-        "hand_log_ratio", "beta_eigenvalue", "beta_eigenvector",
-        "tight_cluster_scalar",
-    }
-    values = (
-        [summary]
-        if isinstance(summary, Tensor)
-        else [
-            summary[key]
-            for key in sorted(summary)
-            if key not in semantic and not key.startswith("folder_")
-        ]
-    )
-    result: list[Tensor] = []
-    batch, compact = mapping.batch_size, mapping.compact_size
-    for value in values:
-        if not isinstance(value, Tensor) or value.shape[:1] != (batch,):
-            raise ValueError("each evaluator summary field must have leading dimension B")
-        if value.device != mapping.compact_to_full.device:
-            raise ValueError("evaluator summary fields and compatibility must share a device")
-        value = value.to(dtype=dtype)
-        if value.ndim >= 3 and value.shape[1:3] == (players, mapping.full_size):
-            row = compact_gather(value, mapping, dim=2)
-            if row.ndim == 3:
-                row = row[..., None]
-            else:
-                row = row.flatten(start_dim=3)
-        elif value.ndim >= 2 and value.shape[1] == mapping.full_size:
-            row = compact_gather(value, mapping, dim=1)
-            if row.ndim == 2:
-                row = row[..., None]
-            else:
-                row = row.flatten(start_dim=2)
-            row = row[:, None].expand(-1, players, -1, -1)
-        elif value.ndim >= 2 and value.shape[1] == players:
-            flat = value.flatten(start_dim=2) if value.ndim > 2 else value[..., None]
-            row = flat[:, :, None, :].expand(-1, -1, compact, -1)
-        else:
-            flat = value.reshape(batch, -1)
-            row = flat[:, None, None, :].expand(-1, players, compact, -1)
-        result.append(row)
-    return torch.cat(result, dim=-1) if result else None
-
-
 class PostflopNet(nn.Module):
     """Pre-LN transformer over evaluator-selected live combo rows."""
 
@@ -136,10 +79,7 @@ class PostflopNet(nn.Module):
         self.rank_embedding = nn.Embedding(13, dc)
         self.suit_embedding = nn.Embedding(4, dc)
         self.combo_features = FFN(3 * dc, dc, c.ffn_hidden)
-        self.summary_projection = nn.Linear(c.evaluator_summary_dim, dc) if c.evaluator_summary_dim else None
-        self.row_affine = nn.Linear(
-            3 + dc + geo_dim + d + 1 + (dc if self.summary_projection else 0), d
-        )
+        self.row_affine = nn.Linear(3 + dc + geo_dim + d + 1, d)
         self.folder_context = FFN(1 + c.folder_line_dim, d, c.ffn_hidden)
         self.tight_delta_projection = nn.Linear(self.n_cards, d, bias=False)
         self.tight_contraction_projection = nn.Linear(1, d, bias=False)
@@ -160,7 +100,6 @@ class PostflopNet(nn.Module):
 
         static_side_dim = (
             dc + 3 + geo_dim + 2 * c.folder_beta_rank + 2 * d
-            + (dc if self.summary_projection else 0)
         )
         side_dim = static_side_dim + 3 * d
         self.layer_norms = nn.ModuleList(LN(d) for _ in range(c.n_layers_post))
@@ -213,41 +152,27 @@ class PostflopNet(nn.Module):
             fields = summary
         else:
             fields = None
-        alpha = None if fields is None else fields.get("single_card_log_ratio")
-        beta = None if fields is None else fields.get("pair_card_log_ratio")
         supplied_hand = None if fields is None else fields.get("hand_log_ratio")
-        valid = None if fields is None else fields.get("output_valid")
         if supplied_hand is not None:
             if supplied_hand.shape != (batch, mapping.full_size):
                 raise ValueError("hand_log_ratio must have shape [B,H]")
             lambda_hand = compact_gather(
                 supplied_hand.to(device=device, dtype=dtype), mapping, dim=1
             )
-        elif alpha is None:
+        elif fields is None:
             lambda_hand = torch.zeros((batch, compact), dtype=dtype, device=device)
         else:
-            if alpha.shape != (batch, self.n_cards):
-                raise ValueError(
-                    f"single_card_log_ratio must have shape [B,{self.n_cards}]"
-                )
-            alpha = alpha.to(device=device, dtype=dtype)
-            lambda_hand = alpha.gather(1, cards[..., 0]) + alpha.gather(1, cards[..., 1])
-        if beta is not None and supplied_hand is None:
-            if beta.shape != (batch, self.n_cards, self.n_cards):
-                raise ValueError("pair_card_log_ratio has the wrong deck width")
-            beta = beta.to(device=device, dtype=torch.float32)
-            batch_ids = torch.arange(batch, device=device)[:, None]
-            lambda_hand = lambda_hand + beta[
-                batch_ids, cards[..., 0], cards[..., 1]
-            ].to(dtype)
+            raise ValueError("current evaluator summaries require hand_log_ratio")
         rank = self.cfg.folder_beta_rank
         if rank:
             signed = torch.zeros((batch, compact, 2 * rank), dtype=dtype, device=device)
             supplied_value = None if fields is None else fields.get("beta_eigenvalue")
             supplied_vector = None if fields is None else fields.get("beta_eigenvector")
-            if supplied_value is not None or supplied_vector is not None:
+            if fields is not None:
                 if supplied_value is None or supplied_vector is None:
-                    raise ValueError("beta eigenvalue/vector fields must be supplied together")
+                    raise ValueError(
+                        "current evaluator summaries require beta eigenvalue/vector fields"
+                    )
                 if supplied_value.shape[0] != batch or supplied_value.shape[1] < rank:
                     raise ValueError("beta_eigenvalue has insufficient rank")
                 if supplied_vector.shape != (
@@ -256,14 +181,6 @@ class PostflopNet(nn.Module):
                     raise ValueError("beta_eigenvector has the wrong shape")
                 selected_value = supplied_value[:, :rank].to(device=device, dtype=torch.float32)
                 selected_vector = supplied_vector[:, :, :rank].to(device=device, dtype=torch.float32)
-            elif beta is not None:
-                symmetric = 0.5 * (beta + beta.transpose(1, 2))
-                eigenvalue, eigenvector = torch.linalg.eigh(symmetric)
-                indices = torch.topk(eigenvalue.abs(), k=rank, dim=1).indices
-                selected_value = eigenvalue.gather(1, indices)
-                selected_vector = eigenvector.gather(
-                    2, indices[:, None, :].expand(-1, self.n_cards, -1)
-                )
             else:
                 selected_value = None
                 selected_vector = None
@@ -279,19 +196,6 @@ class PostflopNet(nn.Module):
                 negative = coordinate.masked_fill(selected_value[:, None, :] >= 0, 0.0)
                 signed = torch.cat((positive, negative), dim=-1).to(dtype)
             geometry = torch.cat((geometry, signed), dim=-1)
-        if valid is not None:
-            if valid.shape != (batch,) or valid.dtype != torch.bool:
-                raise TypeError("output_valid must be bool [B]")
-            lambda_hand = lambda_hand.masked_fill(~valid[:, None], 0.0)
-            geometry = torch.cat(
-                (
-                    geometry[..., : self.n_cards],
-                    geometry[..., self.n_cards :].masked_fill(
-                        ~valid[:, None, None], 0.0
-                    ),
-                ),
-                dim=-1,
-            )
         lambda_hand = lambda_hand.masked_fill(~mapping.valid, 0.0)
         geometry = geometry.masked_fill(~mapping.valid[..., None], 0.0)
         return lambda_hand, geometry
@@ -326,9 +230,6 @@ class PostflopNet(nn.Module):
         seat = fields.get("folder_seat")
         valid = fields.get("folder_output_valid")
         card_mass = fields.get("folder_card_mass")
-        if card_mass is None:
-            # Backward-compatible input name used by older saved test fixtures.
-            card_mass = fields.get("folder_card_marginal")
         supplied_delta = fields.get("folder_delta")
         if card_mass is None and (
             single is None
@@ -649,28 +550,6 @@ class PostflopNet(nn.Module):
         folder_pressure, folder_seat_context, tight_products = self._folder_context(
             masks.evaluator_summary, mapping, players, combo_ranges.dtype, pub.board
         )
-        summary = _summary_fields(masks.evaluator_summary, mapping, players, combo_ranges.dtype)
-        if summary is not None:
-            summary = summary.gather(
-                1,
-                live_ids[..., None, None].expand(
-                    -1, -1, mapping.compact_size, summary.shape[-1]
-                ),
-            )
-        if self.summary_projection is None:
-            # The evaluator DTO also carries mandatory folder-correction fields
-            # consumed above.  A zero generic-summary width disables only this
-            # optional projection; it does not forbid the richer DTO.
-            summary_projected = None
-        else:
-            if summary is None:
-                summary = torch.zeros(
-                    (batch, live_players, mapping.compact_size, c.evaluator_summary_dim),
-                    dtype=combo_ranges.dtype, device=combo_ranges.device,
-                )
-            if summary.shape[-1] != c.evaluator_summary_dim:
-                raise ValueError("concatenated evaluator summary width does not match evaluator_summary_dim")
-            summary_projected = self.summary_projection(summary)
         log_range = torch.log(compact_ranges.clamp_min(c.eps))
         base_reach = compact_ranges.masked_fill(~compact_mask, 0.0)
         base_reach = base_reach / base_reach.sum(dim=2, keepdim=True).clamp_min(c.eps)
@@ -692,8 +571,6 @@ class PostflopNet(nn.Module):
             expanded_pressure,
             torch.ones_like(compact_ranges)[..., None],
         ]
-        if summary_projected is not None:
-            features.append(summary_projected)
         row = self.row_affine(torch.cat(features, dim=-1))
         seats = torch.arange(players, device=row.device)[None].expand(batch, -1)
         if pub.button is not None:
@@ -723,8 +600,6 @@ class PostflopNet(nn.Module):
             corrected_log_reach[..., None], expanded_geometry, beta_square,
             expanded_pressure, expanded_tight,
         ]
-        if summary_projected is not None:
-            side_parts.append(summary_projected)
         side_rows = torch.cat(side_parts, dim=-1)
         x = token
         incidence_mass = corrected_log_reach.exp() * compact_mask

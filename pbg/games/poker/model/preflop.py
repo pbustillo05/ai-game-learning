@@ -35,10 +35,8 @@ class PokerModelConfig:
     m_raise: int = 4
     k_act: int = 7
     s_min: float = 0.02
-    n_buckets_line: int = 64
     max_players: int = 9
     class_embedding_dim: int = 32
-    evaluator_summary_dim: int = 0
     ffn_hidden: int | None = None
     use_branching_heads: bool = False
     max_history_tokens: int = 256
@@ -49,8 +47,8 @@ class PokerModelConfig:
     def __post_init__(self) -> None:
         integer_fields = (
             "d_model", "n_heads", "n_layers_pre", "n_layers_post", "m_raise",
-            "k_act", "n_buckets_line", "max_players", "class_embedding_dim",
-            "evaluator_summary_dim", "max_history_tokens", "folder_beta_rank",
+            "k_act", "max_players", "class_embedding_dim",
+            "max_history_tokens", "folder_beta_rank",
             "folder_line_dim",
         )
         for name in integer_fields:
@@ -77,12 +75,10 @@ class PokerModelConfig:
             raise ValueError("k_act must equal 3 + m_raise")
         if self.s_min <= 0.0 or self.eps <= 0.0:
             raise ValueError("s_min and eps must be positive")
-        if self.n_buckets_line <= 0:
-            raise ValueError("n_buckets_line must be positive")
         if not 2 <= self.max_players <= 9:
             raise ValueError("max_players must be in [2,9]")
-        if self.class_embedding_dim <= 0 or self.evaluator_summary_dim < 0:
-            raise ValueError("embedding dimensions are invalid")
+        if self.class_embedding_dim <= 0:
+            raise ValueError("class_embedding_dim must be positive")
         if self.ffn_hidden is not None and self.ffn_hidden <= 0:
             raise ValueError("ffn_hidden must be positive when supplied")
         if self.max_history_tokens <= 0:
@@ -97,18 +93,6 @@ class PokerModelConfig:
         """Parse ``RootConfig.model`` while rejecting unknown model keys."""
 
         data = dict(values or {})
-        legacy_moments = data.pop("use_moment_heads", None)
-        if legacy_moments not in (None, False):
-            raise ValueError(
-                "root.model.use_moment_heads: V/U heads were removed; set "
-                "use_branching_heads: true and migrate the checkpoint explicitly"
-            )
-        if "p_max" in data:
-            if "max_players" in data:
-                raise ValueError(
-                    "root.model.max_players: specify only one of p_max and max_players"
-                )
-            data["max_players"] = data.pop("p_max")
         allowed = {field.name for field in fields(cls)}
         unknown = sorted(set(data) - allowed)
         if unknown:
@@ -193,7 +177,6 @@ class PreflopMasks:
     status: Tensor | None = None  # int [B,P]
     class_ids: Tensor | None = None  # int [K] or [B,K]
     class_embeddings: Tensor | None = None  # float [K,Dc] or [B,K,Dc]
-    evaluator_summary: Tensor | None = None  # float [B,P,K,S]
 
 
 @dataclass
@@ -253,10 +236,7 @@ class PreflopNet(nn.Module):
         self.anchor_seat_embedding = nn.Embedding(c.max_players, d)
         nn.init.normal_(self.anchor_tokens, std=d**-0.5)
 
-        self.summary_projection = (
-            nn.Linear(c.evaluator_summary_dim, dc) if c.evaluator_summary_dim else None
-        )
-        static_side_dim = dc + 2 + class_geometry_dim + (dc if c.evaluator_summary_dim else 0)
+        static_side_dim = dc + 2 + class_geometry_dim
         side_dim = static_side_dim + 3 * d
         self.layer_norms = nn.ModuleList(LN(d) for _ in range(c.n_layers_pre))
         self.attentions = nn.ModuleList(MHA(d, c.n_heads) for _ in range(c.n_layers_pre))
@@ -372,7 +352,7 @@ class PreflopNet(nn.Module):
         class_ranges: Tensor,
         actor_seat: Tensor | None,
         masks: PreflopMasks | Mapping[str, Tensor] | Tensor | None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor | None, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         batch, players = class_ranges.shape[:2]
         device = class_ranges.device
         actor = pub.to_act if actor_seat is None else actor_seat
@@ -439,14 +419,6 @@ class PreflopNet(nn.Module):
             if embedding_shape not in (expected, batched_expected):
                 raise ValueError("class_embeddings has the wrong shape")
 
-        summary = _mask_value(masks, "evaluator_summary")
-        if self.summary_projection is None:
-            if summary is not None:
-                raise ValueError("evaluator_summary_dim must be configured to supply a summary")
-        else:
-            if summary is None or summary.shape != class_ranges.shape + (self.cfg.evaluator_summary_dim,):
-                raise ValueError("evaluator_summary must have shape [B,P,K,S]")
-
         button = pub.button
         seat_ids = torch.arange(players, device=device)[None, :].expand(batch, -1)
         if button is not None:
@@ -455,7 +427,7 @@ class PreflopNet(nn.Module):
             relative_seats = torch.remainder(seat_ids - button[:, None].long(), players)
         else:
             relative_seats = seat_ids
-        return actor, seat_mask, class_mask, status, class_ids, summary, relative_seats
+        return actor, seat_mask, class_mask, status, class_ids, relative_seats
 
     def _public_tokens(
         self,
@@ -553,7 +525,7 @@ class PreflopNet(nn.Module):
         """
 
         batch, players = self._validate_public(pub, class_ranges)
-        actor, seat_mask, class_mask, status, class_ids, summary, relative_seats = self._metadata(
+        actor, seat_mask, class_mask, status, class_ids, relative_seats = self._metadata(
             pub, class_ranges, actor_seat, masks
         )
         c = self.cfg
@@ -614,9 +586,6 @@ class PreflopNet(nn.Module):
             (expanded_emb, class_ranges[..., None], log_range[..., None], expanded_geometry),
             dim=-1,
         )
-        if self.summary_projection is not None:
-            assert summary is not None
-            side_class = torch.cat((side_class, self.summary_projection(summary)), dim=-1)
         x = token
         incidence_mass = normalized
         identical_scale = (1.0 / self.class_sizes[class_ids]).to(class_ranges.dtype)

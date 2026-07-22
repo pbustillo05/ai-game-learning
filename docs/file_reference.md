@@ -35,8 +35,8 @@
 - `distributed.py` — exact decision-mass scaling helpers.
 - `optimization.py` — flat gradient SUM, common finite decision, clipping,
   optimizer mutation, and scaler transition.
-- `checkpointing.py` — versioned atomic payloads, deterministic v2 migration,
-  per-rank RNG/controller state, scientific identity, and metrics-prefix validation.
+- `checkpointing.py` — strict current-schema atomic payloads, per-rank
+  RNG/controller state, scientific identity, and metrics-prefix validation.
 - `observability.py` — execution, transfer, synchronization, evaluator, and
   memory counters.
 - `training.py` — iteration/learner orchestration, precision contexts, memory
@@ -115,7 +115,7 @@ family.
   model, and adapter.
 - `test_p8_*`, `test_p9_branching.py`, and `test_refactor_storage_targets.py` —
   topology, rollout, branching, and streamed target laws.
-- `test_distributed_learner.py`, `test_phase3_migration.py`, and memory-control
+- `test_distributed_learner.py`, `test_checkpoint_schema.py`, and memory-control
   suites — loss, checkpoint, reference-policy, epoch, and memory contracts.
 - `test_p12_eval.py` — duplicate-deal arena.
 - `test_p13a_gpu_rollout.py` — tensor/CUDA rollout, completion, memory, and

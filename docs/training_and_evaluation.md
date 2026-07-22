@@ -91,15 +91,14 @@ tools/run-status.sh runs/nlhe_hu_32bb_sequential_rb
 tmux attach -t pbg-nlhe_hu_32bb_sequential_rb
 ```
 
-The candidate sequential-RB run checkpoints every 5 iterations. The v5
-checkpoint includes storage/controller schema metadata, distributed logical
-RNG state, optimizer/reference schedule, loss scale, and memory-root controller
-state needed for deterministic resume. Recent v3/v4 and unversioned v2
-checkpoints are migrated as metadata only. Migration removes the retired
-allocation field without assigning its value to page or byte controls;
-incompatible or partial state is rejected on CPU
-before GPU allocation. If a selected checkpoint predates metrics already flushed after
-it, resume trims that uncheckpointed suffix and preserves it as
+The candidate sequential-RB run checkpoints every 5 iterations. The sole v6
+checkpoint schema includes storage/controller metadata, distributed logical RNG
+state, optimizer/reference schedule, loss scale, and memory-root controller
+state needed for deterministic resume. Older, unversioned, and partial
+checkpoints are rejected on CPU before GPU allocation; production performs no
+runtime schema migration. Convert any intentionally retained historical artifact
+offline before using it with this repository. If a selected checkpoint predates
+metrics already flushed after it, resume trims that uncheckpointed suffix and preserves it as
 `metrics.jsonl.before_resume_*.bak`.
 
 ## Training diagnostics
@@ -180,9 +179,11 @@ pbg-benchmark --config configs/benchmarks/nlhe_hu_short.yaml \
   --warmup 2 --repeats 7 --output /tmp/nlhe_profile.json
 ```
 
-`--checkpoint PATH` initializes every mode from one read-only model state and
-records its identity. Baseline comparison now compares versions of the same
-production implementation; it does not select or compare rollout executors.
+`--checkpoint PATH` initializes every mode from one read-only, current-v6 model
+state and records its identity. Loading is strict: missing branching heads or
+other architecture mismatches fail before timing. Baseline comparison compares
+versions of the same production implementation; it does not select or compare
+rollout executors.
 
 ## Duplicate-deal evaluation
 

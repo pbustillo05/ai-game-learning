@@ -15,7 +15,7 @@ from pbg.games.poker.model.postflop import (
 from pbg.games.poker.model.preflop import PokerModelConfig, PokerPublicBatch
 
 
-def _inputs(summary_dim: int = 0):
+def _inputs():
     batch, players = 2, 2
     ranges = torch.rand(batch, players, 1326)
     compatibility = torch.zeros(batch, 1326, dtype=torch.bool)
@@ -37,17 +37,14 @@ def _inputs(summary_dim: int = 0):
         seat_mask=torch.ones(batch, players, dtype=torch.bool),
         button=torch.tensor([1, 0]),
     )
-    summary = None
-    if summary_dim:
-        summary = {"opaque_query_rows": torch.randn(batch, 1326, summary_dim)}
-    return pub, ranges, PostflopMasks(compatibility, evaluator_summary=summary)
+    return pub, ranges, PostflopMasks(compatibility)
 
 
-def _cfg(summary_dim: int = 0):
+def _cfg():
     return PokerModelConfig(
         d_model=16, n_heads=4, n_layers_pre=1, n_layers_post=1,
         m_raise=2, k_act=5, max_players=2, class_embedding_dim=4,
-        evaluator_summary_dim=summary_dim, ffn_hidden=24, use_branching_heads=True,
+        ffn_hidden=24, use_branching_heads=True,
     )
 
 
@@ -63,10 +60,10 @@ def test_compact_gather_scatter_is_ragged_and_differentiable():
     assert source.grad.tolist() == [[1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
 
 
-def test_postflop_forward_scatter_summary_and_autocast():
+def test_postflop_forward_scatter_and_autocast():
     torch.manual_seed(70)
-    pub, ranges, masks = _inputs(summary_dim=2)
-    model = PostflopNet(_cfg(summary_dim=2)).eval()
+    pub, ranges, masks = _inputs()
+    model = PostflopNet(_cfg()).eval()
     output = model(pub, ranges, masks=masks)
     assert output.raw["type_logits"].shape == (2, 1326, 3)
     assert output.raw["omega"].shape == output.raw["mu"].shape == output.raw["s"].shape == (2, 1326, 2)
@@ -74,19 +71,9 @@ def test_postflop_forward_scatter_summary_and_autocast():
     assert output.t is not None and output.t.shape == (2,)
     assert output.c is not None and output.c.shape == (2,)
     assert torch.count_nonzero(output.v[0, 12:]) == 0
-    changed = {"opaque_query_rows": masks.evaluator_summary["opaque_query_rows"] + 2.0}
-    other = model(pub, ranges, masks=PostflopMasks(masks.compatibility, evaluator_summary=changed))
-    assert not torch.allclose(output.v[:, :9], other.v[:, :9])
     with torch.autocast(device_type="cpu", dtype=torch.float16):
         mixed = model(pub, ranges, masks=masks)
     assert mixed.v.dtype == torch.float16
-
-
-def test_configured_summary_accepts_absent_fields_as_zeros():
-    pub, ranges, masks = _inputs()
-    model = PostflopNet(_cfg(summary_dim=3))
-    output = model(pub, ranges, masks=masks)
-    assert torch.isfinite(output.v).all()
 
 
 def test_incidence_residual_exact_card_identical_and_own_channels():
@@ -124,7 +111,7 @@ def test_incidence_residual_exact_card_identical_and_own_channels():
     torch.testing.assert_close(own, expected_own)
 
 
-def test_signed_beta_coordinates_reconstruct_evaluator_pair_field():
+def test_signed_beta_coordinates_consume_current_evaluator_eigenpairs():
     torch.manual_seed(72)
     cfg = _cfg()
     cfg = type(cfg)(**{**cfg.__dict__, "folder_beta_rank": 52})
@@ -132,30 +119,23 @@ def test_signed_beta_coordinates_reconstruct_evaluator_pair_field():
     compatibility = torch.zeros(1, 1326, dtype=torch.bool)
     compatibility[:, :8] = True
     mapping = build_compact_map(compatibility, compact_size=8)
-    matrix = torch.randn(1, 52, 52)
-    matrix = (matrix + matrix.transpose(1, 2)) / 2
-    matrix.diagonal(dim1=1, dim2=2).zero_()
+    eigenvalue = torch.randn(1, 52)
+    eigenvector = torch.linalg.qr(torch.randn(1, 52, 52)).Q
     summary = PartitionSummaryBatch(
         fields={
-            "single_card_log_ratio": torch.randn(1, 52),
-            "pair_card_log_ratio": matrix,
-            "output_valid": torch.ones(1, dtype=torch.bool),
+            "hand_log_ratio": torch.randn(1, 1326),
+            "beta_eigenvalue": eigenvalue,
+            "beta_eigenvector": eigenvector,
         },
-        metadata={},
+        metadata={"contract_version": "2"},
     )
     correction, geometry = model._folded_geometry(summary, mapping, torch.float32)
-    cards = model.combo_cards[mapping.compact_to_full]
-    alpha = summary.fields["single_card_log_ratio"]
-    expected = (
-        alpha.gather(1, cards[..., 0])
-        + alpha.gather(1, cards[..., 1])
-        + matrix[torch.arange(1)[:, None], cards[..., 0], cards[..., 1]]
-    )
-    torch.testing.assert_close(correction, expected)
+    torch.testing.assert_close(correction, summary.fields["hand_log_ratio"][:, :8])
     positive = geometry[..., 52:104]
     negative = geometry[..., 104:]
     reconstructed = positive @ positive.transpose(1, 2) - negative @ negative.transpose(1, 2)
     two_hot = geometry[..., :52]
+    matrix = eigenvector @ torch.diag_embed(eigenvalue) @ eigenvector.transpose(1, 2)
     direct = two_hot @ matrix @ two_hot.transpose(1, 2)
     torch.testing.assert_close(reconstructed, direct, atol=2e-4, rtol=2e-4)
 
@@ -171,25 +151,24 @@ def test_folder_pressure_and_folder_seat_readout_consume_semantic_fields():
     masks.live_seat_ids = torch.zeros((pub.street.shape[0], 1), dtype=torch.long)
     masks.compact_size = int(masks.compatibility.sum(1).max())
     batch = ranges.shape[0]
+    cfg = _cfg()
     fields = {
-        "base_log_z": torch.zeros(batch),
-        "single_card_log_ratio": torch.zeros(batch, 52),
-        "pair_card_log_ratio": torch.zeros(batch, 52, 52),
-        "output_valid": torch.ones(batch, dtype=torch.bool),
+        "hand_log_ratio": torch.zeros(batch, 1326),
+        "beta_eigenvalue": torch.zeros(batch, cfg.folder_beta_rank),
+        "beta_eigenvector": torch.zeros(batch, 52, cfg.folder_beta_rank),
         "folder_log_mass": torch.zeros(batch, 1),
-        "folder_single_card_log_ratio": torch.full((batch, 1, 52), -0.04),
-        "folder_pair_card_log_ratio": torch.zeros(batch, 1, 52, 52),
-        "folder_output_valid": torch.ones(batch, 1, dtype=torch.bool),
+        "folder_card_mass": torch.full((batch, 1, 52), 2.0 / 52.0),
+        "tight_cluster_scalar": torch.zeros(batch),
         "folder_mask": torch.ones(batch, 1, dtype=torch.bool),
         "folder_line_meta": torch.randn(batch, 1, 8),
         "folder_seat": torch.ones(batch, 1, dtype=torch.long),
     }
-    masks.evaluator_summary = PartitionSummaryBatch(fields, {})
-    model = PostflopNet(_cfg()).eval()
+    masks.evaluator_summary = PartitionSummaryBatch(fields, {"contract_version": "2"})
+    model = PostflopNet(cfg).eval()
     first = model(pub, ranges, masks=masks)
     changed = {key: value.clone() for key, value in fields.items()}
-    changed["folder_single_card_log_ratio"][..., :4] = -1.0
-    masks.evaluator_summary = PartitionSummaryBatch(changed, {})
+    changed["folder_card_mass"][..., :4] = 0.0
+    masks.evaluator_summary = PartitionSummaryBatch(changed, {"contract_version": "2"})
     second = model(pub, ranges, masks=masks)
     assert torch.isfinite(first.v).all()
     assert not torch.allclose(first.v, second.v)
@@ -217,6 +196,30 @@ def test_compact_contract_v2_folder_features_feed_postflop_model():
     cfg = type(_cfg())(**{**_cfg().__dict__, "folder_beta_rank": 2})
     output = PostflopNet(cfg).eval()(pub, ranges, masks=masks)
     assert torch.isfinite(output.v).all()
+
+
+def test_current_evaluator_summary_rejects_retired_field_aliases():
+    pub, ranges, masks = _inputs()
+    pub.status[:, 1] = 1
+    pub.to_act.zero_()
+    masks.status = pub.status
+    batch = ranges.shape[0]
+    cfg = type(_cfg())(**{**_cfg().__dict__, "folder_beta_rank": 2})
+    masks.evaluator_summary = PartitionSummaryBatch(
+        {
+            "hand_log_ratio": torch.zeros(batch, 1326),
+            "beta_eigenvalue": torch.zeros(batch, 2),
+            "beta_eigenvector": torch.zeros(batch, 52, 2),
+            "folder_log_mass": torch.zeros(batch, 1),
+            "folder_card_marginal": torch.ones(batch, 1, 52),
+            "folder_mask": torch.ones(batch, 1, dtype=torch.bool),
+            "folder_line_meta": torch.zeros(batch, 1, 8),
+            "folder_seat": torch.ones(batch, 1, dtype=torch.long),
+        },
+        {"contract_version": "2"},
+    )
+    with pytest.raises(ValueError, match="folder card marginals"):
+        PostflopNet(cfg).eval()(pub, ranges, masks=masks)
 
 
 def test_folded_seats_do_not_create_postflop_attention_rows():

@@ -11,7 +11,6 @@ import os
 import platform
 import time
 import uuid
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -25,15 +24,12 @@ from pbg.core.br import SHARED_RESPONSE_SEMANTICS
 from pbg.core.config import RootConfig, seed_all
 from pbg.core.adaptive_branching import AdaptiveKKTController
 from pbg.core.checkpointing import (
-    _capture_rng_state,
-    config_dict_fingerprint,
-    _config_fingerprint,
-    compatible_scientific_configs,
-    legacy_config_fingerprint,
-    matches_legacy_run_fingerprint,
+    capture_rng_state,
+    config_fingerprint,
     inspect_checkpoint,
-    _scientific_config,
-    _validate_metrics_prefix,
+    load_checkpoint_payload,
+    scientific_config,
+    validate_metrics_prefix,
     load_checkpoint,
     save_checkpoint,
 )
@@ -2461,13 +2457,7 @@ def run_training(
     initialized_model_state: Mapping[str, Any] | None = None
     initialization_metadata: dict[str, Any] | None = None
     if init_checkpoint is not None:
-        payload = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
-        if (
-            not isinstance(payload, dict)
-            or not isinstance(payload.get("model"), dict)
-            or not isinstance(payload.get("config"), dict)
-        ):
-            raise RuntimeError("init checkpoint is not a PBG model checkpoint")
+        payload = load_checkpoint_payload(init_checkpoint)
         source_config = payload["config"]
         source_game = source_config.get("game")
         expected_game = {
@@ -2512,11 +2502,7 @@ def run_training(
         ):
             raise RuntimeError("probe target checkpoint SHA-256 does not match configuration")
         cfg.probe.target_sha256 = actual_sha256
-        target_payload = torch.load(target_path, map_location="cpu", weights_only=False)
-        if not isinstance(target_payload, dict) or not isinstance(
-            target_payload.get("config"), dict
-        ) or "model" not in target_payload:
-            raise RuntimeError("probe target is not a PBG model checkpoint")
+        target_payload = load_checkpoint_payload(target_path)
         target_game = target_payload["config"].get("game")
         expected_game = {
             "n_players": cfg.game.n_players,
@@ -2563,29 +2549,9 @@ def run_training(
         try:
             bundle.model.load_state_dict(initialized_model_state)
         except RuntimeError as exc:
-            if cfg.training.mode != "branched_rao_blackwell":
-                raise RuntimeError(
-                    "init checkpoint model architecture does not match the current config"
-                ) from exc
-            incompatible = bundle.model.load_state_dict(
-                initialized_model_state, strict=False
-            )
-            allowed_missing = {
-                name for name in bundle.model.state_dict()
-                if ".branching_heads." in name or name.startswith("branching_heads.")
-            }
-            missing = set(incompatible.missing_keys)
-            if incompatible.unexpected_keys or missing != allowed_missing:
-                raise RuntimeError(
-                    "init checkpoint is incompatible beyond absent T/C branching heads; "
-                    f"missing={sorted(missing)}, unexpected={sorted(incompatible.unexpected_keys)}"
-                ) from exc
-            warnings.warn(
-                "initialized T/C branching heads from current defaults because the explicit "
-                "init checkpoint predates them; optimizer/controller state starts fresh",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            raise RuntimeError(
+                "init checkpoint model architecture does not match the current config"
+            ) from exc
     if target_payload is not None:
         assert target_model_builder is not None and cfg.probe is not None
         opponent = target_model_builder(
@@ -2678,9 +2644,7 @@ def run_training(
                 raise RuntimeError("resume checkpoint has incompatible probe semantics")
             if stored_target.get("sha256") != cfg.probe.target_sha256:
                 raise RuntimeError("resume probe target hash does not match checkpoint")
-        if not compatible_scientific_configs(
-            checkpoint_metadata["cfg_dict"], _scientific_config(cfg)
-        ):
+        if checkpoint_metadata["cfg_dict"] != scientific_config(cfg):
             raise RuntimeError("resume configuration does not match the checkpoint")
         start_iteration = int(checkpoint_metadata["iter"])
         if not 0 <= start_iteration <= cfg.training.iters:
@@ -2816,7 +2780,7 @@ def run_training(
                 json.dumps(
                     {
                         "run_id": run_id,
-                        "config_sha256": _config_fingerprint(cfg),
+                        "config_sha256": config_fingerprint(cfg),
                         "world_size": world,
                         "probe_target": probe_target,
                         "initialization": initialization_metadata,
@@ -2834,23 +2798,17 @@ def run_training(
             if run_record.get("run_id") != run_id:
                 raise RuntimeError("checkpoint belongs to a different run identity")
             recorded_fingerprint = run_record.get("config_sha256")
-            if recorded_fingerprint not in {
-                _config_fingerprint(cfg),
-                legacy_config_fingerprint(cfg),
-                config_dict_fingerprint(checkpoint_metadata["cfg_dict"]),
-            } and not matches_legacy_run_fingerprint(
-                recorded_fingerprint, checkpoint_metadata["cfg_dict"]
-            ):
+            if recorded_fingerprint != config_fingerprint(cfg):
                 raise RuntimeError("run configuration fingerprint does not match")
             if run_record.get("world_size") != world:
                 raise RuntimeError("resume requires the original DDP world size")
-            _validate_metrics_prefix(
+            validate_metrics_prefix(
                 out_dir / "metrics.jsonl", start_iteration, run_id
             )
             for memory_rank in range(world):
                 memory_path = out_dir / f"memory_rank_{memory_rank}.jsonl"
                 if memory_path.exists():
-                    _validate_metrics_prefix(memory_path, start_iteration, run_id)
+                    validate_metrics_prefix(memory_path, start_iteration, run_id)
         metadata = _hardware_metadata(cfg, device, world)
         metadata.update(memory_plan)
         hardware_name = (
@@ -2876,7 +2834,7 @@ def run_training(
                 # No current-iteration draw has occurred. Persist the unchanged
                 # RNG/model state and the conservative controller evidence,
                 # then stop without narrowing and rerolling the iteration.
-                local_rng_state = _capture_rng_state(torch_gen, np_gen)
+                local_rng_state = capture_rng_state(torch_gen, np_gen)
                 if world > 1:
                     gathered_stop: list[dict[str, Any] | None] | None = (
                         [None] * world if rank == 0 else None
@@ -2962,7 +2920,7 @@ def run_training(
                 "mandatory learner singleton feasibility",
                 "local backward step 0",
             }
-            local_rng_state = _capture_rng_state(torch_gen, np_gen)
+            local_rng_state = capture_rng_state(torch_gen, np_gen)
             if world > 1:
                 gathered_failure: list[dict[str, Any] | None] | None = (
                     [None] * world if rank == 0 else None
@@ -3162,7 +3120,7 @@ def run_training(
                 )
         rank_rng_states: list[dict[str, Any]] | None = None
         if checkpoint_due:
-            local_rng_state = _capture_rng_state(torch_gen, np_gen)
+            local_rng_state = capture_rng_state(torch_gen, np_gen)
             if world > 1:
                 gathered: list[dict[str, Any] | None] | None = (
                     [None] * world if rank == 0 else None

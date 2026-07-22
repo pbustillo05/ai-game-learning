@@ -4,11 +4,6 @@ from dataclasses import dataclass
 
 import torch
 
-from pbg.core.checkpointing import (
-    compatible_scientific_configs,
-    config_dict_fingerprint,
-    matches_legacy_run_fingerprint,
-)
 from pbg.core.memory_control import (
     MEMORY_PHASES,
     PhaseMemoryForecaster,
@@ -29,43 +24,6 @@ def test_unique_tensor_bytes_counts_aliased_storage_once() -> None:
     original = torch.zeros(32, dtype=torch.float32)
     value = _Aliased(original, original.view(8, 4))
     assert unique_tensor_bytes(value) == 32 * 4
-
-
-def test_legacy_checkpoint_without_probe_accepts_current_null_probe() -> None:
-    legacy = {"training": {"checkpoint_every": 5}, "rollout": {}}
-    current = {
-        "training": {},
-        "rollout": {
-            "sequential_roots_per_gpu_minimum": 1,
-            "sequential_roots_per_gpu_maximum": 8,
-            "memory_calibration_window": 32,
-            "memory_growth_fraction": 0.10,
-            "memory_growth_delay": 8,
-            "memory_prediction_z": 3.0,
-        },
-        "probe": None,
-    }
-    assert compatible_scientific_configs(legacy, current)
-
-
-def test_legacy_run_fingerprint_allows_only_checkpoint_cadence_drift() -> None:
-    original = {
-        "game": {"n_players": 2},
-        "training": {"iters": 100, "checkpoint_every": 10, "lr": 1e-4},
-    }
-    resumed = {
-        "game": {"n_players": 2},
-        "training": {"iters": 100, "checkpoint_every": 5, "lr": 1e-4},
-    }
-    recorded = config_dict_fingerprint(original)
-    assert matches_legacy_run_fingerprint(recorded, resumed)
-    changed_science = {
-        **resumed,
-        "training": {**resumed["training"], "lr": 2e-4},
-    }
-    assert not matches_legacy_run_fingerprint(recorded, changed_science)
-
-
 
 
 def test_memory_commit_is_transactional_and_safety_decrease_is_unrestricted() -> None:

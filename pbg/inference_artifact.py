@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import os
+import string
 from pathlib import Path
 from typing import Any
 
@@ -12,11 +13,21 @@ import torch
 
 from pbg.core.checkpointing import (
     CHECKPOINT_SCHEMA_VERSION,
-    _migrate_checkpoint_payload,
+    load_checkpoint_payload,
 )
 
 
 INFERENCE_ARTIFACT_SCHEMA_VERSION = "pbg-inference-v1"
+_ARTIFACT_FIELDS = frozenset(
+    {
+        "inference_artifact_schema_version",
+        "source_checkpoint_schema_version",
+        "source_checkpoint_sha256",
+        "iteration",
+        "config",
+        "model",
+    }
+)
 
 
 def sha256_file(path: str | Path) -> str:
@@ -40,10 +51,14 @@ def _validate_artifact(payload: Any) -> dict[str, Any]:
             "unsupported inference artifact schema version "
             f"{payload.get('inference_artifact_schema_version')!r}"
         )
-    required = {"model", "config", "iteration", "source_checkpoint_sha256"}
-    missing = required.difference(payload)
-    if missing:
-        raise RuntimeError(f"inference artifact is missing fields {sorted(missing)}")
+    if set(payload) != _ARTIFACT_FIELDS:
+        raise RuntimeError(
+            "inference artifact fields do not match the current schema; "
+            f"missing={sorted(_ARTIFACT_FIELDS.difference(payload))}, "
+            f"extra={sorted(set(payload).difference(_ARTIFACT_FIELDS))}"
+        )
+    if payload["source_checkpoint_schema_version"] != CHECKPOINT_SCHEMA_VERSION:
+        raise RuntimeError("inference artifact source checkpoint schema is obsolete")
     if not isinstance(payload["model"], dict):
         raise RuntimeError("inference artifact model must be a state mapping")
     config = payload["config"]
@@ -51,12 +66,17 @@ def _validate_artifact(payload: Any) -> dict[str, Any]:
         not isinstance(config, dict)
         or not isinstance(config.get("game"), dict)
         or not isinstance(config.get("model"), dict)
+        or set(config) != {"game", "model"}
     ):
         raise RuntimeError(
             "inference artifact must contain game and model configuration"
         )
     digest = payload["source_checkpoint_sha256"]
-    if not isinstance(digest, str) or len(digest) != 64:
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in string.hexdigits for character in digest)
+    ):
         raise RuntimeError("inference artifact source checkpoint hash is invalid")
     return payload
 
@@ -88,17 +108,13 @@ def load_inference_source(path: str | Path) -> dict[str, Any]:
             "source_schema_version": payload.get("source_checkpoint_schema_version"),
         }
 
-    checkpoint = _migrate_checkpoint_payload(
-        torch.load(source, map_location="cpu", weights_only=False)
-    )
+    checkpoint = load_checkpoint_payload(source)
     return {
         "model": checkpoint["model"],
         "config": copy.deepcopy(checkpoint["config"]),
         "iteration": int(checkpoint["iteration"]),
         "source_checkpoint_sha256": sha256_file(source),
-        "source_schema_version": checkpoint.get(
-            "checkpoint_schema_version", CHECKPOINT_SCHEMA_VERSION
-        ),
+        "source_schema_version": checkpoint["checkpoint_schema_version"],
     }
 
 
@@ -108,15 +124,21 @@ def export_inference_artifact(
     """Atomically export model weights and scientific configuration only."""
 
     source = Path(checkpoint_path)
-    payload = _migrate_checkpoint_payload(
-        torch.load(source, map_location="cpu", weights_only=False)
-    )
+    payload = load_checkpoint_payload(source)
+    config = payload["config"]
+    if not isinstance(config.get("game"), dict) or not isinstance(
+        config.get("model"), dict
+    ):
+        raise RuntimeError("checkpoint must contain current game and model configuration")
     artifact = {
         "inference_artifact_schema_version": INFERENCE_ARTIFACT_SCHEMA_VERSION,
         "source_checkpoint_schema_version": payload["checkpoint_schema_version"],
         "source_checkpoint_sha256": sha256_file(source),
         "iteration": int(payload["iteration"]),
-        "config": copy.deepcopy(payload["config"]),
+        "config": {
+            "game": copy.deepcopy(config["game"]),
+            "model": copy.deepcopy(config["model"]),
+        },
         "model": {
             name: value.detach().to(device="cpu").contiguous()
             for name, value in payload["model"].items()

@@ -6,8 +6,9 @@
 > as another global row limit. `storage_page_rows` controls allocation
 > granularity only; `execution_memory_bytes` is the branched hard byte ceiling.
 > Sequential root width is selected from schema-derived rollout, seal, target,
-> and optimization phase models. Checkpoint schema v5 removes the retired field
-> explicitly and records that transition. The proposal and measurements below
+> and optimization phase models. Checkpoint schema v5 removed the retired field
+> explicitly and recorded that transition. The current strict v6 schema
+> supersedes v5 and performs no runtime migration. The proposal and measurements below
 > remain historical design evidence.
 >
 > One implementation detail was resolved in favor of the primary family

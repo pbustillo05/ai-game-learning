@@ -21,81 +21,57 @@ from pbg.core.memory_control import SEQUENTIAL_MEMORY_CONTROLLER_VERSION
 from pbg.core.storage import TRAINING_STORAGE_SCHEMA_VERSION
 
 
-CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v5"
-PREVIOUS_CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v4"
-LEGACY_CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v3"
-ANCIENT_CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v2"
-_RETIRED_ROLLOUT_CAPACITY_FIELD = "node" + "_budget"
+CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v6"
+_REQUIRED_CHECKPOINT_FIELDS = frozenset(
+    {
+        "checkpoint_schema_version",
+        "storage_schema_version",
+        "controller_schema_version",
+        "branching_controller_schema_version",
+        "model",
+        "optimizer",
+        "scaler",
+        "iteration",
+        "config",
+        "hardware_profile",
+        "torch_generator",
+        "numpy_generator",
+        "torch_cpu_rng",
+        "torch_cuda_rng",
+        "run_id",
+        "rank_rng_states",
+        "reference_model",
+        "reference_iteration",
+        "adaptive_work_state",
+        "branching_controller_state",
+        "probe_target",
+        "logical_work",
+        "initialization",
+    }
+)
 
 
-def _migrate_rollout_config(migrated: dict[str, Any]) -> None:
-    """Remove the retired allocation capacity without reinterpreting its value."""
-
-    config = migrated.get("config")
-    rollout = config.get("rollout") if isinstance(config, dict) else None
-    if isinstance(rollout, dict) and _RETIRED_ROLLOUT_CAPACITY_FIELD in rollout:
-        rollout = dict(rollout)
-        rollout.pop(_RETIRED_ROLLOUT_CAPACITY_FIELD)
-        config = dict(config)
-        config["rollout"] = rollout
-        migrated["config"] = config
-        transitions = list(migrated.get("configuration_schema_transitions", ()))
-        transitions.append("removed retired total-row allocation field; no replacement")
-        migrated["configuration_schema_transitions"] = transitions
-
-
-def _migrate_checkpoint_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Validate metadata and deterministically migrate the recent v2 payload.
-
-    Migration changes only metadata. It never reconstructs a legacy runtime
-    tree, reach cache, target store, or learner allocation.
-    """
+def validate_checkpoint_payload(payload: Any) -> dict[str, Any]:
+    """Require the sole current checkpoint schema without runtime migration."""
 
     if not isinstance(payload, dict):
         raise RuntimeError("checkpoint payload must be a mapping")
     version = payload.get("checkpoint_schema_version")
-    # Migration mutates metadata keys only. A shallow copy avoids duplicating
-    # model/optimizer tensors, especially after map_location places them on a
-    # GPU during the actual restore.
-    migrated = dict(payload)
-    if version is None:
-        required = {
-            "model", "optimizer", "scaler", "iteration", "config",
-            "torch_generator", "numpy_generator", "torch_cpu_rng",
-        }
-        missing = required.difference(migrated)
-        if missing:
-            raise RuntimeError(
-                "legacy checkpoint is partial; missing required fields "
-                f"{sorted(missing)}"
-            )
-        migrated["migrated_from_checkpoint_schema"] = ANCIENT_CHECKPOINT_SCHEMA_VERSION
-        migrated["checkpoint_schema_version"] = CHECKPOINT_SCHEMA_VERSION
-        migrated["storage_schema_version"] = TRAINING_STORAGE_SCHEMA_VERSION
-        state = migrated.get("adaptive_work_state")
-        if state is not None and state.get("version") != SEQUENTIAL_MEMORY_CONTROLLER_VERSION:
-            raise RuntimeError("legacy checkpoint has incompatible controller state")
-        migrated["controller_schema_version"] = (
-            None if state is None else SEQUENTIAL_MEMORY_CONTROLLER_VERSION
-        )
-    elif version in {PREVIOUS_CHECKPOINT_SCHEMA_VERSION, LEGACY_CHECKPOINT_SCHEMA_VERSION}:
-        migrated["migrated_from_checkpoint_schema"] = version
-        migrated["checkpoint_schema_version"] = CHECKPOINT_SCHEMA_VERSION
-        if version == LEGACY_CHECKPOINT_SCHEMA_VERSION:
-            migrated["branching_controller_schema_version"] = None
-            migrated["branching_controller_state"] = None
-    elif version != CHECKPOINT_SCHEMA_VERSION:
+    if version != CHECKPOINT_SCHEMA_VERSION:
         raise RuntimeError(f"unsupported checkpoint schema version {version!r}")
-    migrated.setdefault("branching_controller_schema_version", None)
-    migrated.setdefault("branching_controller_state", None)
-    migrated.setdefault("initialization", None)
-    if migrated.get("storage_schema_version") == "pbg-training-storage-v1":
-        migrated["storage_schema_version"] = TRAINING_STORAGE_SCHEMA_VERSION
-    if migrated.get("storage_schema_version") != TRAINING_STORAGE_SCHEMA_VERSION:
+    missing = _REQUIRED_CHECKPOINT_FIELDS.difference(payload)
+    extra = set(payload).difference(_REQUIRED_CHECKPOINT_FIELDS)
+    if missing or extra:
+        raise RuntimeError(
+            f"checkpoint {CHECKPOINT_SCHEMA_VERSION} fields do not match the current "
+            f"schema; missing={sorted(missing)}, extra={sorted(extra)}"
+        )
+    if payload.get("storage_schema_version") != TRAINING_STORAGE_SCHEMA_VERSION:
         raise RuntimeError("checkpoint storage schema is incompatible")
-    _migrate_rollout_config(migrated)
-    controller_version = migrated.get("controller_schema_version")
-    state = migrated.get("adaptive_work_state")
+    if not isinstance(payload["model"], dict) or not isinstance(payload["config"], dict):
+        raise RuntimeError("checkpoint model and config must be mappings")
+    controller_version = payload["controller_schema_version"]
+    state = payload["adaptive_work_state"]
     if (state is None) != (controller_version is None):
         raise RuntimeError("checkpoint contains partial controller metadata")
     if state is not None and (
@@ -103,8 +79,8 @@ def _migrate_checkpoint_payload(payload: dict[str, Any]) -> dict[str, Any]:
         or state.get("version") != SEQUENTIAL_MEMORY_CONTROLLER_VERSION
     ):
         raise RuntimeError("checkpoint controller schema is incompatible")
-    branching_state = migrated.get("branching_controller_state")
-    branching_version = migrated.get("branching_controller_schema_version")
+    branching_state = payload["branching_controller_state"]
+    branching_version = payload["branching_controller_schema_version"]
     if (branching_state is None) != (branching_version is None):
         raise RuntimeError("checkpoint contains partial adaptive KKT controller metadata")
     if branching_state is not None and (
@@ -112,36 +88,39 @@ def _migrate_checkpoint_payload(payload: dict[str, Any]) -> dict[str, Any]:
         or branching_state.get("version") != BRANCHING_CONTROLLER_VERSION
     ):
         raise RuntimeError("checkpoint adaptive KKT controller schema is incompatible")
-    rank_states = migrated.get("rank_rng_states")
+    rank_states = payload["rank_rng_states"]
     if rank_states is not None and any(
         not isinstance(item, dict)
         or not {"torch_generator", "numpy_generator", "torch_cpu_rng", "torch_cuda_rng"}.issubset(item)
         for item in rank_states
     ):
         raise RuntimeError("checkpoint contains a partial per-rank RNG state")
-    return migrated
+    return payload
+
+
+def load_checkpoint_payload(
+    path: str | Path, *, map_location: str | torch.device = "cpu"
+) -> dict[str, Any]:
+    """Load and validate one current-schema project checkpoint."""
+
+    return validate_checkpoint_payload(
+        torch.load(path, map_location=map_location, weights_only=False)
+    )
 
 
 def inspect_checkpoint(path: str | Path) -> dict[str, Any]:
-    """Validate checkpoint compatibility on CPU before any GPU allocation."""
+    """Validate the current checkpoint schema on CPU before GPU allocation."""
 
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    migrated = _migrate_checkpoint_payload(payload)
+    payload = load_checkpoint_payload(path)
     return {
-        "checkpoint_schema_version": migrated["checkpoint_schema_version"],
-        "migrated_from_checkpoint_schema": migrated.get(
-            "migrated_from_checkpoint_schema"
-        ),
-        "storage_schema_version": migrated["storage_schema_version"],
-        "controller_schema_version": migrated["controller_schema_version"],
-        "branching_controller_schema_version": migrated[
+        "checkpoint_schema_version": payload["checkpoint_schema_version"],
+        "storage_schema_version": payload["storage_schema_version"],
+        "controller_schema_version": payload["controller_schema_version"],
+        "branching_controller_schema_version": payload[
             "branching_controller_schema_version"
         ],
-        "iteration": int(migrated["iteration"]),
-        "config": copy.deepcopy(migrated["config"]),
-        "configuration_schema_transitions": tuple(
-            migrated.get("configuration_schema_transitions", ())
-        ),
+        "iteration": int(payload["iteration"]),
+        "config": copy.deepcopy(payload["config"]),
     }
 
 
@@ -224,9 +203,7 @@ def load_checkpoint(
 ) -> dict[str, Any]:
     """Restore checkpoint state and return iteration/config metadata."""
 
-    payload = _migrate_checkpoint_payload(
-        torch.load(path, map_location=map_location, weights_only=False)
-    )
+    payload = load_checkpoint_payload(path, map_location=map_location)
     raw_model = model.module if hasattr(model, "module") else model
     raw_model.load_state_dict(payload["model"])
     reference_state = payload.get("reference_model")
@@ -272,9 +249,6 @@ def load_checkpoint(
         "logical_work": copy.deepcopy(payload.get("logical_work")),
         "initialization": copy.deepcopy(payload.get("initialization")),
         "checkpoint_schema_version": payload["checkpoint_schema_version"],
-        "migrated_from_checkpoint_schema": payload.get(
-            "migrated_from_checkpoint_schema"
-        ),
         "storage_schema_version": payload["storage_schema_version"],
         "controller_schema_version": payload["controller_schema_version"],
         "branching_controller_schema_version": payload[
@@ -312,86 +286,6 @@ def scientific_config(cfg: RootConfig) -> dict[str, Any]:
     return result
 
 
-def compatible_scientific_configs(
-    left: dict[str, Any], right: dict[str, Any]
-) -> bool:
-    """Compare current/legacy checkpoint configs ignoring log cadence."""
-
-    def normalized(value: dict[str, Any]) -> dict[str, Any]:
-        result = copy.deepcopy(value)
-        result.pop("hardware", None)
-        # Checkpoints written before probe training existed omit the key;
-        # absence is equivalent to the current schema's explicit null.
-        result.setdefault("probe", None)
-        result.get("training", {}).pop("checkpoint_every", None)
-        if result.get("probe") is not None:
-            result["probe"].pop("target_checkpoint", None)
-        rollout = result.get("rollout", {})
-        rollout.pop(_RETIRED_ROLLOUT_CAPACITY_FIELD, None)
-        # Width bounds and calibration are execution controls.  They do not
-        # change the estimator represented by a scientific checkpoint.
-        for key in (
-            "sequential_roots_per_gpu_minimum",
-            "sequential_roots_per_gpu_maximum",
-            "memory_calibration_window",
-            "memory_growth_fraction",
-            "memory_growth_delay",
-            "memory_prediction_z",
-        ):
-            rollout.pop(key, None)
-        return result
-
-    return normalized(left) == normalized(right)
-
-
-def legacy_config_fingerprint(cfg: RootConfig) -> str:
-    """Return the pre-cadence-separation fingerprint for old run manifests."""
-
-    result = asdict(cfg)
-    result.pop("hardware", None)
-    encoded = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def config_dict_fingerprint(config: dict[str, Any]) -> str:
-    """Fingerprint a stored legacy scientific-config dictionary."""
-
-    encoded = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def matches_legacy_run_fingerprint(
-    recorded: str | None, checkpoint_config: dict[str, Any]
-) -> bool:
-    """Match an old run manifest while allowing only checkpoint cadence drift.
-
-    Old manifests hashed ``training.checkpoint_every`` even though it controls
-    persistence rather than the scientific trajectory.  A later checkpoint
-    may therefore be scientifically compatible but carry a different cadence.
-    Recover the original manifest hash by exhaustively trying the finite set of
-    positive cadences within the configured training horizon.  No other field
-    is relaxed.
-    """
-
-    if not isinstance(recorded, str) or len(recorded) != 64:
-        return False
-    if config_dict_fingerprint(checkpoint_config) == recorded:
-        return True
-    training = checkpoint_config.get("training")
-    if not isinstance(training, dict):
-        return False
-    iterations = training.get("iters")
-    if isinstance(iterations, bool) or not isinstance(iterations, int):
-        return False
-    candidate = copy.deepcopy(checkpoint_config)
-    candidate_training = candidate["training"]
-    for cadence in range(1, iterations + 1):
-        candidate_training["checkpoint_every"] = cadence
-        if config_dict_fingerprint(candidate) == recorded:
-            return True
-    return False
-
-
 def config_fingerprint(cfg: RootConfig) -> str:
     """Return the stable SHA-256 identity of the scientific configuration."""
 
@@ -420,11 +314,3 @@ def validate_metrics_prefix(path: Path, completed: int, run_id: str) -> None:
         if not backup.exists():
             shutil.copy2(path, backup)
         path.write_text("\n".join(raw_lines[:completed]) + ("\n" if completed else ""), encoding="utf-8")
-
-
-# Compatibility aliases retained for existing internal imports while callers
-# migrate to the cohesive checkpointing module.
-_capture_rng_state = capture_rng_state
-_scientific_config = scientific_config
-_config_fingerprint = config_fingerprint
-_validate_metrics_prefix = validate_metrics_prefix

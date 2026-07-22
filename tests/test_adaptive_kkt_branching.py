@@ -94,9 +94,15 @@ def test_preflop_and_postflop_emit_positive_public_t_and_c_heads() -> None:
     assert bool(((post.t > 0) & (post.t < 1)).all()) and bool((post.c > 0).all())
 
 
-def test_legacy_vu_head_config_is_rejected_loudly() -> None:
-    with pytest.raises(ValueError, match="V/U heads were removed"):
-        PokerModelConfig.from_dict({"use_moment_heads": True})
+@pytest.mark.parametrize("value", [False, True])
+def test_legacy_vu_head_config_is_rejected_loudly(value: bool) -> None:
+    with pytest.raises(ValueError, match="use_moment_heads.*unknown"):
+        PokerModelConfig.from_dict({"use_moment_heads": value})
+
+
+def test_legacy_player_count_alias_is_rejected_loudly() -> None:
+    with pytest.raises(ValueError, match="p_max.*unknown"):
+        PokerModelConfig.from_dict({"p_max": 2})
 
 
 def test_branching_modes_are_explicit_typed_and_fail_early() -> None:

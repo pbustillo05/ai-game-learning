@@ -1958,11 +1958,7 @@ class PokerRolloutBackend:
         cfg = getattr(post, "cfg", None)
         beta = int(getattr(cfg, "folder_beta_rank", 16))
         required = bool(
-            getattr(
-                post,
-                "requires_partition_summary",
-                int(getattr(cfg, "evaluator_summary_dim", 0)) > 0,
-            )
+            getattr(post, "requires_partition_summary", False)
         )
         self._partition_required[beta] = (
             self._partition_required.get(beta, False) or required
@@ -2068,11 +2064,7 @@ class PokerRolloutBackend:
             source = frozen_model.module if hasattr(frozen_model, "module") else frozen_model
             post_model = getattr(source, "postflop", None)
             consumes_partition = bool(
-                getattr(
-                    post_model,
-                    "requires_partition_summary",
-                    getattr(getattr(post_model, "cfg", None), "evaluator_summary_dim", 0) > 0,
-                )
+                getattr(post_model, "requires_partition_summary", False)
             )
             expected_live = int(family.removeprefix("post_"))
             compatibility = self._compatibility(pub.board)
@@ -2178,11 +2170,7 @@ class PokerRolloutBackend:
             source = frozen_model.module if hasattr(frozen_model, "module") else frozen_model
             post_model = getattr(source, "postflop", None)
             consumes_partition = bool(
-                getattr(
-                    post_model,
-                    "requires_partition_summary",
-                    getattr(getattr(post_model, "cfg", None), "evaluator_summary_dim", 0) > 0,
-                )
+                getattr(post_model, "requires_partition_summary", False)
             )
             summary_fields = {
                 name.removeprefix("folded_summary."): value
@@ -2267,12 +2255,7 @@ class PokerRolloutBackend:
             source = model.module if hasattr(model, "module") else model
             post_model = getattr(source, "postflop", None)
             consumes_partition = bool(
-                getattr(
-                    post_model,
-                    "requires_partition_summary",
-                    getattr(getattr(post_model, "cfg", None), "evaluator_summary_dim", 0)
-                    > 0,
-                )
+                getattr(post_model, "requires_partition_summary", False)
             )
             if consumes_partition and not summary_fields and live < self.n_players:
                 raise ValueError("postflop immutable input omitted folded summary rows")
@@ -2524,11 +2507,7 @@ class PokerRolloutBackend:
             source_model = frozen_model.module if hasattr(frozen_model, "module") else frozen_model
             post_model = getattr(source_model, "postflop", None)
             consumes_partition = bool(
-                getattr(
-                    post_model,
-                    "requires_partition_summary",
-                    getattr(getattr(post_model, "cfg", None), "evaluator_summary_dim", 0) > 0,
-                )
+                getattr(post_model, "requires_partition_summary", False)
             )
             post_street = self.states.street[rows[post]]
             n_live = (self.states.status[rows[post]] != FOLDED).sum(1)
