@@ -751,6 +751,9 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         if sequential
         else int(cfg.rollout.storage_page_rows or 256)
     )
+    rollout_chunk_rows = max(
+        int(cfg.rollout.storage_page_rows or 256), live_state_rows
+    )
     raises_per_street = math.ceil(engine_cfg.stack_bb / engine_cfg.bb) + 1
     state_history_steps = 4 * engine_cfg.n_players * (raises_per_street + 1) + 3
     plan = estimate_rollout_memory(
@@ -766,7 +769,7 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
             getattr(model.postflop, "requires_partition_summary", False)
         ),
         use_branching_heads=model_cfg.use_branching_heads,
-        storage_page_rows=int(cfg.rollout.storage_page_rows or 256),
+        storage_page_rows=rollout_chunk_rows,
         live_state_rows=live_state_rows,
     )
     _preflight_cuda_rollout(

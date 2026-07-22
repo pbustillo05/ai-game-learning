@@ -577,7 +577,13 @@ def _sample_branched_tree_impl(
         rows = nodes.to(torch.int64)
         states = buffer.state_ref[rows]
         reaches = reaches_for(nodes)
-        partition_id = None if family is None else family_names.index(family)
+        partition_for_family = getattr(backend, "rollout_partition_id", None)
+        if family is None:
+            partition_id = None
+        elif callable(partition_for_family):
+            partition_id = int(partition_for_family(family))
+        else:
+            partition_id = family_names.index(family)
         decision_rows = None
         if partition_id is not None and record_policy_node:
             decision_rows = reserve_capture(

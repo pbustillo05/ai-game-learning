@@ -171,6 +171,9 @@ class PokerRolloutBackend:
             raise ValueError("live_state_rows must be a positive integer")
         self.live_state_rows = int(live_state_rows)
         self.e_max = RAISE_OFFSET + cfg.n_ticks
+        self._legal_event_ids = torch.arange(
+            self.e_max, dtype=torch.int32, device=self.device
+        )[None]
         self.raise_unit_values = (
             torch.arange(1, cfg.n_ticks + 1, dtype=torch.float32, device=self.device)
             * float(cfg.chip_unit_bb)
@@ -217,6 +220,7 @@ class PokerRolloutBackend:
         }
         self._partition_required = {initial_beta: False}
         self._active_decision_input_store: PokerDecisionInputCaptureStore | None = None
+        self._pending_policy_public: tuple[str, Tensor, PokerPublicBatch] | None = None
         self._next_dependency_anchor = 0
         self.combo_cards = torch.tensor(
             self.geometry.combo_cards,
@@ -238,12 +242,23 @@ class PokerRolloutBackend:
         self.execution_metrics = ExecutionMetrics()
         self.execution_families = (
             "pre",
-            *(f"post_{live}" for live in range(2, cfg.n_players + 1)),
+            *(
+                f"post_{live}_s{street}"
+                for street in range(1, RIVER + 1)
+                for live in range(2, cfg.n_players + 1)
+            ),
         )
-        self.execution_family_values = (0, *range(2, cfg.n_players + 1))
+        self.execution_family_values = (
+            0,
+            *(
+                street * (cfg.n_players + 1) + live
+                for street in range(1, RIVER + 1)
+                for live in range(2, cfg.n_players + 1)
+            ),
+        )
         self.execution_family_priorities = (
             0,
-            *(1 for _ in range(2, cfg.n_players + 1)),
+            *(1 for _ in self.execution_families[1:]),
         )
         self.game = self
 
@@ -278,6 +293,7 @@ class PokerRolloutBackend:
     def release_rollout_owners(self) -> None:
         """Release mutable state/history and summary pages after exact sealing."""
 
+        self._pending_policy_public = None
         capture_store = self._active_decision_input_store
         if capture_store is not None:
             for arena in capture_store.input_arenas.values():
@@ -479,10 +495,21 @@ class PokerRolloutBackend:
         """Return player event ids and legal masks ``[B,E_max]``."""
 
         self._validate_handles(states)
+        pending = self._pending_policy_public
+        if (
+            pending is not None
+            and pending[1] is states
+        ):
+            # policy_forward_family owns exactly one pending physical pack.
+            # Decision capture validates the handle equality before consuming
+            # it; sampling, transition, and reach may reuse its immutable legal
+            # structure without re-encoding the same public state four times.
+            legal = pending[2].legal_action_mask
+            ids = self._legal_event_ids.expand(states.shape[0], -1)
+            return ids, legal
         rows = states.to(torch.int64)
         actor = self.states.actor[rows].to(torch.int64)
-        ids = torch.arange(self.e_max, dtype=torch.int32, device=self.device)[None, :]
-        ids = ids.expand(states.shape[0], -1).clone()  # [B,E]
+        ids = self._legal_event_ids.expand(states.shape[0], -1)  # [B,E]
         mask = torch.zeros_like(ids, dtype=torch.bool)  # [B,E]
         player = self.states.phase[rows] == _PLAYER
         to_call = self.states.current_bet[rows] - self.states.committed_street[rows, actor]
@@ -591,15 +618,20 @@ class PokerRolloutBackend:
         fold = event_ids == FOLD
         call = event_ids == CHECK_CALL
         raise_event = event_ids >= RAISE_OFFSET
-        self.states.status[rows[fold], actor[fold]] = FOLDED
-        self.states.acted[rows[fold], actor[fold]] = True
+        actor_status = self.states.status[rows, actor]
+        self.states.status[rows, actor] = torch.where(
+            fold, torch.full_like(actor_status, FOLDED), actor_status
+        )
+        actor_acted = self.states.acted[rows, actor]
+        self.states.acted[rows, actor] = actor_acted | fold
         to_call = (self.states.current_bet[rows] - self.states.committed_street[rows, actor]).clamp_min(0.0)
         addition_call = torch.minimum(self.states.stacks[rows, actor], to_call)
         selected_call = torch.where(call, addition_call, torch.zeros_like(addition_call))
         self.states.stacks[rows, actor] -= selected_call
         self.states.committed_street[rows, actor] += selected_call
         self.states.committed_total[rows, actor] += selected_call
-        self.states.acted[rows[call], actor[call]] = True
+        actor_acted = self.states.acted[rows, actor]
+        self.states.acted[rows, actor] = actor_acted | call
         targets = parent_targets
         tick = (event_ids - RAISE_OFFSET).clamp(0, self.n_ticks - 1).to(torch.int64)
         target = targets[batch, tick]
@@ -616,8 +648,11 @@ class PokerRolloutBackend:
             full_raise, increment, self.states.last_full_raise[rows]
         )
         self.states.n_raises[rows] += full_raise.to(torch.int32)
-        self.states.acted[rows[full_raise]] = False
-        self.states.acted[rows[raise_event], actor[raise_event]] = True
+        acted = self.states.acted[rows]
+        acted = acted & (~full_raise[:, None])
+        actor_acted = acted[batch, actor] | raise_event
+        acted[batch, actor] = actor_acted
+        self.states.acted[rows] = acted
         all_in = self.states.stacks[rows, actor] <= _EPS
         self.states.stacks[rows, actor] = torch.where(
             all_in, torch.zeros_like(self.states.stacks[rows, actor]), self.states.stacks[rows, actor]
@@ -646,29 +681,45 @@ class PokerRolloutBackend:
         self.states.history_min_raise_to[history_rows] = parent_minimum
         self.states.history_max_raise_to[history_rows] = parent_maximum
         self.states.history_length[rows] += 1
-        if bool(fold.any()):
-            fold_rows = rows[fold]
-            fold_actor = actor[fold]
-            fold_board = self.states.board[parent_rows[fold]]
-            self.states.board_at_fold[fold_rows, fold_actor] = torch.where(
-                fold_board < 0, torch.full_like(fold_board, 255), fold_board
-            ).to(torch.uint8)
-            self.states.fold_line_meta[fold_rows, fold_actor] = torch.stack(
-                (
-                    self.states.street[parent_rows[fold]].to(torch.float32),
-                    self.states.committed_total[parent_rows[fold], fold_actor],
-                    self.states.committed_street[parent_rows[fold], fold_actor],
-                    self.states.committed_total[parent_rows[fold]].sum(1),
-                    parent_to_call[fold],
-                    self.states.n_raises[parent_rows[fold]].to(torch.float32),
-                    self.states.history_length[parent_rows[fold]].to(torch.float32),
-                    (fold_board >= 0).sum(1).to(torch.float32),
-                ),
-                dim=1,
-            )
-            self.states.partition_cache_key[fold_rows] = self._dependency_anchors(
-                int(fold_rows.numel())
-            )
+        # Fold snapshots use one fixed-width masked transaction.  The former
+        # bool(fold.any())/boolean compaction synchronized every player pack
+        # and created multiple dynamic-shape CUDA tensors even when no row
+        # folded.  Dependency labels need uniqueness, not density, so reserving
+        # one deterministic label per physical row preserves their contract.
+        fold_board = self.states.board[parent_rows]
+        board_at_fold = self.states.board_at_fold[rows]
+        board_at_fold[batch, actor] = torch.where(
+            fold_board < 0, torch.full_like(fold_board, 255), fold_board
+        ).to(torch.uint8)
+        self.states.board_at_fold[rows] = torch.where(
+            fold[:, None, None],
+            board_at_fold,
+            self.states.board_at_fold[rows],
+        )
+        fold_line_meta = self.states.fold_line_meta[rows]
+        fold_line_meta[batch, actor] = torch.stack(
+            (
+                self.states.street[parent_rows].to(torch.float32),
+                self.states.committed_total[parent_rows, parent_actor],
+                self.states.committed_street[parent_rows, parent_actor],
+                self.states.committed_total[parent_rows].sum(1),
+                parent_to_call,
+                self.states.n_raises[parent_rows].to(torch.float32),
+                self.states.history_length[parent_rows].to(torch.float32),
+                (fold_board >= 0).sum(1).to(torch.float32),
+            ),
+            dim=1,
+        )
+        self.states.fold_line_meta[rows] = torch.where(
+            fold[:, None, None],
+            fold_line_meta,
+            self.states.fold_line_meta[rows],
+        )
+        anchors = self._dependency_anchors(states.numel())
+        inherited_anchor = self.states.partition_cache_key[rows]
+        self.states.partition_cache_key[rows] = torch.where(
+            fold, anchors, inherited_anchor
+        )
         self.states.reopen_mask[rows] = (~self.states.acted[rows]) & (self.states.status[rows] == LIVE)
 
         contesting = self.states.status[rows] != FOLDED
@@ -1040,20 +1091,25 @@ class PokerRolloutBackend:
         states: Tensor,
         events: EventBatch,
         policy_out: PolicyOutput | None,
+        *,
+        selected_logp: Tensor | None = None,
     ) -> Tensor:
         """Update action likelihoods or board compatibility ``[B,P,H]``."""
 
         result = reach.clone()  # [B,P,H]
         if policy_out is not None:
-            legal_ids, legal_mask = self.legal_events(states)
-            from pbg.games.poker.adapter import PokerPolicyAdapter
+            if selected_logp is None:
+                legal_ids, legal_mask = self.legal_events(states)
+                from pbg.games.poker.adapter import PokerPolicyAdapter
 
-            adapter = PokerPolicyAdapter(
-                self.n_ticks, exact_to_model=self.combo_class
-            )
-            selected = adapter.log_prob(
-                policy_out, events.public_id[:, None], legal_ids, legal_mask
-            )[:, 0]
+                adapter = PokerPolicyAdapter(
+                    self.n_ticks, exact_to_model=self.combo_class
+                )
+                selected = adapter.log_prob(
+                    policy_out, events.public_id[:, None], legal_ids, legal_mask
+                )[:, 0]
+            else:
+                selected = selected_logp
             if selected.shape[1] == self.n_classes:
                 selected = selected[:, self.combo_class]
             actor = self.classify(states).to(torch.int64)
@@ -1067,6 +1123,23 @@ class PokerRolloutBackend:
             & real[:, None, None, :]
         ).any(3).any(2)  # [B,H]
         return result.masked_fill(conflict[:, None, :], -torch.inf)
+
+    def selected_policy_logp(
+        self,
+        states: Tensor,
+        events: EventBatch,
+        policy_out: PolicyOutput,
+        adapter: Any,
+    ) -> Tensor:
+        """Compute the selected natural-domain log probability once per pack."""
+
+        legal_ids, legal_mask = self.legal_events(states)
+        selected = adapter.log_prob(
+            policy_out, events.public_id[:, None], legal_ids, legal_mask
+        )
+        if selected.ndim != 3 or selected.shape[:2] != (states.numel(), 1):
+            raise ValueError("selected policy logp must have shape [B,1,X]")
+        return selected.detach()[:, 0].float()
 
     def encode_public(self, states: Tensor) -> PokerPublicBatch:
         """Construct model public inputs from handles ``[B]``."""
@@ -1114,10 +1187,15 @@ class PokerRolloutBackend:
             history=self._packed_history(states),
         )
 
-    def serialize_decision_inputs(self, states: Tensor) -> dict[str, Tensor]:
+    def serialize_decision_inputs(
+        self,
+        states: Tensor,
+        *,
+        public: PokerPublicBatch | None = None,
+    ) -> dict[str, Tensor]:
         """Materialize complete immutable public/history model inputs once."""
 
-        pub = self.encode_public(states)
+        pub = self.encode_public(states) if public is None else public
         if pub.history is None:
             raise RuntimeError("poker public input omitted its packed history")
 
@@ -1178,9 +1256,22 @@ class PokerRolloutBackend:
     ) -> PokerDecisionInputCapture:
         """Capture one player pack on its immutable natural model domain."""
 
-        partition_id = 0 if family == "pre" else int(family.removeprefix("post_")) - 1
+        live, _ = self._parse_execution_family(family)
+        partition_id = 0 if live is None else live - 1
         spec = self.training_partition_specs()[partition_id]
-        public = self.serialize_decision_inputs(states)
+        pending = self._pending_policy_public
+        cached_public = None
+        if pending is not None and pending[0] == family:
+            cached_states, cached_public = pending[1], pending[2]
+            if cached_states is not states:
+                if cached_states.shape != states.shape:
+                    raise RuntimeError("cached policy-public pack has the wrong row count")
+                _require_device(
+                    (cached_states == states).all(),
+                    "decision capture does not match the pending policy-public pack",
+                )
+            self._pending_policy_public = None
+        public = self.serialize_decision_inputs(states, public=cached_public)
         finite = torch.isfinite(log_reach)
         gauge = log_reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
         weights = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
@@ -1257,6 +1348,7 @@ class PokerRolloutBackend:
 
         if self._active_decision_input_store is not None:
             raise RuntimeError("a poker decision-input capture store is already active")
+        self._pending_policy_public = None
         store = PokerDecisionInputCaptureStore(
             {}, {}, accountant, {}, {}, mode, bool(dynamic_heads)
         )
@@ -1709,6 +1801,24 @@ class PokerRolloutBackend:
         return PokerPublicBatch(**values)
 
     @staticmethod
+    def _parse_execution_family(family: str) -> tuple[int | None, int | None]:
+        """Return ``(live_players, street)`` for rollout/learner family names."""
+
+        if family == "pre":
+            return None, 0
+        parts = family.split("_")
+        if len(parts) not in {2, 3} or parts[0] != "post":
+            raise ValueError(f"invalid poker execution family {family!r}")
+        try:
+            live = int(parts[1])
+            street = None if len(parts) == 2 else int(parts[2].removeprefix("s"))
+        except ValueError as exc:
+            raise ValueError(f"invalid poker execution family {family!r}") from exc
+        if live < 2 or street is not None and not 1 <= street <= RIVER:
+            raise ValueError(f"invalid poker execution family {family!r}")
+        return live, street
+
+    @staticmethod
     def _combine_outputs(parts: list[tuple[Tensor, PolicyOutput]], batch: int) -> PolicyOutput:
         if not parts:
             raise ValueError("cannot combine an empty policy batch")
@@ -1813,12 +1923,19 @@ class PokerRolloutBackend:
         )
 
     def rollout_family_ids(self, states: Tensor) -> Tensor:
-        """Return ``0=pre`` or ``A=post_A`` without street partitioning."""
+        """Return exact street/live execution queues; preflop remains zero."""
 
         rows = states.to(torch.int64)
-        street = self.states.street[rows]
+        street = self.states.street[rows].to(torch.int64)
         live = (self.states.status[rows] != FOLDED).sum(1).to(torch.int64)
-        return torch.where(street == 0, torch.zeros_like(live), live)
+        post = street * (self.n_players + 1) + live
+        return torch.where(street == 0, torch.zeros_like(live), post)
+
+    def rollout_partition_id(self, family: str) -> int:
+        """Map a physical execution queue to its natural learner partition."""
+
+        live, _ = self._parse_execution_family(family)
+        return 0 if live is None else live - 1
 
     def training_partition_specs(self):
         """Return poker-owned natural-width partitions for generic training."""
@@ -2027,16 +2144,16 @@ class PokerRolloutBackend:
         live = (self.states.status[rows] != FOLDED).sum(1)
         if family == "pre":
             expected = street == 0
-        elif family.startswith("post_"):
-            try:
-                expected_live = int(family.removeprefix("post_"))
-            except ValueError as exc:
-                raise ValueError(f"invalid poker execution family {family!r}") from exc
+            expected_live = None
+            expected_street = 0
+        else:
+            expected_live, expected_street = self._parse_execution_family(family)
+            assert expected_live is not None
             if not 2 <= expected_live <= self.n_players:
                 raise ValueError(f"invalid poker execution family {family!r}")
             expected = (street != 0) & (live == expected_live)
-        else:
-            raise ValueError(f"invalid poker execution family {family!r}")
+            if expected_street is not None:
+                expected = expected & (street == expected_street)
         if states.device.type == "cuda":
             torch._assert_async(expected.all(), "family queue contains a misrouted poker row")
         elif not bool(expected.all()):
@@ -2066,7 +2183,7 @@ class PokerRolloutBackend:
             consumes_partition = bool(
                 getattr(post_model, "requires_partition_summary", False)
             )
-            expected_live = int(family.removeprefix("post_"))
+            assert expected_live is not None
             compatibility = self._compatibility(pub.board)
             partition = None
             if consumes_partition and expected_live < self.n_players:
@@ -2085,9 +2202,9 @@ class PokerRolloutBackend:
                 status=pub.status,
                 evaluator_summary=partition,
                 live_seat_ids=live_seat_ids,
-                # Flop has the widest compatible set. Turn/river rows are
-                # padded and masked inside this same post_A invocation.
-                compact_size=math.comb(self.n_cards - 3, 2),
+                compact_size=math.comb(
+                    self.n_cards - ((expected_street or 1) + 2), 2
+                ),
             )
             output = frozen_model.forward_postflop(pub, weights, pub.to_act, masks)
             self.batch_size_histograms[f"postflop_{expected_live}"].append(
@@ -2106,6 +2223,7 @@ class PokerRolloutBackend:
             padded_tokens=states.numel() * width,
             padded_token_pairs=states.numel() * width * width,
         )
+        self._pending_policy_public = (family, states, pub)
         return output
 
     def policy_forward_partition(
@@ -2397,9 +2515,10 @@ class PokerRolloutBackend:
                 + self.max_rollout_steps
                 + k_act
             )
-        live = int(family.removeprefix("post_"))
+        live, street = self._parse_execution_family(family)
+        assert live is not None
         return (
-            live * math.comb(self.n_cards - 3, 2)
+            live * math.comb(self.n_cards - ((street or 1) + 2), 2)
             + scalar_count
             + 6
             + self.max_rollout_steps
@@ -2449,7 +2568,7 @@ class PokerRolloutBackend:
         natural = (
             self.n_players * self.n_classes
             if family == "pre"
-            else (int(family.removeprefix("post_")) * self.n_hands)
+            else (int(self._parse_execution_family(family)[0]) * self.n_hands)
         ) * 4
         # A 2x envelope covers gathered inputs, loss tensors, fused-attention
         # workspaces, allocator bins, and the measured forward/backward delta

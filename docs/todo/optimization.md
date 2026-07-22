@@ -1,8 +1,9 @@
 # Performance and optimization program
 
-Status: measured 2026-07-22. This replaces the 2026-07-21 list. It is an
-experiment backlog, not authority for training semantics or storage lifetime;
-`docs/theory/` and its pseudocode remain authoritative.
+Status: rollout stopping point accepted 2026-07-22. This replaces the
+2026-07-21 list. It is an experiment log and remaining backlog, not authority
+for training semantics or storage lifetime; `docs/theory/` and its pseudocode
+remain authoritative.
 
 The optimization objective is not merely the shortest iteration. At fixed
 statistical work and an explicit memory envelope, maximize:
@@ -31,13 +32,14 @@ rollout from 3.758 to 1.961 seconds. The queue family and 64-row policy pack wer
 already present in the faster implementation; the queue idea is not the
 regression.
 
-The current rollout also repeats legal-action, history, policy-probability,
-selected-log-probability, reach, and serialization work around every model
-call. A bounded operator profile found about 790 kernel launches and 20
-implicit stream synchronizations per fresh decision; attention accounted for
-only about 21% of self CUDA time in that diagnostic. The page facade explains a
-large part of the indexing, copy, temporary-allocation, and launch pressure;
-duplicated pack work and immutable decision capture are additional costs.
+The audited rollout also repeated legal-action, history, selected-log-
+probability, reach, and serialization work around every model call. A bounded
+operator profile found about 790 kernel launches and 20 implicit stream
+synchronizations per fresh decision; attention accounted for only about 21% of
+self CUDA time in that diagnostic. The dense-slab fix removed the dominant page
+facade cost, and pack-local reuse now removes several duplicated computations.
+History packing, reach updates, transition routing, and eager launch structure
+remain the next meaningful costs.
 
 The second immediate issue is configuration. Recent sustained A/B runs used
 the conservative `local_3x2080ti` profile even when one card was assigned. That
@@ -49,21 +51,20 @@ not the number of participating ranks.
 
 Larger rollout packs help, but only within the memory contract. Moving from 64
 to 96 family rows improved a 512-root iteration by 16.6%, while 128 rows failed
-the downstream workspace-closure guard. At 2,048 roots, 96 rows reserved
-10.497 GB (9.78 GiB). That is below the current profile's 10.723 GB limit but
-above a literal 10,000,000,000-byte hard ceiling. Until the ceiling is made
-unambiguous in configuration, treat 96 rows as an experiment rather than a
-production default.
+the downstream workspace-closure guard. The completed production sweep chose
+84 rows at about 9.07 GB median reservation. Width 88 and above remains
+diagnostic because it leaves insufficient room below a literal
+10,000,000,000-byte hard ceiling.
 
 ## Implementation progress: dense live-state boundary
 
-The first rollout milestone was implemented and measured on 2026-07-22.  The
-accepted performance gate is now a production-scale single-GPU sequential-RB
-workload with 2,048 trajectory starts, checkpoint 1110 from
-`runs/nlhe_hu_32bb_full_sequential_rb`, 64 family rows, 64 active trajectories,
-1,024 completion samples, and the configured 256-row append-only page size.
-The earlier 128- and 512-root probes remain debugging tools and are not release
-performance evidence.
+The rollout pass reached its stopping point on 2026-07-22. The accepted
+performance gate is a production-scale single-GPU sequential-RB workload with
+2,048 trajectory starts, the model weights from checkpoint 1110 in
+`runs/nlhe_hu_32bb_full_sequential_rb`, 1,024 completion samples, one learner
+step, and one warmup. The earlier 128- and 512-root probes remain debugging
+tools and are not release performance evidence. The checkpoint wrapper was
+schema-migrated only for the benchmark; model parameters were unchanged.
 
 The implementation makes mutable state/history a distinct physical domain.
 For sequential rollout it admits one recyclable dense slab of
@@ -80,76 +81,72 @@ single-page gather/write paths, and whole-row replacement no longer gathers
 the field that it is about to overwrite.  Multi-page append-only arenas retain
 their generic checked implementation.
 
-Production-scale results are:
+The complete production progression is:
 
-| 2,048-start sequential-RB measurement | Decisions | Model calls | Padded attention pairs | Rollout | End-to-end decisions/s |
+| 2,048-start sequential-RB measurement | Decisions | Model calls | Padded attention pairs | Rollout | Raw rollout decisions/s |
 |---|---:|---:|---:|---:|---:|
-| Audit matched baseline, 64 rows | about 8,050 | 139.5 | not recorded in the summary | 87.45 s | 90.9 |
-| Pre-fix reproduction, repeat seed 101 | 8,087 | 140 | 33.149 billion | 90.27 s | 88.3 |
-| Dense live-state implementation, two-repeat median | 8,049.5 | 139.5 | 32.976 billion | 51.65 s | 152.7 |
+| Audit matched baseline, family 64 | about 8,050 | 139.5 | not recorded | 87.45 s | about 92.1 |
+| Pre-fix reproduction, seed 101 | 8,087 | 140 | 33.149 billion | 90.27 s | 89.6 |
+| Dense live slab and efficient append-only chunks, family 64 | 8,233 | 141 | 34.057 billion | 35.72 s | 230.5 |
+| Exact-street physical queues, family 80 | 8,255 | 123 | 32.277 billion | 32.46 s | 254.3 |
+| Final safe family 84, two-repeat median | 8,064.5 | 118 | 31.229 billion | 31.39 s | 256.9 |
 
-Against the matched audit baseline, the accepted implementation reduces
-rollout time by 40.9% and raises end-to-end decision throughput by about 68%.
-The median peak was 3.34 GiB allocated and 6.16 GiB reserved, with a 2,112-row
-state high-water and no state row crossing the seal boundary.  The history
-high-water median was 719 rows and exactly the sentinel row remained at seal.
+The final family-84 samples were 32.170 seconds for 8,248 decisions and 30.603
+seconds for 7,881 decisions. Median total iteration time, including one learner
+step, was 32.455 seconds. Median peak allocation was 4.607 GB and median peak
+reservation was 9.071 GB. Against the matched audit baseline, rollout time fell
+about 64% and raw rollout throughput rose about 2.8 times. The raw result is
+within about 1% of the July 17 historical rollout rate of 258.9 decisions/s;
+the available samples do not establish that it has surpassed that record.
 
-A diagnostic one-repeat run that used a global 2,112-row page for every rollout
-arena reached 35.90 s for the same 8,087 decisions and 140 model calls.  That is
-useful headroom evidence but is not accepted as the live-state result: a global
-page changes append-only slack and abstraction boundaries.  The next rollout
-work should recover that headroom with explicit bulk topology/retained writes,
-then remove duplicated legal/probability/history work without changing page
-ownership or statistical work.
+The accepted implementation consists of:
 
-Focused CPU gates after this milestone passed 101 tests with seven CUDA-only
-skips.  CUDA benchmark teardown left no compute process resident.
+- a recyclable dense live-state slab sized from the configured controller
+  frontier plus one family pack, rather than generated-node capacity;
+- direct single-slab state access and direct contiguous append commits, while
+  retained/topology storage remains realized-work, chunked, and byte-admitted;
+- append-only rollout chunks at the bounded live-state geometry, eliminating
+  hundreds of tiny cold-storage pages without restoring an all-node state
+  table;
+- physical postflop queues split by exact street and live-player count, mapped
+  back to the unchanged natural learner partitions;
+- one selected policy log-probability per pack, reused by reach and retention,
+  and reuse of the pending public/history/legal representation when capture
+  consumes the same physical pack; and
+- fixed-width masked fold/acted updates, removing the per-pack
+  `bool(fold.any())` synchronization and dynamic boolean compaction.
 
-### Follow-on rollout width result
+Exact-street queues reduced padded attention work by about 5.6% at family 64.
+The final masked fold update produced 31.856 seconds for the same 8,248-decision
+sample that previously took 32.170 seconds, an additional approximately 1%
+gain. Immutable event-id caching and removal of a redundant identity check were
+included after that sample; identity-matched packs now skip the redundant
+equality assertion. These changes were CUDA-tested but not credited separately.
 
-The production family-width gate was rerun after the dense-state milestone on
-the same live source snapshot, using the schema-migrated copy of checkpoint
-1110, 2,048 starts, repeat seed 104830, 1,024 completion samples, and one warmup
-per arm.  GPUs 0 and 2 ran the 64- and 88-row arms concurrently; the 84-row arm
-then ran on GPU 0.
+Family 84 is the production choice for the 2080 Ti profile. Family 88 was about
+1.5% faster in an earlier width sweep but reserved 9.84 GB, leaving only about
+158 MB below the decimal 10 GB ceiling. It remains a diagnostic point, not the
+default. A 4,096-row cold-storage chunk improved rollout only from 32.464 to
+32.369 seconds, about 0.3%, and was rejected. Flexible/automatic attention took
+56.078 seconds versus approximately 31.86 seconds with SDPA and was also
+rejected.
 
-| Family rows | Decisions | Model calls | Rollout | ms/decision | Peak allocated / reserved |
-|---:|---:|---:|---:|---:|---:|
-| 64 | 8,233 | 141 | 36.228 s | 4.400 | 3.63 / 6.62 GB |
-| 84 | 8,283 | 112 | 33.723 s | 4.071 | 4.60 / 9.05 GB |
-| 88 | 8,262 | 107 | 33.118 s | 4.008 | 4.80 / 9.84 GB |
+The small storage micro-optimizations remain accepted: direct page-slice
+append commits reduced a matched family-84 sample by 1.1%, and seeding a
+multi-page gather from its first page instead of a zero allocation reduced a
+matched sample by 0.35%. Neither changes storage lifetime or capacity.
 
-Family 84 is the production choice for the 2080 Ti profile.  It reduces
-rollout time per decision by 7.5% and raises end-to-end throughput by 7.6%
-relative to 64 rows while retaining about 955 MB below the decimal 10 GB
-ceiling.  Family 88 is 1.5% faster than 84 but leaves only about 158 MB and is
-therefore retained as an aggressive diagnostic point, not the default.  The
-live-state slab forecast now covers the adaptive controller's configured
-maximum root frontier plus one family pack, so controller widening cannot
-silently fall back to multi-page hot state.
+Validation at the stopping point produced 247 passed and 37 skipped in the
+general suite. The full CUDA suite produced 272 passed, 10 skipped, and two
+failures in the stateful inference API caused by the separately audited
+preflop class/combo output shape mismatch at `pbg/inference.py:596`; neither
+failure enters rollout. The final focused CUDA rollout gate produced 30 passed
+and two skipped. The benchmark GPU returned to its clean idle allocation.
 
-The first production sample of combined public/history, legal-mask, and
-selected-log-probability reuse did not improve rollout (36.45 s versus 35.95 s
-for identical 8,087 decisions and 33.149 billion padded attention pairs).
-Keep that experiment provisional until a settled paired median demonstrates a
-gain; do not credit it in the cumulative speedup.
-
-Append-only arena commits now bypass generic arbitrary-row page matching when
-the host cursor already proves that the reserved span is contiguous.  A
-same-source monkeypatched control at family 84 measured 32.368 s with the old
-`reserve_rows` plus generic `write` path and 32.011 s with direct page-slice
-commits.  Both arms produced exactly 8,253 decisions, 118 model calls, 32.258
-billion padded attention pairs, and the same 4.61 / 9.06 GB peak.  This is a
-1.1% rollout reduction with no page-size, ownership, or memory-accounting
-change.
-
-Multi-page arbitrary gathers now seed their result from the first page instead
-of allocating zeros and merging that page through an additional `where`.  A
-simultaneous same-source production A/B measured 31.953 s for the old gather
-and 31.840 s for the new gather with exactly 8,253 decisions, 118 model calls,
-and 32.258 billion padded pairs in both arms.  The 0.35% rollout reduction is
-small, but peak reservation also fell from 9,055,502,336 to 9,015,656,448
-bytes and the change adds no state or lifetime complexity.
+This is the stopping point for the eager rollout pass. Further progress now
+requires a larger architectural step--history bucketing or an allocation-free
+dequeue-to-enqueue compiled/graph boundary--rather than more page-size or
+attention-dispatch tuning.
 
 Sequential target construction and especially branched target construction
 still contain or recently contained host-driven recurrences. A concurrent
@@ -166,11 +163,14 @@ process was explicitly assigned a device and teardown was checked. The Python
 environment was `/home/pablob/.venvs/poker`, PyTorch was 2.12.1+cu130, and the
 cards have compute capability 7.5 and 11,264 MiB physical VRAM.
 
-The working tree was based on commit `b9a42fbca95da10f7f892ef3d79033dcb22ee284`
-and was dirty before diagnostics began. Other storage, target, learner, and
-poker-evaluator edits appeared while the sweep was running. Consequently:
+The investigation began at commit `b9a42fbca95da10f7f892ef3d79033dcb22ee284`
+and the early diagnostic sweep crossed concurrent storage, target, learner, and
+poker-evaluator edits. The final family-84 median and focused CUDA gate were
+collected on one settled source snapshot; the commit containing this document
+is the stopping revision. Consequently:
 
-- the results are diagnostic evidence, not a release performance baseline;
+- the final family-84 result is the new eager-rollout baseline, while earlier
+  rows remain diagnostic progression evidence;
 - every artifact records its checkpoint, workload, seeds, and environment;
 - comparisons that crossed a live source edit are identified as candidates to
   rerun, not accepted A/B conclusions; and
@@ -210,6 +210,13 @@ topology is close but not identical.
 | Gradient synchronization | 3.20 s | 3.16 s | approximately flat |
 | Peak allocated / reserved | 4.45 / 6.80 GiB | 3.15 / 5.21 GiB | lower |
 | Global fresh decisions/s | 123.4 | about 87.3 | about 29% lower |
+
+That table records the original regression reproduction, not the optimized
+stopping point. The final single-GPU production gate reached approximately
+256.9 raw rollout decisions/s, versus approximately 258.9 for the historical
+raw rollout. End-to-end comparison still requires a settled two-rank run at the
+same learner/fresh reuse ratio; the one-step rollout gate must not be presented
+as a replacement for that experiment.
 
 The current rank realized 5,051 fresh decisions and presented 14,848 learner
 rows, a reuse factor of 2.94. That exceeds the intended sequential factor of
@@ -530,20 +537,19 @@ Acceptance requires more than recovering speed:
 
 ### Repeated rollout work
 
-For each policy pack, the current orchestration approximately does:
+Before this pass, each policy pack encoded public state, legal events, and
+history for forward; recomputed legal structure for keyed sampling and reach;
+computed selected log probability separately for reach and retention; and
+serialized retained inputs by encoding public/history again. The accepted
+path now slices each role pack once, reuses the pending public/history/legal
+representation for the same physical pack, and computes selected natural log
+probability once for both reach and retention.
 
-1. encode public state and legal events for the model forward;
-2. classify and compute legal probabilities again for keyed sampling;
-3. execute the poker transition;
-4. recompute legal events and selected full-hand log probability for reach;
-5. clone the full `[batch, players, hands]` reach tensor;
-6. recompute selected log probability for retained old policy data; and
-7. serialize retained inputs by encoding public state and history again.
-
-Reach normalization, preflop 1,326-to-169 reduction, legal masks, and history
-materialization are repeated across those calls. The selected full-hand log
-probability is computed twice. This work creates many pointwise kernels,
-temporary tensors, copies, and validation assertions around one model forward.
+This is only partial fusion. Model forward, action sampling, transition,
+reach cloning/update, routing, and retained writes are still separate eager
+operations with many pointwise kernels and temporaries. The cache is deliberately
+pack-local and identity-checked; it does not extend state lifetime or create a
+global replay cache.
 
 The desired unit is a fused family step that computes legal structure once and
 returns action, selected log probability, next state, updated reach, routing
@@ -553,10 +559,11 @@ preallocated destinations. This is also the right CUDA graph boundary.
 ### History materialization and recycling
 
 CUDA history is currently materialized at the maximum rollout depth (42) on
-every call to avoid a scalar read. It performs six binary-lift levels over the
-batch-by-42 slab and gathers multiple fields. Retained input serialization then
-does it again. Recycling history rows uses boolean-indexed dynamic tensors,
-`unique`, Python recursion, and `numel()`-dependent control.
+each new physical policy pack to avoid a scalar read. It performs six
+binary-lift levels over the batch-by-42 slab and gathers multiple fields. The
+same packed history is now reused by immediate retention, but recycling history
+rows still uses boolean-indexed dynamic tensors, `unique`, Python recursion,
+and `numel()`-dependent control.
 
 Fixed width is capture-friendly but needlessly expensive for short histories.
 Use immutable 8/16/32/42 history buckets or an incremental compact descriptor,
@@ -616,10 +623,14 @@ payload, so it belongs ahead of communication overlap.
 
 ### Physical layouts left on the table
 
-- All postflop calls still pay the flop hand width. Exact physical widths are
-  1,176 on flop, 1,128 on turn, and 1,081 on river. This saves only a few percent
-  on the current sequential street mix, but about 11--13% of attention pairs in
-  late-street-heavy branching samples.
+Postflop execution is now physically split by exact street and live-player
+count. Flop, turn, and river use compact widths 1,176, 1,128, and 1,081 while
+mapping to the same natural learner partition. At family 64 this reduced padded
+pair work by about 5.6% and rollout by about 4.9% relative to the preceding
+dense-slab result.
+
+The remaining layout opportunities are:
+
 - Active preflop reach remains full 1,326-hand form even though retained and
   model inputs are natural 169-class form. Keep it natural until the flop and
   expand once, if the theory mapping and sampling laws remain exact.
@@ -636,31 +647,31 @@ The order below combines measured ceiling, expected speedup, implementation
 risk, and whether the change unlocks CUDA graphs. Each item needs an A/B at
 fixed seeds, checkpoint, realized-work accounting, and reuse ratio.
 
-| Rank | Experiment | Why now / expected result | Effort | Acceptance gate |
-|---:|---|---|---:|---|
-| 0 | Freeze a trustworthy benchmark revision and byte-exact 2080 ceiling | Live source edits and ambiguous GB/GiB currently invalidate final tuning decisions | Low | clean revision; raw samples; 10,000,000,000-byte gate; GPU teardown |
-| 1 | Use the 10 GB card envelope independently of rank count | Removes the observed 20-subspan/step configuration failure without semantic code changes | Low | same loss/topology; <=10 GB; materially fewer physical subspans |
-| 2 | Remove field-wise paging from hot live state | Exact intervention cut rollout 47.8%; enables a stable dense graph boundary | Medium-high | recover near-flat A/B time; one bulk pack read/write; exact state/lifetime accounting |
-| 3 | Fuse rollout legal/probability/sample/logp/reach/retention preprocessing | Removes duplicated pack work and reduces launch/copy pressure after state staging | Medium | >=20% further rollout reduction; identical keyed actions and retained tensors |
-| 4 | Reuse and bucket history materialization; fixed-capacity recycling | History is encoded twice and dynamic recycling likely causes many implicit syncs | Medium | fewer launches/syncs and no lifetime/schema drift |
-| 5 | Capture/compile the whole dequeue-to-enqueue rollout pack | Kernel launches are about 790/decision; stable dense 64/32/16/tail packs can amortize them | Medium-high | >=15% additional rollout gain; bounded graph variants; logical RNG unchanged |
-| 6 | Re-baseline and finish vectorized CUDA target recurrences | Removes scalar CPU work; branch targets already consume about 9% of representative time | Medium | exact target equality/estimator tests; no per-node D2H; >=2x target speedup |
-| 7 | Tune family rows under phase-closure admission | 96 rows gave +20.8% at 512 roots, but production peak exceeded decimal 10 GB | Low-medium | select largest safe 64/80/88/96 width with p99 reserved < ceiling |
-| 8 | Split postflop physical execution by street | Reduces pair work 11--13% in late-heavy branching and creates better graph shapes | Medium | exact natural mapping; fewer pairs and lower rollout time |
-| 9 | Capture learner gather+forward+loss+backward per partition/shape | Forward+backward is 46.86 s and graph prerequisites are already strong | Medium-high | >=15% learner compute gain at fixed rows/step and gradients |
-| 10 | Policy-only reference forward/cache | 7.59 s measured ceiling and avoids unused value/T/C outputs | Medium | KL bitwise/tolerance match; lower cache time and bytes |
-| 11 | Gate per-subspan CUDA events and fuse finite/norm/clip reductions | Removes instrumentation and two host decisions from every step | Low-medium | unchanged skip/clip semantics; lower launch/sync counts |
-| 12 | Precompute/bit-pack immutable learner descriptors | Reduces sampled-row pointwise/index work and benefits learner graphs | Medium | net byte reduction or admitted memory; faster gathered subspan |
-| 13 | Natural 169-class active preflop reach | Reduces active reach bandwidth and scatter work before flop | Medium-high | exact reach/sampling equivalence and one bounded flop expansion |
-| 14 | Overlap gradient communication with final backward buckets | Only 3.16 s current ceiling, so valuable after local compute work | Medium-high | identical reduced flat gradient; exposed sync time falls |
-| 15 | Replace allocator `empty_cache()` boundary with measured reusable-space admission | May avoid release/reallocation churn, but current phase planner relies on it | Medium | no OOM regression across adversarial phase closures |
-| 16 | Deterministic small-k chance selection and minor kernel cleanup | Real but below repeated rollout/history work | Low-medium | exact counter-key law or approved equivalent; measured gain |
+| Rank | Status | Experiment | Result / next acceptance gate |
+|---:|---|---|---|
+| 0 | Partial | Freeze a trustworthy benchmark revision and byte-exact 2080 ceiling | This commit is the stopping revision and teardown is clean; make the 10,000,000,000-byte policy explicit rather than relying only on width headroom. |
+| 1 | Open | Use the 10 GB card envelope independently of rank count | Same loss/topology, no more than 10 GB, and materially fewer learner subspans. |
+| 2 | Done | Remove field-wise paging from hot live state | Dense recyclable slab plus bounded efficient cold chunks; lifecycle and CUDA gates pass. |
+| 3 | Partial | Fuse rollout legal/probability/sample/logp/reach/retention preprocessing | Public/history/legal and selected logp are reused; remaining full-pack fusion should deliver at least 15% to justify complexity. |
+| 4 | Partial | Reuse and bucket history materialization; fixed-capacity recycling | Immediate retention reuse is done; 8/16/32/42 buckets and fixed device recycling remain open. |
+| 5 | Open | Capture/compile the whole dequeue-to-enqueue rollout pack | Require at least 15% rollout gain, bounded graph variants, and unchanged logical RNG. |
+| 6 | Open | Re-baseline and finish vectorized CUDA target recurrences | Exact target equality, no per-node D2H, and at least 2x target speedup. |
+| 7 | Done | Tune family rows under phase-closure admission | Family 84 selected at 9.07 GB median reserved; 88 rejected for insufficient headroom. |
+| 8 | Done | Split postflop physical execution by street | Exact natural mapping passes; padded pairs fell about 5.6% at family 64. |
+| 9 | Open | Capture learner gather+forward+loss+backward per partition/shape | At least 15% learner compute gain at fixed rows/step and identical gradients. |
+| 10 | Open | Policy-only reference forward/cache | Match KL and reduce the measured 7.59-second cache ceiling and retained bytes. |
+| 11 | Open | Gate per-subspan CUDA events and fuse finite/norm/clip reductions | Preserve skip/clip semantics and reduce launches and host decisions. |
+| 12 | Open | Precompute/bit-pack immutable learner descriptors | Net byte reduction or admitted memory and a faster gathered subspan. |
+| 13 | Open | Natural 169-class active preflop reach | Exact reach/sampling equivalence and one bounded flop expansion. |
+| 14 | Open | Overlap gradient communication with final backward buckets | Identical reduced flat gradient and lower exposed synchronization. |
+| 15 | Open | Replace allocator `empty_cache()` boundary with measured reusable-space admission | No OOM regression across adversarial phase closures. |
+| 16 | Open | Deterministic small-k chance selection and minor kernel cleanup | Preserve the exact counter-key law or obtain an approved equivalent and measure a gain. |
 
-Rank 0 is measurement infrastructure, not a request to postpone optimization.
-Ranks 1--7 can proceed as a short sequence: establish the envelope, restore a
-dense hot state boundary, fuse the rollout pack, stabilize history shapes,
-capture the whole pack, validate targets, then retune width around the faster
-implementation.
+The next rollout pass should start at ranks 4 and 5: stabilize history shapes,
+then form an allocation-free full-pack boundary and compile/capture it. Rank 1
+is primarily a learner-envelope correction and rank 6 is a separate target
+project. Do not reopen width, page-size, or attention-dispatch tuning without
+new evidence that changes the ceilings measured above.
 
 ## CUDA graph plan
 
@@ -669,10 +680,9 @@ storage phase transitions, and learner work remain deliberately dynamic and
 bounded. Within rollout, however, the graph boundary should be the whole
 fixed-width processing of one device queue pack: dequeue through direct
 successor enqueue. A CPU routing summary is only an implementation stepping
-stone, not the target architecture. Do not capture the current
-`PagedTensorColumn` implementation: replay would faithfully repeat its page
-scans and read-modify-write copies, and its changing page set is not a stable
-capture shape.
+stone, not the target architecture. Capture must start from the accepted dense
+live slab and exact-street queues; cold paged retained/topology storage remains
+outside the graph except for pre-reserved direct append destinations.
 
 ### Rollout graph boundary
 
@@ -680,7 +690,7 @@ For each `(execution family, street, row bucket, mode)`, one graph replay should
 perform:
 
 ```text
-dequeue 64/96 live-slot handles from the selected device queue
+dequeue 84/42/21/tail live-slot handles from the selected device queue
     -> bulk-load each required state/reach/history field exactly once
     -> compact history/public encoding
     -> legal events and policy forward
@@ -703,9 +713,9 @@ an invalid transition writes a device failure flag that is checked at a
 declared control boundary. No dynamic-output `nonzero`, `.item()`, Python loop,
 or CUDA allocation may occur inside the captured path.
 
-Start with 64-row steady-state graphs and 32/16/8/tail graphs; separately test
-the largest byte-admitted steady width in the 80--96 range. After the
-street-specific layout experiment, key postflop graphs by flop/turn/river.
+Start with the production 84-row steady-state graph and bounded 42/21/tail
+graphs. Key postflop graphs by the already implemented flop/turn/river physical
+families.
 Dummy rows need an explicit inert mask: they must not consume logical RNG keys,
 mutate state, reserve storage, or write retained rows. Queue, state, history,
 retention, leaf, and scratch addresses must be stable and preallocated from the
@@ -828,8 +838,10 @@ storage lifecycle, finite-gradient behavior, and teardown gates also pass.
 - Moving poker transitions to CPU: it would add strict device/host dependencies
   when the measured queue-control CPU cost is already negligible.
 
-The near-term success criterion is a settled two-GPU sequential-RB run at a
-true 2.0 learner/fresh ratio that returns global fresh decision throughput to
-at least the historical 123.4 decisions/s while remaining below the byte-exact
-2080 Ti ceiling. The stretch target is to exceed that record by 25% through
-rollout fusion and capture, without counting reduced learner work as speedup.
+The eager-rollout recovery criterion is met: the production gate is within
+about 1% of the historical raw rollout rate and remains below the conservative
+2080 Ti ceiling. The remaining end-to-end criterion is a settled two-GPU
+sequential-RB run at a true 2.0 learner/fresh ratio that reaches at least the
+historical 123.4 global fresh decisions/s. The stretch target remains 25% above
+that record through history stabilization and full-pack fusion/capture, without
+counting reduced learner work as speedup.

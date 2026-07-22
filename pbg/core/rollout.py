@@ -309,7 +309,8 @@ def _sample_trees_sequential(
         raise ValueError("family-scheduled batch and admission sizes must be positive")
     max_rows = max(1, start_count * (int(backend.max_rollout_steps) + 1))
     chunk_nodes = int(
-        getattr(rollout_cfg, "storage_page_rows", None)
+        getattr(backend, "storage_page_rows", None)
+        or getattr(rollout_cfg, "storage_page_rows", None)
         or min(max_rows, max(batch_rows, 256))
     )
 
@@ -780,7 +781,12 @@ def _sample_trees_sequential(
             role_parts = (
                 (torch.arange(count, device=device), bundle.model, True),
             )
-        partition_id = family_names.index(selected_family)
+        partition_for_family = getattr(backend, "rollout_partition_id", None)
+        partition_id = (
+            int(partition_for_family(selected_family))
+            if callable(partition_for_family)
+            else family_names.index(selected_family)
+        )
         reserved_by_role: dict[int, Tensor] = {}
         for role_index, (positions, _, retain) in enumerate(role_parts):
             if retain and positions.numel():
@@ -797,26 +803,54 @@ def _sample_trees_sequential(
                     continue
                 if role_model is None:
                     raise RuntimeError("mixed-policy rollout is missing its opponent model")
+                role_states = states[positions]
+                role_reaches = reaches[positions]
+                role_profiles = profiles[positions]
+                role_keys = keys[positions]
+                role_nodes = batch_nodes[positions]
+                role_rows = batch_rows_index[positions]
                 output = actual_cost_forward(
                     role_model,
                     selected_family,
-                    states[positions],
-                    reaches[positions],
+                    role_states,
+                    role_reaches,
                 )
                 role_events = _sample_events_logical(
                     backend,
-                    states[positions],
-                    profiles[positions],
+                    role_states,
+                    role_profiles,
                     output,
                     bundle.policy_adapter,
-                    keys[positions],
+                    role_keys,
                     gen,
                 )
-                step_player = getattr(backend, "step_player_batch", backend.step)
-                next_states[positions] = step_player(states[positions], role_events)
-                next_reach[positions] = backend.reach_update(
-                    reaches[positions], states[positions], role_events, output
+                selected_logp_fn = getattr(
+                    backend, "selected_policy_logp", None
                 )
+                role_selected_logp = (
+                    selected_logp_fn(
+                        role_states,
+                        role_events,
+                        output,
+                        bundle.policy_adapter,
+                    )
+                    if callable(selected_logp_fn)
+                    else None
+                )
+                step_player = getattr(backend, "step_player_batch", backend.step)
+                next_states[positions] = step_player(role_states, role_events)
+                if role_selected_logp is None:
+                    next_reach[positions] = backend.reach_update(
+                        role_reaches, role_states, role_events, output
+                    )
+                else:
+                    next_reach[positions] = backend.reach_update(
+                        role_reaches,
+                        role_states,
+                        role_events,
+                        output,
+                        selected_logp=role_selected_logp,
+                    )
                 event_ids[positions] = role_events.public_id
                 for name, value in role_events.payload.items():
                     destination = event_payload.get(name)
@@ -829,34 +863,35 @@ def _sample_trees_sequential(
                         event_payload[name] = destination
                     destination[positions] = value
                 if retain:
-                    legal_ids, legal_mask = backend.legal_events(states[positions])
-                    selected_logp = _selected_policy_logp(
-                        bundle.policy_adapter,
-                        output,
-                        role_events.public_id[:, None],
-                        legal_ids,
-                        legal_mask,
-                    ).detach()[:, 0]
+                    if role_selected_logp is None:
+                        legal_ids, legal_mask = backend.legal_events(
+                            role_states
+                        )
+                        selected_logp = _selected_policy_logp(
+                            bundle.policy_adapter,
+                            output,
+                            role_events.public_id[:, None],
+                            legal_ids,
+                            legal_mask,
+                        ).detach()[:, 0]
+                    else:
+                        selected_logp = role_selected_logp
                     write_capture(
                         decision_input_store,
                         reserved_by_role[role_index],
-                        batch_nodes[positions],
+                        role_nodes,
                         capture_inputs(
                             selected_family,
-                            states[positions],
-                            reaches[positions],
+                            role_states,
+                            role_reaches,
                         ),
                         {
-                            "node_id": batch_nodes[positions].to(torch.int32),
-                            "root_id": buffer.tree_id[
-                                batch_rows_index[positions]
-                            ].to(torch.int32),
+                            "node_id": role_nodes.to(torch.int32),
+                            "root_id": buffer.tree_id[role_rows].to(torch.int32),
                             "decision_ordinal": (
-                                buffer.depth_player[batch_rows_index[positions]] - 1
+                                buffer.depth_player[role_rows] - 1
                             ).to(torch.int32),
-                            "owner": buffer.owner[batch_rows_index[positions]].to(
-                                torch.int32
-                            ),
+                            "owner": buffer.owner[role_rows].to(torch.int32),
                             "event": role_events.public_id.to(torch.int32),
                             "old_logp": selected_logp.to(torch.float32),
                             "old_v": output.v.detach().to(torch.float32),
