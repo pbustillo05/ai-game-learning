@@ -168,8 +168,18 @@ class PagedRolloutTopology:
             for value in (parents, states, owners, events, weights)
         ):
             raise ValueError("child append tensors must be on the topology device")
+        node_start = self.node_count
+        edge_start = self.edge_count
         nodes, edges = self.reserve_children(parents, weights)
-        self.commit_children(nodes, edges, states, owners, events)
+        self.commit_children(
+            nodes,
+            edges,
+            states,
+            owners,
+            events,
+            _node_start=node_start,
+            _edge_start=edge_start,
+        )
         return nodes
 
     def reserve_children(
@@ -251,6 +261,9 @@ class PagedRolloutTopology:
         states: Tensor,
         owners: Tensor,
         events: Tensor,
+        *,
+        _node_start: int | None = None,
+        _edge_start: int | None = None,
     ) -> None:
         """Fill one physical subspan of previously reserved child rows."""
 
@@ -275,19 +288,22 @@ class PagedRolloutTopology:
             child_owner.clamp(0, self.n_players - 1)[:, None],
             player.to(torch.int32)[:, None],
         )
-        self.nodes.write(
-            node_rows,
-            {
-                "owner": owners.to(torch.int32),
-                "state_ref": states.to(torch.int32),
-                "depth_p": parent_depth + increments,
-                "depth_player": self.depth_player[parent_rows]
-                + player.to(torch.int32),
-            },
-        )
-        self.edges.write(
-            edges.to(torch.int64), {"child_event": events.to(torch.int32)}
-        )
+        node_values = {
+            "owner": owners.to(torch.int32),
+            "state_ref": states.to(torch.int32),
+            "depth_p": parent_depth + increments,
+            "depth_player": self.depth_player[parent_rows]
+            + player.to(torch.int32),
+        }
+        edge_values = {"child_event": events.to(torch.int32)}
+        if (_node_start is None) != (_edge_start is None):
+            raise ValueError("contiguous child commit requires both host cursors")
+        if _node_start is None:
+            self.nodes.write(node_rows, node_values)
+            self.edges.write(edges.to(torch.int64), edge_values)
+        else:
+            self.nodes.write_contiguous(_node_start, node_values)
+            self.edges.write_contiguous(_edge_start, edge_values)
 
     def release(self) -> None:
         self.nodes.release()
