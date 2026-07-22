@@ -5,7 +5,7 @@ import itertools
 import pytest
 import torch
 
-from pbg.eval.rao_blackwell_variance import (
+from experiments.rao_blackwell_variance.eval.rao_blackwell_variance import (
     SufficientStatistics,
     assigned_jobs,
     canonical_jobs,

@@ -66,12 +66,16 @@
 ## Configuration
 
 - `configs/train/` — production and conservative smoke/gate training presets.
-- `configs/experiments/` — profiling, variance, smoke, and optimization
+- `configs/experiments/` — profiling, smoke, and optimization
   workloads.
 - `configs/hardware/` — local RTX 2080 Ti and Quest execution envelopes.
 
 Every active scientific YAML uses direct `game.n_players`, `stack_bb`, and
 `rank_count`, plus the neutral rollout fields documented in `CONTRACTS.md`.
+
+Checkpoint-specific research implementations, including their configs and
+tests, live under `experiments/` and are excluded from the installed `pbg`
+package and default test suite.
 
 ## Documentation
 

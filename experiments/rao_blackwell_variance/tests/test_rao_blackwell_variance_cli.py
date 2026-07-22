@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pbg.cli import rao_blackwell_variance as cli
-from pbg.eval.rao_blackwell_variance import load_experiment_config
+from experiments.rao_blackwell_variance.cli import rao_blackwell_variance as cli
+from experiments.rao_blackwell_variance.eval.rao_blackwell_variance import (
+    load_experiment_config,
+)
 
 
-CONFIG = Path("configs/experiments/nlhe_hu_32bb_rao_blackwell_variance.yaml")
+CONFIG = Path(
+    "experiments/rao_blackwell_variance/configs/"
+    "nlhe_hu_32bb_rao_blackwell_variance.yaml"
+)
 
 
 def test_scientific_config_defaults() -> None:

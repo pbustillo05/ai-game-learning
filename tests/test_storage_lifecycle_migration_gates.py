@@ -82,6 +82,25 @@ def test_node_budget_is_absent_from_production_python() -> None:
     assert offenders == []
 
 
+def test_checkpoint_specific_variance_experiments_are_absent_from_production() -> None:
+    retired_modules = {
+        "rao_blackwell_variance.py",
+        "branched_rao_blackwell_variance.py",
+    }
+    assert [
+        str(path.relative_to(ROOT))
+        for path in PRODUCTION.rglob("*.py")
+        if path.name in retired_modules
+    ] == []
+
+    reverse_dependencies = [
+        str(path.relative_to(ROOT))
+        for path in PRODUCTION.rglob("*.py")
+        if "experiments.rao_blackwell_variance" in path.read_text(encoding="utf-8")
+    ]
+    assert reverse_dependencies == []
+
+
 def test_production_rollout_and_targets_do_not_grow_payload_with_torch_cat() -> None:
     offenders: list[str] = []
     for relative in (

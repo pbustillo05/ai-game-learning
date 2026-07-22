@@ -25,7 +25,7 @@ from torch import Tensor, nn
 import yaml
 
 from pbg.core.branching import BranchingDiagnosticLimits
-from pbg.eval.rao_blackwell_variance import (
+from experiments.rao_blackwell_variance.eval.rao_blackwell_variance import (
     checkpoint_sha256,
     logical_seed,
     rademacher_direction,

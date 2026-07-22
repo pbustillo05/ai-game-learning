@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from pbg.core.topology import BranchedTreeSpan
-from pbg.eval.branched_rao_blackwell_variance import (
+from experiments.rao_blackwell_variance.eval.branched_rao_blackwell_variance import (
     _propagate_functional_coefficients,
     _tree_layout,
     load_config,
@@ -87,7 +87,7 @@ def test_variance_surface_uses_branch_specific_A_and_one_over_n() -> None:
 
 def test_approved_config_has_only_checkpoint_1110() -> None:
     config = load_config(
-        "configs/experiments/nlhe_hu_32bb_branched_rao_blackwell_variance.yaml"
+        "experiments/rao_blackwell_variance/configs/nlhe_hu_32bb_branched_rao_blackwell_variance.yaml"
     )
     assert config["checkpoint"] == 1110
     assert config["rollout"]["roots_per_gpu"] == 1

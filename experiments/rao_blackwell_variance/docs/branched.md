@@ -799,7 +799,7 @@ Sanity checks:
 ## Approved checkpoint-1110 experiment
 
 The executable experiment is configured in
-`configs/experiments/nlhe_hu_32bb_branched_rao_blackwell_variance.yaml`.  It
+`experiments/rao_blackwell_variance/configs/nlhe_hu_32bb_branched_rao_blackwell_variance.yaml`. It
 uses only checkpoint 1110 from the completed heads-up, 32 bb, full-deck run.
 It does not average checkpoints: the public-tree distribution and frozen
 gradient integrand are both those of iteration 1110.

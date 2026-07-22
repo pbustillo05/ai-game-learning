@@ -829,8 +829,8 @@ modify the production learner's estimator.  The implementation must provide:
    job succeeds.
 
 The intended module names are
-`pbg.eval.rao_blackwell_variance` and
-`pbg.cli.rao_blackwell_variance`.  The scientific YAML must contain the
+`experiments.rao_blackwell_variance.eval.rao_blackwell_variance` and
+`experiments.rao_blackwell_variance.cli.rao_blackwell_variance`. The scientific YAML must contain the
 checkpoint list, candidate grid, $n_{\mathrm{oracle}}$, probe count/seeds,
 superbatch count, trajectory-chunk size, evaluator functional bound, precision,
 timing repetitions, memory abort threshold, and output directory.  CLI
@@ -840,11 +840,11 @@ resume-safe job filter; overrides must be recorded in the manifest.
 The complete minimal PBG file boundary is:
 
 ```text
-pbg/eval/rao_blackwell_variance.py
-pbg/cli/rao_blackwell_variance.py
-configs/experiments/nlhe_hu_32bb_rao_blackwell_variance.yaml
-tests/test_rao_blackwell_variance.py
-tests/test_rao_blackwell_variance_cli.py
+experiments/rao_blackwell_variance/eval/rao_blackwell_variance.py
+experiments/rao_blackwell_variance/cli/rao_blackwell_variance.py
+experiments/rao_blackwell_variance/configs/nlhe_hu_32bb_rao_blackwell_variance.yaml
+experiments/rao_blackwell_variance/tests/test_rao_blackwell_variance.py
+experiments/rao_blackwell_variance/tests/test_rao_blackwell_variance_cli.py
 ```
 
 Existing rollout, logical-RNG, checkpoint-loading, poker completion-input,
@@ -1537,7 +1537,7 @@ a successful inventory check.  No JSONL file has concurrent writers.
 The command-line contract is:
 
 ```text
-python -m pbg.cli.rao_blackwell_variance \
+python -m experiments.rao_blackwell_variance.cli.rao_blackwell_variance \
   --config CONFIG \
   --phase {smoke,calibrate-oracle,variance,performance,validate,analyze,all} \
   [--device DEVICE] [--resume]
@@ -1552,8 +1552,8 @@ memory gate; it never writes a success marker and continues.
 The smoke command after implementation is:
 
 ```bash
-./tools/poker-python -m pbg.cli.rao_blackwell_variance \
-  --config configs/experiments/nlhe_hu_32bb_rao_blackwell_variance.yaml \
+./tools/poker-python -m experiments.rao_blackwell_variance.cli.rao_blackwell_variance \
+  --config experiments/rao_blackwell_variance/configs/nlhe_hu_32bb_rao_blackwell_variance.yaml \
   --phase smoke --device cuda:0
 ```
 
@@ -1563,8 +1563,8 @@ idle physical GPU IDs, the resumable production command has this form:
 ```bash
 CUDA_VISIBLE_DEVICES=GPU0,GPU1,GPU2 \
   /home/pablob/.venvs/poker/bin/torchrun --standalone --nproc-per-node=3 \
-  -m pbg.cli.rao_blackwell_variance \
-  --config configs/experiments/nlhe_hu_32bb_rao_blackwell_variance.yaml \
+  -m experiments.rao_blackwell_variance.cli.rao_blackwell_variance \
+  --config experiments/rao_blackwell_variance/configs/nlhe_hu_32bb_rao_blackwell_variance.yaml \
   --phase all --resume
 ```
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 venv=/home/pablob/.venvs/poker
 toolkit=${venv}/lib/python3.10/site-packages/nvidia/cu13
-config=${repo_root}/configs/experiments/nlhe_hu_32bb_rao_blackwell_variance.yaml
+config=${repo_root}/experiments/rao_blackwell_variance/configs/nlhe_hu_32bb_rao_blackwell_variance.yaml
 gpu_ids=${PBG_VARIANCE_GPUS:-0,1}
 chunk_cooldown_seconds=${PBG_VARIANCE_CHUNK_COOLDOWN_SECONDS:-0}
 duty_run_seconds=${PBG_VARIANCE_DUTY_RUN_SECONDS:-4}
@@ -20,7 +20,7 @@ if [[ ${1:-} != "--inside-tmux" ]]; then
     echo "tmux session ${session_name} already exists; attach with: tmux attach -t ${session_name}" >&2
     exit 3
   fi
-  tmux new-session -d -s "${session_name}" "${repo_root}/tools/run-rao-blackwell-variance --inside-tmux"
+  tmux new-session -d -s "${session_name}" "${repo_root}/experiments/rao_blackwell_variance/tools/run-rao-blackwell-variance --inside-tmux"
   echo "Launched in tmux session ${session_name}."
   echo "Attach: tmux attach -t ${session_name}"
   echo "Log: ${repo_root}/runs/rao_blackwell_variance_terminal/launch.log"
@@ -85,7 +85,7 @@ echo "Launching Rao--Blackwell variance jobs on physical GPUs ${gpu_ids} with ${
 "${venv}/bin/torchrun" \
   --standalone \
   --nproc-per-node="${worker_count}" \
-  -m pbg.cli.rao_blackwell_variance \
+  -m experiments.rao_blackwell_variance.cli.rao_blackwell_variance \
   --config "${config}" \
   --phase variance \
   --resume &
@@ -145,7 +145,7 @@ if (( torchrun_status != 0 )); then
 fi
 
 "${venv}/bin/python" \
-  -m pbg.cli.rao_blackwell_variance \
+  -m experiments.rao_blackwell_variance.cli.rao_blackwell_variance \
   --config "${config}" \
   --phase analyze \
   --device cpu \

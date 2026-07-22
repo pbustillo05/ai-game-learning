@@ -1,7 +1,7 @@
 """Rao--Blackwell gradient-variance experiment utilities.
 
 The expensive runner reduces every directional gradient probe to the seven
-scalars in eq. (20) of ``docs/todo/rao_blackwell_variance_experiment.md``.
+scalars in eq. (20) of ``experiments/rao_blackwell_variance/docs/sequential.md``.
 This module owns the mergeable representation and all subsequent analysis;
 none of these routines require CUDA or retain hand-width tensors.
 """

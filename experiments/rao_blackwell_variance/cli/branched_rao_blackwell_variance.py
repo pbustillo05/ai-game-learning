@@ -15,7 +15,7 @@ from typing import Any, Mapping
 import torch
 from pbg.core.devices import resolve_execution_device, validate_workload_capabilities
 
-from pbg.eval.branched_rao_blackwell_variance import (
+from experiments.rao_blackwell_variance.eval.branched_rao_blackwell_variance import (
     BranchedVarianceRunner,
     SCHEMA_VERSION,
     atomic_json,

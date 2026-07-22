@@ -15,7 +15,7 @@ from typing import Any
 import torch
 from pbg.core.devices import resolve_execution_device, validate_workload_capabilities
 
-from pbg.eval.rao_blackwell_variance import (
+from experiments.rao_blackwell_variance.eval.rao_blackwell_variance import (
     assigned_jobs,
     atomic_json,
     canonical_jobs,
@@ -209,7 +209,7 @@ def run_variance(
     if job_filter is not None:
         jobs = tuple(job for job in jobs if job == job_filter)
     checkpoint_hashes: dict[int, str] = {}
-    from pbg.eval.rao_blackwell_variance import checkpoint_sha256
+    from experiments.rao_blackwell_variance.eval.rao_blackwell_variance import checkpoint_sha256
     for checkpoint in config["checkpoints"]:
         path = Path(config["checkpoint_dir"]) / f"ckpt_{int(checkpoint):07d}.pt"
         checkpoint_hashes[int(checkpoint)] = checkpoint_sha256(path)
@@ -243,7 +243,7 @@ def run_variance(
 
 
 def run_analysis(config: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
-    from pbg.eval.rao_blackwell_variance import (
+    from experiments.rao_blackwell_variance.eval.rao_blackwell_variance import (
         SufficientStatistics, checkpoint_sha256, variance_cube,
     )
     out = Path(config["out_dir"])
