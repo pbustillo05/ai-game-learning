@@ -1,847 +1,438 @@
-# Performance and optimization program
+# Rollout optimization program
 
-Status: rollout stopping point accepted 2026-07-22. This replaces the
-2026-07-21 list. It is an experiment log and remaining backlog, not authority
-for training semantics or storage lifetime; `docs/theory/` and its pseudocode
-remain authoritative.
+Status: eager-rollout stopping point accepted 2026-07-22. The 2,560-start
+production baseline is now established. The next pass should start with
+history-shape stabilization and a full dequeue-to-enqueue execution boundary.
 
-The optimization objective is not merely the shortest iteration. At fixed
-statistical work and an explicit memory envelope, maximize:
+This document is the performance decision log and experiment queue. It is not
+authority for sampling, estimator, target, or storage-lifetime semantics.
+`docs/theory/core_math.tex` and `docs/theory/pseudocode/` remain authoritative.
 
-1. fresh player decision nodes generated per second;
-2. useful learner rows and backward passes per second; and
-3. end-to-end fresh player nodes per second at the intended rollout-to-learner
-   reuse ratio.
+## Current result
 
-For sequential training, compare implementations at approximately one fresh
-rollout decision to two learner presentations. For branching, benchmark both
-1:1 and 2:1 rollout-to-learner ratios. A run that becomes faster only by doing
-less learner work is not an implementation speedup.
+The July 21 paged-state refactor regressed production-scale sequential-RB
+rollout from approximately 259 to 90 fresh decisions/s. The accepted fixes
+restore it to approximately 257 decisions/s on the historical-continuity gate:
 
-## Executive diagnosis
+| Frozen 2,048-start checkpoint-1110 gate | Before | Current stopping point |
+|---|---:|---:|
+| Rollout time | 87.45--90.27 s | 31.39 s median |
+| Fresh decisions | about 8,050--8,087 | 8,064.5 median |
+| Rollout time/decision | about 10.9--11.2 ms | 3.892 ms |
+| Raw rollout throughput | about 90--92 decisions/s | 256.9 decisions/s |
+| Model calls | about 140 | 118 |
+| Padded attention pairs | 33.149 billion in the reproduction | 31.229 billion |
+| Peak allocated/reserved | not comparable | 4.607/9.071 GB |
 
-The largest opportunity is the rollout hot path. The current learner is about
-10% faster per optimizer step than the July 17 historical record, but the
-matched two-GPU iteration spends 2.57 times as long in rollout. Git bisection
-and a controlled intervention identify the largest known cause: commit
-`a399e30` replaced direct structure-of-arrays state indexing with a generic
-paged-column facade on every hot poker-state field. On the same commit, seeds,
-492 decisions, 24 model calls, and 2.040 billion padded attention pairs,
-replacing only that facade with the preceding flat state implementation reduced
-rollout from 3.758 to 1.961 seconds. The queue family and 64-row policy pack were
-already present in the faster implementation; the queue idea is not the
-regression.
+This is about a 64% rollout-time reduction and 2.8x raw throughput improvement
+against the audited regression. It is within about 1% of the pre-refactor raw
+record. The first required 2,560-start gate subsequently established a 3.827
+ms/decision current baseline, or 261.3 decisions/s. End-to-end two-rank
+performance at a fixed learner/fresh ratio has not yet been re-established.
 
-The audited rollout also repeated legal-action, history, selected-log-
-probability, reach, and serialization work around every model call. A bounded
-operator profile found about 790 kernel launches and 20 implicit stream
-synchronizations per fresh decision; attention accounted for only about 21% of
-self CUDA time in that diagnostic. The dense-slab fix removed the dominant page
-facade cost, and pack-local reuse now removes several duplicated computations.
-History packing, reach updates, transition routing, and eager launch structure
-remain the next meaningful costs.
+## Mandatory production benchmark contract
 
-The second immediate issue is configuration. Recent sustained A/B runs used
-the conservative `local_3x2080ti` profile even when one card was assigned. That
-profile admitted only 15 preflop and 3 postflop learner rows per physical
-subspan, causing roughly 20 forward/backward subspans per optimizer step. The
-10 GiB two-card profile admitted 54/10 rows in the historical-geometry run,
-only two subspans per step. Memory admission must describe the card envelope,
-not the number of participating ranks.
+Do not accept an optimization using 128 or 512 starts. Those sizes are only for
+debugging correctness, crashes, and gross regressions.
 
-Larger rollout packs help, but only within the memory contract. Moving from 64
-to 96 family rows improved a 512-root iteration by 16.6%, while 128 rows failed
-the downstream workspace-closure guard. The completed production sweep chose
-84 rows at about 9.07 GB median reservation. Width 88 and above remains
-diagnostic because it leaves insufficient room below a literal
-10,000,000,000-byte hard ceiling.
+### Workload
 
-## Implementation progress: dense live-state boundary
+| Setting | Required value |
+|---|---|
+| Game/mode | HU NLHE, 32 bb, 13 ranks, sequential Rao--Blackwell |
+| Config | `configs/train/nlhe_hu_32bb_rb.yaml` |
+| Hardware profile | `local_2x2080ti` (explicit SDPA selection) |
+| Device | CUDA on one otherwise idle RTX 2080 Ti for the rollout gate |
+| Trajectory starts | 2,560 per GPU, the configured production value; never below 2,500 |
+| Checkpoint | Highest-numbered checkpoint in `runs/nlhe_hu_32bb_full_sequential_rb`; currently `ckpt_0001110.pt` |
+| Completion samples | 1,024 |
+| Family rows | 84 unless that parameter is the experiment |
+| Active trajectories | 64 unless that parameter is the experiment |
+| Configured storage page rows | 256 unless that parameter is the experiment |
+| Warmup/repeats | At least 1 warmup and 3 timed repeats; use 5 repeats before changing a production default |
+| Rollout-isolation learner work | One learner step; never present this as end-to-end production throughput |
+| End-to-end confirmation | Two ranks, minibatch 128, 116 learner steps/rank, and report the realized learner-presentations/fresh-decision ratio |
 
-The rollout pass reached its stopping point on 2026-07-22. The accepted
-performance gate is a production-scale single-GPU sequential-RB workload with
-2,048 trajectory starts, the model weights from checkpoint 1110 in
-`runs/nlhe_hu_32bb_full_sequential_rb`, 1,024 completion samples, one learner
-step, and one warmup. The earlier 128- and 512-root probes remain debugging
-tools and are not release performance evidence. The checkpoint wrapper was
-schema-migrated only for the benchmark; model parameters were unchanged.
+Resolve the checkpoint again before every experiment; do not hard-code an older
+checkpoint after a newer one appears. Record its path, iteration, and SHA-256
+in the benchmark artifact. Checkpoint loading is strict and accepts only the
+current schema. If the latest trained checkpoint predates that schema, use a
+read-only current-schema benchmark wrapper containing the exact same model
+weights and record both identities. Never substitute random initialization.
 
-The implementation makes mutable state/history a distinct physical domain.
-For sequential rollout it admits one recyclable dense slab of
-`roots_per_gpu + family_batch_rows` rows, the exact live-frontier high-water
-bound observed and implied by the scheduler's parent/child overlap.  Logical
-topology ids remain separate.  Parents still release their slots after all
-successors and immutable retained rows commit, history remains refcounted, and
-the memory plan charges the full slab capacity.  Append-only topology,
-decision, action, and leaf ownership retain their own page geometry.
+At this stopping point, `ckpt_0001110.pt` is schema v3 while the runtime accepts
+only schema v6. The validated exact-weight wrapper used for these measurements
+is `/tmp/pbg_ckpt_0001110_v6_benchmark.pt`. Because `/tmp` is ephemeral, verify
+that it exists and that every model tensor equals the source checkpoint before
+using it; regenerate an equivalent read-only wrapper if it does not. This is a
+benchmark artifact, not permission to restore legacy loading in production.
 
-Within a resolved live slab, `PagedTensorColumn` now delegates ordinary tensor
-indexing directly to the dense field.  The generic arena also has direct
-single-page gather/write paths, and whole-row replacement no longer gathers
-the field that it is about to overwrite.  Multi-page append-only arenas retain
-their generic checked implementation.
+Example single-GPU rollout gate, after confirming the selected GPU is idle:
 
-The complete production progression is:
+```bash
+source /home/pablob/.venvs/poker/bin/activate
+export CUDA_HOME=/home/pablob/.venvs/poker/lib/python3.10/site-packages/nvidia/cu13
+export PATH="$VIRTUAL_ENV/bin:$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
 
-| 2,048-start sequential-RB measurement | Decisions | Model calls | Padded attention pairs | Rollout | Raw rollout decisions/s |
+CUDA_VISIBLE_DEVICES=1 python -m pbg.cli.benchmark \
+  --config configs/train/nlhe_hu_32bb_rb.yaml \
+  --checkpoint /tmp/pbg_ckpt_0001110_v6_benchmark.pt \
+  --hardware-profile local_2x2080ti \
+  --device cuda \
+  --mode rao_blackwell \
+  --roots-per-gpu 2560 \
+  --completion-samples 1024 \
+  --family-batch-rows 84 \
+  --max-active-trajectories 64 \
+  --gd-steps 1 \
+  --warmup 1 \
+  --repeats 3 \
+  --output /tmp/nlhe_rollout_candidate.json
+```
+
+The wrapper in this example corresponds to the latest source checkpoint as of
+2026-07-22. Replace both source and wrapper when the run directory contains a
+newer checkpoint. Do not omit `--hardware-profile`: this training config does
+not embed a profile, and omission selects the rejected automatic/FlexAttention
+path rather than the production SDPA path.
+
+### Benchmark and commit discipline
+
+For every candidate:
+
+1. Check `nvidia-smi` before CUDA work and select only an idle GPU. Do not touch
+   another user's process.
+2. Change one performance idea at a time. Preserve fixed seeds, checkpoint,
+   workload, statistical work, and logical RNG addressing.
+3. Run a small correctness probe if needed, then the mandatory 2,560-start
+   gate. Report every raw sample, not just the median.
+4. Compare rollout seconds/decision first. Also report decisions, calls, padded
+   tokens/pairs, phase times, allocated/reserved bytes, and teardown state.
+   Raw samples are authoritative for optional per-family/per-street metrics:
+   the current median aggregator intersects optional keys, so a tiny repeat can
+   erase a stratum that exists in other samples.
+5. Run the relevant semantic tests and CUDA acceptance tests. A speedup with a
+   storage-lifetime, target, RNG, or gradient change is not accepted.
+6. Confirm the GPU returns to its pre-benchmark idle state.
+7. Commit each successful optimization separately. Do not accumulate several
+   unmeasured wins in one implementation commit.
+8. Immediately update this document with the result and implementation commit
+   hash in a small follow-up documentation commit. This avoids the impossible
+   circular requirement of putting a commit's own hash inside itself.
+9. Rejected code must not remain on the production path. Record the rejection
+   and evidence here.
+
+A result should normally improve the production median by at least 3% or have a
+clear paired confidence interval before adding structural complexity. Smaller
+changes can be accepted when they simplify the hot path or reduce memory with
+no semantic cost, but must be labeled as such.
+
+## Times to beat
+
+The primary cross-run gate is time per fresh decision because different seeds
+and checkpoints realize different tree lengths.
+
+| Gate | Time to beat | Equivalent throughput | Notes |
+|---|---:|---:|---|
+| Current eager baseline | **3.827 ms/decision** | **261.3 decisions/s** | Median at the required 2,560 starts after `48ce2a3` |
+| Pre-refactor raw rollout record | **3.863 ms/decision** | **258.9 decisions/s** | 19.51 s for 5,051 decisions on July 17 |
+| Rollout stretch target | **3.090 ms/decision** | **323.6 decisions/s** | 25% above the pre-refactor raw rate |
+| Historical end-to-end record | n/a | **123.4 global fresh decisions/s** | Two ranks; must match learner/fresh ratio before comparison |
+| End-to-end stretch target | n/a | **154.3 global fresh decisions/s** | 25% above the historical record at a true 2.0 learner/fresh ratio |
+| Memory ceiling | n/a | n/a | Torch peak reserved must stay below 10,000,000,000 bytes on the 2080 Ti profile |
+
+The old 87.45-second paged-state result is a regression floor, not a meaningful
+target. Do not claim a win merely for beating it. Do not compare absolute
+rollout seconds across different realized decision counts; compare paired
+seconds/decision and include the raw counts.
+
+## Optimization project commits
+
+| Commit | Role | Result |
+|---|---|---|
+| `32adb8c` | Pre-optimization marker | Reproducible starting point for this pass |
+| `d95b7d3` | Dense recyclable live-state slab | Removed generic `PagedTensorColumn` page scans from hot mutable state while preserving bounded live-frontier ownership |
+| `be0b009` | Safe family width 84 | Improved packing while retaining about 0.95 GB below the decimal 10 GB ceiling |
+| `5ecfeb4` | Direct contiguous arena appends | Avoided generic arbitrary-row page matching for already-proven contiguous reservations; about 1.1% in the paired sample |
+| `cf6bc34` | Leaner multi-page gathers | Removed the zero-seed/first-page merge; about 0.35% and lower reservation in the paired sample |
+| `83aab85` | Finish eager rollout pass | Exact-street execution queues, pack-local public/legal/history and selected-logp reuse, fixed-width transition updates, and the final benchmark record |
+| `48ce2a3` | Immediate child commit fast-path | Used host-proven contiguous cursors for the unsplit sequential child commit; 0.26--0.50% paired gain at 2,560 starts |
+
+Commit `f0b049b` occurred during the sweep but is a compatibility-schema
+cleanup, not a credited performance optimization.
+
+## ROI-ordered backlog
+
+Priority applies to the next work. Closed items remain in the same table so an
+experiment is not accidentally repeated. Status must be exactly `Open`,
+`Implemented in <hash>`, or `Rejected`.
+
+| ROI | Idea | Status | Evidence or acceptance gate |
+|---:|---|---|---|
+| 1 | Bucket history at 8/16/32/42 tokens and replace dynamic recycling with fixed-capacity device worklists | Open | History still runs six binary-lift levels over width 42 and uses dynamic `unique`/boolean compaction; require fewer launches/syncs and unchanged lifetime |
+| 2 | Build an allocation-free dequeue-to-enqueue pack and compile/capture it per exact family and row bucket | Open | About 790 launches/decision in the bounded profile; require at least 15% rollout gain, bounded graph workspaces, and unchanged logical RNG |
+| 3 | Fuse remaining transition, reach, routing, and retained-write preprocessing | Open | Public/legal/history and selected logp are already reused; require at least 15% for a complex fused implementation |
+| 4 | Finish and re-baseline vectorized CUDA target recurrences | Open | Require exact targets, no per-node D2H, and at least 2x target speedup; especially relevant for branching |
+| 5 | Use the 10 GB card envelope independently of participating rank count | Open | The conservative multi-card profile caused about 20 learner subspans/step versus two in the historical geometry; require unchanged loss/topology and no more than 10 GB |
+| 6 | Capture learner gather + forward + loss + backward by partition/shape | Open | Require at least 15% learner compute gain with identical gradients and fixed rows/step |
+| 7 | Add policy-only reference forward/cache | Open | Reference cache had a 7.59 s ceiling and retains unused value/branching outputs; require matching KL and lower bytes/time |
+| 8 | Gate detailed CUDA events and fuse finite/norm/clip reductions | Open | Preserve skip/clip semantics while reducing launches and host decisions |
+| 9 | Precompute or bit-pack immutable learner descriptors | Open | Accept only with net admitted-byte benefit and faster sampled subspans |
+| 10 | Keep active preflop reach in natural 169-class form until one bounded flop expansion | Open | Require exact reach and sampling equivalence |
+| 11 | Overlap gradient communication with final backward buckets | Open | Only a 3.16 s measured ceiling; require identical reduced flat gradients |
+| 12 | Replace the allocator `empty_cache()` boundary with measured reusable-space admission | Open | Require no OOM regression across adversarial phase closures |
+| 13 | Deterministic small-k chance selection instead of sorting all 52 scores | Open | Preserve the exact counter-key sampling law or obtain explicit approval for an equivalent law |
+| — | Dense recyclable live-state slab | Implemented in `d95b7d3` | Dominant regression fixed; mutable capacity remains proportional to the admitted live frontier, not total nodes |
+| — | Tune production family width | Implemented in `be0b009` | Width 84 selected; width 88 was only 1.5% faster and left about 158 MB below 10 GB |
+| — | Direct contiguous append commit | Implemented in `5ecfeb4` | About 1.1% matched gain with unchanged ownership |
+| — | Trim generic multi-page gather | Implemented in `cf6bc34` | About 0.35% matched gain; small but essentially free |
+| — | Split physical postflop execution by exact street | Implemented in `83aab85` | About 5.6% fewer padded pairs at family 64 and about 4.9% lower rollout in the progression |
+| — | Reuse public/history/legal representation and selected policy logp within a pack | Implemented in `83aab85` | Removes duplicate encoding/log-probability work without extending state lifetime |
+| — | Remove dynamic fold compaction and its host synchronization | Implemented in `83aab85` | Fixed-width masked update was about 1% faster in the matched sample |
+| — | Commit immediate unsplit child batches contiguously | Implemented in `48ce2a3` | Median 3.827 versus 3.846 ms/decision; a small, consistent, essentially free hot-path simplification |
+| — | Raise production width to 88 or 96 | Rejected | Faster, but 88 reserved 9.84 GB and 96 reserved 10.497 GB; insufficient 2080 Ti headroom |
+| — | Use 4,096-row cold-storage chunks | Rejected | Only about 0.3% faster than the bounded derived chunk |
+| — | Flexible/automatic attention dispatch | Rejected | 56.078 s versus about 31.86 s with SDPA |
+| — | Widen active trajectory window without widening family packs | Rejected | Active windows 32 and 64 were effectively tied once family packs filled |
+| — | Optimize scheduler control transfers or sealing first | Rejected | Scheduler control was 4.4 ms and sealing about 13 ms per full iteration |
+| — | Whole-iteration CUDA graph | Rejected | Conflicts with bounded dynamic realized work; capture fixed pack shapes instead |
+| — | Move poker transitions to CPU | Rejected | Violates the accelerator-only hot-path contract and adds strict device/host dependencies |
+
+## Accepted benchmark evidence
+
+### Production progression
+
+These are 2,048-start historical-continuity measurements using checkpoint 1110
+weights, 1,024 completion samples, and one learner step. They are retained to
+explain the accepted commits; new work must use the 2,560-start contract above.
+
+| Implementation | Decisions | Calls | Padded pairs | Rollout | Raw decisions/s |
 |---|---:|---:|---:|---:|---:|
 | Audit matched baseline, family 64 | about 8,050 | 139.5 | not recorded | 87.45 s | about 92.1 |
-| Pre-fix reproduction, seed 101 | 8,087 | 140 | 33.149 billion | 90.27 s | 89.6 |
-| Dense live slab and efficient append-only chunks, family 64 | 8,233 | 141 | 34.057 billion | 35.72 s | 230.5 |
-| Exact-street physical queues, family 80 | 8,255 | 123 | 32.277 billion | 32.46 s | 254.3 |
-| Final safe family 84, two-repeat median | 8,064.5 | 118 | 31.229 billion | 31.39 s | 256.9 |
+| Pre-fix reproduction, seed 101 | 8,087 | 140 | 33.149 B | 90.27 s | 89.6 |
+| Dense live slab and efficient chunks, family 64 | 8,233 | 141 | 34.057 B | 35.72 s | 230.5 |
+| Exact-street queues, family 64 | 8,233 | 145 | 32.145 B | 33.98 s | 242.3 |
+| Exact-street queues, family 80 | 8,255 | 123 | 32.277 B | 32.46 s | 254.3 |
+| Final family 84, two-repeat median | 8,064.5 | 118 | 31.229 B | 31.39 s | 256.9 |
 
-The final family-84 samples were 32.170 seconds for 8,248 decisions and 30.603
-seconds for 7,881 decisions. Median total iteration time, including one learner
-step, was 32.455 seconds. Median peak allocation was 4.607 GB and median peak
-reservation was 9.071 GB. Against the matched audit baseline, rollout time fell
-about 64% and raw rollout throughput rose about 2.8 times. The raw result is
-within about 1% of the July 17 historical rollout rate of 258.9 decisions/s;
-the available samples do not establish that it has surpassed that record.
+The two final family-84 samples were 32.170 seconds for 8,248 decisions and
+30.603 seconds for 7,881 decisions. Median total time with one learner step was
+32.455 seconds. The final fixed-width fold update later measured 31.856 seconds
+for the same 8,248-decision sample that had taken 32.170 seconds. Immutable
+event-id caching and the identity-matched cache fast path were CUDA-tested but
+not credited separately.
 
-The accepted implementation consists of:
+### Required 2,560-start baseline
 
-- a recyclable dense live-state slab sized from the configured controller
-  frontier plus one family pack, rather than generated-node capacity;
-- direct single-slab state access and direct contiguous append commits, while
-  retained/topology storage remains realized-work, chunked, and byte-admitted;
-- append-only rollout chunks at the bounded live-state geometry, eliminating
-  hundreds of tiny cold-storage pages without restoring an all-node state
-  table;
-- physical postflop queues split by exact street and live-player count, mapped
-  back to the unchanged natural learner partitions;
-- one selected policy log-probability per pack, reused by reach and retention,
-  and reuse of the pending public/history/legal representation when capture
-  consumes the same physical pack; and
-- fixed-width masked fold/acted updates, removing the per-pack
-  `bool(fold.any())` synchronization and dynamic boolean compaction.
+Commit `48ce2a3` established the first baseline under the mandatory production
+contract. It specializes only the immediate unsplit sequential child commit;
+branched subspan commits retain arbitrary-row routing. Source checkpoint
+`ckpt_0001110.pt` (schema v3, SHA-256
+`bced881945512f2a4152d3acd88a0a06395a00130cdf68a61aa2652bc1b5aebb`)
+was represented by exact-weight schema-v6 wrapper SHA-256
+`b72fb7f313032114f605ac665d1c80741a4bb8b9993dfe68cfc7b48947010603`.
+All 366 model tensors were equal. Repeat seeds were 104830, 209559, and 314288
+on one RTX 2080 Ti with PyTorch 2.12.1, CUDA 13.0, and explicit
+`local_2x2080ti` SDPA execution.
 
-Exact-street queues reduced padded attention work by about 5.6% at family 64.
-The final masked fold update produced 31.856 seconds for the same 8,248-decision
-sample that previously took 32.170 seconds, an additional approximately 1%
-gain. Immutable event-id caching and removal of a redundant identity check were
-included after that sample; identity-matched packs now skip the redundant
-equality assertion. These changes were CUDA-tested but not credited separately.
+| Repeat | Decisions | Calls | Padded pairs | Baseline rollout | Candidate rollout | Baseline/candidate ms per decision | Gain |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 10,316 | 147 | 40.625 B | 39.509 s | 39.399 s | 3.830 / 3.819 | 0.28% |
+| 2 | 9,745 | 149 | 37.480 B | 37.647 s | 37.550 s | 3.863 / 3.853 | 0.26% |
+| 3 | 10,201 | 144 | 39.913 B | 39.238 s | 39.041 s | 3.846 / 3.827 | 0.50% |
 
-Family 84 is the production choice for the 2080 Ti profile. Family 88 was about
-1.5% faster in an earlier width sweep but reserved 9.84 GB, leaving only about
-158 MB below the decimal 10 GB ceiling. It remains a diagnostic point, not the
-default. A 4,096-row cold-storage chunk improved rollout only from 32.464 to
-32.369 seconds, about 0.3%, and was rejected. Flexible/automatic attention took
-56.078 seconds versus approximately 31.86 seconds with SDPA and was also
-rejected.
+Candidate peak allocation was 4.624--4.625 GB and peak reservation was
+8.852--8.921 GB. Post-process teardown left 17.4 MB allocated and 130.0 MB
+reserved, and `nvidia-smi` showed the GPU back at its 6 MiB display-only idle
+state. Focused validation was 31 passed and one skipped in the storage/tree
+suite plus the CUDA topology test. The gain is below the ordinary 3% threshold
+and is credited only because it removes generic page matching from a
+host-proven contiguous write without changing the arbitrary-row path.
 
-The small storage micro-optimizations remain accepted: direct page-slice
-append commits reduced a matched family-84 sample by 1.1%, and seeding a
-multi-page gather from its first page instead of a zero allocation reduced a
-matched sample by 0.35%. Neither changes storage lifetime or capacity.
+An earlier invocation without `--hardware-profile local_2x2080ti` measured
+6.635--6.695 ms/decision because it selected automatic/FlexAttention. That is
+invalid baseline evidence and led to the explicit-profile contract correction
+above.
 
-Validation at the stopping point produced 247 passed and 37 skipped in the
-general suite. The full CUDA suite produced 272 passed, 10 skipped, and two
-failures in the stateful inference API caused by the separately audited
-preflop class/combo output shape mismatch at `pbg/inference.py:596`; neither
-failure enters rollout. The final focused CUDA rollout gate produced 30 passed
-and two skipped. The benchmark GPU returned to its clean idle allocation.
+### Root-cause bisection
 
-This is the stopping point for the eager rollout pass. Further progress now
-requires a larger architectural step--history bucketing or an allocation-free
-dequeue-to-enqueue compiled/graph boundary--rather than more page-size or
-attention-dispatch tuning.
+Commit `a399e30` introduced the large discontinuity by replacing direct
+structure-of-arrays state indexing with generic paged-column access on every
+hot poker field. On a controlled 128-start workload with identical 492
+decisions, 24 model calls, and 2.040 billion padded pairs:
 
-Sequential target construction and especially branched target construction
-still contain or recently contained host-driven recurrences. A concurrent
-dirty-worktree change began vectorizing sequential targets while these
-measurements were being collected, so target timings must be re-baselined from
-a settled revision. The architectural conclusion remains: all target payload
-and recurrence work belongs on CUDA, with only bounded structural summaries at
-declared control boundaries.
-
-## Measurement provenance and limitations
-
-Measurements used RTX 2080 Ti GPUs 0 and 1; GPU 2 was left idle. Each CUDA
-process was explicitly assigned a device and teardown was checked. The Python
-environment was `/home/pablob/.venvs/poker`, PyTorch was 2.12.1+cu130, and the
-cards have compute capability 7.5 and 11,264 MiB physical VRAM.
-
-The investigation began at commit `b9a42fbca95da10f7f892ef3d79033dcb22ee284`
-and the early diagnostic sweep crossed concurrent storage, target, learner, and
-poker-evaluator edits. The final family-84 median and focused CUDA gate were
-collected on one settled source snapshot; the commit containing this document
-is the stopping revision. Consequently:
-
-- the final family-84 result is the new eager-rollout baseline, while earlier
-  rows remain diagnostic progression evidence;
-- every artifact records its checkpoint, workload, seeds, and environment;
-- comparisons that crossed a live source edit are identified as candidates to
-  rerun, not accepted A/B conclusions; and
-- no numerical loss from a newly initialized branching head is treated as a
-  trained-policy result.
-
-The benchmark harness needed one correctness repair before branching could be
-measured. Mode conversion now clears every branching-only control for normal
-and sequential-RB modes, preserves native branching configuration, and
-requires an explicit finite queue capacity when synthesizing a branched probe
-from a sequential config. The selected branching mode and queue capacity are
-now part of workload provenance. Six focused benchmark-gate tests pass.
-
-One harness defect remains: median aggregation intersects optional metric keys,
-so a tiny branching repeat can erase useful strata that were present in other
-samples. Raw samples are authoritative until aggregation uses a declared
-metric schema and reports missing strata explicitly.
-
-## Historical comparison
-
-The strongest comparable historical record is the July 17 two-GPU HU 32 bb
-sequential-RB run with 2,048 roots per rank, 1,024 completion samples, a
-64-row minibatch, and 232 optimizer steps. The current reproduction used the
-nearest loadable checkpoint rather than the exact historical model, so rollout
-topology is close but not identical.
-
-| Quantity | July 17 record | 2026-07-22 diagnostic | Change |
-|---|---:|---:|---:|
-| Total iteration | 93.13 s | 115.68 s | 24.2% slower |
-| Rollout | 19.51 s | 50.13 s | 2.57x slower |
-| Targets | 4.15 s | 2.84 s | 31.6% faster in this full run |
-| Learner total | 69.43 s | 62.70 s | 9.7% faster |
-| Learner time/step | 299.3 ms | 270.3 ms | 9.7% faster |
-| Learner forward | 18.83 s | 16.24 s | 13.7% faster |
-| Learner backward | 33.87 s | 30.62 s | 9.6% faster |
-| Reference cache | 8.79 s | 7.59 s | 13.6% faster |
-| Gradient synchronization | 3.20 s | 3.16 s | approximately flat |
-| Peak allocated / reserved | 4.45 / 6.80 GiB | 3.15 / 5.21 GiB | lower |
-| Global fresh decisions/s | 123.4 | about 87.3 | about 29% lower |
-
-That table records the original regression reproduction, not the optimized
-stopping point. The final single-GPU production gate reached approximately
-256.9 raw rollout decisions/s, versus approximately 258.9 for the historical
-raw rollout. End-to-end comparison still requires a settled two-rank run at the
-same learner/fresh reuse ratio; the one-step rollout gate must not be presented
-as a replacement for that experiment.
-
-The current rank realized 5,051 fresh decisions and presented 14,848 learner
-rows, a reuse factor of 2.94. That exceeds the intended sequential factor of
-about 2. At fixed measured per-step cost, 158 rather than 232 steps would be
-near a factor of 2, but this is a workload calibration, not an optimization
-claim. Implementation comparisons must hold this ratio fixed.
-
-There is an important target-timing discrepancy to preserve in the baseline:
-an older exact 5,051-decision artifact reported 1.055 s for targets, versus
-2.836 s in the current two-rank reproduction. The full July 17 report reported
-4.15 s. The new vectorized target work should be accepted only after one exact
-artifact and timing definition explain this difference.
-
-Recent 60-iteration sustained runs are not directly comparable to the July 17
-record because they used 512 roots, 16 learner steps, minibatch 128, and the
-`local_3x2080ti` workspace envelope. Their useful diagnosis is structural:
-
-| Mode | Decisions | Total | Rollout | Targets | Learner | Physical subspans/step |
-|---|---:|---:|---:|---:|---:|---:|
-| Normal | 2,519 | 87.13 s | 29.07 s | 0.26 s | 57.79 s | about 20 |
-| Sequential RB | 2,920 | 94.93 s | 34.41 s | 1.32 s | 59.18 s | about 20 |
-
-Those learner times are dominated by an unnecessarily narrow workspace plan,
-not by the statistical minibatch size itself.
-
-### Rollout regression bisection
-
-The family scheduler is not new. Commit `181ab70` made it the sole rollout path
-on July 16, before the fast July 17 record. Git blame shows that dequeue,
-64-row family formation, model forward, action sampling, poker transition,
-reach update, and successor classification in the present loop mostly descend
-from `181ab70` and `e9e2aff`. The large discontinuity instead begins at
-`a399e30` (`refactor(core): add byte-admitted rollout storage`) on July 21.
-
-Archived snapshots of `1cde6de` immediately before that commit and `a399e30`
-were run with the same checkpoint, HU 32 bb sequential RB workload, 128 roots,
-node budget 43, family rows 64, active rows 32, 16 completion samples, one
-16-row learner step, one warmup, and three timed repeats. The pre-refactor
-median rollout was 1.965 seconds; unmodified `a399e30` was 3.718 seconds even
-though both medians made 24 model calls and nearly identical padded model work.
-
-A stricter two-stage intervention was then made only in a temporary `a399e30`
-archive:
-
-| `a399e30` diagnostic | Decisions | Model calls | Padded attention pairs | Rollout | Total |
-|---|---:|---:|---:|---:|---:|
-| Paged state, new history zero-writes removed | 492 | 24 | 2,040,271,723 | 3.758 s | 4.126 s |
-| Prior flat state backend, same history control | 492 | 24 | 2,040,271,723 | 1.961 s | 2.317 s |
-
-Removing the new history initialization writes alone did not improve the
-result. Replacing the paged state backend recovered the entire pre-refactor
-rollout time across all three paired samples. This isolates the state access
-abstraction, rather than model work, queue fill, topology, learner work, or the
-new history initialization, as the cause of the approximately 1.9x step at
-that commit. The present small-workload regression is smaller because later
-changes recovered some time, but the same facade remains in the hot path.
-
-## Current controlled experiments
-
-Unless noted otherwise, these used checkpoint 1110 from
-`runs/nlhe_hu_32bb_full_sequential_rb`, fixed benchmark seeds, one warmup, and
-three timed repeats on one idle 2080 Ti.
-
-### Mode and phase baseline
-
-At 128 roots, 16 completion samples, family rows 64, active trajectories 32,
-and one 16-row learner step:
-
-| Mode | Decisions | Total | Rollout | Targets | Learner | Decisions/s | Peak allocated / reserved |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Normal | 492 | 3.590 s | 3.291 s | 0.048 s | 0.239 s | 129.5 | 2.77 / 5.10 GiB |
-| Sequential RB | 495 | 3.730 s | 3.261 s | 0.235 s | 0.212 s | 124.9 | 2.72 / 5.02 GiB |
-
-With deliberately little learner work, rollout owns 87--92% of the iteration.
-RB target work is visible, but it is much smaller than rollout at this size.
-
-### Rollout family width and active-window sweep
-
-The 128-root family-width sweep gave:
-
-| Family rows | Median decisions | Rollout | Approx. rollout ms/decision | Model calls | Peak allocated / reserved |
-|---:|---:|---:|---:|---:|---:|
-| 16 | 494 | 6.905 s | 14.0 | 41 | 1.00 / 1.85 GiB |
-| 32 | 494 | 4.591 s | 9.3 | 27 | 1.72 / 3.38 GiB |
-| 64 | 495 | 3.261 s | 6.6 | 19 | 2.72 / 5.02 GiB |
-
-The previous document's claim that 32 and 64 rows were tied is stale for the
-trained checkpoint and current code. Sixty-four rows reduced rollout time per
-decision by about 29% relative to 32 and by about 53% relative to 16. The gain
-tracks fewer model calls and kernel-launch groups.
-
-At 512 roots, family 64 with active windows 32 and 64 was effectively tied:
-15.35 versus 15.42 s of rollout and 113.4 versus 114.5 end-to-end decisions/s.
-Widening the active trajectory window alone is not useful once the family pack
-is already full.
-
-At the same 512-root geometry, moving family rows from 64 to 96 reduced model
-calls from about 50 to 38, rollout from 15.42 to 12.58 s, and total time from
-17.18 to 14.33 s. End-to-end throughput rose from 114.5 to 138.3 decisions/s,
-a 20.8% throughput gain (16.6% less time). Median reserved memory rose from
-5.57 to 8.49 GiB. Family rows 128 failed cleanly before backward because the
-10 GiB plan could not close downstream completion and learner workspace.
-
-A settled, paired production sweep then ran 64 rows on GPU 1 and 96 rows on GPU
-0 simultaneously. The processes launched four seconds apart and loaded the
-same source snapshot, checkpoint, and repeat seeds before later worktree edits;
-GPU 2 remained idle:
-
-| Family rows | Decisions | Model calls | Rollout | Total | Decisions/s | Peak allocated / reserved |
-|---:|---:|---:|---:|---:|---:|---:|
-| 64 | 8,050 | 139.5 | 87.45 s | 88.55 s | 90.9 | 3.34 / 6.16 GiB |
-| 96 | 8,071 | 98.0 | 70.49 s | 71.59 s | 112.7 | 4.79 / 9.78 GiB |
-
-Ninety-six rows cut rollout time by 19.4%, total time by 19.2%, and increased
-end-to-end throughput by 24.0%. The two raw repeat pairs showed the same large
-gap. It reserved 10,497,294,336 bytes and allocated 5,145,100,288 bytes at
-median peak. This validates the throughput gain, but the point nearly consumes
-the current profile and violates a decimal 10 GB limit. The next sweep should
-find the largest safe intermediate width, likely in the 80--88 range, rather
-than adopting 96 as the 2080 Ti default.
-
-### Branching diagnostic
-
-No loadable checkpoint in the inspected run set has trained current T/C heads.
-An older six-player checkpoint predates the present branching heads and compact
-postflop schema. The only current branch measurement therefore used the trained
-sequential trunk plus newly initialized T/C heads, fixed beta 2.3, a 4,096-row
-queue, and a 1,000-node duplication cutoff.
-
-One representative sample produced 2,128 nodes and 1,346 decisions in 15.73 s:
-
-| Phase | Seconds | Share |
+| `a399e30` intervention | Rollout | Total |
 |---|---:|---:|
-| Rollout | 14.029 | 89.2% |
-| Targets/completion | 1.458 | 9.3% |
-| Learner | 0.228 | 1.5% |
-| Seal | 0.012 | 0.1% |
+| Paged state, history zero-write control | 3.758 s | 4.126 s |
+| Prior flat state backend, same control | 1.961 s | 2.317 s |
 
-About 97.5% of its decisions were postflop and 75.5% were on the river. Another
-repeat collapsed to five nodes because the branching heads are untrained. This
-is useful evidence for phase costs and late-street geometry, not a stable
-throughput baseline. A trained T/C checkpoint or fixed replayable topology is
-required before accepting branch optimizations.
+Removing history initialization alone did not help. Replacing paged hot state
+recovered the entire pre-refactor time in all paired samples. The queue family
+and 64-row packs existed before the regression and were not its cause.
 
-## Time and memory anatomy
+### Width and memory evidence
 
-For the current 232-step two-GPU reproduction, the phase shares were:
+| Family rows | Decisions | Calls | Rollout | ms/decision | Peak allocated/reserved |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 8,233 | 141 | 36.228 s | 4.400 | 3.63/6.62 GB |
+| 84 | 8,283 | 112 | 33.723 s | 4.071 | 4.60/9.05 GB |
+| 88 | 8,262 | 107 | 33.118 s | 4.008 | 4.80/9.84 GB |
 
-| Phase/component | Seconds | Share of iteration | Optimization ceiling |
-|---|---:|---:|---|
-| Rollout | 50.13 | 43.3% | largest end-to-end regression |
-| Targets | 2.84 | 2.5% | host recurrence; larger branch share |
-| Learner total | 62.70 | 54.2% | large absolute budget |
-| └ backward | 30.62 | 26.5% | graph/fusion candidate |
-| └ forward | 16.24 | 14.0% | graph/fusion candidate |
-| └ reference cache | 7.59 | 6.6% | compute only consumed policy fields |
-| └ gradient sync | 3.16 | 2.7% | lower ROI than July estimate |
-| └ loss | 2.28 | 2.0% | include in learner graph |
-| └ optimizer | 2.10 | 1.8% | leave outside first graph |
-| Seal | 0.013 | negligible | not a target |
+Width 84 is the safe 2080 Ti choice. Width 128 failed the downstream workspace
+closure guard. Low learner live memory does not justify a larger rollout
+capacity: phase admission must account for reserved memory, non-Torch
+occupancy, graph workspaces, completion, sealing overlap, and learner closure.
 
-Manually declared scheduler synchronization was only 198 calls and 4.4 ms in
-the full iteration. This does not mean the host is irrelevant. It means queue
-control traffic is cheap. Python kernel issuing and implicit synchronization
-from dynamic-shape CUDA operations remain expensive and are not counted by the
-manual scheduler metric.
+### Operator and phase ceilings
 
-Memory is phase-shaped rather than cumulative. In the full 96-row probe:
+A bounded 32-start profile was wall-time distorted but useful for counts:
 
-| Boundary | Allocated | Reserved | Interpretation |
-|---|---:|---:|---|
-| Iteration start | 0.23 GiB | 2.87 GiB | model/optimizer/reference plus allocator cache |
-| Rollout peak | 4.79 GiB | 9.78 GiB | actual iteration peak and limiting phase |
-| Pre-optimization live | 0.40 GiB | 9.78 GiB | most reservation reusable after rollout release |
-| Learner peak | 2.64 GiB | 2.88 GiB | much lower after cache release |
-| Iteration end | 0.40 GiB | 2.88 GiB | no retained rollout owner |
-
-The 4.99 GiB gap between peak allocated and reserved is allocator-held slack,
-not live tensors. Admission nevertheless has to respect reserved memory plus
-non-Torch occupancy on an 11,264 MiB card. Do not raise a global capacity based
-on low learner live memory; preserve last-consumer phase closure and separately
-bound rollout, completion, sealing overlap, and learner transients.
-
-Define two hardware envelopes:
-
-- `2080ti_10gb`: conservatively cap Torch peak reservation at
-  10,000,000,000 bytes until the user-facing "10 GB" ceiling is explicitly
-  defined otherwise, retain a non-Torch/driver guard, and fail before work;
-- `h100_throughput`: admit substantially wider physical rows from measured H100
-  transient formulas, but retain finite schemas and phase-local closure even
-  when memory is plentiful.
-
-## Bounded operator profile
-
-A one-iteration, 32-root sequential-RB profile was intentionally bounded and
-disabled shape, stack, and memory recording. Even so it generated about
-615,000 events for only 137 fresh decisions, so its absolute wall time is
-profiler-distorted. Event counts and self-CUDA proportions are still useful:
-
-| Event | Calls | Diagnostic meaning |
+| Event | Count | Meaning |
 |---|---:|---|
-| `cudaLaunchKernel` | 108,254 | about 790 launches per decision |
-| `cudaStreamSynchronize` | 2,800 | about 20 implicit syncs per decision |
-| `aten::empty` | 23,382 | severe transient-allocation pressure |
+| CUDA kernel launches | 108,254 | About 790 per fresh decision |
+| Stream synchronizations | 2,800 | About 20 implicit syncs per decision |
+| `aten::empty` | 23,382 | High transient-allocation pressure |
 | `aten::copy_` | 14,190 | 12.3% of self CUDA time |
-| `aten::index` | 7,624 | repeated gather/scatter work |
+| `aten::index` | 7,624 | Repeated gathers/scatters |
 | `aten::cat` | 748 | 7.8% of self CUDA time |
-| async assertions | 6,532 | repeated hot-path validation kernels |
-| D2D async copies | 5,528 | device staging/copy pressure |
-| efficient-attention forward | 90 | only 21.1% of self CUDA time |
+| Efficient-attention forward | 90 | Only 21.1% of self CUDA time |
 
-The result argues against treating the model FLOPs as the whole rollout cost.
-A full profiler trace is unsafe: earlier complete traces consumed 16--19 GiB
-host RAM and minutes constructing event trees. Use CUDA-event component buckets,
-Nsight on short scheduled windows, or narrow profiler schedules.
+The older full two-rank reproduction spent 50.13 s in rollout, 2.84 s in
+targets, and 62.70 s in the learner. Learner subcomponents were 30.62 s
+backward, 16.24 s forward, 7.59 s reference cache, 3.16 s gradient sync, 2.28 s
+loss, and 2.10 s optimizer. Those ceilings explain the open ROI order; they
+must be re-measured after the rollout changes before accepting learner work.
 
-## Optimization leaks in the current design
+The comparable historical phase record was:
 
-### Hot state paging is at the wrong abstraction boundary
+| Quantity | July 17 record | Pre-fix July 22 reproduction |
+|---|---:|---:|
+| Total iteration | 93.13 s | 115.68 s |
+| Rollout | 19.51 s | 50.13 s |
+| Targets | 4.15 s | 2.84 s |
+| Learner | 69.43 s | 62.70 s |
+| Learner time/step | 299.3 ms | 270.3 ms |
+| Peak allocated/reserved | 4.45/6.80 GiB | 3.15/5.21 GiB |
+| Global fresh decisions/s | 123.4 | about 87.3 |
 
-The byte-admitted storage objective is correct, but `PagedTensorColumn` makes
-the page abstraction visible at every ordinary tensor expression. A field read
-does not perform the former `column[rows]`. It allocates a zero output, computes
-page ids and offsets, gathers a candidate from every allocated page, and merges
-each candidate with `torch.where`. A field write first gathers the selected
-field into a temporary, mutates it, then calls `write`; `write` constructs a
-`[selected rows, page width]` match matrix for every page and copies a whole
-page-width field through another `where`. Poker encoding, legality, transition,
-classification, history, and state initialization each touch many fields, so
-one 64-row dequeue causes these page scans repeatedly.
+The learner was already faster; rollout caused the end-to-end regression. The
+historical run used a 2.94 learner-presentation/fresh-decision ratio, so its
+total seconds are not an acceptance gate for a new run targeting ratio 2.0.
 
-This is why processing the same queue width no longer launches the same code in
-the meaningful sense. The outer policy-forward and poker functions have the
-same names and much of the same source, but their apparently tensor-like state
-loads and stores expanded into many allocation, division, remainder, clamp,
-comparison, `where`, argmax, and copy kernels. The cost also scales with the
-number of admitted pages, not just the 64 useful rows.
+## Non-negotiable implementation constraints
 
-Keep paging and byte admission at an ownership boundary, but remove the
-per-field facade from compute. The first experiment should add one explicit
-bulk `read_state_pack(handles)` that materializes all required fields once into
-a dense fixed-width `PokerStateBatch`, followed by one bulk successor write
-grouped by destination slab. The stronger design is to store queued live states
-directly in admitted, recyclable dense queue/slab slots and keep logical node
-ids separate; this is phase-local frontier storage, not a topology-capacity
-table. Immutable retained decisions and cold sealed data may remain paged.
-Compare both approaches against the exact flat-state intervention while
-preserving last-consumer release and byte accounting.
+Performance work must preserve all of these:
 
-### Philosophy-preserving state replacement contract
+1. Production rollout, completion, model, losses, backward, optimizer state,
+   posterior work, and showdown evaluation remain on CUDA. No CPU fallback.
+2. Logical occurrence/topology ids remain separate from recyclable physical
+   live-state slots.
+3. Mutable public state and active reach/profile capacity derive from the
+   admitted live-frontier high-water bound, never total possible/generated
+   nodes or retained decision capacity.
+4. Release a parent's mutable slot only after all successors, immutable
+   retained rows, and leaf data have committed.
+5. Retained decision, action, leaf, and occurrence tables remain schema-derived,
+   byte-admitted, realized-work storage and seal once into exact destinations.
+6. Do not replay discarded rollout state or retain public-state handles for
+   targets/learning. Write natural retained inputs once at the realized spot.
+7. Preserve keyed RNG addresses, sampled actions, successor states, reaches,
+   topology, targets, and learner tensors under paired tests.
+8. Charge slab/page slack, graph workspaces, seal overlap, completion, and
+   learner transients against the hard memory envelope before allocation.
 
-Removing `PagedTensorColumn` from the hot path does **not** authorize restoring
-the old all-generated-node state table. It changes the physical compute
-interface, not the storage semantics in
-`docs/theory/implementation_notes.md` or the authoritative lifecycle
-pseudocode. Keep these invariants:
+The three storage domains deliberately differ:
 
-1. Logical occurrence and topology ids remain stable and separate from
-   recyclable physical state slots.
-2. Mutable public state and active reach/profile exist only for occurrences
-   that are queued, evaluating, or being chance-closed. Their capacity is
-   derived from the transactionally admitted live-frontier high-water bound
-   $F_{\rm state}$, never from total possible or generated nodes $N$.
-3. After a parent has committed all successors, immutable retained rows, and
-   leaf data, release its mutable state and active reach/profile immediately.
-4. At each realized player spot, write the natural partition input and required
-   reach/folded artifacts once. Do not reintroduce rollout replay or reconstruct
-   discarded state for targets or learning.
-5. Decision, action, leaf, and occurrence tables remain schema-derived,
-   byte-admitted, realized-work storage. Growing retained tables may remain
-   chunked/append-only and are sealed once into exact contiguous destinations.
-6. Admission continues to charge allocated capacity, page/slab slack, graph
-   workspaces, seal overlap, completion, and learner closure against the hard
-   memory envelope before allocation.
+| Domain | Physical rule |
+|---|---|
+| Hot mutable state | Dense recyclable slots bounded by live frontier; no per-field page scans |
+| Growing retained rollout data | Schema-derived chunked append-only storage with stable logical addresses |
+| Sealed training data | Exact realized dense extents; release source chunks after validated sealing |
 
-Treat the three storage domains differently:
+## Notes for the top open ideas
 
-| Domain | Row domain and lifetime | Required physical behavior |
-|---|---|---|
-| Hot mutable public state | At most the admitted live frontier; released at the parent's last consumer | Dense recyclable slots or slabs; one bulk pack read and one bulk successor write; never field-wise page scans |
-| Growing retained rollout data | Realized decisions, sampled edges, leaves, and compact occurrences | Schema-derived chunked append-only tables with stable logical addresses |
-| Sealed training data | Exact realized rows that survive into targets/optimization | One exact dense extent per final column/partition; source chunks released after validated sealing |
+### History shapes and recycling
 
-The preferred interface is explicit rather than tensor-compatible:
+History currently materializes maximum width 42 for every new policy pack and
+performs six binary-lift levels. Immediate decision retention now reuses that
+packed history, but recycling still uses boolean-indexed dynamic tensors,
+`unique`, Python recursion, and `numel()`-dependent control. Test immutable
+8/16/32/42 buckets or an incremental compact descriptor plus fixed-capacity
+device worklists. Do not create a global history capacity beyond the last
+consumer.
+
+### Full rollout pack compilation/capture
+
+The desired fixed-shape unit is:
 
 ```text
-read_live_pack(slot_ids, static_pack_buffers)
-    -> dense PokerStateBatch and active reach/profile
-process_dense_pack(...)
-    -> retained rows, leaves, and dense successor candidates
-reserve_live_successor_slots(valid_mask)
-commit_live_pack(successor_slots, successor_candidates)
-release_live_slots(consumed_parent_slots)
+dequeue admitted live-slot handles
+  -> bulk-load state/reach/history once
+  -> compact history and encode public state
+  -> legal events and policy forward
+  -> keyed sampling and selected log probability
+  -> reach update and poker transition
+  -> classify and compact successors
+  -> direct retained/leaf writes
+  -> reserve, write, and enqueue successor slots
 ```
 
-Poker encoding, legality, sampling, transition, history, and classification may
-operate only on the dense pack representation. They must not receive a
-`PagedTensorColumn` or perform storage page resolution. If physical live-state
-slabs are retained, resolve all selected slot ids once at `read_live_pack` and
-group all destination writes once at `commit_live_pack`; the slab abstraction
-must end at those two boundaries. A stronger implementation lets admitted
-family queues own the dense recyclable slots directly.
+Start from the accepted dense live slab and exact flop/turn/river families.
+Begin with 84-row steady-state and bounded 42/21/tail variants. Dummy rows must
+be inert: no RNG keys, state mutation, storage reservation, or retained writes.
+No dynamic-output `nonzero`, `.item()`, Python loop, or CUDA allocation belongs
+inside capture. Failure/overflow uses a device flag checked only at a declared
+control boundary.
 
-Acceptance requires more than recovering speed:
+First make the eager pack allocation-free, then try
+`torch.compile(fullgraph=True, mode="reduce-overhead")` or targeted kernels,
+then capture with `torch.cuda.CUDAGraph`. Do not capture the whole iteration;
+realized tree size, phase transitions, and learner work remain intentionally
+dynamic and bounded.
 
-- no mutable state capacity proportional to $N$, a node budget, or retained
-  decision capacity;
-- no target/learner public-state handle and no replay of discarded rollout
-  state;
-- identical keyed RNG addresses, sampled actions, successor states, retained
-  natural inputs, reaches, topology, and targets under paired tests;
-- parent slots provably released only after every required child/retained/leaf
-  write and reusable immediately afterwards;
-- schema-ledger prediction agrees with measured owners and peak reservation,
-  including CUDA graph buffers, under the byte-exact 2080 Ti ceiling; and
-- the eager dense-pack path first recovers near the 1.96-second flat-state
-  intervention before compilation or graph capture is credited with a gain.
+### Targets and learner
 
-### Repeated rollout work
+Sequential and especially branched targets have contained host-driven
+recurrences. Use sealed CSR and segmented device recurrences with no per-node
+D2H. Branching needs a trained current T/C checkpoint or fixed replayable
+topology before performance acceptance; untrained branching heads sometimes
+collapse a sample to five nodes. The only representative untrained-head sample
+had 2,128 nodes and 1,346 decisions: rollout was 14.029 s, targets/completion
+1.458 s, and learner 0.228 s; 97.5% of decisions were postflop and 75.5% river.
+Treat it only as phase/geometry evidence.
 
-Before this pass, each policy pack encoded public state, legal events, and
-history for forward; recomputed legal structure for keyed sampling and reach;
-computed selected log probability separately for reach and retention; and
-serialized retained inputs by encoding public/history again. The accepted
-path now slices each role pack once, reuses the pending public/history/legal
-representation for the same physical pack, and computes selected natural log
-probability once for both reach and retention.
+Target timing also has an unresolved provenance discrepancy: exact artifacts
+reported 1.055 s and 2.836 s for apparently similar 5,051-decision work, while
+the July 17 full report recorded 4.15 s. Define and reconcile the timing before
+crediting a target speedup.
 
-This is only partial fusion. Model forward, action sampling, transition,
-reach cloning/update, routing, and retained writes are still separate eager
-operations with many pointwise kernels and temporaries. The cache is deliberately
-pack-local and identity-checked; it does not extend state lifetime or create a
-global replay cache.
+For the learner, graph immutable partition/shape subspans containing sampled
+gather, current forward, policy-only reference lookup, loss, and backward into
+the stable flat fp32 gradient buffer. Keep NCCL and optimizer outside the first
+graph. Do not optimize optimizer capture first: its measured ceiling was only
+2.10 seconds.
 
-The desired unit is a fused family step that computes legal structure once and
-returns action, selected log probability, next state, updated reach, routing
-summary, and already-natural retained inputs. It should write directly into
-preallocated destinations. This is also the right CUDA graph boundary.
+## Required report for every accepted result
 
-### History materialization and recycling
+Include:
 
-CUDA history is currently materialized at the maximum rollout depth (42) on
-each new physical policy pack to avoid a scalar read. It performs six
-binary-lift levels over the batch-by-42 slab and gathers multiple fields. The
-same packed history is now reused by immediate retention, but recycling history
-rows still uses boolean-indexed dynamic tensors, `unique`, Python recursion,
-and `numel()`-dependent control.
-
-Fixed width is capture-friendly but needlessly expensive for short histories.
-Use immutable 8/16/32/42 history buckets or an incremental compact descriptor,
-reuse the packed history between inference and retention, and replace dynamic
-recycling with fixed-capacity device worklists. Do not solve this by retaining
-a global dense history capacity beyond the last consumer.
-
-### Hot validation and dynamic CUDA shapes
-
-The policy adapter launches repeated device/shape/legal checks for each action
-path. Assertions remain essential at ingestion and acceptance boundaries, but
-immutable partition and shape facts should be validated once, not four times
-inside every pack. Throughput builds should use graph-safe asynchronous checks
-only for genuinely data-dependent invariants. A debug mode can retain the full
-diagnostic suite.
-
-Manual `execution_undeclared_host_synchronizations == 0` is not sufficient
-proof: it records a small known set of dynamic-position operations and misses
-implicit synchronization inside many dynamic-shape PyTorch operators. Add an
-operator-level sync gate for bounded profiles.
-
-### Target construction
-
-The audited sequential builders used Python trajectory/decision loops with
-CUDA scalar extraction. Branched targets copied topology to CPU, traversed
-nodes and edges in Python, and issued many small CUDA operations. The branch
-diagnostic spent 1.46 s in targets for only 1,346 decisions.
-
-Use sealed CSR and segmented device recurrences. Sequential player-clock
-targets can use batched segmented scans. Branched recurrences should use
-bounded reverse-depth or frontier passes over sealed topology, keeping payload
-on device. A bulk compact pointer/control transfer is acceptable only at an
-explicit bounded structural boundary. The in-progress dirty sequential target
-rewrite follows this direction but needs exact semantic and performance gates.
-
-### Learner launch structure
-
-The learner has stable parameters, a stable flat fp32 gradient buffer, no
-dropout, immutable sealed inputs, and a small physical-shape set. It is a good
-CUDA graph candidate. At present it also creates and records many CUDA events
-for every physical subspan even outside focused diagnostics, performs a full
-finite scan, and converts finite/norm results to host scalars each step.
-
-Gate detailed CUDA timing behind profiling. Fuse finite detection, norm, and
-clip scale into one device reduction and one common decision. First capture a
-pure subspan graph containing static-index gather, current forward, cached
-reference lookup, loss, and scaled backward. Zero the flat gradient buffer once
-outside the graph; keep NCCL and optimizer update outside the first version.
-
-### Reference cache computes unused heads
-
-The reference KL consumes raw policy fields, but cache construction retains a
-full policy output including value and branching heads. Add a policy-only
-reference forward and cache only the consumed natural logits/masks. Its measured
-ceiling is 7.59 s in the current full iteration and roughly 72 MB of retained
-payload, so it belongs ahead of communication overlap.
-
-### Physical layouts left on the table
-
-Postflop execution is now physically split by exact street and live-player
-count. Flop, turn, and river use compact widths 1,176, 1,128, and 1,081 while
-mapping to the same natural learner partition. At family 64 this reduced padded
-pair work by about 5.6% and rollout by about 4.9% relative to the preceding
-dense-slab result.
-
-The remaining layout opportunities are:
-
-- Active preflop reach remains full 1,326-hand form even though retained and
-  model inputs are natural 169-class form. Keep it natural until the flop and
-  expand once, if the theory mapping and sampling laws remain exact.
-- Compatibility masks and other immutable learner descriptors are reconstructed
-  for sampled rows. Precompute or bit-pack them in sealed storage when the byte
-  cost is lower than repeated kernels.
-- Chance sampling sorts all 52 scores to choose a few cards. A deterministic
-  fixed-size selection/top-k formulation should be measured after the larger
-  rollout leaks are removed.
-
-## ROI-ordered experiment backlog
-
-The order below combines measured ceiling, expected speedup, implementation
-risk, and whether the change unlocks CUDA graphs. Each item needs an A/B at
-fixed seeds, checkpoint, realized-work accounting, and reuse ratio.
-
-| Rank | Status | Experiment | Result / next acceptance gate |
-|---:|---|---|---|
-| 0 | Partial | Freeze a trustworthy benchmark revision and byte-exact 2080 ceiling | This commit is the stopping revision and teardown is clean; make the 10,000,000,000-byte policy explicit rather than relying only on width headroom. |
-| 1 | Open | Use the 10 GB card envelope independently of rank count | Same loss/topology, no more than 10 GB, and materially fewer learner subspans. |
-| 2 | Done | Remove field-wise paging from hot live state | Dense recyclable slab plus bounded efficient cold chunks; lifecycle and CUDA gates pass. |
-| 3 | Partial | Fuse rollout legal/probability/sample/logp/reach/retention preprocessing | Public/history/legal and selected logp are reused; remaining full-pack fusion should deliver at least 15% to justify complexity. |
-| 4 | Partial | Reuse and bucket history materialization; fixed-capacity recycling | Immediate retention reuse is done; 8/16/32/42 buckets and fixed device recycling remain open. |
-| 5 | Open | Capture/compile the whole dequeue-to-enqueue rollout pack | Require at least 15% rollout gain, bounded graph variants, and unchanged logical RNG. |
-| 6 | Open | Re-baseline and finish vectorized CUDA target recurrences | Exact target equality, no per-node D2H, and at least 2x target speedup. |
-| 7 | Done | Tune family rows under phase-closure admission | Family 84 selected at 9.07 GB median reserved; 88 rejected for insufficient headroom. |
-| 8 | Done | Split postflop physical execution by street | Exact natural mapping passes; padded pairs fell about 5.6% at family 64. |
-| 9 | Open | Capture learner gather+forward+loss+backward per partition/shape | At least 15% learner compute gain at fixed rows/step and identical gradients. |
-| 10 | Open | Policy-only reference forward/cache | Match KL and reduce the measured 7.59-second cache ceiling and retained bytes. |
-| 11 | Open | Gate per-subspan CUDA events and fuse finite/norm/clip reductions | Preserve skip/clip semantics and reduce launches and host decisions. |
-| 12 | Open | Precompute/bit-pack immutable learner descriptors | Net byte reduction or admitted memory and a faster gathered subspan. |
-| 13 | Open | Natural 169-class active preflop reach | Exact reach/sampling equivalence and one bounded flop expansion. |
-| 14 | Open | Overlap gradient communication with final backward buckets | Identical reduced flat gradient and lower exposed synchronization. |
-| 15 | Open | Replace allocator `empty_cache()` boundary with measured reusable-space admission | No OOM regression across adversarial phase closures. |
-| 16 | Open | Deterministic small-k chance selection and minor kernel cleanup | Preserve the exact counter-key law or obtain an approved equivalent and measure a gain. |
-
-The next rollout pass should start at ranks 4 and 5: stabilize history shapes,
-then form an allocation-free full-pack boundary and compile/capture it. Rank 1
-is primarily a learner-envelope correction and rank 6 is a separate target
-project. Do not reopen width, page-size, or attention-dispatch tuning without
-new evidence that changes the ceilings measured above.
-
-## CUDA graph plan
-
-Do not capture the whole training iteration. Queue lengths, realized tree size,
-storage phase transitions, and learner work remain deliberately dynamic and
-bounded. Within rollout, however, the graph boundary should be the whole
-fixed-width processing of one device queue pack: dequeue through direct
-successor enqueue. A CPU routing summary is only an implementation stepping
-stone, not the target architecture. Capture must start from the accepted dense
-live slab and exact-street queues; cold paged retained/topology storage remains
-outside the graph except for pre-reserved direct append destinations.
-
-### Rollout graph boundary
-
-For each `(execution family, street, row bucket, mode)`, one graph replay should
-perform:
-
-```text
-dequeue 84/42/21/tail live-slot handles from the selected device queue
-    -> bulk-load each required state/reach/history field exactly once
-    -> compact history/public encoding
-    -> legal events and policy forward
-    -> keyed action sampling
-    -> selected full-hand log probability
-    -> acting-player reach update
-    -> poker transition and chance/posterior work when required
-    -> classify successors by execution family
-    -> direct write of natural retained inputs
-    -> allocate/write successor state and history rows
-    -> compact and enqueue successors into device queues
-    -> write terminal leaves, counters, and a device failure flag
-```
-
-Sequential mode has at most one successor per input row. Branching uses an
-immutable `[batch, max_offspring]` candidate slab, a valid-child mask, and
-device prefix sums to compact children. Reserve each destination queue once per
-pack rather than atomically appending one child at a time. Capacity overflow or
-an invalid transition writes a device failure flag that is checked at a
-declared control boundary. No dynamic-output `nonzero`, `.item()`, Python loop,
-or CUDA allocation may occur inside the captured path.
-
-Start with the production 84-row steady-state graph and bounded 42/21/tail
-graphs. Key postflop graphs by the already implemented flop/turn/river physical
-families.
-Dummy rows need an explicit inert mask: they must not consume logical RNG keys,
-mutate state, reserve storage, or write retained rows. Queue, state, history,
-retention, leaf, and scratch addresses must be stable and preallocated from the
-immutable admitted schemas.
-
-The preferred hot representation is a structure of dense, recyclable live
-slots owned by the admitted family queues or frontier slabs. Queue entries are
-slot ids; all columns for the selected slots are bulk-loaded once into static
-graph input buffers, and successor columns are written once to slots reserved
-in the destination queues. The number of slots is derived from the admitted
-live-frontier and closure bounds, not total possible tree nodes. This preserves
-realized-work and last-consumer storage: consumed slots are released after the
-successor and retained rows have been committed. Paged arenas can still own
-cold immutable captures, but no `PagedTensorColumn` operation belongs inside
-the graph. This representation and its tests must satisfy every item in the
-philosophy-preserving state replacement contract above; “static graph address”
-never means an all-$N$ mutable-state allocation.
-
-CUDA graph capture amortizes launches but does not itself fuse kernels. First
-express the eager dequeue-to-enqueue pack as one allocation-free tensor
-operation over dense pack buffers and prove that it recovers the flat-state
-baseline. Use `torch.compile(fullgraph=True, mode="reduce-overhead")` or a few
-targeted custom kernels to fuse legal/probability/sample/logp/reach, history
-packing, transition routing, and masked compaction where profitable. Then
-capture the complete compiled pack with explicit `torch.cuda.CUDAGraph`. Keep
-SDPA/Flash Attention and evaluator kernels intact when they are capture-safe.
-CUDA 13 in the venv is available; no CPU fallback is permitted.
-
-The host initially selects a nonempty execution-family queue and replays its
-graph. It must not receive actions, successor states, histories, or routing
-payloads. Occasional compact queue counters and failure flags are sufficient;
-device-side or persistent scheduling is lower priority because measured host
-queue control is currently only milliseconds per iteration. Double buffering
-and secondary streams come only after a single-stream whole-pack graph is
-correct and measured; otherwise they obscure the launch problem.
-
-Graph capture owns additional stable workspaces. Recalibrate memory after all
-graph variants are warmed: the measured 96-row eager path already exceeds a
-literal 10,000,000,000-byte Torch ceiling, so an 80--88-row graph may be the
-2080 Ti optimum even though H100 should admit much wider packs.
-
-### Learner graph boundary
-
-For each immutable partition and physical row shape:
-
-```text
-static sampled-row index buffer
-    -> sealed-input gather / immutable descriptor lookup
-    -> current policy forward
-    -> policy-only cached reference lookup
-    -> PPO/RB loss
-    -> scaled backward into stable flat fp32 gradient storage
-```
-
-Zero flat gradients once before replaying all subspan graphs. Do not capture
-per-subspan metrics or CUDA-event construction. Keep finite/norm/clip, NCCL,
-and optimizer update outside initially. Expected current shapes in the 64-row
-historical geometry are 54 preflop and 10 postflop; with a 128-row statistical
-minibatch they are approximately 64 and 12 under the same card envelope.
-
-Once stable, measure capturing finite/clip and optimizer separately. Capturing
-the optimizer first has only a 2.10 s ceiling and is not high ROI.
-
-## Scientific benchmark matrix
-
-Every proposed change should run this minimum matrix on a settled revision.
-Use GPUs 0 and 1 concurrently for independent one-card probes or one two-rank
-DDP run, and leave GPU 2 idle.
-
-### Sequential matrix
-
-1. Normal and sequential RB, 128 roots, completion 16, one learner step:
-   quick semantic/phase smoke and three-repeat launch comparison.
-2. Sequential RB, 512 roots, completion 256, family widths 64/80/88/96,
-   active windows 32/64, one learner step: packing and memory curve.
-3. Sequential RB, 2,048 roots/rank, completion 1,024, minibatch 64, learner
-   steps chosen after rollout so learner/fresh ratio is 2.0: production gate.
-4. The same production workload with fixed 232 steps only as a link to the
-   historical record.
-
-### Branching matrix
-
-Use a trained current T/C checkpoint or a fixed replayable sealed topology.
-Stratify natural tiny, natural medium, natural large, and cutoff-closed trees.
-Report both 1:1 and 2:1 rollout-to-learner ratios. Never use the median of a
-mixture where one random untrained tree collapses to five nodes.
-
-### Required reported metrics
-
-- fresh decision nodes and all player nodes per rank and globally;
-- rollout-only and end-to-end nodes/s;
-- learner statistical rows/s, physical rows/s, backward subspans/s, and
-  optimizer steps/s;
-- learner presentations divided by fresh decisions;
-- phase wall time and nested CUDA component time;
+- commit/source revision, resolved checkpoint path/iteration/SHA, config, seed,
+  repeat seeds, GPU model, CUDA/PyTorch versions, and raw samples;
+- fresh decisions, all player nodes, rollout seconds and seconds/decision;
+- end-to-end decisions/s only with learner rows, steps, and the realized
+  learner-presentations/fresh-decision ratio;
 - model calls, rows/call, tail fraction, padded tokens, and attention pairs by
-  street and execution family;
-- kernel launches, implicit stream synchronizations, D2D/H2D/D2H bytes;
-- peak allocated, peak reserved, non-Torch occupancy, and phase-boundary live
-  owners; and
-- GPU clocks, power, temperature, and utilization so thermal throttling is not
-  mistaken for a code regression.
+  street/execution family;
+- rollout, targets, completion, sealing, reference, learner, and optimizer time;
+- kernel launches, implicit syncs, and D2D/H2D/D2H traffic when profiling;
+- peak allocated/reserved bytes, non-Torch occupancy, phase-boundary owners,
+  and post-run teardown state; and
+- median plus range or confidence interval, never only a mean.
 
-Use median plus range or bootstrap interval, not only a mean. Run enough warmup
-for allocator and compiled/graph state. Compare paired repeat seeds and include
-raw samples. A performance change is accepted only when semantics, keyed RNG,
-storage lifecycle, finite-gradient behavior, and teardown gates also pass.
-
-## What not to optimize first
-
-- Scheduler control transfers: measured at only 4.4 ms in the full iteration.
-- Sealing: about 13 ms and already follows exact last-consumer storage.
-- Optimizer capture: only a 2.10 s ceiling before larger learner graph work.
-- Wider active windows by themselves: 32 and 64 were tied once 64-row packs
-  filled.
-- Blindly larger family packs: 128 rows already failed closure, and 96 rows
-  exceeded the conservative decimal 10 GB production ceiling.
-- Whole-iteration CUDA graphs: they conflict with bounded dynamic realized work
-  and would hide, rather than solve, unstable compute boundaries.
-- Moving poker transitions to CPU: it would add strict device/host dependencies
-  when the measured queue-control CPU cost is already negligible.
-
-The eager-rollout recovery criterion is met: the production gate is within
-about 1% of the historical raw rollout rate and remains below the conservative
-2080 Ti ceiling. The remaining end-to-end criterion is a settled two-GPU
-sequential-RB run at a true 2.0 learner/fresh ratio that reaches at least the
-historical 123.4 global fresh decisions/s. The stretch target remains 25% above
-that record through history stabilization and full-pack fusion/capture, without
-counting reduced learner work as speedup.
+Validation at the current stopping point was 247 passed and 37 skipped in the
+general suite. The full CUDA suite was 272 passed, 10 skipped, and two unrelated
+stateful-inference failures from the separately audited preflop class/combo
+shape mismatch at `pbg/inference.py:596`. The final focused CUDA rollout gate
+was 30 passed and two skipped. Re-check this status on every new optimization;
+do not treat known unrelated failures as permission for new failures.
