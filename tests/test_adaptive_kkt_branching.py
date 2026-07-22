@@ -362,7 +362,9 @@ def test_queue_safeguard_is_batch_local_recovers_and_retains_counterfactual_coun
     assert degree[:2].tolist() == [1, 3]
     assert sample.topology.nominal_degree[:2].tolist() == [3, 3]
     assert sample.branching_diagnostics["safeguard_batches"] == 1
-    old_c = sample.decision_source["old_c"]
+    old_c = torch.cat(
+        [sample.decision_inputs.decision_sources[key]["old_c"] for key in sorted(sample.decision_inputs.decision_sources)]
+    )
     assert old_c.tolist() == pytest.approx([10.0, 0.1])
     counterfactual = float(sample.node_count) + float(
         ((sample.decision_aux["nominal_child_count"].float()

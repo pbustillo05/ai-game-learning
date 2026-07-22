@@ -21,6 +21,9 @@ from pbg.core.storage import (
     SealedTensorBlock,
     TensorFieldSchema,
     TensorSchema,
+    rollout_action_source_schema,
+    rollout_policy_source_schema,
+    stopped_leaf_source_schema,
 )
 from pbg.core.execution import (
     child_path_keys,
@@ -97,6 +100,16 @@ class PokerDecisionInputCaptureStore:
     input_arenas: dict[int, PagedTensorArena]
     summary_caches: dict[int, DevicePartitionSummaryCache]
     accountant: ByteAccountant | None = None
+    decision_arenas: dict[int, PagedTensorArena] | None = None
+    action_arenas: dict[int, PagedTensorArena] | None = None
+    mode: str = "normal"
+    dynamic_heads: bool = False
+
+    def __post_init__(self) -> None:
+        if self.decision_arenas is None:
+            self.decision_arenas = {}
+        if self.action_arenas is None:
+            self.action_arenas = {}
 
 
 class PokerRolloutBackend:
@@ -111,6 +124,13 @@ class PokerRolloutBackend:
         partition_adapter: Sibling-facade neutral-partition adapter.
     Every returned tensor remains on ``device``.
     """
+
+    def rollout_leaf_source_schema(self, mode: str) -> TensorSchema:
+        """Return the immutable poker leaf schema before sampling starts."""
+
+        return stopped_leaf_source_schema(
+            mode, players=self.n_players, exact_width=self.n_hands
+        )
 
     def __init__(
         self,
@@ -247,10 +267,16 @@ class PokerRolloutBackend:
         if capture_store is not None:
             for arena in capture_store.input_arenas.values():
                 arena.release()
+            for arena in capture_store.decision_arenas.values():
+                arena.release()
+            for arena in capture_store.action_arenas.values():
+                arena.release()
             for cache in capture_store.summary_caches.values():
                 if cache.arena is not None:
                     cache.arena.release()
             capture_store.input_arenas.clear()
+            capture_store.decision_arenas.clear()
+            capture_store.action_arenas.clear()
             capture_store.summary_caches.clear()
             self._active_decision_input_store = None
         self.states.reset(release_pages=True)
@@ -1007,10 +1033,14 @@ class PokerRolloutBackend:
             legal_ids, legal_mask = self.legal_events(states)
             from pbg.games.poker.adapter import PokerPolicyAdapter
 
-            adapter = PokerPolicyAdapter(self.n_ticks)
+            adapter = PokerPolicyAdapter(
+                self.n_ticks, exact_to_model=self.combo_class
+            )
             selected = adapter.log_prob(
                 policy_out, events.public_id[:, None], legal_ids, legal_mask
-            )[:, 0]  # [B,H]
+            )[:, 0]
+            if selected.shape[1] == self.n_classes:
+                selected = selected[:, self.combo_class]
             actor = self.classify(states).to(torch.int64)
             batch = torch.arange(states.shape[0], device=self.device)
             result[batch, actor] += selected.detach().float()
@@ -1202,15 +1232,117 @@ class PokerRolloutBackend:
         )
 
     def begin_decision_input_captures(
-        self, *, accountant: ByteAccountant | None = None
+        self,
+        *,
+        mode: str = "normal",
+        dynamic_heads: bool = False,
+        accountant: ByteAccountant | None = None,
     ) -> PokerDecisionInputCaptureStore:
         """Create one rollout-local paged owner for decision captures."""
 
         if self._active_decision_input_store is not None:
             raise RuntimeError("a poker decision-input capture store is already active")
-        store = PokerDecisionInputCaptureStore({}, {}, accountant)
+        store = PokerDecisionInputCaptureStore(
+            {}, {}, accountant, {}, {}, mode, bool(dynamic_heads)
+        )
         self._active_decision_input_store = store
         return store
+
+    def reserve_decision_input_captures(
+        self,
+        store: PokerDecisionInputCaptureStore,
+        partition_id: int,
+        count: int,
+    ) -> Tensor:
+        """Reserve stable natural input and policy rows before model execution."""
+
+        partition_id = int(partition_id)
+        spec = self.training_partition_specs()[partition_id]
+        input_arena = store.input_arenas.get(partition_id)
+        if input_arena is None:
+            input_schema = spec.input_schema
+            input_arena = PagedTensorArena(
+                TensorSchema(
+                    f"poker_partition_{partition_id}_decision_capture",
+                    (
+                        TensorFieldSchema("node_id", torch.int32, alignment=4),
+                        *input_schema.fields,
+                    ),
+                    chunk_header_bytes=input_schema.chunk_header_bytes,
+                    allocator_slack_bytes=input_schema.allocator_slack_bytes,
+                ),
+                self.storage_page_rows,
+                self.device,
+                accountant=store.accountant,
+                label=f"poker_partition_{partition_id}_decision_capture",
+            )
+            store.input_arenas[partition_id] = input_arena
+        decision_arena = store.decision_arenas.get(partition_id)
+        if decision_arena is None:
+            decision_arena = PagedTensorArena(
+                rollout_policy_source_schema(
+                    store.mode,
+                    model_width=spec.model_width,
+                    dynamic_heads=store.dynamic_heads,
+                ),
+                self.storage_page_rows,
+                self.device,
+                accountant=store.accountant,
+                label=f"poker_partition_{partition_id}_policy_capture",
+            )
+            store.decision_arenas[partition_id] = decision_arena
+        input_rows = input_arena.reserve_rows(count)
+        decision_rows = decision_arena.reserve_rows(count)
+        if not torch.equal(input_rows, decision_rows):
+            raise RuntimeError("natural input and policy row reservations diverged")
+        return decision_rows
+
+    def reserve_action_captures(
+        self,
+        store: PokerDecisionInputCaptureStore,
+        partition_id: int,
+        decision_rows: Tensor,
+        counts: Tensor,
+    ) -> Tensor:
+        """Reserve exact ragged action rows before posterior/event draws."""
+
+        partition_id = int(partition_id)
+        decision_arena = store.decision_arenas[partition_id]
+        counts = counts.to(device=self.device, dtype=torch.int32)
+        total = int(counts.to(torch.int64).sum())
+        action_arena = store.action_arenas.get(partition_id)
+        if action_arena is None:
+            width = self.training_partition_specs()[partition_id].model_width
+            action_arena = PagedTensorArena(
+                rollout_action_source_schema(width),
+                self.storage_page_rows,
+                self.device,
+                accountant=store.accountant,
+                label=f"poker_partition_{partition_id}_action_capture",
+            )
+            store.action_arenas[partition_id] = action_arena
+        action_rows = action_arena.reserve_rows(total)
+        begin = torch.empty_like(counts, dtype=torch.int64)
+        if counts.numel():
+            begin[0] = action_rows[0] if total else action_arena.size
+            if counts.numel() > 1:
+                begin[1:] = begin[0] + counts.to(torch.int64).cumsum(0)[:-1]
+        decision_arena.write(
+            decision_rows.to(torch.int64),
+            {"action_begin": begin, "action_count": counts},
+        )
+        return action_rows
+
+    def write_action_captures(
+        self,
+        store: PokerDecisionInputCaptureStore,
+        partition_id: int,
+        action_rows: Tensor,
+        columns: Mapping[str, Tensor],
+    ) -> None:
+        store.action_arenas[int(partition_id)].write(
+            action_rows.to(torch.int64), columns
+        )
 
     def _decision_summary_cache(
         self,
@@ -1233,36 +1365,20 @@ class PokerRolloutBackend:
             store.summary_caches[partition_id] = summary_cache
         return summary_cache
 
-    def append_decision_input_capture(
+    def write_decision_input_capture(
         self,
         store: PokerDecisionInputCaptureStore,
+        rows: Tensor,
         node_ids: Tensor,
         capture: PokerDecisionInputCapture,
+        policy_columns: Mapping[str, Tensor],
     ) -> None:
         """Move one scheduler pack immediately into its paged last-consumer owner."""
 
         if not isinstance(store, PokerDecisionInputCaptureStore):
             raise TypeError("expected PokerDecisionInputCaptureStore")
         partition_id = int(capture.partition_id)
-        arena = store.input_arenas.get(partition_id)
-        if arena is None:
-            input_schema = self.training_partition_specs()[partition_id].input_schema
-            arena = PagedTensorArena(
-                TensorSchema(
-                    f"poker_partition_{partition_id}_decision_capture",
-                    (
-                        TensorFieldSchema("node_id", torch.int32, alignment=4),
-                        *input_schema.fields,
-                    ),
-                    chunk_header_bytes=input_schema.chunk_header_bytes,
-                    allocator_slack_bytes=input_schema.allocator_slack_bytes,
-                ),
-                self.storage_page_rows,
-                self.device,
-                accountant=store.accountant,
-                label=f"poker_partition_{partition_id}_decision_capture",
-            )
-            store.input_arenas[partition_id] = arena
+        arena = store.input_arenas[partition_id]
         columns = dict(capture.columns)
         if capture.folded_summary is not None:
             pending = capture.folded_summary
@@ -1298,7 +1414,9 @@ class PokerRolloutBackend:
             columns["folded_summary_ref"] = summary_rows[
                 capture.columns["folded_summary_ref"].to(torch.int64)
             ].to(torch.int32)
-        arena.append({"node_id": node_ids.to(torch.int32), **columns})
+        rows = rows.to(device=self.device, dtype=torch.int64)
+        arena.write(rows, {"node_id": node_ids.to(torch.int32), **columns})
+        store.decision_arenas[partition_id].write(rows, policy_columns)
 
     @staticmethod
     def _seal_columns(
@@ -1340,8 +1458,17 @@ class PokerRolloutBackend:
         if not store.input_arenas:
             empty = torch.empty(0, dtype=torch.int32, device=self.device)
             self._active_decision_input_store = None
-            return SealedDecisionInputs(empty, empty, empty, {})
+            return SealedDecisionInputs(
+                node_ids=empty,
+                partition_id=empty,
+                partition_row=empty,
+                inputs={},
+                decision_sources={},
+            )
         blocks: dict[int, SealedTensorBlock] = {}
+        decisions: dict[int, SealedTensorBlock] = {}
+        actions: dict[int, SealedTensorBlock] = {}
+        action_ptrs: dict[int, Tensor] = {}
         pools: dict[int, Mapping[str, SealedTensorBlock]] = {}
         seal_metrics: dict[str, SealMetrics] = {}
         partition_specs = self.training_partition_specs()
@@ -1397,6 +1524,42 @@ class PokerRolloutBackend:
                 name: source.gather(name, order).detach()
                 for name in input_schema.by_name
             }
+            decision_source = store.decision_arenas[partition_id]
+            decision_block, decision_metrics = decision_source.seal(
+                scratch_rows=self.storage_page_rows,
+                row_order=order,
+                release_source=True,
+            )
+            decisions[partition_id] = decision_block
+            action_source = store.action_arenas.get(partition_id)
+            if action_source is not None:
+                counts = decision_block["action_count"].to(torch.int64)
+                begins = decision_block["action_begin"].to(torch.int64)
+                ptr = torch.empty(
+                    decision_block.rows + 1, dtype=torch.int32, device=self.device
+                )
+                ptr[0] = 0
+                ptr[1:] = counts.cumsum(0).to(torch.int32)
+                total_actions = action_source.size
+                compact_start = ptr[:-1].to(torch.int64)
+                action_order = (
+                    torch.arange(total_actions, device=self.device)
+                    - torch.repeat_interleave(compact_start, counts)
+                    + torch.repeat_interleave(begins, counts)
+                )
+                action_block, action_metrics = action_source.seal(
+                    scratch_rows=self.storage_page_rows,
+                    row_order=action_order,
+                    release_source=True,
+                )
+                actions[partition_id] = action_block
+                action_ptrs[partition_id] = ptr
+                seal_metrics[
+                    f"policy_actions_partition_{partition_id}"
+                ] = action_metrics
+            seal_metrics[
+                f"policy_decisions_partition_{partition_id}"
+            ] = decision_metrics
             summary = summary_source
             summary_destination_bytes = 0
             summary_logical_bytes = 0
@@ -1456,16 +1619,21 @@ class PokerRolloutBackend:
             if cache.arena is not None:
                 cache.arena.release()
         store.input_arenas.clear()
+        store.decision_arenas.clear()
+        store.action_arenas.clear()
         store.summary_caches.clear()
         self._active_decision_input_store = None
         order = torch.argsort(nodes.to(torch.int64), stable=True)
         return SealedDecisionInputs(
-            nodes[order],
-            partition_ids[order],
-            partition_rows[order],
-            blocks,
-            pools,
-            seal_metrics,
+            node_ids=nodes[order],
+            partition_id=partition_ids[order],
+            partition_row=partition_rows[order],
+            inputs=blocks,
+            decision_sources=decisions,
+            action_sources=actions,
+            action_ptrs=action_ptrs,
+            input_pools=pools,
+            seal_metrics=seal_metrics,
         )
 
     def _public_from_immutable_inputs(
@@ -1878,16 +2046,8 @@ class PokerRolloutBackend:
             class_ranges.scatter_add_(2, class_ids, weights)
             masks = PreflopMasks(seat_mask=pub.seat_mask, status=pub.status)
             output = frozen_model.forward_preflop(pub, class_ranges, pub.to_act, masks)
-            if output.v.shape[1] == self.n_classes:
-                output = PolicyOutput(
-                    raw={
-                        name: value[:, self.combo_class]
-                        for name, value in output.raw.items()
-                    },
-                    v=output.v[:, self.combo_class],
-                    t=output.t,
-                    c=output.c,
-                )
+            if output.v.shape[1] != self.n_classes:
+                raise ValueError("preflop rollout forward changed its natural class domain")
             self.batch_size_histograms["preflop"].append(states.numel())
         else:
             source = frozen_model.module if hasattr(frozen_model, "module") else frozen_model
@@ -2124,16 +2284,6 @@ class PokerRolloutBackend:
             masks,
             strict=False,
         )
-        if partition_id == 0 and output.v.shape[1] == self.n_classes:
-            output = PolicyOutput(
-                raw={
-                    name: value[:, self.combo_class]
-                    for name, value in output.raw.items()
-                },
-                v=output.v[:, self.combo_class],
-                t=output.t,
-                c=output.c,
-            )
         return output
 
     def policy_forward_family_actual_cost(

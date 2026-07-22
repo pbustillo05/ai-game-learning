@@ -241,12 +241,31 @@ def test_folded_summaries_have_sparse_anchor_ownership_and_complete_accounting()
     )
     for node_id in (10, 11):
         with torch.no_grad():
-            backend.policy_forward_family(model, "post_2", flop_after_fold, reach)
-        capture = backend.capture_decision_inputs("post_2", flop_after_fold, reach)
-        backend.append_decision_input_capture(
+            output = backend.policy_forward_family(
+                model, "post_2", flop_after_fold, reach
+            )
+        capture = backend.capture_decision_inputs(
+            "post_2", flop_after_fold, reach
+        )
+        capture_rows = backend.reserve_decision_input_captures(store, 1, 1)
+        backend.write_decision_input_capture(
             store,
+            capture_rows,
             torch.tensor([node_id], dtype=torch.int32, device=device),
             capture,
+            {
+                "node_id": torch.tensor(
+                    [node_id], dtype=torch.int32, device=device
+                ),
+                "root_id": torch.zeros(1, dtype=torch.int32, device=device),
+                "decision_ordinal": torch.zeros(
+                    1, dtype=torch.int32, device=device
+                ),
+                "owner": torch.zeros(1, dtype=torch.int32, device=device),
+                "event": torch.zeros(1, dtype=torch.int32, device=device),
+                "old_logp": torch.zeros_like(output.v),
+                "old_v": output.v.detach().to(torch.float32),
+            },
         )
     assert partition.calls == 1
     assert store.summary_caches[1].size == 1
@@ -259,5 +278,6 @@ def test_folded_summaries_have_sparse_anchor_ownership_and_complete_accounting()
     assert accountant.reserved_bytes == (
         sealed.node_ids.numel() * 3 * 4
         + sealed.inputs[1].allocated_capacity_bytes
+        + sealed.decision_sources[1].allocated_capacity_bytes
         + sealed.input_pools[1]["folded_summary"].allocated_capacity_bytes
     )

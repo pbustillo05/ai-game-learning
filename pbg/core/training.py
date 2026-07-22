@@ -609,31 +609,52 @@ def _analytical_memory_plan(
     input_source += input_pool_source
     input_destination += input_pool_destination
 
-    widest_model_width = max(int(spec.model_width) for spec in partition_specs)
-    decision_schema = rollout_decision_schema(
-        mode,
-        model_width=widest_model_width,
-        event_count=events,
-        dynamic_heads=True,
+    source_decision_schemas = tuple(
+        rollout_policy_source_schema(
+            mode, model_width=int(spec.model_width), dynamic_heads=True
+        )
+        for spec in partition_specs
     )
-    action_schema = rollout_action_schema(widest_model_width)
-    source_action_schema = rollout_action_source_schema(exact_width)
-    source_decision_schema = rollout_policy_source_schema(
-        mode, exact_width=exact_width, dynamic_heads=True
-    )
-    decision_source = paged(source_decision_schema, decision_rows)
-    decision_destination = exact(decision_schema, decision_rows)
-    training_decision_base = exact(
+    decision_schemas = tuple(
         rollout_decision_schema(
             mode,
-            model_width=widest_model_width,
+            model_width=int(spec.model_width),
             event_count=events,
-            dynamic_heads=False,
-        ),
-        decision_rows,
+            dynamic_heads=True,
+        )
+        for spec in partition_specs
     )
-    action_source = 0 if sequential else paged(source_action_schema, action_rows)
-    action_destination = 0 if sequential else exact(action_schema, action_rows)
+    source_action_schemas = tuple(
+        rollout_action_source_schema(int(spec.model_width))
+        for spec in partition_specs
+    )
+    action_schemas = tuple(
+        rollout_action_schema(int(spec.model_width)) for spec in partition_specs
+    )
+    decision_source = max(
+        paged(schema, decision_rows) for schema in source_decision_schemas
+    )
+    decision_destination = max(
+        exact(schema, decision_rows) for schema in decision_schemas
+    )
+    training_decision_base = max(
+        exact(
+            rollout_decision_schema(
+                mode,
+                model_width=int(spec.model_width),
+                event_count=events,
+                dynamic_heads=False,
+            ),
+            decision_rows,
+        )
+        for spec in partition_specs
+    )
+    action_source = 0 if sequential else max(
+        paged(schema, action_rows) for schema in source_action_schemas
+    )
+    action_destination = 0 if sequential else max(
+        exact(schema, action_rows) for schema in action_schemas
+    )
 
     source_leaf_schema = stopped_leaf_source_schema(
         mode, players=players, exact_width=exact_width
@@ -707,12 +728,12 @@ def _analytical_memory_plan(
         schema.payload_bytes(min(page_rows, max(decision_rows, 1)))
         for schema in (
             *input_schemas,
-            source_decision_schema,
-            decision_schema,
+            *source_decision_schemas,
+            *decision_schemas,
             source_leaf_schema,
             destination_leaf_schema,
-            source_action_schema,
-            action_schema,
+            *source_action_schemas,
+            *action_schemas,
         )
     )
 
@@ -926,7 +947,7 @@ def _decision_street_metrics(
     to the host once per iteration rather than synchronizing every decision.
     """
 
-    node_ids = sample.decision_source["node_id"]
+    node_ids = sample.decision_inputs.node_ids
     if node_ids.numel() == 0:
         return
     captured = sample.decision_inputs
@@ -982,10 +1003,18 @@ def _record_branched_controller_metrics(
 ) -> None:
     """Preserve dynamic-KKT observations before rollout owners are released."""
 
-    old_t = sample.decision_source.columns.get("old_t")
-    old_c = sample.decision_source.columns.get("old_c")
-    if old_t is None or old_c is None:
-        raise RuntimeError("branched rollout did not retain frozen T/C heads")
+    count = sample.decision_inputs.node_ids.numel()
+    old_t = torch.empty(count, dtype=torch.float32, device=device)
+    old_c = torch.empty_like(old_t)
+    for partition_id, source in sample.decision_inputs.decision_sources.items():
+        source_t = source.columns.get("old_t")
+        source_c = source.columns.get("old_c")
+        if source_t is None or source_c is None:
+            raise RuntimeError("branched rollout did not retain frozen T/C heads")
+        selected = sample.decision_inputs.partition_id == partition_id
+        rows = sample.decision_inputs.partition_row[selected].to(torch.int64)
+        old_t[selected] = source_t[rows]
+        old_c[selected] = source_c[rows]
     profile_metrics.update(
         {
             key: float(value)
@@ -1173,7 +1202,7 @@ def _build_iteration_data(
             )
             if not isinstance(sampled, SealedRolloutSample):
                 raise RuntimeError("normal rollout returned a probe sample")
-            sampled_decisions = sampled.decision_source.rows
+            sampled_decisions = sampled.decision_inputs.node_ids.numel()
             sampled_nodes = sampled.node_count
             sampled_leaves = sampled.leaf_source.rows
             sampled_offspring_mean = sampled_offspring_max = None
@@ -1490,59 +1519,11 @@ def _seal_sequential_rollout_storage(
     backend = bundle.rollout_backend
     device = backend.device
     partitions = _natural_partition_set(cfg, bundle)
-    source = sample.decision_source
-    nodes = source["node_id"].to(torch.int64)
     captured = sample.decision_inputs
     if not isinstance(captured, SealedDecisionInputs):
         raise RuntimeError("sequential sealing requires immutable decision inputs")
-    if not torch.equal(captured.node_ids.to(torch.int64), nodes):
-        raise RuntimeError("captured decision inputs and policy rows are misaligned")
-    owner = source["owner"].to(torch.int32)
+    nodes = captured.node_ids.to(torch.int64)
     partition_id = captured.partition_id.to(torch.int64)
-    legal_ids = torch.arange(
-        backend.e_max, dtype=torch.int32, device=device
-    )[None].expand(nodes.numel(), -1)
-    legal_mask = torch.empty(
-        (nodes.numel(), backend.e_max), dtype=torch.bool, device=device
-    )
-    for pid, input_block in captured.inputs.items():
-        positions = (captured.partition_id == pid).nonzero(
-            as_tuple=False
-        ).squeeze(1)
-        legal_mask[positions] = input_block.columns["legal_action_mask"][
-            captured.partition_row[positions].to(torch.int64)
-        ]
-
-    event = source["event"].to(torch.int32)
-    global_decisions: dict[str, Tensor]
-    if cfg.training.mode == "normal":
-        if root_profiles is None:
-            raise RuntimeError("normal rollout omitted sampled private profiles")
-        trajectory = source["root_id"].to(torch.int64)
-        realized_type = root_profiles[trajectory, owner.to(torch.int64)].to(torch.int32)
-        batch = torch.arange(nodes.numel(), device=device)
-        global_decisions = {
-            "owner": owner,
-            "event": event,
-            "realized_type": realized_type,
-            "old_log_prob": source["old_logp"][
-                batch, realized_type.to(torch.int64)
-            ].detach().to(torch.float32),
-            "old_value": source["old_v"][
-                batch, realized_type.to(torch.int64)
-            ].detach().to(torch.float32),
-            "legal_event_ids": legal_ids.to(torch.int32),
-            "legal_event_mask": legal_mask.to(torch.bool),
-        }
-    else:
-        global_decisions = {
-            "owner": owner,
-            "event": event,
-            "old_log_prob": source["old_logp"].detach().to(torch.float32),
-            "old_value": source["old_v"].detach().to(torch.float32),
-            "legal_event_ids": legal_ids.to(torch.int32),
-            "legal_event_mask": legal_mask.to(torch.bool),
-        }
 
     blocks: dict[int, PartitionRolloutBlock] = {}
     global_to_partition_row = torch.full(
@@ -1555,6 +1536,7 @@ def _seal_sequential_rollout_storage(
         if selected.numel() == 0:
             continue
         inputs = captured.inputs[partition.partition_id]
+        source = captured.decision_sources[partition.partition_id]
         input_pools = dict(captured.input_pools.get(partition.partition_id, {}))
         captured_rows = captured.partition_row[selected].to(torch.int64)
         if not torch.equal(
@@ -1562,16 +1544,30 @@ def _seal_sequential_rollout_storage(
             torch.arange(selected.numel(), dtype=torch.int64, device=device),
         ):
             raise RuntimeError("captured partition rows are not exact and contiguous")
+        legal_ids = torch.arange(
+            backend.e_max, dtype=torch.int32, device=device
+        )[None].expand(selected.numel(), -1)
         decision_columns = {
-            name: value[selected].detach() for name, value in global_decisions.items()
+            "owner": source["owner"].detach().to(torch.int32),
+            "event": source["event"].detach().to(torch.int32),
+            "old_log_prob": source["old_logp"].detach().to(torch.float32),
+            "old_value": source["old_v"].detach().to(torch.float32),
+            "legal_event_ids": legal_ids,
+            "legal_event_mask": inputs["legal_action_mask"].detach().to(torch.bool),
         }
-        if cfg.training.mode != "normal" and partition.partition_id == 0:
-            decision_columns["old_value"] = _compress_preflop_rows(
-                decision_columns["old_value"], backend
-            )
-            decision_columns["old_log_prob"] = _compress_preflop_rows(
-                decision_columns["old_log_prob"], backend
-            )
+        if cfg.training.mode == "normal":
+            if root_profiles is None:
+                raise RuntimeError("normal rollout omitted sampled private profiles")
+            realized_type = root_profiles[
+                source["root_id"].to(torch.int64), source["owner"].to(torch.int64)
+            ].to(torch.int32)
+            model_type = torch.as_tensor(
+                partition.exact_to_model, dtype=torch.int64, device=device
+            )[realized_type.to(torch.int64)]
+            row = torch.arange(source.rows, device=device)
+            decision_columns["realized_type"] = realized_type
+            decision_columns["old_log_prob"] = source["old_logp"][row, model_type]
+            decision_columns["old_value"] = source["old_v"][row, model_type]
         decisions = _sealed_dynamic_block(
             f"poker_partition_{partition.partition_id}_decision",
             decision_columns,
@@ -1724,62 +1720,17 @@ def _seal_branched_rollout_storage(
     backend = bundle.rollout_backend
     device = backend.device
     partitions = _natural_partition_set(cfg, bundle)
-    source = sampled.decision_source
-    nodes = source["node_id"].to(torch.int64)
     captured = sampled.decision_inputs
     if not isinstance(captured, SealedDecisionInputs):
         raise RuntimeError("branched production requires captured immutable inputs")
-    if not torch.equal(captured.node_ids.to(torch.int64), nodes):
-        raise RuntimeError("branched captured inputs and policy rows are misaligned")
+    nodes = captured.node_ids.to(torch.int64)
 
     topology = sampled.topology
     if not isinstance(topology, BranchedTreeSpan):
         raise TypeError("branched direct seal omitted compact span topology")
 
-    legal_ids = torch.arange(
-        backend.e_max, dtype=torch.int32, device=device
-    )[None].expand(nodes.numel(), -1)
-    legal_mask = torch.empty(
-        (nodes.numel(), backend.e_max), dtype=torch.bool, device=device
-    )
-    for partition_id, input_block in captured.inputs.items():
-        positions = (captured.partition_id == partition_id).nonzero(
-            as_tuple=False
-        ).squeeze(1)
-        legal_mask[positions] = input_block.columns["legal_action_mask"][
-            captured.partition_row[positions].to(torch.int64)
-        ]
-
     target_degree = sampled.decision_aux["executed_child_count"].to(torch.int64)
     nominal_decision = sampled.decision_aux["nominal_child_count"].to(torch.int32)
-    global_decisions: dict[str, Tensor] = {
-        "owner": sampled.decision_aux["owner"].detach().to(torch.int32),
-        "old_value": source["old_v"].detach().to(torch.float32),
-        "legal_event_ids": legal_ids,
-        "legal_event_mask": legal_mask,
-        "log_weight": sampled.decision_aux["log_weight"].detach().to(torch.float64),
-        "nominal_child_count": nominal_decision,
-        "executed_child_count": target_degree.to(torch.int32),
-    }
-    old_t = source.columns.get("old_t")
-    old_c = source.columns.get("old_c")
-    if old_t is not None or old_c is not None:
-        if old_t is None or old_c is None:
-            raise RuntimeError("branched frozen T/C heads are incomplete")
-        global_decisions["frozen_trace_variance"] = old_t.detach()
-        global_decisions["frozen_cost"] = old_c.detach()
-
-    if sampled.action_ptr is None or sampled.action_source is None:
-        raise RuntimeError("branched direct seal omitted ragged action storage")
-    if not torch.equal(
-        sampled.action_ptr[1:] - sampled.action_ptr[:-1],
-        target_degree.to(torch.int32),
-    ):
-        raise RuntimeError("ragged rollout actions disagree with target topology")
-    action_decision = torch.repeat_interleave(
-        torch.arange(nodes.numel(), dtype=torch.int64, device=device),
-        target_degree,
-    )
 
     blocks: dict[int, PartitionRolloutBlock] = {}
     for partition in partitions.specs:
@@ -1788,20 +1739,36 @@ def _seal_branched_rollout_storage(
         ).squeeze(1)
         if selected.numel() == 0:
             continue
+        source = captured.decision_sources[partition.partition_id]
         captured_rows = captured.partition_row[selected].to(torch.int64)
         if not torch.equal(
             captured_rows,
             torch.arange(selected.numel(), dtype=torch.int64, device=device),
         ):
             raise RuntimeError("branched partition input rows are not contiguous")
+        inputs = captured.inputs[partition.partition_id]
         decisions_columns = {
-            name: value[selected].detach()
-            for name, value in global_decisions.items()
+            "owner": sampled.decision_aux["owner"][selected]
+            .detach()
+            .to(torch.int32),
+            "old_value": source["old_v"].detach().to(torch.float32),
+            "legal_event_ids": torch.arange(
+                backend.e_max, dtype=torch.int32, device=device
+            )[None].expand(selected.numel(), -1),
+            "legal_event_mask": inputs["legal_action_mask"].detach().to(torch.bool),
+            "log_weight": sampled.decision_aux["log_weight"][selected]
+            .detach()
+            .to(torch.float64),
+            "nominal_child_count": nominal_decision[selected],
+            "executed_child_count": target_degree[selected].to(torch.int32),
         }
-        if partition.partition_id == 0:
-            decisions_columns["old_value"] = _compress_preflop_rows(
-                decisions_columns["old_value"], backend
-            )
+        old_t = source.columns.get("old_t")
+        old_c = source.columns.get("old_c")
+        if old_t is not None or old_c is not None:
+            if old_t is None or old_c is None:
+                raise RuntimeError("branched frozen T/C heads are incomplete")
+            decisions_columns["frozen_trace_variance"] = old_t.detach()
+            decisions_columns["frozen_cost"] = old_c.detach()
         decisions = _sealed_dynamic_block(
             f"poker_partition_{partition.partition_id}_branched_decision",
             decisions_columns,
@@ -1812,28 +1779,19 @@ def _seal_branched_rollout_storage(
                 dynamic_heads="frozen_trace_variance" in decisions_columns,
             ),
         )
-        partition_actions = captured.partition_id[action_decision] == partition.partition_id
-        action_events = sampled.action_source["event"][partition_actions]
-        action_old_logp = sampled.action_source["old_logp"][partition_actions]
-        if partition.partition_id == 0:
-            action_old_logp = _compress_preflop_rows(action_old_logp, backend)
+        action_source = captured.action_sources[partition.partition_id]
+        action_ptr = captured.action_ptrs[partition.partition_id]
         actions = _sealed_dynamic_block(
             f"poker_partition_{partition.partition_id}_branched_action",
             {
-                "event": action_events.detach().to(torch.int32),
-                "old_log_prob": action_old_logp.detach().to(torch.float32),
+                "event": action_source["event"].detach().to(torch.int32),
+                "old_log_prob": action_source["old_logp"].detach().to(torch.float32),
             },
             schema=rollout_action_schema(partition.model_width),
         )
-        counts = target_degree[selected]
-        action_ptr = torch.empty(
-            selected.numel() + 1, dtype=torch.int32, device=device
-        )
-        action_ptr[0] = 0
-        action_ptr[1:] = counts.cumsum(0).to(torch.int32)
         blocks[partition.partition_id] = PartitionRolloutBlock(
             partition.partition_id,
-            captured.inputs[partition.partition_id],
+            inputs,
             decisions,
             actions,
             action_ptr,
@@ -1931,29 +1889,6 @@ def _seal_branched_rollout_storage(
         sampled.seal_metrics,
     )
     return rollout, partitions, completion, quality_parts
-
-
-def _compress_preflop_rows(value: Tensor, backend: Any) -> Tensor:
-    """Project an old combo-indexed model row back to its native class rows."""
-
-    if value.shape[-1] == backend.n_classes:
-        return value.detach()
-    if value.shape[-1] != backend.n_hands:
-        raise ValueError("old poker output has neither natural nor exact width")
-    combo_class = backend.combo_class.to(torch.int64)
-    representatives = torch.stack(
-        [(combo_class == index).nonzero(as_tuple=False)[0, 0] for index in range(backend.n_classes)]
-    )
-    result = value.index_select(-1, representatives).detach()
-    # Rollout currently samples exact hands from a class-row policy. This hard
-    # gate prevents a lossy quotient if that architectural invariant changes.
-    lifted = result.index_select(-1, combo_class)
-    if not bool(torch.allclose(value, lifted, atol=2e-5, rtol=2e-5)):
-        raise RuntimeError("preflop old outputs are not constant on canonical classes")
-    return result
-
-
-
 
 def _validate_policy_identity(
     cfg: RootConfig,

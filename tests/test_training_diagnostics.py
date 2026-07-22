@@ -29,10 +29,9 @@ def test_decision_street_metrics_counts_and_normalizes() -> None:
         partition_id=torch.zeros(6, dtype=torch.int32),
         partition_row=torch.arange(6, dtype=torch.int32),
         inputs={0: block},
+        decision_sources={0: block},
     )
-    sample = SimpleNamespace(
-        decision_source={"node_id": inputs.node_ids}, decision_inputs=inputs
-    )
+    sample = SimpleNamespace(decision_inputs=inputs)
     metrics: dict[str, float] = {}
 
     _decision_street_metrics(metrics, SimpleNamespace(), sample)

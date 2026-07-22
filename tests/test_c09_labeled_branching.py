@@ -159,27 +159,62 @@ class _LabeledBackend:
 
     @staticmethod
     def begin_decision_input_captures(
-        *, accountant: object | None = None
-    ) -> list[tuple[Tensor, Tensor]]:
-        del accountant
-        return []
+        *, mode: str = "branched_rb", dynamic_heads: bool = False,
+        accountant: object | None = None
+    ) -> dict[str, object]:
+        del mode, dynamic_heads, accountant
+        return {"next_decision": 0, "next_action": 0, "decisions": {}, "actions": {}}
 
     @staticmethod
-    def append_decision_input_capture(
-        store: list[tuple[Tensor, Tensor]], node_ids: Tensor, capture: Tensor
+    def reserve_decision_input_captures(store: dict[str, object], partition_id: int, count: int) -> Tensor:
+        del partition_id
+        start = int(store["next_decision"])
+        store["next_decision"] = start + count
+        return torch.arange(start, start + count, dtype=torch.int64)
+
+    @staticmethod
+    def reserve_action_captures(
+        store: dict[str, object], partition_id: int, decision_rows: Tensor, counts: Tensor
+    ) -> Tensor:
+        del partition_id
+        start = int(store["next_action"])
+        total = int(counts.sum())
+        store["next_action"] = start + total
+        begins = start + torch.cat((torch.zeros(1, dtype=torch.int64), counts.cumsum(0)[:-1]))
+        for row, begin, count in zip(decision_rows.tolist(), begins.tolist(), counts.tolist()):
+            store["decisions"].setdefault(row, {})["action_begin"] = begin
+            store["decisions"][row]["action_count"] = count
+        return torch.arange(start, start + total, dtype=torch.int64)
+
+    @staticmethod
+    def write_decision_input_capture(
+        store: dict[str, object], rows: Tensor, node_ids: Tensor, capture: Tensor,
+        policy_columns: dict[str, Tensor]
     ) -> None:
-        store.append((node_ids, capture))
+        for index, row in enumerate(rows.tolist()):
+            record = store["decisions"].setdefault(row, {})
+            record.update({"node_id": node_ids[index], "reach": capture[index]})
+            record.update({name: value[index] for name, value in policy_columns.items()})
+
+    @staticmethod
+    def write_action_captures(
+        store: dict[str, object], partition_id: int, rows: Tensor,
+        columns: dict[str, Tensor]
+    ) -> None:
+        del partition_id
+        for index, row in enumerate(rows.tolist()):
+            store["actions"][row] = {name: value[index] for name, value in columns.items()}
 
     def seal_decision_input_captures(
-        self, records: list[tuple[Tensor, Tensor]]
+        self, records: dict[str, object]
     ) -> SealedDecisionInputs:
-        if not records:
+        if not records["decisions"]:
             empty = torch.empty(0, dtype=torch.int32)
-            return SealedDecisionInputs(empty, empty, empty, {})
-        nodes = torch.cat([node for node, _ in records]).to(torch.int32)
-        reaches = torch.cat([reach for _, reach in records]).to(torch.float32)
-        order = torch.argsort(nodes.to(torch.int64), stable=True)
-        nodes, reaches = nodes[order], reaches[order]
+            return SealedDecisionInputs(empty, empty, empty, {}, {})
+        original = [records["decisions"][row] for row in sorted(records["decisions"])]
+        ordered = sorted(original, key=lambda record: int(record["node_id"]))
+        nodes = torch.stack([record["node_id"] for record in ordered]).to(torch.int32)
+        reaches = torch.stack([record["reach"] for record in ordered]).to(torch.float32)
         schema = TensorSchema(
             "labeled_test_decision_input",
             (TensorFieldSchema("reach", torch.float32, (2, 1)),),
@@ -190,9 +225,57 @@ class _LabeledBackend:
             nodes.numel(),
             schema.capacity_bytes(nodes.numel(), chunks=int(nodes.numel() > 0)),
         )
+        has_dynamic_heads = "old_t" in ordered[0]
+        policy_schema = TensorSchema(
+            "labeled_test_policy",
+            (
+                TensorFieldSchema("node_id", torch.int32),
+                TensorFieldSchema("old_v", torch.float32, (1,)),
+                TensorFieldSchema("action_begin", torch.int64),
+                TensorFieldSchema("action_count", torch.int32),
+                *(
+                    (TensorFieldSchema("old_t", torch.float32), TensorFieldSchema("old_c", torch.float32))
+                    if has_dynamic_heads else ()
+                ),
+            ),
+        )
+        policy_columns = {
+            "node_id": nodes,
+            "old_v": torch.stack([record["old_v"] for record in ordered]),
+            "action_begin": torch.tensor([record["action_begin"] for record in ordered]),
+            "action_count": torch.tensor([record["action_count"] for record in ordered], dtype=torch.int32),
+            **(
+                {
+                    "old_t": torch.stack([record["old_t"] for record in ordered]),
+                    "old_c": torch.stack([record["old_c"] for record in ordered]),
+                }
+                if has_dynamic_heads else {}
+            ),
+        }
+        policy = SealedTensorBlock(policy_schema, policy_columns, nodes.numel(), policy_schema.capacity_bytes(nodes.numel()))
+        action_records = [
+            records["actions"][index]
+            for record in ordered
+            for index in range(record["action_begin"], record["action_begin"] + record["action_count"])
+        ]
+        action_schema = TensorSchema(
+            "labeled_test_action",
+            (TensorFieldSchema("event", torch.int32), TensorFieldSchema("old_logp", torch.float32, (1,))),
+        )
+        action_columns = {
+            "event": torch.stack([record["event"] for record in action_records]),
+            "old_logp": torch.stack([record["old_logp"] for record in action_records]),
+        }
+        actions = SealedTensorBlock(action_schema, action_columns, len(action_records), action_schema.capacity_bytes(len(action_records)))
+        ptr = torch.empty(nodes.numel() + 1, dtype=torch.int32)
+        ptr[0] = 0
+        ptr[1:] = policy_columns["action_count"].cumsum(0)
         rows = torch.arange(nodes.numel(), dtype=torch.int32)
         records.clear()
-        return SealedDecisionInputs(nodes, torch.zeros_like(nodes), rows, {0: block})
+        return SealedDecisionInputs(
+            nodes, torch.zeros_like(nodes), rows, {0: block}, {0: policy},
+            {0: actions}, {0: ptr}
+        )
 
 
 def _cfg(
@@ -234,9 +317,9 @@ def test_equal_labeled_siblings_remain_distinct_with_uniform_weights() -> None:
     sample = _sample(_LabeledBackend(4.0), _cfg(1, 4.0))
     sample.topology.validate(leaf_rows=sample.leaf_source.rows)
     assert int(sample.topology.degree[0]) == 4
-    assert torch.equal(sample.action_source["event"], torch.zeros(4, dtype=torch.int32))
-    assert sample.action_ptr.tolist() == [0, 4]
-    assert sample.action_source["old_logp"].shape == (4, 1)
+    assert torch.equal(sample.decision_inputs.action_sources[0]["event"], torch.zeros(4, dtype=torch.int32))
+    assert sample.decision_inputs.action_ptrs[0].tolist() == [0, 4]
+    assert sample.decision_inputs.action_sources[0]["old_logp"].shape == (4, 1)
 
 
 def test_duplicate_siblings_expand_independently_without_label_sorting() -> None:
@@ -269,8 +352,8 @@ def test_branched_uses_one_root_and_preserves_duplicate_children() -> None:
     assert all(children.numel() == 2 for children in descendants)
     assert torch.cat(descendants).unique().numel() == 4
     assert backend.forward_batch_sizes == [1, 2]
-    assert sample.action_ptr.tolist() == [0, 2, 4, 6]
-    assert sample.action_source["old_logp"].shape == (6, 1)
+    assert sample.decision_inputs.action_ptrs[0].tolist() == [0, 2, 4, 6]
+    assert sample.decision_inputs.action_sources[0]["old_logp"].shape == (6, 1)
 
 
 def test_branched_dispatches_actual_cost_family_blocks() -> None:
@@ -281,7 +364,7 @@ def test_branched_dispatches_actual_cost_family_blocks() -> None:
     sample.topology.validate(leaf_rows=sample.leaf_source.rows)
     assert backend.actual_cost_batch_sizes == [1, 2]
     assert backend.forward_batch_sizes == [1, 2]
-    assert sample.action_ptr.tolist() == [0, 2, 4, 6]
+    assert sample.decision_inputs.action_ptrs[0].tolist() == [0, 2, 4, 6]
 
 
 def test_child_materialization_is_bounded_and_physical_plan_invariant() -> None:
@@ -312,10 +395,10 @@ def test_child_materialization_is_bounded_and_physical_plan_invariant() -> None:
         "nominal_degree",
     ):
         assert torch.equal(getattr(narrow.topology, name), getattr(wide.topology, name))
-    assert torch.equal(narrow.action_ptr, wide.action_ptr)
-    assert torch.equal(narrow.action_source["event"], wide.action_source["event"])
+    assert torch.equal(narrow.decision_inputs.action_ptrs[0], wide.decision_inputs.action_ptrs[0])
+    assert torch.equal(narrow.decision_inputs.action_sources[0]["event"], wide.decision_inputs.action_sources[0]["event"])
     assert torch.equal(
-        narrow.action_source["old_logp"], wide.action_source["old_logp"]
+        narrow.decision_inputs.action_sources[0]["old_logp"], wide.decision_inputs.action_sources[0]["old_logp"]
     )
     assert torch.equal(narrow.leaf_source["path_key"], wide.leaf_source["path_key"])
 
@@ -338,7 +421,7 @@ def test_upper_cutoff_switches_later_expansions_to_spines() -> None:
     assert sample.node_count == 5
     assert int(degree[0]) == 2
     assert torch.equal(degree[1:3], torch.ones(2, dtype=torch.int64))
-    assert sample.action_ptr.tolist() == [0, 2, 3, 4]
+    assert sample.decision_inputs.action_ptrs[0].tolist() == [0, 2, 3, 4]
     assert diagnostics == {
         "upper_cutoff_batches": 1,
         "upper_cutoff_parents": 2,
@@ -406,9 +489,9 @@ def test_root_refill_reaches_minimum_and_finalizes_uniform_weights() -> None:
         sample.node_count - tree.pre_refill_node_count
     )
     assert int(tree.nominal_degree[0]) == tree.root_target_degree
-    assert sample.decision_source["node_id"].tolist() == [0]
-    assert sample.action_ptr.tolist() == [0, tree.root_target_degree]
-    assert sample.action_source["old_logp"].shape == (tree.root_target_degree, 1)
+    assert sample.decision_inputs.decision_sources[0]["node_id"].tolist() == [0]
+    assert sample.decision_inputs.action_ptrs[0].tolist() == [0, tree.root_target_degree]
+    assert sample.decision_inputs.action_sources[0]["old_logp"].shape == (tree.root_target_degree, 1)
     tree.validate(leaf_rows=sample.leaf_source.rows)
 
 

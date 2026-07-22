@@ -37,16 +37,22 @@ def _require_device(condition: Tensor, message: str) -> None:
 class PokerPolicyAdapter:
     """Compose contextual action types and conditional raise ticks."""
 
-    def __init__(self, n_ticks: int | None = None, eps: float = 1e-12) -> None:
+    def __init__(
+        self,
+        n_ticks: int | None = None,
+        eps: float = 1e-12,
+        exact_to_model: Tensor | tuple[int, ...] | None = None,
+    ) -> None:
         if n_ticks is not None and n_ticks <= 0:
             raise ValueError("n_ticks must be positive")
         if eps <= 0:
             raise ValueError("eps must be positive")
         self.n_ticks = n_ticks
         self.eps = float(eps)
+        self.exact_to_model = exact_to_model
 
-    @staticmethod
     def select_actor_row(
+        self,
         output: PolicyOutput | Mapping[str, Tensor], profiles: Tensor, actor: Tensor
     ) -> dict[str, Tensor]:
         """Select exactly the actor combo stipulated by each fresh profile."""
@@ -64,6 +70,15 @@ class PokerPolicyAdapter:
         if len(raw_widths) != 1:
             raise ValueError("raw policy fields must share one compact hand width")
         n_hands = next(iter(raw_widths))
+        if self.exact_to_model is not None and n_hands != len(self.exact_to_model):
+            mapping = torch.as_tensor(
+                self.exact_to_model, dtype=torch.int64, device=combo.device
+            )
+            _require_device(
+                ((combo >= 0) & (combo < mapping.numel())).all(),
+                "the stipulated actor combo is invalid",
+            )
+            combo = mapping[combo]
         _require_device(
             ((combo >= 0) & (combo < n_hands)).all(),
             "the stipulated actor combo is invalid",
@@ -388,13 +403,9 @@ class PokerModelBundle(nn.Module):
         self, pub: PokerPublicBatch, class_ranges: Tensor, actor_seat: Tensor | None = None,
         masks: PreflopMasks | None = None,
     ) -> PolicyOutput:
-        """Run preflop and lift its compact class rows to compact combo rows."""
+        """Run preflop on its natural class domain."""
 
-        output = self.preflop(pub, class_ranges, actor_seat, masks)
-        return PolicyOutput(
-            {name: value[:, self.combo_class] for name, value in output.raw.items()},
-            output.v[:, self.combo_class], output.t, output.c,
-        )
+        return self.preflop(pub, class_ranges, actor_seat, masks)
 
     def forward_postflop(
         self, pub: PokerPublicBatch, combo_ranges: Tensor, actor_seat: Tensor | None = None,
@@ -428,9 +439,13 @@ class PokerModelBundle(nn.Module):
             )
             ids = self.combo_class.view(1, 1, -1).expand_as(selected)
             class_ranges.scatter_add_(2, ids, selected)
-            lifted = self.forward_preflop(
+            compact = self.forward_preflop(
                 self._slice_public(pub, pre_rows), class_ranges, actor[pre_rows],
                 self._slice_pre_masks(preflop_masks, pre_rows, batch),
+            )
+            lifted = PolicyOutput(
+                {key: value[:, self.combo_class] for key, value in compact.raw.items()},
+                compact.v[:, self.combo_class], compact.t, compact.c,
             )
             for local, global_row in enumerate(pre_rows.tolist()):
                 outputs[global_row] = PolicyOutput({k: v[local:local+1] for k, v in lifted.raw.items()},

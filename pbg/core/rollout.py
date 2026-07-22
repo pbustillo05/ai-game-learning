@@ -26,7 +26,7 @@ from pbg.core.execution import (
     stable_partition_masked,
 )
 from pbg.core.tree import PagedRolloutTopology
-from pbg.core.storage import PagedRowAccumulator, SealedRolloutSample
+from pbg.core.storage import PagedTensorArena, SealedRolloutSample, stopped_leaf_source_schema
 from pbg.core.topology import SequentialDecisionCSR
 
 
@@ -350,11 +350,12 @@ def _sample_trees_sequential(
     probe_enabled = bundle.opponent_model is not None
     capture_inputs = getattr(backend, "capture_decision_inputs", None)
     begin_captures = getattr(backend, "begin_decision_input_captures", None)
-    append_capture = getattr(backend, "append_decision_input_capture", None)
+    reserve_capture = getattr(backend, "reserve_decision_input_captures", None)
+    write_capture = getattr(backend, "write_decision_input_capture", None)
     seal_captures = getattr(backend, "seal_decision_input_captures", None)
     if not all(
         callable(value)
-        for value in (capture_inputs, begin_captures, append_capture, seal_captures)
+        for value in (capture_inputs, begin_captures, reserve_capture, write_capture, seal_captures)
     ):
         raise TypeError(
             "sequential rollout backends must capture immutable natural decision inputs"
@@ -433,12 +434,24 @@ def _sample_trees_sequential(
         desired_resident_starts=min(start_count, admission_size),
     )
     logical_seed = _logical_seed(cfg, gen)
-    policy_rows = PagedRowAccumulator(
-        "sequential_policy_rows", chunk_nodes, device
+    training_mode = getattr(getattr(cfg, "training", None), "mode", None)
+    source_mode = (
+        "normal" if training_mode == "normal" and not probe_enabled else "sequential_rb"
     )
-    decision_input_store = begin_captures()
-    leaf_rows = PagedRowAccumulator(
-        "sequential_stopped_leaf_rows", chunk_nodes, device
+    decision_input_store = begin_captures(mode=source_mode)
+    leaf_schema_factory = getattr(backend, "rollout_leaf_source_schema", None)
+    leaf_schema = (
+        leaf_schema_factory("probe" if probe_enabled else source_mode)
+        if callable(leaf_schema_factory)
+        else stopped_leaf_source_schema(
+            "generic", players=p_max, exact_width=x_max
+        )
+    )
+    leaf_rows = PagedTensorArena(
+        leaf_schema,
+        chunk_nodes,
+        device,
+        label="sequential_stopped_leaf_rows",
     )
     scheduler_steps = 0
     active_starts = 0
@@ -765,12 +778,19 @@ def _sample_trees_sequential(
             role_parts = (
                 (torch.arange(count, device=device), bundle.model, True),
             )
+        partition_id = family_names.index(selected_family)
+        reserved_by_role: dict[int, Tensor] = {}
+        for role_index, (positions, _, retain) in enumerate(role_parts):
+            if retain and positions.numel():
+                reserved_by_role[role_index] = reserve_capture(
+                    decision_input_store, partition_id, positions.numel()
+                )
         next_states = torch.empty_like(states)
         next_reach = torch.empty_like(reaches)
         event_ids = torch.empty(count, dtype=torch.int32, device=device)
         event_payload: dict[str, Tensor] = {}
         with torch.no_grad():
-            for positions, role_model, retain in role_parts:
+            for role_index, (positions, role_model, retain) in enumerate(role_parts):
                 if positions.numel() == 0:
                     continue
                 if role_model is None:
@@ -815,7 +835,15 @@ def _sample_trees_sequential(
                         legal_ids,
                         legal_mask,
                     ).detach()[:, 0]
-                    policy_rows.append(
+                    write_capture(
+                        decision_input_store,
+                        reserved_by_role[role_index],
+                        batch_nodes[positions],
+                        capture_inputs(
+                            selected_family,
+                            states[positions],
+                            reaches[positions],
+                        ),
                         {
                             "node_id": batch_nodes[positions].to(torch.int32),
                             "root_id": buffer.tree_id[
@@ -830,16 +858,7 @@ def _sample_trees_sequential(
                             "event": role_events.public_id.to(torch.int32),
                             "old_logp": selected_logp.to(torch.float32),
                             "old_v": output.v.detach().to(torch.float32),
-                        }
-                    )
-                    append_capture(
-                        decision_input_store,
-                        batch_nodes[positions],
-                        capture_inputs(
-                            selected_family,
-                            states[positions],
-                            reaches[positions],
-                        ),
+                        },
                     )
         events = EventBatch(public_id=event_ids, payload=event_payload)
         next_owner = backend.classify(next_states).to(torch.int32)
@@ -868,30 +887,31 @@ def _sample_trees_sequential(
         )
     for queue in queues.values():
         queue.release()
-    if not leaf_rows.rows or leaf_rows.arena is None:
+    if not leaf_rows.size:
         raise RuntimeError("sequential rollout produced no stopped-leaf rows")
-    leaf_root = leaf_rows.arena.gather(
-        "root_id", torch.arange(leaf_rows.rows, device=device)
+    leaf_root = leaf_rows.gather(
+        "root_id", torch.arange(leaf_rows.size, device=device)
     )
     leaf_order = torch.argsort(leaf_root.to(torch.int64), stable=True)
-    leaf_block, leaf_metrics = leaf_rows.seal(row_order=leaf_order)
+    leaf_block, leaf_metrics = leaf_rows.seal(
+        scratch_rows=chunk_nodes, row_order=leaf_order, release_source=True
+    )
     verify_recycling = getattr(backend, "verify_state_recycling_boundary", None)
     if callable(verify_recycling):
         verify_recycling()
-    if not policy_rows.rows or policy_rows.arena is None:
-        raise RuntimeError("sequential rollout produced no decision rows")
-    source_nodes = policy_rows.arena.gather(
-        "node_id", torch.arange(policy_rows.rows, device=device)
-    )
-    order = torch.argsort(source_nodes.to(torch.int64), stable=True)
-    policy_block, policy_metrics = policy_rows.seal(row_order=order)
-    node_ids = policy_block["node_id"].to(torch.int32)
     decision_inputs = seal_captures(decision_input_store)
-    if not torch.equal(decision_inputs.node_ids, node_ids):
-        raise RuntimeError("policy and natural decision-input rows are misaligned")
+    if not decision_inputs.node_ids.numel():
+        raise RuntimeError("sequential rollout produced no decision rows")
+    source_root = torch.empty_like(decision_inputs.node_ids)
+    source_ordinal = torch.empty_like(decision_inputs.node_ids)
+    for partition_id, source in decision_inputs.decision_sources.items():
+        selected = decision_inputs.partition_id == partition_id
+        rows = decision_inputs.partition_row[selected].to(torch.int64)
+        source_root[selected] = source["root_id"][rows]
+        source_ordinal[selected] = source["decision_ordinal"][rows]
     topology = SequentialDecisionCSR.build(
-        root_id=policy_block["root_id"],
-        decision_ordinal=policy_block["decision_ordinal"],
+        root_id=source_root,
+        decision_ordinal=source_ordinal,
         decision_partition=decision_inputs.partition_id,
         decision_row=decision_inputs.partition_row,
         leaf_root_id=leaf_block["root_id"],
@@ -905,7 +925,6 @@ def _sample_trees_sequential(
     node_count = buffer.node_count
     arena.release()
     buffer.release()
-    training_mode = getattr(getattr(cfg, "training", None), "mode", None)
     mode = (
         "probe"
         if probe_enabled
@@ -916,7 +935,6 @@ def _sample_trees_sequential(
     sample = SealedRolloutSample(
         mode=mode,
         topology=topology,
-        decision_source=policy_block,
         leaf_source=leaf_block,
         decision_inputs=decision_inputs,
         node_count=node_count,
@@ -925,7 +943,6 @@ def _sample_trees_sequential(
         trajectory_node_count=trajectory_node_count,
         seal_metrics={
             "leaf_rows": leaf_metrics,
-            "policy_rows": policy_metrics,
             **decision_inputs.seal_metrics,
         },
     )

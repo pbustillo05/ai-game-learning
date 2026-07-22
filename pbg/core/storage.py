@@ -637,67 +637,6 @@ class PagedTensorArena:
         self._released = True
 
 
-class PagedRowAccumulator:
-    """Schema-on-first-write paged owner for one homogeneous row stream.
-
-    The first realized pack fixes an immutable schema.  Later packs move into
-    admitted pages immediately; sealing is the only source-plus-destination
-    overlap and uses :class:`PagedTensorArena`'s bounded scratch copy.
-    """
-
-    def __init__(
-        self,
-        label: str,
-        page_rows: int,
-        device: torch.device | str,
-        *,
-        accountant: ByteAccountant | None = None,
-    ) -> None:
-        self.label = str(label)
-        self.page_rows = int(page_rows)
-        self.device = torch.device(device)
-        self.accountant = accountant
-        self.arena: PagedTensorArena | None = None
-
-    @property
-    def rows(self) -> int:
-        return 0 if self.arena is None else self.arena.size
-
-    def append(self, columns: Mapping[str, Tensor]) -> Tensor:
-        if not columns:
-            raise ValueError("paged row packs require at least one field")
-        if self.arena is None:
-            schema = TensorSchema(
-                self.label,
-                tuple(
-                    TensorFieldSchema(
-                        name,
-                        value.dtype,
-                        tuple(value.shape[1:]),
-                        alignment=min(max(value.element_size(), 1), 16),
-                    )
-                    for name, value in columns.items()
-                ),
-            )
-            self.arena = PagedTensorArena(
-                schema,
-                self.page_rows,
-                self.device,
-                accountant=self.accountant,
-                label=self.label,
-            )
-        return self.arena.append(columns)
-
-    def seal(self, *, row_order: Tensor | None = None) -> tuple[SealedTensorBlock, SealMetrics]:
-        if self.arena is None:
-            raise RuntimeError("cannot seal an unrealized row stream")
-        return self.arena.seal(
-            scratch_rows=self.page_rows,
-            row_order=row_order,
-            release_source=True,
-        )
-
-
 def admit_arena_growth(requests: Mapping[PagedTensorArena, int]) -> None:
     """Admit and allocate several arena extents as one publication transaction.
 
@@ -1112,6 +1051,9 @@ class SealedDecisionInputs:
     partition_id: Tensor
     partition_row: Tensor
     inputs: Mapping[int, SealedTensorBlock]
+    decision_sources: Mapping[int, SealedTensorBlock] = field(default_factory=dict)
+    action_sources: Mapping[int, SealedTensorBlock] = field(default_factory=dict)
+    action_ptrs: Mapping[int, Tensor] = field(default_factory=dict)
     input_pools: Mapping[int, Mapping[str, SealedTensorBlock]] = field(
         default_factory=dict
     )
@@ -1127,6 +1069,15 @@ class SealedDecisionInputs:
             if value.dtype != torch.int32 or value.shape != (count,):
                 raise ValueError(f"sealed decision {name} must be int32 [D]")
         inputs = MappingProxyType({int(key): value for key, value in self.inputs.items()})
+        decisions = MappingProxyType(
+            {int(key): value for key, value in self.decision_sources.items()}
+        )
+        actions = MappingProxyType(
+            {int(key): value for key, value in self.action_sources.items()}
+        )
+        action_ptrs = MappingProxyType(
+            {int(key): value for key, value in self.action_ptrs.items()}
+        )
         pools = MappingProxyType(
             {
                 int(key): MappingProxyType(dict(value))
@@ -1144,7 +1095,23 @@ class SealedDecisionInputs:
                 )
             ):
                 raise ValueError("sealed decision partition rows are not exact")
+            decision = decisions.get(partition)
+            if decision is None or decision.rows != block.rows:
+                raise ValueError("natural inputs and policy sources must align")
+            action = actions.get(partition)
+            ptr = action_ptrs.get(partition)
+            if (action is None) != (ptr is None):
+                raise ValueError("partition actions and action pointers must coexist")
+            if ptr is not None and (
+                ptr.dtype != torch.int32
+                or ptr.shape != (block.rows + 1,)
+                or int(ptr[-1]) != action.rows
+            ):
+                raise ValueError("partition action CSR does not match its decisions")
         object.__setattr__(self, "inputs", inputs)
+        object.__setattr__(self, "decision_sources", decisions)
+        object.__setattr__(self, "action_sources", actions)
+        object.__setattr__(self, "action_ptrs", action_ptrs)
         object.__setattr__(self, "input_pools", pools)
         object.__setattr__(self, "seal_metrics", MappingProxyType(dict(self.seal_metrics)))
 
@@ -1179,12 +1146,9 @@ class SealedRolloutSample:
 
     mode: str
     topology: Any
-    decision_source: SealedTensorBlock
     leaf_source: SealedTensorBlock
     decision_inputs: SealedDecisionInputs
     node_count: int
-    action_source: SealedTensorBlock | None = None
-    action_ptr: Tensor | None = None
     root_profiles: Tensor | None = None
     probe_seats: Tensor | None = None
     trajectory_node_count: Tensor | None = None
@@ -1199,15 +1163,10 @@ class SealedRolloutSample:
             raise ValueError("unknown directly sealed rollout mode")
         if isinstance(self.node_count, bool) or self.node_count < 0:
             raise ValueError("sealed rollout node_count must be nonnegative")
-        if self.decision_source.rows != self.decision_inputs.node_ids.numel():
-            raise ValueError("decision source and natural inputs must align")
-        if self.action_source is None:
-            if self.action_ptr is not None:
-                raise ValueError("sequential direct seal cannot own action_ptr")
-        elif self.action_ptr is None or self.action_ptr.shape != (
-            self.decision_source.rows + 1,
-        ):
-            raise ValueError("branched direct seal requires one global action CSR")
+        if sum(
+            block.rows for block in self.decision_inputs.decision_sources.values()
+        ) != self.decision_inputs.node_ids.numel():
+            raise ValueError("partition policy sources and natural inputs must align")
         object.__setattr__(
             self,
             "branching_diagnostics",
@@ -1495,7 +1454,7 @@ def topology_schema(mode: str) -> TensorSchema:
 
 
 def rollout_policy_source_schema(
-    mode: str, *, exact_width: int, dynamic_heads: bool = True
+    mode: str, *, model_width: int, dynamic_heads: bool = True
 ) -> TensorSchema:
     """Paged scheduler policy rows before partition-aware sealing."""
 
@@ -1508,16 +1467,20 @@ def rollout_policy_source_schema(
                 TensorFieldSchema("owner", torch.int32, alignment=4),
                 TensorFieldSchema("event", torch.int32, alignment=4),
                 TensorFieldSchema(
-                    "old_logp", torch.float32, (exact_width,), alignment=16
+                    "old_logp", torch.float32, (model_width,), alignment=16
                 ),
                 TensorFieldSchema(
-                    "old_v", torch.float32, (exact_width,), alignment=16
+                    "old_v", torch.float32, (model_width,), alignment=16
                 ),
             )
         )
     elif mode == "branched_rb":
-        fields.append(
-            TensorFieldSchema("old_v", torch.float32, (exact_width,), alignment=16)
+        fields.extend(
+            (
+                TensorFieldSchema("old_v", torch.float32, (model_width,), alignment=16),
+                TensorFieldSchema("action_begin", torch.int64, fill=-1, alignment=8),
+                TensorFieldSchema("action_count", torch.int32, alignment=4),
+            )
         )
         if dynamic_heads:
             fields.extend(
@@ -1606,15 +1569,15 @@ def rollout_action_schema(model_width: int) -> TensorSchema:
     )
 
 
-def rollout_action_source_schema(exact_width: int) -> TensorSchema:
+def rollout_action_source_schema(model_width: int) -> TensorSchema:
     """Paged scheduler edge-policy rows before ragged action sealing."""
 
     return TensorSchema(
         "branched_rb_action_source",
         (
-            TensorFieldSchema("edge_id", torch.int64, alignment=8),
+            TensorFieldSchema("event", torch.int32, alignment=4),
             TensorFieldSchema(
-                "old_logp", torch.float32, (exact_width,), alignment=16
+                "old_logp", torch.float32, (model_width,), alignment=16
             ),
         ),
     )
@@ -1631,12 +1594,18 @@ def stopped_leaf_source_schema(mode: str, *, players: int, exact_width: int) -> 
             "log_reach", torch.float32, (players, exact_width), alignment=16
         ),
     ]
-    if mode == "normal":
+    if mode == "generic":
+        pass
+    elif mode == "normal":
         fields.append(
             TensorFieldSchema("reward", torch.float32, (players,), alignment=16)
         )
-    elif mode in {"sequential_rb", "branched_rb"}:
+    elif mode in {"sequential_rb", "branched_rb", "probe"}:
         fields.extend(_rb_completion_public_fields(players))
+        if mode == "probe":
+            fields.append(
+                TensorFieldSchema("reward", torch.float32, (players,), alignment=16)
+            )
     else:
         raise ValueError("unknown rollout mode")
     return TensorSchema(f"{mode}_stopped_leaf_source", tuple(fields))

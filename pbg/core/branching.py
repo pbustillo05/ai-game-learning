@@ -16,7 +16,7 @@ from pbg.core.adaptive_branching import (
     randomized_round,
 )
 from pbg.core.tree import PagedRolloutTopology
-from pbg.core.storage import PagedRowAccumulator, SealedRolloutSample
+from pbg.core.storage import SealedRolloutSample
 from pbg.core.topology import BranchedTreeSpan
 
 
@@ -129,6 +129,7 @@ def _sample_branched_tree_impl(
         SealedTensorBlock,
         TensorFieldSchema,
         TensorSchema,
+        stopped_leaf_source_schema,
     )
     from pbg.core.rollout import (
         _logical_seed,
@@ -288,26 +289,43 @@ def _sample_branched_tree_impl(
     logical_seed = _logical_seed(cfg, gen)
     tree_address = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     scheduler_step = 0
-    policy_edge_rows = PagedRowAccumulator(
-        "branched_policy_edge_rows", page_rows, device, accountant=accountant
-    )
-    policy_node_rows = PagedRowAccumulator(
-        "branched_policy_node_rows", page_rows, device, accountant=accountant
-    )
+    completed_decision_rows = 0
     capture_inputs = getattr(backend, "capture_decision_inputs", None)
     begin_captures = getattr(backend, "begin_decision_input_captures", None)
-    append_capture = getattr(backend, "append_decision_input_capture", None)
+    reserve_capture = getattr(backend, "reserve_decision_input_captures", None)
+    write_capture = getattr(backend, "write_decision_input_capture", None)
+    reserve_actions = getattr(backend, "reserve_action_captures", None)
+    write_actions = getattr(backend, "write_action_captures", None)
     seal_captures = getattr(backend, "seal_decision_input_captures", None)
     if not all(
         callable(value)
-        for value in (capture_inputs, begin_captures, append_capture, seal_captures)
+        for value in (
+            capture_inputs,
+            begin_captures,
+            reserve_capture,
+            write_capture,
+            reserve_actions,
+            write_actions,
+            seal_captures,
+        )
     ):
         raise TypeError(
             "branched rollout backends must capture immutable natural decision inputs"
         )
-    decision_input_store = begin_captures(accountant=accountant)
-    leaf_rows = PagedRowAccumulator(
-        "branched_stopped_leaf_rows", page_rows, device, accountant=accountant
+    leaf_schema_factory = getattr(backend, "rollout_leaf_source_schema", None)
+    leaf_schema = (
+        leaf_schema_factory("branched_rb")
+        if callable(leaf_schema_factory)
+        else stopped_leaf_source_schema(
+            "generic", players=p_max, exact_width=x_max
+        )
+    )
+    leaf_rows = PagedTensorArena(
+        leaf_schema,
+        page_rows,
+        device,
+        accountant=accountant,
+        label="branched_stopped_leaf_rows",
     )
     cutoff_active = False
     branching_mode = getattr(rollout_cfg, "branching_mode", None)
@@ -324,6 +342,18 @@ def _sample_branched_tree_impl(
     )
     if dynamic_active and controller is None:
         raise ValueError("dynamic branching after warmup requires controller state")
+    source_model = (
+        bundle.model.module if hasattr(bundle.model, "module") else bundle.model
+    )
+    preflop_model = getattr(source_model, "preflop", None)
+    retains_branching_heads = (
+        getattr(preflop_model, "branching_heads", None) is not None
+    )
+    decision_input_store = begin_captures(
+        mode="branched_rb",
+        dynamic_heads=retains_branching_heads,
+        accountant=accountant,
+    )
     safe_tree_size = getattr(rollout_cfg, "safe_tree_size", None)
     if safe_tree_size is not None and (
         isinstance(safe_tree_size, bool)
@@ -417,8 +447,8 @@ def _sample_branched_tree_impl(
             queued_nodes=sum(family_queue_nodes.values()),
             frontier_nodes=frontier_nodes,
             family_queue_nodes=family_queue_nodes,
-            completed_leaves=leaf_rows.rows,
-            completed_decisions=policy_node_rows.rows,
+            completed_leaves=leaf_rows.size,
+            completed_decisions=completed_decision_rows,
         )
 
     def read_control(value: Tensor) -> tuple[int, ...]:
@@ -543,9 +573,17 @@ def _sample_branched_tree_impl(
         forced_edge_weight: float | None = None,
         record_policy_node: bool = True,
     ) -> Tensor:
+        nonlocal completed_decision_rows
         rows = nodes.to(torch.int64)
         states = buffer.state_ref[rows]
         reaches = reaches_for(nodes)
+        partition_id = None if family is None else family_names.index(family)
+        decision_rows = None
+        if partition_id is not None and record_policy_node:
+            decision_rows = reserve_capture(
+                decision_input_store, partition_id, nodes.numel()
+            )
+            completed_decision_rows += nodes.numel()
         output = None
         if dynamic_active and family is not None:
             output = actual_cost_forward(bundle.model, family, states, reaches)
@@ -568,12 +606,32 @@ def _sample_branched_tree_impl(
             admit_child_wave(total)
         if family is not None and output is None:
             output = actual_cost_forward(bundle.model, family, states, reaches)
-        if family is not None and record_policy_node:
+        action_rows = None
+        if partition_id is not None and record_policy_node:
             assert output is not None
-            append_capture(
+            assert decision_rows is not None
+            action_rows = reserve_actions(
+                decision_input_store, partition_id, decision_rows, offspring
+            )
+            output_t = getattr(output, "t", None)
+            output_c = getattr(output, "c", None)
+            write_capture(
                 decision_input_store,
+                decision_rows,
                 nodes.to(torch.int32),
                 capture_inputs(family, states, reaches),
+                {
+                    "node_id": nodes.to(torch.int32),
+                    "old_v": output.v.detach().to(torch.float32),
+                    **(
+                        {}
+                        if output_t is None or output_c is None
+                        else {
+                            "old_t": output_t.detach().to(torch.float32),
+                            "old_c": output_c.detach().to(torch.float32),
+                        }
+                    ),
+                },
             )
         prefix = torch.empty_like(offspring)
         prefix[0] = 0
@@ -744,7 +802,7 @@ def _sample_branched_tree_impl(
             )
             log_player_sum[children.to(torch.int64)] = child_log_sum
             log_ancestor_product[children.to(torch.int64)] = child_log_product
-            if family is not None:
+            if family is not None and record_policy_node:
                 assert child_output is not None
                 legal_ids, legal_mask = backend.legal_events(child_states)
                 edge_logp = _selected_policy_logp(
@@ -754,11 +812,15 @@ def _sample_branched_tree_impl(
                     legal_ids,
                     legal_mask,
                 ).detach()[:, 0]
-                policy_edge_rows.append(
+                assert partition_id is not None and action_rows is not None
+                write_actions(
+                    decision_input_store,
+                    partition_id,
+                    action_rows[start:end],
                     {
-                        "edge_id": edge_rows.to(torch.int64),
+                        "event": events.public_id.to(torch.int32),
                         "old_logp": edge_logp.to(torch.float32),
-                    }
+                    },
                 )
         children = torch.arange(
             first_child,
@@ -767,23 +829,6 @@ def _sample_branched_tree_impl(
             device=device,
         )
         if family is not None and record_policy_node:
-            assert output is not None
-            output_t = getattr(output, "t", None)
-            output_c = getattr(output, "c", None)
-            policy_node_rows.append(
-                {
-                    "node_id": nodes.to(torch.int32),
-                    "old_v": output.v.detach().to(torch.float32),
-                    **(
-                        {}
-                        if output_t is None or output_c is None
-                        else {
-                            "old_t": output_t.detach().to(torch.float32),
-                            "old_c": output_c.detach().to(torch.float32),
-                        }
-                    ),
-                }
-            )
             DeviceWorkQueue.mark_done(arena, rows)
         releasable = nodes[nodes != 0]
         if releasable.numel():
@@ -993,13 +1038,15 @@ def _sample_branched_tree_impl(
         )
         child_begin[degree > 0] = first[degree > 0]
 
-    if not leaf_rows.rows or leaf_rows.arena is None:
+    if not leaf_rows.size:
         raise RuntimeError("branched rollout produced no stopped-leaf rows")
-    source_nodes = leaf_rows.arena.gather(
-        "node_id", torch.arange(leaf_rows.rows, device=device)
+    source_nodes = leaf_rows.gather(
+        "node_id", torch.arange(leaf_rows.size, device=device)
     )
     leaf_order = torch.argsort(source_nodes.to(torch.int64), stable=True)
-    leaf_block, leaf_metrics = leaf_rows.seal(row_order=leaf_order)
+    leaf_block, leaf_metrics = leaf_rows.seal(
+        scratch_rows=page_rows, row_order=leaf_order, release_source=True
+    )
     verify_recycling = getattr(backend, "verify_state_recycling_boundary", None)
     if callable(verify_recycling):
         verify_recycling()
@@ -1038,72 +1085,20 @@ def _sample_branched_tree_impl(
         leaf_rows=leaf_block.rows,
     )
 
-    if decision_nodes.numel():
-        target_counts = degree_old[decision_nodes].to(torch.int64)
-        if root_pre_refill_child_count is not None:
-            root_row = (decision_nodes == 0).nonzero(as_tuple=False).squeeze(1)
-            if root_row.numel() != 1:
-                raise RuntimeError("protected root is not a retained decision")
-            target_counts[root_row] = int(root_pre_refill_child_count)
-        action_ptr = torch.empty(
-            decision_nodes.numel() + 1, dtype=torch.int32, device=device
-        )
-        action_ptr[0] = 0
-        action_ptr[1:] = target_counts.cumsum(0).to(torch.int32)
-        logp_action = torch.full(
-            (int(action_ptr[-1]), x_max),
-            -torch.inf,
-            dtype=torch.float32,
-            device=device,
-        )
-        edge_block, edge_metrics = policy_edge_rows.seal()
-        edge_ids = edge_block["edge_id"].to(torch.int64)
-        edge_logp = edge_block["old_logp"].to(torch.float32)
-        parents = buffer.edge_parent[edge_ids].to(torch.int64)
-        node_to_row = torch.full(
-            (buffer.node_count,), -1, dtype=torch.int64, device=device
-        )
-        node_to_row[decision_nodes] = torch.arange(decision_nodes.numel(), device=device)
-        # Append-order edge ids are not CSR positions under work queue scheduling:
-        # another family may expand a later node first. PagedRolloutTopology stores
-        # each edge's stable parent-local ordinal explicitly for this mapping.
-        columns = buffer.edge_ordinal[edge_ids].to(torch.int64)
-        rows = node_to_row[parents]
-        retained = (rows >= 0) & (columns < target_counts[rows.clamp_min(0)])
-        destinations = action_ptr[rows[retained]].to(torch.int64) + columns[retained]
-        logp_action[destinations] = edge_logp[retained]
-        action_event = buffer.child_event[edge_ids[retained]].to(torch.int32)
-        ordered_event = torch.empty(int(action_ptr[-1]), dtype=torch.int32, device=device)
-        ordered_event[destinations] = action_event
-        assert policy_node_rows.arena is not None
-        cached_nodes = policy_node_rows.arena.gather(
-            "node_id", torch.arange(policy_node_rows.rows, device=device)
-        ).to(torch.int32)
-        order = torch.argsort(cached_nodes.to(torch.int64))
-        node_block, node_metrics = policy_node_rows.seal(row_order=order)
-        if not torch.equal(cached_nodes[order], decision_nodes):
-            raise RuntimeError("family-scheduled branched rollout omitted a decision cache row")
-    else:
-        edge_metrics = node_metrics = None
-        action_ptr = torch.zeros(1, dtype=torch.int32, device=device)
-        ordered_event = torch.empty(0, dtype=torch.int32, device=device)
-        logp_action = torch.empty((0, x_max), dtype=torch.float32, device=device)
+    if not decision_nodes.numel():
         raise RuntimeError("branched rollout produced no player decisions")
-    if not torch.equal(decision_inputs.node_ids, node_block["node_id"]):
-        raise RuntimeError("branched decision inputs are not aligned with topology")
-    action_schema = TensorSchema(
-        "branched_direct_action_source",
-        (
-            TensorFieldSchema("event", torch.int32, alignment=4),
-            TensorFieldSchema("old_logp", torch.float32, (x_max,), alignment=16),
-        ),
-    )
-    action_source = SealedTensorBlock(
-        action_schema,
-        {"event": ordered_event, "old_logp": logp_action},
-        int(action_ptr[-1]),
-        action_schema.capacity_bytes(int(action_ptr[-1]), chunks=1),
-    )
+    target_counts = degree_old[decision_nodes].to(torch.int64)
+    if root_pre_refill_child_count is not None:
+        root_row = (decision_nodes == 0).nonzero(as_tuple=False).squeeze(1)
+        if root_row.numel() != 1:
+            raise RuntimeError("protected root is not a retained decision")
+        target_counts[root_row] = int(root_pre_refill_child_count)
+    for partition_id, ptr in decision_inputs.action_ptrs.items():
+        selected = decision_inputs.partition_id == partition_id
+        if not torch.equal(
+            (ptr[1:] - ptr[:-1]).to(torch.int64), target_counts[selected]
+        ):
+            raise RuntimeError("reserved natural action rows disagree with topology")
     path_weight = buffer.path_weight[decision_nodes].detach().to(torch.float64)
     if root_pre_refill_child_count is not None:
         root_final_child_count = int(degree_old[0])
@@ -1122,20 +1117,15 @@ def _sample_branched_tree_impl(
     return SealedRolloutSample(
         mode="branched_rb",
         topology=topology,
-        decision_source=node_block,
         leaf_source=leaf_block,
         decision_inputs=decision_inputs,
         node_count=node_count,
-        action_source=action_source,
-        action_ptr=action_ptr,
         decision_node=decision_new_nodes.to(torch.int32),
         decision_aux=decision_aux,
         branching_beta=decision_beta,
         branching_diagnostics=diagnostics,
         seal_metrics={
             "leaf_rows": leaf_metrics,
-            "policy_action_rows": edge_metrics,
-            "policy_decision_rows": node_metrics,
             **decision_inputs.seal_metrics,
         },
     )

@@ -44,10 +44,11 @@ def test_exact_profile_selects_only_stipulated_actor_row():
     # Give each row a unique marker without changing any unrelated profile seat.
     raw["iota"] = torch.arange(1326.0)[None]
     profile = torch.tensor([[17, 901]], dtype=torch.int32)
-    selected = PokerPolicyAdapter.select_actor_row(raw, profile, torch.tensor([1]))
+    adapter = PokerPolicyAdapter()
+    selected = adapter.select_actor_row(raw, profile, torch.tensor([1]))
     assert selected["iota"].item() == 901
     profile[0, 0] = 400
-    selected_again = PokerPolicyAdapter.select_actor_row(raw, profile, torch.tensor([1]))
+    selected_again = adapter.select_actor_row(raw, profile, torch.tensor([1]))
     assert selected_again["iota"].item() == 901
 
 

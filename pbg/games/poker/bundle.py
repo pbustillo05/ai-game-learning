@@ -670,7 +670,9 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
                 module.configure_execution(
                     cfg.hardware.attention_backend, cfg.hardware.query_chunk_size
                 )
-    adapter = PokerPolicyAdapter(engine_cfg.n_ticks)
+    adapter = PokerPolicyAdapter(
+        engine_cfg.n_ticks, exact_to_model=tuple(engine_cfg.geometry.class_of_combo)
+    )
     profiles = PokerGPURejectionSampler(rank_count=engine_cfg.rank_count)
     partition = PokerGPUPartitionAdapter(
         beta_rank=model_cfg.folder_beta_rank, rank_count=engine_cfg.rank_count
