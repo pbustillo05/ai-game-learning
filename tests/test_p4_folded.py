@@ -97,7 +97,7 @@ def _inputs(device: torch.device | str = "cpu") -> tuple[torch.Tensor, torch.Ten
 
 
 
-def test_no_folder_summary_is_neutral_and_skips_evaluator(
+def test_no_folder_summary_is_forbidden_and_skips_evaluator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = _install_fake(monkeypatch)
@@ -109,14 +109,13 @@ def test_no_folder_summary_is_neutral_and_skips_evaluator(
         line_meta=torch.empty((2, 0, 8), dtype=torch.float32),
         folder_mask=torch.empty((2, 0), dtype=torch.bool),
     )
-    output = PokerGPUPartitionAdapter().summarize(
-        board_cards=torch.full((2, 5), -1, dtype=torch.int16),
-        live_range_weights=torch.rand(2, 3, 1326),
-        folded=folded,
-    )
+    with pytest.raises(ValueError, match="all-live postflop"):
+        PokerGPUPartitionAdapter().summarize(
+            board_cards=torch.full((2, 5), -1, dtype=torch.int16),
+            live_range_weights=torch.rand(2, 3, 1326),
+            folded=folded,
+        )
     assert "all" not in calls
-    assert torch.count_nonzero(output.fields["hand_log_ratio"]) == 0
-    assert output.fields["folder_card_mass"].shape == (2, 0, 52)
 
 
 

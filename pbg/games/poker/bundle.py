@@ -73,7 +73,7 @@ def estimate_rollout_memory(
     rank_count: int = 13,
     max_history_tokens: int = 1,
     folder_beta_rank: int = 16,
-    partition_cache_materialized: bool = True,
+    partition_summary_required: bool = True,
     use_branching_heads: bool = False,
     storage_page_rows: int = 256,
 ) -> PokerRolloutMemoryPlan:
@@ -104,8 +104,9 @@ def estimate_rollout_memory(
                 n_cards=4 * rank_count,
                 beta_rank=folder_beta_rank,
                 max_folders=max(0, n_players - 2),
+                include_anchor=True,
             )
-            if partition_cache_materialized
+            if partition_summary_required
             else 0
         ),
     )
@@ -686,7 +687,9 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         # governed by the backend rollout-step bound rather than model tokens.
         max_history_tokens=state_history_steps,
         folder_beta_rank=model_cfg.folder_beta_rank,
-        partition_cache_materialized=model_cfg.evaluator_summary_dim > 0,
+        partition_summary_required=bool(
+            getattr(model.postflop, "requires_partition_summary", False)
+        ),
         use_branching_heads=model_cfg.use_branching_heads,
         storage_page_rows=int(cfg.rollout.storage_page_rows or 256),
     )

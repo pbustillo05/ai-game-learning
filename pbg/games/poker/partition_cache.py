@@ -5,7 +5,12 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from pbg.core.storage import PagedTensorArena, TensorFieldSchema, TensorSchema
+from pbg.core.storage import (
+    ByteAccountant,
+    PagedTensorArena,
+    TensorFieldSchema,
+    TensorSchema,
+)
 from pbg.games.poker.folded import PartitionSummaryBatch
 
 
@@ -90,12 +95,18 @@ class DevicePartitionSummaryCache:
         beta_rank: int,
         line_dim: int = 8,
         page_rows: int = 64,
+        accountant: ByteAccountant | None = None,
+        label: str = "poker_folded_summary",
     ) -> None:
         if max_folders < 0:
             raise ValueError("partition cache dimensions are invalid")
         self.max_folders = int(max_folders)
         self.device = torch.device(device)
         self.page_rows = int(page_rows)
+        self.accountant = accountant
+        self.label = str(label)
+        if not self.label:
+            raise ValueError("partition cache label must be nonempty")
         self.schema = (
             None
             if self.max_folders == 0
@@ -135,6 +146,11 @@ class DevicePartitionSummaryCache:
         """Return device-local cache-hit flags for int state keys ``[B]``."""
 
         return self._lookup(keys) >= 0
+
+    def lookup_rows(self, keys: Tensor) -> Tensor:
+        """Return stable owned row ids, or ``-1`` for absent anchors."""
+
+        return self._lookup(keys)
 
     def _lookup(self, keys: Tensor) -> Tensor:
         keys = keys.to(device=self.device, dtype=torch.int64)
@@ -177,7 +193,8 @@ class DevicePartitionSummaryCache:
             self.schema,
             self.page_rows,
             self.device,
-            label="poker_folded_summary",
+            accountant=self.accountant,
+            label=self.label,
         )
         return self.arena
 
@@ -305,11 +322,12 @@ class DevicePartitionSummaryCache:
         beta_rank: int,
         max_folders: int,
         line_dim: int = 8,
+        include_anchor: bool = False,
     ) -> int:
-        """Return schema payload bytes for ``capacity`` realized sparse rows.
+        """Return schema capacity bytes for ``capacity`` sparse rows.
 
-        This is the exact sealed-pool estimator. The mutable cache itself
-        admits pages only as distinct anchors are materialized.
+        Sealed pools omit the anchor field. Mutable rollout caches set
+        ``include_anchor`` and admit this amount one page at a time.
         """
 
         if min(capacity, n_cards, beta_rank, max_folders, line_dim) < 0:
@@ -321,6 +339,6 @@ class DevicePartitionSummaryCache:
             beta_rank=beta_rank,
             max_folders=max_folders,
             line_dim=line_dim,
-            include_anchor=False,
+            include_anchor=include_anchor,
         )
         return schema.capacity_bytes(capacity, chunks=1)

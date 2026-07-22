@@ -257,35 +257,9 @@ class PokerGPUPartitionAdapter:
         boundary_board = self._normalize_board(board_cards)  # [B,5]
         self._validate_inputs(boundary_board, live_range_weights, folded)
         batch_size = boundary_board.shape[0]
-        # The correction is the folded subsystem integrated out. Live ranges are accepted
-        # only because they remain part of the local call-site contract;
-        # including them in the neutral partition law would double-count live
-        # collision geometry and produce a non-neutral correction with K=0.
         if folded.reach_weights.shape[1] == 0:
-            zeros = torch.zeros(
-                (batch_size,), dtype=torch.float32, device=boundary_board.device
-            )
-            n_folders = folded.reach_weights.shape[1]
-            n_cards = self.geometry.n_cards
-            fields = {
-                "hand_log_ratio": torch.zeros((batch_size, self.geometry.n_hands), dtype=torch.float32, device=boundary_board.device),
-                "beta_eigenvalue": torch.zeros((batch_size, self.beta_rank), dtype=torch.float32, device=boundary_board.device),
-                "beta_eigenvector": torch.zeros((batch_size, n_cards, self.beta_rank), dtype=torch.float32, device=boundary_board.device),
-                "folder_log_mass": torch.zeros((batch_size, n_folders), dtype=torch.float32, device=boundary_board.device),
-                "folder_card_mass": torch.zeros((batch_size, n_folders, n_cards), dtype=torch.float32, device=boundary_board.device),
-                "tight_cluster_scalar": zeros,
-                "folder_mask": folded.folder_mask,
-                "folder_line_meta": folded.line_meta,
-                "folder_seat": folded.seat_ids if folded.seat_ids is not None else torch.arange(
-                    n_folders, dtype=torch.int64, device=boundary_board.device
-                )[None].expand(batch_size, -1),
-            }
-            return PartitionSummaryBatch(
-                fields=fields,
-                metadata={
-                    "contract_version": EXPECTED_CONTRACT_VERSION,
-                    "neutral_no_folders": True,
-                },
+            raise ValueError(
+                "all-live postflop states have no folded-summary request"
             )
 
         if boundary_board.device.type not in {"cuda", "mps"}:
