@@ -15,7 +15,7 @@ five-mode certification, or performance-gate standard.
 | C02 | Confirmed defect — blocker | Mandatory rank-local failures lack common terminal agreement and can strand peers in collectives. | `AUD-TL-001` |
 | C03 | Fixed in d407d8e4f80e6e01b702ccbf707e7659bafc09e7 | BR has no authoritative response class, seat law, objective, stopping/cutoff, or estimator. | `A-01`, `EVAL-001`, authority part of `MODE-007` |
 | C04 | Confirmed defect — high | Multi-player BR early-fold settlement is broken; BR also lacks a CUDA acceptance gate. | `TRACE-001`, `EVAL-002`, correctness/test part of `MODE-007` |
-| C05 | Confirmed defect — high | Inferred/handwritten rollout schemas, preflop exact-width model carriers, and late logical-address reservation violate immutable natural storage. | `AUD-RSQ-003/004/006` |
+| C05 | Fixed in 3625e0adb2add0b260e11b4c3a50e196548b58c6 | Inferred/handwritten rollout schemas, preflop exact-width model carriers, and late logical-address reservation violate immutable natural storage. | `AUD-RSQ-003/004/006` |
 | C06 | Confirmed defect — high | Branched child transient materialization scales with logical offspring instead of bounded physical subspans. | `AUD-RSQ-005`, part of `AUD-RSQ-006`, `PERF-003` |
 | C07 | Fixed in a78deab51699416d36f785a53c6ef0f251efb43d | Queue policy/accounting and the common fixed/warmup scientific safeguard differ from authority. | `AUD-RSQ-007/008/009`, fixed/warmup `HIST-OOM-01`, `PERF-007` |
 | C08 | Confirmed defect — high | Core training/BR accepts CPU and Gloo instead of requiring NVIDIA CUDA/NCCL. | `MODE-001`, `AUD-TL-005`, CUDA part of `EVAL-002` |
