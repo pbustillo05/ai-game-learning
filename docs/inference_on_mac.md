@@ -1,10 +1,10 @@
 # Poker inference on Apple Silicon
 
 `PokerInferenceSession` is the model-only serving entry point. It loads a
-training checkpoint or compact inference artifact without constructing rollout
-storage, completion, an optimizer, or any CUDA subsystem. Public NLHE rules run
-on CPU, folded-player statistics use the sibling evaluator's CPU implementation,
-and all policy/value network operations run on Metal through PyTorch MPS.
+training checkpoint or compact inference artifact without constructing training
+storage, completion, or an optimizer. Public NLHE state, ranges, model forwards,
+and supported evaluator calls remain on Metal through PyTorch MPS. CUDA is also
+supported by the same tensor-native inference implementation.
 
 ## Installation and diagnostics
 
@@ -26,7 +26,6 @@ Verify the accelerator before loading a production checkpoint:
 
 Do not set `PYTORCH_ENABLE_MPS_FALLBACK=1`. The inference loader rejects that
 setting because it can silently execute unsupported model operators on CPU.
-The explicit folded-statistics CPU call is unaffected.
 
 ## Export and load
 
@@ -45,7 +44,7 @@ from pbg.inference import PokerInferenceSession
 
 session = PokerInferenceSession.from_checkpoint(
     "policy.pt",
-    device="mps",       # "auto" selects MPS when available
+    device="mps",       # required; the other supported value is "cuda"
     precision="auto",   # fp16 on MPS; use "fp32" for strict comparison
     mode="auto",        # singleton latency path, batched throughput path
 )
@@ -73,6 +72,9 @@ outside their configured highest-rank deck.
 Use `new_hands`, `advance_many`, `deal_many`, and `predict_many` to amortize
 input construction and Metal dispatch. Requests are grouped by street and live
 player count, split under the MPS memory budget, and restored to caller order.
+Folded-player postflop inference is rejected on MPS until evaluator contract v2
+implements `summarize_folders`; preflop and no-folder postflop inference remain
+available. CUDA supports every inference spot.
 
 ```python
 hands = session.new_hands([0, 1, 0, 1])

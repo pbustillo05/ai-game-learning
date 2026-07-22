@@ -1,4 +1,4 @@
-"""Benchmark warmed model-only poker inference on CPU or Apple MPS."""
+"""Benchmark warmed model-only poker inference on CUDA or Apple MPS."""
 
 from __future__ import annotations
 
@@ -26,11 +26,14 @@ def _prepare_hands(
         return hands, private
     for hand in hands:
         while session._owner(session._state(hand)) != CHANCE:
-            state = session.engine.states.state(session._state(hand).ref)
-            to_call = max(
-                0.0,
-                state.current_bet - state.committed_street[state.actor],
+            ref = torch.tensor(
+                [session._state(hand).ref], dtype=torch.int64, device=session.device
             )
+            actor = session.backend.states.actor[ref].long()
+            to_call = float((
+                session.backend.states.current_bet[ref]
+                - session.backend.states.committed_street[ref, actor]
+            ).clamp_min(0).to("cpu")[0])
             session.advance(hand, "call" if to_call > 0 else "check")
         session.deal(hand, active[:3])
     return hands, private
@@ -41,7 +44,7 @@ def main() -> None:
         description="Benchmark warmed poker policy/value inference"
     )
     parser.add_argument("checkpoint")
-    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "mps"))
+    parser.add_argument("--device", required=True, choices=("cuda", "mps"))
     parser.add_argument("--precision", default="auto", choices=("auto", "fp32", "fp16"))
     parser.add_argument(
         "--mode", default="auto", choices=("auto", "latency", "throughput")

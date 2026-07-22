@@ -43,13 +43,14 @@ def test_obsolete_global_and_decision_target_fields_are_rejected(tmp_path) -> No
     source = tmp_path / "obsolete.yaml"
     source.write_text(
         """
+device: cuda
 game: {name: poker, n_players: 2, stack_bb: 8, rank_count: 4}
 rollout:
   sequential_starts: 8
   target_decisions_per_gpu: 100
   beta: null
   storage_page_rows: 100
-completion: {n_samples: 2, backend: cpu}
+completion: {n_samples: 2}
 model: {}
 loss:
   {name: ppo_value_entropy, lam: 1.0, clip_eps: 0.2, clip_eps_v: 0.2,

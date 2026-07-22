@@ -1,11 +1,10 @@
-"""Stateful, model-only NLHE inference on CPU or Apple MPS."""
+"""Stateful accelerator-native NLHE inference on CUDA or Apple MPS."""
 
 from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
 import math
-import os
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
@@ -13,21 +12,16 @@ import torch
 from torch import Tensor
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL
-from pbg.games.poker.adapter import PokerGame, PokerPolicyAdapter
+from pbg.games.poker.adapter import PokerPolicyAdapter
 from pbg.games.poker.bundle import build_model_from_config
-from pbg.games.poker.engine import (
+from pbg.games.poker.rules import (
     CHECK_CALL,
     FOLD,
     FOLDED,
     RAISE_OFFSET,
-    NLHEEngine,
     PokerConfig,
 )
-from pbg.games.poker.folded import (
-    FoldSnapshotBatch,
-    PartitionSummaryBatch,
-    PokerGPUPartitionAdapter,
-)
+from pbg.games.poker.folded import PartitionSummaryBatch, PokerGPUPartitionAdapter
 from pbg.games.poker.model.postflop import PostflopMasks
 from pbg.games.poker.model.preflop import (
     PackedPublicHistory,
@@ -36,6 +30,9 @@ from pbg.games.poker.model.preflop import (
 )
 from pbg.games.poker.model.primitives import MHA
 from pbg.inference_artifact import load_inference_source
+from pbg.core.game import EventBatch
+from pbg.core.devices import assert_module_device, resolve_execution_device
+from pbg.games.poker.rollout_backend import PokerRolloutBackend
 
 
 _RANKS = "23456789TJQKA"
@@ -87,17 +84,9 @@ class FullStrategy:
 
 
 @dataclass
-class _FoldRecord:
-    board_at_fold: Tensor  # uint8 [5], CPU
-    line_meta: Tensor  # float32 [8], CPU
-
-
-@dataclass
 class _HandState:
     ref: int
     log_reach: Tensor  # float32 [P,H], model device
-    folds: dict[int, _FoldRecord]
-    fold_version: int = 0
 
 
 def parse_card(card: str | int, *, first_card: int = 0) -> int:
@@ -155,12 +144,12 @@ class PokerInferenceSession:
         self,
         source: dict[str, Any],
         *,
-        device: str | torch.device = "auto",
+        device: str | torch.device,
         precision: str = "auto",
         mode: str = "auto",
         max_batch_rows: int | None = None,
     ) -> None:
-        self.device = self._resolve_device(device)
+        self.device = resolve_execution_device(device, workload="inference")
         if precision not in {"auto", "fp32", "fp16"}:
             raise ValueError("precision must be 'auto', 'fp32', or 'fp16'")
         if mode not in {"auto", "latency", "throughput"}:
@@ -169,14 +158,6 @@ class PokerInferenceSession:
             isinstance(max_batch_rows, bool) or max_batch_rows <= 0
         ):
             raise ValueError("max_batch_rows must be positive when supplied")
-        if (
-            self.device.type == "mps"
-            and os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1"
-        ):
-            raise RuntimeError(
-                "PYTORCH_ENABLE_MPS_FALLBACK=1 hides unsupported model operations; "
-                "unset it before creating an MPS inference session"
-            )
         if precision == "auto":
             self.precision = "fp16" if self.device.type == "mps" else "fp32"
         else:
@@ -195,14 +176,7 @@ class PokerInferenceSession:
             stack_bb=game["stack_bb"],
             rank_count=game["rank_count"],
         )
-        self.engine = NLHEEngine(self.game_config)
-        self._game = PokerGame(
-            self.engine,
-            profile_sampler=object(),
-            showdown_evaluator=object(),
-            partition_adapter=object(),
-        )
-        self.model = build_model_from_config(scientific, torch.device("cpu"))
+        self.model = build_model_from_config(scientific, self.device)
         self.model.load_state_dict(source["model"], strict=True)
         self.model.eval().requires_grad_(False)
         for module in self.model.modules():
@@ -210,19 +184,24 @@ class PokerInferenceSession:
                 module.configure_execution(
                     "sdpa" if self.device.type == "mps" else "auto", 128
                 )
-        self.model.to(self.device)
+        assert_module_device(self.model, self.device, "inference model")
         self.adapter = PokerPolicyAdapter(self.game_config.n_ticks)
         self.partition_adapter = PokerGPUPartitionAdapter(
             beta_rank=self.model.postflop.cfg.folder_beta_rank,
             rank_count=self.game_config.rank_count,
         )
+        self.backend = PokerRolloutBackend(
+            self.game_config,
+            self.device,
+            storage_page_rows=max(16, int(max_batch_rows or 64)),
+            max_rollout_steps=self.model.preflop.cfg.max_history_tokens,
+            partition_adapter=self.partition_adapter,
+        )
+        self.backend.states.reset()
         self.iteration = int(source["iteration"])
         self.source_checkpoint_sha256 = str(source["source_checkpoint_sha256"])
         self._hands: dict[int, _HandState] = {}
         self._next_hand_id = 0
-        self._partition_cache: dict[
-            tuple[int, tuple[int, ...], int], PartitionSummaryBatch
-        ] = {}
         self._combo_cards_cpu = torch.tensor(
             self.game_config.geometry.combo_cards, dtype=torch.int64
         )
@@ -238,7 +217,7 @@ class PokerInferenceSession:
         cls,
         path: str | Path,
         *,
-        device: str | torch.device = "auto",
+        device: str | torch.device,
         precision: str = "auto",
         mode: str = "auto",
         max_batch_rows: int | None = None,
@@ -253,45 +232,45 @@ class PokerInferenceSession:
             max_batch_rows=max_batch_rows,
         )
 
-    @staticmethod
-    def _resolve_device(device: str | torch.device) -> torch.device:
-        if str(device) == "auto":
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                return torch.device("mps")
-            return torch.device("cpu")
-        resolved = torch.device(device)
-        if resolved.type not in {"cpu", "mps"}:
-            raise ValueError("inference device must be 'auto', 'cpu', or 'mps'")
-        if resolved.type == "mps" and not (
-            hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-        ):
-            built = hasattr(torch.backends, "mps") and torch.backends.mps.is_built()
-            reason = (
-                "unavailable on this Mac" if built else "absent from this PyTorch build"
-            )
-            raise RuntimeError(f"MPS is {reason}")
-        return resolved
-
     def new_hand(self, button: int = 0) -> HandHandle:
         """Create one inference hand with uniform initial private ranges."""
 
         handle = HandHandle(self._next_hand_id)
         self._next_hand_id += 1
         self._hands[handle.value] = _HandState(
-            ref=self.engine.new_hand(button),
+            ref=int(self.backend.append_initial_states(
+                torch.tensor([button], dtype=torch.int32, device=self.device)
+            ).to("cpu")[0]),
             log_reach=torch.zeros(
                 (self.game_config.n_players, self.game_config.geometry.n_hands),
                 dtype=torch.float32,
                 device=self.device,
             ),
-            folds={},
         )
         return handle
 
     def new_hands(self, buttons: Sequence[int]) -> list[HandHandle]:
         """Create a batch of independent hands in input order."""
 
-        return [self.new_hand(button) for button in buttons]
+        if not buttons:
+            return []
+        roots = self.backend.append_initial_states(
+            torch.tensor(buttons, dtype=torch.int32, device=self.device)
+        ).to("cpu").tolist()
+        result: list[HandHandle] = []
+        for ref in roots:
+            handle = HandHandle(self._next_hand_id)
+            self._next_hand_id += 1
+            self._hands[handle.value] = _HandState(
+                ref=int(ref),
+                log_reach=torch.zeros(
+                    (self.game_config.n_players, self.game_config.geometry.n_hands),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+            )
+            result.append(handle)
+        return result
 
     def _state(self, hand: HandHandle) -> _HandState:
         if not isinstance(hand, HandHandle) or hand.value not in self._hands:
@@ -300,7 +279,9 @@ class PokerInferenceSession:
 
     def _owner(self, state: _HandState) -> int:
         return int(
-            self.engine.owner_of(torch.tensor([state.ref], dtype=torch.int32))[0]
+            self.backend.classify(torch.tensor(
+                [state.ref], dtype=torch.int32, device=self.device
+            )).to("cpu")[0]
         )
 
     def _require_decision(self, hand: HandHandle) -> _HandState:
@@ -324,10 +305,14 @@ class PokerInferenceSession:
         return self.game_config.geometry.hand_index(*sorted(parsed))
 
     def _resolve_action(self, ref: int, action: Any) -> int:
-        refs = torch.tensor([ref], dtype=torch.int32)
-        _, legal = self.engine.legal_events(refs)
-        state = self.engine.states.state(ref)
-        to_call = max(0.0, state.current_bet - state.committed_street[state.actor])
+        refs = torch.tensor([ref], dtype=torch.int32, device=self.device)
+        _, legal = self.backend.legal_events(refs)
+        row = refs.to(torch.int64)
+        actor = self.backend.states.actor[row].to(torch.int64)
+        to_call = float((
+            self.backend.states.current_bet[row]
+            - self.backend.states.committed_street[row, actor]
+        ).clamp_min(0).to("cpu")[0])
         if isinstance(action, PokerAction):
             event = action.event_id
         elif isinstance(action, str):
@@ -341,7 +326,10 @@ class PokerInferenceSession:
                     raise ValueError("call is illegal when checking is available")
                 event = CHECK_CALL
             elif name in {"all_in", "allin"}:
-                target = state.committed_street[state.actor] + state.stacks[state.actor]
+                target = float((
+                    self.backend.states.committed_street[row, actor]
+                    + self.backend.states.stacks[row, actor]
+                ).to("cpu")[0])
                 event = self._raise_event_for(ref, target)
             else:
                 raise ValueError(f"unknown poker action {action!r}")
@@ -355,17 +343,19 @@ class PokerInferenceSession:
             raise TypeError(
                 "action must be fold/check/call/all_in, PokerAction, or ('raise_to', bb)"
             )
-        if not 0 <= event < self.engine.e_max or not bool(legal[0, event]):
+        if not 0 <= event < self.backend.e_max or not bool(legal[0, event].to("cpu")):
             raise ValueError(f"event {event} is illegal in the current public state")
         return int(event)
 
     def _raise_event_for(self, ref: int, target: float) -> int:
         if not math.isfinite(target):
             raise ValueError("raise-to amount must be finite")
-        refs = torch.tensor([ref], dtype=torch.int32)
-        targets = self.engine.raise_targets(refs)[0]
-        _, legal = self.engine.legal_events(refs)
-        matches = torch.isclose(targets, torch.tensor(target), atol=1e-6, rtol=0.0)
+        refs = torch.tensor([ref], dtype=torch.int32, device=self.device)
+        targets = self.backend.raise_targets(refs)[0]
+        _, legal = self.backend.legal_events(refs)
+        matches = torch.isclose(
+            targets, torch.tensor(target, device=self.device), atol=1e-6, rtol=0.0
+        )
         columns = (matches & legal[0, RAISE_OFFSET:]).nonzero(as_tuple=False)
         if columns.numel() != 1:
             raise ValueError(
@@ -374,14 +364,17 @@ class PokerInferenceSession:
         return RAISE_OFFSET + int(columns[0, 0])
 
     def _actions_for(self, ref: int) -> tuple[PokerAction, ...]:
-        refs = torch.tensor([ref], dtype=torch.int32)
-        _, legal = self.engine.legal_events(refs)
-        targets = self.engine.raise_targets(refs)[0]
-        state = self.engine.states.state(ref)
-        to_call = max(0.0, state.current_bet - state.committed_street[state.actor])
-        maximum = state.committed_street[state.actor] + state.stacks[state.actor]
+        refs = torch.tensor([ref], dtype=torch.int32, device=self.device)
+        _, legal = self.backend.legal_events(refs)
+        targets = self.backend.raise_targets(refs)[0]
+        row = refs.to(torch.int64)
+        actor = self.backend.states.actor[row].to(torch.int64)
+        to_call = float((self.backend.states.current_bet[row]
+            - self.backend.states.committed_street[row, actor]).clamp_min(0).to("cpu")[0])
+        maximum = float((self.backend.states.committed_street[row, actor]
+            + self.backend.states.stacks[row, actor]).to("cpu")[0])
         actions: list[PokerAction] = []
-        for event in legal[0].nonzero(as_tuple=False).squeeze(1).tolist():
+        for event in legal[0].nonzero(as_tuple=False).squeeze(1).to("cpu").tolist():
             if event == FOLD:
                 actions.append(PokerAction("fold", event))
             elif event == CHECK_CALL:
@@ -389,7 +382,7 @@ class PokerInferenceSession:
                     PokerAction("call" if to_call > 1e-6 else "check", event)
                 )
             else:
-                target = float(targets[event - RAISE_OFFSET])
+                target = float(targets[event - RAISE_OFFSET].to("cpu"))
                 actions.append(
                     PokerAction(
                         "raise_to",
@@ -412,7 +405,7 @@ class PokerInferenceSession:
         scalar_count = (
             3 * self.game_config.n_players
             + 13
-            + self.engine.e_max
+            + self.backend.e_max
             + self.game_config.n_ticks
         )
         if street == 0:
@@ -434,7 +427,7 @@ class PokerInferenceSession:
         token_cap = max(1, 131_072 // tokens)
         pair_cap = max(1, 268_435_456 // (tokens * tokens))
         admitted = min(logical, 64, token_cap, pair_cap)
-        if self.device.type == "mps":
+        if self.device.type == "mps" and live < self.game_config.n_players:
             recommended = int(torch.mps.recommended_max_memory())
             driver = int(torch.mps.driver_allocated_memory())
             reserve = max(2 * 1024**3, recommended // 4)
@@ -467,112 +460,23 @@ class PokerInferenceSession:
 
     def _partition_summary(
         self,
-        handles: Sequence[HandHandle],
-        states: Sequence[_HandState],
-        pub_cpu: PokerPublicBatch,
+        refs: Tensor,
+        pub: PokerPublicBatch,
         weights: Tensor,
         live: int,
     ) -> PartitionSummaryBatch:
-        keys = [
-            (
-                handle.value,
-                tuple(int(card) for card in self.engine.states.board[state.ref]),
-                state.fold_version,
+        if self.device.type == "mps":
+            raise RuntimeError(
+                "postflop MPS inference is unavailable because evaluator contract v2 "
+                "defers summarize_folders on MPS"
             )
-            for handle, state in zip(handles, states, strict=True)
-        ]
-        missing = [
-            index for index, key in enumerate(keys) if key not in self._partition_cache
-        ]
-        if missing:
-            status = pub_cpu.status
-            if status is None:
-                raise RuntimeError("postflop public state is missing seat status")
-            weights_cpu = (
-                weights[missing].detach().to(device="cpu", dtype=torch.float32)
-            )
-            ordered_seats = [
-                sorted(
-                    range(self.game_config.n_players),
-                    key=lambda seat: int(status[index, seat] == FOLDED),
-                )
-                for index in missing
-            ]
-            live_weights = torch.stack(
-                [
-                    weights_cpu[row, seats[:live]]
-                    for row, seats in enumerate(ordered_seats)
-                ]
-            )
-            folder_count = self.game_config.n_players - live
-            if folder_count:
-                folded_weights = torch.stack(
-                    [
-                        weights_cpu[row, seats[live:]]
-                        for row, seats in enumerate(ordered_seats)
-                    ]
-                )
-                fold_boards = torch.stack(
-                    [
-                        torch.stack(
-                            [
-                                states[index].folds[seat].board_at_fold
-                                for seat in seats[live:]
-                            ]
-                        )
-                        for index, seats in zip(missing, ordered_seats, strict=True)
-                    ]
-                )
-                line_meta = torch.stack(
-                    [
-                        torch.stack(
-                            [
-                                states[index].folds[seat].line_meta
-                                for seat in seats[live:]
-                            ]
-                        )
-                        for index, seats in zip(missing, ordered_seats, strict=True)
-                    ]
-                )
-            else:
-                n_hands = self.game_config.geometry.n_hands
-                folded_weights = torch.empty(
-                    (len(missing), 0, n_hands), dtype=torch.float32
-                )
-                fold_boards = torch.empty((len(missing), 0, 5), dtype=torch.uint8)
-                line_meta = torch.empty((len(missing), 0, 8), dtype=torch.float32)
-            folder_seats = torch.tensor(
-                [seats[live:] for seats in ordered_seats], dtype=torch.int64
-            )
-            folded = FoldSnapshotBatch(
-                reach_weights=folded_weights.contiguous(),
-                board_at_fold=fold_boards.contiguous(),
-                line_meta=line_meta.contiguous(),
-                folder_mask=torch.ones((len(missing), folder_count), dtype=torch.bool),
-                seat_ids=folder_seats.contiguous(),
-            )
-            computed = self.partition_adapter.summarize(
-                board_cards=pub_cpu.board[missing].to(torch.int16).contiguous(),
-                live_range_weights=live_weights.contiguous(),
-                folded=folded,
-            )
-            for row, index in enumerate(missing):
-                self._partition_cache[keys[index]] = PartitionSummaryBatch(
-                    fields={
-                        name: value[row : row + 1].clone()
-                        for name, value in computed.fields.items()
-                    },
-                    metadata=dict(computed.metadata),
-                )
-        first = self._partition_cache[keys[0]]
-        return PartitionSummaryBatch(
-            fields={
-                name: torch.cat(
-                    [self._partition_cache[key].fields[name] for key in keys], dim=0
-                )
-                for name in first.fields
-            },
-            metadata=dict(first.metadata),
+        return self.backend._partition_summary_uncached(
+            refs,
+            pub.board,
+            weights,
+            pub.status,
+            live,
+            compute_mask=torch.ones(refs.shape, dtype=torch.bool, device=self.device),
         )
 
     def _evaluate_full_device(
@@ -581,11 +485,13 @@ class PokerInferenceSession:
         if not handles:
             raise ValueError("at least one hand is required")
         states = [self._require_decision(hand) for hand in handles]
-        refs = torch.tensor([state.ref for state in states], dtype=torch.int32)
-        legal_ids_cpu, legal_mask_cpu = self.engine.legal_events(refs)
+        refs = torch.tensor(
+            [state.ref for state in states], dtype=torch.int32, device=self.device
+        )
+        legal_ids_all, legal_mask_all = self.backend.legal_events(refs)
         batch = len(handles)
         n_hands = self.game_config.geometry.n_hands
-        e_max = self.engine.e_max
+        e_max = self.backend.e_max
         probabilities = torch.empty(
             (batch, n_hands, e_max), dtype=torch.float32, device=self.device
         )
@@ -593,25 +499,27 @@ class PokerInferenceSession:
         seat_values: Tensor | None = None
 
         groups: dict[tuple[int, int, int], list[int]] = {}
-        for index, state in enumerate(states):
-            public = self.engine.states.state(state.ref)
-            live = sum(status != FOLDED for status in public.status)
-            history = len(public.public_history)
+        controls = torch.stack((
+            self.backend.states.street[refs.long()].to(torch.int32),
+            (self.backend.states.status[refs.long()] != FOLDED).sum(1).to(torch.int32),
+            self.backend.states.history_length[refs.long()].to(torch.int32),
+        ), dim=1).to("cpu").tolist()
+        for index, (street, live, history) in enumerate(controls):
             history_bucket = 0 if history == 0 else 1 << (history - 1).bit_length()
-            groups.setdefault((public.street, live, history_bucket), []).append(index)
+            groups.setdefault((street, live, history_bucket), []).append(index)
 
         with torch.inference_mode():
             for family, positions in groups.items():
                 physical = self._physical_batch_rows(family, len(positions))
                 for start in range(0, len(positions), physical):
                     selected = positions[start : start + physical]
-                    selected_handles = [handles[index] for index in selected]
                     selected_states = [states[index] for index in selected]
                     selected_refs = torch.tensor(
-                        [state.ref for state in selected_states], dtype=torch.int32
+                        [state.ref for state in selected_states],
+                        dtype=torch.int32,
+                        device=self.device,
                     )
-                    pub_cpu = self._game.encode_public(selected_refs)
-                    pub = _move_public(pub_cpu, self.device)
+                    pub = self.backend.encode_public(selected_refs)
                     log_reach = torch.stack(
                         [state.log_reach for state in selected_states]
                     )
@@ -640,10 +548,9 @@ class PokerInferenceSession:
                                 ),
                             )
                         else:
-                            summary_cpu = self._partition_summary(
-                                selected_handles,
-                                selected_states,
-                                pub_cpu,
+                            summary = self._partition_summary(
+                                selected_refs,
+                                pub,
                                 weights,
                                 family[1],
                             )
@@ -668,9 +575,7 @@ class PokerInferenceSession:
                                     seat_mask=pub.seat_mask,
                                     combo_mask=weights > 0,
                                     status=pub.status,
-                                    evaluator_summary=_move_summary(
-                                        summary_cpu, self.device
-                                    ),
+                                    evaluator_summary=summary,
                                     live_seat_ids=live_ids,
                                     compact_size=math.comb(
                                         self.game_config.geometry.n_cards
@@ -679,8 +584,9 @@ class PokerInferenceSession:
                                     ),
                                 ),
                             )
-                        legal_ids = legal_ids_cpu[selected].to(self.device)
-                        legal_mask = legal_mask_cpu[selected].to(self.device)
+                        index = torch.tensor(selected, device=self.device)
+                        legal_ids = legal_ids_all[index]
+                        legal_mask = legal_mask_all[index]
                         part_probability = self.adapter.probabilities(
                             output, legal_ids, legal_mask
                         )
@@ -693,8 +599,8 @@ class PokerInferenceSession:
             probabilities,
             values,
             seat_values,
-            legal_ids_cpu.to(self.device),
-            legal_mask_cpu.to(self.device),
+            legal_ids_all,
+            legal_mask_all,
         )
 
     def predict(
@@ -749,7 +655,7 @@ class PokerInferenceSession:
         results: list[Decision] = []
         for row, (hand, combo) in enumerate(zip(hands, combo_ids, strict=True)):
             state = self._state(hand)
-            board = self.engine.states.board[state.ref]
+            board = self.backend.states.board[state.ref].to("cpu").tolist()
             cards = self._combo_cards_cpu[combo]
             if any(int(card) in board for card in cards):
                 raise ValueError("private_hand conflicts with the public board")
@@ -788,11 +694,12 @@ class PokerInferenceSession:
         probability, values, seat_values, _, legal_mask = self._evaluate_full_device(
             selected
         )
-        boards = torch.tensor(
-            [self.engine.states.board[self._state(hand).ref] for hand in selected],
+        refs = torch.tensor(
+            [self._state(hand).ref for hand in selected],
             dtype=torch.int64,
             device=self.device,
         )
+        boards = self.backend.states.board[refs].to(torch.int64)
         compatible = self._compatibility(boards)
         return FullStrategy(
             hands=tuple(selected),
@@ -834,45 +741,18 @@ class PokerInferenceSession:
         for row, (hand, state, event) in enumerate(
             zip(hands, states, events, strict=True)
         ):
-            public = self.engine.states.state(state.ref)
-            actor = public.actor
+            ref = torch.tensor([state.ref], dtype=torch.int32, device=self.device)
+            actor = int(self.backend.states.actor[ref.long()].to("cpu")[0])
             selected = probability[row, :, event].clamp_min(self.adapter.eps)
             state.log_reach[actor] += torch.log(selected).float()
             finite = torch.isfinite(state.log_reach[actor])
             gauge = state.log_reach[actor].masked_fill(~finite, -torch.inf).amax()
             state.log_reach[actor] -= gauge
-            if event == FOLD:
-                board = torch.tensor(
-                    public.board + (-1,) * (5 - len(public.board)),
-                    dtype=torch.int16,
-                )
-                board_at_fold = torch.where(
-                    board < 0, torch.full_like(board, 255), board
-                ).to(torch.uint8)
-                to_call = max(
-                    0.0,
-                    public.current_bet - public.committed_street[actor],
-                )
-                line = torch.tensor(
-                    [
-                        public.street,
-                        public.committed_total[actor],
-                        public.committed_street[actor],
-                        sum(public.committed_total),
-                        to_call,
-                        public.n_raises,
-                        len(public.public_history),
-                        len(public.board),
-                    ],
-                    dtype=torch.float32,
-                )
-                state.folds[actor] = _FoldRecord(board_at_fold, line)
-                state.fold_version += 1
-            successor = self.engine.step(
-                torch.tensor([state.ref], dtype=torch.int32),
-                torch.tensor([event], dtype=torch.int32),
+            successor = self.backend.step(
+                ref,
+                EventBatch(torch.tensor([event], dtype=torch.int32, device=self.device)),
             )
-            state.ref = int(successor[0])
+            state.ref = int(successor.to("cpu")[0])
         return list(hands)
 
     def deal(self, hand: HandHandle, cards: Sequence[str | int]) -> HandHandle:
@@ -903,11 +783,13 @@ class PokerInferenceSession:
                 parse_card(card, first_card=self.game_config.geometry.first_card)
                 for card in cards
             ]
-            public = self.engine.states.state(state.ref)
-            expected = 3 if public.street == 0 else 1
+            ref = torch.tensor([state.ref], dtype=torch.int64, device=self.device)
+            street = int(self.backend.states.street[ref].to("cpu")[0])
+            expected = 3 if street == 0 else 1
             if len(parsed) != expected:
                 raise ValueError(f"street requires exactly {expected} public card(s)")
-            if len(set(parsed)) != len(parsed) or set(parsed) & set(public.board):
+            board = self.backend.states.board[ref].to("cpu")[0].tolist()
+            if len(set(parsed)) != len(parsed) or set(parsed) & {c for c in board if c >= 0}:
                 raise ValueError("public cards must be unique")
             parsed_rows.append(parsed)
         for state, cards in zip(states, parsed_rows, strict=True):
@@ -920,11 +802,16 @@ class PokerInferenceSession:
                 .any(1)
             )
             state.log_reach[:, conflict] = -torch.inf
-            successor = self.engine.deal(
-                torch.tensor([state.ref], dtype=torch.int32),
-                torch.tensor([cards], dtype=torch.int16),
+            padded = cards + [-1] * (3 - len(cards))
+            ref = torch.tensor([state.ref], dtype=torch.int32, device=self.device)
+            successor = self.backend.step(
+                ref,
+                EventBatch(
+                    torch.zeros(1, dtype=torch.int32, device=self.device),
+                    {"cards": torch.tensor([padded], dtype=torch.int16, device=self.device)},
+                ),
             )
-            state.ref = int(successor[0])
+            state.ref = int(successor.to("cpu")[0])
         return list(hands)
 
 

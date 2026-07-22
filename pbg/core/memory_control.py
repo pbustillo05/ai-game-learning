@@ -443,11 +443,9 @@ class SequentialMemoryController:
             safe = min(safe, int(values.min()))
         elif torch.distributed.is_available() and torch.distributed.is_initialized():
             backend = torch.distributed.get_backend()
-            reduction_device = (
-                torch.device("cuda", torch.cuda.current_device())
-                if backend == "nccl"
-                else torch.device("cpu")
-            )
+            if backend != "nccl":
+                raise RuntimeError("distributed memory control is NCCL-only")
+            reduction_device = torch.device("cuda", torch.cuda.current_device())
             value = torch.tensor(local_safe, dtype=torch.int64, device=reduction_device)
             torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.MIN)
             safe = int(value)

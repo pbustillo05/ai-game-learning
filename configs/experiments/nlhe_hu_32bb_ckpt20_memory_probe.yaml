@@ -19,9 +19,9 @@ rollout:
   memory_growth_delay: 8
   memory_prediction_z: 3.0
 
+device: cuda
 completion:
   n_samples: 1024
-  backend: cuda
 
 model:
   d_model: 128

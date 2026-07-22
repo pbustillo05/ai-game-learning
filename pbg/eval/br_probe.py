@@ -15,7 +15,6 @@ import torch
 from torch import Tensor
 
 from pbg.config import load_config_mapping
-from pbg.eval.arena import _student_t_critical
 from pbg.core.execution import DrawPurpose
 from pbg.core.game import PROBE_FOLD, GameBundle
 from pbg.core.rollout import (
@@ -24,6 +23,27 @@ from pbg.core.rollout import (
     sequential_leaf_logical_rng_keys,
 )
 from pbg.games.poker.bundle import build_bundle, build_model_from_config
+from pbg.core.devices import resolve_execution_device, validate_workload_capabilities
+
+
+_T975 = (
+    0.0, 12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306,
+    2.262, 2.228, 2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110,
+    2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
+    2.052, 2.048, 2.045, 2.042,
+)
+
+
+def _student_t_critical(df: int) -> float:
+    if df <= 0:
+        raise ValueError("Student-t degrees of freedom must be positive")
+    if df < len(_T975):
+        return _T975[df]
+    z = 1.959963984540054
+    inverse = 1.0 / df
+    return z + (z**3 + z) * inverse / 4.0 + (
+        5 * z**5 + 16 * z**3 + 3 * z
+    ) * inverse**2 / 96.0
 
 
 @dataclass(frozen=True)
@@ -90,6 +110,15 @@ def evaluate_br_probe(
 ) -> BRProbeReport:
     """Evaluate one probe against its target using paired stochastic rollouts."""
 
+    requested_override = (
+        None
+        if device is None
+        else resolve_execution_device(device, workload="best-response evaluation")
+    )
+    if requested_override is not None:
+        validate_workload_capabilities(
+            requested_override, workload="best-response evaluation"
+        )
     started = time.perf_counter()
     probe_path = Path(probe_checkpoint)
     probe_payload = torch.load(probe_path, map_location="cpu", weights_only=False)
@@ -120,10 +149,11 @@ def evaluate_br_probe(
         batch_size = min(n_hands, max(block, (256 // block) * block))
     if batch_size <= 0 or batch_size % block:
         raise ValueError("batch_size must be a positive multiple of P^2")
-    requested = torch.device(
-        device
-        or ("cuda:0" if torch.cuda.is_available() else "cpu")
+    requested = resolve_execution_device(
+        cfg.device if requested_override is None else requested_override,
+        workload="best-response evaluation",
     )
+    validate_workload_capabilities(requested, workload="best-response evaluation")
     cfg.rollout.roots_per_gpu = min(batch_size, n_hands)
     bundle = build_bundle(cfg, requested)
     bundle.model.load_state_dict(probe_payload["model"])

@@ -396,7 +396,8 @@ def run_variance_job(
     raw["training"]["amp"] = False
     raw["training"]["reproducibility"] = "strict"
     raw["training"]["minibatch_size"] = max(2, int(raw["training"].get("minibatch_size", 2)))
-    raw["completion"]["backend"] = "cuda" if device.type == "cuda" else "cpu"
+    raw["device"] = device.type
+    raw["completion"].pop("backend", None)
     raw["completion"]["n_samples"] = int(experiment["oracle"]["initial_samples"])
     raw["loss"]["lam"] = 1.0
     raw["loss"]["c_v"] = 0.0005

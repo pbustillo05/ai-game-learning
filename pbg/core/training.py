@@ -95,6 +95,11 @@ from pbg.core.rollout import (
 from pbg.core.execution import LOGICAL_RNG_VERSION, DrawPurpose, logical_rng_keys
 from pbg.core.completion import BatchedCompletionStats
 from pbg.core.utility import utility_conversion, utility_scale
+from pbg.core.devices import (
+    assert_module_device,
+    resolve_execution_device,
+    validate_workload_capabilities,
+)
 
 
 def _configure_reproducibility(profile: str) -> None:
@@ -191,7 +196,7 @@ def _hardware_metadata(
         "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
         "logical_rng": LOGICAL_RNG_VERSION,
         "scheduler_control_sync_policy": "one_fixed_control_block_per_decision_v1",
-        "completion_backend": cfg.completion.backend,
+        "execution_device": cfg.device,
         "execution_calibration": {
             "batch_rows": cfg.rollout.family_batch_rows,
             "max_active_trajectories": cfg.rollout.max_active_trajectories,
@@ -223,7 +228,7 @@ def _hardware_metadata(
             f"hardware profile {profile.name!r} allows at most {profile.max_devices} devices"
         )
     if device.type != "cuda":
-        metadata["attention_backend"] = "cpu_reference"
+        metadata["attention_backend"] = "mps"
         return metadata
     props = torch.cuda.get_device_properties(device)
     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
@@ -446,7 +451,7 @@ def _value_workspace_budget(cfg: RootConfig, device: torch.device) -> int:
 
     gib = 1024**3
     if device.type != "cuda":
-        return gib
+        raise RuntimeError("training value workspaces require CUDA")
     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
     profile = cfg.hardware
     if profile is None:
@@ -836,7 +841,7 @@ def _validate_memory_preflight(
     """Reject a structurally impossible CUDA plan before rollout allocation."""
 
     if device.type != "cuda":
-        return
+        raise RuntimeError("training memory preflight requires CUDA")
     # ``plan`` describes the complete phase peak, including model/backend
     # tensors already allocated when this check runs. Comparing it with current
     # free memory would double-count those residents.
@@ -855,7 +860,7 @@ def _validate_memory_calibration(
     """Gate later iterations using the measured byte-complete CUDA peak."""
 
     if device.type != "cuda":
-        return
+        raise RuntimeError("training memory calibration requires CUDA")
     peaks = [
         value
         for key, value in metrics.items()
@@ -2425,14 +2430,11 @@ def run_training(
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    if cfg.completion.backend == "cpu":
-        requested = torch.device("cpu")
-    elif cfg.completion.backend == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("poker completion backend 'cuda' requires an available CUDA device")
-        requested = torch.device(f"cuda:{local_rank}")
-    else:
-        requested = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    workload = "distributed training" if world > 1 else "training"
+    requested = resolve_execution_device(
+        cfg.device, workload=workload, local_rank=local_rank
+    )
+    validate_workload_capabilities(requested, workload=workload)
     if requested.type == "cuda" and cfg.hardware is None:
         raise RuntimeError(
             "CUDA training requires an explicit hardware profile with token, "
@@ -2533,11 +2535,15 @@ def run_training(
     if not isinstance(bundle, GameBundle):
         raise TypeError("bundle builder must return GameBundle")
     device = torch.device(bundle.rollout_backend.device)
-    if device.type == "cuda":
-        torch.cuda.set_device(device)
+    if device != requested:
+        raise RuntimeError(
+            f"bundle rollout device {device} differs from selected device {requested}"
+        )
+    torch.cuda.set_device(device)
     if torch_gen.device != device:
         torch_gen, np_gen = seed_all(cfg.training.seed, rank, device)
     bundle.model.to(device)
+    assert_module_device(bundle.model, device, "training model")
     if initialized_model_state is not None:
         try:
             bundle.model.load_state_dict(initialized_model_state)
@@ -2589,7 +2595,7 @@ def run_training(
                 ) from exc
     if world > 1:
         if not dist.is_initialized():
-            dist.init_process_group("nccl" if device.type == "cuda" else "gloo")
+            dist.init_process_group("nccl")
         # Each rank owns a plain model replica. Gradients are accumulated under
         # the exact local objective scale and reduced once through the explicit
         # flat SUM path; DDP's equal-rank averaging is intentionally not used.

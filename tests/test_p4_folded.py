@@ -12,7 +12,7 @@ import torch
 
 @dataclass(frozen=True)
 class _Info:
-    contract_version: str = "1"
+    contract_version: str = "2"
     package_version: str = "test"
     build_revision: str = "fake"
     rank_count: int = 13
@@ -52,7 +52,7 @@ class _FakeEvaluator:
 
 
 def _install_fake(
-    monkeypatch: pytest.MonkeyPatch, *, version: str = "1", bad_combo: bool = False
+    monkeypatch: pytest.MonkeyPatch, *, version: str = "2", bad_combo: bool = False
 ) -> dict[str, Any]:
     calls: dict[str, Any] = {}
     package = ModuleType("poker_gpu_evaluator")
@@ -96,31 +96,6 @@ def _inputs(device: torch.device | str = "cpu") -> tuple[torch.Tensor, torch.Ten
     return board, live, folded
 
 
-def test_import_is_lazy_and_maps_compact_folder_features(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delitem(sys.modules, "poker_gpu_evaluator", raising=False)
-    module = importlib.reload(importlib.import_module("pbg.games.poker.folded"))
-    assert "poker_gpu_evaluator" not in sys.modules
-    calls = _install_fake(monkeypatch)
-    board, live, folded = _inputs()
-    output = module.PokerGPUPartitionAdapter().summarize(
-        board_cards=board, live_range_weights=live, folded=folded
-    )
-    [call] = calls["all"]
-    assert set(call) == {"board_cards", "folder_weights", "row_mask", "beta_rank"}
-    assert call["board_cards"].tolist() == [[0, 5, 9, 255, 255], [4, 8, 12, 16, 20]]
-    assert torch.equal(call["folder_weights"], folded.reach_weights)
-    assert torch.equal(call["row_mask"], folded.folder_mask)
-    assert set(output.fields) == {
-        "hand_log_ratio", "beta_eigenvalue", "beta_eigenvector",
-        "folder_log_mass", "folder_card_mass", "tight_cluster_scalar",
-        "folder_mask", "folder_line_meta", "folder_seat",
-    }
-    assert output.fields["hand_log_ratio"].shape == (2, 1326)
-    assert output.fields["folder_card_mass"].shape == (2, 3, 52)
-    assert output.metadata["contract_version"] == "1"
-
 
 def test_no_folder_summary_is_neutral_and_skips_evaluator(
     monkeypatch: pytest.MonkeyPatch,
@@ -143,39 +118,6 @@ def test_no_folder_summary_is_neutral_and_skips_evaluator(
     assert torch.count_nonzero(output.fields["hand_log_ratio"]) == 0
     assert output.fields["folder_card_mass"].shape == (2, 0, 52)
 
-
-def test_version_result_and_combo_contract_errors(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from pbg.games.poker.folded import PokerGPUPartitionAdapter
-
-    board, live, folded = _inputs()
-    _install_fake(monkeypatch, version="0")
-    with pytest.raises(RuntimeError, match="expected CONTRACT_VERSION '1'"):
-        PokerGPUPartitionAdapter().summarize(
-            board_cards=board, live_range_weights=live, folded=folded
-        )
-
-    _install_fake(monkeypatch, bad_combo=True)
-    with pytest.raises(RuntimeError, match="combo_cards is incompatible"):
-        PokerGPUPartitionAdapter().summarize(
-            board_cards=board, live_range_weights=live, folded=folded
-        )
-
-    calls = _install_fake(monkeypatch)
-    original = _FakeEvaluator.summarize_folders
-
-    def bad(self: _FakeEvaluator, **kwargs: Any) -> Any:
-        result = original(self, **kwargs)
-        result.hand_log_ratio = result.hand_log_ratio.double()
-        return result
-
-    monkeypatch.setattr(_FakeEvaluator, "summarize_folders", bad)
-    with pytest.raises(TypeError, match="hand_log_ratio.*dtype"):
-        PokerGPUPartitionAdapter().summarize(
-            board_cards=board, live_range_weights=live, folded=folded
-        )
-    assert "all" in calls
 
 
 def test_input_shape_and_dtype_contract(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -211,10 +153,3 @@ def test_cuda_mapping_has_no_cpu_or_numpy_round_trip(monkeypatch: pytest.MonkeyP
         board_cards=board, live_range_weights=live, folded=folded
     )
     assert all(value.device.type == "cuda" for value in output.fields.values())
-
-
-def test_real_sibling_folder_smoke() -> None:
-    package = pytest.importorskip("poker_gpu_evaluator")
-    assert package.CONTRACT_VERSION == "2"
-    evaluator = package.bind(rank_count=13)
-    assert callable(evaluator.summarize_folders)

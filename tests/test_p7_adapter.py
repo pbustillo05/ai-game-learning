@@ -2,9 +2,9 @@ from types import SimpleNamespace
 
 import torch
 
-from pbg.games.poker.adapter import PokerGame, PokerPolicyAdapter
+from pbg.games.poker.adapter import PokerPolicyAdapter
 from pbg.games.poker.cards import DeckGeometry
-from pbg.games.poker.engine import CHECK_CALL, NLHEEngine, PokerConfig
+from pbg.games.poker.rules import CHECK_CALL
 
 
 GEOMETRY = DeckGeometry(13)
@@ -104,51 +104,3 @@ def _advance_checks(engine, ref):
     while int(engine.owner_of(torch.tensor([ref], dtype=torch.int32))[0]) >= 0:
         ref = int(engine.step(torch.tensor([ref], dtype=torch.int32), torch.tensor([CHECK_CALL], dtype=torch.int32))[0])
     return ref
-
-
-def test_chance_draw_uses_only_profile_and_board_complement():
-    engine = NLHEEngine(PokerConfig(n_players=2))
-    game = PokerGame(engine, profile_sampler=object(), showdown_evaluator=object(), partition_adapter=object())
-    chance = _advance_checks(engine, engine.new_hand(0))
-    profiles = torch.tensor(
-        [[GEOMETRY.hand_index(0, 1), GEOMETRY.hand_index(2, 3)]],
-        dtype=torch.int32,
-    )
-    generator = torch.Generator().manual_seed(73)
-    seen = set()
-    for _ in range(300):
-        cards = game.sample_chance_cards(torch.tensor([chance], dtype=torch.int32), profiles, generator)
-        assert cards.shape == (1, 3)
-        assert not (set(cards[0].tolist()) & {0, 1, 2, 3})
-        seen.add(int(cards[0, 0]))
-    assert len(seen) > 40
-
-
-class _FakeShowdown:
-    def __init__(self):
-        self.calls = []
-
-    def evaluate(self, **kwargs):
-        self.calls.append(kwargs)
-        return SimpleNamespace(payoff=torch.tensor([[1.0, -1.0]]))
-
-
-def test_fixed_showdown_crosses_bound_api_and_uses_evaluator_payoff():
-    engine = NLHEEngine(PokerConfig(n_players=2))
-    fake = _FakeShowdown()
-    game = PokerGame(engine, profile_sampler=object(), showdown_evaluator=fake, partition_adapter=object())
-    ref = _advance_checks(engine, engine.new_hand(0))
-    for cards in (torch.tensor([[4, 9, 14]], dtype=torch.int16),
-                  torch.tensor([[19]], dtype=torch.int16),
-                  torch.tensor([[24]], dtype=torch.int16)):
-        ref = int(engine.deal(torch.tensor([ref], dtype=torch.int32), cards)[0])
-        ref = _advance_checks(engine, ref)
-    profile = torch.tensor(
-        [[GEOMETRY.hand_index(0, 1), GEOMETRY.hand_index(2, 3)]],
-        dtype=torch.int32,
-    )
-    payoff = game.reward(profile, torch.tensor([ref], dtype=torch.int32))
-    assert len(fake.calls) == 1
-    assert fake.calls[0]["board_cards"].shape == (1, 5)
-    torch.testing.assert_close(payoff, torch.tensor([[1.0, -1.0]]))
-    torch.testing.assert_close(payoff.sum(1), torch.zeros(1))

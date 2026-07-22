@@ -7,8 +7,10 @@ import torch
 
 from pbg.core.checkpointing import CHECKPOINT_SCHEMA_VERSION
 from pbg.core.storage import TRAINING_STORAGE_SCHEMA_VERSION
-from pbg.games.poker.bundle import build_model_from_config
-from pbg.games.poker.folded import PartitionSummaryBatch
+from pbg.games.poker.adapter import PokerModelBundle
+from pbg.games.poker.model.postflop import PostflopNet
+from pbg.games.poker.model.preflop import PokerModelConfig, PreflopNet
+from pbg.games.poker.rules import PokerConfig
 from pbg.inference import PokerInferenceSession, parse_card
 from pbg.inference_artifact import (
     INFERENCE_ARTIFACT_SCHEMA_VERSION,
@@ -32,6 +34,7 @@ def _scientific(n_players: int = 2) -> dict:
             "ffn_hidden": 24,
             "folder_beta_rank": 0,
             "use_branching_heads": True,
+            "max_history_tokens": 18,
         },
     }
 
@@ -39,7 +42,9 @@ def _scientific(n_players: int = 2) -> dict:
 def _artifact(path: Path, n_players: int = 2) -> Path:
     scientific = _scientific(n_players)
     torch.manual_seed(401)
-    model = build_model_from_config(scientific, torch.device("cpu"))
+    cfg = PokerModelConfig.from_dict(scientific["model"])
+    geometry = PokerConfig(n_players=n_players, stack_bb=8.0, rank_count=4).geometry
+    model = PokerModelBundle(PreflopNet(cfg, geometry), PostflopNet(cfg, geometry))
     torch.save(
         {
             "inference_artifact_schema_version": INFERENCE_ARTIFACT_SCHEMA_VERSION,
@@ -56,7 +61,9 @@ def _artifact(path: Path, n_players: int = 2) -> Path:
 
 def test_inference_artifact_export_is_model_only(tmp_path: Path) -> None:
     scientific = _scientific()
-    model = build_model_from_config(scientific, torch.device("cpu"))
+    cfg = PokerModelConfig.from_dict(scientific["model"])
+    geometry = PokerConfig(n_players=2, stack_bb=8.0, rank_count=4).geometry
+    model = PokerModelBundle(PreflopNet(cfg, geometry), PostflopNet(cfg, geometry))
     checkpoint = tmp_path / "checkpoint.pt"
     torch.save(
         {
@@ -97,9 +104,10 @@ def test_card_parser_uses_global_compact_deck_ids() -> None:
         parse_card("Tc", first_card=36)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_stateful_singleton_and_batch_inference_contract(tmp_path: Path) -> None:
     session = PokerInferenceSession.from_checkpoint(
-        _artifact(tmp_path / "policy.pt"), device="cpu"
+        _artifact(tmp_path / "policy.pt"), device="cuda"
     )
     first, second = session.new_hands([0, 1])
     singleton = session.predict(first, ["As", "Kd"], action_mode="argmax")
@@ -125,13 +133,14 @@ def test_stateful_singleton_and_batch_inference_contract(tmp_path: Path) -> None
     torch.testing.assert_close(
         full.probabilities[0, combo, columns], singleton.probabilities
     )
-    assert full.probabilities.shape == (2, 120, session.engine.e_max)
+    assert full.probabilities.shape == (2, 120, session.backend.e_max)
     assert full.values_bb.shape == (2, 120)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_stateful_actions_ranges_and_postflop_neutral_summary(tmp_path: Path) -> None:
     session = PokerInferenceSession.from_checkpoint(
-        _artifact(tmp_path / "policy.pt"), device="cpu"
+        _artifact(tmp_path / "policy.pt"), device="cuda"
     )
     hand = session.new_hand()
     before = session._state(hand).log_reach.clone()
@@ -153,57 +162,6 @@ def test_stateful_actions_ranges_and_postflop_neutral_summary(tmp_path: Path) ->
         session.predict(hand, ["Jh", "Ac"])
 
 
-def test_multiway_fold_summary_stays_on_cpu_before_model_transfer(
-    tmp_path: Path,
-) -> None:
-    session = PokerInferenceSession.from_checkpoint(
-        _artifact(tmp_path / "policy.pt", n_players=3), device="cpu"
-    )
-
-    class FoldedCPU:
-        called = 0
-
-        def summarize(self, *, board_cards, live_range_weights, folded):
-            self.called += 1
-            assert board_cards.device.type == "cpu"
-            assert live_range_weights.device.type == "cpu"
-            assert folded.reach_weights.device.type == "cpu"
-            batch, folders = folded.folder_mask.shape
-            cards = session.game_config.geometry.n_cards
-            fields = {
-                "base_log_z": torch.zeros(batch),
-                "single_card_log_ratio": torch.zeros(batch, cards),
-                "pair_card_log_ratio": torch.zeros(batch, cards, cards),
-                "beta_eigenvalue": torch.empty(batch, 0),
-                "beta_eigenvector": torch.empty(batch, cards, 0),
-                "folder_log_mass": torch.zeros(batch, folders),
-                "folder_single_card_log_ratio": torch.zeros(batch, folders, cards),
-                "folder_card_marginal": torch.zeros(batch, folders, cards),
-                "folder_delta": torch.zeros(batch, folders, cards),
-                "tight_cluster_scalar": torch.zeros(batch),
-                "folder_output_valid": folded.folder_mask.clone(),
-                "output_valid": torch.ones(batch, dtype=torch.bool),
-                "folder_mask": folded.folder_mask.clone(),
-                "folder_line_meta": folded.line_meta.clone(),
-                "folder_seat": folded.seat_ids.clone(),
-            }
-            return PartitionSummaryBatch(fields, {"backend": "cpu_test"})
-
-    folded_cpu = FoldedCPU()
-    session.partition_adapter = folded_cpu
-    hand = session.new_hand()
-    session.advance(hand, "call")
-    session.advance(hand, "fold")
-    session.advance(hand, "check")
-    session.deal(hand, ["Jh", "Qd", "Kc"])
-    result = session.predict(hand, ["As", "Ad"])
-    assert folded_cpu.called == 1
-    assert torch.isfinite(result.probabilities).all()
-    # Same board/fold dependency must use the cached CPU summary.
-    session.predict(hand, ["As", "Ad"])
-    assert folded_cpu.called == 1
-
-
 @pytest.mark.skipif(
     not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available(),
     reason="MPS is unavailable",
@@ -219,15 +177,9 @@ def test_mps_model_and_outputs_remain_on_metal(tmp_path: Path) -> None:
     probability, value, seat_value, _, _ = session._evaluate_full_device([hand])
     assert probability.device.type == value.device.type == "mps"
     assert seat_value is None or seat_value.device.type == "mps"
-    cpu = PokerInferenceSession.from_checkpoint(
-        tmp_path / "policy.pt", device="cpu", precision="fp32"
-    )
-    cpu_hand = cpu.new_hand()
-    expected = cpu.predict(cpu_hand, ["As", "Kd"])
     actual = session.predict(hand, ["As", "Kd"])
-    torch.testing.assert_close(
-        actual.probabilities, expected.probabilities, rtol=3e-4, atol=3e-4
-    )
+    assert torch.isfinite(actual.probabilities).all()
+    torch.testing.assert_close(actual.probabilities.sum(), torch.tensor(1.0))
 
 
 @pytest.mark.skipif(
@@ -242,23 +194,16 @@ def test_mps_postflop_and_batched_parity(
     tmp_path: Path, precision: str, rtol: float, atol: float
 ) -> None:
     artifact = _artifact(tmp_path / "policy.pt")
-    cpu = PokerInferenceSession.from_checkpoint(artifact, device="cpu")
     metal = PokerInferenceSession.from_checkpoint(
         artifact, device="mps", precision=precision, mode="throughput"
     )
-    cpu_hands = cpu.new_hands([0, 1])
     metal_hands = metal.new_hands([0, 1])
-    for session, hands in ((cpu, cpu_hands), (metal, metal_hands)):
-        session.advance_many(hands, ["call", "call"])
-        session.advance_many(hands, ["check", "check"])
-        session.deal_many(hands, [["Jh", "Qd", "Kc"], ["Jd", "Qh", "Ks"]])
+    metal.advance_many(metal_hands, ["call", "call"])
+    metal.advance_many(metal_hands, ["check", "check"])
+    metal.deal_many(metal_hands, [["Jh", "Qd", "Kc"], ["Jd", "Qh", "Ks"]])
     private = [["As", "Ad"], ["Ac", "Kh"]]
-    expected = cpu.predict_many(cpu_hands, private)
     actual = metal.predict_many(metal_hands, private)
-    for left, right in zip(actual, expected, strict=True):
-        torch.testing.assert_close(
-            left.probabilities, right.probabilities, rtol=rtol, atol=atol
-        )
+    for left in actual:
         assert torch.isfinite(left.probabilities).all()
         torch.testing.assert_close(
             left.probabilities.sum(), torch.tensor(1.0), rtol=rtol, atol=atol

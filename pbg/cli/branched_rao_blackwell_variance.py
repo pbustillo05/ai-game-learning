@@ -13,6 +13,7 @@ import statistics
 from typing import Any, Mapping
 
 import torch
+from pbg.core.devices import resolve_execution_device, validate_workload_capabilities
 
 from pbg.eval.branched_rao_blackwell_variance import (
     BranchedVarianceRunner,
@@ -28,10 +29,11 @@ from pbg.eval.branched_rao_blackwell_variance import (
 
 
 def _device(argument: str | None) -> torch.device:
-    device = torch.device(argument or ("cuda:0" if torch.cuda.is_available() else "cpu"))
+    if argument is None:
+        raise ValueError("--device must explicitly select cuda or mps")
+    device = resolve_execution_device(argument, workload="variance evaluation")
+    validate_workload_capabilities(device, workload="variance evaluation")
     if device.type == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError(f"requested unavailable device {device}")
         torch.cuda.set_device(device)
     return device
 
@@ -364,7 +366,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--phase", required=True, choices=("smoke", "run", "analyze"))
-    parser.add_argument("--device", default=None)
+    parser.add_argument("--device", required=True, choices=("cuda", "mps"))
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
     config = load_config(args.config)

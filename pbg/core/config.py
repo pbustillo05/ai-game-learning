@@ -72,10 +72,9 @@ class RolloutConfig:
 
 @dataclass
 class CompletionConfig:
-    """Configure samples and the expected evaluator tensor device."""
+    """Configure Monte Carlo completion work."""
 
     n_samples: int | None
-    backend: str
 
 
 @dataclass
@@ -156,6 +155,7 @@ class HardwareProfileConfig:
 class RootConfig:
     """Top-level configuration shared by all game implementations."""
 
+    device: Literal["cuda", "mps"]
     game: GameConfig
     rollout: RolloutConfig
     completion: CompletionConfig
@@ -275,10 +275,6 @@ def _validate_config(cfg: RootConfig) -> None:
         if not math.isfinite(value) or value < 0:
             raise ConfigError(f"{path}: expected a finite nonnegative value")
 
-    if cfg.completion.backend not in {"auto", "cpu", "cuda"}:
-        raise ConfigError(
-            "root.completion.backend: poker requires 'auto', 'cpu', or 'cuda'"
-        )
     modes = {"normal", "rao_blackwell", "branched_rao_blackwell"}
     if cfg.training.mode not in modes:
         raise ConfigError(

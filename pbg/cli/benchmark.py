@@ -22,8 +22,9 @@ def main() -> None:
     parser.add_argument("--hardware-profile", default=None)
     parser.add_argument(
         "--device",
+        choices=("cuda", "mps"),
         default=None,
-        help="explicit torch device (for example cpu or cuda:0); default is auto",
+        help="explicit accelerator; defaults to config.device",
     )
     parser.add_argument("--mode", action="append", choices=MODES, dest="modes")
     parser.add_argument("--warmup", type=int, default=1)
@@ -46,9 +47,6 @@ def main() -> None:
     parser.add_argument("--max-active-trajectories", type=int, default=None)
     parser.add_argument("--storage-page-rows", type=int, default=None)
     parser.add_argument("--completion-samples", type=int, default=None)
-    parser.add_argument(
-        "--completion-backend", choices=("auto", "cpu", "cuda"), default=None
-    )
     parser.add_argument("--minibatch-size", type=int, default=None)
     parser.add_argument("--gd-steps", type=int, default=None)
     parser.add_argument("--output", default=None, help="optional JSON result/baseline path")
@@ -76,8 +74,6 @@ def main() -> None:
         cfg.rollout.storage_page_rows = args.storage_page_rows
     if args.completion_samples is not None:
         cfg.completion.n_samples = args.completion_samples
-    if args.completion_backend is not None:
-        cfg.completion.backend = args.completion_backend
     if args.minibatch_size is not None:
         cfg.training.minibatch_size = args.minibatch_size
     if args.gd_steps is not None:

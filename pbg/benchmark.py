@@ -23,6 +23,7 @@ from pbg.core.training import (
     _scaler,
 )
 from pbg.runtime import build_game_bundle
+from pbg.core.devices import resolve_execution_device, validate_workload_capabilities
 
 
 MODES = ("normal", "rao_blackwell", "branched_rao_blackwell")
@@ -170,13 +171,11 @@ def benchmark_modes(
     environment: dict[str, Any] | None = None
     for mode in modes:
         local = _mode_config(cfg, mode)
-        requested = torch.device(
-            device
-            if device is not None
-            else ("cuda:0" if torch.cuda.is_available() else "cpu")
+        requested = resolve_execution_device(
+            cfg.device if device is None else device,
+            workload="training benchmark",
         )
-        if requested.type == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("CUDA benchmark requested but CUDA is unavailable")
+        validate_workload_capabilities(requested, workload="training benchmark")
         if requested.type == "cuda":
             torch.cuda.set_device(requested)
             torch.cuda.empty_cache()
@@ -297,7 +296,7 @@ def benchmark_modes(
                     "roots_per_gpu": local.rollout.roots_per_gpu,
                     "beta": local.rollout.beta,
                     "completion_samples": local.completion.n_samples,
-                    "completion_backend": local.completion.backend,
+                    "execution_device": str(device),
                     "logical_rng": LOGICAL_RNG_VERSION,
                     "training_seed": local.training.seed,
                     "model_initialization_protocol": initialization_protocol,
@@ -358,7 +357,7 @@ def benchmark_modes(
             "game": "nlhe",
             "roots_per_gpu": cfg.rollout.roots_per_gpu,
             "completion_samples": cfg.completion.n_samples,
-            "completion_backend": cfg.completion.backend,
+            "execution_device": str(device),
             "minibatch_size": cfg.training.minibatch_size,
             "gd_steps_per_iter": cfg.training.gd_steps_per_iter,
             "logical_rng": LOGICAL_RNG_VERSION,
@@ -411,7 +410,7 @@ def compare_benchmark(
         "game",
         "roots_per_gpu",
         "completion_samples",
-        "completion_backend",
+        "execution_device",
         "minibatch_size",
         "gd_steps_per_iter",
         "logical_rng",

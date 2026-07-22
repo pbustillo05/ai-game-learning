@@ -7,8 +7,8 @@
 - `pbg/cli/train.py` — `pbg-train` command.
 - `pbg/benchmark.py`, `pbg/cli/benchmark.py` — three-mode profiling of the
   single production implementation.
-- `pbg/eval/arena.py` — offline duplicate-deal checkpoint evaluation.
-- `pbg/inference.py`, `pbg/inference_artifact.py` — stateful CPU-rules/MPS-model
+- `pbg/eval/br_probe.py` — accelerator-native paired best-response evaluation.
+- `pbg/inference.py`, `pbg/inference_artifact.py` — stateful CUDA/MPS tensor-native
   serving and compact model-only artifacts.
 
 ## Generic core

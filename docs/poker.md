@@ -24,12 +24,10 @@ flop/turn/river labels plus dealt-card payloads.
 
 ## Public rules and tensor state
 
-`NLHEEngine` is the append-only CPU rule oracle. It covers blind/button order,
+`PokerRolloutBackend` and `PokerTensorStateStore` implement the public rules and
+own the sole production state path. They cover blind/button order,
 fold/check/call/raise-to, minimum full raises, short-all-in reopening, street
-closure, public chance, folds, and showdown cuts. Exact sampled-showdown payoff
-is returned by the sibling evaluator.
-
-Production uses `PokerRolloutBackend` and `PokerTensorStateStore`. State handles
+closure, public chance, folds, and showdown cuts. State handles
 are device `int32` row indices into a recyclable paged structure of arrays.
 Each successor receives a separately refcounted history row with binary-lifting
 ancestors. Completed state slots and dead history ancestry return to their pools
@@ -52,10 +50,9 @@ Fold successors retain board-at-fold, public line features, and a partition
 dependency key. The sibling's folded-player partition summary lives in a sparse
 paged dependency store until a fold or street change invalidates
 it. Hit rows cross the evaluator facade with a false row mask and merge on the
-device; no Python cache key or hit decision is required. CPU `RangeState` and
-`PokerGame` remain
-active support for navigation and duplicate-deal evaluation; tensor training
-uses the backend's dense/compact reach objects.
+device; no Python cache key or hit decision is required. Navigation, inference,
+and training all use the backend's dense/compact reach objects; there is no
+parallel list-backed range or game implementation.
 
 Optimization currently retains every seat's decision reach because folded-seat
 features remain part of the exact model input. Compaction may be enabled only
@@ -70,7 +67,7 @@ after an immutable summary can reproduce those features identically.
 - deterministic folded-card partition summaries; and
 - fixed-profile showdown payoffs.
 
-The installed contract-v1 interface supports the configured compact deck. Local
+The installed contract-v2 interface supports the configured compact deck. Local
 code validates contract identity, combo mapping, dtype, shape, device,
 padding, seeds, and numerical validity. Missing or incompatible operations fail
 loudly. The sibling contract is documented at
@@ -121,8 +118,8 @@ replay, or decision-throughput root target.
 
 ## Validation
 
-CPU tests cover rule/navigation invariants and model/evaluator boundary errors.
-Tensor tests compare public transitions and policy routing. Real sibling tests
+CPU tests cover only device-independent mathematics, metadata, and serialization.
+Accelerator tensor tests cover public transitions and policy routing. Real sibling tests
 cover compact geometry, collision-free profiles, folded posterior, completion,
 and showdown. CUDA gates cover residency, logical RNG invariance, all three
 modes, memory safety, old-policy identity, and teardown.

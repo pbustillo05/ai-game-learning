@@ -502,11 +502,7 @@ class PostflopNet(nn.Module):
         if live_ids is None:
             seats = torch.arange(players, device=ranges.device)[None].expand(batch, -1)
             ordered = torch.where(seat_mask, seats, players).sort(dim=1).values
-            live_count = (
-                int(seat_mask.sum(1).max().item())
-                if ranges.device.type == "cpu"
-                else players
-            )
+            live_count = players
             selected = ordered[:, :live_count]
             live_valid = selected < players
             live_ids = selected.clamp_max(players - 1)

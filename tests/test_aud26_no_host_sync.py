@@ -7,7 +7,7 @@ import torch
 
 from pbg.core.game import EventBatch
 from pbg.games.poker.adapter import PokerModelBundle
-from pbg.games.poker.engine import CHECK_CALL, FOLD, PokerConfig
+from pbg.games.poker.rules import CHECK_CALL, FOLD, PokerConfig
 from pbg.games.poker.folded import PartitionSummaryBatch, PokerGPUPartitionAdapter
 from pbg.games.poker.model.postflop import PostflopNet
 from pbg.games.poker.model.preflop import PokerModelConfig, PreflopNet

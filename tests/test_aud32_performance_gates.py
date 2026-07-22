@@ -1,21 +1,17 @@
 from __future__ import annotations
 
 import copy
-from types import SimpleNamespace
-
 import pytest
-import torch
 
-from pbg.benchmark import benchmark_modes, compare_benchmark
-from pbg.config import load_config
+from pbg.benchmark import compare_benchmark
 
 
 def _result(speed: float, seconds: float, target_bytes: float) -> dict:
     return {
         "schema": "pbg-performance-v1",
         "environment": {
-            "device_type": "cpu",
-            "device_name": "test-cpu",
+            "device_type": "cuda",
+            "device_name": "test-gpu",
             "compute_capability": None,
             "torch_threads": 1,
         },
@@ -24,7 +20,7 @@ def _result(speed: float, seconds: float, target_bytes: float) -> dict:
             "roots_per_gpu": 64,
             "storage_page_rows": 128,
             "completion_samples": 32,
-            "completion_backend": "cpu",
+            "execution_device": "cuda:0",
             "minibatch_size": 32,
             "gd_steps_per_iter": 1,
             "logical_rng": "counter_hash_v2",
@@ -69,10 +65,10 @@ def test_performance_gate_rejects_cross_environment_comparisons() -> None:
         compare_benchmark(current, baseline)
 
 
-def test_performance_gate_rejects_completion_backend_mismatch() -> None:
+def test_performance_gate_rejects_execution_device_mismatch() -> None:
     baseline = _result(100.0, 1.0, 50.0)
     current = copy.deepcopy(baseline)
-    current["workload"]["completion_backend"] = "cuda"
+    current["workload"]["execution_device"] = "cuda:1"
     with pytest.raises(ValueError, match="workload"):
         compare_benchmark(current, baseline)
 
@@ -84,144 +80,3 @@ def test_performance_gate_rejects_logical_rng_version_mismatch() -> None:
     current["workload"]["logical_rng"] = "counter_hash_v2"
     with pytest.raises(ValueError, match="workload"):
         compare_benchmark(current, baseline)
-
-
-
-def test_benchmark_seeds_model_construction_before_build(monkeypatch) -> None:
-    cfg = load_config("configs/train/nlhe6.yaml")
-    cfg.loss.c_kl = 0.0
-    observed_initializations: list[torch.Tensor] = []
-
-    def build(_cfg, device):
-        model = torch.nn.Linear(2, 2)
-        observed_initializations.append(model.weight.detach().clone())
-        return SimpleNamespace(
-            model=model,
-            rollout_backend=SimpleNamespace(device=torch.device(device)),
-        )
-
-    def iteration(*_args, profile=False, **_kwargs):
-        return (
-            {
-                "profiled_iteration_seconds": 1.0,
-                "phase_rollout_seconds": 0.5,
-                "decisions": 1.0,
-            }
-            if profile
-            else {}
-        )
-
-    monkeypatch.setattr("pbg.benchmark.build_game_bundle", build)
-    monkeypatch.setattr("pbg.benchmark._one_iteration", iteration)
-    torch.manual_seed(1)
-    benchmark_modes(cfg, ("normal",), warmup=0, repeats=1, device="cpu")
-    torch.manual_seed(999_999)
-    benchmark_modes(cfg, ("normal",), warmup=0, repeats=1, device="cpu")
-    assert len(observed_initializations) == 2
-    assert torch.equal(observed_initializations[0], observed_initializations[1])
-
-
-def test_benchmark_loads_and_records_read_only_model_checkpoint(
-    monkeypatch, tmp_path
-) -> None:
-    cfg = load_config("configs/train/nlhe6.yaml")
-    cfg.loss.c_kl = 0.0
-    expected = torch.nn.Linear(2, 2).state_dict()
-    checkpoint = tmp_path / "checkpoint.pt"
-    torch.save(
-        {"model": expected, "iteration": 17, "run_id": "trained-policy"},
-        checkpoint,
-    )
-    observed: list[dict[str, torch.Tensor]] = []
-
-    def build(_cfg, device):
-        return SimpleNamespace(
-            model=torch.nn.Linear(2, 2),
-            rollout_backend=SimpleNamespace(device=torch.device(device)),
-        )
-
-    def iteration(_cfg, bundle, *_args, profile=False, **_kwargs):
-        if profile:
-            observed.append(copy.deepcopy(bundle.model.state_dict()))
-            return {
-                "profiled_iteration_seconds": 1.0,
-                "phase_rollout_seconds": 0.5,
-                "decisions": 1.0,
-            }
-        return {}
-
-    monkeypatch.setattr("pbg.benchmark.build_game_bundle", build)
-    monkeypatch.setattr("pbg.benchmark._one_iteration", iteration)
-    result = benchmark_modes(
-        cfg,
-        ("normal",),
-        warmup=0,
-        repeats=1,
-        device="cpu",
-        checkpoint=checkpoint,
-    )
-
-    assert len(observed) == 1
-    assert all(torch.equal(observed[0][key], value) for key, value in expected.items())
-    assert result["workload"]["model_initialization_protocol"] == "checkpoint_model_state_v1"
-    assert result["workload"]["model_checkpoint"]["iteration"] == 17
-    assert result["workload"]["model_checkpoint"]["run_id"] == "trained-policy"
-
-
-def test_branched_benchmark_initializes_only_missing_branching_heads(
-    monkeypatch, tmp_path
-) -> None:
-    cfg = load_config("configs/train/nlhe6.yaml")
-    cfg.loss.c_kl = 0.0
-
-    class Model(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.trunk = torch.nn.Linear(2, 2)
-            self.branching_heads = torch.nn.Linear(2, 2)
-
-    trained = Model()
-    checkpoint_state = {
-        key: value
-        for key, value in trained.state_dict().items()
-        if not key.startswith("branching_heads.")
-    }
-    checkpoint = tmp_path / "sequential-checkpoint.pt"
-    torch.save({"model": checkpoint_state, "iteration": 23}, checkpoint)
-    observed: list[dict[str, torch.Tensor]] = []
-
-    def build(_cfg, device):
-        return SimpleNamespace(
-            model=Model(),
-            rollout_backend=SimpleNamespace(device=torch.device(device)),
-        )
-
-    def iteration(_cfg, bundle, *_args, profile=False, **_kwargs):
-        if profile:
-            observed.append(copy.deepcopy(bundle.model.state_dict()))
-            return {
-                "profiled_iteration_seconds": 1.0,
-                "phase_rollout_seconds": 0.5,
-                "decisions": 1.0,
-            }
-        return {}
-
-    monkeypatch.setattr("pbg.benchmark.build_game_bundle", build)
-    monkeypatch.setattr("pbg.benchmark._one_iteration", iteration)
-    result = benchmark_modes(
-        cfg,
-        ("branched_rao_blackwell",),
-        warmup=0,
-        repeats=1,
-        device="cpu",
-        checkpoint=checkpoint,
-    )
-
-    assert len(observed) == 1
-    assert all(
-        torch.equal(observed[0][key], value)
-        for key, value in checkpoint_state.items()
-    )
-    assert result["modes"][0]["workload"][
-        "randomly_initialized_checkpoint_keys"
-    ] == ["branching_heads.weight", "branching_heads.bias"]

@@ -16,11 +16,10 @@ from torch import Tensor
 
 from pbg.core.completion import BatchedCompletionStats, ReachView
 from pbg.games.poker.cards import DeckGeometry, validate_evaluator_combo_cards
-from pbg.games.poker.engine import NLHEEngine
 
 PAD_CARD = 255
-EXPECTED_CONTRACT_VERSION = "1"
-SUPPORTED_CONTRACT_VERSIONS = frozenset({"1", "2"})
+EXPECTED_CONTRACT_VERSION = "2"
+SUPPORTED_CONTRACT_VERSIONS = frozenset({"2"})
 
 
 class EvaluatorContractError(RuntimeError):
@@ -45,13 +44,13 @@ def _load_evaluator(rank_count: int) -> Any:
         combo_cards = evaluator.combo_cards
     except (ImportError, ModuleNotFoundError, AttributeError) as exc:
         raise RuntimeError(
-            "poker_gpu_evaluator with the bound contract-v1 API is required; "
+            "poker_gpu_evaluator with the bound contract-v2 API is required; "
             "install or update the sibling package (an editable install is sufficient)"
         ) from exc
     if contract_version not in SUPPORTED_CONTRACT_VERSIONS:
         raise RuntimeError(
             "incompatible poker_gpu_evaluator: expected CONTRACT_VERSION "
-            f"{EXPECTED_CONTRACT_VERSION!r} or '2', got {contract_version!r}; "
+            f"{EXPECTED_CONTRACT_VERSION!r}, got {contract_version!r}; "
             "update the sibling package"
         )
     validate_evaluator_combo_cards(combo_cards, rank_count)
@@ -69,12 +68,9 @@ def _evaluator_metadata(evaluator: Any) -> Mapping[str, object]:
         raise EvaluatorContractError("bound evaluator must expose dataclass info") from exc
 
 
-def _require_backend_device(backend: str, device: torch.device, operation: str) -> None:
-    if backend != "auto" and device.type != backend:
-        raise ValueError(
-            f"{operation} backend {backend!r} requires {backend} input tensors, "
-            f"got {device.type!r}"
-        )
+def _require_accelerator(device: torch.device, operation: str) -> None:
+    if device.type not in {"cuda", "mps"}:
+        raise ValueError(f"{operation} requires CUDA or MPS tensors")
 
 
 def stratum_levels(stratum_players: Tensor) -> Tensor:
@@ -200,22 +196,10 @@ def _reach_rows(reach: ReachView | Tensor | Any) -> Tensor:
     raise TypeError("reach must be a Tensor or expose Tensor log_r/rows")
 
 
-def _engine(game: Any) -> NLHEEngine:
-    candidate = getattr(game, "engine", game)
-    if not isinstance(candidate, NLHEEngine):
-        raise TypeError("game must be an NLHEEngine or expose one as game.engine")
-    return candidate
-
-
 class PokerGPUCompletion:
     """Adapter for evaluator-owned Monte Carlo completion."""
 
-    def __init__(
-        self, *, backend: str = "auto", rank_count: int = 13
-    ) -> None:
-        if backend not in {"auto", "cpu", "cuda"}:
-            raise ValueError("backend must be 'auto', 'cpu', or 'cuda'")
-        self.backend = backend
+    def __init__(self, *, rank_count: int = 13) -> None:
         if isinstance(rank_count, bool) or not 4 <= rank_count <= 13:
             raise ValueError("rank_count must be an integer in [4,13]")
         self.rank_count = int(rank_count)
@@ -225,108 +209,6 @@ class PokerGPUCompletion:
         if self._evaluator is None:
             self._evaluator = _load_evaluator(self.rank_count)
         return self._evaluator
-
-    def complete(
-        self,
-        game: Any,
-        tree: Any,
-        node_ids: Tensor,
-        reach: ReachView | Tensor | Any,
-        n_samples: int,
-        gen: torch.Generator,
-    ) -> BatchedCompletionStats:
-        return self._complete_impl(
-            game, tree, node_ids, reach, n_samples, gen=gen, seed=None
-        )
-
-    def complete_keyed(
-        self,
-        game: Any,
-        tree: Any,
-        node_ids: Tensor,
-        reach: ReachView | Tensor | Any,
-        n_samples: int,
-        keys: Tensor,
-    ) -> BatchedCompletionStats:
-        """Complete rows using caller-owned evaluator stream seeds ``[B]``."""
-
-        return self._complete_impl(
-            game, tree, node_ids, reach, n_samples, gen=None, seed=keys
-        )
-
-    def _complete_impl(
-        self,
-        game: Any,
-        tree: Any,
-        node_ids: Tensor,
-        reach: ReachView | Tensor | Any,
-        n_samples: int,
-        *,
-        gen: torch.Generator | None,
-        seed: Tensor | None,
-    ) -> BatchedCompletionStats:
-        if isinstance(n_samples, bool) or not isinstance(n_samples, int) or n_samples <= 0:
-            raise ValueError("n_samples must be a positive integer")
-        if not isinstance(node_ids, Tensor) or node_ids.ndim != 1:
-            raise ValueError("node_ids must be a one-dimensional Tensor")
-        if node_ids.dtype not in (torch.int32, torch.int64):
-            raise TypeError("node_ids must have dtype int32 or int64")
-        if not hasattr(tree, "state_ref") or not isinstance(tree.state_ref, Tensor):
-            raise TypeError("tree must expose a state_ref Tensor")
-        state_refs = tree.state_ref[node_ids.to(device=tree.state_ref.device, dtype=torch.long)]
-        engine = _engine(game)
-        rows = _reach_rows(reach)
-        batch_size, p_max = rows.shape[:2]
-        if batch_size != node_ids.numel():
-            raise ValueError("reach rows and node_ids must have the same B dimension")
-        if p_max < engine.n_players:
-            raise ValueError("reach rows have fewer seats than the poker engine")
-        state_refs = state_refs.to(device=rows.device, dtype=torch.int32)
-        refs = [int(value) for value in state_refs.detach().cpu().tolist()]
-        boards = torch.tensor(
-            [engine.states.board[ref] for ref in refs], dtype=torch.int16, device=rows.device
-        )
-        board_cards = _normalize_board(boards, self.rank_count)
-        _require_backend_device(self.backend, rows.device, "complete")
-        dealt_mask = torch.zeros((batch_size, p_max), dtype=torch.bool, device=rows.device)
-        dealt_mask[:, : engine.n_players] = True
-        range_weights = _linear_reach(rows, dealt_mask, self.rank_count)
-        strata = engine.pot_strata(state_refs)
-        k = strata.stratum_amount.shape[1]
-        stratum_players = torch.zeros(
-            (batch_size, k, p_max), dtype=torch.bool, device=rows.device
-        )
-        stratum_players[:, :, : engine.n_players] = strata.stratum_players
-        stratum_level = stratum_levels(stratum_players)
-        payoff_baseline = torch.zeros((batch_size, p_max), dtype=torch.float32, device=rows.device)
-        payoff_baseline[:, : engine.n_players] = strata.payoff_baseline
-        if seed is None:
-            if gen is None:
-                raise RuntimeError("mutable poker completion requires a generator")
-            seed = _allocate_seeds(batch_size, gen)
-        elif (
-            seed.shape != (batch_size,)
-            or seed.dtype != torch.int64
-            or seed.device != rows.device
-        ):
-            raise ValueError("completion seeds must be device-local int64 [B]")
-        seed = seed.contiguous()
-        evaluator = self._bound_evaluator()
-        result = evaluator.complete(
-            board_cards=board_cards,
-            range_weights=range_weights,
-            stratum_level=stratum_level,
-            payoff_baseline=payoff_baseline.contiguous(),
-            stratum_amount=strata.stratum_amount.contiguous(),
-            n_samples=n_samples,
-            seed=seed,
-        )
-        metrics = getattr(game, "execution_metrics", None)
-        if metrics is not None:
-            metrics.record_evaluator(rows=batch_size)
-        return self._validate_result(
-            result, batch_size, p_max, rows.device, _evaluator_metadata(evaluator)
-        )
 
     def _validate_result(
         self,
@@ -355,15 +237,11 @@ class PokerGPURejectionSampler:
     def __init__(
         self,
         *,
-        backend: str = "auto",
         max_attempts: int = 100_000,
         rank_count: int = 13,
     ) -> None:
-        if backend not in {"auto", "cpu", "cuda"}:
-            raise ValueError("backend must be 'auto', 'cpu', or 'cuda'")
         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts <= 0:
             raise ValueError("max_attempts must be a positive integer")
-        self.backend = backend
         self.max_attempts = max_attempts
         if isinstance(rank_count, bool) or not 4 <= rank_count <= 13:
             raise ValueError("rank_count must be an integer in [4,13]")
@@ -419,9 +297,7 @@ class PokerGPURejectionSampler:
         if dealt_mask.dtype != torch.bool or dealt_mask.ndim != 2:
             raise TypeError("dealt_mask must be bool [B,P]")
         range_weights = _linear_reach(reach_rows, dealt_mask, self.rank_count)
-        _require_backend_device(
-            self.backend, reach_rows.device, "sample_joint_profiles"
-        )
+        _require_accelerator(reach_rows.device, "sample_joint_profiles")
         batch_size, p_max = dealt_mask.shape
         if board_cards.shape[0] != batch_size or board_cards.device != reach_rows.device:
             raise ValueError("board, reach rows, and dealt_mask must share B and device")
@@ -460,10 +336,7 @@ class PokerGPURejectionSampler:
 class PokerGPUShowdownEvaluator:
     """Adapter for exact fixed-showdown payoffs."""
 
-    def __init__(self, *, backend: str = "auto", rank_count: int = 13) -> None:
-        if backend not in {"auto", "cpu", "cuda"}:
-            raise ValueError("backend must be 'auto', 'cpu', or 'cuda'")
-        self.backend = backend
+    def __init__(self, *, rank_count: int = 13) -> None:
         if isinstance(rank_count, bool) or not 4 <= rank_count <= 13:
             raise ValueError("rank_count must be an integer in [4,13]")
         self.rank_count = int(rank_count)
@@ -498,7 +371,7 @@ class PokerGPUShowdownEvaluator:
         tensors = (board, combo_ids, stratum_level, payoff_baseline, stratum_amount)
         if len({tensor.device for tensor in tensors}) != 1:
             raise ValueError("all showdown tensors must share a device")
-        _require_backend_device(self.backend, board.device, "evaluate_showdowns")
+        _require_accelerator(board.device, "evaluate_showdowns")
         evaluator = self._bound_evaluator()
         payoff = evaluator.evaluate_showdowns(
             board_cards=board,

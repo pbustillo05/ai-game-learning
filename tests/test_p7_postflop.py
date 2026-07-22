@@ -53,7 +53,7 @@ def _cfg(summary_dim: int = 0):
 
 def test_compact_gather_scatter_is_ragged_and_differentiable():
     compatibility = torch.tensor([[True, False, True, False], [False, True, False, False]])
-    mapping = build_compact_map(compatibility)
+    mapping = build_compact_map(compatibility, compact_size=2)
     source = torch.arange(8.0).reshape(2, 4).requires_grad_()
     compact = compact_gather(source, mapping)
     assert compact.tolist() == [[0.0, 2.0], [5.0, 0.0]]
@@ -131,7 +131,7 @@ def test_signed_beta_coordinates_reconstruct_evaluator_pair_field():
     model = PostflopNet(cfg)
     compatibility = torch.zeros(1, 1326, dtype=torch.bool)
     compatibility[:, :8] = True
-    mapping = build_compact_map(compatibility)
+    mapping = build_compact_map(compatibility, compact_size=8)
     matrix = torch.randn(1, 52, 52)
     matrix = (matrix + matrix.transpose(1, 2)) / 2
     matrix.diagonal(dim1=1, dim2=2).zero_()
@@ -166,6 +166,10 @@ def test_folder_pressure_and_folder_seat_readout_consume_semantic_fields():
     pub.status[:, 1] = 1
     pub.to_act.zero_()
     masks.status = pub.status
+    masks.live_seat_ids = torch.zeros((pub.street.shape[0], 1), dtype=torch.long)
+    masks.compact_size = int(masks.compatibility.sum(1).max())
+    masks.live_seat_ids = torch.zeros((pub.street.shape[0], 1), dtype=torch.long)
+    masks.compact_size = int(masks.compatibility.sum(1).max())
     batch = ranges.shape[0]
     fields = {
         "base_log_z": torch.zeros(batch),
@@ -220,6 +224,8 @@ def test_folded_seats_do_not_create_postflop_attention_rows():
     pub.status[:, 1] = 1
     pub.to_act.zero_()
     masks.status = pub.status
+    masks.live_seat_ids = torch.zeros((pub.street.shape[0], 1), dtype=torch.long)
+    masks.compact_size = int(masks.compatibility.sum(1).max())
     model = PostflopNet(_cfg()).eval()
     lengths: list[int] = []
     hook = model.attentions[0].register_forward_pre_hook(

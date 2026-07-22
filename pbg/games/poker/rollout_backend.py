@@ -27,7 +27,7 @@ from pbg.core.execution import (
     logical_categorical_from_valid_probability,
     logical_uniform,
 )
-from pbg.games.poker.engine import (
+from pbg.games.poker.rules import (
     ALL_IN,
     CHECK_CALL,
     FOLD,
@@ -93,16 +93,12 @@ class PokerRolloutBackend:
 
     Args:
         cfg: Public table configuration.
-        device: Owning CPU or CUDA device.
+        device: Owning CUDA or MPS device.
         max_rollout_steps: Maximum public transitions in one sampled path.
         beta_table: Fixed branching intensities by public-stage bucket.
         profile_sampler: Exact sibling-facade joint-profile adapter.
         partition_adapter: Sibling-facade neutral-partition adapter.
-        evaluator_backend: ``"auto"``, ``"cpu"``, or ``"cuda"``.
-
-    Every returned tensor remains on ``device``.  The CPU and CUDA paths run
-    the same state-transition code; :class:`NLHEEngine` remains the separate
-    list-based correctness oracle used only by tests and evaluation.
+    Every returned tensor remains on ``device``.
     """
 
     def __init__(
@@ -115,7 +111,6 @@ class PokerRolloutBackend:
         beta_table: Mapping[str, float] | Any | None = None,
         profile_sampler: PokerGPURejectionSampler | Any | None = None,
         partition_adapter: PokerGPUPartitionAdapter | Any | None = None,
-        evaluator_backend: str = "auto",
     ) -> None:
         self.cfg = cfg
         self.geometry = cfg.geometry
@@ -134,8 +129,8 @@ class PokerRolloutBackend:
             torch.arange(1, cfg.n_ticks + 1, dtype=torch.float32, device=self.device)
             * float(cfg.chip_unit_bb)
         )
-        if evaluator_backend not in {"auto", "cpu", "cuda"}:
-            raise ValueError("evaluator_backend must be 'auto', 'cpu', or 'cuda'")
+        if self.device.type not in {"cuda", "mps"}:
+            raise ValueError("poker rollout execution requires CUDA or MPS")
         if max_rollout_steps is None:
             raises_per_street = math.ceil(cfg.stack_bb / cfg.bb) + 1
             max_rollout_steps = 4 * cfg.n_players * (raises_per_street + 1) + 3
@@ -155,11 +150,9 @@ class PokerRolloutBackend:
         if any(not math.isfinite(float(value)) or float(value) < 1.0 for value in self.beta_table.values()):
             raise ValueError("rollout beta values must be finite and at least one")
         self.profile_sampler = profile_sampler or PokerGPURejectionSampler(
-            backend=evaluator_backend, rank_count=cfg.rank_count
+            rank_count=cfg.rank_count
         )
-        self.showdown_evaluator = PokerGPUShowdownEvaluator(
-            backend=evaluator_backend, rank_count=cfg.rank_count
-        )
+        self.showdown_evaluator = PokerGPUShowdownEvaluator(rank_count=cfg.rank_count)
         self.partition_adapter = partition_adapter or PokerGPUPartitionAdapter(
             rank_count=cfg.rank_count
         )
@@ -299,6 +292,15 @@ class PokerRolloutBackend:
         self._next_dependency_anchor = 0
         for _, cache in self._partition_services.values():
             cache.reset()
+        return self.append_initial_states(buttons)
+
+    def append_initial_states(self, buttons: Tensor) -> Tensor:
+        """Append independent roots without resetting other live inference rows."""
+
+        if buttons.ndim != 1 or buttons.device != self.device:
+            raise ValueError("buttons must be device-local [B]")
+        buttons = buttons.to(torch.int32)
+        n = buttons.shape[0]
         handles = self.states.allocate_all(n)  # [B]
         rows = handles.to(torch.int64)
         if self.n_players == 2:

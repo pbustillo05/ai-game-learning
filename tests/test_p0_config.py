@@ -23,7 +23,7 @@ def test_nlhe_loads_every_config_field() -> None:
     assert cfg.rollout.beta is not None
     assert cfg.rollout.beta["preflop"] == 1.0
     assert cfg.completion.n_samples == 256
-    assert cfg.completion.backend == "cuda"
+    assert cfg.device == "cuda"
     assert cfg.model["d_model"] == 192
     assert cfg.loss.lam == pytest.approx(0.95)
     assert cfg.loss.value_loss == "clipped"

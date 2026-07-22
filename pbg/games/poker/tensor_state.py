@@ -117,6 +117,8 @@ class PokerTensorStateStore:
         self.max_rollout_steps = max_rollout_steps
         self.n_players = n_players
         self.device = torch.device(device)
+        if self.device.type not in {"cuda", "mps"}:
+            raise ValueError("poker rollout state requires CUDA or MPS")
         self.schema = poker_live_state_schema(n_players)
         self.pool = RecyclableTensorPool(
             self.schema,

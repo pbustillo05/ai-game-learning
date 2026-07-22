@@ -15,7 +15,7 @@ from pbg.core.game import PRETERM, PROBE_FOLD, GameBundle
 from pbg.core.tree import PagedRolloutTopology
 from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
 from pbg.games.poker.cards import DeckGeometry
-from pbg.games.poker.engine import PokerConfig
+from pbg.games.poker.rules import PokerConfig
 from pbg.games.poker.folded import PokerGPUPartitionAdapter
 from pbg.games.poker.mc import (
     PokerGPUCompletion,
@@ -35,6 +35,11 @@ from pbg.games.poker.rollout_backend import PokerRolloutBackend
 from pbg.games.poker.tensor_state import (
     poker_live_state_schema,
     poker_public_history_schema,
+)
+from pbg.core.devices import (
+    assert_module_device,
+    resolve_execution_device,
+    validate_workload_capabilities,
 )
 
 
@@ -216,7 +221,7 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
         v_hat = torch.zeros_like(p_hat)
         n_eff = torch.zeros(batch, dtype=torch.float32, device=game.device)
         metadata: dict[str, object] = {
-            "backend": self.backend,
+            "device": str(game.device),
             "fold_completion": "joint_profiles",
             "storage": "immutable_leaf_rows",
         }
@@ -367,7 +372,7 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
         return BatchedCompletionStats(
             p_hat=p_hat,
             v_hat=v_hat,
-            metadata={"backend": self.backend, "selected_player": True},
+            metadata={"device": str(game.device), "selected_player": True},
         )
 
     def _complete_impl(
@@ -410,7 +415,7 @@ class _TensorPokerGPUCompletion(PokerGPUCompletion):
 
         owner = tree.owner[node_ids.to(tree.owner.device).long()]
         preterm = (owner == PRETERM).nonzero(as_tuple=False).squeeze(1)
-        metadata: dict[str, object] = {"backend": self.backend, "fold_completion": "joint_profiles"}
+        metadata: dict[str, object] = {"device": str(game.device), "fold_completion": "joint_profiles"}
         if preterm.numel():
             states = state_refs[preterm]
             selected_reach = rows[preterm]
@@ -587,6 +592,7 @@ def build_model_from_config(
 ) -> PokerModelBundle:
     """Construct only a poker model from checkpoint scientific configuration."""
 
+    device = resolve_execution_device(device, workload="inference")
     game = scientific.get("game")
     model = scientific.get("model")
     if not isinstance(game, dict) or not isinstance(model, dict):
@@ -627,6 +633,7 @@ def build_model_from_config(
         PreflopNet(model_cfg, engine_cfg.geometry),
         PostflopNet(model_cfg, engine_cfg.geometry),
     ).to(device)
+    assert_module_device(result, device, "poker model")
     if hardware is not None:
         for module in result.modules():
             if isinstance(module, MHA):
@@ -639,6 +646,12 @@ def build_model_from_config(
 def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     """Construct one owning poker model and its device-resident backends."""
 
+    device = resolve_execution_device(device, workload="training")
+    validate_workload_capabilities(device, workload="training")
+    if device.type != cfg.device:
+        raise ValueError(
+            f"bundle device {device.type!r} differs from config.device {cfg.device!r}"
+        )
     engine_cfg = PokerConfig(
         n_players=cfg.game.n_players,
         stack_bb=cfg.game.stack_bb,
@@ -657,9 +670,7 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
                     cfg.hardware.attention_backend, cfg.hardware.query_chunk_size
                 )
     adapter = PokerPolicyAdapter(engine_cfg.n_ticks)
-    profiles = PokerGPURejectionSampler(
-        backend=cfg.completion.backend, rank_count=engine_cfg.rank_count
-    )
+    profiles = PokerGPURejectionSampler(rank_count=engine_cfg.rank_count)
     partition = PokerGPUPartitionAdapter(
         beta_rank=model_cfg.folder_beta_rank, rank_count=engine_cfg.rank_count
     )
@@ -696,7 +707,6 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         beta_table=cfg.rollout.beta or {"default": 1.0},
         profile_sampler=profiles,
         partition_adapter=partition,
-        evaluator_backend=cfg.completion.backend,
         max_rollout_steps=model_cfg.max_history_tokens,
     )
     backend.execution_profile = cfg.hardware
@@ -705,13 +715,15 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
     completion = (
         None
         if cfg.training.mode == "normal"
-        else _TensorPokerGPUCompletion(
-            backend=cfg.completion.backend, rank_count=engine_cfg.rank_count
-        )
+        else _TensorPokerGPUCompletion(rank_count=engine_cfg.rank_count)
     )
-    return GameBundle(
+    result = GameBundle(
         model=model,
         rollout_backend=backend,
         policy_adapter=adapter,
         completion_backend=completion,
     )
+    assert_module_device(result.model, device, "poker bundle model")
+    if result.rollout_backend.device != device:
+        raise RuntimeError("poker rollout storage must share the model device")
+    return result

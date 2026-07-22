@@ -475,7 +475,8 @@ class BranchedVarianceRunner:
         raw["training"]["amp"] = False
         raw["training"]["reproducibility"] = "strict"
         raw["training"].setdefault("checkpoint_every", 1)
-        raw["completion"]["backend"] = "cuda" if device.type == "cuda" else "cpu"
+        raw["device"] = device.type
+        raw["completion"].pop("backend", None)
         raw["completion"]["n_samples"] = int(experiment["oracle"]["n_oracle"])
         raw["loss"]["lam"] = 1.0
         raw["loss"]["c_v"] = 0.0005

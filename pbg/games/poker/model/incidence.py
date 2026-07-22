@@ -111,10 +111,8 @@ def build_compact_map(
 ) -> CompactMap:
     """Build a stable, padded map from supplied bool rows ``[B,H]``.
 
-    Production CUDA callers provide the fixed compatible-combo count for the
-    street. This keeps the output shape static and avoids reading a device
-    reduction on the host. Generic CPU callers retain minimal ragged padding;
-    generic CUDA callers conservatively use the full width.
+    Production callers provide the fixed compatible-combo count for the street.
+    The conservative default retains full width without a device-to-host read.
     """
 
     if not isinstance(compatibility, Tensor) or compatibility.ndim != 2:
@@ -124,11 +122,7 @@ def build_compact_map(
     batch, full_size = compatibility.shape
     counts = compatibility.sum(dim=1)
     if compact_size is None:
-        compact_size = (
-            int(counts.max().item())
-            if batch and compatibility.device.type == "cpu"
-            else full_size
-        )
+        compact_size = full_size
     if isinstance(compact_size, bool) or not 0 <= compact_size <= full_size:
         raise ValueError("compact_size must be in [0,H]")
     enough_space = (counts <= compact_size).all()

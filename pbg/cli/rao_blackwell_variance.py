@@ -13,6 +13,7 @@ import sys
 from typing import Any
 
 import torch
+from pbg.core.devices import resolve_execution_device, validate_workload_capabilities
 
 from pbg.eval.rao_blackwell_variance import (
     assigned_jobs,
@@ -36,12 +37,17 @@ def _device(argument: str | None) -> torch.device:
     rank, world, local = _distributed_identity()
     del rank
     if world > 1:
-        if argument is not None:
-            raise ValueError("--device is valid only for an ordinary single-worker invocation")
         assert local is not None
-        device = torch.device("cuda", local)
+        if argument != "cuda":
+            raise ValueError("distributed variance evaluation requires --device cuda")
+        device = resolve_execution_device(
+            "cuda", workload="variance evaluation", local_rank=local
+        )
     else:
-        device = torch.device(argument or ("cuda:0" if torch.cuda.is_available() else "cpu"))
+        if argument is None:
+            raise ValueError("--device must explicitly select cuda or mps")
+        device = resolve_execution_device(argument, workload="variance evaluation")
+    validate_workload_capabilities(device, workload="variance evaluation")
     # A torch.device is only an address. CUDA memory APIs require the process's
     # current device to be initialized explicitly, especially under torchrun
     # where LOCAL_RANK differs across workers.
@@ -196,7 +202,7 @@ def run_variance(
     rank, world, _ = _distributed_identity()
     distributed = world > 1
     if distributed and not torch.distributed.is_initialized():
-        torch.distributed.init_process_group(backend="gloo")
+        torch.distributed.init_process_group(backend="nccl")
     jobs = assigned_jobs(
         config["checkpoints"], int(config["public_sampling"]["superbatches"]), rank, world
     )
@@ -308,7 +314,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Rao--Blackwell gradient-variance experiment")
     parser.add_argument("--config", required=True)
     parser.add_argument("--phase", required=True, choices=("smoke", "calibrate-oracle", "variance", "performance", "validate", "analyze", "all"))
-    parser.add_argument("--device", default=None)
+    parser.add_argument("--device", required=True, choices=("cuda", "mps"))
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--job", default=None, metavar="CHECKPOINT:SUPERBATCH",
