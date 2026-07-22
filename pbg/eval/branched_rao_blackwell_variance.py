@@ -258,7 +258,7 @@ def geometry_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
 def _tree_layout(tree: Any) -> dict[str, Any]:
     parent = tree.parent.detach().to("cpu", torch.int64).tolist()
-    count = tree.child_ptr[1:].detach().to("cpu", torch.int64) - tree.child_ptr[:-1].detach().to("cpu", torch.int64)
+    count = tree.degree.detach().to("cpu", torch.int64)
     counts = count.tolist()
     nodes = len(parent)
     depth = [0] * nodes
@@ -268,9 +268,11 @@ def _tree_layout(tree: Any) -> dict[str, Any]:
                 raise RuntimeError("branched topology is not parent-before-child")
             depth[node] = depth[parent[node]] + 1
     by_depth = [torch.tensor([n for n, d in enumerate(depth) if d == level], dtype=torch.int64) for level in range(max(depth) + 1)]
-    child_node = tree.child_node.detach().to("cpu", torch.int64).tolist()
-    ptr = tree.child_ptr.detach().to("cpu", torch.int64).tolist()
-    children = [child_node[ptr[node] : ptr[node + 1]] for node in range(nodes)]
+    begin = tree.child_begin.detach().to("cpu", torch.int64).tolist()
+    children = [
+        list(range(begin[node], begin[node] + counts[node])) if counts[node] else []
+        for node in range(nodes)
+    ]
     degree = torch.tensor(counts, dtype=torch.float32, device=tree.parent.device)
     return {"depth": depth, "by_depth": by_depth, "children": children, "degree": degree}
 
@@ -307,21 +309,29 @@ def _node_moments(
     return node_p, node_m
 
 
-def _decision_edges(tree: Any, decision_nodes: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+def _decision_edges(sample: Any) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    tree = sample.topology
+    decision_nodes = sample.decision_node
+    if decision_nodes is None or sample.action_ptr is None or sample.action_source is None:
+        raise RuntimeError("branched direct seal omitted decision/action addresses")
     device = tree.parent.device
-    ptr = tree.child_ptr.detach().to("cpu", torch.int64).tolist()
-    child_node = tree.child_node.detach().to("cpu", torch.int64).tolist()
-    child_event = tree.child_event.detach().to("cpu", torch.int64).tolist()
+    ptr = sample.action_ptr.detach().to("cpu", torch.int64).tolist()
+    child_event = sample.action_source["event"].detach().to("cpu", torch.int64).tolist()
     rows = decision_nodes.detach().to("cpu", torch.int64).tolist()
-    counts = torch.tensor([ptr[node + 1] - ptr[node] for node in rows], dtype=torch.int64, device=device)
+    counts = torch.tensor(
+        [ptr[row + 1] - ptr[row] for row in range(len(rows))],
+        dtype=torch.int64,
+        device=device,
+    )
     width = int(counts.max())
     children = torch.zeros((len(rows), width), dtype=torch.int64, device=device)
     events = torch.zeros((len(rows), width), dtype=torch.int64, device=device)
     mask = torch.zeros((len(rows), width), dtype=torch.bool, device=device)
     for row, node in enumerate(rows):
-        count = ptr[node + 1] - ptr[node]
-        children[row, :count] = torch.tensor(child_node[ptr[node] : ptr[node + 1]], device=device)
-        events[row, :count] = torch.tensor(child_event[ptr[node] : ptr[node + 1]], device=device)
+        count = ptr[row + 1] - ptr[row]
+        first = int(tree.child_begin[node])
+        children[row, :count] = torch.arange(first, first + count, device=device)
+        events[row, :count] = torch.tensor(child_event[ptr[row] : ptr[row + 1]], device=device)
         mask[row, :count] = True
     return children, events, mask, counts
 
@@ -401,12 +411,12 @@ def _propagate_functional_coefficients(
     local_m: Tensor,
     functional_weights: Tensor,
     leaf_ids: Tensor,
+    players: int,
 ) -> tuple[Tensor, Tensor]:
     """Propagate local child-summary derivatives to leaf completion rows."""
 
     functionals, decisions = functional_weights.shape
     nodes = int(tree.parent.numel())
-    players = int(tree.depth_p.shape[1])
     hands = local_p.shape[-1]
     if local_p.shape[:2] != children.shape or local_m.shape != local_p.shape:
         raise ValueError("local partials are not action aligned")
@@ -536,7 +546,7 @@ class BranchedVarianceRunner:
         repeat: int,
         *,
         upper_cutoff: int | None = None,
-    ) -> tuple[Any, Any, Any, dict[str, Any]]:
+    ) -> tuple[Any, dict[str, Any]]:
         from pbg.core.branching import sample_branched_tree
 
         seed = logical_seed(int(self.experiment["logical_seed"]), "branched-public-tree", 1110, repeat)
@@ -557,7 +567,7 @@ class BranchedVarianceRunner:
             torch.cuda.reset_peak_memory_stats(self.device)
         started = time.perf_counter()
         with torch.inference_mode():
-            tree, reach, policy = sample_branched_tree(
+            sample = sample_branched_tree(
                 self.bundle,
                 self.cfg,
                 generator,
@@ -568,18 +578,25 @@ class BranchedVarianceRunner:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         elapsed = time.perf_counter() - started
-        degree = tree.child_ptr[1:] - tree.child_ptr[:-1]
+        tree = sample.topology
+        degree = tree.degree
         leaf = degree == 0
+        layout = _tree_layout(tree)
+        weights = torch.ones(tree.nodes, dtype=torch.float64, device=self.device)
+        for host_nodes in layout["by_depth"][1:]:
+            selected = host_nodes.to(self.device)
+            parent = tree.parent[selected].to(torch.int64)
+            weights[selected] = weights[parent] / degree[parent]
         geometry = {
             "beta": float(beta),
             "repeat": int(repeat),
             "seed": int(seed),
-            "nodes": int(tree.parent.numel()),
-            "decisions": int(policy.node_ids.numel()),
+            "nodes": sample.node_count,
+            "decisions": sample.decision_source.rows,
             "leaves": int(leaf.sum()),
             "max_offspring": int(degree.max()),
-            "max_player_depth": int(tree.depth_player.max()),
-            "leaf_weight_sum": float(tree.path_weight[leaf].double().sum()),
+            "max_player_depth": max(layout["depth"]),
+            "leaf_weight_sum": float(weights[leaf].sum()),
             "rollout_seconds": elapsed,
             "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(self.device)) if self.device.type == "cuda" else 0,
             "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(self.device)) if self.device.type == "cuda" else 0,
@@ -589,20 +606,28 @@ class BranchedVarianceRunner:
             "upper_cutoff_avoided_children": int(diagnostics["upper_cutoff_avoided_children"]),
         }
         self.memory_gate()
-        return tree, reach, policy, geometry
+        return sample, geometry
 
     def _complete_leaves(
-        self, tree: Any, reach: Any, policy: Any, beta: float, repeat: int, n_samples: int
+        self, sample: Any, beta: float, repeat: int, n_samples: int
     ) -> tuple[Tensor, Tensor, Tensor, dict[str, Tensor], Tensor, float]:
-        leaf_ids = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero(as_tuple=False).squeeze(1)
-        leaf_reach = reach.rows_for(
-            tree, leaf_ids.to(torch.int32), self.bundle.rollout_backend, policy
-        )
-        captured_leaf = reach.payload_for(leaf_ids.to(torch.int32))
+        tree = sample.topology
+        leaf_nodes = (tree.leaf_row >= 0).nonzero(as_tuple=False).squeeze(1)
+        leaf_ids = leaf_nodes[torch.argsort(tree.leaf_row[leaf_nodes])]
+        leaf_reach = sample.leaf_source["log_reach"]
+        captured_leaf = sample.leaf_source.columns
         inputs = {
             name: value
             for name, value in captured_leaf.items()
-            if name not in {"owner", "fold_payoff"}
+            if name
+            not in {
+                "node_id",
+                "root_id",
+                "path_key",
+                "log_reach",
+                "owner",
+                "fold_payoff",
+            }
         }
         inputs["range_weights"] = (
             self.bundle.rollout_backend.range_weights_from_log_reach(leaf_reach)
@@ -631,16 +656,18 @@ class BranchedVarianceRunner:
     def moment_tree(self, beta: float, repeat: int, *, n_samples: int | None = None) -> dict[str, Any]:
         n_samples = int(n_samples or self.experiment["oracle"]["n_oracle"])
         started = time.perf_counter()
-        tree, reach, policy, geometry = self.sample_tree(beta, repeat)
+        sample, geometry = self.sample_tree(beta, repeat)
+        tree = sample.topology
         rollout_done = time.perf_counter()
-        if policy.decision_inputs is None:
-            raise RuntimeError("branched rollout omitted decision inputs")
-        decisions = policy.node_ids.to(torch.int64)
-        children, events, child_mask, child_count = _decision_edges(tree, decisions)
+        decisions = sample.decision_node
+        if decisions is None:
+            raise RuntimeError("branched direct seal omitted compact decision rows")
+        decisions = decisions.to(torch.int64)
+        children, events, child_mask, child_count = _decision_edges(sample)
         directions_started = time.perf_counter()
         d_value, d_logp = _model_directional_rows(
             self.bundle,
-            policy.decision_inputs,
+            sample.decision_inputs,
             events,
             child_mask,
             self.directions,
@@ -651,26 +678,26 @@ class BranchedVarianceRunner:
         direction_done = time.perf_counter()
         self.memory_gate()
         leaf_ids, leaf_p, leaf_m, completion_inputs, completion_seeds, minimum_ess = self._complete_leaves(
-            tree, reach, policy, beta, repeat, n_samples
+            sample, beta, repeat, n_samples
         )
         completion_done = time.perf_counter()
         layout = _tree_layout(tree)
         node_p, node_m = _node_moments(tree, leaf_ids, leaf_p, leaf_m, layout)
-        owners = tree.owner[decisions].to(torch.int64)
+        owners = sample.decision_aux["owner"].to(torch.int64)
         gather_owner = owners[:, None, None].expand(-1, children.shape[1], node_p.shape[2])
         child_p = node_p[children].gather(2, gather_owner[:, :, None, :]).squeeze(2)
         child_m = node_m[children].gather(2, gather_owner[:, :, None, :]).squeeze(2)
         projected, partial_p, partial_m = projected_loss_and_child_partials(
             child_p,
             child_m,
-            policy.old_v,
+            sample.decision_source["old_v"],
             d_value,
             d_logp,
             child_mask,
             child_count,
             c_v=0.0005,
         )
-        decision_weight = tree.path_weight[decisions].to(torch.float64)
+        decision_weight = sample.decision_aux["log_weight"].exp().to(torch.float64)
         length = decision_weight.sum()
         gradient = (projected.double() * decision_weight[None]).sum(1)
         minibatch = (
@@ -709,6 +736,7 @@ class BranchedVarianceRunner:
                 local_m=partial_m[probe],
                 functional_weights=functional_weights,
                 leaf_ids=leaf_ids,
+                players=int(self.bundle.rollout_backend.n_players),
             )
             world_sum = torch.zeros(1 + node_hutchinson, dtype=torch.float64)
             mean_var_sum = torch.zeros_like(world_sum)

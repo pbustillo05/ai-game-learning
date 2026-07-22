@@ -441,24 +441,16 @@ def run_variance_job(
         parameter.requires_grad_(True)
     sampled = sample_trees_sequential(bundle, cfg, generator, iteration=int(checkpoint))
     rollout_seconds = time.perf_counter() - rollout_started
-    tree, leaf_reach_cache, policy = sampled
-    if policy.decision_inputs is None:
-        raise RuntimeError("sequential rollout did not retain decision inputs")
-    decision_inputs = policy.decision_inputs
-    decision_nodes = policy.node_ids.to(torch.int64)
-    trajectory_id = tree.tree_id[decision_nodes].to(torch.int64)
-    owner = tree.owner[decision_nodes].to(torch.int64)
-    edge = tree.child_ptr[decision_nodes].to(torch.int64)
-    if not bool((tree.child_ptr[decision_nodes + 1] - edge == 1).all()):
-        raise RuntimeError("sequential decisions must have exactly one realized child")
-    events = tree.child_event[edge].to(torch.int64)
-    leaf_ids = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero(as_tuple=False).squeeze(1)
-    leaf_tree = tree.tree_id[leaf_ids.to(torch.int64)].to(torch.int64)
-    order = torch.argsort(leaf_tree)
-    leaf_ids = leaf_ids[order]
-    if not torch.equal(leaf_tree[order], torch.arange(maximum_n, device=device)):
+    decision_inputs = sampled.decision_inputs
+    decision_source = sampled.decision_source
+    trajectory_id = decision_source["root_id"].to(torch.int64)
+    owner = decision_source["owner"].to(torch.int64)
+    events = decision_source["event"].to(torch.int64)
+    leaf_source = sampled.leaf_source
+    leaf_tree = leaf_source["root_id"].to(torch.int64)
+    if not torch.equal(leaf_tree, torch.arange(maximum_n, device=device)):
         raise RuntimeError("sequential rollout must produce one leaf per trajectory")
-    leaf_reach = leaf_reach_cache.rows_for(tree, leaf_ids.to(torch.int32), bundle.rollout_backend, policy)
+    leaf_reach = leaf_source["log_reach"]
     n_values = tuple(int(value) for value in experiment["candidates"]["N"])
     probes = int(experiment["probes"]["count"])
     probes_per_chunk = int(experiment["streaming"].get("probes_per_chunk", 1))
@@ -516,15 +508,23 @@ def run_variance_job(
         maximum_functionals = int(counts.max().item()) + 1
         if maximum_functionals > functional_bound:
             raise MemoryError(f"trajectory requires {maximum_functionals} functionals, exceeding configured bound {functional_bound}")
-        selected_leaf_ids = leaf_ids[first:stop]
         selected_leaf_reach = leaf_reach[first:stop]
-        captured_leaf = leaf_reach_cache.payload_for(
-            selected_leaf_ids.to(torch.int32)
-        )
+        captured_leaf = {
+            name: value[first:stop]
+            for name, value in leaf_source.columns.items()
+        }
         completion_inputs = {
             name: value
             for name, value in captured_leaf.items()
-            if name not in {"owner", "fold_payoff"}
+            if name
+            not in {
+                "node_id",
+                "root_id",
+                "path_key",
+                "log_reach",
+                "owner",
+                "fold_payoff",
+            }
         }
         completion_inputs["range_weights"] = (
             bundle.rollout_backend.range_weights_from_log_reach(

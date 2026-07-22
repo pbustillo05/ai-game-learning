@@ -21,7 +21,7 @@ from pbg.core.branching import (
 from pbg.config import ConfigError, load_config
 from pbg.core.game import EventBatch, GameBundle, TERMINAL
 from pbg.core.rollout import _selected_policy_logp
-from pbg.core.tree import PagedTreeSource
+from pbg.core.tree import PagedRolloutTopology
 from pbg.core.storage import (
     SealedDecisionInputs,
     SealedTensorBlock,
@@ -218,66 +218,57 @@ def _sample(
 
 
 def test_equal_labeled_siblings_remain_distinct_with_uniform_weights() -> None:
-    tree, _, policy = _sample(_LabeledBackend(4.0), _cfg(1, 4.0))
-    tree.validate()
-    roots = (tree.parent == -1).nonzero().squeeze(1)
-    counts = tree.child_ptr[roots + 1] - tree.child_ptr[roots]
-    assert torch.equal(counts, torch.full_like(counts, 4))
-    assert torch.equal(tree.child_event, torch.zeros_like(tree.child_event))
-    assert torch.allclose(tree.nu, torch.full_like(tree.nu, 0.25), atol=0, rtol=0)
-    assert torch.allclose(tree.path_weight[tree.child_node], tree.nu, atol=0, rtol=0)
-    assert policy.action_ptr.tolist() == [0, 4]
-    assert policy.old_logp_action.shape == (4, 1)
+    sample = _sample(_LabeledBackend(4.0), _cfg(1, 4.0))
+    sample.topology.validate(leaf_rows=sample.leaf_source.rows)
+    assert int(sample.topology.degree[0]) == 4
+    assert torch.equal(sample.action_source["event"], torch.zeros(4, dtype=torch.int32))
+    assert sample.action_ptr.tolist() == [0, 4]
+    assert sample.action_source["old_logp"].shape == (4, 1)
 
 
 def test_duplicate_siblings_expand_independently_without_label_sorting() -> None:
     backend = _LabeledBackend(2.0, two_levels=True)
-    tree, _, _ = _sample(backend, _cfg(1, 2.0), 7)
+    sample = _sample(backend, _cfg(1, 2.0), 7)
+    tree = sample.topology
     assert backend.forward_batch_sizes == [1, 2]
-    roots = (tree.parent == -1).nonzero().squeeze(1)
-    assert roots.numel() == 1
-    for root in roots:
-        first = tree.child_node[tree.child_ptr[root] : tree.child_ptr[root + 1]]
-        assert torch.equal(
-            tree.child_event[tree.child_ptr[root] : tree.child_ptr[root + 1]],
-            torch.zeros(2, dtype=torch.int32),
-        )
-        descendants = [
-            tree.child_node[tree.child_ptr[node] : tree.child_ptr[node + 1]]
-            for node in first
-        ]
-        assert all(children.numel() == 2 for children in descendants)
-        assert torch.cat(descendants).unique().numel() == 4
+    first = torch.arange(tree.child_begin[0], tree.child_begin[0] + tree.degree[0])
+    descendants = [
+        torch.arange(tree.child_begin[node], tree.child_begin[node] + tree.degree[node])
+        for node in first
+    ]
+    assert all(children.numel() == 2 for children in descendants)
+    assert torch.cat(descendants).unique().numel() == 4
 
 
 def test_branched_uses_one_root_and_preserves_duplicate_children() -> None:
     backend = _LabeledBackend(2.0, two_levels=True)
-    tree, _, policy = _sample(backend, _cfg(1, 2.0), 7)
-    tree.validate()
+    sample = _sample(backend, _cfg(1, 2.0), 7)
+    tree = sample.topology
+    tree.validate(leaf_rows=sample.leaf_source.rows)
     roots = (tree.parent == -1).nonzero().squeeze(1)
     assert roots.tolist() == [0]
-    first = tree.child_node[tree.child_ptr[0] : tree.child_ptr[1]]
+    first = torch.arange(tree.child_begin[0], tree.child_begin[0] + tree.degree[0])
     assert first.numel() == 2
     descendants = [
-        tree.child_node[tree.child_ptr[node] : tree.child_ptr[node + 1]]
+        torch.arange(tree.child_begin[node], tree.child_begin[node] + tree.degree[node])
         for node in first
     ]
     assert all(children.numel() == 2 for children in descendants)
     assert torch.cat(descendants).unique().numel() == 4
     assert backend.forward_batch_sizes == [1, 2]
-    assert policy.action_ptr.tolist() == [0, 2, 4, 6]
-    assert policy.old_logp_action.shape == (6, 1)
+    assert sample.action_ptr.tolist() == [0, 2, 4, 6]
+    assert sample.action_source["old_logp"].shape == (6, 1)
 
 
 def test_branched_dispatches_actual_cost_family_blocks() -> None:
     backend = _LabeledBackend(2.0, two_levels=True)
     cfg = _cfg(1, 2.0)
-    tree, _, policy = _sample(backend, cfg, 7)
+    sample = _sample(backend, cfg, 7)
 
-    tree.validate()
+    sample.topology.validate(leaf_rows=sample.leaf_source.rows)
     assert backend.actual_cost_batch_sizes == [1, 2]
     assert backend.forward_batch_sizes == [1, 2]
-    assert policy.action_ptr.tolist() == [0, 2, 4, 6]
+    assert sample.action_ptr.tolist() == [0, 2, 4, 6]
 
 
 def test_upper_cutoff_switches_later_expansions_to_spines() -> None:
@@ -286,7 +277,7 @@ def test_upper_cutoff_switches_later_expansions_to_spines() -> None:
     diagnostics: dict[str, int] = {}
 
     bundle = GameBundle(_Model(), backend, _Adapter(), None)
-    tree, _, policy = sample_branched_tree(
+    sample = sample_branched_tree(
         bundle,
         cfg,
         torch.Generator().manual_seed(7),
@@ -294,11 +285,11 @@ def test_upper_cutoff_switches_later_expansions_to_spines() -> None:
         diagnostic_limits=BranchingDiagnosticLimits(upper_nodes=4),
     )
 
-    degree = tree.child_ptr[1:] - tree.child_ptr[:-1]
-    assert tree.owner.numel() == 5
+    degree = sample.topology.degree
+    assert sample.node_count == 5
     assert int(degree[0]) == 2
     assert torch.equal(degree[1:3], torch.ones(2, dtype=torch.int64))
-    assert policy.action_ptr.tolist() == [0, 2, 3, 4]
+    assert sample.action_ptr.tolist() == [0, 2, 3, 4]
     assert diagnostics == {
         "upper_cutoff_batches": 1,
         "upper_cutoff_parents": 2,
@@ -332,10 +323,10 @@ def test_stop_cutoff_reports_unexpanded_live_queue() -> None:
 
 
 def test_root_fractional_rounding_is_keyed_and_repeatable() -> None:
-    first, _, _ = _sample(_LabeledBackend(1.5), _cfg(1, 1.5), 19)
-    second, _, _ = _sample(_LabeledBackend(1.5), _cfg(1, 1.5), 19)
-    first_count = int(first.child_ptr[1] - first.child_ptr[0])
-    second_count = int(second.child_ptr[1] - second.child_ptr[0])
+    first = _sample(_LabeledBackend(1.5), _cfg(1, 1.5), 19)
+    second = _sample(_LabeledBackend(1.5), _cfg(1, 1.5), 19)
+    first_count = int(first.topology.degree[0])
+    second_count = int(second.topology.degree[0])
     assert first_count in {1, 2}
     assert second_count == first_count
 
@@ -346,46 +337,35 @@ def test_root_refill_reaches_minimum_and_finalizes_uniform_weights() -> None:
     cfg.branching_min_nodes = 10
     diagnostics: dict[str, int] = {}
 
-    tree, _, policy = sample_branched_tree(
+    sample = sample_branched_tree(
         GameBundle(_Model(), backend, _Adapter(), None),
         cfg,
         torch.Generator().manual_seed(19),
         diagnostics=diagnostics,
     )
 
-    root_degree = int(tree.child_ptr[1] - tree.child_ptr[0])
-    assert tree.owner.numel() == 10
+    tree = sample.topology
+    root_degree = int(tree.degree[0])
+    assert sample.node_count == 10
     assert tree.pre_refill_node_count in {3, 4}
-    assert tree.root_pre_refill_child_count in {2, 3}
+    assert tree.root_target_degree in {2, 3}
     assert root_degree == 9
     assert diagnostics["root_refill_count"] == (
-        root_degree - tree.root_pre_refill_child_count
+        root_degree - tree.root_target_degree
     )
     assert diagnostics["root_refill_added_nodes"] == (
-        tree.owner.numel() - tree.pre_refill_node_count
+        sample.node_count - tree.pre_refill_node_count
     )
-    assert int(tree.nominal_child_count[0]) == tree.root_pre_refill_child_count
-    assert torch.allclose(
-        tree.nu[:root_degree],
-        torch.full((root_degree,), 1.0 / root_degree),
-        atol=1.0e-7,
-        rtol=0.0,
-    )
-    assert torch.allclose(
-        tree.path_weight[1:],
-        torch.full((root_degree,), 1.0 / root_degree),
-        atol=1.0e-7,
-        rtol=0.0,
-    )
-    assert policy.node_ids.tolist() == [0]
-    assert policy.action_ptr.tolist() == [0, tree.root_pre_refill_child_count]
-    assert policy.old_logp_action.shape == (tree.root_pre_refill_child_count, 1)
-    tree.validate()
+    assert int(tree.nominal_degree[0]) == tree.root_target_degree
+    assert sample.decision_source["node_id"].tolist() == [0]
+    assert sample.action_ptr.tolist() == [0, tree.root_target_degree]
+    assert sample.action_source["old_logp"].shape == (tree.root_target_degree, 1)
+    tree.validate(leaf_rows=sample.leaf_source.rows)
 
 
 def test_root_refill_is_disabled_without_minimum() -> None:
-    ordinary, _, _ = _sample(_LabeledBackend(2.3), _cfg(1, 2.3), 19)
-    assert ordinary.root_pre_refill_child_count is None
+    ordinary = _sample(_LabeledBackend(2.3), _cfg(1, 2.3), 19).topology
+    assert ordinary.root_target_degree is None
     assert ordinary.pre_refill_node_count is None
 
 
@@ -440,8 +420,7 @@ def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> 
 def test_labeled_hot_path_has_no_explicit_host_transfers_or_label_sort() -> None:
     banned = {"cpu", "numpy", "tolist", "item", "sort", "argsort"}
     for function in (
-        PagedTreeSource.append_children,
-        PagedTreeSource.finalize,
+        PagedRolloutTopology.append_children,
         _selected_policy_logp,
     ):
         syntax = ast.parse(textwrap.dedent(inspect.getsource(function)))

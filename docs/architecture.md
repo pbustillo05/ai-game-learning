@@ -69,7 +69,7 @@ randomized-rounded abstract child, including repeated event labels.
 
 Owner codes are players $\ge0$, `CHANCE=-1`, `TERMINAL=-2`, and `PRETERM=-3`.
 State references are recyclable device `int32` handles, separate from monotone
-logical node ids. `PagedTreeSource` appends topology pages only as realized
+logical node ids. `PagedRolloutTopology` appends topology pages only as realized
 nodes and edges arrive; sealing produces exact sequential chronology or one
 rooted six-column branched span.
 

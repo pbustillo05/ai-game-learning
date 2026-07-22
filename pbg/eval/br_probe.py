@@ -63,23 +63,17 @@ def _sha256(path: Path) -> str:
 def _selected_reward(
     bundle: GameBundle,
     cfg: Any,
-    sampled: ProbeRollout | tuple[Any, Any, Any, Tensor],
+    sampled: Any,
     seats: Tensor,
     gen: torch.Generator,
 ) -> Tensor:
-    if isinstance(sampled, ProbeRollout):
-        tree, leaf_rows = sampled.tree, sampled.leaf_reach
-    else:
-        tree, leaf_rows, _, _ = sampled
-    leaf = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero(
-        as_tuple=False
-    ).squeeze(1)
-    leaf_tree = tree.tree_id[leaf].to(torch.int64)
+    sample = sampled.sample if isinstance(sampled, ProbeRollout) else sampled
+    leaf_tree = sample.leaf_source["root_id"].to(torch.int64)
     leaf_seats = seats[leaf_tree].to(torch.int64)
     del bundle, cfg, gen
-    reward = leaf_rows.payload_for(leaf.to(torch.int32))["reward"]
+    reward = sample.leaf_source["reward"]
     result = torch.empty(seats.shape[0], dtype=torch.float32, device=seats.device)
-    rows = torch.arange(leaf.numel(), device=seats.device)
+    rows = torch.arange(sample.leaf_source.rows, device=seats.device)
     result[leaf_tree] = reward[rows, leaf_seats]
     return result
 

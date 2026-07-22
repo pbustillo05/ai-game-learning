@@ -14,13 +14,9 @@ from pbg.core.adaptive_branching import (
     log_kkt_intensity,
     randomized_round,
 )
-from pbg.core.tree import (
-    PagedTreeSource,
-    RolloutDecisionRows,
-    StoppedLeafRows,
-    SampledTree,
-)
-from pbg.core.storage import PagedRowAccumulator
+from pbg.core.tree import PagedRolloutTopology
+from pbg.core.storage import PagedRowAccumulator, SealedRolloutSample
+from pbg.core.topology import BranchedTreeSpan
 
 
 class BranchingCutoffReached(RuntimeError):
@@ -73,7 +69,7 @@ def sample_branched_tree(
     diagnostics: dict[str, int] | None = None,
     controller: Any | None = None,
     diagnostic_limits: BranchingDiagnosticLimits | None = None,
-) -> tuple[SampledTree, StoppedLeafRows, RolloutDecisionRows]:
+) -> SealedRolloutSample:
     """Sample one tree and release mutable backend owners on every exit."""
 
     try:
@@ -101,7 +97,7 @@ def _sample_branched_tree_impl(
     diagnostics: dict[str, int] | None = None,
     controller: Any | None = None,
     diagnostic_limits: BranchingDiagnosticLimits | None = None,
-) -> tuple[SampledTree, StoppedLeafRows, RolloutDecisionRows]:
+) -> SealedRolloutSample:
     """Sample one duplicate-preserving branched tree through execution families."""
 
     if diagnostics is None:
@@ -128,6 +124,7 @@ def _sample_branched_tree_impl(
         RecyclableTensorPool,
         PagedTensorArena,
         PagedTensorColumn,
+        SealedTensorBlock,
         TensorFieldSchema,
         TensorSchema,
     )
@@ -185,7 +182,7 @@ def _sample_branched_tree_impl(
     if roots.shape != (1,) or roots.dtype != torch.int32 or roots.device != device:
         raise ValueError("branched_root_state must return device-local int32 [1]")
     root_owner = backend.classify(roots).to(torch.int32)
-    buffer = PagedTreeSource(
+    buffer = PagedRolloutTopology(
         1,
         p_max,
         device,
@@ -780,6 +777,12 @@ def _sample_branched_tree_impl(
                 leaf_rows.append(
                     {
                         "node_id": stopped_nodes,
+                        "root_id": torch.full(
+                            (stopped,), int(tree_address), dtype=torch.int32, device=device
+                        ),
+                        "path_key": arena.gather_many(
+                            ("path_key",), stopped_rows
+                        )["path_key"].to(torch.int64),
                         "log_reach": stopped_reach,
                         **({} if payload is None else payload),
                     }
@@ -885,69 +888,79 @@ def _sample_branched_tree_impl(
     if reach_pool.live_rows != 0:
         raise RuntimeError("branched live reach slots survived their last consumer")
     reach_pool.release()
-    tree = buffer.finalize()
-    if minimum_nodes is not None:
-        assert pre_refill_node_count is not None
-        assert root_pre_refill_child_count is not None
-        root_final_child_count = int(buffer.child_count[0])
-        root_scale = root_pre_refill_child_count / root_final_child_count
-        root_edge_stop = int(tree.child_ptr[1])
-        tree.nu[:root_edge_stop].fill_(1.0 / root_final_child_count)
-        tree.path_weight[1:].mul_(root_scale)
-        root_children = tree.child_node[:root_edge_stop].to(torch.int64)
-        tree.path_weight[root_children] = tree.nu[:root_edge_stop]
-        tree.root_pre_refill_child_count = root_pre_refill_child_count
-        tree.pre_refill_node_count = pre_refill_node_count
-    tree.nominal_child_count = nominal_count[: buffer.node_count].detach()
-    tree.branching_beta = beta_rows[: buffer.node_count].detach()
-    tree.logical_path = arena.gather_many(
-        ("path_key",), torch.arange(buffer.node_count, device=device)
-    )["path_key"].detach()
-    arena.release()
-    tree.logical_tree_address = int(tree_address)
-    tree.branching_diagnostics = dict(diagnostics)
-    tree.validate()
-    if leaf_rows.rows:
-        assert leaf_rows.arena is not None
-        source_nodes = leaf_rows.arena.gather(
-            "node_id", torch.arange(leaf_rows.rows, device=device)
+    node_count = buffer.node_count
+    all_nodes = torch.arange(node_count, device=device)
+    old_parent = buffer.parent[all_nodes].to(torch.int64)
+    old_order = torch.empty(node_count, dtype=torch.int64, device=device)
+    old_order[0] = 0
+    old_order[1:] = torch.argsort(old_parent[1:], stable=True) + 1
+    old_to_new = torch.empty(node_count, dtype=torch.int64, device=device)
+    old_to_new[old_order] = torch.arange(node_count, device=device)
+    parent = old_parent[old_order]
+    parent = torch.where(parent < 0, parent, old_to_new[parent]).to(torch.int32)
+    degree_old = buffer.child_count[all_nodes].to(torch.int32)
+    degree = degree_old[old_order]
+    child_begin = torch.full((node_count,), -1, dtype=torch.int32, device=device)
+    if node_count > 1:
+        child_ids = torch.arange(1, node_count, dtype=torch.int32, device=device)
+        first = torch.full((node_count,), node_count, dtype=torch.int32, device=device)
+        first.scatter_reduce_(
+            0, parent[1:].to(torch.int64), child_ids, reduce="amin", include_self=True
         )
-        leaf_order = torch.argsort(source_nodes.to(torch.int64), stable=True)
-        leaf_block, leaf_metrics = leaf_rows.seal(row_order=leaf_order)
-        reach_nodes = leaf_block["node_id"].to(torch.int32)
-        retained_leaf_reach = leaf_block["log_reach"].to(torch.float32)
-        leaf_payload = {
-            name: value
-            for name, value in leaf_block.columns.items()
-            if name not in {"node_id", "log_reach"}
-        } or None
-    else:
-        leaf_metrics = None
-        reach_nodes = torch.empty(0, dtype=torch.int32, device=device)
-        retained_leaf_reach = torch.empty(
-            (0, p_max, x_max), dtype=torch.float32, device=device
-        )
-        leaf_payload = None
-    reach_cache = StoppedLeafRows(
-        "sealed",
-        retained_leaf_reach,
-        reach_nodes,
-        leaf_payload,
-        {} if leaf_metrics is None else {"leaf_rows": leaf_metrics},
+        child_begin[degree > 0] = first[degree > 0]
+
+    if not leaf_rows.rows or leaf_rows.arena is None:
+        raise RuntimeError("branched rollout produced no stopped-leaf rows")
+    source_nodes = leaf_rows.arena.gather(
+        "node_id", torch.arange(leaf_rows.rows, device=device)
     )
+    leaf_order = torch.argsort(source_nodes.to(torch.int64), stable=True)
+    leaf_block, leaf_metrics = leaf_rows.seal(row_order=leaf_order)
     verify_recycling = getattr(backend, "verify_state_recycling_boundary", None)
     if callable(verify_recycling):
         verify_recycling()
-    decision_nodes = ((tree.owner >= 0) & (tree.owner < p_max)).nonzero().squeeze(1)
+    decision_inputs = seal_captures(decision_input_store)
+    decision_nodes = decision_inputs.node_ids.to(torch.int64)
+    decision_new_nodes = old_to_new[decision_nodes]
+    decision_partition = torch.full(
+        (node_count,), -1, dtype=torch.int32, device=device
+    )
+    decision_row = torch.full_like(decision_partition, -1)
+    decision_partition[decision_new_nodes] = decision_inputs.partition_id
+    decision_row[decision_new_nodes] = decision_inputs.partition_row
+    leaf_old = leaf_block["node_id"].to(torch.int64)
+    leaf_new = old_to_new[leaf_old]
+    leaf_row = torch.full((node_count,), -1, dtype=torch.int32, device=device)
+    leaf_row[leaf_new] = torch.arange(
+        leaf_block.rows, dtype=torch.int32, device=device
+    )
+    nominal_old = nominal_count[:node_count].detach().to(torch.int32)
+    topology = BranchedTreeSpan(
+        parent=parent,
+        child_begin=child_begin,
+        degree=degree,
+        decision_partition=decision_partition,
+        decision_row=decision_row,
+        leaf_row=leaf_row,
+        root_target_degree=root_pre_refill_child_count,
+        pre_refill_node_count=pre_refill_node_count,
+        nominal_degree=nominal_old[old_order],
+    )
+    topology.validate(
+        partition_rows={
+            int(partition): block.rows
+            for partition, block in decision_inputs.inputs.items()
+        },
+        leaf_rows=leaf_block.rows,
+    )
+
     if decision_nodes.numel():
-        counts = tree.child_ptr[decision_nodes + 1] - tree.child_ptr[decision_nodes]
-        target_counts = counts.to(torch.int64)
-        protected = getattr(tree, "root_pre_refill_child_count", None)
-        if protected is not None:
+        target_counts = degree_old[decision_nodes].to(torch.int64)
+        if root_pre_refill_child_count is not None:
             root_row = (decision_nodes == 0).nonzero(as_tuple=False).squeeze(1)
             if root_row.numel() != 1:
                 raise RuntimeError("protected root is not a retained decision")
-            target_counts[root_row] = int(protected)
+            target_counts[root_row] = int(root_pre_refill_child_count)
         action_ptr = torch.empty(
             decision_nodes.numel() + 1, dtype=torch.int32, device=device
         )
@@ -968,7 +981,7 @@ def _sample_branched_tree_impl(
         )
         node_to_row[decision_nodes] = torch.arange(decision_nodes.numel(), device=device)
         # Append-order edge ids are not CSR positions under work queue scheduling:
-        # another family may expand a later node first. PagedTreeSource stores
+        # another family may expand a later node first. PagedRolloutTopology stores
         # each edge's stable parent-local ordinal explicitly for this mapping.
         columns = buffer.edge_ordinal[edge_ids].to(torch.int64)
         rows = node_to_row[parents]
@@ -986,31 +999,62 @@ def _sample_branched_tree_impl(
         node_block, node_metrics = policy_node_rows.seal(row_order=order)
         if not torch.equal(cached_nodes[order], decision_nodes):
             raise RuntimeError("family-scheduled branched rollout omitted a decision cache row")
-        old_v = node_block["old_v"].to(torch.float32)
-        old_t = node_block.columns.get("old_t")
-        old_c = node_block.columns.get("old_c")
     else:
         edge_metrics = node_metrics = None
         action_ptr = torch.zeros(1, dtype=torch.int32, device=device)
         ordered_event = torch.empty(0, dtype=torch.int32, device=device)
         logp_action = torch.empty((0, x_max), dtype=torch.float32, device=device)
-        old_v = torch.empty((0, x_max), dtype=torch.float32, device=device)
-        old_t = old_c = None
-    decision_inputs = seal_captures(decision_input_store)
-    if not torch.equal(decision_inputs.node_ids, decision_nodes.to(torch.int32)):
+        raise RuntimeError("branched rollout produced no player decisions")
+    if not torch.equal(decision_inputs.node_ids, node_block["node_id"]):
         raise RuntimeError("branched decision inputs are not aligned with topology")
-    frozen = RolloutDecisionRows(
-        decision_nodes.to(torch.int32), action_ptr, ordered_event, logp_action,
-        old_v, decision_inputs, old_t, old_c,
-        {
-            **({} if edge_metrics is None else {"policy_action_rows": edge_metrics}),
-            **({} if node_metrics is None else {"policy_decision_rows": node_metrics}),
+    action_schema = TensorSchema(
+        "branched_direct_action_source",
+        (
+            TensorFieldSchema("event", torch.int32, alignment=4),
+            TensorFieldSchema("old_logp", torch.float32, (x_max,), alignment=16),
+        ),
+    )
+    action_source = SealedTensorBlock(
+        action_schema,
+        {"event": ordered_event, "old_logp": logp_action},
+        int(action_ptr[-1]),
+        action_schema.capacity_bytes(int(action_ptr[-1]), chunks=1),
+    )
+    path_weight = buffer.path_weight[decision_nodes].detach().to(torch.float64)
+    if root_pre_refill_child_count is not None:
+        root_final_child_count = int(degree_old[0])
+        path_weight.mul_(root_pre_refill_child_count / root_final_child_count)
+        path_weight[decision_nodes == 0] = 1.0
+    decision_aux = {
+        "owner": buffer.owner[decision_nodes].detach().to(torch.int32),
+        "log_weight": torch.log(path_weight),
+        "nominal_child_count": nominal_old[decision_nodes],
+        "executed_child_count": target_counts.to(torch.int32),
+    }
+    decision_beta = beta_rows[decision_nodes].detach().to(torch.float32)
+    arena.release()
+    buffer.release()
+    control_arena.release()
+    return SealedRolloutSample(
+        mode="branched_rb",
+        topology=topology,
+        decision_source=node_block,
+        leaf_source=leaf_block,
+        decision_inputs=decision_inputs,
+        node_count=node_count,
+        action_source=action_source,
+        action_ptr=action_ptr,
+        decision_node=decision_new_nodes.to(torch.int32),
+        decision_aux=decision_aux,
+        branching_beta=decision_beta,
+        branching_diagnostics=diagnostics,
+        seal_metrics={
+            "leaf_rows": leaf_metrics,
+            "policy_action_rows": edge_metrics,
+            "policy_decision_rows": node_metrics,
             **decision_inputs.seal_metrics,
         },
     )
-    buffer.release()
-    control_arena.release()
-    return tree, reach_cache, frozen
 
 
 

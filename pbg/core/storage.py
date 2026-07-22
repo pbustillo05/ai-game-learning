@@ -1169,6 +1169,55 @@ class SealedDecisionInputs:
 
 
 @dataclass(frozen=True)
+class SealedRolloutSample:
+    """Direct compact-seal result returned by a rollout scheduler.
+
+    The decision and leaf sources are exact contiguous copies of paged
+    last-consumer rows. No all-node compatibility tree or reach/policy wrapper
+    exists between those sources and the compact topology.
+    """
+
+    mode: str
+    topology: Any
+    decision_source: SealedTensorBlock
+    leaf_source: SealedTensorBlock
+    decision_inputs: SealedDecisionInputs
+    node_count: int
+    action_source: SealedTensorBlock | None = None
+    action_ptr: Tensor | None = None
+    root_profiles: Tensor | None = None
+    probe_seats: Tensor | None = None
+    trajectory_node_count: Tensor | None = None
+    decision_node: Tensor | None = None
+    decision_aux: Mapping[str, Tensor] = field(default_factory=dict)
+    branching_beta: Tensor | None = None
+    branching_diagnostics: Mapping[str, int | float] = field(default_factory=dict)
+    seal_metrics: Mapping[str, SealMetrics] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"normal", "sequential_rb", "branched_rb", "probe"}:
+            raise ValueError("unknown directly sealed rollout mode")
+        if isinstance(self.node_count, bool) or self.node_count < 0:
+            raise ValueError("sealed rollout node_count must be nonnegative")
+        if self.decision_source.rows != self.decision_inputs.node_ids.numel():
+            raise ValueError("decision source and natural inputs must align")
+        if self.action_source is None:
+            if self.action_ptr is not None:
+                raise ValueError("sequential direct seal cannot own action_ptr")
+        elif self.action_ptr is None or self.action_ptr.shape != (
+            self.decision_source.rows + 1,
+        ):
+            raise ValueError("branched direct seal requires one global action CSR")
+        object.__setattr__(
+            self,
+            "branching_diagnostics",
+            MappingProxyType(dict(self.branching_diagnostics)),
+        )
+        object.__setattr__(self, "decision_aux", MappingProxyType(dict(self.decision_aux)))
+        object.__setattr__(self, "seal_metrics", MappingProxyType(dict(self.seal_metrics)))
+
+
+@dataclass(frozen=True)
 class TrainingPartition:
     """One immutable aligned partition block consumed by optimization."""
 
@@ -1454,6 +1503,10 @@ def rollout_policy_source_schema(
     if mode in {"normal", "sequential_rb"}:
         fields.extend(
             (
+                TensorFieldSchema("root_id", torch.int32, alignment=4),
+                TensorFieldSchema("decision_ordinal", torch.int32, alignment=4),
+                TensorFieldSchema("owner", torch.int32, alignment=4),
+                TensorFieldSchema("event", torch.int32, alignment=4),
                 TensorFieldSchema(
                     "old_logp", torch.float32, (exact_width,), alignment=16
                 ),
@@ -1572,6 +1625,8 @@ def stopped_leaf_source_schema(mode: str, *, players: int, exact_width: int) -> 
 
     fields = [
         TensorFieldSchema("node_id", torch.int32, alignment=4),
+        TensorFieldSchema("root_id", torch.int32, alignment=4),
+        TensorFieldSchema("path_key", torch.int64, alignment=8),
         TensorFieldSchema(
             "log_reach", torch.float32, (players, exact_width), alignment=16
         ),

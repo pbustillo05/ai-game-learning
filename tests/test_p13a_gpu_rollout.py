@@ -578,15 +578,16 @@ def test_core_sampler_accumulates_many_trees_before_model_forward() -> None:
     rollout = SimpleNamespace(
         roots_per_gpu=16, storage_page_rows=64
     )
-    tree, reach, policy = sample_trees_sequential(
+    sample = sample_trees_sequential(
         GameBundle(model, backend, PokerPolicyAdapter(cfg.n_ticks), None),
         rollout,
         torch.Generator().manual_seed(123),
     )
-    tree.validate()
-    assert int(((tree.owner == TERMINAL) | (tree.owner == PRETERM)).sum()) == 16
-    assert reach.log_r.device == backend.device
-    assert policy.old_v.shape[0] > len(model.calls) and policy.old_v.shape[1] == 1326
+    sample.topology.validate(leaf_rows=sample.leaf_source.rows)
+    assert sample.leaf_source.rows == 16
+    assert sample.leaf_source["log_reach"].device == backend.device
+    assert sample.decision_source["old_v"].shape[0] > len(model.calls)
+    assert sample.decision_source["old_v"].shape[1] == 1326
     assert all(batch > 1 for _, batch, _ in model.calls)
     assert profiles.devices == [backend.device]
 
@@ -605,21 +606,20 @@ def test_poker_family_scheduled_sequential_rollout_closes_chance_segments() -> N
         storage_page_rows=32,
         logical_seed=123,
     )
-    tree, reach, policy = sample_trees_sequential(
+    sample = sample_trees_sequential(
         GameBundle(model, backend, PokerPolicyAdapter(cfg.n_ticks), None),
         rollout,
         torch.Generator().manual_seed(999),
         iteration=2,
     )
-    tree.validate()
-    assert int(((tree.owner == TERMINAL) | (tree.owner == PRETERM)).sum()) == 8
-    assert reach.log_r.shape[0] == 8
-    assert policy.decision_inputs is not None
-    assert policy.decision_inputs.node_ids.numel() == policy.node_ids.numel()
-    assert policy.node_ids.numel() > 0
+    sample.topology.validate(leaf_rows=sample.leaf_source.rows)
+    assert sample.leaf_source.rows == 8
+    assert sample.leaf_source["log_reach"].shape[0] == 8
+    assert sample.decision_inputs.node_ids.numel() == sample.decision_source.rows
+    assert sample.decision_source.rows > 0
     assert bool(
         torch.cat(
-            [block["street"] for block in policy.decision_inputs.inputs.values()]
+            [block["street"] for block in sample.decision_inputs.inputs.values()]
         ).gt(0).any()
     )
     assert all(batch > 1 for _, batch, _ in model.calls)
@@ -716,21 +716,13 @@ def test_poker_actual_cost_keeps_physical_pack_indices_on_device() -> None:
 
 
 
-def _execution_public_paths(tree) -> tuple[tuple[int, ...], ...]:
+def _execution_public_paths(sample) -> tuple[tuple[int, ...], ...]:
     paths: list[tuple[int, ...]] = []
-    roots = (tree.parent == -1).nonzero(as_tuple=False).squeeze(1)
-    for root in roots.cpu().tolist():
-        node = root
-        events: list[int] = []
-        while True:
-            first = int(tree.child_ptr[node])
-            stop = int(tree.child_ptr[node + 1])
-            if first == stop:
-                break
-            assert stop == first + 1
-            events.append(int(tree.child_event[first]))
-            node = int(tree.child_node[first])
-        paths.append(tuple(events))
+    source = sample.decision_source
+    for root in range(sample.topology.roots):
+        selected = source["root_id"] == root
+        order = torch.argsort(source["decision_ordinal"][selected])
+        paths.append(tuple(source["event"][selected][order].cpu().tolist()))
     return tuple(paths)
 
 
@@ -774,16 +766,15 @@ def _assert_real_execution_poker_sample(cfg, backend, model, sampled, run_cfg) -
     del run_cfg
     package = pytest.importorskip("poker_gpu_evaluator")
     evaluator = package.bind(rank_count=13)
-    tree, reach, policy, profiles = sampled
-    tree.validate()
+    sample = sampled
+    sample.topology.validate(leaf_rows=sample.leaf_source.rows)
+    profiles = sample.root_profiles
+    assert profiles is not None
     assert profiles.shape == (4, 2)
     cards = evaluator.combo_cards.to(profiles.device)[profiles.to(torch.int64)]
     ordered = cards.reshape(4, -1).sort(1).values
     assert bool((ordered[:, 1:] != ordered[:, :-1]).all())
-    chance = tree.owner == CHANCE
-    assert bool(((tree.child_ptr[1:] - tree.child_ptr[:-1])[chance] == 1).all())
-
-    captured = policy.decision_inputs
+    captured = sample.decision_inputs
     assert isinstance(captured, SealedDecisionInputs)
     for partition_id, block in captured.inputs.items():
         rows = (captured.partition_id == partition_id).nonzero(as_tuple=False).squeeze(1)
@@ -794,8 +785,8 @@ def _assert_real_execution_poker_sample(cfg, backend, model, sampled, run_cfg) -
     assert metrics["execution_evaluator_rows"] == 8
     assert metrics["execution_state_live_rows_at_seal"] == 0
     assert metrics["execution_history_live_rows_at_seal"] == 1
-    assert metrics["execution_state_live_rows_high_water"] < tree.parent.numel()
-    assert metrics["execution_history_live_rows_high_water"] < tree.parent.numel()
+    assert metrics["execution_state_live_rows_high_water"] < sample.node_count
+    assert metrics["execution_history_live_rows_high_water"] < sample.node_count
     assert metrics["execution_evaluator_calls"] >= 1
 
 
@@ -805,8 +796,8 @@ def test_real_sibling_execution_poker_cpu_is_logically_addressed_and_collision_f
     right = _real_execution_poker_sample(torch.device("cpu"), batch_rows=4, admission=4)
     _assert_real_execution_poker_sample(*left)
     _assert_real_execution_poker_sample(*right)
-    assert torch.equal(left[3][3], right[3][3])
-    assert _execution_public_paths(left[3][0]) == _execution_public_paths(right[3][0])
+    assert torch.equal(left[3].root_profiles, right[3].root_profiles)
+    assert _execution_public_paths(left[3]) == _execution_public_paths(right[3])
 
     sealed_runs = []
     for game_cfg, backend, model, sampled, run_cfg in (left, right):
@@ -879,24 +870,27 @@ def test_poker_last_consumer_reaches_are_schedule_repeatable(
         if mode == "branched_rao_blackwell"
         else sample_trees_sequential
     )
-    full_tree, full_reach, full_policy = sampler(
+    full_sample = sampler(
         GameBundle(model, full_backend, PokerPolicyAdapter(cfg.n_ticks), None),
         SimpleNamespace(**common),
         torch.Generator().manual_seed(731),
     )
-    replay_tree, replay_reach, replay_policy = sampler(
+    replay_sample = sampler(
         GameBundle(model, replay_backend, PokerPolicyAdapter(cfg.n_ticks), None),
         SimpleNamespace(**common),
         torch.Generator().manual_seed(731),
     )
-    for field in ("parent", "child_ptr", "child_node", "child_event", "owner", "state_ref"):
-        assert torch.equal(getattr(replay_tree, field), getattr(full_tree, field))
-    assert torch.equal(replay_reach.node_index, full_reach.node_index)
-    assert torch.equal(replay_reach.log_r, full_reach.log_r)
-    assert full_policy.decision_inputs is not None
-    assert replay_policy.decision_inputs is not None
-    expected = full_policy.decision_inputs
-    actual = replay_policy.decision_inputs
+    for field in replay_sample.topology.__dataclass_fields__:
+        actual_field = getattr(replay_sample.topology, field)
+        expected_field = getattr(full_sample.topology, field)
+        if isinstance(actual_field, torch.Tensor):
+            assert torch.equal(actual_field, expected_field)
+        else:
+            assert actual_field == expected_field
+    for name, value in full_sample.leaf_source.columns.items():
+        assert torch.equal(replay_sample.leaf_source[name], value)
+    expected = full_sample.decision_inputs
+    actual = replay_sample.decision_inputs
     assert isinstance(expected, SealedDecisionInputs)
     assert isinstance(actual, SealedDecisionInputs)
     assert torch.equal(actual.node_ids, expected.node_ids)
@@ -908,22 +902,21 @@ def test_poker_last_consumer_reaches_are_schedule_repeatable(
 
     streets = torch.cat([block["street"] for block in actual.inputs.values()])
     assert bool((streets > 0).any())
-    events = replay_tree.child_event
-    assert bool(((events >= 100_000) & (events < 200_000)).any())
-    assert bool(((events >= 200_000) & (events < 300_000)).any())
-    assert bool(((events >= 300_000) & (events < 400_000)).any())
     if mode == "branched_rao_blackwell":
         has_duplicate_label = False
-        for parent in range(replay_tree.parent.numel()):
-            start, stop = int(replay_tree.child_ptr[parent]), int(replay_tree.child_ptr[parent + 1])
-            labels = replay_tree.child_event[start:stop]
+        assert replay_sample.action_ptr is not None
+        assert replay_sample.action_source is not None
+        for row in range(replay_sample.decision_source.rows):
+            start = int(replay_sample.action_ptr[row])
+            stop = int(replay_sample.action_ptr[row + 1])
+            labels = replay_sample.action_source["event"][start:stop]
             has_duplicate_label |= labels.numel() > labels.unique().numel()
         assert has_duplicate_label
     lifecycle = replay_backend.execution_metrics.snapshot()
     assert lifecycle["execution_state_live_rows_at_seal"] == 0
     assert lifecycle["execution_history_live_rows_at_seal"] == 1
-    assert lifecycle["execution_state_live_rows_high_water"] < replay_tree.parent.numel()
-    assert lifecycle["execution_history_live_rows_high_water"] <= replay_tree.parent.numel()
+    assert lifecycle["execution_state_live_rows_high_water"] < replay_sample.node_count
+    assert lifecycle["execution_history_live_rows_high_water"] <= replay_sample.node_count
     assert replay_backend.states.arena.page_count == 0
     assert replay_backend.states.history_arena.page_count == 0
 
@@ -953,28 +946,26 @@ def test_poker_fold_reaches_are_retained_only_at_last_consumers() -> None:
     full_backend = _backend(cfg, page_rows=32)
     replay_backend = _backend(cfg, page_rows=32)
     model = _AlwaysFoldModel()
-    full_tree, full_reach, full_policy = sample_trees_sequential(
+    full_sample = sample_trees_sequential(
         GameBundle(model, full_backend, PokerPolicyAdapter(cfg.n_ticks), None),
         rollout,
         torch.Generator().manual_seed(732),
     )
-    replay_tree, replay_reach, replay_policy = sample_trees_sequential(
+    replay_sample = sample_trees_sequential(
         GameBundle(model, replay_backend, PokerPolicyAdapter(cfg.n_ticks), None),
         SimpleNamespace(**dict(vars(rollout))),
         torch.Generator().manual_seed(732),
     )
-    assert torch.equal(replay_reach.node_index, full_reach.node_index)
-    assert torch.equal(replay_reach.log_r, full_reach.log_r)
-    assert full_policy.decision_inputs is not None
-    assert replay_policy.decision_inputs is not None
-    expected = full_policy.decision_inputs
-    actual = replay_policy.decision_inputs
+    for name, value in full_sample.leaf_source.columns.items():
+        assert torch.equal(replay_sample.leaf_source[name], value)
+    expected = full_sample.decision_inputs
+    actual = replay_sample.decision_inputs
     assert isinstance(expected, SealedDecisionInputs)
     assert isinstance(actual, SealedDecisionInputs)
     for partition_id, block in expected.inputs.items():
         for name, value in block.columns.items():
             assert torch.equal(actual.inputs[partition_id].columns[name], value)
-    assert bool((replay_tree.child_event == FOLD).any())
+    assert bool((replay_sample.decision_source["event"] == FOLD).any())
 
 
 def test_completion_inputs_are_device_facade_tensors_and_conserve_pots() -> None:

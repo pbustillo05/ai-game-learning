@@ -57,6 +57,7 @@ from pbg.core.storage import (
     RolloutStorage,
     SamplingMetadata,
     SealedDecisionInputs,
+    SealedRolloutSample,
     SealedTensorBlock,
     SequentialPosteriorPool,
     TensorFieldSchema,
@@ -75,7 +76,7 @@ from pbg.core.storage import (
     target_decision_schema,
     topology_schema,
 )
-from pbg.core.tree import PagedTreeSource
+from pbg.core.tree import PagedRolloutTopology
 from pbg.core.targets import (
     _walker_alias,
     build_branched_rb_targets,
@@ -634,8 +635,8 @@ def _analytical_memory_plan(
     leaf_destination = exact(destination_leaf_schema, leaf_rows)
 
     source_topology = paged(
-        PagedTreeSource.node_schema(players), realized_prior_rows
-    ) + paged(PagedTreeSource.edge_schema(), realized_prior_rows)
+        PagedRolloutTopology.node_schema(players), realized_prior_rows
+    ) + paged(PagedRolloutTopology.edge_schema(), realized_prior_rows)
     sealed_topology = exact(topology_schema(mode), realized_prior_rows)
     if sequential:
         sealed_topology += exact(
@@ -906,8 +907,7 @@ def _profiled_call(
 def _decision_street_metrics(
     profile_metrics: dict[str, float],
     backend: Any,
-    tree: Any,
-    policy: Any,
+    sample: SealedRolloutSample,
 ) -> None:
     """Record decision-node counts by poker street for one sampled rollout.
 
@@ -916,10 +916,10 @@ def _decision_street_metrics(
     to the host once per iteration rather than synchronizing every decision.
     """
 
-    node_ids = policy.node_ids
+    node_ids = sample.decision_source["node_id"]
     if node_ids.numel() == 0:
         return
-    captured = getattr(policy, "decision_inputs", None)
+    captured = sample.decision_inputs
     if not isinstance(captured, SealedDecisionInputs):
         raise RuntimeError("decision metrics require sealed immutable inputs")
     labels = torch.empty(
@@ -940,13 +940,14 @@ def _decision_street_metrics(
 
 
 def _trajectory_length_metrics(
-    profile_metrics: dict[str, float], tree: Any, starts: int
+    profile_metrics: dict[str, float], sample: SealedRolloutSample, starts: int
 ) -> None:
     """Record policy-conditioned realized trajectory-length diagnostics."""
 
-    if starts <= 0 or tree.tree_id.numel() == 0:
+    lengths = sample.trajectory_node_count
+    if starts <= 0 or lengths is None or lengths.numel() == 0:
         return
-    lengths = torch.bincount(tree.tree_id.to(torch.int64), minlength=starts).float()
+    lengths = lengths.float()
     ordered = lengths.sort().values
     count = ordered.numel()
     profile_metrics["trajectory_length_mean"] = float(lengths.mean())
@@ -962,8 +963,7 @@ def _trajectory_length_metrics(
 
 def _record_branched_controller_metrics(
     cfg: RootConfig,
-    tree: Any,
-    rollout_decisions: Any,
+    sample: SealedRolloutSample,
     controller: Any | None,
     profile_metrics: dict[str, float],
     *,
@@ -972,12 +972,14 @@ def _record_branched_controller_metrics(
 ) -> None:
     """Preserve dynamic-KKT observations before rollout owners are released."""
 
-    if rollout_decisions.old_t is None or rollout_decisions.old_c is None:
+    old_t = sample.decision_source.columns.get("old_t")
+    old_c = sample.decision_source.columns.get("old_c")
+    if old_t is None or old_c is None:
         raise RuntimeError("branched rollout did not retain frozen T/C heads")
     profile_metrics.update(
         {
             key: float(value)
-            for key, value in getattr(tree, "branching_diagnostics", {}).items()
+            for key, value in sample.branching_diagnostics.items()
         }
     )
     if cfg.rollout.branching_mode != "dynamic":
@@ -985,19 +987,12 @@ def _record_branched_controller_metrics(
     adaptive = cfg.rollout.adaptive_kkt
     if adaptive is None:
         raise RuntimeError("dynamic branching has no adaptive KKT configuration")
-    decision_ids = rollout_decisions.node_ids.to(torch.int64)
-    offspring = tree.child_ptr[1:] - tree.child_ptr[:-1]
-    executed = offspring[decision_ids].to(torch.float32)
-    nominal = (
-        executed
-        if tree.nominal_child_count is None
-        else tree.nominal_child_count[decision_ids].to(torch.float32)
-    )
-    beta_values = (
-        nominal
-        if tree.branching_beta is None
-        else tree.branching_beta[decision_ids]
-    )
+    decision_ids = sample.decision_node
+    if decision_ids is None:
+        raise RuntimeError("branched direct seal omitted compact decision nodes")
+    executed = sample.decision_aux["executed_child_count"].to(torch.float32)
+    nominal = sample.decision_aux["nominal_child_count"].to(torch.float32)
+    beta_values = nominal if sample.branching_beta is None else sample.branching_beta
     profile_metrics.update(
         {
             "beta_mean": float(beta_values.mean()),
@@ -1008,16 +1003,17 @@ def _record_branched_controller_metrics(
             "beta_max_clip_rate": float(
                 (beta_values >= float(adaptive.beta_max)).float().mean()
             ),
-            "tree_size_vs_M": float(tree.owner.numel())
+            "tree_size_vs_M": float(sample.node_count)
             / float(adaptive.target_tree_size),
         }
     )
     if iteration < int(adaptive.warmup_iters):
         return
-    pre_refill_nodes = tree.pre_refill_node_count
+    topology = sample.topology
+    pre_refill_nodes = topology.pre_refill_node_count
     if pre_refill_nodes is None:
-        counterfactual = float(tree.owner.numel()) + float(
-            ((nominal - executed) * rollout_decisions.old_c).sum()
+        counterfactual = float(sample.node_count) + float(
+            ((nominal - executed) * old_c).sum()
         )
     else:
         original = decision_ids < int(pre_refill_nodes)
@@ -1025,7 +1021,7 @@ def _record_branched_controller_metrics(
         original_ids = decision_ids[original]
         root = original_ids == 0
         if bool(root.any()):
-            protected = tree.root_pre_refill_child_count
+            protected = topology.root_target_degree
             if protected is None:
                 raise RuntimeError(
                     "pre-refill node metadata omitted the protected root degree"
@@ -1034,7 +1030,7 @@ def _record_branched_controller_metrics(
         counterfactual = float(pre_refill_nodes) + float(
             (
                 (nominal[original] - original_executed)
-                * rollout_decisions.old_c[original]
+                * old_c[original]
             ).sum()
         )
     if dist.is_available() and dist.is_initialized():
@@ -1151,29 +1147,24 @@ def _build_iteration_data(
                 profile,
                 sample_normal_rollout,
             )
-            sampled_tree, _, sampled_policy, _ = sampled
-            sampled_decisions = int(sampled_policy.node_ids.numel())
-            sampled_nodes = int(sampled_tree.owner.numel())
-            sampled_leaves = sampled_offspring_mean = sampled_offspring_max = None
+            if not isinstance(sampled, SealedRolloutSample):
+                raise RuntimeError("normal rollout returned a probe sample")
+            sampled_decisions = sampled.decision_source.rows
+            sampled_nodes = sampled.node_count
+            sampled_leaves = sampled.leaf_source.rows
+            sampled_offspring_mean = sampled_offspring_max = None
             if profile:
-                sampled_leaves = int(
-                    (sampled_tree.child_ptr[1:] == sampled_tree.child_ptr[:-1]).sum()
+                sampled_offspring_mean = float(
+                    (sampled_nodes - sampled_leaves) / max(sampled_nodes, 1)
                 )
-                sampled_offspring = (
-                    sampled_tree.child_ptr[1:] - sampled_tree.child_ptr[:-1]
-                )
-                sampled_offspring_mean = float(sampled_offspring.float().mean())
-                sampled_offspring_max = float(sampled_offspring.max())
+                sampled_offspring_max = 1.0
                 _decision_street_metrics(
                     profile_metrics,
                     bundle.rollout_backend,
-                    sampled_tree,
-                    sampled_policy,
+                    sampled,
                 )
                 _trajectory_length_metrics(
-                    profile_metrics,
-                    sampled_tree,
-                    int(cfg.rollout.roots_per_gpu),
+                    profile_metrics, sampled, int(cfg.rollout.roots_per_gpu)
                 )
             rollout, partitions, _, _ = _profiled_call(
                 profile_metrics,
@@ -1191,9 +1182,7 @@ def _build_iteration_data(
             if profile:
                 record_sealed_rollout(rollout)
             rollout_leaf_count = int(rollout.leaves.rows)
-            del sampled, sampled_tree, sampled_policy
-            if profile:
-                del sampled_offspring
+            del sampled
             storage = _profiled_call(
                 profile_metrics,
                 "backward",
@@ -1244,24 +1233,23 @@ def _build_iteration_data(
         )
         if cfg.training.mode == "rao_blackwell":
             if isinstance(rb_sample, ProbeRollout):
-                tree = rb_sample.tree
-                rollout_decisions = rb_sample.policy
+                sample = rb_sample.sample
             else:
-                tree, _, rollout_decisions = rb_sample
-            sampled_nodes = int(tree.owner.numel())
+                sample = rb_sample
+            sampled_nodes = sample.node_count
             sampled_offspring_mean = sampled_offspring_max = None
             if profile:
-                sampled_offspring = tree.child_ptr[1:] - tree.child_ptr[:-1]
-                sampled_offspring_mean = float(sampled_offspring.float().mean())
-                sampled_offspring_max = float(sampled_offspring.max())
+                sampled_offspring_mean = float(
+                    (sampled_nodes - sample.leaf_source.rows) / max(sampled_nodes, 1)
+                )
+                sampled_offspring_max = 1.0
                 _decision_street_metrics(
                     profile_metrics,
                     bundle.rollout_backend,
-                    tree,
-                    rollout_decisions,
+                    sample,
                 )
                 _trajectory_length_metrics(
-                    profile_metrics, tree, int(cfg.rollout.roots_per_gpu)
+                    profile_metrics, sample, int(cfg.rollout.roots_per_gpu)
                 )
             rollout, partitions, completion, quality_parts = _profiled_call(
                 profile_metrics,
@@ -1279,9 +1267,7 @@ def _build_iteration_data(
             if profile:
                 record_sealed_rollout(rollout)
             rollout_leaf_count = int(rollout.leaves.rows)
-            del rb_sample, tree, rollout_decisions
-            if profile:
-                del sampled_offspring
+            del rb_sample, sample
             if completion is None:
                 raise RuntimeError("sequential RB seal omitted completion")
             workspace_bytes = _value_workspace_budget(cfg, device)
@@ -1334,12 +1320,10 @@ def _build_iteration_data(
         if cfg.training.mode == "branched_rao_blackwell":
             if isinstance(rb_sample, ProbeRollout):
                 raise RuntimeError("branched rollout cannot be an opponent probe")
-            tree, _, rollout_decisions = rb_sample
-            sampled_nodes = int(tree.owner.numel())
+            sampled_nodes = rb_sample.node_count
             _record_branched_controller_metrics(
                 cfg,
-                tree,
-                rollout_decisions,
+                rb_sample,
                 branching_controller,
                 profile_metrics,
                 iteration=iteration,
@@ -1349,8 +1333,7 @@ def _build_iteration_data(
                 _decision_street_metrics(
                     profile_metrics,
                     bundle.rollout_backend,
-                    tree,
-                    rollout_decisions,
+                    rb_sample,
                 )
             rollout, partitions, completion, quality_parts = _profiled_call(
                 profile_metrics,
@@ -1368,7 +1351,7 @@ def _build_iteration_data(
             if profile:
                 record_sealed_rollout(rollout)
             rollout_leaf_count = int(rollout.leaves.rows)
-            del rb_sample, tree, rollout_decisions
+            del rb_sample
             workspace_bytes = _value_workspace_budget(cfg, device)
             completion_rows = _completion_batch_rows(
                 bundle, rollout.leaves.rows, workspace_bytes
@@ -1476,24 +1459,21 @@ def _seal_sequential_rollout_storage(
     """
 
     probe = sampled if isinstance(sampled, ProbeRollout) else None
-    if probe is None:
-        tree, reach_cache, rollout_decisions, *tail = sampled
-        root_profiles = tail[0] if tail else None
-    else:
-        tree = probe.tree
-        reach_cache = probe.leaf_reach
-        rollout_decisions = probe.policy
-        root_profiles = probe.root_profiles
+    sample = probe.sample if probe is not None else sampled
+    if not isinstance(sample, SealedRolloutSample):
+        raise TypeError("sequential seal requires a directly sealed rollout sample")
+    root_profiles = sample.root_profiles
     backend = bundle.rollout_backend
     device = backend.device
     partitions = _natural_partition_set(cfg, bundle)
-    nodes = rollout_decisions.node_ids.to(torch.int64)
-    captured = rollout_decisions.decision_inputs
+    source = sample.decision_source
+    nodes = source["node_id"].to(torch.int64)
+    captured = sample.decision_inputs
     if not isinstance(captured, SealedDecisionInputs):
         raise RuntimeError("sequential sealing requires immutable decision inputs")
     if not torch.equal(captured.node_ids.to(torch.int64), nodes):
         raise RuntimeError("captured decision inputs and policy rows are misaligned")
-    owner = tree.owner[nodes].to(torch.int32)
+    owner = source["owner"].to(torch.int32)
     partition_id = captured.partition_id.to(torch.int64)
     legal_ids = torch.arange(
         backend.e_max, dtype=torch.int32, device=device
@@ -1509,23 +1489,22 @@ def _seal_sequential_rollout_storage(
             captured.partition_row[positions].to(torch.int64)
         ]
 
-    edge = tree.child_ptr[nodes].to(torch.int64)
-    event = tree.child_event[edge].to(torch.int32)
+    event = source["event"].to(torch.int32)
     global_decisions: dict[str, Tensor]
     if cfg.training.mode == "normal":
         if root_profiles is None:
             raise RuntimeError("normal rollout omitted sampled private profiles")
-        trajectory = tree.tree_id[nodes].to(torch.int64)
+        trajectory = source["root_id"].to(torch.int64)
         realized_type = root_profiles[trajectory, owner.to(torch.int64)].to(torch.int32)
         batch = torch.arange(nodes.numel(), device=device)
         global_decisions = {
             "owner": owner,
             "event": event,
             "realized_type": realized_type,
-            "old_log_prob": rollout_decisions.old_logp_action[
+            "old_log_prob": source["old_logp"][
                 batch, realized_type.to(torch.int64)
             ].detach().to(torch.float32),
-            "old_value": rollout_decisions.old_v[
+            "old_value": source["old_v"][
                 batch, realized_type.to(torch.int64)
             ].detach().to(torch.float32),
             "legal_event_ids": legal_ids.to(torch.int32),
@@ -1535,8 +1514,8 @@ def _seal_sequential_rollout_storage(
         global_decisions = {
             "owner": owner,
             "event": event,
-            "old_log_prob": rollout_decisions.old_logp_action.detach().to(torch.float32),
-            "old_value": rollout_decisions.old_v.detach().to(torch.float32),
+            "old_log_prob": source["old_logp"].detach().to(torch.float32),
+            "old_value": source["old_v"].detach().to(torch.float32),
             "legal_event_ids": legal_ids.to(torch.int32),
             "legal_event_mask": legal_mask.to(torch.bool),
         }
@@ -1587,12 +1566,8 @@ def _seal_sequential_rollout_storage(
             input_pools=input_pools,
         )
 
-    leaf_ids = (tree.child_ptr[1:] == tree.child_ptr[:-1]).nonzero(
-        as_tuple=False
-    ).squeeze(1)
-    leaf_order = torch.argsort(tree.tree_id[leaf_ids].to(torch.int64), stable=True)
-    leaf_ids = leaf_ids[leaf_order]
-    leaf_roots = tree.tree_id[leaf_ids].to(torch.int32)
+    leaf_source = sample.leaf_source
+    leaf_roots = leaf_source["root_id"].to(torch.int32)
     root_count = int(cfg.rollout.roots_per_gpu)
     if not torch.equal(
         leaf_roots.to(torch.int64), torch.arange(root_count, device=device)
@@ -1602,7 +1577,7 @@ def _seal_sequential_rollout_storage(
     quality_parts: list[tuple[int, dict[str, float]]] = []
     if cfg.training.mode == "normal":
         assert root_profiles is not None
-        reward = reach_cache.payload_for(leaf_ids.to(torch.int32))["reward"]
+        reward = leaf_source["reward"]
         reward = reward.float() * utility_scale(cfg)
         leaves = _sealed_dynamic_block(
             "normal_leaf",
@@ -1615,14 +1590,21 @@ def _seal_sequential_rollout_storage(
     else:
         if bundle.completion_backend is None or cfg.completion.n_samples is None:
             raise RuntimeError("sequential RB requires a completion service")
-        leaf_reach = reach_cache.rows_for(
-            tree, leaf_ids.to(torch.int32), backend, rollout_decisions
-        ).detach().to(torch.float32)
-        captured_leaf = reach_cache.payload_for(leaf_ids.to(torch.int32))
+        leaf_reach = leaf_source["log_reach"].detach().to(torch.float32)
+        captured_leaf = leaf_source.columns
         completion_inputs = {
             name: value
             for name, value in captured_leaf.items()
-            if name not in {"owner", "fold_payoff", "reward"}
+            if name
+            not in {
+                "node_id",
+                "root_id",
+                "path_key",
+                "log_reach",
+                "owner",
+                "fold_payoff",
+                "reward",
+            }
         }
         completion_inputs["range_weights"] = backend.range_weights_from_log_reach(
             leaf_reach
@@ -1630,10 +1612,10 @@ def _seal_sequential_rollout_storage(
         leaf_owner = captured_leaf["owner"]
         fold_payoff = captured_leaf["fold_payoff"]
         completion_key = sequential_leaf_logical_rng_keys(
-            tree,
+            leaf_source["root_id"],
+            leaf_source["path_key"],
             cfg,
             gen,
-            leaf_ids,
             iteration=iteration,
             purpose=DrawPurpose.COMPLETION,
         )
@@ -1690,21 +1672,15 @@ def _seal_sequential_rollout_storage(
         )
         mode = "sequential_rb"
 
-    topology = SequentialDecisionCSR.build(
-        root_id=tree.tree_id[nodes].to(torch.int32),
-        decision_ordinal=(tree.depth_player[nodes] - 1).to(torch.int32),
-        decision_partition=partition_id.to(torch.int32),
-        decision_row=global_to_partition_row,
-        leaf_root_id=leaf_roots,
-        leaf_row=torch.arange(root_count, dtype=torch.int32, device=device),
-        root_count=root_count,
-    )
+    topology = sample.topology
+    if not isinstance(topology, SequentialDecisionCSR):
+        raise TypeError("sequential direct seal omitted decision-only CSR")
     rollout = RolloutStorage(
         mode,
         blocks,
         topology,
         leaves,
-        {**reach_cache.seal_metrics, **rollout_decisions.seal_metrics},
+        sample.seal_metrics,
     )
     return rollout, partitions, completion, quality_parts
 
@@ -1719,79 +1695,22 @@ def _seal_branched_rollout_storage(
 ) -> tuple[RolloutStorage, Any, CompletionSpec, list[tuple[int, dict[str, float]]]]:
     """Seal one rooted branched sample into ragged immutable storage."""
 
-    tree, reach_cache, rollout_decisions = sampled
+    if not isinstance(sampled, SealedRolloutSample):
+        raise TypeError("branched seal requires a directly sealed rollout sample")
     backend = bundle.rollout_backend
     device = backend.device
     partitions = _natural_partition_set(cfg, bundle)
-    nodes = rollout_decisions.node_ids.to(torch.int64)
-    captured = rollout_decisions.decision_inputs
+    source = sampled.decision_source
+    nodes = source["node_id"].to(torch.int64)
+    captured = sampled.decision_inputs
     if not isinstance(captured, SealedDecisionInputs):
         raise RuntimeError("branched production requires captured immutable inputs")
     if not torch.equal(captured.node_ids.to(torch.int64), nodes):
         raise RuntimeError("branched captured inputs and policy rows are misaligned")
 
-    node_count = int(tree.parent.numel())
-    old_order = torch.cat(
-        (
-            torch.zeros(1, dtype=torch.int64, device=device),
-            torch.argsort(tree.parent[1:].to(torch.int64), stable=True) + 1,
-        )
-    )
-    old_to_new = torch.empty(node_count, dtype=torch.int64, device=device)
-    old_to_new[old_order] = torch.arange(node_count, device=device)
-    parent = tree.parent[old_order].to(torch.int64)
-    parent = torch.where(parent < 0, parent, old_to_new[parent]).to(torch.int32)
-    degree_old = (tree.child_ptr[1:] - tree.child_ptr[:-1]).to(torch.int32)
-    degree = degree_old[old_order]
-    child_begin = torch.full(
-        (node_count,), -1, dtype=torch.int32, device=device
-    )
-    if node_count > 1:
-        child_ids = torch.arange(1, node_count, dtype=torch.int32, device=device)
-        child_parents = parent[1:].to(torch.int64)
-        first = torch.full(
-            (node_count,), node_count, dtype=torch.int32, device=device
-        )
-        first.scatter_reduce_(
-            0, child_parents, child_ids, reduce="amin", include_self=True
-        )
-        child_begin[degree > 0] = first[degree > 0]
-
-    decision_partition = torch.full(
-        (node_count,), -1, dtype=torch.int32, device=device
-    )
-    decision_row = torch.full_like(decision_partition, -1)
-    decision_new_nodes = old_to_new[nodes]
-    decision_partition[decision_new_nodes] = captured.partition_id
-    decision_row[decision_new_nodes] = captured.partition_row
-
-    leaf_old = (degree_old == 0).nonzero(as_tuple=False).squeeze(1)
-    leaf_new = old_to_new[leaf_old]
-    leaf_order = torch.argsort(leaf_new, stable=True)
-    leaf_old = leaf_old[leaf_order]
-    leaf_new = leaf_new[leaf_order]
-    leaf_row = torch.full((node_count,), -1, dtype=torch.int32, device=device)
-    leaf_row[leaf_new] = torch.arange(
-        leaf_old.numel(), dtype=torch.int32, device=device
-    )
-    protected_root_degree = getattr(tree, "root_pre_refill_child_count", None)
-    topology = BranchedTreeSpan(
-        parent=parent,
-        child_begin=child_begin,
-        degree=degree,
-        decision_partition=decision_partition,
-        decision_row=decision_row,
-        leaf_row=leaf_row,
-        root_target_degree=(
-            None if protected_root_degree is None else int(protected_root_degree)
-        ),
-        pre_refill_node_count=getattr(tree, "pre_refill_node_count", None),
-        nominal_degree=(
-            degree.clone()
-            if getattr(tree, "nominal_child_count", None) is None
-            else tree.nominal_child_count[old_order].detach().to(torch.int32)
-        ),
-    )
+    topology = sampled.topology
+    if not isinstance(topology, BranchedTreeSpan):
+        raise TypeError("branched direct seal omitted compact span topology")
 
     legal_ids = torch.arange(
         backend.e_max, dtype=torch.int32, device=device
@@ -1807,35 +1726,29 @@ def _seal_branched_rollout_storage(
             captured.partition_row[positions].to(torch.int64)
         ]
 
-    full_degree = degree_old[nodes].to(torch.int64)
-    target_degree = full_degree.clone()
-    if protected_root_degree is not None:
-        root_position = (nodes == 0).nonzero(as_tuple=False).squeeze(1)
-        if root_position.numel() != 1:
-            raise RuntimeError("protected branched root is not a retained decision")
-        target_degree[root_position] = int(protected_root_degree)
-    nominal = getattr(tree, "nominal_child_count", None)
-    if nominal is None:
-        nominal_decision = full_degree.to(torch.int32)
-    else:
-        nominal_decision = nominal[nodes].detach().to(torch.int32)
+    target_degree = sampled.decision_aux["executed_child_count"].to(torch.int64)
+    nominal_decision = sampled.decision_aux["nominal_child_count"].to(torch.int32)
     global_decisions: dict[str, Tensor] = {
-        "owner": tree.owner[nodes].detach().to(torch.int32),
-        "old_value": rollout_decisions.old_v.detach().to(torch.float32),
+        "owner": sampled.decision_aux["owner"].detach().to(torch.int32),
+        "old_value": source["old_v"].detach().to(torch.float32),
         "legal_event_ids": legal_ids,
         "legal_event_mask": legal_mask,
-        "log_weight": torch.log(tree.path_weight[nodes].detach().to(torch.float64)),
+        "log_weight": sampled.decision_aux["log_weight"].detach().to(torch.float64),
         "nominal_child_count": nominal_decision,
         "executed_child_count": target_degree.to(torch.int32),
     }
-    if rollout_decisions.old_t is not None or rollout_decisions.old_c is not None:
-        if rollout_decisions.old_t is None or rollout_decisions.old_c is None:
+    old_t = source.columns.get("old_t")
+    old_c = source.columns.get("old_c")
+    if old_t is not None or old_c is not None:
+        if old_t is None or old_c is None:
             raise RuntimeError("branched frozen T/C heads are incomplete")
-        global_decisions["frozen_trace_variance"] = rollout_decisions.old_t.detach()
-        global_decisions["frozen_cost"] = rollout_decisions.old_c.detach()
+        global_decisions["frozen_trace_variance"] = old_t.detach()
+        global_decisions["frozen_cost"] = old_c.detach()
 
+    if sampled.action_ptr is None or sampled.action_source is None:
+        raise RuntimeError("branched direct seal omitted ragged action storage")
     if not torch.equal(
-        rollout_decisions.action_ptr[1:] - rollout_decisions.action_ptr[:-1],
+        sampled.action_ptr[1:] - sampled.action_ptr[:-1],
         target_degree.to(torch.int32),
     ):
         raise RuntimeError("ragged rollout actions disagree with target topology")
@@ -1876,8 +1789,8 @@ def _seal_branched_rollout_storage(
             ),
         )
         partition_actions = captured.partition_id[action_decision] == partition.partition_id
-        action_events = rollout_decisions.action_event[partition_actions]
-        action_old_logp = rollout_decisions.old_logp_action[partition_actions]
+        action_events = sampled.action_source["event"][partition_actions]
+        action_old_logp = sampled.action_source["old_logp"][partition_actions]
         if partition.partition_id == 0:
             action_old_logp = _compress_preflop_rows(action_old_logp, backend)
         actions = _sealed_dynamic_block(
@@ -1903,31 +1816,32 @@ def _seal_branched_rollout_storage(
             captured.input_pools.get(partition.partition_id, {}),
         )
 
-    leaf_reach = reach_cache.rows_for(
-        tree, leaf_old.to(torch.int32), backend, rollout_decisions
-    ).detach().to(torch.float32)
-    captured_leaf = reach_cache.payload_for(leaf_old.to(torch.int32))
+    leaf_source = sampled.leaf_source
+    leaf_reach = leaf_source["log_reach"].detach().to(torch.float32)
+    captured_leaf = leaf_source.columns
     completion_inputs = {
         name: value
         for name, value in captured_leaf.items()
-        if name not in {"owner", "fold_payoff"}
+        if name
+        not in {
+            "node_id",
+            "root_id",
+            "path_key",
+            "log_reach",
+            "owner",
+            "fold_payoff",
+        }
     }
     completion_inputs["range_weights"] = backend.range_weights_from_log_reach(
         leaf_reach
     )
     leaf_owner = captured_leaf["owner"]
     fold_payoff = captured_leaf["fold_payoff"]
-    logical_path = getattr(tree, "logical_path", None)
-    if not isinstance(logical_path, Tensor):
-        raise RuntimeError("branched rollout omitted logical path addresses")
-    tree_address = int(getattr(tree, "logical_tree_address", 0))
     completion_key = logical_rng_keys(
         seed=_logical_seed(cfg, gen),
         iteration=iteration,
-        trajectory=torch.full(
-            (leaf_old.numel(),), tree_address, dtype=torch.int64, device=device
-        ),
-        path=logical_path[leaf_old],
+        trajectory=leaf_source["root_id"].to(torch.int64),
+        path=leaf_source["path_key"].to(torch.int64),
         draw=0,
         purpose=DrawPurpose.COMPLETION,
     )
@@ -1990,7 +1904,7 @@ def _seal_branched_rollout_storage(
         blocks,
         topology,
         leaves,
-        {**reach_cache.seal_metrics, **rollout_decisions.seal_metrics},
+        sampled.seal_metrics,
     )
     return rollout, partitions, completion, quality_parts
 

@@ -1,57 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 import torch
 
-from pbg.core.game import CHANCE, PRETERM, TERMINAL
+from pbg.core.game import TERMINAL
 from pbg.core.execution import ByteAccountant
-from pbg.core.tree import PagedTreeSource
-from tests.tree_fixture import DiagnosticTreeBuilder
-
-
-def _hand_tree():
-    builder = DiagnosticTreeBuilder(2)
-    root = builder.add_root(10, 0, 0)
-    left = builder.add_child(root, 11, 4, 0.25, CHANCE)
-    right = builder.add_child(root, 12, 5, 0.75, TERMINAL)
-    builder.add_child(left, 13, 8, 1.0, PRETERM)
-    return builder.finalize(), (root, left, right)
-
-
-def test_builder_finalize_computes_csr_depth_and_path_weight() -> None:
-    tree, (root, left, right) = _hand_tree()
-    tree.validate()
-    assert tree.parent.tolist() == [-1, root, root, left]
-    assert tree.child_ptr.tolist() == [0, 2, 3, 3, 3]
-    assert tree.child_node.tolist() == [left, right, 3]
-    assert tree.child_event.tolist() == [4, 5, 8]
-    assert torch.equal(
-        tree.depth_p,
-        torch.tensor([[1, 0], [1, 0], [1, 0], [1, 0]], dtype=torch.int32),
-    )
-    assert tree.depth_player.tolist() == [1, 1, 1, 1]
-    assert torch.equal(tree.path_weight, torch.tensor([1.0, 0.25, 0.75, 0.25]))
-
-
-def test_depth_counts_owned_nodes_including_the_current_state() -> None:
-    builder = DiagnosticTreeBuilder(2)
-    root = builder.add_root(0, 0)
-    chance = builder.add_child(root, 1, 10, 1.0, CHANCE)
-    player_one = builder.add_child(chance, 2, 11, 1.0, 1)
-    player_zero = builder.add_child(player_one, 3, 12, 1.0, 0)
-    builder.add_child(player_zero, 4, 13, 1.0, TERMINAL)
-
-    tree = builder.finalize()
-
-    assert torch.equal(
-        tree.depth_p,
-        torch.tensor(
-            [[1, 0], [1, 0], [1, 1], [2, 1], [2, 1]], dtype=torch.int32
-        ),
-    )
-    assert tree.depth_player.tolist() == [1, 1, 2, 3, 3]
+from pbg.core.tree import PagedRolloutTopology
 
 
 @pytest.mark.parametrize(
@@ -67,7 +21,7 @@ def test_depth_counts_owned_nodes_including_the_current_state() -> None:
     ],
 )
 def test_device_tree_depth_uses_the_same_inclusive_convention(device: str) -> None:
-    buffer = PagedTreeSource(1, 2, device, page_rows=2)
+    buffer = PagedRolloutTopology(1, 2, device, page_rows=2)
     root = buffer.add_roots(
         torch.tensor([0], dtype=torch.int32, device=device),
         torch.tensor([0], dtype=torch.int32, device=device),
@@ -87,19 +41,17 @@ def test_device_tree_depth_uses_the_same_inclusive_convention(device: str) -> No
         torch.tensor([1.0], device=device),
     )
 
-    tree = buffer.finalize()
-    tree.validate()
     assert torch.equal(
-        tree.depth_p,
+        buffer.depth_p[torch.arange(buffer.node_count, device=device)],
         torch.tensor(
             [[1, 0], [1, 1], [1, 1]], dtype=torch.int32, device=device
         ),
     )
-    assert tree.depth_player.tolist() == [1, 2, 2]
+    assert buffer.depth_player[torch.arange(buffer.node_count, device=device)].tolist() == [1, 2, 2]
 
 
-def test_device_tree_finalizes_cross_depth_expansion_without_sorting() -> None:
-    buffer = PagedTreeSource(2, 3, "cpu", page_rows=2)
+def test_paged_edges_keep_stable_parent_local_ordinals_without_legacy_finalize() -> None:
+    buffer = PagedRolloutTopology(2, 3, "cpu", page_rows=2)
     roots = buffer.add_roots(
         torch.tensor([0, 1], dtype=torch.int32),
         torch.tensor([0, 0], dtype=torch.int32),
@@ -119,23 +71,21 @@ def test_device_tree_finalizes_cross_depth_expansion_without_sorting() -> None:
         torch.tensor([0.25, 0.75]),
     )
 
-    tree = buffer.finalize()
-
-    tree.validate()
-    assert tree.child_ptr.tolist() == [0, 2, 3, 3, 3, 3]
-    assert tree.child_node.tolist() == [
-        *earlier_root_children.tolist(),
-        *later_root_child.tolist(),
+    edge_rows = torch.arange(buffer.edge_count)
+    assert buffer.edge_parent[edge_rows].tolist() == [1, 0, 0]
+    assert buffer.edge_ordinal[edge_rows].tolist() == [0, 0, 1]
+    assert buffer.child_node[edge_rows].tolist() == [
+        *later_root_child.tolist(), *earlier_root_children.tolist()
     ]
-    assert tree.child_event.tolist() == [100, 101, 200]
-    assert torch.equal(tree.nu, torch.tensor([0.25, 0.75, 1.0]))
+    assert buffer.child_event[edge_rows].tolist() == [200, 100, 101]
+    assert torch.equal(buffer.edge_weight[edge_rows], torch.tensor([1.0, 0.25, 0.75]))
 
 
 def test_child_wave_page_admission_rolls_back_every_owner_before_mutation() -> None:
-    node_page = PagedTreeSource.node_schema(2).capacity_bytes(1, chunks=1)
-    edge_page = PagedTreeSource.edge_schema().capacity_bytes(1, chunks=1)
+    node_page = PagedRolloutTopology.node_schema(2).capacity_bytes(1, chunks=1)
+    edge_page = PagedRolloutTopology.edge_schema().capacity_bytes(1, chunks=1)
     accountant = ByteAccountant(node_page + max(node_page, edge_page))
-    buffer = PagedTreeSource(
+    buffer = PagedRolloutTopology(
         1, 2, "cpu", page_rows=1, accountant=accountant
     )
     root = buffer.add_roots(
@@ -162,24 +112,3 @@ def test_child_wave_page_admission_rolls_back_every_owner_before_mutation() -> N
         int(buffer.child_count[root.to(torch.int64)][0]),
         accountant.reserved_bytes,
     ) == before
-
-
-def test_validate_rejects_bad_nu_and_path_weight() -> None:
-    tree, _ = _hand_tree()
-    bad_nu = tree.nu.clone()
-    bad_nu[0] = 0.5
-    try:
-        replace(tree, nu=bad_nu).validate()
-    except ValueError as exc:
-        assert "nu rows" in str(exc)
-    else:
-        raise AssertionError("invalid nu row was accepted")
-
-    bad_path = tree.path_weight.clone()
-    bad_path[1] = 0.5
-    try:
-        replace(tree, path_weight=bad_path).validate()
-    except ValueError as exc:
-        assert "path_weight" in str(exc)
-    else:
-        raise AssertionError("invalid path weight was accepted")

@@ -295,23 +295,23 @@ def test_fixed_and_dynamic_warmup_ignore_heads_then_dynamic_uses_them() -> None:
         log_kappa=math.log(1000.0),
     )
 
-    fixed_tree, _, _ = sample_branched_tree(
+    fixed_sample = sample_branched_tree(
         bundle, fixed_cfg, torch.Generator().manual_seed(5), iteration=20,
         controller=controller,
     )
-    warmup_tree, _, _ = sample_branched_tree(
+    warmup_sample = sample_branched_tree(
         bundle, dynamic_cfg, torch.Generator().manual_seed(5), iteration=2,
     )
-    fixed_degree = fixed_tree.child_ptr[1:] - fixed_tree.child_ptr[:-1]
-    warmup_degree = warmup_tree.child_ptr[1:] - warmup_tree.child_ptr[:-1]
+    fixed_degree = fixed_sample.topology.degree
+    warmup_degree = warmup_sample.topology.degree
     assert torch.equal(warmup_degree, fixed_degree)
     assert backend.actual_cost_batch_sizes[-2:] == [1, 1]
 
-    active_tree, _, _ = sample_branched_tree(
+    active_sample = sample_branched_tree(
         bundle, dynamic_cfg, torch.Generator().manual_seed(5), iteration=3,
         controller=controller,
     )
-    active_degree = active_tree.child_ptr[1:] - active_tree.child_ptr[:-1]
+    active_degree = active_sample.topology.degree
     assert active_degree[:4].tolist() == [3, 3, 3, 3]
 
     with pytest.raises(ValueError, match="requires controller state"):
@@ -341,22 +341,23 @@ def test_queue_safeguard_is_batch_local_recovers_and_retains_counterfactual_coun
         kappa_max=1.0e6,
         log_kappa=math.log(1000.0),
     )
-    tree, _, policy = sample_branched_tree(
+    sample = sample_branched_tree(
         GameBundle(_AdaptiveModel(), backend, _Adapter(), None),
         cfg,
         torch.Generator().manual_seed(4),
         controller=controller,
     )
-    degree = tree.child_ptr[1:] - tree.child_ptr[:-1]
+    degree = sample.topology.degree
     assert degree[:2].tolist() == [1, 3]
-    assert tree.nominal_child_count[:2].tolist() == [3, 3]
-    assert tree.branching_diagnostics["safeguard_batches"] == 1
-    assert policy.old_c.tolist() == pytest.approx([10.0, 0.1])
-    counterfactual = float(tree.owner.numel()) + float(
-        ((tree.nominal_child_count[policy.node_ids.long()].float()
-          - degree[policy.node_ids.long()].float()) * policy.old_c).sum()
+    assert sample.topology.nominal_degree[:2].tolist() == [3, 3]
+    assert sample.branching_diagnostics["safeguard_batches"] == 1
+    old_c = sample.decision_source["old_c"]
+    assert old_c.tolist() == pytest.approx([10.0, 0.1])
+    counterfactual = float(sample.node_count) + float(
+        ((sample.decision_aux["nominal_child_count"].float()
+          - sample.decision_aux["executed_child_count"].float()) * old_c).sum()
     )
-    assert counterfactual == pytest.approx(float(tree.owner.numel()) + 20.0)
+    assert counterfactual == pytest.approx(float(sample.node_count) + 20.0)
 
 
 @dataclass

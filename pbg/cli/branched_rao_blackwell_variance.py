@@ -103,11 +103,11 @@ def _run_geometry_jobs(
         if path.exists() and resume:
             record = json.loads(path.read_text(encoding="utf-8"))
         else:
-            tree, reach, policy, record = runner.sample_tree(beta, repeat)
+            sample, record = runner.sample_tree(beta, repeat)
             record["schema_version"] = SCHEMA_VERSION
             record["success"] = True
             atomic_json(path, record)
-            del tree, reach, policy
+            del sample
         records.append(record)
         print(
             f"[geometry beta={beta:.3f}] {repeat + 1}/{count} "

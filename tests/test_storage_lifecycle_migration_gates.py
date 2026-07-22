@@ -30,6 +30,10 @@ def test_training_orchestrator_uses_rollout_storage_and_authoritative_targets_di
     for retired in (
         "_RolloutSealInput",
         "_seal_iteration_training_storage",
+        "SampledTree",
+        "RolloutDecisionRows",
+        "StoppedLeafRows",
+        "PagedTreeSource",
         "streamed_branched_value",
         "build_normal_dataset_from_sampled",
     ):

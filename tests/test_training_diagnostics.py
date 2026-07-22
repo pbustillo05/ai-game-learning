@@ -30,10 +30,12 @@ def test_decision_street_metrics_counts_and_normalizes() -> None:
         partition_row=torch.arange(6, dtype=torch.int32),
         inputs={0: block},
     )
-    policy = SimpleNamespace(node_ids=inputs.node_ids, decision_inputs=inputs)
+    sample = SimpleNamespace(
+        decision_source={"node_id": inputs.node_ids}, decision_inputs=inputs
+    )
     metrics: dict[str, float] = {}
 
-    _decision_street_metrics(metrics, SimpleNamespace(), SimpleNamespace(), policy)
+    _decision_street_metrics(metrics, SimpleNamespace(), sample)
 
     assert metrics["decision_nodes_preflop"] == 1.0
     assert metrics["decision_nodes_flop"] == 2.0

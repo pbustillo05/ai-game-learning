@@ -111,8 +111,9 @@ protected ordinary-root cohort under root refill.
 
 ### 6. `pbg/core/tree.py` and `pbg/core/topology.py`: source and seal
 
-[`tree.py`](../../pbg/core/tree.py) contains `PagedTreeSource`, the paged
-rollout-time topology source, plus the small sealed handoff records.
+[`tree.py`](../../pbg/core/tree.py) contains `PagedRolloutTopology`, the paged
+rollout-time topology source; rollout sealing consumes it directly and releases
+its pages without constructing an all-node handoff tree.
 [`topology.py`](../../pbg/core/topology.py) contains the exact immutable
 `SequentialDecisionCSR` and `BranchedTreeSpan` validators. Validation is
 vectorized on CUDA and checks row domains, roots, contiguous child spans,

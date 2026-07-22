@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from pbg.core.game import CHANCE, PRETERM
-from tests.tree_fixture import DiagnosticTreeBuilder
+from pbg.core.topology import BranchedTreeSpan
 from pbg.eval.branched_rao_blackwell_variance import (
     _propagate_functional_coefficients,
     _tree_layout,
@@ -40,12 +39,15 @@ def test_projected_leave_one_out_partials_match_autograd() -> None:
 
 
 def test_child_summary_partials_propagate_through_chance_average() -> None:
-    builder = DiagnosticTreeBuilder(2)
-    root = builder.add_root(0, 0)
-    chance = builder.add_child(root, 1, 4, 1.0, CHANCE)
-    left = builder.add_child(chance, 2, 5, 0.5, PRETERM)
-    right = builder.add_child(chance, 3, 6, 0.5, PRETERM)
-    tree = builder.finalize()
+    root, chance, left, right = range(4)
+    tree = BranchedTreeSpan(
+        parent=torch.tensor([-1, root, chance, chance], dtype=torch.int32),
+        child_begin=torch.tensor([chance, left, -1, -1], dtype=torch.int32),
+        degree=torch.tensor([1, 2, 0, 0], dtype=torch.int32),
+        decision_partition=torch.tensor([0, -1, -1, -1], dtype=torch.int32),
+        decision_row=torch.tensor([0, -1, -1, -1], dtype=torch.int32),
+        leaf_row=torch.tensor([-1, -1, 0, 1], dtype=torch.int32),
+    )
     layout = _tree_layout(tree)
     children = torch.tensor([[chance]])
     mask = torch.ones((1, 1), dtype=torch.bool)
@@ -62,6 +64,7 @@ def test_child_summary_partials_propagate_through_chance_average() -> None:
         local_m=local_m,
         functional_weights=torch.tensor([[3.0]], dtype=torch.float64),
         leaf_ids=torch.tensor([left, right]),
+        players=2,
     )
     torch.testing.assert_close(
         leaf_p[:, :, 0], torch.tensor([[[3.0, -6.0], [3.0, -6.0]]])

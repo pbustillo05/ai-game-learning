@@ -12,7 +12,7 @@ from torch import Tensor
 from pbg.core.completion import BatchedCompletionStats
 from pbg.core.config import RootConfig
 from pbg.core.game import PRETERM, PROBE_FOLD, GameBundle
-from pbg.core.tree import PagedTreeSource
+from pbg.core.tree import PagedRolloutTopology
 from pbg.games.poker.adapter import PokerModelBundle, PokerPolicyAdapter
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.engine import PokerConfig
@@ -82,8 +82,8 @@ def estimate_rollout_memory(
     reach_rows = max(root_count, 1) if sequential else page_rows
     state_schema = poker_live_state_schema(n_players)
     history_schema = poker_public_history_schema(max_history_tokens)
-    node_schema = PagedTreeSource.node_schema(n_players)
-    edge_schema = PagedTreeSource.edge_schema()
+    node_schema = PagedRolloutTopology.node_schema(n_players)
+    edge_schema = PagedRolloutTopology.edge_schema()
     return PokerRolloutMemoryPlan(
         page_rows=page_rows,
         state_page_bytes=state_schema.capacity_bytes(page_rows, chunks=1),

@@ -4,6 +4,7 @@ import copy
 import hashlib
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,7 +14,6 @@ from pbg.config import ConfigError, load_config
 from pbg.core.checkpointing import scientific_config
 from pbg.core.game import PROBE_FOLD, EventBatch
 from pbg.core.rollout import ProbeRollout, sample_trees_sequential
-from pbg.core.tree import SampledTree
 from pbg.core.training import _build_iteration_data
 from pbg.eval.br_probe import evaluate_br_probe
 from pbg.games.poker.bundle import build_bundle
@@ -103,11 +103,11 @@ def test_probe_rollout_and_backward_retain_only_selected_player(tmp_path: Path) 
     gen = torch.Generator().manual_seed(123)
     sampled = sample_trees_sequential(bundle, cfg, gen, iteration=0)
     assert isinstance(sampled, ProbeRollout)
-    nodes = sampled.policy.node_ids.to(torch.int64)
-    owners = sampled.tree.owner[nodes]
-    selected = sampled.seats[sampled.tree.tree_id[nodes].to(torch.int64)]
+    source = sampled.sample.decision_source
+    owners = source["owner"]
+    selected = sampled.seats[source["root_id"].to(torch.int64)]
     assert torch.equal(owners, selected)
-    assert torch.equal(sampled.policy.node_ids, sampled.decision_inputs.node_ids)
+    assert torch.equal(source["node_id"], sampled.sample.decision_inputs.node_ids)
 
     cfg.rollout.max_active_trajectories = 1
     rescheduled = sample_trees_sequential(
@@ -180,23 +180,13 @@ def test_probe_fold_completion_is_selected_posterior_and_public_payoff(
     folded = backend.step_player_batch(
         root, EventBatch(torch.zeros(1, dtype=torch.int32))
     )
-    tree = SampledTree(
-        parent=torch.tensor([-1], dtype=torch.int32),
-        child_ptr=torch.tensor([0, 0], dtype=torch.int32),
-        child_node=torch.empty(0, dtype=torch.int32),
-        child_event=torch.empty(0, dtype=torch.int32),
-        nu=torch.empty(0, dtype=torch.float32),
-        tree_id=torch.tensor([0], dtype=torch.int32),
+    leaf_context = SimpleNamespace(
         owner=torch.tensor([PROBE_FOLD], dtype=torch.int32),
-        depth_p=torch.zeros((1, 2), dtype=torch.int32),
-        depth_player=torch.zeros(1, dtype=torch.int32),
         state_ref=folded,
-        path_weight=torch.ones(1),
     )
-    tree.validate()
     stats = bundle.completion_backend.complete_selected_keyed(
         backend,
-        tree,
+        leaf_context,
         torch.tensor([0], dtype=torch.int32),
         torch.zeros((1, 2, backend.x_sizes[0])),
         8,
