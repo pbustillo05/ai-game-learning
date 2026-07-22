@@ -55,6 +55,56 @@ above a literal 10,000,000,000-byte hard ceiling. Until the ceiling is made
 unambiguous in configuration, treat 96 rows as an experiment rather than a
 production default.
 
+## Implementation progress: dense live-state boundary
+
+The first rollout milestone was implemented and measured on 2026-07-22.  The
+accepted performance gate is now a production-scale single-GPU sequential-RB
+workload with 2,048 trajectory starts, checkpoint 1110 from
+`runs/nlhe_hu_32bb_full_sequential_rb`, 64 family rows, 64 active trajectories,
+1,024 completion samples, and the configured 256-row append-only page size.
+The earlier 128- and 512-root probes remain debugging tools and are not release
+performance evidence.
+
+The implementation makes mutable state/history a distinct physical domain.
+For sequential rollout it admits one recyclable dense slab of
+`roots_per_gpu + family_batch_rows` rows, the exact live-frontier high-water
+bound observed and implied by the scheduler's parent/child overlap.  Logical
+topology ids remain separate.  Parents still release their slots after all
+successors and immutable retained rows commit, history remains refcounted, and
+the memory plan charges the full slab capacity.  Append-only topology,
+decision, action, and leaf ownership retain their own page geometry.
+
+Within a resolved live slab, `PagedTensorColumn` now delegates ordinary tensor
+indexing directly to the dense field.  The generic arena also has direct
+single-page gather/write paths, and whole-row replacement no longer gathers
+the field that it is about to overwrite.  Multi-page append-only arenas retain
+their generic checked implementation.
+
+Production-scale results are:
+
+| 2,048-start sequential-RB measurement | Decisions | Model calls | Padded attention pairs | Rollout | End-to-end decisions/s |
+|---|---:|---:|---:|---:|---:|
+| Audit matched baseline, 64 rows | about 8,050 | 139.5 | not recorded in the summary | 87.45 s | 90.9 |
+| Pre-fix reproduction, repeat seed 101 | 8,087 | 140 | 33.149 billion | 90.27 s | 88.3 |
+| Dense live-state implementation, two-repeat median | 8,049.5 | 139.5 | 32.976 billion | 51.65 s | 152.7 |
+
+Against the matched audit baseline, the accepted implementation reduces
+rollout time by 40.9% and raises end-to-end decision throughput by about 68%.
+The median peak was 3.34 GiB allocated and 6.16 GiB reserved, with a 2,112-row
+state high-water and no state row crossing the seal boundary.  The history
+high-water median was 719 rows and exactly the sentinel row remained at seal.
+
+A diagnostic one-repeat run that used a global 2,112-row page for every rollout
+arena reached 35.90 s for the same 8,087 decisions and 140 model calls.  That is
+useful headroom evidence but is not accepted as the live-state result: a global
+page changes append-only slack and abstraction boundaries.  The next rollout
+work should recover that headroom with explicit bulk topology/retained writes,
+then remove duplicated legal/probability/history work without changing page
+ownership or statistical work.
+
+Focused CPU gates after this milestone passed 101 tests with seven CUDA-only
+skips.  CUDA benchmark teardown left no compute process resident.
+
 Sequential target construction and especially branched target construction
 still contain or recently contained host-driven recurrences. A concurrent
 dirty-worktree change began vectorizing sequential targets while these

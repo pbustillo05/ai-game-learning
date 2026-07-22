@@ -48,6 +48,7 @@ class PokerRolloutMemoryPlan:
     """Schema-derived minimum admitted rollout transaction."""
 
     page_rows: int
+    live_state_rows: int
     state_page_bytes: int
     history_page_bytes: int
     topology_page_bytes: int
@@ -76,6 +77,7 @@ def estimate_rollout_memory(
     partition_summary_required: bool = True,
     use_branching_heads: bool = False,
     storage_page_rows: int = 256,
+    live_state_rows: int | None = None,
 ) -> PokerRolloutMemoryPlan:
     """Return the page/live-frontier minimum needed before the first draw."""
 
@@ -83,6 +85,11 @@ def estimate_rollout_memory(
     if root_count < 0 or n_players <= 0 or storage_page_rows <= 0:
         raise ValueError("invalid rollout memory-plan dimensions")
     page_rows = int(storage_page_rows)
+    if live_state_rows is None:
+        live_state_rows = page_rows
+    if isinstance(live_state_rows, bool) or live_state_rows <= 0:
+        raise ValueError("live_state_rows must be positive")
+    live_state_rows = int(live_state_rows)
     n_hands = DeckGeometry(rank_count).n_hands
     reach_rows = max(root_count, 1) if sequential else page_rows
     state_schema = poker_live_state_schema(n_players)
@@ -91,8 +98,9 @@ def estimate_rollout_memory(
     edge_schema = PagedRolloutTopology.edge_schema()
     return PokerRolloutMemoryPlan(
         page_rows=page_rows,
-        state_page_bytes=state_schema.capacity_bytes(page_rows, chunks=1),
-        history_page_bytes=history_schema.capacity_bytes(page_rows, chunks=1),
+        live_state_rows=live_state_rows,
+        state_page_bytes=state_schema.capacity_bytes(live_state_rows, chunks=1),
+        history_page_bytes=history_schema.capacity_bytes(live_state_rows, chunks=1),
         topology_page_bytes=(
             node_schema.capacity_bytes(page_rows, chunks=1)
             + edge_schema.capacity_bytes(page_rows, chunks=1)
@@ -728,12 +736,23 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         beta_rank=model_cfg.folder_beta_rank, rank_count=engine_cfg.rank_count
     )
     resident_trees = cfg.rollout.roots_per_gpu
+    sequential = cfg.training.mode != "branched_rao_blackwell"
+    # A sequential scheduler owns one mutable state per resident trajectory
+    # plus at most one physical successor pack before the processed parents
+    # reach their last consumer.  Use that exact live-frontier bound as one
+    # dense recyclable slab; retained append-only stores keep their separately
+    # configured page geometry.
+    live_state_rows = (
+        resident_trees + int(cfg.rollout.family_batch_rows or 256)
+        if sequential
+        else int(cfg.rollout.storage_page_rows or 256)
+    )
     raises_per_street = math.ceil(engine_cfg.stack_bb / engine_cfg.bb) + 1
     state_history_steps = 4 * engine_cfg.n_players * (raises_per_street + 1) + 3
     plan = estimate_rollout_memory(
         root_count=resident_trees,
         n_players=engine_cfg.n_players,
-        sequential=cfg.training.mode != "branched_rao_blackwell",
+        sequential=sequential,
         rank_count=engine_cfg.rank_count,
         # This sizes the state store's binary-lift history, whose allocation is
         # governed by the backend rollout-step bound rather than model tokens.
@@ -744,6 +763,7 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         ),
         use_branching_heads=model_cfg.use_branching_heads,
         storage_page_rows=int(cfg.rollout.storage_page_rows or 256),
+        live_state_rows=live_state_rows,
     )
     _preflight_cuda_rollout(
         plan,
@@ -759,6 +779,7 @@ def build_bundle(cfg: RootConfig, device: torch.device) -> GameBundle:
         engine_cfg,
         device,
         storage_page_rows=plan.page_rows,
+        live_state_rows=plan.live_state_rows,
         beta_table=cfg.rollout.beta or {"default": 1.0},
         profile_sampler=profiles,
         partition_adapter=partition,

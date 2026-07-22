@@ -147,6 +147,7 @@ class PokerRolloutBackend:
         device: torch.device | str,
         *,
         storage_page_rows: int = 256,
+        live_state_rows: int | None = None,
         max_rollout_steps: int | None = None,
         beta_table: Mapping[str, float] | Any | None = None,
         profile_sampler: PokerGPURejectionSampler | Any | None = None,
@@ -164,6 +165,11 @@ class PokerRolloutBackend:
         self.x_sizes = (self.n_hands,) * cfg.n_players
         self.n_ticks = cfg.n_ticks
         self.storage_page_rows = int(storage_page_rows)
+        if live_state_rows is None:
+            live_state_rows = self.storage_page_rows
+        if isinstance(live_state_rows, bool) or int(live_state_rows) <= 0:
+            raise ValueError("live_state_rows must be a positive integer")
+        self.live_state_rows = int(live_state_rows)
         self.e_max = RAISE_OFFSET + cfg.n_ticks
         self.raise_unit_values = (
             torch.arange(1, cfg.n_ticks + 1, dtype=torch.float32, device=self.device)
@@ -179,7 +185,7 @@ class PokerRolloutBackend:
             self.max_rollout_steps,
             self.device,
             cfg.n_players,
-            page_rows=storage_page_rows,
+            page_rows=self.live_state_rows,
         )
         self.state_store = self.states
         self.history_materializer = DeviceHistoryMaterializer(self.states)

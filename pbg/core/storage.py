@@ -418,6 +418,19 @@ class PagedTensorArena:
                 raise ValueError(f"write value for {name!r} violates its schema")
             if value.device != self.device:
                 raise ValueError("write tensors must already be on the arena device")
+        if rows.numel() == 0:
+            return
+        if len(self._pages) == 1:
+            # The hot live-frontier arena is deliberately sized so a physical
+            # rollout pack normally resides in one admitted slab.  Resolving
+            # that slab through the generic page-match matrix turned every
+            # ordinary state write into O(B * page_rows) comparison and where
+            # work.  Page ownership and byte admission remain unchanged; only
+            # the compute boundary uses the already-resolved sole slab.
+            columns = self._pages[0]
+            for name, value in values.items():
+                columns[name].index_copy_(0, rows, value)
+            return
         page_id = torch.div(rows, self.page_rows, rounding_mode="floor")
         offset = torch.remainder(rows, self.page_rows)
         # Each page update uses a fixed, admitted page-width match matrix.
@@ -430,8 +443,6 @@ class PagedTensorArena:
                 offset[:, None] == positions[None, :]
             )
             present = matches.any(0)
-            if rows.numel() == 0:
-                continue
             source = matches.to(torch.int64).argmax(0)
             for name, value in values.items():
                 candidate = value[source]
@@ -451,6 +462,11 @@ class PagedTensorArena:
                 ((rows >= 0) & (rows < self._size)).all(),
                 "gather row ids are outside the logical arena",
             )
+        if len(self._pages) == 1:
+            # See the matching write fast path.  index_select is the explicit
+            # dense-pack read for a single resolved live-state slab and avoids
+            # allocating/merging one candidate tensor per page.
+            return self._pages[0][name].index_select(0, rows)
         output = torch.zeros(
             (rows.numel(), *spec.shape), dtype=spec.dtype, device=self.device
         )
@@ -700,10 +716,31 @@ def admit_arena_growth(requests: Mapping[PagedTensorArena, int]) -> None:
 class PagedTensorColumn:
     """Tensor-style row indexing over one field of a paged arena."""
 
-    def __init__(self, arena: PagedTensorArena, name: str) -> None:
+    def __init__(
+        self,
+        arena: PagedTensorArena,
+        name: str,
+        *,
+        direct_single_slab: bool = False,
+    ) -> None:
         self.arena = arena
         self.name = name
         self.spec = arena.schema.by_name[name]
+        self.direct_single_slab = bool(direct_single_slab)
+
+    def _direct_slab(self) -> Tensor | None:
+        """Return the resolved compute slab for trusted live-slot columns.
+
+        Mutable live-state handles are validated once at the backend boundary
+        and remain physical slot addresses, not topology identities.  When the
+        admitted owner has one slab, exposing that slab to ordinary tensor
+        indexing is the dense compute interface: paging remains an allocation
+        and lifetime concern and does not leak into every poker expression.
+        """
+
+        if self.direct_single_slab and self.arena.page_count == 1:
+            return self.arena._pages[0][self.name]
+        return None
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -777,6 +814,9 @@ class PagedTensorColumn:
         full[(slice(None),) * len(row_shape) + rest] = value
 
     def __getitem__(self, key: Any) -> Tensor:
+        direct = self._direct_slab()
+        if direct is not None:
+            return direct[key]
         parts = key if isinstance(key, tuple) else (key,)
         rows, row_shape, scalar = self._rows(parts[0])
         full = self.arena.gather(self.name, rows)
@@ -788,8 +828,29 @@ class PagedTensorColumn:
         return self._select(full, row_shape, parts[1:])
 
     def __setitem__(self, key: Any, value: Any) -> None:
+        direct = self._direct_slab()
+        if direct is not None:
+            direct[key] = value
+            return
         parts = key if isinstance(key, tuple) else (key,)
         rows, row_shape, scalar = self._rows(parts[0])
+        if len(parts) == 1:
+            # A whole-row assignment has no dependency on the previous field
+            # value.  The former tensor-compatible implementation gathered the
+            # complete field merely to overwrite it, doubling hot-path state
+            # traffic and page resolution.
+            target_shape = (rows.numel(), *self.spec.shape)
+            assigned = torch.as_tensor(
+                value, dtype=self.spec.dtype, device=self.device
+            )
+            try:
+                assigned = torch.broadcast_to(assigned, target_shape)
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"assignment to {self.name!r} cannot broadcast to {target_shape}"
+                ) from exc
+            self.arena.write(rows, {self.name: assigned})
+            return
         full = self.arena.gather(self.name, rows)
         if scalar:
             shaped = full[0]

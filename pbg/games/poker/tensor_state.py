@@ -128,7 +128,13 @@ class PokerTensorStateStore:
         )
         self.arena = self.pool.arena
         for field in self.schema.fields:
-            setattr(self, field.name, PagedTensorColumn(self.arena, field.name))
+            setattr(
+                self,
+                field.name,
+                PagedTensorColumn(
+                    self.arena, field.name, direct_single_slab=True
+                ),
+            )
         self.history_schema = poker_public_history_schema(max_rollout_steps)
         self.history_pool = RecyclableTensorPool(
             self.history_schema,
@@ -141,7 +147,9 @@ class PokerTensorStateStore:
             setattr(
                 self,
                 field.name,
-                PagedTensorColumn(self.history_arena, field.name),
+                PagedTensorColumn(
+                    self.history_arena, field.name, direct_single_slab=True
+                ),
             )
 
     @property

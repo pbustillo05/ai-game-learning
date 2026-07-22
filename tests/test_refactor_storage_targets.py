@@ -14,6 +14,7 @@ from pbg.core.partition import (
 )
 from pbg.core.storage import (
     PagedTensorArena,
+    PagedTensorColumn,
     PartitionRolloutBlock,
     RecyclableTensorPool,
     RolloutStorage,
@@ -175,6 +176,25 @@ def test_paged_reservation_is_atomic_and_recyclable_slots_follow_last_consumer()
     pool.write(reused, {"payload": torch.tensor([[9.0, 8.0]])})
     assert torch.equal(pool.gather("payload", reused), torch.tensor([[9.0, 8.0]]))
     assert pool.capacity_rows == 2
+
+
+def test_direct_single_slab_column_uses_dense_tensor_indexing() -> None:
+    schema = TensorSchema(
+        "live_dense_slab",
+        (TensorFieldSchema("payload", torch.float32, (3,)),),
+    )
+    arena = PagedTensorArena(schema, 4, "cpu")
+    rows = arena.reserve_rows(3)
+    column = PagedTensorColumn(arena, "payload", direct_single_slab=True)
+    column[rows] = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+    selected = torch.tensor([2, 0], dtype=torch.int64)
+    coordinates = torch.tensor([1, 2], dtype=torch.int64)
+    assert torch.equal(column[selected, coordinates], torch.tensor([7.0, 2.0]))
+    column[selected, coordinates] = torch.tensor([70.0, 20.0])
+    assert torch.equal(
+        column[rows],
+        torch.tensor([[0.0, 1.0, 20.0], [3.0, 4.0, 5.0], [6.0, 70.0, 8.0]]),
+    )
 
 
 def test_byte_accountant_group_reservation_rolls_back_before_allocation() -> None:
