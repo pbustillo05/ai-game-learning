@@ -866,12 +866,6 @@ def _sample_branched_tree_impl(
                 dtype=torch.int32,
                 device=device,
             )
-            edge_rows = torch.arange(
-                first_edge + start,
-                first_edge + end,
-                dtype=torch.int32,
-                device=device,
-            )
             child_states = states[parent_positions]
             child_reach = reaches[parent_positions]
             expanded_paths = parent_paths[parent_positions]
@@ -921,7 +915,11 @@ def _sample_branched_tree_impl(
             )
             next_owner = backend.classify(next_states).to(torch.int32)
             buffer.commit_children(
-                children, edge_rows, next_states, next_owner, events.public_id
+                first_child + start,
+                first_edge + start,
+                next_states,
+                next_owner,
+                events.public_id,
             )
             child_reach_handles = arena.gather_many(
                 ("reach_handle",), children.to(torch.int64)

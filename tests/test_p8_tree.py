@@ -95,15 +95,15 @@ def test_child_addresses_can_be_reserved_before_physical_materialization() -> No
     assert buffer.state_ref[children.to(torch.int64)].tolist() == [-1, -1, -1]
 
     buffer.commit_children(
-        children[:2],
-        edges[:2],
+        1,
+        0,
         torch.tensor([10, 11], dtype=torch.int32),
         torch.tensor([1, TERMINAL], dtype=torch.int32),
         torch.tensor([100, 101], dtype=torch.int32),
     )
     buffer.commit_children(
-        children[2:],
-        edges[2:],
+        3,
+        2,
         torch.tensor([12], dtype=torch.int32),
         torch.tensor([0], dtype=torch.int32),
         torch.tensor([102], dtype=torch.int32),

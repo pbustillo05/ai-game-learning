@@ -175,13 +175,11 @@ class PagedRolloutTopology:
         edge_start = self.edge_count
         nodes, edges = self.reserve_children(parents, weights)
         self.commit_children(
-            nodes,
-            edges,
+            node_start,
+            edge_start,
             states,
             owners,
             events,
-            _node_start=node_start,
-            _edge_start=edge_start,
         )
         return nodes
 
@@ -259,28 +257,41 @@ class PagedRolloutTopology:
 
     def commit_children(
         self,
-        nodes: Tensor,
-        edges: Tensor,
+        node_start: int,
+        edge_start: int,
         states: Tensor,
         owners: Tensor,
         events: Tensor,
-        *,
-        _node_start: int | None = None,
-        _edge_start: int | None = None,
     ) -> None:
-        """Fill one physical subspan of previously reserved child rows."""
+        """Fill one host-known contiguous subspan of reserved child rows."""
 
-        count = int(nodes.numel())
-        if any(value.shape != (count,) for value in (edges, states, owners, events)):
-            raise ValueError("child commit tensors must all have shape [C_subspan]")
-        if any(
-            value.device != self.device
-            for value in (nodes, edges, states, owners, events)
+        if (
+            isinstance(node_start, bool)
+            or not isinstance(node_start, int)
+            or node_start < 0
+            or isinstance(edge_start, bool)
+            or not isinstance(edge_start, int)
+            or edge_start < 0
         ):
+            raise ValueError("child commit cursors must be nonnegative integers")
+        count = int(states.numel())
+        if any(value.shape != (count,) for value in (owners, events)):
+            raise ValueError("child commit tensors must all have shape [C_subspan]")
+        if any(value.device != self.device for value in (states, owners, events)):
             raise ValueError("child commit tensors must be on the topology device")
+        if (
+            node_start + count > self.node_count
+            or edge_start + count > self.edge_count
+        ):
+            raise ValueError("child commit exceeds reserved topology rows")
         if count == 0:
             return
-        node_rows = nodes.to(torch.int64)
+        node_rows = torch.arange(
+            node_start,
+            node_start + count,
+            dtype=torch.int64,
+            device=self.device,
+        )
         parent_rows = self.parent[node_rows].to(torch.int64)
         parent_depth = self.depth_p[parent_rows]
         child_owner = owners.to(torch.int64)
@@ -299,14 +310,8 @@ class PagedRolloutTopology:
             + player.to(torch.int32),
         }
         edge_values = {"child_event": events.to(torch.int32)}
-        if (_node_start is None) != (_edge_start is None):
-            raise ValueError("contiguous child commit requires both host cursors")
-        if _node_start is None:
-            self.nodes.write(node_rows, node_values)
-            self.edges.write(edges.to(torch.int64), edge_values)
-        else:
-            self.nodes.write_contiguous(_node_start, node_values)
-            self.edges.write_contiguous(_edge_start, edge_values)
+        self.nodes.write_contiguous(node_start, node_values)
+        self.edges.write_contiguous(edge_start, edge_values)
 
     def release(self) -> None:
         self.nodes.release()

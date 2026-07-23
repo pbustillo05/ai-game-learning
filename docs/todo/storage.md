@@ -1,6 +1,7 @@
 # Throughput-first storage design
 
-Status: pre-optimization hand-off, 2026-07-23.
+Status: ROI 1 state/history and ROI 2 contiguous child commits accepted,
+2026-07-23; pack-local occurrence/topology/controller routing is next.
 
 The immediate priority is the physical data path, not logical byte trimming.
 The current branched rollout repeatedly routes hot mutable rows through growing
@@ -105,11 +106,10 @@ The storage design must internalize what has already been measured:
 - Commits `5ecfeb4` and `cf6bc34` were small follow-ups, not the dominant fix.
   Direct host-proven contiguous appends were about 1.1% faster, and removing
   one redundant first-page gather merge was about 0.35% faster.
-- Commit `48ce2a3` specialized immediate unsplit sequential child commits, but
-  deliberately left branched subspan commits on arbitrary-row routing. The
-  current branched implementation still pays that generic path even though
-  each reserved physical child subspan has a host-known contiguous logical
-  extent.
+- Commit `48ce2a3` specialized immediate unsplit sequential child commits.
+  The accepted ROI 2 replacement now makes the same host-known contiguous
+  cursor contract mandatory for every branched physical child subspan and
+  deletes the arbitrary-row commit fallback.
 - Section 15 falsifies redundant policy forwards as the main branched
   slowdown. After excluding reference-cache construction, branched rollout
   has essentially one policy-forward row per retained player decision and
@@ -203,12 +203,11 @@ benchmark-only implementation is not an accepted result.
    rows/page. `PagedTensorColumn` gathers loop over every page. Parent
    metadata, controller factors, and updates are read repeatedly during
    expansion, so later packs cost more than earlier packs.
-4. **Known-contiguous branched commits use arbitrary-row writes.**
-   Branched rollout reserves child topology in stable contiguous subspans,
-   then calls `commit_children` without the host cursors required by
-   `write_contiguous`. Generic writes build page-match work for all admitted
-   pages. The sequential immediate-child specialization already demonstrates
-   the intended fast boundary.
+4. **Known-contiguous branched commits used arbitrary-row writes.**
+   **Fixed by the accepted ROI 2 replacement.** Branched rollout now passes
+   each stable node/edge cursor through `commit_children`, whose sole surviving
+   path is `write_contiguous`; the arbitrary-row commit API and fallback were
+   deleted.
 5. **Occurrence chunk routing repeats the page-scan pattern.**
    `ChunkedOccurrenceArena` gathers/scatters by building selectors and merging
    candidates for every accumulated chunk. A realistic tree reaches roughly
@@ -243,10 +242,9 @@ Work in isolated, paired steps. Do not combine all of these into one rewrite:
    capacities and lifetime accounting. The state/history slice is accepted;
    active reach remains pending after its isolated experiment missed the
    throughput gate.
-3. Pass host-known contiguous cursors through branched child reservation and
-   commit. Preserve the two-pass rule that fixes every child/RNG address before
-   the first draw; optimize the physical commit without changing logical
-   order.
+3. **Accepted 2026-07-23.** Pass host-known contiguous cursors through branched
+   child reservation and commit. The two-pass rule still fixes every child/RNG
+   address before the first draw, and the sole commit path is now contiguous.
 4. Remove all-chunk scans from hot occurrence/topology/controller access.
    Keep stable logical addresses and paged append-only ownership, but resolve a
    bounded pack to only its intersecting physical chunks. Splitting mutable
@@ -1243,7 +1241,7 @@ geometry, and seed for the first paired candidate.
 | ROI | Change | Expected byte effect | Throughput expectation | Scope and acceptance gate |
 |---:|---|---:|---|---|
 | 1 | Remove generic all-page scans from branched mutable state, shared history, and active reach | keep capacity proportional to admitted live high water; remove per-256-row tensor fragmentation and routing transients | strongly positive; this is the sequential paged-state regression class still present in branching | **State/history accepted 2026-07-23; reach pending.** Strict seed 104,830 reduced selected-owner generic accesses from 81,616 to zero, aggregate candidate rows by 88.5%, rollout time by 40.3%, and total time by 18.1%. Reserved peak was unchanged and allocated peak rose 0.02%. Exact discrete work and zero undeclared synchronizations were preserved. A reach-only slice removed 767 scans and 55.4GB of routing temporaries but improved rollout only 0.22%; it was rejected and removed. |
-| 2 | Commit host-proven contiguous branched child subspans directly | capacity-neutral; removes page-match matrices and candidate copies | positive and low-risk | **Instrumented 2026-07-23; implementation pending.** Topology append already used 319 node and 318 edge contiguous writes, but hot updates still included 970 generic node writes and 312 generic edge writes, materializing 28.2M candidate rows. Pass physical subspan cursors through the remaining commit boundary; preserve two-pass address publication and stable child order; exact children/edges/events; paired seed-104830 branch gate |
+| 2 | Commit host-proven contiguous branched child subspans directly | capacity-neutral; removes page-match matrices and candidate copies | positive and low-risk | **Accepted 2026-07-23.** The production `commit_children` API now requires host node/edge cursors and has no arbitrary-row fallback. A same-environment seed-104830 pair reproduced the exact 25,865 nodes, 16,540 decisions, 19,788 actions, 6,621 leaves, completion work, learner rows, and optimizer outcomes. It replaced 718 generic accesses with 726 bounded contiguous accesses, removed 24.36M candidate rows and 1.081GB of issued routing work, improved rollout by 5.25% and end-to-end time by 2.58%, and changed neither allocated nor reserved peak bytes. |
 | 3 | Make occurrence/topology/controller access pack-local instead of all-chunk/all-page | retain paged append-only capacity; remove $O(B\,n_{\text{pages}})$ hot routing work | potentially strongly positive on large trees | **Instrumented 2026-07-23; implementation pending.** Occurrence, node/edge topology, and controller owners made 10,640 generic accesses, visited 560,060 chunks/pages, and materialized 85.3M candidate rows; each reached 91 accumulated segments. Medium core refactor. Stable logical addresses and last-consumer ownership; report early/late-pack timing and scaling versus realized page count |
 | 4 | Restore exact-street physical rollout queues or an equally efficient bounded packer | no required retained-byte change; reduces mixed-street padded work | positive; previously about 4.9% in HU | Separate scheduling experiment. Natural training partitions unchanged; identical keyed RNG/topology; padded pairs and wall time must improve |
 | 5 | Replace per-destination routing sorts with one stable partition only after owner-local page scans are gone | candidate core is roughly $10F_bM\to16F_b$, excluding queue staging | unknown until fixed-window/device-offset costs are included | Localized experiment. Identical stable queue order and RNG; no new host slicing/sync; realistic sequential and branched CUDA timing |
@@ -1299,6 +1297,22 @@ All three recorded zero selected-owner generic scans, zero undeclared
 synchronizations, unchanged 14,848 learner presentations and 58 optimizer
 attempts, and clean teardown. Their concurrent timings are robustness evidence,
 not substitutes for the paired acceptance timing.
+
+The strict same-environment ROI 2 pair is stored in
+`runs/experiments/nlhe_hu_32bb_branched_fixed_storage_contiguous_commit_parent_20260723/benchmark.json`
+and
+`runs/experiments/nlhe_hu_32bb_branched_fixed_storage_contiguous_commit_candidate_20260723/benchmark.json`.
+Both used the exact parent checkpoint, `--warmup 0 --repeats 1 --seed 101`,
+and logical seed 104,830. They produced identical discrete work: 25,865 nodes,
+16,540 player decisions, 19,788 actions, 6,621 leaves, 6,779,904 completion
+samples, 14,848 learner presentations, and 53 applied plus five nonfinite
+optimizer attempts. Generic storage accesses fell from 13,142 to 12,424 and
+candidate rows from 110,699,640 to 86,343,800; the 359 generic edge commits
+were eliminated and the corresponding 359 node commits became contiguous.
+Rollout time fell from 152.664 to 144.649 seconds and total time from 279.996
+to 272.776 seconds. Both allocated and reserved iteration peaks were identical
+at 4,621,654,016 and 7,805,599,744 bytes, respectively, with zero undeclared
+host synchronizations and clean GPU teardown.
 
 # 13. Acceptance and reporting
 
