@@ -84,16 +84,31 @@ draw uses a disjoint counter key $K(k,\iota(s),u,\mathsf{purpose})$; hence queue
 order, physical pack size, and GPU speed cannot change the sampled object}
 \KwDef{In sequential modes $\mathcal I_g=\{(g,i):0\leq i<G_k\}$.
 \Obj{SafeAdmit} controls only how many of these already-fixed roots are live at
-once; it may neither change $G_k$ nor discard, retry, or replace a trajectory}
+once; it may neither change $G_k$ nor discard, retry, or replace a trajectory.
+In $\mathsf{branchRB}$, only a classified whole-attempt memory/admission
+failure may discard the single partial tree, after all of its owners are
+released, and restart it under the bounded recovery rule below}
 \KwDef{$\Obj{Pack}_m(Q)$ removes a stable insertion-order prefix of $Q$.
 $\Obj{PhysicalPlan}_m(B)$ returns stable maximum-feasible subspans of $B$;
-it neither sorts nor reroutes rows.  $\Obj{Full}_m(Q)$ and all memory admission
-tests use the partition's declared worst-case physical contract, not an
-undeclared game label}
+it neither sorts nor reroutes rows.  For each subspan $J$, the optional
+game-owned realized-pack oracle in $\Obj{PartitionSpec}_m.\mathtt{byteWork}$
+returns an opaque descriptor and declared token/work cost.  It may reduce
+public fields within $J$ but may not split, reorder, reroute, or delay its rows.
+Core never interprets the descriptor.  $\Obj{Full}_m(Q)$ and pre-dequeue memory
+admission use the partition's safe worst-case contract; the realized cost may
+tighten physical execution only after the stable prefix is fixed}
 \KwDef{Any failed hard transaction sets a local failure flag and exits current
-work without retrying a draw.  Every rank reaches the single common-order
-failure agreement after local rollout; no rank enters targets or mass
-collectives with a partial store}
+work.  A classified $\mathsf{branchRB}$ memory/admission failure is retryable
+only as a whole attempt; every other transaction failure is terminal and never
+retries a draw.  Every rank reaches the common-order failure agreement after
+local rollout; no rank enters targets or mass collectives with a partial store}
+\KwDef{For branched attempt $a\geq0$ on rank $g$, use logical tree address
+$\tau(g,a)=g+a|\mathcal G|$.  After a retryable failure, release every
+partial/sealed owner and allocator-recoverable cache, apply the same emergency
+backoff to the applicable fixed-$\beta$ scale or dynamic $\kappa$ controller on
+every rank, agree on $(a+1,\tau(g,a+1))$, and redraw from that disjoint address.
+The realized sample is selected by OOM-conditioned recovery and may be biased;
+record the cause, old/new controls, old/new addresses, and allocator peaks}
 \KwDef{$\operatorname{Min}_{\preceq}C=
 \{m\in C:\nexists m'\in C,\ m'\prec m\}$.  Among full queues choose an element
 of $\operatorname{Min}_{\preceq}C$ by decreasing $(\Obj{load},\Obj{age})$;
@@ -141,14 +156,19 @@ mode-specific compact topology, stable partition tables, and leaf rows}
     }
     \Else{
       Set $f_g\gets1$ and exit the loop: the next fixed root cannot be admitted
-      under the declared transaction; do not replace, retry, or reroll it;
+      under the declared transaction.  In sequential modes do not replace,
+      retry, or reroll it; in branched mode classify it for the whole-attempt
+      recovery boundary;
     }
 
     $B\gets\Obj{Pack}_m(\Q{g}{m})$; mark $B$ $\mathsf{EVALUATING}$;
     $R\gets\Reserve_g(B,\mathsf m)$
     \tcc*[r]{logical child/action addresses are fixed before physical packing}
     \ForEach{$J\in\Obj{PhysicalPlan}_m(B)$}{
-      $Y_J\gets\Forward_m(\Obj{PartitionInputTable}_{g,m}[d(J)];\theta_k)$;
+      $(c_J,z_J)\gets\Obj{PartitionSpec}_m.\mathtt{byteWork.realize}(J)$;
+      $Y_J\gets\Forward_m(\Obj{PartitionInputTable}_{g,m}[d(J)];
+        \theta_k,z_J)$
+      \tcc*[r]{core accounts $c_J$ but does not interpret opaque $z_J$};
       $\Obj{DecisionTable}_{g,m}[d(J)].\mathtt{oldV}
         \gets
         \begin{cases}[l"l]
@@ -188,8 +208,18 @@ mode-specific compact topology, stable partition tables, and leaf rows}
   \Obj{OccurrenceArena}_g)$;
 }
 $f\gets\AllReduceMax_g f_g$ in the common control-collective order;
-\If{$f=1$}{release every current partial/sealed store on every rank; atomically
-checkpoint the last completed iteration and terminate cleanly}
+\If{$f=1$}{
+  release every current partial/sealed store on every rank;
+  \uIf{every failure is a classified branched memory/admission failure and the
+  configured retry limit is not exhausted}{
+    synchronously back off the branching controls; increment the attempt;
+    agree on its disjoint logical tree address; restart this algorithm with new
+    randomness;
+  }
+  \Else{
+    atomically checkpoint the last completed iteration and terminate cleanly;
+  }
+}
 \tcc{No model/queue collective occurs during rollout.  The boundary failure
 agreement prevents a later collective deadlock.  No clone of $\theta_k$ is
 needed: synchronous optimization cannot start until all fixed targets exist.}
@@ -207,7 +237,10 @@ rows; source chunks released only after their last copy}
 Compute exact destination extents from realized counts.  Before allocating any
 destination, reserve transactionally the simultaneous source-chunk capacity,
 all destination bytes, and the declared bounded seal scratch under the hard
-phase ceiling; on failure stop cleanly without changing the sampled object;
+phase ceiling; on failure preserve the source transaction for the common
+failure boundary.  Sequential failure stops without changing the sampled
+object; classified branched memory failure may release the entire attempt and
+redraw only through the bounded recovery above;
 \uIf{$\mathsf m\ne\mathsf{branchRB}$}{
   Count player decisions per root in logical chronological order; exclusive-scan
   into $\mathtt{trajectoryPtr}[G_k+1]$ and scatter each retained $(m,d)$ using

@@ -13,6 +13,7 @@ from typing import Any, Iterable
 
 import torch
 
+from pbg.core.adaptive_branching import CostSafeguardController
 from pbg.core.config import RootConfig, seed_all
 from pbg.core.checkpointing import load_checkpoint_payload
 from pbg.core.branching import BranchingDiagnosticLimits
@@ -251,6 +252,11 @@ def benchmark_modes(
             reference_model.requires_grad_(False)
         amp_enabled, amp_dtype = _precision(local, device)
         scaler = _scaler(bool(amp_enabled and amp_dtype == torch.float16))
+        safeguard_controller = (
+            CostSafeguardController.from_config(local.rollout)
+            if local.rollout.safe_tree_size is not None
+            else None
+        )
         environment = _environment(device)
         for iteration in range(warmup):
             _one_iteration(
@@ -262,11 +268,17 @@ def benchmark_modes(
                 iteration,
                 profile=False,
                 reference_model=reference_model,
+                safeguard_controller=safeguard_controller,
                 branching_diagnostic_limits=diagnostic_limits,
             )
         model_state = _cpu_snapshot(bundle.model.state_dict())
         optimizer_state = _cpu_snapshot(optimizer.state_dict())
         scaler_state = _cpu_snapshot(scaler.state_dict())
+        safeguard_state = (
+            None
+            if safeguard_controller is None
+            else copy.deepcopy(safeguard_controller.state_dict())
+        )
         repeat_seeds = [
             int(local.training.seed) + 104_729 * (repeat + 1)
             for repeat in range(repeats)
@@ -277,6 +289,11 @@ def benchmark_modes(
             bundle.model.load_state_dict(model_state)
             optimizer.load_state_dict(optimizer_state)
             scaler.load_state_dict(scaler_state)
+            safeguard_controller = (
+                None
+                if safeguard_state is None
+                else CostSafeguardController.from_state_dict(safeguard_state)
+            )
             torch_gen, _ = seed_all(repeat_seed, 0, device)
             local.rollout.logical_seed = repeat_seed
             sample = _one_iteration(
@@ -288,6 +305,7 @@ def benchmark_modes(
                 profile_iteration,
                 profile=True,
                 reference_model=reference_model,
+                safeguard_controller=safeguard_controller,
                 branching_diagnostic_limits=diagnostic_limits,
             )
             decisions = float(sample["decisions"])
@@ -323,6 +341,10 @@ def benchmark_modes(
                     ),
                     "branching_mode": local.rollout.branching_mode,
                     "queue_capacity_rows": local.rollout.queue_capacity_rows,
+                    "safe_tree_size": local.rollout.safe_tree_size,
+                    "safe_tree_activation_consecutive_iters": (
+                        local.rollout.safe_tree_activation_consecutive_iters
+                    ),
                 },
                 "metrics": _median_metrics(samples),
                 "samples": samples,

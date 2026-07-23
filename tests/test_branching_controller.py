@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import gc
 import math
 from pathlib import Path
 from types import SimpleNamespace
+import weakref
 
 import numpy as np
 import pytest
@@ -14,12 +16,16 @@ from torch import nn
 from pbg.config import ConfigError, load_config, load_config_mapping
 from pbg.core.adaptive_branching import (
     AdaptiveKKTController,
+    branched_attempt_address,
     FixedBetaController,
 )
 from pbg.core.branching import sample_branched_tree
 from pbg.core.checkpointing import load_checkpoint, save_checkpoint
 from pbg.core.game import GameBundle
-from pbg.core.distributed_failure import DistributedFailureAgreement
+from pbg.core.distributed_failure import (
+    DistributedFailureAgreement,
+    DistributedPhaseFailure,
+)
 from pbg.core.memory_control import (
     MEMORY_PHASES,
     BranchedMemoryRejection,
@@ -229,7 +235,64 @@ def test_accounting_rejection_preserves_reason_and_fresh_attempt_address() -> No
         )
     assert samples[0].branching_diagnostics["branching_attempt"] == 0
     assert samples[1].branching_diagnostics["branching_attempt"] == 1
+    assert samples[0].branching_diagnostics["branching_attempt_address"] == 0
+    assert samples[1].branching_diagnostics["branching_attempt_address"] == 1
     assert samples[0].topology.degree.tolist() != samples[1].topology.degree.tolist()
+
+
+def test_branched_attempt_addresses_are_disjoint_across_ranks_and_attempts() -> None:
+    addresses = {
+        branched_attempt_address(attempt, rank=rank, world_size=3)
+        for attempt in range(4)
+        for rank in range(3)
+    }
+    assert addresses == set(range(12))
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        branched_attempt_address(True)
+    with pytest.raises(ValueError, match=r"\[0, world_size\)"):
+        branched_attempt_address(0, rank=2, world_size=2)
+
+
+def test_single_rank_nonmemory_retry_phase_failure_is_terminal() -> None:
+    agreement = DistributedFailureAgreement(torch.device("cpu"))
+
+    with pytest.raises(DistributedPhaseFailure) as caught:
+        agreement.run_retryable(
+            "branched attempt",
+            lambda: (_ for _ in ()).throw(ValueError("invalid data")),
+            retry_types=(MemoryError,),
+        )
+
+    assert caught.value.phase == "branched attempt"
+    assert caught.value.failing_rank == 0
+    assert caught.value.local_detail == "ValueError: invalid data"
+
+
+def test_retryable_failure_does_not_retain_failed_attempt_traceback() -> None:
+    class AttemptOwner:
+        pass
+
+    agreement = DistributedFailureAgreement(torch.device("cpu"))
+    owner_ref: weakref.ReferenceType[AttemptOwner] | None = None
+
+    def fail() -> None:
+        nonlocal owner_ref
+        owner = AttemptOwner()
+        owner_ref = weakref.ref(owner)
+        raise MemoryError("injected")
+
+    result, error, rank = agreement.run_retryable(
+        "branched attempt",
+        fail,
+        retry_types=(MemoryError,),
+    )
+    gc.collect()
+
+    assert result is None
+    assert isinstance(error, MemoryError)
+    assert error.__traceback__ is None
+    assert rank == 0
+    assert owner_ref is not None and owner_ref() is None
 
 
 def test_mocked_distributed_attempt_discards_for_any_rejecting_rank(
@@ -254,3 +317,27 @@ def test_mocked_distributed_attempt_discards_for_any_rejecting_rank(
     assert result is None
     assert error is None
     assert rank == 1
+
+
+def test_mocked_distributed_retry_transition_requires_equal_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agreement = DistributedFailureAgreement(torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    calls = 0
+
+    def disagree(value, op=None, group=None):
+        nonlocal calls
+        del op, group
+        value.fill_(4 if calls == 0 else 5)
+        calls += 1
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", disagree)
+    with pytest.raises(DistributedPhaseFailure) as caught:
+        agreement.check_equal_int("retry transition", 4)
+    assert caught.value.local_detail == (
+        "rank-common transition mismatch: min=4, max=5"
+    )

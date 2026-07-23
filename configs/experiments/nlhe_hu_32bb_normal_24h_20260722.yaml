@@ -65,6 +65,7 @@ loss:
   c_v: 0.125
   c_h: 0.025
   c_kl: 0.05
-  entropy_schedule: const
+  entropy_schedule: linear_decay
+  entropy_decay_iters: 500
   utility_normalization: stack
   value_loss: clipped

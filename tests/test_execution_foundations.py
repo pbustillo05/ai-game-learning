@@ -454,28 +454,31 @@ def test_work_queue_capacity_and_prefix_staging_are_exactly_accounted() -> None:
 
 
 def test_queue_scheduler_is_globally_full_first_then_preorder_fill_age() -> None:
-    names = ("upstream", "downstream")
+    partition_ids = (0, 1)
     priorities = (0, 1)
-    queues = {name: DeviceWorkQueue(8, "cpu", staging_rows=3) for name in names}
-    queues["upstream"].enqueue(torch.tensor([0, 1], dtype=torch.int64), logical_time=0)
-    queues["downstream"].enqueue(
+    queues = {
+        partition_id: DeviceWorkQueue(8, "cpu", staging_rows=3)
+        for partition_id in partition_ids
+    }
+    queues[0].enqueue(torch.tensor([0, 1], dtype=torch.int64), logical_time=0)
+    queues[1].enqueue(
         torch.tensor([2, 3, 4], dtype=torch.int64), logical_time=1
     )
     selected = select_work_queue(
-        names, priorities, queues, 3, allow_partial=False, logical_time=2
+        partition_ids, priorities, queues, 3, allow_partial=False, logical_time=2
     )
     assert selected is not None
-    assert (selected.family, selected.rows, selected.forced_partial) == (
-        "downstream", 3, False
+    assert (selected.partition_id, selected.rows, selected.forced_partial) == (
+        1, 3, False
     )
 
-    queues["downstream"].dequeue(3)
+    queues[1].dequeue(3)
     selected = select_work_queue(
-        names, priorities, queues, 3, allow_partial=True, logical_time=3
+        partition_ids, priorities, queues, 3, allow_partial=True, logical_time=3
     )
     assert selected is not None
-    assert (selected.family, selected.rows, selected.forced_partial) == (
-        "upstream", 2, True
+    assert (selected.partition_id, selected.rows, selected.forced_partial) == (
+        0, 2, True
     )
 
 

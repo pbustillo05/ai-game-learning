@@ -636,12 +636,12 @@ def validate_config(cfg: RootConfig) -> None:
             else "configuration"
         )
         raise ValueError(f"root.game.{field}: {message}") from exc
-    # Active poker has one preflop family plus post_A for every possible live
+    # Active poker has one preflop partition plus post_A for every possible live
     # count A=2..P, hence P potentially nonempty learner strata.
     if cfg.training.minibatch_size < poker_cfg.n_players:
         raise ValueError(
             "root.training.minibatch_size: must cover every potentially nonempty "
-            f"poker execution family ({poker_cfg.n_players})"
+            f"poker partition ({poker_cfg.n_players})"
         )
     _validate_attention_capacity(cfg, poker_cfg, model_cfg)
 

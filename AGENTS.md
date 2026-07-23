@@ -113,3 +113,9 @@ Follow these rules:
 - Do not touch other users' GPU jobs. After checking GPU state, make sure to only launch tasks in idle available GPUs.
 - After a GPU task is done, make sure the GPU has returned to a clean idle state, without any strange lingering workload or memory usage.
 - Prefer commands that make resource targeting explicit.
+
+## RUNS folder hygiene
+The `runs/` and `config/` folders can get out of hand fast. Follow these rules:
+- name runs folders and `config/train/` files using: `nlhe_{hu or {P}max}_{{S}bb}_{normal or rb or branched_fixed or branched_KKT}_{optional short identifier}`
+- delete failed runs, failed configs,...
+- all experimental runs live in `runs/experiments/` and `configs/experiments/`, they don't clogg the root of the `runs/` and `config/` folders.

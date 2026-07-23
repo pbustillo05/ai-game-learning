@@ -89,6 +89,29 @@ class DistributedFailureAgreement:
 
         self._agree(phase, local_detail)
 
+    def check_equal_int(self, phase: str, value: int) -> None:
+        """Require one precomputed integer transition value on every rank."""
+
+        if not self.distributed:
+            return
+        rank = dist.get_rank(self.group)
+        self._first_failure.fill_(int(value))
+        dist.all_reduce(self._first_failure, op=dist.ReduceOp.MIN, group=self.group)
+        minimum = int(self._first_failure)
+        self._first_failure.fill_(int(value))
+        dist.all_reduce(self._first_failure, op=dist.ReduceOp.MAX, group=self.group)
+        maximum = int(self._first_failure)
+        if minimum != maximum:
+            raise DistributedPhaseFailure(
+                phase,
+                0,
+                (
+                    f"rank-common transition mismatch: min={minimum}, max={maximum}"
+                    if rank == 0
+                    else None
+                ),
+            )
+
     def run_retryable(
         self,
         phase: str,
@@ -107,7 +130,16 @@ class DistributedFailureAgreement:
             try:
                 return operation(), None, None
             except retry_types as exc:
+                exc.__traceback__ = None
+                exc.__context__ = None
+                exc.__cause__ = None
                 return None, exc, 0
+            except DistributedPhaseFailure:
+                raise
+            except Exception as exc:
+                raise DistributedPhaseFailure(
+                    phase, 0, f"{type(exc).__name__}: {exc}"
+                ) from exc
 
         rank = dist.get_rank(self.group)
         world = dist.get_world_size(self.group)
@@ -117,6 +149,9 @@ class DistributedFailureAgreement:
         try:
             result = operation()
         except retry_types as exc:
+            exc.__traceback__ = None
+            exc.__context__ = None
+            exc.__cause__ = None
             retry = exc
         except DistributedPhaseFailure:
             raise
@@ -140,5 +175,6 @@ class DistributedFailureAgreement:
                 terminal_detail if rank == common else None,
             )
         if common < 2 * world:
+            result = None
             return None, retry if rank == common else None, common - world
         return result, None, None

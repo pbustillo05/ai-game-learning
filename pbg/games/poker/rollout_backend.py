@@ -13,6 +13,7 @@ from torch import Tensor, nn
 
 from pbg.core.game import CHANCE, PRETERM, PROBE_FOLD, TERMINAL, EventBatch
 from pbg.core.observability import ExecutionMetrics
+from pbg.core.partition import PhysicalPack
 from pbg.core.storage import (
     ByteAccountant,
     PagedTensorArena,
@@ -100,6 +101,15 @@ class PokerDecisionInputCapture:
     partition_id: int
     columns: Mapping[str, Tensor]
     folded_summary: PokerFoldedSummaryCapture | None = None
+
+
+@dataclass(frozen=True)
+class PokerPhysicalPack:
+    """Opaque dequeue-time compact geometry for one natural partition pack."""
+
+    partition_id: int
+    minimum_street: int
+    compact_hand_width: int
 
 
 @dataclass
@@ -220,7 +230,7 @@ class PokerRolloutBackend:
         }
         self._partition_required = {initial_beta: False}
         self._active_decision_input_store: PokerDecisionInputCaptureStore | None = None
-        self._pending_policy_public: tuple[str, Tensor, PokerPublicBatch] | None = None
+        self._pending_policy_public: tuple[int, Tensor, PokerPublicBatch] | None = None
         self._next_dependency_anchor = 0
         self.combo_cards = torch.tensor(
             self.geometry.combo_cards,
@@ -240,26 +250,7 @@ class PokerRolloutBackend:
         # Aggregate counters are intentionally lossless.  The former bounded
         # deque silently discarded early calls in long iterations.
         self.execution_metrics = ExecutionMetrics()
-        self.execution_families = (
-            "pre",
-            *(
-                f"post_{live}_s{street}"
-                for street in range(1, RIVER + 1)
-                for live in range(2, cfg.n_players + 1)
-            ),
-        )
-        self.execution_family_values = (
-            0,
-            *(
-                street * (cfg.n_players + 1) + live
-                for street in range(1, RIVER + 1)
-                for live in range(2, cfg.n_players + 1)
-            ),
-        )
-        self.execution_family_priorities = (
-            0,
-            *(1 for _ in self.execution_families[1:]),
-        )
+        self._training_partitions = None
         self.game = self
 
     def _dynamic_positions(self, mask: Tensor, source: str) -> Tensor:
@@ -500,7 +491,7 @@ class PokerRolloutBackend:
             pending is not None
             and pending[1] is states
         ):
-            # policy_forward_family owns exactly one pending physical pack.
+            # The partition forward owns exactly one pending physical pack.
             # Decision capture validates the handle equality before consuming
             # it; sampling, transition, and reach may reuse its immutable legal
             # structure without re-encoding the same public state four times.
@@ -1250,18 +1241,16 @@ class PokerRolloutBackend:
 
     def capture_decision_inputs(
         self,
-        family: str,
+        partition_id: int,
         states: Tensor,
         log_reach: Tensor,
     ) -> PokerDecisionInputCapture:
         """Capture one player pack on its immutable natural model domain."""
 
-        live, _ = self._parse_execution_family(family)
-        partition_id = 0 if live is None else live - 1
         spec = self.training_partition_specs()[partition_id]
         pending = self._pending_policy_public
         cached_public = None
-        if pending is not None and pending[0] == family:
+        if pending is not None and pending[0] == partition_id:
             cached_states, cached_public = pending[1], pending[2]
             if cached_states is not states:
                 if cached_states.shape != states.shape:
@@ -1801,24 +1790,6 @@ class PokerRolloutBackend:
         return PokerPublicBatch(**values)
 
     @staticmethod
-    def _parse_execution_family(family: str) -> tuple[int | None, int | None]:
-        """Return ``(live_players, street)`` for rollout/learner family names."""
-
-        if family == "pre":
-            return None, 0
-        parts = family.split("_")
-        if len(parts) not in {2, 3} or parts[0] != "post":
-            raise ValueError(f"invalid poker execution family {family!r}")
-        try:
-            live = int(parts[1])
-            street = None if len(parts) == 2 else int(parts[2].removeprefix("s"))
-        except ValueError as exc:
-            raise ValueError(f"invalid poker execution family {family!r}") from exc
-        if live < 2 or street is not None and not 1 <= street <= RIVER:
-            raise ValueError(f"invalid poker execution family {family!r}")
-        return live, street
-
-    @staticmethod
     def _combine_outputs(parts: list[tuple[Tensor, PolicyOutput]], batch: int) -> PolicyOutput:
         if not parts:
             raise ValueError("cannot combine an empty policy batch")
@@ -1846,8 +1817,8 @@ class PokerRolloutBackend:
 
     def _planned_policy_batches(
         self, model: nn.Module, states: Tensor, phase: str
-    ) -> list[tuple[Tensor, str]]:
-        """Return deterministic bounded batches with host-known family names."""
+    ) -> list[tuple[Tensor, int]]:
+        """Return deterministic bounded batches with stable partition ids."""
 
         if phase not in {"training", "inference"}:
             raise ValueError("phase must be 'training' or 'inference'")
@@ -1857,14 +1828,14 @@ class PokerRolloutBackend:
             return []
         profile = self.execution_profile
         if profile is None:
-            return [(torch.arange(states.numel(), device=states.device), "")]
+            return [(torch.arange(states.numel(), device=states.device), -1)]
         source = model.module if hasattr(model, "module") else model
         post_model = getattr(source, "postflop", None)
         if post_model is None:
-            return [(torch.arange(states.numel(), device=states.device), "")]
+            return [(torch.arange(states.numel(), device=states.device), -1)]
         token_count, family = self._policy_work_rows(model, states)
         return [
-            (plan.positions, plan.family)
+            (plan.positions, plan.partition_id)
             for plan in _plan_policy_batches(
                 token_count,
                 family,
@@ -1922,32 +1893,56 @@ class PokerRolloutBackend:
             torch.where(street == 0, torch.zeros_like(live), live),
         )
 
-    def rollout_family_ids(self, states: Tensor) -> Tensor:
-        """Return exact street/live execution queues; preflop remains zero."""
+    def rollout_partition_ids(self, states: Tensor) -> Tensor:
+        """Route states to stable ``pre``/``post_A`` partition ids."""
 
         rows = states.to(torch.int64)
         street = self.states.street[rows].to(torch.int64)
         live = (self.states.status[rows] != FOLDED).sum(1).to(torch.int64)
-        post = street * (self.n_players + 1) + live
-        return torch.where(street == 0, torch.zeros_like(live), post)
+        return torch.where(street == 0, torch.zeros_like(live), live - 1)
 
-    def rollout_partition_id(self, family: str) -> int:
-        """Map a physical execution queue to its natural learner partition."""
+    def _physical_pack(self, partition_id: int, states: Tensor) -> PhysicalPack:
+        """Size one stable dequeued prefix with a single device reduction."""
 
-        live, _ = self._parse_execution_family(family)
-        return 0 if live is None else live - 1
+        if states.ndim != 1 or states.numel() == 0:
+            raise ValueError("a physical poker pack requires nonempty state handles")
+        rows = states.to(torch.int64)
+        street = self.states.street[rows].to(torch.int64)
+        if partition_id == 0:
+            minimum_street = 0
+            compact_width = self.n_classes
+        else:
+            started = time.perf_counter()
+            minimum = street.min()
+            minimum_street = int(minimum)
+            if self.device.type == "cuda":
+                self.execution_metrics.record_scheduler_control_synchronization(
+                    seconds=time.perf_counter() - started,
+                    nbytes=minimum.element_size(),
+                )
+            compact_width = math.comb(
+                self.n_cards - (minimum_street + 2), 2
+            )
+        return PhysicalPack(
+            rows=states.numel(),
+            token_width=compact_width,
+            descriptor=PokerPhysicalPack(
+                partition_id=partition_id,
+                minimum_street=minimum_street,
+                compact_hand_width=compact_width,
+            ),
+        )
 
     def training_partition_specs(self):
         """Return poker-owned natural-width partitions for generic training."""
 
         from pbg.games.poker.partitions import poker_partition_specs
 
+        if self._training_partitions is not None:
+            return self._training_partitions
+
         def router(states: Any) -> int | Tensor:
-            routed = self.rollout_family_ids(states)
-            if isinstance(routed, Tensor):
-                return torch.where(routed == 0, routed, routed - 1).to(torch.int64)
-            value = int(routed)
-            return 0 if value == 0 else value - 1
+            return self.rollout_partition_ids(states)
 
         forwards = {
             partition_id: (
@@ -1957,7 +1952,7 @@ class PokerRolloutBackend:
             )
             for partition_id in range(self.n_players)
         }
-        return poker_partition_specs(
+        self._training_partitions = poker_partition_specs(
             rank_count=self.cfg.rank_count,
             n_players=self.n_players,
             router=router,
@@ -1965,7 +1960,16 @@ class PokerRolloutBackend:
             max_history_tokens=self.max_rollout_steps,
             n_ticks=self.n_ticks,
             e_max=self.e_max,
+            pack_planners={
+                partition_id: (
+                    lambda states, partition_id=partition_id: self._physical_pack(
+                        partition_id, states
+                    )
+                )
+                for partition_id in range(self.n_players)
+            },
         )
+        return self._training_partitions
 
     def training_input_pool_schemas(
         self,
@@ -1984,60 +1988,31 @@ class PokerRolloutBackend:
             for partition_id in range(1, self.n_players - 1)
         }
 
-    def rollout_row_cost(
-        self, model: nn.Module, states: Tensor
-    ) -> tuple[Tensor, Tensor]:
-        """Return padded-token width and non-model workspace estimates ``[B]``."""
-
-        source = model.module if hasattr(model, "module") else model
-        post_model = getattr(source, "postflop", None)
-        k_act = int(getattr(getattr(post_model, "cfg", None), "k_act", 0))
-        rows = states.to(torch.int64)
-        street = self.states.street[rows].to(torch.int64)
-        live = (self.states.status[rows] != FOLDED).sum(1).to(torch.int64)
-        history = self.states.history_length[rows].to(torch.int64)
-        if self.device.type == "cuda":
-            history = torch.full_like(history, self.max_rollout_steps)
-        scalar_count = 3 * self.n_players + 13 + self.e_max + self.n_ticks
-        pre_tokens = (
-            self.n_players * self.n_classes
-            + scalar_count
-            + 1
-            + history
-            + k_act
-        )
-        # post_A deliberately mixes flop/turn/river in one invocation. Its
-        # compact tensor is therefore padded to the flop width for every row;
-        # only the realized history component varies within the family.
-        post_tokens = (
-            live * math.comb(self.n_cards - 3, 2)
-            + scalar_count
-            + 6
-            + history
-            + k_act
-        )
-        tokens = torch.where(street == 0, pre_tokens, post_tokens)
-        return tokens, torch.zeros_like(tokens)
-
-
     def _record_policy_model_call(
         self,
         model: nn.Module,
         states: Tensor,
         positions: Tensor,
-        family: str,
+        partition_id: int,
+        *,
+        compact_hand_width: int | None = None,
     ) -> None:
         """Aggregate one actual direct model call, including padded work."""
 
         if self.device.type == "cuda":
-            maximum = self._family_maximum_width(model, family)
+            maximum = self._partition_maximum_width(
+                model,
+                partition_id,
+                compact_hand_width=compact_hand_width,
+            )
         else:
             token_count, _ = self._policy_work_rows(model, states[positions])
             maximum = int(token_count.max())
         rows = int(positions.numel())
+        label = "pre" if partition_id == 0 else f"post_{partition_id + 1}"
         self.execution_metrics.record_model_call(
             "training" if torch.is_grad_enabled() else "inference",
-            family,
+            label,
             rows,
             padded_tokens=rows * maximum,
             padded_token_pairs=rows * maximum * maximum,
@@ -2107,64 +2082,75 @@ class PokerRolloutBackend:
             plans = self._planned_policy_batches(
                 frozen_model, states, "inference"
             )
-            if all(family for _, family in plans):
+            if all(partition_id >= 0 for _, partition_id in plans):
                 parts = [
                     (
                         positions,
-                        self.policy_forward_family(
+                        self.policy_forward_rollout_partition(
                             frozen_model,
-                            family,
+                            partition_id,
                             states[positions],
                             reach[positions],
+                            physical_pack=self._physical_pack(
+                                partition_id, states[positions]
+                            ),
                         ),
                     )
-                    for positions, family in plans
+                    for positions, partition_id in plans
                 ]
                 return self._combine_outputs(parts, states.shape[0])
         return self._policy_forward_direct(frozen_model, states, reach)
 
-    def policy_forward_family(
+    def policy_forward_rollout_partition(
         self,
         frozen_model: nn.Module,
-        family: str,
+        partition_id: int,
         states: Tensor,
         reach: Tensor,
+        *,
+        physical_pack: PhysicalPack,
     ) -> PolicyOutput:
-        """Execute one already-routed family, allowing mixed postflop streets."""
+        """Execute one stable natural partition with dequeue-time pack sizing."""
 
         self._select_partition_service(frozen_model)
 
         self._validate_handles(states)
         if states.ndim != 1 or states.numel() == 0:
-            raise ValueError("a family policy call requires a nonempty state vector")
+            raise ValueError("a partition policy call requires a nonempty state vector")
         if reach.shape != (states.shape[0], self.n_players, self.n_hands):
             raise ValueError("reach has the wrong compact hand width")
         rows = states.to(torch.int64)
         street = self.states.street[rows]
         live = (self.states.status[rows] != FOLDED).sum(1)
-        if family == "pre":
+        if partition_id == 0:
             expected = street == 0
-            expected_live = None
-            expected_street = 0
+            expected_live = self.n_players
         else:
-            expected_live, expected_street = self._parse_execution_family(family)
-            assert expected_live is not None
+            expected_live = partition_id + 1
             if not 2 <= expected_live <= self.n_players:
-                raise ValueError(f"invalid poker execution family {family!r}")
+                raise ValueError(f"invalid poker partition id {partition_id}")
             expected = (street != 0) & (live == expected_live)
-            if expected_street is not None:
-                expected = expected & (street == expected_street)
+        descriptor = physical_pack.descriptor
+        if (
+            physical_pack.rows != states.numel()
+            or not isinstance(descriptor, PokerPhysicalPack)
+            or descriptor.partition_id != partition_id
+            or descriptor.compact_hand_width != physical_pack.token_width
+        ):
+            raise ValueError("poker physical pack does not match its partition rows")
         if states.device.type == "cuda":
-            torch._assert_async(expected.all(), "family queue contains a misrouted poker row")
+            torch._assert_async(
+                expected.all(), "partition queue contains a misrouted poker row"
+            )
         elif not bool(expected.all()):
-            raise ValueError("family queue contains a misrouted poker row")
+            raise ValueError("partition queue contains a misrouted poker row")
 
         finite = torch.isfinite(reach)
         gauge = reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
         weights = torch.exp(reach - gauge).masked_fill(~finite, 0.0)
         pub = self.encode_public(states)
         positions = torch.arange(states.numel(), device=self.device)
-        if family == "pre":
+        if partition_id == 0:
             class_ranges = torch.zeros(
                 (states.numel(), self.n_players, self.n_classes),
                 dtype=torch.float32,
@@ -2183,7 +2169,6 @@ class PokerRolloutBackend:
             consumes_partition = bool(
                 getattr(post_model, "requires_partition_summary", False)
             )
-            assert expected_live is not None
             compatibility = self._compatibility(pub.board)
             partition = None
             if consumes_partition and expected_live < self.n_players:
@@ -2202,9 +2187,7 @@ class PokerRolloutBackend:
                 status=pub.status,
                 evaluator_summary=partition,
                 live_seat_ids=live_seat_ids,
-                compact_size=math.comb(
-                    self.n_cards - ((expected_street or 1) + 2), 2
-                ),
+                compact_size=descriptor.compact_hand_width,
             )
             output = frozen_model.forward_postflop(pub, weights, pub.to_act, masks)
             self.batch_size_histograms[f"postflop_{expected_live}"].append(
@@ -2214,16 +2197,21 @@ class PokerRolloutBackend:
         # Family routing and row count are host-known at this declared launch
         # boundary. Padded work uses the calibrated worst-case family width and
         # therefore introduces no hidden device scalar read.
-        width = self._family_maximum_width(frozen_model, family)
+        width = self._partition_maximum_width(
+            frozen_model,
+            partition_id,
+            compact_hand_width=descriptor.compact_hand_width,
+        )
+        label = "pre" if partition_id == 0 else f"post_{partition_id + 1}"
         phase = "training" if torch.is_grad_enabled() else "inference"
         self.execution_metrics.record_model_call(
             phase,
-            family,
+            label,
             states.numel(),
             padded_tokens=states.numel() * width,
             padded_token_pairs=states.numel() * width * width,
         )
-        self._pending_policy_public = (family, states, pub)
+        self._pending_policy_public = (partition_id, states, pub)
         return output
 
     def policy_forward_partition(
@@ -2318,7 +2306,7 @@ class PokerRolloutBackend:
             if output.v.shape[1] != self.n_hands:
                 raise ValueError("postflop learner forward changed the canonical domain")
             family = f"post_{live}"
-        width = self._family_maximum_width(frozen_model, family)
+        width = self._partition_maximum_width(frozen_model, partition_id)
         self.execution_metrics.record_model_call(
             "training" if torch.is_grad_enabled() else "inference",
             family,
@@ -2406,108 +2394,41 @@ class PokerRolloutBackend:
         )
         return output
 
-    def policy_forward_family_actual_cost(
+    def policy_forward_partition_actual_cost(
         self,
         frozen_model: nn.Module,
-        family: str,
+        partition_id: int,
         states: Tensor,
         reach: Tensor,
+        *,
+        physical_pack: PhysicalPack,
     ) -> PolicyOutput:
-        """Greedily split one logical family block using its actual row costs.
-
-        The cost vector is the sole device-to-host scheduler control transfer
-        for the logical block.  Planning on that fixed-size vector amortizes
-        the boundary across all physical calls and keeps queue/RNG identities
-        independent of the resulting width order.
-        """
+        """Forward one stable dequeued partition prefix at its realized width."""
 
         if states.ndim != 1 or states.numel() == 0:
-            raise ValueError("a family policy block requires a nonempty state vector")
-        # A singleton has exactly one possible physical plan.  Avoid reading a
-        # cost vector that cannot change that plan; narrow branched trees hit
-        # this case frequently.
-        if states.numel() == 1:
-            return self.policy_forward_family(frozen_model, family, states, reach)
-        profile = self.execution_profile
-        if profile is None:
-            return self.policy_forward_family(frozen_model, family, states, reach)
-
-        # CUDA history tensors are materialized at the family-wide bounded
-        # width, so every row in this already-routed family has identical
-        # padded cost. The queue calibration has already enforced the profile;
-        # a width-vector host transfer cannot improve this physical plan.
-        if self.device.type == "cuda":
-            return self.policy_forward_family(frozen_model, family, states, reach)
-
-        widths, _ = self.rollout_row_cost(frozen_model, states)
-        host_widths = widths
-
-        max_tokens = int(profile.inference_max_tokens)
-        max_pairs = int(profile.inference_max_token_pairs)
-        # Keep indexed input/output destinations on the rollout device.  The
-        # current prototype still reads the fixed-size width vector to plan
-        # greedy boundaries, but reconstructing every physical pack from a
-        # Python list used to add one H2D index transfer per model call.  A
-        # stable device argsort has precisely the requested width/insertion-order tiebreak
-        # order and lets all spans below remain device views.
-        ordered_positions = torch.argsort(widths, stable=True)
-        # Do not transfer the permutation back merely to plan its boundaries:
-        # the already-declared width vector supplies the same stable ordering
-        # on the host, while ``ordered_positions`` remains the sole index
-        # source used for device gathers/scatters.
-        ordered = sorted(
-            range(states.numel()), key=lambda position: (int(host_widths[position]), position)
+            raise ValueError("a partition policy block requires nonempty state handles")
+        return self.policy_forward_rollout_partition(
+            frozen_model,
+            partition_id,
+            states,
+            reach,
+            physical_pack=physical_pack,
         )
-        plans: list[tuple[int, int]] = []
-        current_start = 0
-        current_rows = 0
-        current_max = 0
-        for ordered_index in range(states.numel()):
-            position = ordered[ordered_index]
-            width = int(host_widths[position])
-            if width > max_tokens or width * width > max_pairs:
-                raise MemoryError(
-                    f"one {family} row needs {width} tokens/{width * width} token pairs"
-                )
-            candidate_max = max(current_max, width)
-            candidate_rows = current_rows + 1
-            if current_rows and (
-                candidate_rows * candidate_max > max_tokens
-                or candidate_rows * candidate_max * candidate_max > max_pairs
-            ):
-                plans.append((current_start, current_rows))
-                current_start = ordered_index
-                current_rows = 0
-                current_max = 0
-            current_rows += 1
-            current_max = max(current_max, width)
-        if current_rows:
-            plans.append((current_start, current_rows))
 
-        if len(plans) == 1 and plans[0] == (0, states.numel()):
-            return self.policy_forward_family(frozen_model, family, states, reach)
-
-        parts: list[tuple[Tensor, PolicyOutput]] = []
-        for start, count in plans:
-            positions = ordered_positions.narrow(0, start, count)
-            parts.append(
-                (
-                    positions,
-                    self.policy_forward_family(
-                        frozen_model, family, states[positions], reach[positions]
-                    ),
-                )
-            )
-        return self._combine_outputs(parts, states.numel())
-
-    def _family_maximum_width(self, model: nn.Module, family: str) -> int:
-        """Return the host-known padded width used by queue calibration."""
+    def _partition_maximum_width(
+        self,
+        model: nn.Module,
+        partition_id: int,
+        *,
+        compact_hand_width: int | None = None,
+    ) -> int:
+        """Return padded tokens for one natural partition and physical width."""
 
         source = model.module if hasattr(model, "module") else model
         post_model = getattr(source, "postflop", None)
         k_act = int(getattr(getattr(post_model, "cfg", None), "k_act", 0))
         scalar_count = 3 * self.n_players + 13 + self.e_max + self.n_ticks
-        if family == "pre":
+        if partition_id == 0:
             return (
                 self.n_players * self.n_classes
                 + scalar_count
@@ -2515,10 +2436,13 @@ class PokerRolloutBackend:
                 + self.max_rollout_steps
                 + k_act
             )
-        live, street = self._parse_execution_family(family)
-        assert live is not None
+        live = partition_id + 1
+        if not 2 <= live <= self.n_players:
+            raise ValueError(f"invalid poker partition id {partition_id}")
+        if compact_hand_width is None:
+            compact_hand_width = math.comb(self.n_cards - 3, 2)
         return (
-            live * math.comb(self.n_cards - ((street or 1) + 2), 2)
+            live * compact_hand_width
             + scalar_count
             + 6
             + self.max_rollout_steps
@@ -2526,17 +2450,17 @@ class PokerRolloutBackend:
         )
 
     def training_transient_bytes(
-        self, model: nn.Module, family: str, rows: int, *, amp: bool
+        self, model: nn.Module, partition_id: int, rows: int, *, amp: bool
     ) -> int:
         """Conservative activation/workspace bound for one learner subspan."""
 
         if isinstance(rows, bool) or rows <= 0:
             raise ValueError("training workspace rows must be positive")
         source = model.module if hasattr(model, "module") else model
-        branch = source.preflop if family == "pre" else source.postflop
+        branch = source.preflop if partition_id == 0 else source.postflop
         cfg = branch.cfg
-        tokens = self._family_maximum_width(source, family)
-        layers = int(cfg.n_layers_pre if family == "pre" else cfg.n_layers_post)
+        tokens = self._partition_maximum_width(source, partition_id)
+        layers = int(cfg.n_layers_pre if partition_id == 0 else cfg.n_layers_post)
         scalar_bytes = 2 if amp else 4
         # Match the configured bounded-memory attention implementation.  Flex
         # attention does not materialize the quadratic score/probability
@@ -2567,8 +2491,8 @@ class PokerRolloutBackend:
         per_row = layers * (attention + features)
         natural = (
             self.n_players * self.n_classes
-            if family == "pre"
-            else (int(self._parse_execution_family(family)[0]) * self.n_hands)
+            if partition_id == 0
+            else ((partition_id + 1) * self.n_hands)
         ) * 4
         # A 2x envelope covers gathered inputs, loss tensors, fused-attention
         # workspaces, allocator bins, and the measured forward/backward delta
@@ -2578,7 +2502,7 @@ class PokerRolloutBackend:
     def _policy_forward_direct(
         self, frozen_model: nn.Module, states: Tensor, reach: Tensor
     ) -> PolicyOutput:
-        """Route one already-budgeted street-family policy batch."""
+        """Route one already-budgeted policy batch through natural partitions."""
 
         self._validate_handles(states)
         if reach.shape != (states.shape[0], self.n_players, self.n_hands):
@@ -2616,7 +2540,7 @@ class PokerRolloutBackend:
             parts.append((preflop, output))
             self.batch_size_histograms["preflop"].append(preflop.shape[0])
             self._record_policy_model_call(
-                frozen_model, states, preflop, "pre"
+                frozen_model, states, preflop, 0
             )
 
         post = self._dynamic_positions(
@@ -2628,47 +2552,49 @@ class PokerRolloutBackend:
             consumes_partition = bool(
                 getattr(post_model, "requires_partition_summary", False)
             )
-            post_street = self.states.street[rows[post]]
             n_live = (self.states.status[rows[post]] != FOLDED).sum(1)
-            for street in range(1, RIVER + 1):
-                compact_size = math.comb(
-                    self.n_cards - (street + 2), 2
+            for live in range(2, self.n_players + 1):
+                positions = post[n_live == live]
+                if positions.numel() == 0:
+                    continue
+                physical_pack = self._physical_pack(live - 1, states[positions])
+                descriptor = physical_pack.descriptor
+                assert isinstance(descriptor, PokerPhysicalPack)
+                post_pub = self._slice_public(pub, positions)
+                compatibility = self._compatibility(post_pub.board)
+                partition = None
+                if consumes_partition and live < self.n_players:
+                    partition = self._partition_summary(
+                        states[positions], post_pub.board, weights[positions],
+                        post_pub.status, live
+                    )
+                masks = PostflopMasks(
+                    compatibility=compatibility,
+                    seat_mask=post_pub.seat_mask,
+                    combo_mask=(weights[positions] > 0),
+                    status=post_pub.status,
+                    evaluator_summary=partition,
+                    live_seat_ids=torch.where(
+                        post_pub.status != FOLDED,
+                        torch.arange(self.n_players, device=self.device)[None],
+                        self.n_players,
+                    ).sort(1).values[:, :live],
+                    compact_size=descriptor.compact_hand_width,
                 )
-                for live in range(2, self.n_players + 1):
-                    positions = post[(post_street == street) & (n_live == live)]
-                    if positions.numel() == 0:
-                        continue
-                    post_pub = self._slice_public(pub, positions)
-                    compatibility = self._compatibility(post_pub.board)
-                    partition = None
-                    if consumes_partition and live < self.n_players:
-                        partition = self._partition_summary(
-                            states[positions], post_pub.board, weights[positions],
-                            post_pub.status, live
-                        )
-                    masks = PostflopMasks(
-                        compatibility=compatibility,
-                        seat_mask=post_pub.seat_mask,
-                        combo_mask=(weights[positions] > 0),
-                        status=post_pub.status,
-                        evaluator_summary=partition,
-                        live_seat_ids=torch.where(
-                            post_pub.status != FOLDED,
-                            torch.arange(self.n_players, device=self.device)[None],
-                            self.n_players,
-                        ).sort(1).values[:, :live],
-                        compact_size=compact_size,
-                    )
-                    output = frozen_model.forward_postflop(
-                        post_pub, weights[positions], post_pub.to_act, masks
-                    )
-                    parts.append((positions, output))
-                    self.batch_size_histograms[
-                        f"postflop_{live}"
-                    ].append(positions.shape[0])
-                    self._record_policy_model_call(
-                        frozen_model, states, positions, f"post_{live}"
-                    )
+                output = frozen_model.forward_postflop(
+                    post_pub, weights[positions], post_pub.to_act, masks
+                )
+                parts.append((positions, output))
+                self.batch_size_histograms[
+                    f"postflop_{live}"
+                ].append(positions.shape[0])
+                self._record_policy_model_call(
+                    frozen_model,
+                    states,
+                    positions,
+                    live - 1,
+                    compact_hand_width=descriptor.compact_hand_width,
+                )
         return self._combine_outputs(parts, states.shape[0])
 
     def _compatibility(self, board: Tensor) -> Tensor:

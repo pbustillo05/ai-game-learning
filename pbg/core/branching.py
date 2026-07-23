@@ -11,6 +11,7 @@ from torch import Tensor
 
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, GameBundle
 from pbg.core.adaptive_branching import (
+    branched_attempt_address,
     child_path_factors,
     log_kkt_intensity,
     randomized_round,
@@ -172,8 +173,8 @@ def _sample_branched_tree_impl(
     )
     from pbg.core.rollout import (
         _logical_seed,
-        _family_ids,
-        _family_spec,
+        _partition_ids,
+        _rollout_partitions,
         _sample_events_logical,
         _sample_profiles_logical,
         _selected_policy_logp,
@@ -299,7 +300,9 @@ def _sample_branched_tree_impl(
             ("reach_handle",), occurrences.to(torch.int64)
         )["reach_handle"]
         reach_pool.release_rows(handles)
-    family_names, family_values, family_priorities = _family_spec(backend)
+    partitions = _rollout_partitions(backend)
+    partition_ids = tuple(spec.partition_id for spec in partitions.specs)
+    partition_preorder = tuple(spec.preorder for spec in partitions.specs)
     queue_limit = getattr(rollout_cfg, "queue_capacity_rows", None)
     if (
         isinstance(queue_limit, bool)
@@ -310,29 +313,23 @@ def _sample_branched_tree_impl(
     if child_pack_rows > queue_limit:
         raise ValueError("family_batch_rows cannot exceed queue_capacity_rows")
     queues = {
-        name: DeviceWorkQueue(
+        partition_id: DeviceWorkQueue(
             queue_limit,
             device,
             staging_rows=child_pack_rows,
             accountant=accountant,
-            label=f"branched_queue_{name}",
+            label=f"branched_queue_partition_{partition_id}",
         )
-        for name in family_names
+        for partition_id in partition_ids
     }
     metrics = getattr(backend, "execution_metrics", None)
     actual_cost_forward = getattr(
-        backend, "policy_forward_family_actual_cost", None
+        backend, "policy_forward_partition_actual_cost", None
     )
     if not callable(actual_cost_forward):
-        raise ValueError("production requires an actual-cost family forward")
+        raise ValueError("production requires an actual-cost partition forward")
     logical_seed = _logical_seed(cfg, gen)
-    tree_address = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    world_size = (
-        dist.get_world_size()
-        if dist.is_available() and dist.is_initialized()
-        else 1
-    )
-    rng_tree_address = tree_address + int(attempt) * world_size
+    rng_tree_address = branched_attempt_address(attempt)
     scheduler_step = 0
     completed_decision_rows = 0
     capture_inputs = getattr(backend, "capture_decision_inputs", None)
@@ -505,7 +502,8 @@ def _sample_branched_tree_impl(
         if stop_cutoff is None or buffer.node_count < stop_cutoff:
             return
         family_queue_nodes = {
-            name: int(queue.host_count) for name, queue in queues.items()
+            partitions[partition_id].name: int(queue.host_count)
+            for partition_id, queue in queues.items()
         }
         raise BranchingCutoffReached(
             node_count=buffer.node_count,
@@ -550,20 +548,22 @@ def _sample_branched_tree_impl(
     def record_queues() -> None:
         if metrics is None:
             return
-        for name, queue in queues.items():
+        for partition_id, queue in queues.items():
             metrics.record_queue(
-                name,
+                partitions[partition_id].name,
                 depth=queue.host_count,
                 oldest_age=float(queue.oldest_age(scheduler_step)),
             )
 
-    def forecast_workspace(family: str, rows: int) -> int:
+    def forecast_workspace(partition_id: int, rows: int) -> int:
         predictor = getattr(backend, "training_transient_bytes", None)
         if not callable(predictor):
             return 0
         source = bundle.model.module if hasattr(bundle.model, "module") else bundle.model
         amp = bool(getattr(getattr(cfg, "training", None), "amp", False))
-        return int(predictor(source, family, max(1, int(rows)), amp=amp))
+        return int(
+            predictor(source, partition_id, max(1, int(rows)), amp=amp)
+        )
 
     def admit(
         phase: str,
@@ -586,7 +586,7 @@ def _sample_branched_tree_impl(
 
     def offspring_for(
         nodes: Tensor,
-        family: str | None,
+        partition_id: int | None,
         output: Any | None,
         frontier_cost_forecast: float,
     ) -> tuple[Tensor, Tensor, int]:
@@ -596,7 +596,7 @@ def _sample_branched_tree_impl(
         fixed_beta = _validate_beta(backend.beta_fn(states), nodes.numel(), device)
         if branching_mode == "fixed":
             fixed_beta = (fixed_beta * fixed_scale).clamp_min(1.0)
-        if dynamic_active and family is not None:
+        if dynamic_active and partition_id is not None:
             if output is None or output.t is None or output.c is None:
                 raise RuntimeError("adaptive KKT rollout model omitted T/C heads")
             beta = log_kkt_intensity(
@@ -623,7 +623,7 @@ def _sample_branched_tree_impl(
         nominal = randomized_round(beta, logical_uniform(keys))
         offspring = nominal
         safeguard = bool(
-            family is not None
+            partition_id is not None
             and queue_pressure_active
             and buffer.node_count + frontier_cost_forecast
             > float(safe_tree_size)
@@ -665,7 +665,7 @@ def _sample_branched_tree_impl(
 
     def expand(
         nodes: Tensor,
-        family: str | None,
+        partition_id: int | None,
         frontier_cost_forecast: float = 0.0,
         *,
         forced_offspring: Tensor | None = None,
@@ -676,13 +676,6 @@ def _sample_branched_tree_impl(
         rows = nodes.to(torch.int64)
         states = buffer.state_ref[rows]
         reaches = reaches_for(nodes)
-        partition_for_family = getattr(backend, "rollout_partition_id", None)
-        if family is None:
-            partition_id = None
-        elif callable(partition_for_family):
-            partition_id = int(partition_for_family(family))
-        else:
-            partition_id = family_names.index(family)
         decision_rows = None
         if partition_id is not None and record_policy_node:
             decision_rows = reserve_capture(
@@ -690,16 +683,29 @@ def _sample_branched_tree_impl(
             )
             completed_decision_rows += nodes.numel()
         output = None
-        if dynamic_active and family is not None:
+        physical_pack = (
+            None
+            if partition_id is None
+            else partitions[partition_id].byte_work.realize(
+                states, rows=nodes.numel()
+            )
+        )
+        if dynamic_active and partition_id is not None:
             admit(
                 "rollout",
-                workspace_bytes=forecast_workspace(family, nodes.numel()),
-                reason=f"{family} adaptive policy forward",
+                workspace_bytes=forecast_workspace(partition_id, nodes.numel()),
+                reason=f"{partitions[partition_id].name} adaptive policy forward",
             )
-            output = actual_cost_forward(bundle.model, family, states, reaches)
+            output = actual_cost_forward(
+                bundle.model,
+                partition_id,
+                states,
+                reaches,
+                physical_pack=physical_pack,
+            )
         if forced_offspring is None:
             offspring, _, total = offspring_for(
-                nodes, family, output, frontier_cost_forecast
+                nodes, partition_id, output, frontier_cost_forecast
             )
         else:
             if (
@@ -719,13 +725,19 @@ def _sample_branched_tree_impl(
                 reason="root-refill child wave",
             )
             admit_child_wave(total)
-        if family is not None and output is None:
+        if partition_id is not None and output is None:
             admit(
                 "rollout",
-                workspace_bytes=forecast_workspace(family, nodes.numel()),
-                reason=f"{family} policy forward",
+                workspace_bytes=forecast_workspace(partition_id, nodes.numel()),
+                reason=f"{partitions[partition_id].name} policy forward",
             )
-            output = actual_cost_forward(bundle.model, family, states, reaches)
+            output = actual_cost_forward(
+                bundle.model,
+                partition_id,
+                states,
+                reaches,
+                physical_pack=physical_pack,
+            )
         action_rows = None
         if partition_id is not None and record_policy_node:
             assert output is not None
@@ -739,7 +751,7 @@ def _sample_branched_tree_impl(
                 decision_input_store,
                 decision_rows,
                 nodes.to(torch.int32),
-                capture_inputs(family, states, reaches),
+                capture_inputs(partition_id, states, reaches),
                 {
                     "node_id": nodes.to(torch.int32),
                     "old_v": output.v.detach().to(torch.float32),
@@ -876,7 +888,7 @@ def _sample_branched_tree_impl(
                 backend, child_states, child_reach, posterior_keys, gen
             )
             child_output = None
-            if family is not None:
+            if partition_id is not None:
                 assert output is not None
                 child_output = _index_policy_output(output, parent_positions)
             event_keys = logical_rng_keys(
@@ -886,7 +898,9 @@ def _sample_branched_tree_impl(
                 path=expanded_paths,
                 draw=ordinal,
                 purpose=(
-                    DrawPurpose.ACTION if family is not None else DrawPurpose.CHANCE
+                    DrawPurpose.ACTION
+                    if partition_id is not None
+                    else DrawPurpose.CHANCE
                 ),
             )
             events = _sample_events_logical(
@@ -898,7 +912,7 @@ def _sample_branched_tree_impl(
                 event_keys,
                 gen,
             )
-            if family is None:
+            if partition_id is None:
                 step_batch = getattr(backend, "step_chance_batch", backend.step)
             else:
                 step_batch = getattr(backend, "step_player_batch", backend.step)
@@ -922,7 +936,7 @@ def _sample_branched_tree_impl(
             )
             log_player_sum[children.to(torch.int64)] = child_log_sum
             log_ancestor_product[children.to(torch.int64)] = child_log_product
-            if family is not None and record_policy_node:
+            if partition_id is not None and record_policy_node:
                 assert child_output is not None
                 legal_ids, legal_mask = backend.legal_events(child_states)
                 edge_logp = _selected_policy_logp(
@@ -948,7 +962,7 @@ def _sample_branched_tree_impl(
             dtype=torch.int32,
             device=device,
         )
-        if family is not None and record_policy_node:
+        if partition_id is not None and record_policy_node:
             DeviceWorkQueue.mark_done(arena, rows)
         releasable = nodes[nodes != 0]
         if releasable.numel():
@@ -970,34 +984,34 @@ def _sample_branched_tree_impl(
             rows = frontier.to(torch.int64)
             owners = buffer.owner[rows]
             states = buffer.state_ref[rows]
-            family_ids = _family_ids(backend, states)
+            routed_partition_ids = _partition_ids(partitions, states)
             chance_route, leaf_route, invalid_route = -1, -2, -3
             player = (owners >= 0) & (owners < p_max)
             route = torch.where(
                 owners == CHANCE,
-                torch.full_like(family_ids, chance_route),
+                torch.full_like(routed_partition_ids, chance_route),
                 torch.where(
                     (owners == TERMINAL) | (owners == PRETERM),
-                    torch.full_like(family_ids, leaf_route),
+                    torch.full_like(routed_partition_ids, leaf_route),
                     torch.where(
                         player,
-                        family_ids,
-                        torch.full_like(family_ids, invalid_route),
+                        routed_partition_ids,
+                        torch.full_like(routed_partition_ids, invalid_route),
                     ),
                 ),
             )
             partition = stable_partition_masked(
                 frontier.to(torch.int64),
                 route,
-                (*family_values, chance_route, leaf_route),
+                (*partition_ids, chance_route, leaf_route),
             )
             counts = read_control(partition.selected_count)
-            for index, (name, count) in enumerate(
-                zip(family_names, counts[: len(family_names)], strict=True)
+            for index, (partition_id, count) in enumerate(
+                zip(partition_ids, counts[: len(partition_ids)], strict=True)
             ):
                 if count:
                     queued = partition.candidate_handles[index, :count]
-                    queues[name].enqueue(
+                    queues[partition_id].enqueue(
                         queued,
                         arena=arena,
                         logical_time=scheduler_step,
@@ -1007,11 +1021,21 @@ def _sample_branched_tree_impl(
                         qstates = buffer.state_ref[qrows]
                         admit(
                             "rollout",
-                            workspace_bytes=forecast_workspace(name, count),
-                            reason=f"{name} C-head queue forecast",
+                            workspace_bytes=forecast_workspace(partition_id, count),
+                            reason=(
+                                f"{partitions[partition_id].name} "
+                                "C-head queue forecast"
+                            ),
                         )
+                        physical_pack = partitions[
+                            partition_id
+                        ].byte_work.realize(qstates, rows=count)
                         qout = actual_cost_forward(
-                            bundle.model, name, qstates, reaches_for(queued)
+                            bundle.model,
+                            partition_id,
+                            qstates,
+                            reaches_for(queued),
+                            physical_pack=physical_pack,
                         )
                         if qout.c is None:
                             raise RuntimeError("queue-pressure accounting requires C head")
@@ -1038,7 +1062,10 @@ def _sample_branched_tree_impl(
                     {
                         "node_id": stopped_nodes,
                         "root_id": torch.full(
-                            (stopped,), int(tree_address), dtype=torch.int32, device=device
+                            (stopped,),
+                            int(rng_tree_address),
+                            dtype=torch.int32,
+                            device=device,
                         ),
                         "path_key": arena.gather_many(
                             ("path_key",), stopped_rows
@@ -1063,8 +1090,8 @@ def _sample_branched_tree_impl(
             stop_if_cutoff_reached()
             scheduler_step += 1
             selection = select_work_queue(
-                family_names,
-                family_priorities,
+                partition_ids,
+                partition_preorder,
                 queues,
                 child_pack_rows,
                 allow_partial=True,
@@ -1072,8 +1099,8 @@ def _sample_branched_tree_impl(
             )
             if selection is None:
                 raise RuntimeError("branched queue scheduler lost nonempty work")
-            family = selection.family
-            queue = queues[family]
+            partition_id = selection.partition_id
+            queue = queues[partition_id]
             count = selection.rows
             frontier_cost_forecast = queue_cost_total
             nodes = queue.dequeue(count, arena=arena).to(torch.int32)
@@ -1083,7 +1110,7 @@ def _sample_branched_tree_impl(
                 removed = read_float_control(queue_cost[nodes.to(torch.int64)].sum())
                 queue_cost_total -= removed
             record_queues()
-            chance_close(expand(nodes, family, frontier_cost_forecast))
+            chance_close(expand(nodes, partition_id, frontier_cost_forecast))
 
     chance_close(root_nodes)
     drain_player_queues()
@@ -1097,15 +1124,17 @@ def _sample_branched_tree_impl(
             raise RuntimeError("a refillable branched root must have an ordinary child")
         root_owner_value = int(root_owner[0])
         if root_owner_value == CHANCE:
-            root_family = None
+            root_partition_id = None
         elif 0 <= root_owner_value < p_max:
-            root_family_value = read_control(
-                _family_ids(backend, roots).reshape(1)
+            root_partition_id = read_control(
+                _partition_ids(partitions, roots).reshape(1)
             )[0]
             try:
-                root_family = family_names[family_values.index(root_family_value)]
-            except ValueError as error:
-                raise RuntimeError("branched root has an unknown execution family") from error
+                partitions[root_partition_id]
+            except KeyError as error:
+                raise RuntimeError(
+                    "branched root has an unknown partition id"
+                ) from error
         else:
             raise RuntimeError("branched root must be expandable for root refill")
 
@@ -1114,7 +1143,7 @@ def _sample_branched_tree_impl(
             refill_count += 1
             extra = expand(
                 root_nodes,
-                root_family,
+                root_partition_id,
                 forced_offspring=torch.ones(1, dtype=torch.int64, device=device),
                 forced_edge_weight=1.0 / root_pre_refill_child_count,
                 record_policy_node=False,
@@ -1240,6 +1269,7 @@ def _sample_branched_tree_impl(
     sealed_diagnostics = {
         **diagnostics,
         "branching_attempt": int(attempt),
+        "branching_attempt_address": rng_tree_address,
         "fixed_beta_scale": fixed_scale,
         "execution_accountant_limit_bytes": accountant.limit_bytes,
         "execution_accountant_high_water_bytes": accountant.high_water_bytes,

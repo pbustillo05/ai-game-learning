@@ -324,6 +324,38 @@ def test_mode_loss_cache_recompute_and_split_gradient_equality(mode, value_loss)
     assert torch.allclose(model.weight.grad, unsplit, atol=2e-7, rtol=2e-6)
 
 
+def test_branched_mode_loss_uses_legal_inert_events_for_ragged_padding() -> None:
+    storage, specs, partition = _fixture("branched_rb")
+    # Decision one owns only action row two (event zero). Its inactive padded
+    # slot physically points at decision two's first action (event one), which
+    # is deliberately illegal for decision one.
+    partition.columns["legal_event_mask"][1] = torch.tensor([True, False])
+
+    class StrictAdapter(_Adapter):
+        def log_prob(self, output, events, legal_ids, legal_mask):
+            selected_is_legal = (
+                (legal_ids[:, None, :] == events[:, :, None])
+                & legal_mask[:, None, :]
+            ).any(-1)
+            if not bool(selected_is_legal.all()):
+                raise ValueError("ragged padding selected an illegal event")
+            return super().log_prob(output, events, legal_ids, legal_mask)
+
+    rows = torch.arange(partition.inputs.rows)
+    output = _Model().output(partition.inputs.columns)
+    result = mode_loss(
+        "branched_rb",
+        specs[0],
+        storage,
+        partition,
+        rows,
+        output,
+        StrictAdapter(),
+        _loss_cfg(),
+    )
+    assert torch.isfinite(result.per_decision).all()
+
+
 def test_normal_mode_loss_matches_direct_production_formula() -> None:
     storage, specs, partition = _fixture("normal")
     model = _Model()

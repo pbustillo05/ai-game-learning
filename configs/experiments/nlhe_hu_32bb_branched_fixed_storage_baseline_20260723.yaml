@@ -1,0 +1,88 @@
+game:
+  n_players: 2
+  stack_bb: 32.0
+  rank_count: 13
+
+rollout:
+  # The benchmark harness rewrites this to 3,072 for sequential modes. Fixed
+  # branching always samples one distinguished-root tree per rank.
+  sequential_roots_per_gpu_initial: 1
+  sequential_roots_per_gpu_minimum: 1
+  sequential_roots_per_gpu_maximum: 1
+  branching_mode: fixed
+  beta:
+    default: 3.0
+  # Configure the C-head safeguard but require its calibration gate to activate
+  # it. Checkpoint 1,110 has only dummy untrained T/C heads, so its high
+  # calibration loss must leave the safeguard inactive. The independent
+  # diagnostic node cutoff is the benchmark's temporary OOM guard.
+  safe_tree_size: 30000.0
+  safe_tree_activation_gamma_deviance_max: 0.1
+  safe_tree_activation_p95_underprediction_max: 2.0
+  safe_tree_activation_consecutive_iters: 8
+  # This is only the protected lower-tail refill used to remove near-empty
+  # trees from the fixed-beta distribution. It is not a workload-size target.
+  branching_min_nodes: 1000
+  branching_ideal_nodes: 20000.0
+  queue_capacity_rows: 32768
+  family_batch_rows: 84
+  max_active_trajectories: 64
+  storage_page_rows: 256
+  execution_memory_bytes: 1610612736
+  branching_oom_retry_limit: 0
+
+device: cuda
+
+completion:
+  n_samples: 1024
+
+model:
+  d_model: 128
+  n_heads: 4
+  n_layers_pre: 4
+  n_layers_post: 6
+  m_raise: 2
+  k_act: 5
+  s_min: 0.02
+  max_players: 2
+  class_embedding_dim: 32
+  ffn_hidden: null
+  use_branching_heads: true
+  max_history_tokens: 42
+  folder_beta_rank: 0
+  folder_line_dim: 8
+  eps: 1.0e-8
+
+training:
+  mode: branched_rao_blackwell
+  iters: 1
+  # 58 * 256 = 14,848 statistical rows per rank and iteration.
+  gd_steps_per_iter: 58
+  ppo_epochs: null
+  minibatch_size: 256
+  lr: 0.00005
+  adam_betas: [0.9, 0.999]
+  optimizer: adamw
+  grad_clip: 0.5
+  amp: true
+  seed: 101
+  checkpoint_every: 1
+  out_dir: runs/experiments/nlhe_hu_32bb_branched_fixed_storage_baseline_20260723
+  reproducibility: throughput
+  kl_ref_interval: 100
+  kl_ref_effective_hands_rollout: 172800000.0
+
+loss:
+  name: rb_ppo
+  lam: 0.95
+  clip_eps: 0.2
+  clip_eps_v: 0.2
+  c_v: 0.125
+  c_h: 0.025
+  c_kl: 0.05
+  c_t: 1.0
+  c_c: 1.0
+  entropy_schedule: linear_decay
+  entropy_decay_iters: 500
+  utility_normalization: stack
+  value_loss: clipped

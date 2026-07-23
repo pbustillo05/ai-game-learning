@@ -87,7 +87,7 @@ $\preceq$ & Optional preorder used only to choose among otherwise eligible queue
 $X_m=|\mathcal X_m|$ & Exact private-state width used by targets and losses. \\
 $Y_m=|\mathcal Y_m|$, $\varphi_m$ & Natural model-row width and fixed exact-state-to-model-row lookup. \\
 input/model layout & Natural partition input and curried policy/value forward on $\mathcal Y_m$. \\
-byte/work contract & Fixed worst-case retained bytes per row, transient bytes per physical pack, safe row limits, and legal batch quanta. \\
+byte/work contract & Fixed worst-case retained bytes per row, transient bytes per physical pack, safe row limits, legal batch quanta, and an optional game-owned realized-pack cost oracle. \\
 completion specification & Opaque immutable leaf fields, exact ordered reach domain, counter-based seed/key, declared output rows, and calibrated completion bytes/work. \\
 \bottomrule
 \end{tabular}
@@ -109,10 +109,20 @@ Poker supplies exactly
 \]
 with the $\mathsf{post}_A$ mutually incomparable.  The public board and betting
 history remain opaque input fields.  Flop, turn, and river with the same $A$
-are one partition, use the same fixed dense hand width, and are not sorted,
-split, packed, or assigned different physical costs by street.  This contract
-contains no optimization based on structural zeros after a board card is
-revealed.
+are one partition, use the same fixed dense retained hand width, and are not
+sorted, split, rerouted, or delayed by street.  After the scheduler dequeues a
+stable prefix $Q$ of $\mathsf{post}_A$, however, its game-owned byte/work oracle
+may declare the physical compact width
+\[
+  H_Q^{\max}=\binom{4R-b_{\min}(Q)}{2},
+  \qquad b_{\min}(Q)=\min_{x\in Q}|\operatorname{board}(x)|.
+\]
+This one reduction sizes every row in that physical pack: a prefix containing
+a flop uses flop width, a turn/river-only prefix uses turn width, and an
+all-river prefix uses river width.  The realized descriptor is returned through
+the immutable partition's byte/work contract.  Core sees only the declared
+cost and never inspects the board, street, or a diagnostic name.  Canonical
+stored model outputs and targets remain full $H$ rows.
 
 Let
 \[
@@ -549,19 +559,28 @@ checkpointed.
 
 This is a capacity controller, not a geometry rejection rule.  Neither it nor
 \Obj{SafeAdmit} may truncate, discard, reroll, or replace already selected
-roots.  \Obj{SafeAdmit} only limits concurrent live frontier work.  If the
-declared transaction for a chunk, seal, completion, or singleton learner
-subspan cannot fit, the run checkpoints and stops cleanly; it does not alter
-the conditional sampling law.  Optional reference caches are excluded from
-root feasibility and may be admitted later only when both cache construction
-and training fit.  Consequently the empty-cache path is always the safety
-fallback.
+roots in normal or sequential-RB modes.  \Obj{SafeAdmit} only limits concurrent
+live frontier work.  If the declared transaction for a chunk, seal, completion,
+or singleton learner subspan cannot fit, a sequential run checkpoints and
+stops cleanly; it does not alter the conditional sampling law.  The sole
+exception is a classified branched memory/admission failure: after every owner
+of the failed partial/sealed attempt is released, the bounded synchronized
+recovery in \texttt{family\_scheduled\_rollout.tex} backs off branching
+controls and redraws the one branched tree at a disjoint attempt address.  This
+OOM-conditioned selection can bias the realized branched sample.  Optional
+reference caches are excluded from root feasibility and may be admitted later
+only when both cache construction and training fit.  Consequently the
+empty-cache path is always the safety fallback.
 
 At every phase boundary, terminal local failures participate in one declared
 common-order control agreement before any later collective.  If any rank
 fails, all ranks release the current partial/sealed store and terminate from
-the last completed checkpoint.  A rank must never skip a collective while
-healthy peers enter it, and no failed current iteration is retried.
+the last completed checkpoint.  A classified branched memory/admission failure
+instead participates in the retry agreement only after full attempt release;
+all ranks must agree on the identical control transition and next attempt
+number before drawing again.  Exhaustion and every non-memory, invalid-data,
+correctness, evaluator, or collective failure remain terminal.  A rank must
+never skip a collective while healthy peers enter it.
 
 \section{HU 32 bb sequential-RB back-of-the-envelope}
 
@@ -661,15 +680,23 @@ Sealing tests must force multiple source chunks and verify exact destination
 extents, stable row/topology order, and a measured peak no larger than the
 declared source-plus-destination-plus-scratch transaction.  Controller tests
 must cover cold start, immediate decrease, delayed/capped increase, multi-rank
-minimum, checkpoint resume, underestimated geometry, and clean pre-draw or
-singleton failure with no reroll.  Poker tests must assert that all stored
+minimum, checkpoint resume, and underestimated geometry.  Sequential
+pre-draw/singleton failure must stop with no reroll.  Branched-OOM tests must
+prove whole-attempt release, a rank-common control update, distinct old/new
+attempt addresses, bounded retries, observable causes and memory peaks, and a
+terminal stop on exhaustion; non-memory failure injection must prove that this
+exception is not entered.  Poker tests must assert that all stored
 preflop model inputs/outputs/caches have width $K$ (169 for $R=13$), all stored
 postflop model inputs/outputs/caches have width $H$ (1326 for $R=13$), and RB
 posteriors/targets retain the canonical $H$ exact-hand order in both cases.
-No postflop-street specialization should be
-added without a separate controlled experiment showing a material end-to-end
-gain at equal sampled spots, identical estimators/losses, and no loss of safe
-decision capacity; the current design intentionally contains none.
+Poker rollout tests must additionally prove that routing exposes only
+$\mathsf{pre}$ and $\mathsf{post}_A$ queues, that mixed-street prefixes preserve
+insertion order, and that their realized compact widths equal
+$\binom{4R-b_{\min}(Q)}2$.  Controlled CUDA measurements compare equal dequeued
+rows and fixed logical RNG addresses, report each prefix's street composition,
+and require a branched end-to-end gain without a sequential regression outside
+measurement noise.  This physical optimization never authorizes
+street-specific queues, retained layouts, or learner partitions.
 
 \section{Traceability to future game-neutral units}
 

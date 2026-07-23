@@ -120,9 +120,12 @@ $W$ later successful observations preserve coverage;
 Record which phase and field constrained the next width, the predicted and
 observed peaks, guard headroom, controller version, and $G_k$;
 Checkpoint the state atomically with the training checkpoint;
-\tcc{Never discard, truncate, reroll, or retry an iteration to make its
-realized geometry fit.  A runtime singleton/admission failure is a clean
-checkpointed stop and conservative next-run evidence, not a new random draw.}
+\tcc{In normal and sequential-RB modes, never discard, truncate, reroll, or
+retry an iteration to make its realized geometry fit.  A runtime
+singleton/admission failure is a clean checkpointed stop and conservative
+next-run evidence, not a new random draw.  The sole exception is the
+whole-attempt branched-OOM recovery defined by
+\Obj{FamilyScheduledRollout}; it never applies to this sequential controller.}
 \Return{$\Obj{WidthState}_k$};
 \end{algorithm}
 

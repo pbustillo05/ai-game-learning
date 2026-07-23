@@ -25,6 +25,7 @@ from pbg.core.br import SHARED_RESPONSE_SEMANTICS
 from pbg.core.config import RootConfig, seed_all
 from pbg.core.adaptive_branching import (
     AdaptiveKKTController,
+    branched_attempt_address,
     CostSafeguardController,
     FixedBetaController,
 )
@@ -2228,6 +2229,46 @@ def _one_iteration(
     identity_metrics: dict[str, float] = {}
     retry_records: list[dict[str, Any]] = []
     attempt = 0
+
+    def retry_control_state() -> dict[str, Any]:
+        mode = str(cfg.rollout.branching_mode)
+        if isinstance(branching_controller, FixedBetaController):
+            configured = cfg.rollout.beta or {}
+            return {
+                "mode": mode,
+                "log_kappa": float(branching_controller.scalar.log_kappa),
+                "kappa": float(branching_controller.scale),
+                "emergency_backoffs": int(
+                    branching_controller.scalar.emergency_backoffs
+                ),
+                "pending_emergency": bool(
+                    branching_controller.scalar.pending_emergency
+                ),
+                "effective_beta": {
+                    str(name): float(value)
+                    for name, value in branching_controller.effective_schedule(
+                        configured
+                    ).items()
+                },
+            }
+        if isinstance(branching_controller, AdaptiveKKTController):
+            adaptive = cfg.rollout.adaptive_kkt
+            return {
+                "mode": mode,
+                "log_kappa": float(branching_controller.log_kappa),
+                "kappa": float(math.exp(branching_controller.log_kappa)),
+                "emergency_backoffs": int(
+                    branching_controller.emergency_backoffs
+                ),
+                "pending_emergency": bool(
+                    branching_controller.pending_emergency
+                ),
+                "beta_max": (
+                    None if adaptive is None else float(adaptive.beta_max)
+                ),
+            }
+        return {"mode": mode}
+
     while True:
         def build_attempt() -> IterationData:
             built = _build_iteration_data(
@@ -2292,7 +2333,6 @@ def _one_iteration(
                 reserved_peak_bytes=reserved_peak,
             )
         release = getattr(bundle.rollout_backend, "release_rollout_owners", None)
-        cleanup_ok = True
         cleanup_detail = ""
         try:
             if callable(release):
@@ -2303,30 +2343,75 @@ def _one_iteration(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
         except Exception as cleanup_error:  # noqa: BLE001 - preserve OOM evidence
-            cleanup_ok = False
             cleanup_detail = f"{type(cleanup_error).__name__}: {cleanup_error}"
-        retry_records.append(
-            {
-                "attempt": attempt,
-                "failing_rank": failing_rank,
-                "phase": rejection.phase,
-                "reason": rejection.reason,
-                "predicted_bytes": rejection.predicted_bytes,
-                "allocated_peak_bytes": max(
-                    rejection.allocated_peak_bytes, allocated_peak
-                ),
-                "reserved_peak_bytes": max(
-                    rejection.reserved_peak_bytes, reserved_peak
-                ),
-                "cleanup_ok": cleanup_ok,
-                "cleanup_detail": cleanup_detail,
-            }
+        agreement.check(
+            "branched memory retry cleanup",
+            cleanup_detail or None,
         )
         backoff = float(cfg.rollout.branching_emergency_backoff)
         if branching_controller is None:
             raise RuntimeError("branched retry requires branching controller state")
-        branching_controller.emergency_backoff(backoff)
-        attempt += 1
+        backoff_detail = ""
+        controls_before: dict[str, Any] = {}
+        controls_after: dict[str, Any] = {}
+        backoff_metrics: dict[str, float] = {}
+        try:
+            controls_before = retry_control_state()
+            backoff_metrics = {
+                str(name): float(value)
+                for name, value in branching_controller.emergency_backoff(
+                    backoff
+                ).items()
+            }
+            controls_after = retry_control_state()
+        except Exception as backoff_error:  # noqa: BLE001 - rank-common stop
+            backoff_detail = f"{type(backoff_error).__name__}: {backoff_error}"
+        agreement.check(
+            "branched memory retry controller backoff",
+            backoff_detail or None,
+        )
+        next_attempt = attempt + 1
+        world_size = (
+            dist.get_world_size(agreement.group) if agreement.distributed else 1
+        )
+        transition = {
+            "next_attempt": next_attempt,
+            "world_size": world_size,
+            "controls": controls_after,
+        }
+        transition_fingerprint = int(
+            hashlib.sha256(
+                json.dumps(transition, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:15],
+            16,
+        )
+        agreement.check_equal_int(
+            "branched memory retry transition",
+            transition_fingerprint,
+        )
+        retry_record = {
+            "attempt": attempt,
+            "attempt_address": branched_attempt_address(attempt),
+            "next_attempt": next_attempt,
+            "next_attempt_address": branched_attempt_address(next_attempt),
+            "failing_rank": failing_rank,
+            "phase": rejection.phase,
+            "reason": rejection.reason,
+            "predicted_bytes": rejection.predicted_bytes,
+            "hard_ceiling_bytes": rejection.hard_ceiling_bytes,
+            "allocated_peak_bytes": max(
+                rejection.allocated_peak_bytes, allocated_peak
+            ),
+            "reserved_peak_bytes": max(
+                rejection.reserved_peak_bytes, reserved_peak
+            ),
+            "controls_before": controls_before,
+            "controls_after": controls_after,
+            "backoff_metrics": backoff_metrics,
+            "cleanup_ok": True,
+        }
+        retry_records.append(retry_record)
+        attempt = next_attempt
         if attempt > int(cfg.rollout.branching_oom_retry_limit):
             agreement.check(
                 "branched memory retry exhaustion",
@@ -2336,7 +2421,7 @@ def _one_iteration(
                 f"predicted={rejection.predicted_bytes}; "
                 f"allocated_peak={rejection.allocated_peak_bytes}; "
                 f"reserved_peak={rejection.reserved_peak_bytes}; "
-                f"cleanup_ok={cleanup_ok}",
+                f"retry_record={json.dumps(retry_record, sort_keys=True)}",
             )
     if retry_records:
         data.profile_metrics.update(
@@ -2459,12 +2544,11 @@ def _one_iteration(
         [storage.sampling.log_z[partition_id] for partition_id in active_ids]
     )
     local_mass = torch.exp(local_logs - torch.logsumexp(local_logs, 0))
-    family_names = (
-        "pre" if partition_id == 0 else f"post_{partition_id + 1}"
-        for partition_id in active_ids
-    )
     widths = torch.tensor(
-        [bundle.rollout_backend._family_maximum_width(source, name) for name in family_names],
+        [
+            bundle.rollout_backend._partition_maximum_width(source, partition_id)
+            for partition_id in active_ids
+        ],
         dtype=torch.float64,
         device=device,
     )
@@ -2490,11 +2574,14 @@ def _one_iteration(
     physical_shapes: dict[int, tuple[PhysicalShape, ...]] = {}
     reference_build_shapes: dict[int, tuple[PhysicalShape, ...]] = {}
     for partition_id in active_ids:
-        family_name = "pre" if partition_id == 0 else f"post_{partition_id + 1}"
         configured = int(cfg.rollout.family_batch_rows or statistical_counts[partition_id])
         row_cap = max(1, min(configured, statistical_counts[partition_id]))
         if cfg.hardware is not None:
-            width = int(bundle.rollout_backend._family_maximum_width(source, family_name))
+            width = int(
+                bundle.rollout_backend._partition_maximum_width(
+                    source, partition_id
+                )
+            )
             token_cap = cfg.hardware.training_max_tokens // max(width, 1)
             pair_cap = cfg.hardware.training_max_token_pairs // max(width * width, 1)
             row_cap = max(1, min(row_cap, token_cap, pair_cap))
@@ -2502,11 +2589,11 @@ def _one_iteration(
         if not callable(predictor):
             raise TypeError("rollout backend lacks a learner workspace contract")
         while row_cap > 1 and predictor(
-            source, family_name, row_cap, amp=amp_enabled
+            source, partition_id, row_cap, amp=amp_enabled
         ) > available_transient:
             row_cap = max(1, row_cap // 2)
         transient_bytes = predictor(
-            source, family_name, row_cap, amp=amp_enabled
+            source, partition_id, row_cap, amp=amp_enabled
         )
         iteration_profile[
             f"partition_{partition_id}_physical_rows"
@@ -2523,12 +2610,12 @@ def _one_iteration(
         # row count (and never beyond the configured family pack).
         build_row_cap = min(configured, 2 * row_cap)
         build_transient = math.ceil(
-            predictor(source, family_name, build_row_cap, amp=amp_enabled) / 2
+            predictor(source, partition_id, build_row_cap, amp=amp_enabled) / 2
         )
         while build_row_cap > row_cap and build_transient > available_transient:
             build_row_cap = max(row_cap, build_row_cap // 2)
             build_transient = math.ceil(
-                predictor(source, family_name, build_row_cap, amp=amp_enabled) / 2
+                predictor(source, partition_id, build_row_cap, amp=amp_enabled) / 2
             )
         iteration_profile[
             f"partition_{partition_id}_reference_build_rows"
@@ -3243,6 +3330,9 @@ def run_training(
                 "learner construction",
                 "mandatory learner singleton feasibility",
                 "local backward step 0",
+                "branched memory retry cleanup",
+                "branched memory retry controller backoff",
+                "branched memory retry transition",
                 "branched memory retry exhaustion",
             }
             local_rng_state = capture_rng_state(torch_gen, np_gen)
@@ -3342,6 +3432,8 @@ def run_training(
             if (
                 key.startswith("memory_")
                 or key.startswith("phase_") and "peak_" in key
+                or key.startswith("branching_retry")
+                or key in {"branching_attempt", "branching_attempt_address"}
                 or key.startswith("execution_")
                 and any(
                     marker in key

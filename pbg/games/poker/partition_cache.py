@@ -83,7 +83,7 @@ class DevicePartitionSummaryCache:
     Only realized distinct anchors own rows. Lookup scans admitted key pages;
     there is no validity vector or summary payload shaped by rollout capacity.
     Folder dimensions use fixed per-row maximum storage and are sliced to the
-    host-known execution family on return.
+    host-known natural partition on return.
     """
 
     def __init__(

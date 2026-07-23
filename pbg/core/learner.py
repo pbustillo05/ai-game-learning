@@ -758,12 +758,21 @@ def mode_loss(
         )
         weight = child_posterior.reshape(rows.numel(), maximum, -1).sum(1)
         weight = weight / counts[:, None].to(weight)
-        events = _column(actions, "event")[action_rows].long()[:, None]
         # Policy output is per decision; repeat natural rows only for this
         # physical action span, never as retained storage.
         repeated_output = _output_rows(output, decision_index)
         repeated_legal_ids = legal_ids[decision_index]
         repeated_legal_mask = legal_mask[decision_index]
+        events = _column(actions, "event")[action_rows].long()[:, None]
+        # A fixed-width ragged pack may index the following decision's first
+        # action in an inactive tail slot.  Give those inert rows a legal event
+        # from their own decision before calling the strict policy adapter;
+        # their posterior and every reported ratio/clip contribution remain
+        # masked below.
+        safe_event = repeated_legal_ids.gather(
+            1, repeated_legal_mask.to(torch.int64).argmax(1, keepdim=True)
+        )
+        events = torch.where(active_rows[:, None], events, safe_event)
         action_logp = _exact_rows(
             adapter.log_prob(
                 repeated_output, events, repeated_legal_ids, repeated_legal_mask

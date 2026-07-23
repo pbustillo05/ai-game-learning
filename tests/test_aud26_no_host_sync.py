@@ -34,7 +34,7 @@ from pbg.games.poker.mc import (
     _linear_reach,
     _normalize_board,
 )
-from pbg.games.poker.rollout_backend import PokerRolloutBackend
+from pbg.games.poker.rollout_backend import PokerPhysicalPack, PokerRolloutBackend
 from tests.categorical_policy_fixture import CategoricalPolicyAdapter, PolicyOutput
 
 
@@ -138,6 +138,51 @@ def test_cuda_hot_path_implementations_do_not_copy_or_branch_through_host() -> N
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_partition_router_and_dequeue_pack_width_mix_postflop_streets() -> None:
+    device = torch.device("cuda")
+    cfg = PokerConfig(n_players=3, stack_bb=8.0, rank_count=4)
+    backend = PokerRolloutBackend(
+        cfg,
+        device,
+        storage_page_rows=8,
+        max_rollout_steps=16,
+        partition_adapter=_DevicePartition(),
+    )
+    states = backend.sequential_start_states(4)
+    backend.states.street[states.to(torch.int64)] = torch.tensor(
+        [0, 1, 2, 3], dtype=torch.int32, device=device
+    )
+    partitions = backend.training_partition_specs()
+    assert backend.training_partition_specs() is partitions
+
+    assert tuple(spec.name for spec in partitions.specs) == (
+        "pre",
+        "post_2",
+        "post_3",
+    )
+    assert torch.equal(
+        partitions.route(states),
+        torch.tensor([0, 2, 2, 2], dtype=torch.int64, device=device),
+    )
+
+    expected = (
+        (states[1:], 1, 78),
+        (states[2:], 2, 66),
+        (states[3:], 3, 55),
+    )
+    for handles, minimum_street, compact_width in expected:
+        pack = partitions[2].byte_work.realize(
+            handles, rows=handles.numel()
+        )
+        assert pack.token_width == compact_width
+        assert isinstance(pack.descriptor, PokerPhysicalPack)
+        assert pack.descriptor.minimum_street == minimum_street
+        assert pack.descriptor.compact_hand_width == compact_width
+
+    backend.release_rollout_owners()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_alias_compaction_and_biased_attention_request_no_host_sync() -> None:
     device = torch.device("cuda")
     attention = MHA(16, 4).to(device)
@@ -223,13 +268,17 @@ def test_branched_loss_ragged_action_controls_request_no_host_sync() -> None:
         "legal_event_ids": torch.tensor(
             [[0, 1], [0, 1]], dtype=torch.int32, device=device
         ),
-        "legal_event_mask": torch.ones((2, 2), dtype=torch.bool, device=device),
+        # Decision zero's inactive padded slot points at action row one, whose
+        # event is deliberately illegal for decision zero.
+        "legal_event_mask": torch.tensor(
+            [[True, False], [True, True]], dtype=torch.bool, device=device
+        ),
         "old_value": torch.zeros((2, 2), device=device),
         "value_hat": torch.zeros((2, 4), device=device),
     }
     actions = {
         "action_ptr": torch.tensor([0, 1, 3], dtype=torch.int32, device=device),
-        "event": torch.tensor([0, 0, 1], dtype=torch.int32, device=device),
+        "event": torch.tensor([0, 1, 0], dtype=torch.int32, device=device),
         "old_log_prob": torch.zeros((3, 2), device=device),
         "child_posterior": torch.ones((3, 4), device=device),
         "advantage_hat": torch.zeros((3, 4), device=device),
@@ -323,15 +372,23 @@ def test_full_preflop_postflop_policy_inputs_request_no_host_sync() -> None:
             {"cards": torch.tensor([[3, 7, 11]], dtype=torch.int16, device=device)},
         ),
     )
-    sealed_preflop = backend.capture_decision_inputs("pre", root, reach).columns
+    sealed_preflop = backend.capture_decision_inputs(0, root, reach).columns
+    pre_pack = backend._physical_pack(0, root)
+    post_pack = backend._physical_pack(1, flop)
 
     previous = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode("error")
     try:
         with torch.no_grad():
-            pre = backend.policy_forward_family(model, "pre", root, reach)
-            post = backend.policy_forward_family(model, "post_2", flop, reach)
-            cached = backend.policy_forward_family(model, "post_2", flop, reach)
+            pre = backend.policy_forward_rollout_partition(
+                model, 0, root, reach, physical_pack=pre_pack
+            )
+            post = backend.policy_forward_rollout_partition(
+                model, 1, flop, reach, physical_pack=post_pack
+            )
+            cached = backend.policy_forward_rollout_partition(
+                model, 1, flop, reach, physical_pack=post_pack
+            )
             sealed = backend.policy_forward_partition(model, 0, sealed_preflop)
         assert pre.v.is_cuda and post.v.is_cuda and cached.v.is_cuda and sealed.v.is_cuda
     finally:
@@ -403,7 +460,13 @@ def test_folded_summaries_have_sparse_anchor_ownership_and_complete_accounting()
         ),
     )
     with torch.no_grad():
-        backend.policy_forward_family(model, "post_3", flop_all_live, reach)
+        backend.policy_forward_rollout_partition(
+            model,
+            2,
+            flop_all_live,
+            reach,
+            physical_pack=backend._physical_pack(2, flop_all_live),
+        )
     assert partition.calls == 0
 
     # Two scheduler packs sharing one dependency anchor compute and retain one
@@ -423,11 +486,15 @@ def test_folded_summaries_have_sparse_anchor_ownership_and_complete_accounting()
     )
     for node_id in (10, 11):
         with torch.no_grad():
-            output = backend.policy_forward_family(
-                model, "post_2", flop_after_fold, reach
+            output = backend.policy_forward_rollout_partition(
+                model,
+                1,
+                flop_after_fold,
+                reach,
+                physical_pack=backend._physical_pack(1, flop_after_fold),
             )
         capture = backend.capture_decision_inputs(
-            "post_2", flop_after_fold, reach
+            1, flop_after_fold, reach
         )
         capture_rows = backend.reserve_decision_input_captures(store, 1, 1)
         backend.write_decision_input_capture(

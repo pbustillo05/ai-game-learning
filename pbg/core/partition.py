@@ -28,6 +28,24 @@ class CompletionForward(Protocol):
     def __call__(self, leaves: Mapping[str, Tensor], *, rows: Tensor) -> Any: ...
 
 
+@dataclass(frozen=True)
+class PhysicalPack:
+    """Game-owned realized sizing for one stable dequeued partition prefix."""
+
+    rows: int
+    token_width: int
+    descriptor: Any = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.rows, bool)
+            or self.rows <= 0
+            or isinstance(self.token_width, bool)
+            or self.token_width <= 0
+        ):
+            raise ValueError("physical pack rows and token width must be positive")
+
+
 def _freeze_mapping(value: Mapping[str, int]) -> Mapping[str, int]:
     result = {str(name): int(size) for name, size in value.items()}
     if any(not name or size < 0 for name, size in result.items()):
@@ -48,6 +66,7 @@ class ByteWorkContract:
     transient_per_pack: Mapping[str, int] = field(default_factory=dict)
     max_rows: int = 1
     batch_quanta: tuple[int, ...] = (1,)
+    pack: Callable[[Any], PhysicalPack] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "retained_per_row", _freeze_mapping(self.retained_per_row))
@@ -64,6 +83,8 @@ class ByteWorkContract:
         if quanta[0] != 1:
             raise ValueError("batch_quanta must include singleton execution")
         object.__setattr__(self, "batch_quanta", quanta)
+        if self.pack is not None and not callable(self.pack):
+            raise TypeError("physical pack planner must be callable")
 
     @property
     def retained_row_bytes(self) -> int:
@@ -72,6 +93,18 @@ class ByteWorkContract:
     @property
     def transient_pack_bytes(self) -> int:
         return sum(self.transient_per_pack.values())
+
+    def realize(self, public_state: Any, *, rows: int) -> PhysicalPack:
+        """Return opaque game-owned physical sizing without parsing it in core."""
+
+        if isinstance(rows, bool) or rows <= 0 or rows > self.max_rows:
+            raise ValueError("physical pack row count is outside the declared bound")
+        if self.pack is None:
+            return PhysicalPack(rows=rows, token_width=1)
+        result = self.pack(public_state)
+        if not isinstance(result, PhysicalPack) or result.rows != rows:
+            raise ValueError("physical pack planner returned an invalid row extent")
+        return result
 
 
 @dataclass(frozen=True)

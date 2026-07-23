@@ -20,6 +20,7 @@ from pbg.core.branching import (
 )
 from pbg.config import ConfigError, load_config
 from pbg.core.game import EventBatch, GameBundle, TERMINAL
+from pbg.core.partition import ByteWorkContract, PartitionSet, PartitionSpec
 from pbg.core.rollout import _selected_policy_logp
 from pbg.core.tree import PagedRolloutTopology
 from pbg.core.storage import (
@@ -103,16 +104,40 @@ class _LabeledBackend:
         self.forward_batch_sizes.append(int(states.numel()))
         return model(states)
 
-    def policy_forward_family_actual_cost(
+    def policy_forward_partition_actual_cost(
         self,
         model: nn.Module,
-        family: str,
+        partition_id: int,
         states: Tensor,
         reach: Tensor,
+        *,
+        physical_pack: object,
     ) -> _Output:
-        assert family == "default"
+        assert partition_id == 0
+        assert physical_pack is not None
         self.actual_cost_batch_sizes.append(int(states.numel()))
         return self.policy_forward(model, states, reach)
+
+    def training_partition_specs(self) -> PartitionSet:
+        return PartitionSet(
+            (
+                PartitionSpec(
+                    partition_id=0,
+                    name="default",
+                    router=lambda states: torch.zeros_like(states, dtype=torch.int64),
+                    exact_width=1,
+                    model_width=1,
+                    exact_to_model=(0,),
+                    forward=lambda inputs: inputs,
+                    byte_work=ByteWorkContract(max_rows=2**31 - 1),
+                    input_schema=TensorSchema(
+                        "dummy_partition",
+                        (TensorFieldSchema("state", torch.int32),),
+                    ),
+                    preorder=0,
+                ),
+            )
+        )
 
     def sample_profiles(
         self, states: Tensor, reach: Tensor, gen: torch.Generator
@@ -152,9 +177,10 @@ class _LabeledBackend:
         return torch.full(states.shape, self.beta, dtype=torch.float32)
 
     def capture_decision_inputs(
-        self, family: str, states: Tensor, reach: Tensor
+        self, partition_id: int, states: Tensor, reach: Tensor
     ) -> Tensor:
-        del family, states
+        assert partition_id == 0
+        del states
         return reach.detach().clone()
 
     @staticmethod

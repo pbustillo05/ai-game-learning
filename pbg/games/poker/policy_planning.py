@@ -12,10 +12,10 @@ from torch import Tensor
 
 @dataclass(frozen=True)
 class PlannedPolicyBatch:
-    """One device index view and its host-known execution family."""
+    """One device index view and its stable natural partition id."""
 
     positions: Tensor
-    family: str
+    partition_id: int
 
 
 def plan_policy_batches(
@@ -100,8 +100,9 @@ def plan_policy_batches(
     result: list[PlannedPolicyBatch] = []
     for start, count, family_id, maximum in plans:
         positions = device_order.narrow(0, start, count)
-        family_name = "pre" if family_id == 0 else f"post_{family_id}"
-        result.append(PlannedPolicyBatch(positions, family_name))
+        partition_id = 0 if family_id == 0 else family_id - 1
+        family_name = "pre" if partition_id == 0 else f"post_{partition_id + 1}"
+        result.append(PlannedPolicyBatch(positions, partition_id))
         metrics.record_policy_pack(
             phase,
             family_name,

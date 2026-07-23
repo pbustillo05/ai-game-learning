@@ -13,6 +13,7 @@ from torch import Tensor
 
 from pbg.core.br import training_probe_seats
 from pbg.core.game import CHANCE, PRETERM, PROBE_FOLD, TERMINAL, EventBatch, GameBundle
+from pbg.core.partition import PartitionSet
 from pbg.core.execution import (
     DONE,
     ChunkedOccurrenceArena,
@@ -55,32 +56,22 @@ def _selected_policy_logp(
 
 
 
-def _family_spec(
-    backend: Any,
-) -> tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
-    """Return stable execution-family names and their device routing values."""
-
-    names = tuple(getattr(backend, "execution_families", ("default",)))
-    values = tuple(getattr(backend, "execution_family_values", range(len(names))))
-    priorities = tuple(getattr(backend, "execution_family_priorities", (0,) * len(names)))
-    if (
-        not names
-        or len(values) != len(names)
-        or len(priorities) != len(names)
-        or len(set(values)) != len(values)
-    ):
-        raise ValueError("rollout execution families require unique names and values")
-    return names, values, priorities
+def _rollout_partitions(backend: Any) -> PartitionSet:
+    factory = getattr(backend, "training_partition_specs", None)
+    if not callable(factory):
+        raise TypeError("rollout backend must expose its immutable PartitionSet")
+    result = factory()
+    if not isinstance(result, PartitionSet):
+        raise TypeError("training_partition_specs must return PartitionSet")
+    return result
 
 
-def _family_ids(backend: Any, states: Tensor) -> Tensor:
-    route = getattr(backend, "rollout_family_ids", None)
-    if callable(route):
-        result = route(states)
-    else:
-        result = torch.zeros(states.shape, dtype=torch.int64, device=states.device)
+def _partition_ids(partitions: PartitionSet, states: Tensor) -> Tensor:
+    result = partitions.route(states)
+    if not isinstance(result, Tensor):
+        result = torch.full_like(states, int(result), dtype=torch.int64)
     if result.shape != states.shape or result.device != states.device:
-        raise ValueError("rollout_family_ids must return device-local [B]")
+        raise ValueError("PartitionSet.route must return device-local [B]")
     return result.to(torch.int64)
 
 
@@ -407,21 +398,23 @@ def _sample_trees_sequential(
         (start_count, p_max), dtype=torch.int32, device=device
     )
 
-    family_names, family_values, family_priorities = _family_spec(backend)
+    partitions = _rollout_partitions(backend)
+    partition_ids = tuple(spec.partition_id for spec in partitions.specs)
+    partition_preorder = tuple(spec.preorder for spec in partitions.specs)
     queues = {
-        name: DeviceWorkQueue(
+        partition_id: DeviceWorkQueue(
             start_count,
             device,
             staging_rows=min(start_count, batch_rows),
-            label=f"sequential_queue_{name}",
+            label=f"sequential_queue_partition_{partition_id}",
         )
-        for name in family_names
+        for partition_id in partition_ids
     }
     actual_cost_forward = getattr(
-        backend, "policy_forward_family_actual_cost", None
+        backend, "policy_forward_partition_actual_cost", None
     )
     if not callable(actual_cost_forward):
-        raise ValueError("production requires an actual-cost family forward")
+        raise ValueError("production requires an actual-cost partition forward")
     admission_plan = _admission_plan(
         backend=backend,
         rollout_cfg=rollout_cfg,
@@ -486,9 +479,9 @@ def _sample_trees_sequential(
     def record_queues() -> None:
         if metrics is None:
             return
-        for name, queue in queues.items():
+        for partition_id, queue in queues.items():
             metrics.record_queue(
-                name,
+                partitions[partition_id].name,
                 depth=queue.host_count,
                 oldest_age=float(queue.oldest_age(scheduler_steps)),
             )
@@ -540,31 +533,31 @@ def _sample_trees_sequential(
             rows = frontier.to(torch.int64)
             owners = buffer.owner[rows]
             states = buffer.state_ref[rows]
-            family_ids = _family_ids(backend, states)
+            routed_partition_ids = _partition_ids(partitions, states)
             chance_route = -1
             leaf_route = -2
             invalid_route = -3
             player = (owners >= 0) & (owners < p_max)
             route = torch.where(
                 owners == CHANCE,
-                torch.full_like(family_ids, chance_route),
+                torch.full_like(routed_partition_ids, chance_route),
                 torch.where(
                     (owners == TERMINAL) | (owners == PRETERM) | (owners == PROBE_FOLD),
-                    torch.full_like(family_ids, leaf_route),
+                    torch.full_like(routed_partition_ids, leaf_route),
                     torch.where(
                         player,
-                        family_ids,
-                        torch.full_like(family_ids, invalid_route),
+                        routed_partition_ids,
+                        torch.full_like(routed_partition_ids, invalid_route),
                     ),
                 ),
             )
             routed = stable_partition_masked(
                 frontier.to(torch.int64),
                 route,
-                (*family_values, chance_route, leaf_route),
+                (*partition_ids, chance_route, leaf_route),
             )
             counts = read_control_counts(routed.selected_count)
-            family_counts = counts[: len(family_names)]
+            partition_counts = counts[: len(partition_ids)]
             chance_count, stopped = counts[-2:]
             if stopped:
                 stopped_nodes = routed.candidate_handles[-1, :stopped].to(torch.int32)
@@ -635,11 +628,11 @@ def _sample_trees_sequential(
                     "reserved_bytes_max",
                     admission_plan.committed_bytes(active_starts),
                 )
-            for index, (name, count) in enumerate(
-                zip(family_names, family_counts, strict=True)
+            for index, (partition_id, count) in enumerate(
+                zip(partition_ids, partition_counts, strict=True)
             ):
                 if count:
-                    queues[name].enqueue(
+                    queues[partition_id].enqueue(
                         routed.candidate_handles[index, :count],
                         arena=arena,
                         logical_time=scheduler_steps,
@@ -689,8 +682,8 @@ def _sample_trees_sequential(
             raise RuntimeError("family-scheduled rollout scheduler exceeded its progress bound")
 
         selection = select_work_queue(
-            family_names,
-            family_priorities,
+            partition_ids,
+            partition_preorder,
             queues,
             batch_rows,
             allow_partial=False,
@@ -736,8 +729,8 @@ def _sample_trees_sequential(
         else:
             if selection is None:
                 selection = select_work_queue(
-                    family_names,
-                    family_priorities,
+                    partition_ids,
+                    partition_preorder,
                     queues,
                     batch_rows,
                     allow_partial=True,
@@ -745,13 +738,13 @@ def _sample_trees_sequential(
                 )
             if selection is None:
                 break
-        selected_family = selection.family
+        partition_id = selection.partition_id
         forced_drain = selection.forced_partial
-        queue = queues[selected_family]
+        queue = queues[partition_id]
         count = selection.rows
         batch_nodes = queue.dequeue(count, arena=arena).to(torch.int32)
         if metrics is not None and forced_drain:
-            metrics.record_forced_drain(selected_family, rows=count)
+            metrics.record_forced_drain(partitions[partition_id].name, rows=count)
         record_queues()
         batch_rows_index = batch_nodes.to(torch.int64)
         states = buffer.state_ref[batch_rows_index]
@@ -781,11 +774,8 @@ def _sample_trees_sequential(
             role_parts = (
                 (torch.arange(count, device=device), bundle.model, True),
             )
-        partition_for_family = getattr(backend, "rollout_partition_id", None)
-        partition_id = (
-            int(partition_for_family(selected_family))
-            if callable(partition_for_family)
-            else family_names.index(selected_family)
+        physical_pack = partitions[partition_id].byte_work.realize(
+            states, rows=count
         )
         reserved_by_role: dict[int, Tensor] = {}
         for role_index, (positions, _, retain) in enumerate(role_parts):
@@ -811,9 +801,16 @@ def _sample_trees_sequential(
                 role_rows = batch_rows_index[positions]
                 output = actual_cost_forward(
                     role_model,
-                    selected_family,
+                    partition_id,
                     role_states,
                     role_reaches,
+                    physical_pack=(
+                        physical_pack
+                        if positions.numel() == count
+                        else partitions[partition_id].byte_work.realize(
+                            role_states, rows=positions.numel()
+                        )
+                    ),
                 )
                 role_events = _sample_events_logical(
                     backend,
@@ -881,7 +878,7 @@ def _sample_trees_sequential(
                         reserved_by_role[role_index],
                         role_nodes,
                         capture_inputs(
-                            selected_family,
+                            partition_id,
                             role_states,
                             role_reaches,
                         ),

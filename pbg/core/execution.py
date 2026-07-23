@@ -783,15 +783,15 @@ class DeviceWorkQueue:
 
 @dataclass(frozen=True)
 class QueueSelection:
-    family: str
+    partition_id: int
     rows: int
     forced_partial: bool
 
 
 def select_work_queue(
-    family_names: tuple[str, ...],
-    family_priorities: tuple[int, ...],
-    queues: Mapping[str, DeviceWorkQueue],
+    partition_ids: tuple[int, ...],
+    partition_preorder: tuple[int | None, ...],
+    queues: Mapping[int, DeviceWorkQueue],
     batch_rows: int,
     *,
     allow_partial: bool,
@@ -799,48 +799,63 @@ def select_work_queue(
 ) -> QueueSelection | None:
     """Apply the authoritative full-first, then preorder/load/age policy."""
 
-    if len(family_names) != len(family_priorities):
-        raise ValueError("queue families and priorities must have equal length")
+    if (
+        not partition_ids
+        or len(partition_ids) != len(partition_preorder)
+        or len(set(partition_ids)) != len(partition_ids)
+    ):
+        raise ValueError("queue partitions require unique ids and matching preorder")
     if isinstance(batch_rows, bool) or batch_rows <= 0:
         raise ValueError("queue batch rows must be positive")
-    nonempty = [name for name in family_names if queues[name].host_count]
+    positions = {partition_id: index for index, partition_id in enumerate(partition_ids)}
+
+    def minimal_layer(candidates: list[int]) -> list[int]:
+        declared = [
+            partition_preorder[positions[partition_id]]
+            for partition_id in candidates
+            if partition_preorder[positions[partition_id]] is not None
+        ]
+        if not declared:
+            return candidates
+        minimum = min(declared)
+        return [
+            partition_id
+            for partition_id in candidates
+            if partition_preorder[positions[partition_id]] in {None, minimum}
+        ]
+
+    nonempty = [
+        partition_id
+        for partition_id in partition_ids
+        if queues[partition_id].host_count
+    ]
     if not nonempty:
         return None
-    full = [name for name in nonempty if queues[name].host_count >= batch_rows]
+    full = [
+        partition_id
+        for partition_id in nonempty
+        if queues[partition_id].host_count >= batch_rows
+    ]
     candidates = full
     forced_partial = False
     if not candidates:
         if not allow_partial:
             return None
-        minimum_layer = min(
-            family_priorities[family_names.index(name)] for name in nonempty
-        )
-        candidates = [
-            name
-            for name in nonempty
-            if family_priorities[family_names.index(name)] == minimum_layer
-        ]
+        candidates = minimal_layer(nonempty)
         forced_partial = True
     else:
-        minimum_layer = min(
-            family_priorities[family_names.index(name)] for name in candidates
-        )
-        candidates = [
-            name
-            for name in candidates
-            if family_priorities[family_names.index(name)] == minimum_layer
-        ]
-    family = max(
+        candidates = minimal_layer(candidates)
+    partition_id = max(
         candidates,
-        key=lambda name: (
-            queues[name].host_count / float(batch_rows),
-            queues[name].oldest_age(logical_time),
-            -family_names.index(name),
+        key=lambda candidate: (
+            queues[candidate].host_count / float(batch_rows),
+            queues[candidate].oldest_age(logical_time),
+            -positions[candidate],
         ),
     )
     return QueueSelection(
-        family=family,
-        rows=min(queues[family].host_count, batch_rows),
+        partition_id=partition_id,
+        rows=min(queues[partition_id].host_count, batch_rows),
         forced_partial=forced_partial,
     )
 

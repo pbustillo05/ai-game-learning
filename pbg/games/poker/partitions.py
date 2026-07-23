@@ -10,6 +10,7 @@ from torch import Tensor
 from pbg.core.partition import (
     ByteWorkContract,
     CompletionSpec,
+    PhysicalPack,
     PartitionSet,
     PartitionSpec,
 )
@@ -27,6 +28,7 @@ def poker_partition_specs(
     n_ticks: int = 1,
     e_max: int = 3,
     public_input_bytes: Mapping[int, int] | None = None,
+    pack_planners: Mapping[int, Callable[[Any], PhysicalPack]] | None = None,
     completion: CompletionSpec | None = None,
 ) -> PartitionSet:
     """Build ``pre`` plus fixed-width ``post_A`` partitions.
@@ -45,6 +47,7 @@ def poker_partition_specs(
     exact_width = geometry.n_hands
     class_width = geometry.n_classes
     widths = {} if public_input_bytes is None else dict(public_input_bytes)
+    planners = {} if pack_planners is None else dict(pack_planners)
     if max_history_tokens <= 0 or n_ticks <= 0 or e_max < 3:
         raise ValueError("poker input geometry must be positive")
 
@@ -138,6 +141,7 @@ def poker_partition_specs(
                     retained_per_row={"natural_input": schema.row_payload_bytes},
                     transient_per_pack={"singleton_output": model_width * 4},
                     max_rows=2**31 - 1,
+                    pack=planners.get(partition_id),
                 ),
                 input_schema=schema,
                 preorder=preorder,

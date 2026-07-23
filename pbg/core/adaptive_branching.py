@@ -19,6 +19,35 @@ FIXED_BETA_CONTROLLER_VERSION = "fixed-beta-v1"
 COST_SAFEGUARD_CONTROLLER_VERSION = "cost-safeguard-v1"
 
 
+def branched_attempt_address(
+    attempt: int,
+    *,
+    rank: int | None = None,
+    world_size: int | None = None,
+) -> int:
+    """Return the disjoint rank-local logical tree address for one attempt."""
+
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+        raise ValueError("branched rollout attempt must be a nonnegative integer")
+    distributed = (
+        torch.distributed.is_available() and torch.distributed.is_initialized()
+    )
+    if rank is None:
+        rank = torch.distributed.get_rank() if distributed else 0
+    if world_size is None:
+        world_size = torch.distributed.get_world_size() if distributed else 1
+    if (
+        isinstance(rank, bool)
+        or not isinstance(rank, int)
+        or isinstance(world_size, bool)
+        or not isinstance(world_size, int)
+        or world_size <= 0
+        or not 0 <= rank < world_size
+    ):
+        raise ValueError("branched rollout rank must lie in [0, world_size)")
+    return rank + attempt * world_size
+
+
 def gamma_deviance(
     prediction: Tensor,
     target: Tensor,

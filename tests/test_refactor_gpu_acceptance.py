@@ -20,7 +20,7 @@ from pbg.runtime import train
 
 def _tiny_config(mode: str, *, branching_mode: str = "fixed"):
     cfg = load_config(
-        "configs/nlhe6_h100.yaml",
+        "configs/train/nlhe6_h100.yaml",
         hardware_profile="local_3x2080ti",
     )
     cfg.game.n_players = 2
@@ -244,6 +244,20 @@ def test_tiny_cuda_branched_memory_retry_is_fresh_and_backed_off(
     assert record["branching_retry_count"] == 1
     assert record["branching_retry_cleanup_ok"] == 1
     assert record["branching_attempt"] == 1
+    assert record["branching_attempt_address"] == 1
+    retry = record["branching_retry_records"][0]
+    assert retry["attempt"] == 0
+    assert retry["attempt_address"] == 0
+    assert retry["next_attempt"] == 1
+    assert retry["next_attempt_address"] == 1
+    assert retry["phase"] == "rollout"
+    assert retry["reason"] == "injected CUDA retry"
+    assert retry["hard_ceiling_bytes"] > 0
+    assert retry["predicted_bytes"] > retry["hard_ceiling_bytes"]
+    assert retry["allocated_peak_bytes"] > 0
+    assert retry["reserved_peak_bytes"] > 0
+    assert retry["controls_before"] != retry["controls_after"]
+    assert retry["backoff_metrics"]
     payload = torch.load(
         Path(cfg.training.out_dir) / "ckpt_0000001.pt",
         map_location="cpu",
@@ -291,6 +305,10 @@ def test_cuda_retry_exhaustion_writes_last_completed_terminal_checkpoint(
     )
     assert stop["phase"] == "branched memory retry exhaustion"
     assert stop["checkpoint"] == "ckpt_terminal_stop_0000000.pt"
+    assert '"attempt_address": 0' in stop["detail"]
+    assert '"next_attempt_address": 1' in stop["detail"]
+    assert '"controls_before":' in stop["detail"]
+    assert '"controls_after":' in stop["detail"]
     payload = torch.load(
         Path(cfg.training.out_dir) / stop["checkpoint"],
         map_location="cpu",
@@ -303,6 +321,38 @@ def test_cuda_retry_exhaustion_writes_last_completed_terminal_checkpoint(
     histories = payload["adaptive_work_state"]["forecaster"]["observations"]
     assert all(not history for history in histories.values())
     assert payload["cost_safeguard_controller_state"]["observations"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_cuda_branched_nonmemory_failure_never_enters_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _tiny_retry_config(tmp_path, "fixed", 2)
+    cfg.training.out_dir = str(tmp_path / "invalid_data")
+
+    def fail_nonmemory(self, phase, realized_nodes, **kwargs):
+        del self, phase, realized_nodes, kwargs
+        raise RuntimeError("injected invalid data")
+
+    monkeypatch.setattr(SequentialMemoryController, "admit", fail_nonmemory)
+    train(cfg)
+
+    stop = json.loads(
+        (Path(cfg.training.out_dir) / "terminal_stop.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert stop["phase"] == "rollout, seal, completion, and targets"
+    assert stop["detail"] == "RuntimeError: injected invalid data"
+    payload = torch.load(
+        Path(cfg.training.out_dir) / stop["checkpoint"],
+        map_location="cpu",
+        weights_only=False,
+    )
+    scalar = payload["branching_controller_state"]["scalar"]
+    assert scalar["emergency_backoffs"] == 0
+    assert scalar["updates"] == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")

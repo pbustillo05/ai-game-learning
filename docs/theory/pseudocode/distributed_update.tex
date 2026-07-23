@@ -114,13 +114,23 @@ by physical subspans; it never computes per-example parameter gradients or
 copies a full gradient buffer}
 \KwOut{identical $\theta_{k+1}$ and optimizer state on every GPU}
 
+Before this algorithm is entered, the rollout/target boundary performs one
+common-order failure agreement.  A classified branched memory/admission
+failure before valid targets is its sole retryable outcome: every rank releases
+the entire current attempt, agrees on the controller backoff and next disjoint
+attempt address, and returns to \Obj{FamilyScheduledRollout} while its retry
+bound remains.  This recovery selects a new tree conditioned on the earlier
+attempt failing and can therefore bias the realized branched training sample.
+Exhaustion and every other failure are terminal;
+
 \ForEach{$g\in\mathcal G$ \textbf{after its target builder finishes}}{
   First prove that the mandatory uncached singleton path fits; set a terminal
   local failure flag on any validation, planning, or singleton-forward failure;
 }
-All ranks perform one common-order terminal agreement.  If any rank failed,
-release every current training store, checkpoint the last completed iteration,
-and stop; no rank launches a mass collective or rerolls the failed iteration;
+All ranks perform the learner's common-order terminal agreement.  If any rank
+failed, release every current training store, checkpoint the last completed
+iteration, and stop; no rank launches a mass collective or rerolls the failed
+iteration;
 
 \ForEach{$g\in\mathcal G$ \textbf{after the terminal agreement succeeds}}{
   Read $(\log Z_{g,m},\Obj{AliasTable}_{g,m})_m$; verify their decision domains
