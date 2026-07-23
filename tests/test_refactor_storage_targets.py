@@ -14,6 +14,7 @@ from pbg.core.partition import (
     PartitionSpec,
 )
 from pbg.core.storage import (
+    DenseRecyclableTensorPool,
     PagedTensorArena,
     PagedTensorColumn,
     PartitionRolloutBlock,
@@ -23,6 +24,7 @@ from pbg.core.storage import (
     TensorFieldSchema,
     TensorSchema,
     TrainingPartition,
+    admit_dense_pool_growth,
     occurrence_schema,
     paged_capacity_bytes,
     rollout_action_schema,
@@ -179,23 +181,114 @@ def test_paged_reservation_is_atomic_and_recyclable_slots_follow_last_consumer()
     assert pool.capacity_rows == 2
 
 
-def test_direct_single_slab_column_uses_dense_tensor_indexing() -> None:
+def test_dense_recyclable_pool_grows_one_direct_live_frontier_slab() -> None:
+    metrics = ExecutionMetrics()
     schema = TensorSchema(
-        "live_dense_slab",
-        (TensorFieldSchema("payload", torch.float32, (3,)),),
+        "dense_live",
+        (TensorFieldSchema("payload", torch.float32, (2,), alignment=16),),
+        chunk_header_bytes=32,
+        allocator_slack_bytes=16,
     )
-    arena = PagedTensorArena(schema, 4, "cpu")
-    rows = arena.reserve_rows(3)
-    column = PagedTensorColumn(arena, "payload", direct_single_slab=True)
-    column[rows] = torch.arange(9, dtype=torch.float32).reshape(3, 3)
-    selected = torch.tensor([2, 0], dtype=torch.int64)
-    coordinates = torch.tensor([1, 2], dtype=torch.int64)
-    assert torch.equal(column[selected, coordinates], torch.tensor([7.0, 2.0]))
-    column[selected, coordinates] = torch.tensor([70.0, 20.0])
+    pool = DenseRecyclableTensorPool(
+        schema,
+        2,
+        "cpu",
+        access_metrics=metrics,
+    )
+    first = pool.allocate(3)
+    pool.write(
+        first,
+        {"payload": torch.arange(6, dtype=torch.float32).reshape(3, 2)},
+    )
+    pool.release_rows(first[1:])
+    reused = pool.allocate(2)
+    assert torch.equal(reused, first[1:])
+    pool.write(
+        reused,
+        {"payload": torch.tensor([[8.0, 9.0], [10.0, 11.0]])},
+    )
     assert torch.equal(
-        column[rows],
-        torch.tensor([[0.0, 1.0, 20.0], [3.0, 4.0, 5.0], [6.0, 70.0, 8.0]]),
+        pool.gather("payload", torch.tensor([0, 1, 2])),
+        torch.tensor([[0.0, 1.0], [8.0, 9.0], [10.0, 11.0]]),
     )
+    pool.require_capacity(3)
+    grown = pool.allocate(3)
+    assert torch.equal(grown, torch.tensor([3, 4, 5]))
+    assert torch.equal(
+        pool.gather("payload", torch.tensor([0, 1, 2])),
+        torch.tensor([[0.0, 1.0], [8.0, 9.0], [10.0, 11.0]]),
+    )
+    assert pool.live_rows == pool.high_water_live_rows == 6
+    assert 6 <= pool.capacity_rows < 9
+    totals = metrics.totals()
+    assert totals.get("storage_generic_accesses", 0) == 0
+    assert totals["storage_direct_accesses"] == 4
+    assert totals["storage_candidate_rows"] == 0
+    assert (
+        metrics.snapshot()[
+            "execution_storage_dense_live_slab_read_direct_"
+            "storage_segments_per_access_max"
+        ]
+        == 1
+    )
+
+
+def test_dense_recyclable_growth_preserves_old_slab_when_overlap_is_not_admitted() -> None:
+    schema = TensorSchema(
+        "dense_transaction",
+        (TensorFieldSchema("payload", torch.float32, (2,), alignment=16),),
+        chunk_header_bytes=32,
+        allocator_slack_bytes=16,
+    )
+    initial_bytes = schema.capacity_bytes(2)
+    replacement_bytes = schema.capacity_bytes(6)
+    accountant = ByteAccountant(initial_bytes + replacement_bytes - 1)
+    pool = DenseRecyclableTensorPool(
+        schema,
+        2,
+        "cpu",
+        accountant=accountant,
+    )
+    rows = pool.allocate(2)
+    values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    pool.write(rows, {"payload": values})
+    with pytest.raises(MemoryError):
+        pool.require_capacity(3)
+    assert pool.capacity_rows == 2
+    assert accountant.reserved_bytes == initial_bytes
+    assert torch.equal(pool.gather("payload", rows), values)
+    pool.release()
+    assert accountant.reserved_bytes == 0
+
+
+def test_grouped_dense_growth_publishes_neither_slab_when_overlap_is_unsafe() -> None:
+    schema = TensorSchema(
+        "dense_group",
+        (TensorFieldSchema("payload", torch.float32, (2,), alignment=16),),
+    )
+    initial_bytes = schema.capacity_bytes(2)
+    replacement_bytes = schema.capacity_bytes(6)
+    accountant = ByteAccountant(2 * (initial_bytes + replacement_bytes) - 1)
+    left = DenseRecyclableTensorPool(schema, 2, "cpu", accountant=accountant)
+    right = DenseRecyclableTensorPool(
+        schema,
+        2,
+        "cpu",
+        accountant=accountant,
+        label="dense_group_right",
+    )
+    left_rows = left.allocate(2)
+    right_rows = right.allocate(2)
+    left_values = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    right_values = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+    left.write(left_rows, {"payload": left_values})
+    right.write(right_rows, {"payload": right_values})
+    with pytest.raises(MemoryError):
+        admit_dense_pool_growth({left: 3, right: 3})
+    assert left.capacity_rows == right.capacity_rows == 2
+    assert accountant.reserved_bytes == 2 * initial_bytes
+    assert torch.equal(left.gather("payload", left_rows), left_values)
+    assert torch.equal(right.gather("payload", right_rows), right_values)
 
 
 def test_paged_access_metrics_distinguish_direct_contiguous_and_generic_work() -> None:

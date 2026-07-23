@@ -163,9 +163,9 @@ def _sample_branched_tree_impl(
         stable_partition_masked,
     )
     from pbg.core.storage import (
-        RecyclableTensorPool,
         PagedTensorArena,
         PagedTensorColumn,
+        RecyclableTensorPool,
         SealedTensorBlock,
         TensorFieldSchema,
         TensorSchema,
@@ -481,13 +481,6 @@ def _sample_branched_tree_impl(
             (reach_pool.arena, reach_pool.arena.page_count),
         )
         occurrence_chunks = arena.chunk_count
-        state_arenas = (
-            getattr(getattr(backend, "states", None), "arena", None),
-            getattr(getattr(backend, "states", None), "history_arena", None),
-        )
-        state_checkpoints = tuple(
-            (owner, owner.page_count) for owner in state_arenas if owner is not None
-        )
         try:
             buffer.require_child_capacity(count)
             arena.require_capacity(count)
@@ -495,9 +488,11 @@ def _sample_branched_tree_impl(
             reach_pool.require_capacity(count)
             require_states = getattr(backend, "require_successor_capacity", None)
             if callable(require_states):
+                # Dense state/history growth is one final grouped transaction.
+                # No later child-wave admission can fail after it publishes.
                 require_states(count)
         except BaseException:
-            for owner, pages in reversed((*checkpoints, *state_checkpoints)):
+            for owner, pages in reversed(checkpoints):
                 owner.rollback_page_growth(pages)
             arena.rollback_chunk_growth(occurrence_chunks)
             raise

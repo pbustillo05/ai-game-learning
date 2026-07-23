@@ -870,47 +870,10 @@ def admit_arena_growth(requests: Mapping[PagedTensorArena, int]) -> None:
 class PagedTensorColumn:
     """Tensor-style row indexing over one field of a paged arena."""
 
-    def __init__(
-        self,
-        arena: PagedTensorArena,
-        name: str,
-        *,
-        direct_single_slab: bool = False,
-    ) -> None:
+    def __init__(self, arena: PagedTensorArena, name: str) -> None:
         self.arena = arena
         self.name = name
         self.spec = arena.schema.by_name[name]
-        self.direct_single_slab = bool(direct_single_slab)
-
-    def _direct_slab(self) -> Tensor | None:
-        """Return the resolved compute slab for trusted live-slot columns.
-
-        Mutable live-state handles are validated once at the backend boundary
-        and remain physical slot addresses, not topology identities.  When the
-        admitted owner has one slab, exposing that slab to ordinary tensor
-        indexing is the dense compute interface: paging remains an allocation
-        and lifetime concern and does not leak into every poker expression.
-        """
-
-        if self.direct_single_slab and self.arena.page_count == 1:
-            return self.arena._pages[0][self.name]
-        return None
-
-    def _direct_row_count(self, key: Any) -> int:
-        """Return the host-known selector extent without reading device data."""
-
-        selector = key[0] if isinstance(key, tuple) else key
-        if isinstance(selector, int):
-            return 1
-        if isinstance(selector, slice):
-            start, stop, step = selector.indices(self.arena.size)
-            return len(range(start, stop, step))
-        if isinstance(selector, Tensor):
-            # Boolean selectors inspect this many logical rows. Their exact
-            # selected count is device data and must not be synchronized only
-            # for diagnostics.
-            return selector.numel()
-        return torch.as_tensor(selector).numel()
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -984,19 +947,6 @@ class PagedTensorColumn:
         full[(slice(None),) * len(row_shape) + rest] = value
 
     def __getitem__(self, key: Any) -> Tensor:
-        direct = self._direct_slab()
-        if direct is not None:
-            result = direct[key]
-            rows = self._direct_row_count(key)
-            self.arena._record_access(
-                "read",
-                "direct",
-                segments_visited=1,
-                rows_requested=rows,
-                rows_moved=rows,
-                tensor_operations=1,
-            )
-            return result
         parts = key if isinstance(key, tuple) else (key,)
         rows, row_shape, scalar = self._rows(parts[0])
         full = self.arena.gather(self.name, rows)
@@ -1008,19 +958,6 @@ class PagedTensorColumn:
         return self._select(full, row_shape, parts[1:])
 
     def __setitem__(self, key: Any, value: Any) -> None:
-        direct = self._direct_slab()
-        if direct is not None:
-            direct[key] = value
-            rows = self._direct_row_count(key)
-            self.arena._record_access(
-                "write",
-                "direct",
-                segments_visited=1,
-                rows_requested=rows,
-                rows_moved=rows,
-                tensor_operations=1,
-            )
-            return
         parts = key if isinstance(key, tuple) else (key,)
         rows, row_shape, scalar = self._rows(parts[0])
         if len(parts) == 1:
@@ -1217,6 +1154,378 @@ class RecyclableTensorPool:
         self._live_rows = 0
         self.high_water_live_rows = 0
         self.arena.release()
+
+
+class DenseRecyclableTensorPool:
+    """Dense mutable slots whose capacity follows the live-frontier high water.
+
+    Physical handles remain recyclable integer slots, but every field has one
+    directly indexable compute slab instead of an accumulated page list.
+    Growth is transactional and geometric: the old and replacement slabs are
+    charged together until the stable handle prefix has been copied.  Capacity
+    therefore depends on realized simultaneous ownership, never total
+    generated rows.
+    """
+
+    def __init__(
+        self,
+        schema: TensorSchema,
+        allocation_quantum_rows: int,
+        device: torch.device | str,
+        *,
+        accountant: ByteAccountant | None = None,
+        label: str | None = None,
+        maximum_rows: int | None = None,
+        access_metrics: Any | None = None,
+    ) -> None:
+        if (
+            isinstance(allocation_quantum_rows, bool)
+            or allocation_quantum_rows <= 0
+        ):
+            raise ValueError("allocation_quantum_rows must be positive")
+        if maximum_rows is not None and (
+            isinstance(maximum_rows, bool) or maximum_rows <= 0
+        ):
+            raise ValueError("maximum_rows must be positive or None")
+        self.schema = schema
+        self.allocation_quantum_rows = int(allocation_quantum_rows)
+        self.device = torch.device(device)
+        self.accountant = accountant
+        self.label = schema.name if label is None else str(label)
+        if not self.label:
+            raise ValueError("pool label must be nonempty")
+        self.maximum_rows = maximum_rows
+        self.access_metrics = access_metrics
+        self._columns: dict[str, Tensor] = {}
+        self._reservation_label: str | None = None
+        self._generation = 0
+        self._size = 0
+        self._free: list[Tensor] = []
+        self._live_rows = 0
+        self.high_water_live_rows = 0
+        self._released = False
+
+    @property
+    def capacity_rows(self) -> int:
+        if not self._columns:
+            return 0
+        return int(next(iter(self._columns.values())).shape[0])
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    @property
+    def live_rows(self) -> int:
+        return self._live_rows
+
+    @property
+    def allocated_capacity_bytes(self) -> int:
+        rows = self.capacity_rows
+        return self.schema.capacity_bytes(rows, chunks=int(rows > 0))
+
+    @property
+    def live_payload_bytes(self) -> int:
+        return self.schema.payload_bytes(self.live_rows)
+
+    @property
+    def slack_bytes(self) -> int:
+        return self.allocated_capacity_bytes - self.live_payload_bytes
+
+    def _check_live(self) -> None:
+        if self._released:
+            raise RuntimeError("dense recyclable pool has been released")
+
+    def _next_capacity(self, required: int) -> int:
+        capacity = self.capacity_rows
+        candidate = max(capacity, self.allocation_quantum_rows)
+        while candidate < required:
+            growth = max(self.allocation_quantum_rows, (candidate + 1) // 2)
+            candidate = _align(
+                candidate + growth, self.allocation_quantum_rows
+            )
+        if self.maximum_rows is not None:
+            if required > self.maximum_rows:
+                raise MemoryError(f"{self.label} maximum row capacity exhausted")
+            candidate = min(candidate, self.maximum_rows)
+        return candidate
+
+    def required_fresh_rows(self, count: int) -> int:
+        if isinstance(count, bool) or count < 0:
+            raise ValueError("pool allocation count must be nonnegative")
+        available = sum(batch.numel() for batch in self._free)
+        return max(0, int(count) - available)
+
+    def require_capacity(self, count: int) -> None:
+        """Admit a future allocation without consuming recyclable handles."""
+
+        admit_dense_pool_growth({self: count})
+
+    def allocate(self, count: int) -> Tensor:
+        self._check_live()
+        if isinstance(count, bool) or count < 0:
+            raise ValueError("pool allocation count must be nonnegative")
+        requested = int(count)
+        available = sum(batch.numel() for batch in self._free)
+        reused_count = min(requested, available)
+        fresh_count = requested - reused_count
+        admit_dense_pool_growth({self: count})
+        pieces: list[Tensor] = []
+        remaining = reused_count
+        while remaining:
+            batch = self._free.pop()
+            take = min(remaining, batch.numel())
+            pieces.append(batch[:take])
+            if take < batch.numel():
+                self._free.append(batch[take:])
+            remaining -= take
+        if fresh_count:
+            pieces.append(
+                torch.arange(
+                    self._size,
+                    self._size + fresh_count,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            )
+            self._size += fresh_count
+        handles = (
+            torch.cat(pieces)
+            if len(pieces) > 1
+            else (
+                pieces[0]
+                if pieces
+                else torch.empty(0, dtype=torch.int64, device=self.device)
+            )
+        )
+        self._live_rows += requested
+        self.high_water_live_rows = max(
+            self.high_water_live_rows, self.live_rows
+        )
+        return handles
+
+    def _device_handles(self, rows: Tensor | Iterable[int]) -> Tensor:
+        handles = torch.as_tensor(rows, dtype=torch.int64, device=self.device)
+        if handles.ndim != 1:
+            raise ValueError("pool handles must be one-dimensional")
+        if handles.numel():
+            torch._assert_async(
+                ((handles >= 0) & (handles < self._size)).all(),
+                "pool handle is outside admitted storage",
+            )
+        return handles
+
+    def _assert_not_free(self, handles: Tensor) -> None:
+        for free in self._free:
+            torch._assert_async(
+                ~(handles[:, None] == free[None, :]).any(),
+                "pool handle has already reached its last consumer",
+            )
+
+    def release_rows(self, rows: Tensor | Iterable[int]) -> None:
+        handles = self._device_handles(rows)
+        if handles.numel() > 1:
+            ordered = handles.sort().values
+            torch._assert_async(
+                (ordered[1:] != ordered[:-1]).all(),
+                "released pool handles must be unique",
+            )
+        self._assert_not_free(handles)
+        if handles.numel():
+            self._free.append(handles.clone())
+        self._live_rows -= handles.numel()
+        if self._live_rows < 0:
+            raise RuntimeError("pool live-row accounting underflow")
+
+    def _record_access(
+        self, operation: str, *, rows: int, fields: int
+    ) -> None:
+        recorder = getattr(self.access_metrics, "record_storage_access", None)
+        if callable(recorder):
+            recorder(
+                self.label,
+                "slab",
+                operation,
+                "direct",
+                segments_visited=int(self.capacity_rows > 0),
+                rows_requested=rows,
+                rows_moved=rows * fields,
+                candidate_rows=0,
+                routing_bytes=0,
+                tensor_operations=fields,
+            )
+
+    def write(self, rows: Tensor, values: Mapping[str, Tensor]) -> None:
+        handles = self._device_handles(rows)
+        self._assert_not_free(handles)
+        for name, value in values.items():
+            try:
+                spec = self.schema.by_name[name]
+            except KeyError as exc:
+                raise KeyError(f"unknown schema field {name!r}") from exc
+            if (
+                tuple(value.shape) != (handles.numel(), *spec.shape)
+                or value.dtype != spec.dtype
+            ):
+                raise ValueError(f"write value for {name!r} violates its schema")
+            if value.device != self.device:
+                raise ValueError("write tensors must already be on the pool device")
+        if not handles.numel():
+            return
+        for name, value in values.items():
+            self._columns[name].index_copy_(0, handles, value)
+        self._record_access(
+            "write", rows=handles.numel(), fields=len(values)
+        )
+
+    def gather(self, name: str, rows: Tensor) -> Tensor:
+        handles = self._device_handles(rows)
+        self._assert_not_free(handles)
+        try:
+            result = self._columns[name].index_select(0, handles)
+        except KeyError as exc:
+            raise KeyError(f"unknown schema field {name!r}") from exc
+        self._record_access("read", rows=handles.numel(), fields=1)
+        return result
+
+    def reset(self, *, release_storage: bool = False) -> None:
+        """Release all live handles and optionally drop the admitted slab."""
+
+        self._check_live()
+        self._free.clear()
+        self._size = 0
+        self._live_rows = 0
+        self.high_water_live_rows = 0
+        if not release_storage:
+            return
+        self._columns.clear()
+        if self.accountant is not None and self._reservation_label is not None:
+            self.accountant.release(self._reservation_label)
+        self._reservation_label = None
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._columns.clear()
+        self._free.clear()
+        self._size = 0
+        self._live_rows = 0
+        self.high_water_live_rows = 0
+        if self.accountant is not None and self._reservation_label is not None:
+            self.accountant.release(self._reservation_label)
+        self._reservation_label = None
+        self._released = True
+
+
+def admit_dense_pool_growth(
+    requests: Mapping[DenseRecyclableTensorPool, int],
+) -> None:
+    """Grow several dense live-frontier owners as one unpublished transaction."""
+
+    selected = tuple(requests.items())
+    if not selected:
+        return
+    plans: list[
+        tuple[DenseRecyclableTensorPool, int, int, str]
+    ] = []
+    for pool, requested in selected:
+        pool._check_live()
+        fresh = pool.required_fresh_rows(requested)
+        required = pool.size + fresh
+        if required <= pool.capacity_rows:
+            continue
+        capacity = pool._next_capacity(required)
+        generation = pool._generation + 1
+        plans.append(
+            (pool, capacity, generation, f"{pool.label}.slab.{generation}")
+        )
+    if not plans:
+        return
+    accountants = {pool.accountant for pool, _, _, _ in plans}
+    if len(accountants) != 1:
+        raise ValueError("grouped dense growth requires one shared byte accountant")
+    accountant = next(iter(accountants))
+    reservations = {
+        label: pool.schema.capacity_bytes(capacity, chunks=1)
+        for pool, capacity, _, label in plans
+    }
+    if accountant is not None:
+        accountant.reserve_many(reservations)
+    pending: list[
+        tuple[DenseRecyclableTensorPool, int, str, dict[str, Tensor]]
+    ] = []
+    try:
+        for pool, capacity, generation, label in plans:
+            replacement = pool.schema.allocate(capacity, pool.device)
+            if pool.size:
+                for spec in pool.schema.fields:
+                    replacement[spec.name][: pool.size].copy_(
+                        pool._columns[spec.name][: pool.size]
+                    )
+            pending.append((pool, generation, label, replacement))
+    except BaseException:
+        if accountant is not None:
+            accountant.release_many(reservations)
+        raise
+    previous_columns: list[dict[str, Tensor]] = []
+    previous_labels: list[str] = []
+    for pool, generation, label, replacement in pending:
+        previous_columns.append(pool._columns)
+        if pool._reservation_label is not None:
+            previous_labels.append(pool._reservation_label)
+        pool._columns = replacement
+        pool._reservation_label = label
+        pool._generation = generation
+    for columns in previous_columns:
+        columns.clear()
+    if accountant is not None and previous_labels:
+        accountant.release_many(previous_labels)
+
+
+class DenseRecyclableTensorColumn:
+    """Tensor-style direct indexing over a dynamically grown dense slab."""
+
+    def __init__(self, pool: DenseRecyclableTensorPool, name: str) -> None:
+        self.pool = pool
+        self.name = name
+        self.spec = pool.schema.by_name[name]
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return (self.pool.size, *self.spec.shape)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.spec.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.pool.device
+
+    def numel(self) -> int:
+        return self.pool.size * self.spec.elements_per_row
+
+    def _row_count(self, key: Any) -> int:
+        selector = key[0] if isinstance(key, tuple) else key
+        if isinstance(selector, int):
+            return 1
+        if isinstance(selector, slice):
+            start, stop, step = selector.indices(self.pool.size)
+            return len(range(start, stop, step))
+        if isinstance(selector, Tensor):
+            return selector.numel()
+        return torch.as_tensor(selector).numel()
+
+    def __getitem__(self, key: Any) -> Tensor:
+        self.pool._check_live()
+        result = self.pool._columns[self.name][key]
+        self.pool._record_access("read", rows=self._row_count(key), fields=1)
+        return result
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        self.pool._check_live()
+        self.pool._columns[self.name][key] = value
+        self.pool._record_access("write", rows=self._row_count(key), fields=1)
 
 
 @dataclass(frozen=True)

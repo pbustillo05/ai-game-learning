@@ -185,12 +185,14 @@ benchmark-only implementation is not an accepted result.
 
 ### Confirmed defects
 
-1. **Branched mutable state loses the dense fast path.**
+1. **Branched mutable state lost the dense fast path.**
    `pbg/games/poker/bundle.py` gives branched state a 256-row live slab.
    Section 15 measured 6,212 simultaneously live state rows and 14,073 live
    shared-history rows. The state/history columns use direct tensor indexing
    only while the arena owns one page; they therefore fell back to generic
    multi-page routing across approximately 25 and 55 pages, respectively.
+   The accepted ROI 1 state/history slice below replaces that implementation
+   with grouped, dense recyclable slabs; active reach remains separate.
 2. **Active reach has the same physical mistake.**
    `pbg/core/branching.py` constructs the recyclable
    `[F,P,H]` reach owner in 256-row pages. Each gather/write checks arbitrary
@@ -238,7 +240,9 @@ Work in isolated, paired steps. Do not combine all of these into one rewrite:
    dense or explicitly segmented recyclable compute interface bounded by the
    admitted live frontier. A large page sized to total possible tree work is
    not an acceptable fix. State, history, and reach may need different
-   capacities and lifetime accounting.
+   capacities and lifetime accounting. The state/history slice is accepted;
+   active reach remains pending after its isolated experiment missed the
+   throughput gate.
 3. Pass host-known contiguous cursors through branched child reservation and
    commit. Preserve the two-pass rule that fixes every child/RNG address before
    the first draw; optimize the physical commit without changing logical
@@ -541,12 +545,13 @@ FS_{\text{state}}
 +W_{\text{child}}(B_c).
 $$
 
-The current implementation has recyclable ownership but does **not** preserve
-the required dense compute boundary. Branched construction sets both the
-mutable state/history allocation quantum and active-reach page size to 256
-rows. Once live work exceeds one page, ordinary `PagedTensorColumn` and
-`RecyclableTensorPool` access falls back to generic all-page gather/write
-routing.
+At the instrumentation baseline, recyclable ownership did **not** preserve the
+required dense compute boundary. Branched construction set both mutable
+state/history and active-reach allocation quanta to 256 rows. Once live work
+exceeded one page, ordinary `PagedTensorColumn` and
+`RecyclableTensorPool` access fell back to generic all-page gather/write
+routing. The accepted ROI 1 state/history slice now uses grouped dense slabs
+bounded by admitted live high water; active reach still uses the paged owner.
 
 This distinction is central:
 
@@ -1237,7 +1242,7 @@ geometry, and seed for the first paired candidate.
 
 | ROI | Change | Expected byte effect | Throughput expectation | Scope and acceptance gate |
 |---:|---|---:|---|---|
-| 1 | Remove generic all-page scans from branched mutable state, shared history, and active reach | keep capacity proportional to admitted live high water; remove per-256-row tensor fragmentation and routing transients | strongly positive; this is the sequential paged-state regression class still present in branching | **Instrumented 2026-07-23; implementation pending.** Seed 104,830 measured 54,306/17,052/656 generic state/history/reach accesses, maxima of 25/56/25 pages per access, and 682.8M candidate rows for 14.6M requested rows. Highest priority. Benchmark owners separately where possible. No total-tree-sized slab; identical topology/RNG/retained rows; lower page-path counts, rollout time, and reserved fragmentation |
+| 1 | Remove generic all-page scans from branched mutable state, shared history, and active reach | keep capacity proportional to admitted live high water; remove per-256-row tensor fragmentation and routing transients | strongly positive; this is the sequential paged-state regression class still present in branching | **State/history accepted 2026-07-23; reach pending.** Strict seed 104,830 reduced selected-owner generic accesses from 81,616 to zero, aggregate candidate rows by 88.5%, rollout time by 40.3%, and total time by 18.1%. Reserved peak was unchanged and allocated peak rose 0.02%. Exact discrete work and zero undeclared synchronizations were preserved. A reach-only slice removed 767 scans and 55.4GB of routing temporaries but improved rollout only 0.22%; it was rejected and removed. |
 | 2 | Commit host-proven contiguous branched child subspans directly | capacity-neutral; removes page-match matrices and candidate copies | positive and low-risk | **Instrumented 2026-07-23; implementation pending.** Topology append already used 319 node and 318 edge contiguous writes, but hot updates still included 970 generic node writes and 312 generic edge writes, materializing 28.2M candidate rows. Pass physical subspan cursors through the remaining commit boundary; preserve two-pass address publication and stable child order; exact children/edges/events; paired seed-104830 branch gate |
 | 3 | Make occurrence/topology/controller access pack-local instead of all-chunk/all-page | retain paged append-only capacity; remove $O(B\,n_{\text{pages}})$ hot routing work | potentially strongly positive on large trees | **Instrumented 2026-07-23; implementation pending.** Occurrence, node/edge topology, and controller owners made 10,640 generic accesses, visited 560,060 chunks/pages, and materialized 85.3M candidate rows; each reached 91 accumulated segments. Medium core refactor. Stable logical addresses and last-consumer ownership; report early/late-pack timing and scaling versus realized page count |
 | 4 | Restore exact-street physical rollout queues or an equally efficient bounded packer | no required retained-byte change; reduces mixed-street padded work | positive; previously about 4.9% in HU | Separate scheduling experiment. Natural training partitions unchanged; identical keyed RNG/topology; padded pairs and wall time must improve |
@@ -1270,6 +1275,30 @@ synchronizations, and the 8.960GiB reserved rollout peak. The fresh tree had
 23,267 nodes versus 23,162 in the historical artifact after an independently
 executed throughput-mode warmup, so its 244.790-second rollout is diagnostic
 only, not a strict paired timing acceptance result.
+
+The strict cold comparison required for ROI 1 is
+`runs/experiments/nlhe_hu_32bb_branched_fixed_storage_roi1_baseline_20260723/benchmark.json`
+against
+`runs/experiments/nlhe_hu_32bb_branched_fixed_storage_state_history_candidate_20260723/benchmark.json`.
+Both used `--warmup 0 --repeats 1 --seed 101`, so logical seed 104,830 began
+from byte-identical checkpoint weights. Nodes, children, events, queue work,
+RNG-derived work, retained-row counts, model/evaluator work, learner
+presentations, and optimizer attempts/outcomes were identical. Loss and
+gradient summaries remained within the dispersion observed in a same-code
+throughput-mode rerun. Rollout time was 376.289 to 224.568 seconds and total
+time was 827.087 to 677.514 seconds. Rollout peak reserved memory remained
+7,807,696,896 bytes; peak allocated memory increased from 4,622,451,200 to
+4,623,313,408 bytes. The selected owners use one direct slab segment per
+access, with capacities following their 6,532/15,996-row live high waters
+rather than total generated nodes.
+
+Independent ordinary-CLI runs for logical seeds 104,830, 209,559, and 314,288
+are stored under
+`runs/experiments/nlhe_hu_32bb_branched_fixed_storage_state_history_seed{104830,209559,314288}_20260723/`.
+All three recorded zero selected-owner generic scans, zero undeclared
+synchronizations, unchanged 14,848 learner presentations and 58 optimizer
+attempts, and clean teardown. Their concurrent timings are robustness evidence,
+not substitutes for the paired acceptance timing.
 
 # 13. Acceptance and reporting
 

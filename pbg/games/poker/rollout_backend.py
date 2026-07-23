@@ -201,7 +201,7 @@ class PokerRolloutBackend:
             self.max_rollout_steps,
             self.device,
             cfg.n_players,
-            page_rows=self.live_state_rows,
+            allocation_quantum_rows=self.live_state_rows,
             access_metrics=self.execution_metrics,
         )
         self.state_store = self.states
@@ -304,7 +304,7 @@ class PokerRolloutBackend:
             capture_store.action_arenas.clear()
             capture_store.summary_caches.clear()
             self._active_decision_input_store = None
-        self.states.reset(release_pages=True)
+        self.states.reset(release_storage=True)
         for _, cache in self._partition_services.values():
             cache.reset(release_pages=True)
 

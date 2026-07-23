@@ -312,8 +312,8 @@ class ExecutionMetrics:
         synchronization counters.
         """
 
-        if segment_kind not in {"page", "chunk"}:
-            raise ValueError("storage segment kind must be 'page' or 'chunk'")
+        if segment_kind not in {"page", "chunk", "slab"}:
+            raise ValueError("storage segment kind must be page, chunk, or slab")
         if operation not in {"read", "write", "resolve"}:
             raise ValueError("storage operation must be read, write, or resolve")
         if path not in {"direct", "contiguous", "generic"}:

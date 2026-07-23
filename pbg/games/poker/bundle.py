@@ -49,8 +49,8 @@ class PokerRolloutMemoryPlan:
 
     page_rows: int
     live_state_rows: int
-    state_page_bytes: int
-    history_page_bytes: int
+    state_slab_bytes: int
+    history_slab_bytes: int
     topology_page_bytes: int
     active_reach_bytes: int
     partition_page_bytes: int
@@ -58,8 +58,8 @@ class PokerRolloutMemoryPlan:
     @property
     def peak_bytes(self) -> int:
         return (
-            self.state_page_bytes
-            + self.history_page_bytes
+            self.state_slab_bytes
+            + self.history_slab_bytes
             + self.topology_page_bytes
             + self.active_reach_bytes
             + self.partition_page_bytes
@@ -79,7 +79,7 @@ def estimate_rollout_memory(
     storage_page_rows: int = 256,
     live_state_rows: int | None = None,
 ) -> PokerRolloutMemoryPlan:
-    """Return the page/live-frontier minimum needed before the first draw."""
+    """Return the slab/page minimum needed before the first draw."""
 
     del use_branching_heads
     if root_count < 0 or n_players <= 0 or storage_page_rows <= 0:
@@ -99,8 +99,10 @@ def estimate_rollout_memory(
     return PokerRolloutMemoryPlan(
         page_rows=page_rows,
         live_state_rows=live_state_rows,
-        state_page_bytes=state_schema.capacity_bytes(live_state_rows, chunks=1),
-        history_page_bytes=history_schema.capacity_bytes(live_state_rows, chunks=1),
+        state_slab_bytes=state_schema.capacity_bytes(live_state_rows, chunks=1),
+        history_slab_bytes=history_schema.capacity_bytes(
+            live_state_rows, chunks=1
+        ),
         topology_page_bytes=(
             node_schema.capacity_bytes(page_rows, chunks=1)
             + edge_schema.capacity_bytes(page_rows, chunks=1)

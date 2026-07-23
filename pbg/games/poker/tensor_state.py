@@ -1,4 +1,4 @@
-"""Paged recyclable public states with separate immutable history rows."""
+"""Dense recyclable public states with separate shared history rows."""
 
 from __future__ import annotations
 
@@ -8,10 +8,11 @@ import torch
 from torch import Tensor
 
 from pbg.core.storage import (
-    PagedTensorColumn,
-    RecyclableTensorPool,
+    DenseRecyclableTensorColumn,
+    DenseRecyclableTensorPool,
     TensorFieldSchema,
     TensorSchema,
+    admit_dense_pool_growth,
 )
 from pbg.core.execution import ByteAccountant
 
@@ -94,7 +95,7 @@ def poker_public_history_schema(max_rollout_steps: int) -> TensorSchema:
 
 
 class PokerTensorStateStore:
-    """Store realized public poker states in byte-measurable pages.
+    """Store realized public poker states in dense live-frontier slabs.
 
     State handles are recyclable int32 ``[B]`` row indices. Logical topology
     ids remain monotone in their separate owner. There is deliberately no
@@ -106,7 +107,7 @@ class PokerTensorStateStore:
         max_rollout_steps: int,
         device: torch.device | str,
         n_players: int = 6,
-        page_rows: int = 256,
+        allocation_quantum_rows: int = 256,
         access_metrics: Any | None = None,
     ) -> None:
         if (
@@ -123,66 +124,56 @@ class PokerTensorStateStore:
         if self.device.type not in {"cuda", "mps"}:
             raise ValueError("poker rollout state requires CUDA or MPS")
         self.schema = poker_live_state_schema(n_players)
-        self.pool = RecyclableTensorPool(
+        self.pool = DenseRecyclableTensorPool(
             self.schema,
-            page_rows,
+            allocation_quantum_rows,
             self.device,
             label="poker_live_state",
             access_metrics=access_metrics,
         )
-        self.arena = self.pool.arena
         for field in self.schema.fields:
             setattr(
                 self,
                 field.name,
-                PagedTensorColumn(
-                    self.arena, field.name, direct_single_slab=True
-                ),
+                DenseRecyclableTensorColumn(self.pool, field.name),
             )
         self.history_schema = poker_public_history_schema(max_rollout_steps)
-        self.history_pool = RecyclableTensorPool(
+        self.history_pool = DenseRecyclableTensorPool(
             self.history_schema,
-            page_rows,
+            allocation_quantum_rows,
             self.device,
             label="poker_public_history",
             access_metrics=access_metrics,
         )
-        self.history_arena = self.history_pool.arena
         for field in self.history_schema.fields:
             setattr(
                 self,
                 field.name,
-                PagedTensorColumn(
-                    self.history_arena, field.name, direct_single_slab=True
-                ),
+                DenseRecyclableTensorColumn(self.history_pool, field.name),
             )
 
     @property
     def capacity(self) -> int:
-        return self.arena.capacity_rows
+        return self.pool.capacity_rows
 
     @property
     def allocated_capacity_bytes(self) -> int:
-        return self.arena.allocated_capacity_bytes
-
-    @property
-    def page_slack_bytes(self) -> int:
-        return self.arena.page_slack_bytes
+        return self.pool.allocated_capacity_bytes
 
     @property
     def size(self) -> Tensor:
-        return torch.tensor(self.arena.size, dtype=torch.int32, device=self.device)
+        return torch.tensor(self.pool.size, dtype=torch.int32, device=self.device)
 
     @property
     def history_parent(self) -> Tensor:
         return self.history_jump[:, 0]
 
-    def reset(self, *, release_pages: bool = False) -> None:
-        """Reset the device allocation cursor without reallocating storage."""
+    def reset(self, *, release_storage: bool = False) -> None:
+        """Reset live handles, optionally releasing the admitted slabs."""
 
-        self.pool.reset(release_pages=release_pages)
-        self.history_pool.reset(release_pages=release_pages)
-        if not release_pages:
+        self.pool.reset(release_storage=release_storage)
+        self.history_pool.reset(release_storage=release_storage)
+        if not release_storage:
             # CUDA history packing uses a fixed configured width.  Masked
             # padding therefore still needs one valid gather row even when a
             # root has no public history.  Row zero is the immutable sentinel;
@@ -191,18 +182,22 @@ class PokerTensorStateStore:
             self.history_refcount[sentinel] = 0
 
     def bind_accountant(self, accountant: ByteAccountant | None) -> None:
-        """Bind empty state/history page owners to one rollout byte ledger."""
+        """Bind empty state/history slab owners to one rollout byte ledger."""
 
-        for arena in (self.arena, self.history_arena):
-            if arena.page_count or arena.size:
+        for pool in (self.pool, self.history_pool):
+            if pool.capacity_rows or pool.size:
                 raise RuntimeError("rollout accountant must bind before state reset")
-            arena.accountant = accountant
+            pool.accountant = accountant
 
     def require_successor_capacity(self, count: int) -> None:
         """Admit recyclable state and history slots for one complete child wave."""
 
-        self.pool.require_capacity(count)
-        self.history_pool.require_capacity(count)
+        admit_dense_pool_growth(
+            {
+                self.pool: count,
+                self.history_pool: count,
+            }
+        )
 
     def allocate(self, requested: Tensor) -> Tensor:
         """Allocate requested rows and return int32 handles ``[B]``.
