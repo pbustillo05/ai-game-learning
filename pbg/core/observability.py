@@ -44,6 +44,15 @@ _ADDITIVE_COUNTERS = (
     "collective_bytes",
     "collective_seconds",
     "collective_exposed_seconds",
+    "storage_direct_accesses",
+    "storage_contiguous_accesses",
+    "storage_generic_accesses",
+    "storage_segments_visited",
+    "storage_rows_requested",
+    "storage_rows_moved",
+    "storage_candidate_rows",
+    "storage_routing_bytes",
+    "storage_routing_tensor_operations",
 )
 
 _MAXIMUM_COUNTERS = (
@@ -59,6 +68,9 @@ _MAXIMUM_COUNTERS = (
     "state_live_rows_at_seal",
     "history_live_rows_high_water",
     "history_live_rows_at_seal",
+    "storage_segments_per_access_max",
+    "storage_candidate_rows_per_access_max",
+    "storage_routing_bytes_per_access_max",
 )
 
 
@@ -276,6 +288,94 @@ class ExecutionMetrics:
     def record_target_bytes(self, value: int) -> None:
         self.add("target_bytes", value)
         self.maximum("target_bytes_max", value)
+
+    def record_storage_access(
+        self,
+        owner: str,
+        segment_kind: str,
+        operation: str,
+        path: str,
+        *,
+        segments_visited: int,
+        rows_requested: int,
+        rows_moved: int,
+        candidate_rows: int,
+        routing_bytes: int,
+        tensor_operations: int,
+    ) -> None:
+        """Record one page/chunk access without inspecting device values.
+
+        The caller supplies host-known physical extents and the tensor
+        operations issued by its routing implementation.  This accounting
+        therefore adds no CUDA synchronization to the hot path.  Actual
+        scheduler/host synchronization time remains in the dedicated
+        synchronization counters.
+        """
+
+        if segment_kind not in {"page", "chunk"}:
+            raise ValueError("storage segment kind must be 'page' or 'chunk'")
+        if operation not in {"read", "write", "resolve"}:
+            raise ValueError("storage operation must be read, write, or resolve")
+        if path not in {"direct", "contiguous", "generic"}:
+            raise ValueError("storage path must be direct, contiguous, or generic")
+        values = (
+            segments_visited,
+            rows_requested,
+            rows_moved,
+            candidate_rows,
+            routing_bytes,
+            tensor_operations,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in values
+        ):
+            raise ValueError("storage access values must be nonnegative integers")
+        stratum = "storage_{}_{}_{}_{}".format(
+            _metric_component(owner),
+            segment_kind,
+            operation,
+            path,
+        )
+        for destination in (None, stratum):
+            self.add(f"storage_{path}_accesses", 1, stratum=destination)
+            self.add(
+                "storage_segments_visited",
+                segments_visited,
+                stratum=destination,
+            )
+            self.add(
+                "storage_rows_requested",
+                rows_requested,
+                stratum=destination,
+            )
+            self.add("storage_rows_moved", rows_moved, stratum=destination)
+            self.add(
+                "storage_candidate_rows",
+                candidate_rows,
+                stratum=destination,
+            )
+            self.add("storage_routing_bytes", routing_bytes, stratum=destination)
+            self.add(
+                "storage_routing_tensor_operations",
+                tensor_operations,
+                stratum=destination,
+            )
+            self.maximum(
+                "storage_segments_per_access_max",
+                segments_visited,
+                stratum=destination,
+            )
+            self.maximum(
+                "storage_candidate_rows_per_access_max",
+                candidate_rows,
+                stratum=destination,
+            )
+            self.maximum(
+                "storage_routing_bytes_per_access_max",
+                routing_bytes,
+                stratum=destination,
+            )
 
     def record_collective(
         self, *, nbytes: int, seconds: float, exposed_seconds: float = 0.0

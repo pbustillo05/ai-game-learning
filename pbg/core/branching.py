@@ -226,6 +226,7 @@ def _sample_branched_tree_impl(
                 "upper_cutoff_first_node_count": -1,
             }
         )
+    metrics = getattr(backend, "execution_metrics", None)
     roots = backend.branched_root_state()
     if roots.shape != (1,) or roots.dtype != torch.int32 or roots.device != device:
         raise ValueError("branched_root_state must return device-local int32 [1]")
@@ -236,6 +237,7 @@ def _sample_branched_tree_impl(
         device,
         page_rows=page_rows,
         accountant=accountant,
+        access_metrics=metrics,
     )
     root_nodes = buffer.add_roots(roots, root_owner)
     arena = ChunkedOccurrenceArena(
@@ -248,6 +250,7 @@ def _sample_branched_tree_impl(
         ),
         accountant=accountant,
         label="branched_occurrences",
+        access_metrics=metrics,
     )
     root_handles = arena.allocate(1)
     if device.type == "cuda":
@@ -278,6 +281,7 @@ def _sample_branched_tree_impl(
         device,
         label="branched_live_reach",
         accountant=accountant,
+        access_metrics=metrics,
     )
     root_reach_handles = reach_pool.allocate(1)
     reach_pool.write(root_reach_handles, {"log_reach": root_reach})
@@ -322,7 +326,6 @@ def _sample_branched_tree_impl(
         )
         for partition_id in partition_ids
     }
-    metrics = getattr(backend, "execution_metrics", None)
     actual_cost_forward = getattr(
         backend, "policy_forward_partition_actual_cost", None
     )
@@ -443,6 +446,7 @@ def _sample_branched_tree_impl(
         device,
         accountant=accountant,
         label="branched_controller_rows",
+        access_metrics=metrics,
     )
     nominal_count = PagedTensorColumn(control_arena, "nominal_count")
     beta_rows = PagedTensorColumn(control_arena, "beta")

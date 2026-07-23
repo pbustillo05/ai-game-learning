@@ -220,6 +220,7 @@ class PagedTensorArena:
         accountant: ByteAccountant | None = None,
         label: str | None = None,
         maximum_rows: int | None = None,
+        access_metrics: Any | None = None,
     ) -> None:
         if isinstance(page_rows, bool) or page_rows <= 0:
             raise ValueError("page_rows must be a positive integer")
@@ -235,6 +236,7 @@ class PagedTensorArena:
         if not self.label:
             raise ValueError("arena label must be nonempty")
         self.maximum_rows = maximum_rows
+        self.access_metrics = access_metrics
         self._pages: list[dict[str, Tensor]] = []
         self._lengths: list[int] = []
         self._reservation_labels: list[str] = []
@@ -272,6 +274,33 @@ class PagedTensorArena:
     def _check_live(self) -> None:
         if self._released:
             raise RuntimeError("paged arena has been released")
+
+    def _record_access(
+        self,
+        operation: str,
+        path: str,
+        *,
+        segments_visited: int,
+        rows_requested: int,
+        rows_moved: int,
+        candidate_rows: int = 0,
+        routing_bytes: int = 0,
+        tensor_operations: int = 0,
+    ) -> None:
+        recorder = getattr(self.access_metrics, "record_storage_access", None)
+        if callable(recorder):
+            recorder(
+                self.label,
+                "page",
+                operation,
+                path,
+                segments_visited=segments_visited,
+                rows_requested=rows_requested,
+                rows_moved=rows_moved,
+                candidate_rows=candidate_rows,
+                routing_bytes=routing_bytes,
+                tensor_operations=tensor_operations,
+            )
 
     def reset(self, *, release_pages: bool = False) -> None:
         """Return the logical cursor to zero, optionally dropping admitted pages.
@@ -427,11 +456,13 @@ class PagedTensorArena:
                 raise ValueError("contiguous write tensors must already be on the arena device")
         source_start = 0
         page_start = 0
+        pages_visited = 0
         for columns, length in zip(self._pages, self._lengths, strict=True):
             page_stop = page_start + length
             write_start = max(start, page_start)
             write_stop = min(stop, page_stop)
             if write_start < write_stop:
+                pages_visited += 1
                 rows = write_stop - write_start
                 local_start = write_start - page_start
                 for name, value in values.items():
@@ -444,6 +475,14 @@ class PagedTensorArena:
                 break
         if source_start != count:
             raise RuntimeError("contiguous write did not cover its reserved span")
+        self._record_access(
+            "write",
+            "contiguous",
+            segments_visited=pages_visited,
+            rows_requested=count,
+            rows_moved=count * len(values),
+            tensor_operations=pages_visited * len(values),
+        )
 
     def write(self, rows: Tensor, values: Mapping[str, Tensor]) -> None:
         """Populate already-reserved unique logical rows."""
@@ -480,6 +519,14 @@ class PagedTensorArena:
             columns = self._pages[0]
             for name, value in values.items():
                 columns[name].index_copy_(0, rows, value)
+            self._record_access(
+                "write",
+                "direct",
+                segments_visited=1,
+                rows_requested=rows.numel(),
+                rows_moved=rows.numel() * len(values),
+                tensor_operations=len(values),
+            )
             return
         page_id = torch.div(rows, self.page_rows, rounding_mode="floor")
         offset = torch.remainder(rows, self.page_rows)
@@ -500,6 +547,30 @@ class PagedTensorArena:
                     (length,) + (1,) * (candidate.ndim - 1)
                 )
                 columns[name].copy_(torch.where(mask, candidate, columns[name]))
+        total_page_rows = sum(self._lengths)
+        field_payload = sum(
+            self.schema.by_name[name].row_payload_bytes for name in values
+        )
+        routing_bytes = (
+            rows.numel() * 16
+            + sum(
+                length * 17 + rows.numel() * length
+                for length in self._lengths
+            )
+            + 2 * total_page_rows * field_payload
+        )
+        self._record_access(
+            "write",
+            "generic",
+            segments_visited=len(self._pages),
+            rows_requested=rows.numel(),
+            rows_moved=total_page_rows * len(values),
+            candidate_rows=total_page_rows * len(values),
+            routing_bytes=routing_bytes,
+            tensor_operations=(
+                2 + len(self._pages) * (7 + 3 * len(values))
+            ),
+        )
 
     def gather(self, name: str, rows: Tensor) -> Tensor:
         self._check_live()
@@ -516,7 +587,16 @@ class PagedTensorArena:
             # See the matching write fast path.  index_select is the explicit
             # dense-pack read for a single resolved live-state slab and avoids
             # allocating/merging one candidate tensor per page.
-            return self._pages[0][name].index_select(0, rows)
+            result = self._pages[0][name].index_select(0, rows)
+            self._record_access(
+                "read",
+                "direct",
+                segments_visited=1,
+                rows_requested=rows.numel(),
+                rows_moved=rows.numel(),
+                tensor_operations=1,
+            )
+            return result
         if rows.numel() == 0:
             return torch.empty(
                 (0, *spec.shape), dtype=spec.dtype, device=self.device
@@ -535,6 +615,25 @@ class PagedTensorArena:
                 (rows.numel(),) + (1,) * len(spec.shape)
             )
             output = torch.where(mask, candidate, output)
+        payload = spec.row_payload_bytes
+        page_count = len(self._pages)
+        routing_bytes = (
+            rows.numel() * 16
+            + rows.numel() * payload
+            + max(page_count - 1, 0)
+            * rows.numel()
+            * (8 + 1 + 2 * payload)
+        )
+        self._record_access(
+            "read",
+            "generic",
+            segments_visited=page_count,
+            rows_requested=rows.numel(),
+            rows_moved=rows.numel(),
+            candidate_rows=rows.numel() * page_count,
+            routing_bytes=routing_bytes,
+            tensor_operations=4 + max(page_count - 1, 0) * 4,
+        )
         return output
 
     def require_rows(self, additional_rows: int) -> None:
@@ -797,6 +896,22 @@ class PagedTensorColumn:
             return self.arena._pages[0][self.name]
         return None
 
+    def _direct_row_count(self, key: Any) -> int:
+        """Return the host-known selector extent without reading device data."""
+
+        selector = key[0] if isinstance(key, tuple) else key
+        if isinstance(selector, int):
+            return 1
+        if isinstance(selector, slice):
+            start, stop, step = selector.indices(self.arena.size)
+            return len(range(start, stop, step))
+        if isinstance(selector, Tensor):
+            # Boolean selectors inspect this many logical rows. Their exact
+            # selected count is device data and must not be synchronized only
+            # for diagnostics.
+            return selector.numel()
+        return torch.as_tensor(selector).numel()
+
     @property
     def shape(self) -> tuple[int, ...]:
         return (self.arena.size, *self.spec.shape)
@@ -871,7 +986,17 @@ class PagedTensorColumn:
     def __getitem__(self, key: Any) -> Tensor:
         direct = self._direct_slab()
         if direct is not None:
-            return direct[key]
+            result = direct[key]
+            rows = self._direct_row_count(key)
+            self.arena._record_access(
+                "read",
+                "direct",
+                segments_visited=1,
+                rows_requested=rows,
+                rows_moved=rows,
+                tensor_operations=1,
+            )
+            return result
         parts = key if isinstance(key, tuple) else (key,)
         rows, row_shape, scalar = self._rows(parts[0])
         full = self.arena.gather(self.name, rows)
@@ -886,6 +1011,15 @@ class PagedTensorColumn:
         direct = self._direct_slab()
         if direct is not None:
             direct[key] = value
+            rows = self._direct_row_count(key)
+            self.arena._record_access(
+                "write",
+                "direct",
+                segments_visited=1,
+                rows_requested=rows,
+                rows_moved=rows,
+                tensor_operations=1,
+            )
             return
         parts = key if isinstance(key, tuple) else (key,)
         rows, row_shape, scalar = self._rows(parts[0])
@@ -936,6 +1070,7 @@ class RecyclableTensorPool:
         accountant: ByteAccountant | None = None,
         label: str | None = None,
         maximum_rows: int | None = None,
+        access_metrics: Any | None = None,
     ) -> None:
         self.arena = PagedTensorArena(
             schema,
@@ -944,6 +1079,7 @@ class RecyclableTensorPool:
             accountant=accountant,
             label=label,
             maximum_rows=maximum_rows,
+            access_metrics=access_metrics,
         )
         self._free: list[Tensor] = []
         self._live_rows = 0

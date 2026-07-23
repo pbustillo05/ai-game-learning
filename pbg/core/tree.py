@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Any, Mapping
 import torch
 from torch import Tensor
 
@@ -60,6 +60,7 @@ class PagedRolloutTopology:
         *,
         page_rows: int = 256,
         accountant: ByteAccountant | None = None,
+        access_metrics: Any | None = None,
     ) -> None:
         if root_count < 0 or n_players <= 0 or page_rows <= 0:
             raise ValueError("paged tree dimensions must be nonnegative/positive")
@@ -72,6 +73,7 @@ class PagedRolloutTopology:
             self.device,
             accountant=accountant,
             label="rollout_topology_nodes",
+            access_metrics=access_metrics,
         )
         self.edges = PagedTensorArena(
             self.edge_schema(),
@@ -79,6 +81,7 @@ class PagedRolloutTopology:
             self.device,
             accountant=accountant,
             label="rollout_topology_edges",
+            access_metrics=access_metrics,
         )
         for name in self.nodes.schema.by_name:
             setattr(self, name, PagedTensorColumn(self.nodes, name))

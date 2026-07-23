@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from pbg.core.execution import ByteAccountant
+from pbg.core.observability import ExecutionMetrics
 from pbg.core.partition import (
     ByteWorkContract,
     CompletionSpec,
@@ -194,6 +195,48 @@ def test_direct_single_slab_column_uses_dense_tensor_indexing() -> None:
     assert torch.equal(
         column[rows],
         torch.tensor([[0.0, 1.0, 20.0], [3.0, 4.0, 5.0], [6.0, 70.0, 8.0]]),
+    )
+
+
+def test_paged_access_metrics_distinguish_direct_contiguous_and_generic_work() -> None:
+    metrics = ExecutionMetrics()
+    schema = TensorSchema(
+        "instrumented_pages",
+        (TensorFieldSchema("payload", torch.float32, (2,)),),
+    )
+    arena = PagedTensorArena(
+        schema,
+        2,
+        "cpu",
+        label="instrumented_pages",
+        access_metrics=metrics,
+    )
+    arena.append(
+        {"payload": torch.arange(6, dtype=torch.float32).reshape(3, 2)}
+    )
+    assert metrics.totals()["storage_contiguous_accesses"] == 1
+
+    metrics.clear()
+    selected = torch.tensor([0, 2], dtype=torch.int64)
+    assert arena.gather("payload", selected).shape == (2, 2)
+    arena.write(
+        selected,
+        {"payload": torch.tensor([[8.0, 9.0], [10.0, 11.0]])},
+    )
+    totals = metrics.totals()
+    assert totals["storage_generic_accesses"] == 2
+    assert totals["storage_segments_visited"] == 4
+    assert totals["storage_rows_requested"] == 4
+    assert totals["storage_candidate_rows"] == 8
+    assert totals["storage_routing_bytes"] > 0
+    assert totals["storage_routing_tensor_operations"] > 0
+    snapshot = metrics.snapshot()
+    assert (
+        snapshot[
+            "execution_storage_instrumented_pages_page_read_generic_"
+            "storage_segments_per_access_max"
+        ]
+        == 2
     )
 
 

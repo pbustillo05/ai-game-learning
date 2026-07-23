@@ -263,6 +263,7 @@ class ChunkedOccurrenceArena:
         fields: Mapping[str, ArenaField] | None = None,
         accountant: ByteAccountant | None = None,
         label: str = "occurrence_arena",
+        access_metrics: object | None = None,
     ) -> None:
         if capacity is not None and (isinstance(capacity, bool) or capacity <= 0):
             raise ValueError("arena capacity must be positive or None")
@@ -289,6 +290,7 @@ class ChunkedOccurrenceArena:
             raise ValueError("occurrence arena fields must use integer dtypes")
         self.accountant = accountant
         self.label = label
+        self.access_metrics = access_metrics
         self._chunks: dict[str, list[Tensor]] = {
             name: [] for name in self.fields
         }
@@ -297,6 +299,32 @@ class ChunkedOccurrenceArena:
         self._reserved_bytes = 0
         self._reservation_labels: list[str] = []
         self._released = False
+
+    def _record_access(
+        self,
+        operation: str,
+        *,
+        segments_visited: int,
+        rows_requested: int,
+        rows_moved: int,
+        candidate_rows: int,
+        routing_bytes: int,
+        tensor_operations: int,
+    ) -> None:
+        recorder = getattr(self.access_metrics, "record_storage_access", None)
+        if callable(recorder):
+            recorder(
+                self.label,
+                "chunk",
+                operation,
+                "generic",
+                segments_visited=segments_visited,
+                rows_requested=rows_requested,
+                rows_moved=rows_moved,
+                candidate_rows=candidate_rows,
+                routing_bytes=routing_bytes,
+                tensor_operations=tensor_operations,
+            )
 
     @property
     def size(self) -> int:
@@ -447,6 +475,8 @@ class ChunkedOccurrenceArena:
         handles: Tensor,
         offsets: Tensor,
         selectors: tuple[Tensor, ...],
+        *,
+        include_resolution: bool = True,
     ) -> dict[str, Tensor]:
         outputs = {
             name: torch.full(
@@ -474,6 +504,26 @@ class ChunkedOccurrenceArena:
                     outputs[name][selector] = self._chunks[name][chunk_id][
                         selected_offsets
                     ]
+        rows = handles.numel()
+        chunks = len(selectors)
+        payload = sum(field.row_bytes for field in specs.values())
+        resolution_bytes = rows * (16 + chunks) if include_resolution else 0
+        resolution_ops = 2 + chunks if include_resolution else 0
+        self._record_access(
+            "read",
+            segments_visited=chunks,
+            rows_requested=rows,
+            rows_moved=rows * len(specs),
+            candidate_rows=rows * chunks * len(specs),
+            routing_bytes=(
+                resolution_bytes
+                + rows * payload
+                + chunks * rows * (8 + 2 * payload)
+            ),
+            tensor_operations=(
+                resolution_ops + len(specs) + chunks * (1 + 2 * len(specs))
+            ),
+        )
         return outputs
 
     def _scatter_from_plan(
@@ -481,6 +531,8 @@ class ChunkedOccurrenceArena:
         prepared: Mapping[str, Tensor],
         offsets: Tensor,
         selectors: tuple[Tensor, ...],
+        *,
+        include_resolution: bool = True,
     ) -> None:
         for chunk_id, selector in enumerate(selectors):
             if self.device.type == "cuda":
@@ -502,6 +554,26 @@ class ChunkedOccurrenceArena:
                 selected_offsets = offsets[selector]
                 for name, value in prepared.items():
                     self._chunks[name][chunk_id][selected_offsets] = value[selector]
+        rows = offsets.numel()
+        chunks = len(selectors)
+        payload = sum(
+            self.fields[name].row_bytes for name in prepared
+        )
+        resolution_bytes = rows * (16 + chunks) if include_resolution else 0
+        resolution_ops = 2 + chunks if include_resolution else 0
+        self._record_access(
+            "write",
+            segments_visited=chunks,
+            rows_requested=rows,
+            rows_moved=rows * chunks * len(prepared),
+            candidate_rows=rows * chunks * len(prepared),
+            routing_bytes=(
+                resolution_bytes + chunks * rows * (8 + 4 * payload)
+            ),
+            tensor_operations=(
+                resolution_ops + chunks * (1 + 5 * len(prepared))
+            ),
+        )
 
     def gather_many(self, names: Iterable[str], handles: Tensor) -> dict[str, Tensor]:
         """Gather several fields while sharing one device chunk-index plan."""
@@ -582,13 +654,17 @@ class ChunkedOccurrenceArena:
             handles,
             offsets,
             selectors,
+            include_resolution=True,
         )["status"]
         _device_assert(
             (current == expected).all(),
             f"occurrence status is not {expected} before transition to {new}",
         )
         self._scatter_from_plan(
-            {"status": torch.full_like(current, new)}, offsets, selectors
+            {"status": torch.full_like(current, new)},
+            offsets,
+            selectors,
+            include_resolution=False,
         )
 
 

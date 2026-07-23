@@ -1237,9 +1237,9 @@ geometry, and seed for the first paired candidate.
 
 | ROI | Change | Expected byte effect | Throughput expectation | Scope and acceptance gate |
 |---:|---|---:|---|---|
-| 1 | Remove generic all-page scans from branched mutable state, shared history, and active reach | keep capacity proportional to admitted live high water; remove per-256-row tensor fragmentation and routing transients | strongly positive; this is the sequential paged-state regression class still present in branching | Highest priority. Benchmark state/history and reach changes separately where possible. No total-tree-sized slab; identical topology/RNG/retained rows; lower page-path counts, rollout time, and reserved fragmentation |
-| 2 | Commit host-proven contiguous branched child subspans directly | capacity-neutral; removes page-match matrices and candidate copies | positive and low-risk | Preserve two-pass address publication and stable child order. Exact children/edges/events; paired seed-104830 branch gate |
-| 3 | Make occurrence/topology/controller access pack-local instead of all-chunk/all-page | retain paged append-only capacity; remove $O(B\,n_{\text{pages}})$ hot routing work | potentially strongly positive on large trees | Medium core refactor. Stable logical addresses and last-consumer ownership; report early/late-pack timing and scaling versus realized page count |
+| 1 | Remove generic all-page scans from branched mutable state, shared history, and active reach | keep capacity proportional to admitted live high water; remove per-256-row tensor fragmentation and routing transients | strongly positive; this is the sequential paged-state regression class still present in branching | **Instrumented 2026-07-23; implementation pending.** Seed 104,830 measured 54,306/17,052/656 generic state/history/reach accesses, maxima of 25/56/25 pages per access, and 682.8M candidate rows for 14.6M requested rows. Highest priority. Benchmark owners separately where possible. No total-tree-sized slab; identical topology/RNG/retained rows; lower page-path counts, rollout time, and reserved fragmentation |
+| 2 | Commit host-proven contiguous branched child subspans directly | capacity-neutral; removes page-match matrices and candidate copies | positive and low-risk | **Instrumented 2026-07-23; implementation pending.** Topology append already used 319 node and 318 edge contiguous writes, but hot updates still included 970 generic node writes and 312 generic edge writes, materializing 28.2M candidate rows. Pass physical subspan cursors through the remaining commit boundary; preserve two-pass address publication and stable child order; exact children/edges/events; paired seed-104830 branch gate |
+| 3 | Make occurrence/topology/controller access pack-local instead of all-chunk/all-page | retain paged append-only capacity; remove $O(B\,n_{\text{pages}})$ hot routing work | potentially strongly positive on large trees | **Instrumented 2026-07-23; implementation pending.** Occurrence, node/edge topology, and controller owners made 10,640 generic accesses, visited 560,060 chunks/pages, and materialized 85.3M candidate rows; each reached 91 accumulated segments. Medium core refactor. Stable logical addresses and last-consumer ownership; report early/late-pack timing and scaling versus realized page count |
 | 4 | Restore exact-street physical rollout queues or an equally efficient bounded packer | no required retained-byte change; reduces mixed-street padded work | positive; previously about 4.9% in HU | Separate scheduling experiment. Natural training partitions unchanged; identical keyed RNG/topology; padded pairs and wall time must improve |
 | 5 | Replace per-destination routing sorts with one stable partition only after owner-local page scans are gone | candidate core is roughly $10F_bM\to16F_b$, excluding queue staging | unknown until fixed-window/device-offset costs are included | Localized experiment. Identical stable queue order and RNG; no new host slicing/sync; realistic sequential and branched CUDA timing |
 | 6 | Capture scalar normal old value/log probability and realized type immediately | save $8\sum_mD_m(Y_m-1)$ source bytes | positive: fewer wide writes and later gathers | Small–medium. Exact normal targets/losses; paired CUDA rollout and end-to-end gate |
@@ -1259,6 +1259,17 @@ different phase or owner is binding, re-order the remaining items rather than
 following the table mechanically. Isolation during experimentation does not
 authorize permanent parallel implementations: an accepted item ends with one
 production path and deletion of the implementation it supersedes.
+
+The 2026-07-23 instrumentation run is
+`runs/experiments/nlhe_hu_32bb_branched_fixed_storage_access_20260723/benchmark.json`.
+Its aggregate totals were 82,654 generic accesses, 2.47M segments visited,
+768.0M candidate rows, and 81.9GB of cumulative routing temporaries issued
+(allocation/traffic sum, not a simultaneous peak). It preserved 58/58 applied
+optimizer steps, 14,848 learner presentations, zero undeclared host
+synchronizations, and the 8.960GiB reserved rollout peak. The fresh tree had
+23,267 nodes versus 23,162 in the historical artifact after an independently
+executed throughput-mode warmup, so its 244.790-second rollout is diagnostic
+only, not a strict paired timing acceptance result.
 
 # 13. Acceptance and reporting
 

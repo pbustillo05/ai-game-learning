@@ -194,11 +194,15 @@ class PokerRolloutBackend:
             raises_per_street = math.ceil(cfg.stack_bb / cfg.bb) + 1
             max_rollout_steps = 4 * cfg.n_players * (raises_per_street + 1) + 3
         self.max_rollout_steps = int(max_rollout_steps)
+        # Storage owners are constructed below, so their lossless hot-path
+        # counters must exist before the state/history arenas are bound.
+        self.execution_metrics = ExecutionMetrics()
         self.states = PokerTensorStateStore(
             self.max_rollout_steps,
             self.device,
             cfg.n_players,
             page_rows=self.live_state_rows,
+            access_metrics=self.execution_metrics,
         )
         self.state_store = self.states
         self.history_materializer = DeviceHistoryMaterializer(self.states)
@@ -249,7 +253,6 @@ class PokerRolloutBackend:
         self.execution_profile = None
         # Aggregate counters are intentionally lossless.  The former bounded
         # deque silently discarded early calls in long iterations.
-        self.execution_metrics = ExecutionMetrics()
         self._training_partitions = None
         self.game = self
 

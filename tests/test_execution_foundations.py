@@ -384,6 +384,35 @@ def test_arena_multi_field_gather_scatter_share_cross_chunk_indexing() -> None:
     assert torch.equal(arena.gather("state_ref", selected), values["state_ref"])
 
 
+def test_occurrence_access_metrics_report_all_chunk_candidate_work() -> None:
+    metrics = ExecutionMetrics()
+    arena = ChunkedOccurrenceArena(
+        6,
+        2,
+        "cpu",
+        fields=arena_fields(("state_ref", "path_key")),
+        label="instrumented_occurrences",
+        access_metrics=metrics,
+    )
+    handles = arena.allocate(6)
+    selected = handles[torch.tensor([5, 0, 3])]
+    values = {
+        "state_ref": torch.tensor([15, 10, 13], dtype=torch.int32),
+        "path_key": torch.tensor([25, 20, 23], dtype=torch.int64),
+    }
+    arena.scatter_many(selected, values)
+    gathered = arena.gather_many(tuple(values), selected)
+    assert all(torch.equal(gathered[name], value) for name, value in values.items())
+
+    totals = metrics.totals()
+    assert totals["storage_generic_accesses"] == 2
+    assert totals["storage_segments_visited"] == 6
+    assert totals["storage_rows_requested"] == 6
+    assert totals["storage_candidate_rows"] == 36
+    assert totals["storage_routing_bytes"] > 0
+    assert totals["storage_routing_tensor_operations"] > 0
+
+
 def test_work_queue_status_lifecycle_duplicate_guard_and_overflow_are_exact() -> None:
     arena = ChunkedOccurrenceArena(6, 2, "cpu")
     handles = arena.allocate(6)

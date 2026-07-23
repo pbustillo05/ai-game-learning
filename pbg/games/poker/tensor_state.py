@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import Tensor
 
@@ -105,6 +107,7 @@ class PokerTensorStateStore:
         device: torch.device | str,
         n_players: int = 6,
         page_rows: int = 256,
+        access_metrics: Any | None = None,
     ) -> None:
         if (
             isinstance(max_rollout_steps, bool)
@@ -125,6 +128,7 @@ class PokerTensorStateStore:
             page_rows,
             self.device,
             label="poker_live_state",
+            access_metrics=access_metrics,
         )
         self.arena = self.pool.arena
         for field in self.schema.fields:
@@ -141,6 +145,7 @@ class PokerTensorStateStore:
             page_rows,
             self.device,
             label="poker_public_history",
+            access_metrics=access_metrics,
         )
         self.history_arena = self.history_pool.arena
         for field in self.history_schema.fields:
