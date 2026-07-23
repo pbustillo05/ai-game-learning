@@ -875,6 +875,56 @@ class DistributedUpdateResult:
     metrics: Mapping[str, float]
 
 
+def posterior_effective_hand_counts(storage: TrainingStorage) -> Tensor:
+    """Return one entropy-effective hand count per retained decision row.
+
+    Normal sampling presents one realized private hand per row.  Sequential
+    Rao--Blackwell rows reference an exact posterior in the deduplicated pool;
+    repeated decision references remain repeated here because this vector is
+    decision-aligned, not pool-aligned.
+    """
+
+    first_partition = next(iter(storage.partitions.values()))
+    device = next(iter(first_partition.inputs.columns.values())).device
+    rows = sum(partition.inputs.rows for partition in storage.partitions.values())
+    if storage.mode == "normal":
+        return torch.ones(rows, dtype=torch.float64, device=device)
+    if storage.mode != "sequential_rb" or storage.posterior_pool is None:
+        return torch.ones(rows, dtype=torch.float64, device=device)
+    posterior = storage.posterior_pool.posterior
+    if posterior.ndim != 2 or posterior.shape[0] == 0:
+        raise ValueError("sequential posterior pool must contain fp64-compatible rows")
+    pool_counts = torch.empty(
+        posterior.shape[0], dtype=torch.float64, device=posterior.device
+    )
+    # Bound fp64 entropy workspace independently of rollout width.
+    for begin in range(0, posterior.shape[0], 256):
+        stop = min(begin + 256, posterior.shape[0])
+        values = posterior[begin:stop].to(torch.float64)
+        torch._assert_async(
+            (torch.isfinite(values) & (values >= 0)).all(),
+            "sequential posterior pool must be finite and nonnegative",
+        )
+        mass = values.sum(1)
+        torch._assert_async(
+            (mass > 0).all(),
+            "sequential posterior pool rows must have positive mass",
+        )
+        probability = values / mass[:, None]
+        entropy = -torch.where(
+            probability > 0,
+            probability * torch.log(probability),
+            torch.zeros_like(probability),
+        ).sum(1)
+        pool_counts[begin:stop] = torch.exp(entropy)
+    return torch.cat(
+        [
+            pool_counts[partition.columns["posterior_ref"].to(torch.int64)]
+            for partition in storage.partitions.values()
+        ]
+    )
+
+
 class DistributedFixedRolloutUpdate:
     """Bounded fixed-rollout optimizer consuming only ``TrainingStorage``."""
 
@@ -1216,6 +1266,16 @@ class DistributedFixedRolloutUpdate:
         activation_checkpointed = 0
         objective_terms: dict[str, Tensor] = {}
         ratio_maximum: Tensor | None = None
+        effective_by_partition: dict[int, Tensor] = {}
+        effective_offset = 0
+        effective_counts = posterior_effective_hand_counts(storage)
+        rollout_effective_hands = effective_counts.sum()
+        learner_effective_hands = effective_counts.new_zeros(())
+        for partition_id, partition in storage.partitions.items():
+            effective_by_partition[partition_id] = effective_counts[
+                effective_offset : effective_offset + partition.inputs.rows
+            ]
+            effective_offset += partition.inputs.rows
         timing_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
         cuda_device = self.index_buffer.tensor.device
 
@@ -1242,6 +1302,7 @@ class DistributedFixedRolloutUpdate:
             nonlocal objective_mass
             nonlocal activation_checkpointed
             nonlocal ratio_maximum
+            nonlocal learner_effective_hands
             self.flat_gradient.zero_()
             for position, partition_spec in enumerate(self.partitions.specs):
                 partition_id = partition_spec.partition_id
@@ -1269,6 +1330,10 @@ class DistributedFixedRolloutUpdate:
                 planner = self._planners[partition_id]
                 spans = planner.plan(indices, self.config.available_transient_bytes)
                 sampled_total += count
+                learner_effective_hands = (
+                    learner_effective_hands
+                    + effective_by_partition[partition_id][indices.to(torch.int64)].sum()
+                )
                 partition_sampled[partition_id] = partition_sampled.get(partition_id, 0) + count
                 physical_total += len(spans)
                 tail_total += sum(span.shape_rows not in {s.rows for s in planner.shapes} for span in spans)
@@ -1403,7 +1468,15 @@ class DistributedFixedRolloutUpdate:
                 "reference_cache_predicted_seconds": choice.predicted_seconds,
                 "reference_cache_predicted_peak_bytes": float(choice.predicted_peak_bytes),
                 "activation_checkpointed_subspans": float(activation_checkpointed),
+                "posterior_effective_hands_rollout": float(rollout_effective_hands),
+                "posterior_effective_hand_presentations_learner": float(
+                    learner_effective_hands
+                ),
             }
+        )
+        metrics["posterior_effective_hands_per_learner_sample"] = (
+            metrics["posterior_effective_hand_presentations_learner"]
+            / max(metrics["statistical_rows"], 1.0)
         )
         for partition_id, count in partition_sampled.items():
             metrics[f"partition_{partition_id}_statistical_rows"] = float(count)

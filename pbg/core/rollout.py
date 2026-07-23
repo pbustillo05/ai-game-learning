@@ -1020,6 +1020,9 @@ def sample_trees(
     *,
     iteration: int = 0,
     branching_controller: Any | None = None,
+    safeguard_controller: Any | None = None,
+    branching_memory_controller: Any | None = None,
+    branching_attempt: int = 0,
     branching_diagnostic_limits: Any | None = None,
 ) -> SealedRolloutSample | ProbeRollout:
     """Sample trajectories for sequential RB or one tree for branched RB."""
@@ -1034,6 +1037,9 @@ def sample_trees(
         return sample_branched_tree(
             bundle, cfg, gen, iteration=iteration,
             controller=branching_controller,
+            safeguard_controller=safeguard_controller,
+            memory_controller=branching_memory_controller,
+            attempt=branching_attempt,
             diagnostic_limits=branching_diagnostic_limits,
         )
     raise ValueError("sample_trees requires an RB training mode")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import shutil
 from dataclasses import asdict
@@ -16,18 +17,23 @@ import torch
 from torch import nn
 
 from pbg.core.config import RootConfig
-from pbg.core.adaptive_branching import BRANCHING_CONTROLLER_VERSION
+from pbg.core.adaptive_branching import (
+    BRANCHING_CONTROLLER_VERSION,
+    COST_SAFEGUARD_CONTROLLER_VERSION,
+    FIXED_BETA_CONTROLLER_VERSION,
+)
 from pbg.core.memory_control import SEQUENTIAL_MEMORY_CONTROLLER_VERSION
 from pbg.core.storage import TRAINING_STORAGE_SCHEMA_VERSION
 
 
-CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v6"
+CHECKPOINT_SCHEMA_VERSION = "pbg-checkpoint-v8"
 _REQUIRED_CHECKPOINT_FIELDS = frozenset(
     {
         "checkpoint_schema_version",
         "storage_schema_version",
         "controller_schema_version",
         "branching_controller_schema_version",
+        "cost_safeguard_controller_schema_version",
         "model",
         "optimizer",
         "scaler",
@@ -42,8 +48,10 @@ _REQUIRED_CHECKPOINT_FIELDS = frozenset(
         "rank_rng_states",
         "reference_model",
         "reference_iteration",
+        "reference_effective_hands_rollout",
         "adaptive_work_state",
         "branching_controller_state",
+        "cost_safeguard_controller_state",
         "probe_target",
         "logical_work",
         "initialization",
@@ -76,7 +84,7 @@ def validate_checkpoint_payload(payload: Any) -> dict[str, Any]:
         raise RuntimeError("checkpoint contains partial controller metadata")
     if state is not None and (
         controller_version != SEQUENTIAL_MEMORY_CONTROLLER_VERSION
-        or state.get("version") != SEQUENTIAL_MEMORY_CONTROLLER_VERSION
+        or state.get("version") != controller_version
     ):
         raise RuntimeError("checkpoint controller schema is incompatible")
     branching_state = payload["branching_controller_state"]
@@ -84,10 +92,20 @@ def validate_checkpoint_payload(payload: Any) -> dict[str, Any]:
     if (branching_state is None) != (branching_version is None):
         raise RuntimeError("checkpoint contains partial adaptive KKT controller metadata")
     if branching_state is not None and (
-        branching_version != BRANCHING_CONTROLLER_VERSION
-        or branching_state.get("version") != BRANCHING_CONTROLLER_VERSION
+        branching_version
+        not in {BRANCHING_CONTROLLER_VERSION, FIXED_BETA_CONTROLLER_VERSION}
+        or branching_state.get("version") != branching_version
     ):
         raise RuntimeError("checkpoint adaptive KKT controller schema is incompatible")
+    safeguard_state = payload["cost_safeguard_controller_state"]
+    safeguard_version = payload["cost_safeguard_controller_schema_version"]
+    if (safeguard_state is None) != (safeguard_version is None):
+        raise RuntimeError("checkpoint contains partial cost-safeguard metadata")
+    if safeguard_state is not None and (
+        safeguard_version != COST_SAFEGUARD_CONTROLLER_VERSION
+        or safeguard_state.get("version") != COST_SAFEGUARD_CONTROLLER_VERSION
+    ):
+        raise RuntimeError("checkpoint cost-safeguard controller schema is incompatible")
     rank_states = payload["rank_rng_states"]
     if rank_states is not None and any(
         not isinstance(item, dict)
@@ -95,6 +113,14 @@ def validate_checkpoint_payload(payload: Any) -> dict[str, Any]:
         for item in rank_states
     ):
         raise RuntimeError("checkpoint contains a partial per-rank RNG state")
+    exposure = payload["reference_effective_hands_rollout"]
+    if (
+        isinstance(exposure, bool)
+        or not isinstance(exposure, (int, float))
+        or not math.isfinite(float(exposure))
+        or float(exposure) < 0.0
+    ):
+        raise RuntimeError("checkpoint contains an invalid KL-reference exposure counter")
     return payload
 
 
@@ -119,6 +145,9 @@ def inspect_checkpoint(path: str | Path) -> dict[str, Any]:
         "branching_controller_schema_version": payload[
             "branching_controller_schema_version"
         ],
+        "cost_safeguard_controller_schema_version": payload[
+            "cost_safeguard_controller_schema_version"
+        ],
         "iteration": int(payload["iteration"]),
         "config": copy.deepcopy(payload["config"]),
     }
@@ -138,8 +167,10 @@ def save_checkpoint(
     rank_rng_states: list[dict[str, Any]] | None = None,
     reference_model: nn.Module | None = None,
     reference_iteration: int | None = None,
+    reference_effective_hands_rollout: float = 0.0,
     adaptive_work_state: dict[str, Any] | None = None,
     branching_controller_state: dict[str, Any] | None = None,
+    cost_safeguard_controller_state: dict[str, Any] | None = None,
     probe_target: dict[str, Any] | None = None,
     logical_work: dict[str, int] | None = None,
     initialization: dict[str, Any] | None = None,
@@ -157,10 +188,17 @@ def save_checkpoint(
         "controller_schema_version": (
             None
             if adaptive_work_state is None
-            else SEQUENTIAL_MEMORY_CONTROLLER_VERSION
+            else adaptive_work_state["version"]
         ),
         "branching_controller_schema_version": (
-            None if branching_controller_state is None else BRANCHING_CONTROLLER_VERSION
+            None
+            if branching_controller_state is None
+            else branching_controller_state["version"]
+        ),
+        "cost_safeguard_controller_schema_version": (
+            None
+            if cost_safeguard_controller_state is None
+            else COST_SAFEGUARD_CONTROLLER_VERSION
         ),
         "model": raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -178,8 +216,12 @@ def save_checkpoint(
             None if reference_model is None else reference_model.state_dict()
         ),
         "reference_iteration": reference_iteration,
+        "reference_effective_hands_rollout": float(
+            reference_effective_hands_rollout
+        ),
         "adaptive_work_state": adaptive_work_state,
         "branching_controller_state": branching_controller_state,
+        "cost_safeguard_controller_state": cost_safeguard_controller_state,
         "probe_target": copy.deepcopy(probe_target),
         "logical_work": copy.deepcopy(logical_work),
         "initialization": copy.deepcopy(initialization),
@@ -243,8 +285,14 @@ def load_checkpoint(
         "cfg_dict": payload["config"],
         "run_id": payload.get("run_id"),
         "reference_iteration": payload.get("reference_iteration"),
+        "reference_effective_hands_rollout": float(
+            payload["reference_effective_hands_rollout"]
+        ),
         "adaptive_work_state": payload.get("adaptive_work_state"),
         "branching_controller_state": payload.get("branching_controller_state"),
+        "cost_safeguard_controller_state": payload.get(
+            "cost_safeguard_controller_state"
+        ),
         "probe_target": copy.deepcopy(payload.get("probe_target")),
         "logical_work": copy.deepcopy(payload.get("logical_work")),
         "initialization": copy.deepcopy(payload.get("initialization")),
@@ -253,6 +301,9 @@ def load_checkpoint(
         "controller_schema_version": payload["controller_schema_version"],
         "branching_controller_schema_version": payload[
             "branching_controller_schema_version"
+        ],
+        "cost_safeguard_controller_schema_version": payload[
+            "cost_safeguard_controller_schema_version"
         ],
     }
 

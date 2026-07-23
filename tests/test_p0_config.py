@@ -114,6 +114,7 @@ def test_training_mode_validates_beta_completion_and_loss_axes(tmp_path: Path) -
     raw["loss"]["name"] = "ppo"
     raw["rollout"]["beta"] = None
     raw["rollout"]["branching_mode"] = None
+    raw["rollout"]["branching_ideal_nodes"] = None
     raw["rollout"]["safe_tree_size"] = None
     raw["rollout"]["queue_capacity_rows"] = None
     path = tmp_path / "normal.yaml"
@@ -155,6 +156,7 @@ def test_production_execution_config_is_explicit_and_strict(
     raw["training"]["mode"] = "rao_blackwell"
     raw["rollout"]["beta"] = None
     raw["rollout"]["branching_mode"] = None
+    raw["rollout"]["branching_ideal_nodes"] = None
     raw["rollout"]["safe_tree_size"] = None
     raw["rollout"]["queue_capacity_rows"] = None
     raw["rollout"]["sequential_roots_per_gpu_initial"] = 10

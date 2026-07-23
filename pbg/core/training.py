@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import importlib
 import json
@@ -22,7 +23,11 @@ from torch import Tensor, nn
 
 from pbg.core.br import SHARED_RESPONSE_SEMANTICS
 from pbg.core.config import RootConfig, seed_all
-from pbg.core.adaptive_branching import AdaptiveKKTController
+from pbg.core.adaptive_branching import (
+    AdaptiveKKTController,
+    CostSafeguardController,
+    FixedBetaController,
+)
 from pbg.core.checkpointing import (
     capture_rng_state,
     config_fingerprint,
@@ -46,6 +51,7 @@ from pbg.core.learner import (
 )
 from pbg.core.memory_control import (
     MEMORY_PHASES,
+    BranchedMemoryRejection,
     MemoryAdmissionStop,
     MemoryLedger,
     PhaseMemoryForecaster,
@@ -323,6 +329,8 @@ def _add_distributed_metric_summaries(
         "root_refill_count",
         "root_refill_added_nodes",
         "counterfactual_tree_size",
+        "posterior_effective_hands_rollout",
+        "posterior_effective_hand_presentations_learner",
     )
     present = torch.tensor(
         [name in metrics for name in names], dtype=torch.float64, device=device
@@ -903,6 +911,61 @@ def _validate_memory_calibration(
     metrics["memory_hard_limit_exceeded"] = float(headroom < 0)
 
 
+def _phase_memory_models(
+    memory_plan: Mapping[str, int], units: float
+) -> dict[str, PhaseMemoryModel]:
+    """Build the shared four-phase analytic prior per logical unit."""
+
+    if not math.isfinite(float(units)) or units <= 0:
+        raise ValueError("phase-memory model units must be finite and positive")
+    prefixes = {
+        "rollout": "rollout",
+        "seal": "seal",
+        "targets": "target",
+        "optimization": "optimization",
+    }
+    return {
+        phase: PhaseMemoryModel(
+            fixed_bytes=memory_plan[f"memory_plan_{prefix}_fixed_bytes"],
+            upper_bytes_per_root={
+                "analytic_schema_and_workspace": (
+                    memory_plan[f"memory_plan_{prefix}_variable_bytes"] / units
+                )
+            },
+        )
+        for phase, prefix in prefixes.items()
+    }
+
+
+def _completed_phase_observations(
+    controller: Any,
+    metrics: Mapping[str, Any],
+    units: int,
+    predicted: Mapping[str, int],
+) -> dict[str, PhaseMemoryObservation]:
+    """Translate synchronized completed peaks into the common phase ledger."""
+
+    fallback = int(metrics.get("iteration_peak_reserved_bytes", max(predicted.values())))
+    actual_keys = {
+        "rollout": "phase_rollout_peak_allocated_bytes",
+        "seal": "phase_seal_peak_allocated_bytes",
+        "targets": "phase_backward_peak_allocated_bytes",
+        "optimization": "phase_optimization_peak_allocated_bytes",
+    }
+    result = {}
+    for phase in MEMORY_PHASES:
+        actual = int(metrics.get(actual_keys[phase], fallback))
+        fixed = min(controller.forecaster.analytic_models[phase].fixed_bytes, actual)
+        result[phase] = PhaseMemoryObservation(
+            roots_per_gpu=units,
+            fixed_bytes=fixed,
+            variable_bytes={"analytic_schema_and_workspace": actual - fixed},
+            predicted_peak_bytes=int(predicted[phase]),
+            actual_peak_bytes=actual,
+        )
+    return result
+
+
 def _profiled_call(
     metrics: dict[str, float],
     name: str,
@@ -1093,6 +1156,53 @@ def _commit_branched_controller_observation(
     metrics["counterfactual_tree_size"] = counterfactual
 
 
+def _commit_cost_safeguard_observation(
+    metrics: dict[str, float],
+    controller: CostSafeguardController | None,
+    device: torch.device,
+    agreement: DistributedFailureAgreement,
+) -> None:
+    """Commit rank-conservative cost calibration for the next iteration."""
+
+    if controller is None:
+        return
+    required = (
+        "cost_calibration_gamma_deviance_mean",
+        "cost_calibration_underprediction_p95",
+        "cost_calibration_rows",
+    )
+    missing = [name for name in required if name not in metrics]
+    agreement.check(
+        "cost-safeguard calibration availability",
+        None if not missing else f"missing calibration metrics: {missing}",
+    )
+    worst = torch.tensor(
+        [
+            metrics[required[0]],
+            metrics[required[1]],
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+    rows = torch.tensor(
+        metrics[required[2]], dtype=torch.float64, device=device
+    )
+    if agreement.distributed:
+        dist.all_reduce(worst, op=dist.ReduceOp.MAX, group=agreement.group)
+        dist.all_reduce(rows, op=dist.ReduceOp.SUM, group=agreement.group)
+
+    def commit() -> None:
+        metrics.update(
+            controller.observe(
+                float(worst[0]),
+                float(worst[1]),
+                int(rows),
+            )
+        )
+
+    agreement.run("cost-safeguard controller commit", commit)
+
+
 def _build_iteration_data(
     cfg: RootConfig,
     bundle: GameBundle,
@@ -1102,6 +1212,9 @@ def _build_iteration_data(
     frozen_model: nn.Module | None = None,
     iteration: int = 0,
     branching_controller: Any | None = None,
+    safeguard_controller: Any | None = None,
+    branching_memory_controller: Any | None = None,
+    branching_attempt: int = 0,
     branching_diagnostic_limits: Any | None = None,
 ) -> IterationData:
     """Build compact training data in a frame that owns all frozen transients.
@@ -1185,6 +1298,9 @@ def _build_iteration_data(
             return sample_trees(
                 frozen_bundle, cfg, torch_gen, iteration=iteration,
                 branching_controller=branching_controller,
+                safeguard_controller=safeguard_controller,
+                branching_memory_controller=branching_memory_controller,
+                branching_attempt=branching_attempt,
                 branching_diagnostic_limits=branching_diagnostic_limits,
             )
 
@@ -1371,6 +1487,13 @@ def _build_iteration_data(
             if isinstance(rb_sample, ProbeRollout):
                 raise RuntimeError("branched rollout cannot be an opponent probe")
             sampled_nodes = rb_sample.node_count
+            if branching_memory_controller is not None:
+                branching_memory_controller.admit(
+                    "targets",
+                    sampled_nodes,
+                    device=device,
+                    reason="completion and branched target construction",
+                )
             _record_branched_controller_metrics(
                 cfg,
                 rb_sample,
@@ -1417,6 +1540,7 @@ def _build_iteration_data(
                     completion,
                     cfg.loss.lam,
                     leaf_microbatch_rows=completion_rows,
+                    calibration_metrics=profile_metrics,
                 ),
             )
             del rollout, completion
@@ -2070,6 +2194,8 @@ def _one_iteration(
     reference_model: nn.Module | None = None,
     validate_identity: bool = False,
     branching_controller: Any | None = None,
+    safeguard_controller: Any | None = None,
+    branching_memory_controller: SequentialMemoryController | None = None,
     branching_diagnostic_limits: Any | None = None,
     failure_agreement: DistributedFailureAgreement | None = None,
 ) -> dict[str, Any]:
@@ -2100,18 +2226,139 @@ def _one_iteration(
     amp_enabled, amp_dtype = _precision(cfg, device)
     total_trajectories = int(cfg.rollout.roots_per_gpu)
     identity_metrics: dict[str, float] = {}
-    data = agreement.run(
-        "rollout, seal, completion, and targets",
-        lambda: _build_iteration_data(
-            cfg,
-            bundle,
-            torch_gen,
-            profile=profile,
-            iteration=iteration,
-            branching_controller=branching_controller,
-            branching_diagnostic_limits=branching_diagnostic_limits,
-        ),
-    )
+    retry_records: list[dict[str, Any]] = []
+    attempt = 0
+    while True:
+        def build_attempt() -> IterationData:
+            built = _build_iteration_data(
+                cfg,
+                bundle,
+                torch_gen,
+                profile=profile,
+                iteration=iteration,
+                branching_controller=branching_controller,
+                safeguard_controller=safeguard_controller,
+                branching_memory_controller=branching_memory_controller,
+                branching_attempt=attempt,
+                branching_diagnostic_limits=branching_diagnostic_limits,
+            )
+            if branching_memory_controller is not None:
+                branching_memory_controller.admit(
+                    "optimization",
+                    max(1, int(built.profile_metrics.get("nodes", 1))),
+                    device=device,
+                    reason="sealed learner storage and optimizer workspace",
+                )
+            return built
+
+        if branching_memory_controller is None:
+            data = agreement.run(
+                "rollout, seal, completion, and targets",
+                build_attempt,
+            )
+            break
+        data, retry_error, failing_rank = agreement.run_retryable(
+            "rollout, seal, completion, and targets",
+            build_attempt,
+            retry_types=(MemoryError, torch.OutOfMemoryError),
+        )
+        if retry_error is None and failing_rank is None:
+            assert data is not None
+            break
+
+        allocated_peak = (
+            int(torch.cuda.max_memory_allocated(device))
+            if device.type == "cuda"
+            else 0
+        )
+        reserved_peak = (
+            int(torch.cuda.max_memory_reserved(device))
+            if device.type == "cuda"
+            else 0
+        )
+        if isinstance(retry_error, BranchedMemoryRejection):
+            rejection = retry_error
+        else:
+            rejection = BranchedMemoryRejection(
+                phase="rollout",
+                reason=(
+                    f"rank {failing_rank} memory failure"
+                    if retry_error is None
+                    else f"{type(retry_error).__name__}: {retry_error}"
+                ),
+                predicted_bytes=max(allocated_peak, reserved_peak),
+                hard_ceiling_bytes=branching_memory_controller.hard_ceiling_bytes,
+                allocated_peak_bytes=allocated_peak,
+                reserved_peak_bytes=reserved_peak,
+            )
+        release = getattr(bundle.rollout_backend, "release_rollout_owners", None)
+        cleanup_ok = True
+        cleanup_detail = ""
+        try:
+            if callable(release):
+                release()
+            if execution_metrics is not None:
+                execution_metrics.clear()
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        except Exception as cleanup_error:  # noqa: BLE001 - preserve OOM evidence
+            cleanup_ok = False
+            cleanup_detail = f"{type(cleanup_error).__name__}: {cleanup_error}"
+        retry_records.append(
+            {
+                "attempt": attempt,
+                "failing_rank": failing_rank,
+                "phase": rejection.phase,
+                "reason": rejection.reason,
+                "predicted_bytes": rejection.predicted_bytes,
+                "allocated_peak_bytes": max(
+                    rejection.allocated_peak_bytes, allocated_peak
+                ),
+                "reserved_peak_bytes": max(
+                    rejection.reserved_peak_bytes, reserved_peak
+                ),
+                "cleanup_ok": cleanup_ok,
+                "cleanup_detail": cleanup_detail,
+            }
+        )
+        backoff = float(cfg.rollout.branching_emergency_backoff)
+        if branching_controller is None:
+            raise RuntimeError("branched retry requires branching controller state")
+        branching_controller.emergency_backoff(backoff)
+        attempt += 1
+        if attempt > int(cfg.rollout.branching_oom_retry_limit):
+            agreement.check(
+                "branched memory retry exhaustion",
+                "branched rollout exhausted "
+                f"{cfg.rollout.branching_oom_retry_limit} retries after "
+                f"{rejection.phase}: {rejection.reason}; "
+                f"predicted={rejection.predicted_bytes}; "
+                f"allocated_peak={rejection.allocated_peak_bytes}; "
+                f"reserved_peak={rejection.reserved_peak_bytes}; "
+                f"cleanup_ok={cleanup_ok}",
+            )
+    if retry_records:
+        data.profile_metrics.update(
+            {
+                "branching_retry_count": float(len(retry_records)),
+                "branching_retry_last_predicted_bytes": float(
+                    retry_records[-1]["predicted_bytes"]
+                ),
+                "branching_retry_peak_allocated_bytes": float(
+                    max(item["allocated_peak_bytes"] for item in retry_records)
+                ),
+                "branching_retry_peak_reserved_bytes": float(
+                    max(item["reserved_peak_bytes"] for item in retry_records)
+                ),
+                "branching_retry_cleanup_ok": float(
+                    all(item["cleanup_ok"] for item in retry_records)
+                ),
+                "branching_retry_records": retry_records,
+            }
+        )
+    else:
+        data.profile_metrics["branching_retry_count"] = 0.0
     _commit_branched_controller_observation(
         data.profile_metrics,
         device,
@@ -2418,6 +2665,12 @@ def _one_iteration(
             "adaptive KKT controller commit",
             commit_controller_observation,
         )
+    _commit_cost_safeguard_observation(
+        metrics,
+        safeguard_controller,
+        device,
+        agreement,
+    )
     del learner, storage
     return metrics
 
@@ -2584,6 +2837,21 @@ def run_training(
         # initialization: establish one identical learner before any rollout.
         for value in bundle.model.state_dict().values():
             dist.broadcast(value, src=0)
+    if resume_from is None:
+        digest = hashlib.sha256()
+        for name, value in sorted(bundle.model.state_dict().items()):
+            tensor = value.detach().to(device="cpu").contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(tensor.dtype).encode("ascii"))
+            digest.update(str(tuple(tensor.shape)).encode("ascii"))
+            digest.update(tensor.view(torch.uint8).numpy().tobytes())
+        initial_model_sha256 = digest.hexdigest()
+        if initialization_metadata is None:
+            initialization_metadata = {
+                "kind": "scratch",
+                "seed": int(cfg.training.seed),
+            }
+        initialization_metadata["initial_model_sha256"] = initial_model_sha256
     optimizer_cls = (
         torch.optim.AdamW
         if cfg.training.optimizer == "adamw"
@@ -2597,9 +2865,12 @@ def run_training(
     )
     reference_model: nn.Module | None = None
     reference_iteration: int | None = None
+    reference_effective_hands_rollout = 0.0
     if cfg.loss.c_kl > 0.0:
         reference_model = copy.deepcopy(source_model).eval()
         reference_model.requires_grad_(False)
+        if cfg.training.kl_ref_effective_hands_rollout is not None:
+            reference_iteration = 0
     amp_enabled, amp_dtype = _precision(cfg, device)
     scaler = _scaler(bool(amp_enabled and amp_dtype == torch.float16))
     out_dir = Path(cfg.training.out_dir)
@@ -2607,6 +2878,7 @@ def run_training(
     run_id: str | None = None
     restored_memory_state: Mapping[str, Any] | None = None
     restored_branching_state: Mapping[str, Any] | None = None
+    restored_cost_safeguard_state: Mapping[str, Any] | None = None
     resume_path = None if resume_from is None else Path(resume_from)
     logical_work = {
         "trajectories": 0,
@@ -2651,11 +2923,13 @@ def run_training(
             raise RuntimeError("checkpoint iteration is outside the configured schedule")
         run_id = checkpoint_metadata["run_id"]
         reference_iteration = checkpoint_metadata["reference_iteration"]
+        reference_effective_hands_rollout = checkpoint_metadata[
+            "reference_effective_hands_rollout"
+        ]
         initialization_metadata = checkpoint_metadata.get("initialization")
-        if sequential_memory_control:
-            restored_memory_state = checkpoint_metadata["adaptive_work_state"]
-            if restored_memory_state is None:
-                raise RuntimeError("sequential resume checkpoint has no memory controller state")
+        restored_memory_state = checkpoint_metadata["adaptive_work_state"]
+        if restored_memory_state is None:
+            raise RuntimeError("resume checkpoint has no memory controller state")
         if cfg.rollout.branching_mode == "dynamic":
             restored_branching_state = checkpoint_metadata.get(
                 "branching_controller_state"
@@ -2664,10 +2938,32 @@ def run_training(
                 raise RuntimeError(
                     "adaptive KKT resume checkpoint has no branching controller state"
                 )
+        elif cfg.rollout.branching_mode == "fixed":
+            restored_branching_state = checkpoint_metadata.get(
+                "branching_controller_state"
+            )
+            if restored_branching_state is None:
+                raise RuntimeError(
+                    "fixed branching resume checkpoint has no beta controller state"
+                )
         elif checkpoint_metadata.get("branching_controller_state") is not None:
+            raise RuntimeError("sequential resume checkpoint has branching controller state")
+        restored_cost_safeguard_state = checkpoint_metadata.get(
+            "cost_safeguard_controller_state"
+        )
+        if (
+            cfg.rollout.safe_tree_size is not None
+            and restored_cost_safeguard_state is None
+        ):
             raise RuntimeError(
-                "fixed branching resume checkpoint unexpectedly contains dynamic "
-                "controller state"
+                "safe-tree resume checkpoint has no cost-safeguard controller state"
+            )
+        if (
+            cfg.rollout.safe_tree_size is None
+            and restored_cost_safeguard_state is not None
+        ):
+            raise RuntimeError(
+                "resume checkpoint unexpectedly contains cost-safeguard state"
             )
         if not run_id:
             raise RuntimeError("checkpoint predates run identities and cannot be resumed safely")
@@ -2683,7 +2979,9 @@ def run_training(
     )
     _validate_memory_preflight(allocation_cfg, device, memory_plan)
     memory_controller: SequentialMemoryController | None = None
-    branching_controller: AdaptiveKKTController | None = None
+    branched_memory_controller: SequentialMemoryController | None = None
+    branching_controller: AdaptiveKKTController | FixedBetaController | None = None
+    cost_safeguard_controller: CostSafeguardController | None = None
     adaptive_cfg = cfg.rollout.adaptive_kkt
     if cfg.rollout.branching_mode == "dynamic":
         if adaptive_cfg is None:
@@ -2693,38 +2991,25 @@ def run_training(
             if restored_branching_state is not None
             else AdaptiveKKTController.from_config(adaptive_cfg)
         )
+    elif cfg.rollout.branching_mode == "fixed":
+        branching_controller = (
+            FixedBetaController.from_state_dict(restored_branching_state)
+            if restored_branching_state is not None
+            else FixedBetaController.from_config(cfg.rollout)
+        )
+    if cfg.rollout.safe_tree_size is not None:
+        cost_safeguard_controller = (
+            CostSafeguardController.from_state_dict(
+                restored_cost_safeguard_state
+            )
+            if restored_cost_safeguard_state is not None
+            else CostSafeguardController.from_config(cfg.rollout)
+        )
     if sequential_memory_control:
         maximum = int(cfg.rollout.sequential_roots_per_gpu_maximum)
-        phase_parts = {
-            "rollout": (
-                memory_plan["memory_plan_rollout_fixed_bytes"],
-                memory_plan["memory_plan_rollout_variable_bytes"],
-            ),
-            "seal": (
-                memory_plan["memory_plan_seal_fixed_bytes"],
-                memory_plan["memory_plan_seal_variable_bytes"],
-            ),
-            "targets": (
-                memory_plan["memory_plan_target_fixed_bytes"],
-                memory_plan["memory_plan_target_variable_bytes"],
-            ),
-            "optimization": (
-                memory_plan["memory_plan_optimization_fixed_bytes"],
-                memory_plan["memory_plan_optimization_variable_bytes"],
-            ),
-        }
+        analytic = _phase_memory_models(memory_plan, maximum)
         phase_totals = {
-            phase: fixed + variable
-            for phase, (fixed, variable) in phase_parts.items()
-        }
-        analytic = {
-            phase: PhaseMemoryModel(
-                fixed_bytes=fixed,
-                upper_bytes_per_root={
-                    "analytic_schema_and_workspace": variable / maximum
-                },
-            )
-            for phase, (fixed, variable) in phase_parts.items()
+            phase: model.predict(maximum) for phase, model in analytic.items()
         }
         if device.type == "cuda":
             _, device_bytes = torch.cuda.mem_get_info(device)
@@ -2762,6 +3047,31 @@ def run_training(
         local_cfg.rollout.trajectory_rank_counts = (
             memory_controller.current_roots_per_gpu,
         ) * world
+    else:
+        target_nodes = (
+            float(cfg.rollout.branching_ideal_nodes)
+            if cfg.rollout.branching_mode == "fixed"
+            else float(cfg.rollout.adaptive_kkt.target_tree_size)
+        )
+        analytic = _phase_memory_models(memory_plan, target_nodes)
+        _, device_bytes = torch.cuda.mem_get_info(device)
+        hard = _memory_limit(cfg, device, account_current_free=False)
+        branched_memory_controller = (
+            SequentialMemoryController.from_state_dict(restored_memory_state)
+            if restored_memory_state is not None
+            else SequentialMemoryController(
+                minimum_roots_per_gpu=1,
+                maximum_roots_per_gpu=1,
+                current_roots_per_gpu=1,
+                device_bytes=int(device_bytes),
+                guard_bytes=int(device_bytes) - int(hard),
+                forecaster=PhaseMemoryForecaster(
+                    analytic,
+                    window=int(cfg.rollout.memory_calibration_window),
+                    prediction_z=float(cfg.rollout.memory_prediction_z),
+                ),
+            )
+        )
 
     if rank == 0:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -2861,10 +3171,18 @@ def run_training(
                         rank_rng_states=rank_rng_states,
                         reference_model=reference_model,
                         reference_iteration=reference_iteration,
+                        reference_effective_hands_rollout=(
+                            reference_effective_hands_rollout
+                        ),
                         adaptive_work_state=memory_controller.state_dict(),
                         branching_controller_state=(
                             None if branching_controller is None
                             else branching_controller.state_dict()
+                        ),
+                        cost_safeguard_controller_state=(
+                            None
+                            if cost_safeguard_controller is None
+                            else cost_safeguard_controller.state_dict()
                         ),
                         probe_target=probe_target,
                         logical_work=logical_work,
@@ -2887,7 +3205,11 @@ def run_training(
                 break
             local_cfg.rollout.roots_per_gpu = current
             local_cfg.rollout.trajectory_rank_counts = (current,) * world
-        if reference_model is not None and iteration % cfg.training.kl_ref_interval == 0:
+        if (
+            reference_model is not None
+            and cfg.training.kl_ref_effective_hands_rollout is None
+            and iteration % cfg.training.kl_ref_interval == 0
+        ):
             reference_model.load_state_dict(source_model.state_dict())
             reference_model.eval()
             reference_iteration = iteration
@@ -2905,6 +3227,8 @@ def run_training(
                     reference_model=reference_model,
                     validate_identity=iteration == start_iteration,
                     branching_controller=branching_controller,
+                    safeguard_controller=cost_safeguard_controller,
+                    branching_memory_controller=branched_memory_controller,
                     failure_agreement=failure_agreement,
                 ),
             )
@@ -2919,6 +3243,7 @@ def run_training(
                 "learner construction",
                 "mandatory learner singleton feasibility",
                 "local backward step 0",
+                "branched memory retry exhaustion",
             }
             local_rng_state = capture_rng_state(torch_gen, np_gen)
             if world > 1:
@@ -2963,15 +3288,25 @@ def run_training(
                     rank_rng_states=rank_rng_states,
                     reference_model=reference_model,
                     reference_iteration=reference_iteration,
+                    reference_effective_hands_rollout=(
+                        reference_effective_hands_rollout
+                    ),
                     adaptive_work_state=(
-                        None
-                        if memory_controller is None
-                        else memory_controller.state_dict()
+                        memory_controller.state_dict()
+                        if memory_controller is not None
+                        else branched_memory_controller.state_dict()
+                        if branched_memory_controller is not None
+                        else None
                     ),
                     branching_controller_state=(
                         None
                         if branching_controller is None
                         else branching_controller.state_dict()
+                    ),
+                    cost_safeguard_controller_state=(
+                        None
+                        if cost_safeguard_controller is None
+                        else cost_safeguard_controller.state_dict()
                     ),
                     probe_target=probe_target,
                     logical_work=logical_work,
@@ -3047,42 +3382,78 @@ def run_training(
         _validate_memory_calibration(cfg, device, metrics)
         if memory_controller is not None:
             predicted = memory_controller.last_predicted_peaks
-            fallback = int(
-                metrics.get(
-                    "iteration_peak_reserved_bytes",
-                    max(predicted.values()),
-                )
+            phase_observations = _completed_phase_observations(
+                memory_controller,
+                metrics,
+                memory_controller.current_roots_per_gpu,
+                predicted,
             )
-            actual_keys = {
-                # Allocated phase peaks are ownership/shape evidence and are
-                # invariant to allocator-bin history across checkpoint resume.
-                # Reserved/NVML peaks remain hard-guard diagnostics, but must
-                # not perturb the deterministic next-root decision.
-                "rollout": "phase_rollout_peak_allocated_bytes",
-                "seal": "phase_seal_peak_allocated_bytes",
-                "targets": "phase_backward_peak_allocated_bytes",
-                "optimization": "phase_optimization_peak_allocated_bytes",
-            }
-            phase_observations = {}
-            for phase in MEMORY_PHASES:
-                actual = int(metrics.get(actual_keys[phase], fallback))
-                expected = int(predicted[phase])
-                analytic_fixed = memory_controller.forecaster.analytic_models[
-                    phase
-                ].fixed_bytes
-                observed_fixed = min(analytic_fixed, actual)
-                phase_observations[phase] = PhaseMemoryObservation(
-                    roots_per_gpu=memory_controller.current_roots_per_gpu,
-                    fixed_bytes=observed_fixed,
-                    variable_bytes={
-                        "analytic_schema_and_workspace": actual - observed_fixed
-                    },
-                    predicted_peak_bytes=expected,
-                    actual_peak_bytes=actual,
-                )
             metrics.update(memory_controller.observe_success(phase_observations))
+        elif branched_memory_controller is not None:
+            nodes = max(1, int(metrics["nodes"]))
+            predicted = branched_memory_controller.forecaster.predict(nodes)
+            phase_observations = _completed_phase_observations(
+                branched_memory_controller, metrics, nodes, predicted
+            )
+            branched_memory_controller.observe_phases(nodes, phase_observations)
+            metrics.update(
+                {
+                    "branched_memory_peak_pressure": max(
+                        item.actual_peak_bytes
+                        for item in phase_observations.values()
+                    )
+                    / branched_memory_controller.hard_ceiling_bytes,
+                    **{
+                        f"branched_memory_{phase}_predicted_peak_bytes": float(
+                            phase_observations[phase].predicted_peak_bytes
+                        )
+                        for phase in MEMORY_PHASES
+                    },
+                }
+            )
+            if isinstance(branching_controller, FixedBetaController):
+                pressure = max(
+                    item.actual_peak_bytes for item in phase_observations.values()
+                ) / branched_memory_controller.hard_ceiling_bytes
+                metrics.update(branching_controller.observe(nodes, pressure))
+                configured = cfg.rollout.beta or {}
+                effective = branching_controller.effective_schedule(configured)
+                for name, value in configured.items():
+                    metrics[f"fixed_beta_configured_{name}"] = float(value)
+                    metrics[f"fixed_beta_effective_{name}"] = float(
+                        effective[name]
+                    )
         if reference_iteration is not None:
             metrics["reference_iteration"] = float(reference_iteration)
+        threshold = cfg.training.kl_ref_effective_hands_rollout
+        if reference_model is not None and threshold is not None:
+            exposure_key = (
+                "posterior_effective_hands_rollout_rank_sum"
+                if world > 1
+                else "posterior_effective_hands_rollout"
+            )
+            exposure = float(metrics[exposure_key])
+            metrics["kl_ref_effective_hands_rollout_before"] = float(
+                reference_effective_hands_rollout
+            )
+            reference_effective_hands_rollout += exposure
+            refresh = reference_effective_hands_rollout >= threshold
+            metrics["kl_ref_effective_hands_rollout_threshold"] = float(threshold)
+            metrics["kl_ref_refresh_after_iteration"] = float(refresh)
+            metrics["kl_ref_effective_hands_rollout_overshoot"] = (
+                max(reference_effective_hands_rollout - threshold, 0.0)
+                if refresh
+                else 0.0
+            )
+            if refresh:
+                reference_model.load_state_dict(source_model.state_dict())
+                reference_model.eval()
+                reference_iteration = iteration + 1
+                reference_effective_hands_rollout = 0.0
+            metrics["kl_ref_effective_hands_rollout_after"] = float(
+                reference_effective_hands_rollout
+            )
+            metrics["reference_iteration_next"] = float(reference_iteration)
         for name in logical_work:
             distributed_key = (
                 f"{name}_rank_max"
@@ -3145,14 +3516,24 @@ def run_training(
                 rank_rng_states=rank_rng_states,
                 reference_model=reference_model,
                 reference_iteration=reference_iteration,
+                reference_effective_hands_rollout=(
+                    reference_effective_hands_rollout
+                ),
                 adaptive_work_state=(
-                    None
-                    if memory_controller is None
-                    else memory_controller.state_dict()
+                    memory_controller.state_dict()
+                    if memory_controller is not None
+                    else branched_memory_controller.state_dict()
+                    if branched_memory_controller is not None
+                    else None
                 ),
                 branching_controller_state=(
                     None if branching_controller is None
                     else branching_controller.state_dict()
+                ),
+                cost_safeguard_controller_state=(
+                    None
+                    if cost_safeguard_controller is None
+                    else cost_safeguard_controller.state_dict()
                 ),
                 probe_target=probe_target,
                 logical_work=logical_work,

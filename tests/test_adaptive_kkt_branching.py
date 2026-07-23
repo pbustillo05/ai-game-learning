@@ -14,6 +14,7 @@ from torch import Tensor, nn
 
 from pbg.core.adaptive_branching import (
     AdaptiveKKTController,
+    CostSafeguardController,
     child_path_factors,
     gamma_deviance,
     log_kkt_intensity,
@@ -134,10 +135,26 @@ def test_branching_modes_are_explicit_typed_and_fail_early() -> None:
         "eta_kappa": 0.05,
     }
     raw["rollout"]["adaptive_kkt"] = dynamic_section
+    raw["rollout"]["safe_tree_activation_gamma_deviance_max"] = 0.07
+    raw["rollout"]["safe_tree_activation_p95_underprediction_max"] = 1.8
+    raw["rollout"]["safe_tree_activation_consecutive_iters"] = 5
     cfg = load_config_mapping(raw)
     assert cfg.rollout.branching_mode == "dynamic"
     assert cfg.rollout.adaptive_kkt is not None
     assert cfg.rollout.adaptive_kkt.warmup_iters == 10
+    assert cfg.rollout.safe_tree_activation_gamma_deviance_max == 0.07
+    assert cfg.rollout.safe_tree_activation_p95_underprediction_max == 1.8
+    assert cfg.rollout.safe_tree_activation_consecutive_iters == 5
+
+    for field, value in (
+        ("safe_tree_activation_gamma_deviance_max", -0.1),
+        ("safe_tree_activation_p95_underprediction_max", 0.9),
+        ("safe_tree_activation_consecutive_iters", 0),
+    ):
+        bad = copy.deepcopy(raw)
+        bad["rollout"][field] = value
+        with pytest.raises(ConfigError, match=field):
+            load_config_mapping(bad)
 
     bad = copy.deepcopy(raw)
     bad["rollout"]["adaptive_kkt"]["safe_tree_size"] = 3800.0
@@ -231,6 +248,30 @@ def test_damped_controller_update_saturation_and_persistence() -> None:
     assert restored.state_dict() == controller.state_dict()
 
 
+def _ready_cost_safeguard() -> CostSafeguardController:
+    controller = CostSafeguardController(0.1, 2.0, 1)
+    controller.observe(0.05, 1.5, 10)
+    assert controller.active
+    return controller
+
+
+def test_cost_safeguard_requires_eight_strictly_passing_iterations() -> None:
+    controller = CostSafeguardController(0.1, 2.0, 8)
+    for expected in range(1, 8):
+        metrics = controller.observe(0.099, 1.999, 10)
+        assert metrics["safe_tree_calibration_streak"] == expected
+        assert not controller.active
+    controller.observe(0.099, 1.999, 10)
+    assert controller.active
+    restored = CostSafeguardController.from_state_dict(controller.state_dict())
+    assert restored.state_dict() == controller.state_dict()
+
+    # "Below" is strict, and a miss immediately revokes readiness.
+    controller.observe(0.1, 1.5, 10)
+    assert controller.consecutive_successes == 0
+    assert not controller.active
+
+
 def test_controller_state_round_trips_through_training_checkpoint(tmp_path) -> None:
     cfg = load_config("configs/train/nlhe6.yaml")
     model = nn.Linear(2, 1)
@@ -248,6 +289,8 @@ def test_controller_state_round_trips_through_training_checkpoint(tmp_path) -> N
         log_kappa=0.0,
     )
     controller.observe(80.0)
+    safeguard = CostSafeguardController(0.1, 2.0, 8)
+    safeguard.observe(0.05, 1.5, 10)
     path = tmp_path / "controller.pt"
     save_checkpoint(
         path,
@@ -259,12 +302,17 @@ def test_controller_state_round_trips_through_training_checkpoint(tmp_path) -> N
         torch.Generator().manual_seed(3),
         np.random.default_rng(4),
         branching_controller_state=controller.state_dict(),
+        cost_safeguard_controller_state=safeguard.state_dict(),
     )
     metadata = load_checkpoint(path, model)
     restored = AdaptiveKKTController.from_state_dict(
         metadata["branching_controller_state"]
     )
     assert restored.state_dict() == controller.state_dict()
+    restored_safeguard = CostSafeguardController.from_state_dict(
+        metadata["cost_safeguard_controller_state"]
+    )
+    assert restored_safeguard.state_dict() == safeguard.state_dict()
 
 
 @dataclass
@@ -363,6 +411,7 @@ def test_queue_safeguard_is_batch_local_recovers_and_retains_counterfactual_coun
         cfg,
         torch.Generator().manual_seed(4),
         controller=controller,
+        safeguard_controller=_ready_cost_safeguard(),
     )
     degree = sample.topology.degree
     assert degree[:2].tolist() == [1, 3]
@@ -377,6 +426,32 @@ def test_queue_safeguard_is_batch_local_recovers_and_retains_counterfactual_coun
           - sample.decision_aux["executed_child_count"].float()) * old_c).sum()
     )
     assert counterfactual == pytest.approx(float(sample.node_count) + 20.0)
+
+
+def test_queue_safeguard_does_not_run_before_cost_calibration() -> None:
+    cfg = SimpleNamespace(
+        roots_per_gpu=1,
+        storage_page_rows=32,
+        branching_mode="fixed",
+        adaptive_kkt=None,
+        safe_tree_size=5.0,
+        queue_capacity_rows=64,
+    )
+    safeguard = CostSafeguardController(0.1, 2.0, 8)
+    sample = sample_branched_tree(
+        GameBundle(
+            _AdaptiveModel(),
+            _LabeledBackend(3.0, two_levels=True),
+            _Adapter(),
+            None,
+        ),
+        cfg,
+        torch.Generator().manual_seed(9),
+        safeguard_controller=safeguard,
+    )
+    assert sample.topology.degree[0].item() == 3
+    assert sample.branching_diagnostics["safe_tree_active"] == 0
+    assert sample.branching_diagnostics.get("safeguard_batches", 0) == 0
 
 
 @pytest.mark.parametrize(("mode", "iteration"), (("fixed", 20), ("dynamic", 0)))
@@ -399,6 +474,7 @@ def test_queue_safeguard_applies_in_fixed_mode_and_dynamic_warmup(
         cfg,
         torch.Generator().manual_seed(9),
         iteration=iteration,
+        safeguard_controller=_ready_cost_safeguard(),
     )
     assert sample.topology.degree[0].item() == 1
     assert sample.topology.nominal_degree[0].item() == 3

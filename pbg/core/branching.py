@@ -69,10 +69,15 @@ def sample_branched_tree(
     iteration: int = 0,
     diagnostics: dict[str, int] | None = None,
     controller: Any | None = None,
+    safeguard_controller: Any | None = None,
+    memory_controller: Any | None = None,
+    attempt: int = 0,
     diagnostic_limits: BranchingDiagnosticLimits | None = None,
 ) -> SealedRolloutSample:
     """Sample one tree and release mutable backend owners on every exit."""
 
+    if isinstance(attempt, bool) or attempt < 0:
+        raise ValueError("branched rollout attempt must be nonnegative")
     try:
         return _sample_branched_tree_impl(
             bundle,
@@ -81,8 +86,39 @@ def sample_branched_tree(
             iteration=iteration,
             diagnostics=diagnostics,
             controller=controller,
+            safeguard_controller=safeguard_controller,
+            memory_controller=memory_controller,
+            attempt=attempt,
             diagnostic_limits=diagnostic_limits,
         )
+    except MemoryError as exc:
+        from pbg.core.memory_control import BranchedMemoryRejection
+
+        if memory_controller is None or isinstance(exc, BranchedMemoryRejection):
+            raise
+        device = torch.device(bundle.rollout_backend.device)
+        allocated_peak = (
+            int(torch.cuda.max_memory_allocated(device))
+            if device.type == "cuda"
+            else 0
+        )
+        reserved_peak = (
+            int(torch.cuda.max_memory_reserved(device))
+            if device.type == "cuda"
+            else 0
+        )
+        raise BranchedMemoryRejection(
+            phase=str(getattr(memory_controller, "last_phase", None) or "rollout"),
+            reason=f"{type(exc).__name__}: {exc}",
+            predicted_bytes=max(
+                int(getattr(memory_controller, "last_predicted_bytes", 0)),
+                allocated_peak,
+                reserved_peak,
+            ),
+            hard_ceiling_bytes=int(memory_controller.hard_ceiling_bytes),
+            allocated_peak_bytes=allocated_peak,
+            reserved_peak_bytes=reserved_peak,
+        ) from exc
     finally:
         release = getattr(bundle.rollout_backend, "release_rollout_owners", None)
         if callable(release):
@@ -97,6 +133,9 @@ def _sample_branched_tree_impl(
     iteration: int = 0,
     diagnostics: dict[str, int] | None = None,
     controller: Any | None = None,
+    safeguard_controller: Any | None = None,
+    memory_controller: Any | None = None,
+    attempt: int = 0,
     diagnostic_limits: BranchingDiagnosticLimits | None = None,
 ) -> SealedRolloutSample:
     """Sample one duplicate-preserving branched tree through execution families."""
@@ -288,6 +327,12 @@ def _sample_branched_tree_impl(
         raise ValueError("production requires an actual-cost family forward")
     logical_seed = _logical_seed(cfg, gen)
     tree_address = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    world_size = (
+        dist.get_world_size()
+        if dist.is_available() and dist.is_initialized()
+        else 1
+    )
+    rng_tree_address = tree_address + int(attempt) * world_size
     scheduler_step = 0
     completed_decision_rows = 0
     capture_inputs = getattr(backend, "capture_decision_inputs", None)
@@ -342,6 +387,11 @@ def _sample_branched_tree_impl(
     )
     if dynamic_active and controller is None:
         raise ValueError("dynamic branching after warmup requires controller state")
+    fixed_scale = (
+        float(controller.scale)
+        if branching_mode == "fixed" and hasattr(controller, "scale")
+        else 1.0
+    )
     source_model = (
         bundle.model.module if hasattr(bundle.model, "module") else bundle.model
     )
@@ -361,7 +411,22 @@ def _sample_branched_tree_impl(
         or float(safe_tree_size) < 1.0
     ):
         raise ValueError("safe_tree_size must be finite and at least one")
-    queue_pressure_active = safe_tree_size is not None
+    if safe_tree_size is not None and safeguard_controller is None:
+        raise ValueError("safe_tree_size requires cost-safeguard controller state")
+    if safe_tree_size is None and safeguard_controller is not None:
+        raise ValueError(
+            "cost-safeguard controller state requires safe_tree_size configuration"
+        )
+    queue_pressure_active = bool(
+        safe_tree_size is not None and safeguard_controller.active
+    )
+    if safe_tree_size is not None:
+        diagnostics.update(
+            {
+                "safe_tree_configured": 1,
+                "safe_tree_active": int(queue_pressure_active),
+            }
+        )
     control_arena = PagedTensorArena(
         TensorSchema(
             "branched_controller_rows",
@@ -492,6 +557,33 @@ def _sample_branched_tree_impl(
                 oldest_age=float(queue.oldest_age(scheduler_step)),
             )
 
+    def forecast_workspace(family: str, rows: int) -> int:
+        predictor = getattr(backend, "training_transient_bytes", None)
+        if not callable(predictor):
+            return 0
+        source = bundle.model.module if hasattr(bundle.model, "module") else bundle.model
+        amp = bool(getattr(getattr(cfg, "training", None), "amp", False))
+        return int(predictor(source, family, max(1, int(rows)), amp=amp))
+
+    def admit(
+        phase: str,
+        *,
+        additional_nodes: int = 0,
+        workspace_bytes: int = 0,
+        reason: str,
+    ) -> None:
+        if memory_controller is None:
+            return
+        predicted = memory_controller.admit(
+            phase,
+            buffer.node_count,
+            additional_units=additional_nodes,
+            workspace_bytes=workspace_bytes,
+            device=device,
+            reason=reason,
+        )
+        diagnostics["memory_predicted_bytes"] = int(predicted)
+
     def offspring_for(
         nodes: Tensor,
         family: str | None,
@@ -502,6 +594,8 @@ def _sample_branched_tree_impl(
         rows = nodes.to(torch.int64)
         states = buffer.state_ref[rows]
         fixed_beta = _validate_beta(backend.beta_fn(states), nodes.numel(), device)
+        if branching_mode == "fixed":
+            fixed_beta = (fixed_beta * fixed_scale).clamp_min(1.0)
         if dynamic_active and family is not None:
             if output is None or output.t is None or output.c is None:
                 raise RuntimeError("adaptive KKT rollout model omitted T/C heads")
@@ -521,7 +615,7 @@ def _sample_branched_tree_impl(
         keys = logical_rng_keys(
             seed=logical_seed,
             iteration=iteration,
-            trajectory=torch.full_like(paths, tree_address),
+            trajectory=torch.full_like(paths, rng_tree_address),
             path=paths,
             draw=0,
             purpose=DrawPurpose.ROUND,
@@ -554,6 +648,11 @@ def _sample_branched_tree_impl(
                     diagnostics["upper_cutoff_first_node_count"] = buffer.node_count
         if total <= 0:
             raise RuntimeError("branched intensity produced no child")
+        admit(
+            "rollout",
+            additional_nodes=total,
+            reason="child-wave owners",
+        )
         admit_child_wave(total)
         nominal_count[rows] = nominal.to(torch.int32)
         beta_rows[rows] = beta.detach().to(torch.float32)
@@ -592,6 +691,11 @@ def _sample_branched_tree_impl(
             completed_decision_rows += nodes.numel()
         output = None
         if dynamic_active and family is not None:
+            admit(
+                "rollout",
+                workspace_bytes=forecast_workspace(family, nodes.numel()),
+                reason=f"{family} adaptive policy forward",
+            )
             output = actual_cost_forward(bundle.model, family, states, reaches)
         if forced_offspring is None:
             offspring, _, total = offspring_for(
@@ -609,8 +713,18 @@ def _sample_branched_tree_impl(
                 )
             offspring = forced_offspring
             total = read_control(offspring.sum().reshape(1))[0]
+            admit(
+                "rollout",
+                additional_nodes=total,
+                reason="root-refill child wave",
+            )
             admit_child_wave(total)
         if family is not None and output is None:
+            admit(
+                "rollout",
+                workspace_bytes=forecast_workspace(family, nodes.numel()),
+                reason=f"{family} policy forward",
+            )
             output = actual_cost_forward(bundle.model, family, states, reaches)
         action_rows = None
         if partition_id is not None and record_policy_node:
@@ -753,7 +867,7 @@ def _sample_branched_tree_impl(
             posterior_keys = logical_rng_keys(
                 seed=logical_seed,
                 iteration=iteration,
-                trajectory=torch.full_like(expanded_paths, tree_address),
+                trajectory=torch.full_like(expanded_paths, rng_tree_address),
                 path=expanded_paths,
                 draw=ordinal,
                 purpose=DrawPurpose.POSTERIOR,
@@ -768,7 +882,7 @@ def _sample_branched_tree_impl(
             event_keys = logical_rng_keys(
                 seed=logical_seed,
                 iteration=iteration,
-                trajectory=torch.full_like(expanded_paths, tree_address),
+                trajectory=torch.full_like(expanded_paths, rng_tree_address),
                 path=expanded_paths,
                 draw=ordinal,
                 purpose=(
@@ -891,6 +1005,11 @@ def _sample_branched_tree_impl(
                     if queue_pressure_active:
                         qrows = queued.to(torch.int64)
                         qstates = buffer.state_ref[qrows]
+                        admit(
+                            "rollout",
+                            workspace_bytes=forecast_workspace(name, count),
+                            reason=f"{name} C-head queue forecast",
+                        )
                         qout = actual_cost_forward(
                             bundle.model, name, qstates, reaches_for(queued)
                         )
@@ -1024,6 +1143,7 @@ def _sample_branched_tree_impl(
         raise RuntimeError("branched live reach slots survived their last consumer")
     reach_pool.release()
     node_count = buffer.node_count
+    admit("seal", reason="exact branched rollout sealing")
     all_nodes = torch.arange(node_count, device=device)
     old_parent = buffer.parent[all_nodes].to(torch.int64)
     old_order = torch.empty(node_count, dtype=torch.int64, device=device)
@@ -1117,6 +1237,13 @@ def _sample_branched_tree_impl(
         "executed_child_count": target_counts.to(torch.int32),
     }
     decision_beta = beta_rows[decision_nodes].detach().to(torch.float32)
+    sealed_diagnostics = {
+        **diagnostics,
+        "branching_attempt": int(attempt),
+        "fixed_beta_scale": fixed_scale,
+        "execution_accountant_limit_bytes": accountant.limit_bytes,
+        "execution_accountant_high_water_bytes": accountant.high_water_bytes,
+    }
     arena.release()
     buffer.release()
     control_arena.release()
@@ -1129,7 +1256,7 @@ def _sample_branched_tree_impl(
         decision_node=decision_new_nodes.to(torch.int32),
         decision_aux=decision_aux,
         branching_beta=decision_beta,
-        branching_diagnostics=diagnostics,
+        branching_diagnostics=sealed_diagnostics,
         seal_metrics={
             "leaf_rows": leaf_metrics,
             **decision_inputs.seal_metrics,

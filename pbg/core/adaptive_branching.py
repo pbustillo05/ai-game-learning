@@ -14,7 +14,9 @@ import torch
 from torch import Tensor
 
 
-BRANCHING_CONTROLLER_VERSION = "adaptive-kkt-v1"
+BRANCHING_CONTROLLER_VERSION = "adaptive-kkt-v2"
+FIXED_BETA_CONTROLLER_VERSION = "fixed-beta-v1"
+COST_SAFEGUARD_CONTROLLER_VERSION = "cost-safeguard-v1"
 
 
 def gamma_deviance(
@@ -120,6 +122,8 @@ class AdaptiveKKTController:
     log_kappa: float
     ema_tree_size: float | None = None
     updates: int = 0
+    emergency_backoffs: int = 0
+    pending_emergency: bool = False
 
     def __post_init__(self) -> None:
         values = (
@@ -151,27 +155,52 @@ class AdaptiveKKTController:
             log_kappa=math.log(float(cfg.kappa_initial)),
         )
 
-    def observe(self, counterfactual_tree_size: float) -> Mapping[str, float]:
-        size = float(counterfactual_tree_size)
+    def _damped_size(self, tree_size: float) -> tuple[float, float]:
+        size = float(tree_size)
         if not math.isfinite(size) or size <= 0.0:
             raise ValueError("counterfactual tree size must be finite and positive")
         previous = size if self.ema_tree_size is None else self.ema_tree_size
         self.ema_tree_size = (
             (1.0 - self.gamma_kappa) * previous + self.gamma_kappa * size
         )
-        proposed = self.log_kappa + self.eta_kappa * math.log(
-            self.target_tree_size / self.ema_tree_size
-        )
-        self.log_kappa = min(
+        return size, math.log(self.target_tree_size / self.ema_tree_size)
+
+    def _apply_feedback(self, feedback: float) -> tuple[float, float]:
+        before = self.log_kappa
+        proposed = before + self.eta_kappa * float(feedback)
+        updated = min(
             math.log(self.kappa_max), max(math.log(self.kappa_min), proposed)
         )
+        # An OOM attempt is memory-pressure evidence, not permission for the
+        # following successful tree to immediately undo its emergency backoff.
+        self.log_kappa = min(self.log_kappa, updated) if self.pending_emergency else updated
+        self.pending_emergency = False
         self.updates += 1
+        return before, self.log_kappa
+
+    def observe(self, counterfactual_tree_size: float) -> Mapping[str, float]:
+        size, feedback = self._damped_size(counterfactual_tree_size)
+        self._apply_feedback(feedback)
         return {
             "counterfactual_tree_size": size,
             "kkt_ema_tree_size": self.ema_tree_size,
             "log_kappa": self.log_kappa,
             "kappa_saturated_min": float(self.log_kappa == math.log(self.kappa_min)),
             "kappa_saturated_max": float(self.log_kappa == math.log(self.kappa_max)),
+        }
+
+    def emergency_backoff(self, factor: float) -> Mapping[str, float]:
+        if not math.isfinite(float(factor)) or not 0.0 < factor < 1.0:
+            raise ValueError("KKT emergency backoff must lie in (0,1)")
+        before = self.log_kappa
+        self.log_kappa = max(math.log(self.kappa_min), before + math.log(factor))
+        self.emergency_backoffs += 1
+        self.pending_emergency = True
+        return {
+            "kkt_emergency_backoffs": float(self.emergency_backoffs),
+            "kkt_emergency_log_kappa_before": before,
+            "log_kappa": self.log_kappa,
+            "kappa_saturated_min": float(self.log_kappa == math.log(self.kappa_min)),
         }
 
     def state_dict(self) -> dict[str, Any]:
@@ -185,6 +214,8 @@ class AdaptiveKKTController:
             "log_kappa": self.log_kappa,
             "ema_tree_size": self.ema_tree_size,
             "updates": self.updates,
+            "emergency_backoffs": self.emergency_backoffs,
+            "pending_emergency": self.pending_emergency,
         }
 
     @classmethod
@@ -203,7 +234,254 @@ class AdaptiveKKTController:
                 else float(state["ema_tree_size"])
             ),
             updates=int(state.get("updates", 0)),
+            emergency_backoffs=int(state.get("emergency_backoffs", 0)),
+            pending_emergency=bool(state.get("pending_emergency", False)),
         )
-        if controller.updates < 0:
+        if controller.updates < 0 or controller.emergency_backoffs < 0:
             raise RuntimeError("checkpoint adaptive KKT update count is invalid")
         return controller
+
+
+@dataclass
+class FixedBetaController:
+    """Fixed-beta facade over the same damped log controller used by KKT."""
+
+    scalar: AdaptiveKKTController
+    memory_pressure_target: float
+    ema_memory_pressure: float | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.memory_pressure_target)
+            or not 0.0 < self.memory_pressure_target <= 1.0
+        ):
+            raise ValueError("fixed-beta memory pressure target must lie in (0,1]")
+        if self.ema_memory_pressure is not None and (
+            not math.isfinite(self.ema_memory_pressure)
+            or self.ema_memory_pressure <= 0.0
+        ):
+            raise ValueError("fixed-beta pressure EMA must be finite and positive")
+
+    @classmethod
+    def from_config(cls, cfg: Any) -> "FixedBetaController":
+        if cfg.branching_ideal_nodes is None:
+            raise ValueError("fixed branching requires branching_ideal_nodes")
+        return cls(
+            scalar=AdaptiveKKTController(
+                target_tree_size=float(cfg.branching_ideal_nodes),
+                gamma_kappa=float(cfg.fixed_beta_ema),
+                eta_kappa=float(cfg.fixed_beta_step),
+                kappa_min=float(cfg.fixed_beta_scale_min),
+                kappa_max=float(cfg.fixed_beta_scale_max),
+                log_kappa=0.0,
+            ),
+            memory_pressure_target=float(cfg.branching_memory_pressure_target),
+        )
+
+    @property
+    def scale(self) -> float:
+        return math.exp(self.scalar.log_kappa)
+
+    def effective_schedule(
+        self, configured: Mapping[str, float]
+    ) -> dict[str, float]:
+        return {
+            str(name): max(1.0, float(value) * self.scale)
+            for name, value in configured.items()
+        }
+
+    def observe(
+        self, tree_size: float, memory_pressure: float
+    ) -> Mapping[str, float]:
+        pressure = float(memory_pressure)
+        if not math.isfinite(pressure) or pressure <= 0.0:
+            raise ValueError("fixed-beta memory pressure must be finite and positive")
+        size, target_error = self.scalar._damped_size(tree_size)
+        old_pressure = (
+            pressure if self.ema_memory_pressure is None else self.ema_memory_pressure
+        )
+        self.ema_memory_pressure = (
+            (1.0 - self.scalar.gamma_kappa) * old_pressure
+            + self.scalar.gamma_kappa * pressure
+        )
+        pressure_error = min(
+            0.0,
+            math.log(self.memory_pressure_target / self.ema_memory_pressure),
+        )
+        # Unsafe memory pressure is a veto: even a small tree may not increase
+        # beta until measured headroom is safe again.
+        feedback = (
+            pressure_error
+            if self.ema_memory_pressure > self.memory_pressure_target
+            else target_error
+        )
+        self.scalar._apply_feedback(feedback)
+        lower, upper = math.log(self.scalar.kappa_min), math.log(self.scalar.kappa_max)
+        return {
+            "fixed_beta_tree_size": size,
+            "fixed_beta_ema_tree_size": self.scalar.ema_tree_size,
+            "fixed_beta_target_error": target_error,
+            "fixed_beta_memory_pressure": pressure,
+            "fixed_beta_ema_memory_pressure": self.ema_memory_pressure,
+            "fixed_beta_scale": self.scale,
+            "fixed_beta_scale_saturated_min": float(self.scalar.log_kappa == lower),
+            "fixed_beta_scale_saturated_max": float(self.scalar.log_kappa == upper),
+        }
+
+    def emergency_backoff(self, factor: float) -> Mapping[str, float]:
+        before = self.scale
+        self.scalar.emergency_backoff(factor)
+        return {
+            "fixed_beta_emergency_backoffs": float(self.scalar.emergency_backoffs),
+            "fixed_beta_scale_before_backoff": before,
+            "fixed_beta_scale": self.scale,
+            "fixed_beta_scale_saturated_min": float(
+                self.scale == self.scalar.kappa_min
+            ),
+        }
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "version": FIXED_BETA_CONTROLLER_VERSION,
+            "scalar": self.scalar.state_dict(),
+            "memory_pressure_target": self.memory_pressure_target,
+            "ema_memory_pressure": self.ema_memory_pressure,
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping[str, Any]) -> "FixedBetaController":
+        if state.get("version") != FIXED_BETA_CONTROLLER_VERSION:
+            raise RuntimeError("checkpoint fixed-beta controller schema is incompatible")
+        return cls(
+            scalar=AdaptiveKKTController.from_state_dict(state["scalar"]),
+            memory_pressure_target=float(state["memory_pressure_target"]),
+            ema_memory_pressure=(
+                None if state.get("ema_memory_pressure") is None
+                else float(state["ema_memory_pressure"])
+            ),
+        )
+
+
+@dataclass
+class CostSafeguardController:
+    """Gate cost-head tree-size safeguards on sustained calibration."""
+
+    gamma_deviance_max: float
+    p95_underprediction_max: float
+    consecutive_iterations_required: int
+    consecutive_successes: int = 0
+    active: bool = False
+    observations: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(float(self.gamma_deviance_max))
+            or self.gamma_deviance_max < 0.0
+        ):
+            raise ValueError("cost safeguard Gamma-deviance threshold is invalid")
+        if (
+            not math.isfinite(float(self.p95_underprediction_max))
+            or self.p95_underprediction_max < 1.0
+        ):
+            raise ValueError("cost safeguard underprediction threshold is invalid")
+        if (
+            isinstance(self.consecutive_iterations_required, bool)
+            or self.consecutive_iterations_required < 1
+        ):
+            raise ValueError("cost safeguard consecutive-iteration count is invalid")
+        if (
+            isinstance(self.consecutive_successes, bool)
+            or not 0 <= self.consecutive_successes
+            <= self.consecutive_iterations_required
+        ):
+            raise ValueError("cost safeguard success streak is invalid")
+        if isinstance(self.observations, bool) or self.observations < 0:
+            raise ValueError("cost safeguard observation count is invalid")
+        expected_active = (
+            self.consecutive_successes >= self.consecutive_iterations_required
+        )
+        if bool(self.active) != expected_active:
+            raise ValueError("cost safeguard active state is inconsistent with its streak")
+
+    @classmethod
+    def from_config(cls, cfg: Any) -> "CostSafeguardController":
+        return cls(
+            gamma_deviance_max=float(
+                cfg.safe_tree_activation_gamma_deviance_max
+            ),
+            p95_underprediction_max=float(
+                cfg.safe_tree_activation_p95_underprediction_max
+            ),
+            consecutive_iterations_required=int(
+                cfg.safe_tree_activation_consecutive_iters
+            ),
+        )
+
+    def observe(
+        self,
+        gamma_deviance_mean: float,
+        p95_underprediction: float,
+        calibration_rows: int,
+    ) -> Mapping[str, float]:
+        deviance = float(gamma_deviance_mean)
+        underprediction = float(p95_underprediction)
+        rows = int(calibration_rows)
+        if not math.isfinite(deviance) or deviance < 0.0:
+            raise ValueError("cost calibration Gamma deviance is invalid")
+        if not math.isfinite(underprediction) or underprediction < 0.0:
+            raise ValueError("cost calibration underprediction factor is invalid")
+        if rows < 1:
+            raise ValueError("cost calibration requires at least one row")
+
+        passed = (
+            deviance < self.gamma_deviance_max
+            and underprediction < self.p95_underprediction_max
+        )
+        if passed:
+            self.consecutive_successes = min(
+                self.consecutive_iterations_required,
+                self.consecutive_successes + 1,
+            )
+        else:
+            self.consecutive_successes = 0
+        self.active = (
+            self.consecutive_successes >= self.consecutive_iterations_required
+        )
+        self.observations += 1
+        return {
+            "cost_calibration_gamma_deviance_mean": deviance,
+            "cost_calibration_underprediction_p95": underprediction,
+            "cost_calibration_rows": float(rows),
+            "safe_tree_calibration_passed": float(passed),
+            "safe_tree_calibration_streak": float(self.consecutive_successes),
+            "safe_tree_calibration_required": float(
+                self.consecutive_iterations_required
+            ),
+            "safe_tree_active_next_iteration": float(self.active),
+        }
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "version": COST_SAFEGUARD_CONTROLLER_VERSION,
+            "gamma_deviance_max": self.gamma_deviance_max,
+            "p95_underprediction_max": self.p95_underprediction_max,
+            "consecutive_iterations_required": self.consecutive_iterations_required,
+            "consecutive_successes": self.consecutive_successes,
+            "active": self.active,
+            "observations": self.observations,
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping[str, Any]) -> "CostSafeguardController":
+        if state.get("version") != COST_SAFEGUARD_CONTROLLER_VERSION:
+            raise RuntimeError("checkpoint cost-safeguard controller schema is incompatible")
+        return cls(
+            gamma_deviance_max=float(state["gamma_deviance_max"]),
+            p95_underprediction_max=float(state["p95_underprediction_max"]),
+            consecutive_iterations_required=int(
+                state["consecutive_iterations_required"]
+            ),
+            consecutive_successes=int(state.get("consecutive_successes", 0)),
+            active=bool(state.get("active", False)),
+            observations=int(state.get("observations", 0)),
+        )

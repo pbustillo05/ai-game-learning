@@ -41,6 +41,7 @@ def test_checkpoint_schema_is_current_and_strict(tmp_path: Path) -> None:
     assert header["storage_schema_version"] == TRAINING_STORAGE_SCHEMA_VERSION
     restored = load_checkpoint(path, model)
     assert restored["iter"] == 3
+    assert restored["reference_effective_hands_rollout"] == 0.0
 
     payload = torch.load(path, map_location="cpu", weights_only=False)
     previous = dict(payload)
@@ -55,6 +56,13 @@ def test_checkpoint_schema_is_current_and_strict(tmp_path: Path) -> None:
     torch.save(payload, partial)
     with pytest.raises(RuntimeError, match="missing=.*initialization"):
         inspect_checkpoint(partial)
+
+    invalid = dict(torch.load(path, map_location="cpu", weights_only=False))
+    invalid["reference_effective_hands_rollout"] = -1.0
+    invalid_path = tmp_path / "invalid_exposure.pt"
+    torch.save(invalid, invalid_path)
+    with pytest.raises(RuntimeError, match="invalid KL-reference exposure"):
+        inspect_checkpoint(invalid_path)
 
 
 def test_storage_schema_and_full_deck_partition_domains_are_strict() -> None:

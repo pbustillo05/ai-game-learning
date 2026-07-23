@@ -57,17 +57,29 @@ def _quantile(values: list[float], probability: float) -> float:
 
 def _summary(samples: list[dict[str, object]]) -> dict[str, dict[str, float]]:
     result: dict[str, dict[str, float]] = {}
-    for key in samples[0]:
+    common_keys = set.intersection(*(set(sample) for sample in samples))
+    for key in sorted(common_keys):
         if not all(isinstance(sample[key], (int, float)) for sample in samples):
             continue
         values = [sample[key] for sample in samples]
+        finite = [float(value) for value in values if math.isfinite(float(value))]
+        if not finite:
+            continue
         result[key] = {
-            "mean": float(statistics.fmean(values)),
-            "p05": _quantile(values, 0.05),
-            "p50": _quantile(values, 0.50),
-            "p95": _quantile(values, 0.95),
-            "p99": _quantile(values, 0.99),
-            "max": float(max(values)),
+            "count": float(len(finite)),
+            "min": float(min(finite)),
+            "mean": float(statistics.fmean(finite)),
+            "variance": float(statistics.pvariance(finite)),
+            "stddev": float(statistics.pstdev(finite)),
+            "p01": _quantile(finite, 0.01),
+            "p05": _quantile(finite, 0.05),
+            "p25": _quantile(finite, 0.25),
+            "p50": _quantile(finite, 0.50),
+            "p75": _quantile(finite, 0.75),
+            "p90": _quantile(finite, 0.90),
+            "p95": _quantile(finite, 0.95),
+            "p99": _quantile(finite, 0.99),
+            "max": float(max(finite)),
         }
     return result
 
@@ -96,6 +108,70 @@ def _decision_street_geometry(policy: object) -> dict[str, float]:
     }
 
 
+def _cost_head_calibration(sample: object) -> dict[str, float]:
+    """Compare frozen C predictions with realized descendants per child.
+
+    Suppressed decisions are excluded because their realized subtree is not a
+    draw from the nominal multiplicity.  A refilled root is excluded because
+    its post-refill descendants intentionally do not define the protected C
+    target.
+    """
+
+    topology = sample.topology
+    parent = topology.parent.detach().to("cpu", torch.int64)
+    degree = topology.degree.detach().to("cpu", torch.int64)
+    subtree = torch.ones(parent.numel(), dtype=torch.float64)
+    for node in range(parent.numel() - 1, 0, -1):
+        subtree[int(parent[node])] += subtree[node]
+
+    captured = sample.decision_inputs
+    prediction = torch.empty(captured.node_ids.numel(), dtype=torch.float64)
+    for partition_id, source in captured.decision_sources.items():
+        selected = (captured.partition_id == int(partition_id)).to("cpu")
+        old_c = source.columns.get("old_c")
+        if old_c is None:
+            return {}
+        prediction[selected] = old_c.detach().to("cpu", torch.float64)
+
+    nodes = sample.decision_node.detach().to("cpu", torch.int64)
+    nominal = sample.decision_aux["nominal_child_count"].detach().to("cpu", torch.int64)
+    executed = sample.decision_aux["executed_child_count"].detach().to("cpu", torch.int64)
+    eligible = (degree[nodes] > 0) & (nominal == executed)
+    if topology.pre_refill_node_count is not None:
+        eligible &= nodes != 0
+    realized = (subtree[nodes] - 1.0) / degree[nodes].clamp_min(1)
+    prediction = prediction[eligible]
+    realized = realized[eligible]
+    if not prediction.numel():
+        return {}
+    error = prediction - realized
+    relative = prediction / realized.clamp_min(1.0)
+    log_error = torch.log(prediction.clamp_min(1.0e-30)) - torch.log(
+        realized.clamp_min(1.0e-30)
+    )
+    centered_prediction = prediction - prediction.mean()
+    centered_realized = realized - realized.mean()
+    denominator = torch.sqrt(
+        centered_prediction.square().sum() * centered_realized.square().sum()
+    )
+    correlation = (
+        float((centered_prediction * centered_realized).sum() / denominator)
+        if float(denominator) > 0.0
+        else math.nan
+    )
+    return {
+        "cost_calibration_rows": float(prediction.numel()),
+        "cost_prediction_mean": float(prediction.mean()),
+        "cost_realized_mean": float(realized.mean()),
+        "cost_prediction_bias": float(error.mean()),
+        "cost_prediction_mae": float(error.abs().mean()),
+        "cost_prediction_median_ratio": float(relative.median()),
+        "cost_prediction_under_fraction": float((prediction < realized).double().mean()),
+        "cost_prediction_log_rmse": float(torch.sqrt(log_error.square().mean())),
+        "cost_prediction_correlation": correlation,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -106,7 +182,11 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=32)
     parser.add_argument("--start-repeat", type=int, default=0)
     parser.add_argument("--storage-page-rows", type=int, default=256)
+    parser.add_argument("--family-batch-rows", type=int, default=None)
+    parser.add_argument("--queue-capacity-rows", type=int, default=4096)
     parser.add_argument("--execution-memory-bytes", type=int, default=None)
+    parser.add_argument("--safe-tree-size", type=float, default=None)
+    parser.add_argument("--branching-min-nodes", type=int, default=None)
     parser.add_argument("--upper-cutoff", type=int, default=None)
     parser.add_argument("--stop-cutoff", type=int, default=None)
     parser.add_argument("--lower-cutoff", type=int, default=None)
@@ -122,6 +202,14 @@ def main() -> None:
         parser.error("hard-memory-bytes must be positive")
     if args.execution_memory_bytes is not None and args.execution_memory_bytes <= 0:
         parser.error("execution-memory-bytes must be positive")
+    if args.family_batch_rows is not None and args.family_batch_rows <= 0:
+        parser.error("family-batch-rows must be positive")
+    if args.queue_capacity_rows <= 0:
+        parser.error("queue-capacity-rows must be positive")
+    if args.safe_tree_size is not None and args.safe_tree_size < 1.0:
+        parser.error("safe-tree-size must be at least one")
+    if args.branching_min_nodes is not None and args.branching_min_nodes <= 1:
+        parser.error("branching-min-nodes must be greater than one")
     if args.upper_cutoff is not None and args.upper_cutoff <= 1:
         parser.error("upper-cutoff must be greater than one")
     if args.stop_cutoff is not None and args.stop_cutoff <= 1:
@@ -146,7 +234,12 @@ def main() -> None:
     cfg.rollout.sequential_roots_per_gpu_minimum = 1
     cfg.rollout.sequential_roots_per_gpu_maximum = 1
     cfg.rollout.storage_page_rows = args.storage_page_rows
+    if args.family_batch_rows is not None:
+        cfg.rollout.family_batch_rows = args.family_batch_rows
+    cfg.rollout.queue_capacity_rows = args.queue_capacity_rows
     cfg.rollout.execution_memory_bytes = args.execution_memory_bytes
+    cfg.rollout.safe_tree_size = args.safe_tree_size
+    cfg.rollout.branching_min_nodes = args.branching_min_nodes
     cfg.rollout.beta = {"default": 1.0}
     cfg.rollout.branching_mode = "fixed"
     cfg.rollout.adaptive_kkt = None
@@ -207,36 +300,54 @@ def main() -> None:
             started = time.perf_counter()
             diagnostics: dict[str, int] = {}
             cutoff = None
-            tree = reach = policy = None
+            admission_error = None
+            sampled = None
             try:
                 with torch.inference_mode():
-                    tree, reach, policy = sample_branched_tree(
-                        bundle,
-                        cfg,
-                        generator,
-                        iteration=0,
-                        diagnostics=diagnostics,
-                        diagnostic_limits=diagnostic_limits,
-                    )
+                    with torch.autocast(
+                        device_type=device.type,
+                        enabled=bool(cfg.training.amp),
+                        dtype=torch.float16,
+                    ):
+                        sampled = sample_branched_tree(
+                            bundle,
+                            cfg,
+                            generator,
+                            iteration=0,
+                            diagnostics=diagnostics,
+                            diagnostic_limits=diagnostic_limits,
+                        )
             except BranchingCutoffReached as caught:
                 cutoff = caught
+            except MemoryError as caught:
+                admission_error = str(caught)
             torch.cuda.synchronize(device)
             elapsed = time.perf_counter() - started
             execution = {} if metrics is None else metrics.snapshot()
-            if cutoff is None:
-                assert tree is not None and reach is not None and policy is not None
-                degree = tree.child_ptr[1:] - tree.child_ptr[:-1]
+            if cutoff is None and admission_error is None:
+                assert sampled is not None
+                tree = sampled.topology
+                policy = sampled.decision_inputs
+                degree = tree.degree.detach().to("cpu", torch.int64)
                 leaf = degree == 0
-                leaf_weight = tree.path_weight[leaf].double()
-                leaf_depth = tree.depth_player[leaf].double()
+                parent = tree.parent.detach().to("cpu", torch.int64)
+                is_player = tree.decision_partition.detach().to("cpu") >= 0
+                path_weight = torch.ones(tree.nodes, dtype=torch.float64)
+                player_depth = torch.zeros(tree.nodes, dtype=torch.int64)
+                for node in range(1, tree.nodes):
+                    ancestor = int(parent[node])
+                    path_weight[node] = path_weight[ancestor] / degree[ancestor]
+                    player_depth[node] = player_depth[ancestor] + is_player[ancestor]
+                leaf_weight = path_weight[leaf]
+                leaf_depth = player_depth[leaf].double()
                 weight_total = float(leaf_weight.sum())
                 weighted_depth = float((leaf_weight * leaf_depth).sum() / weight_total)
                 geometry = {
-                    "nodes": float(tree.owner.numel()),
+                    "nodes": float(tree.nodes),
                     "decisions": float(policy.node_ids.numel()),
                     "leaves": float(leaf.sum()),
                     "max_offspring": float(degree.max()),
-                    "max_player_depth": float(tree.depth_player.max()),
+                    "max_player_depth": float(player_depth.max()),
                     "weighted_leaf_player_depth": weighted_depth,
                     "leaf_weight_sum": weight_total,
                     "stop_cutoff_reached": 0.0,
@@ -244,9 +355,15 @@ def main() -> None:
                     "queued_nodes": 0.0,
                     "frontier_nodes": 0.0,
                     "family_queue_nodes": {},
+                    "memory_admission_stop": 0.0,
+                    **{
+                        key: float(value)
+                        for key, value in sampled.branching_diagnostics.items()
+                    },
                     **_decision_street_geometry(policy),
+                    **_cost_head_calibration(sampled),
                 }
-            else:
+            elif cutoff is not None:
                 geometry = {
                     "nodes": float(cutoff.node_count),
                     "decisions": float(cutoff.completed_decisions),
@@ -260,6 +377,24 @@ def main() -> None:
                     "queued_nodes": float(cutoff.queued_nodes),
                     "frontier_nodes": float(cutoff.frontier_nodes),
                     "family_queue_nodes": cutoff.family_queue_nodes,
+                    "memory_admission_stop": 0.0,
+                }
+            else:
+                geometry = {
+                    "nodes": math.nan,
+                    "decisions": math.nan,
+                    "leaves": math.nan,
+                    "max_offspring": math.nan,
+                    "max_player_depth": math.nan,
+                    "weighted_leaf_player_depth": math.nan,
+                    "leaf_weight_sum": math.nan,
+                    "stop_cutoff_reached": 0.0,
+                    "pending_nodes": math.nan,
+                    "queued_nodes": math.nan,
+                    "frontier_nodes": math.nan,
+                    "family_queue_nodes": {},
+                    "memory_admission_stop": 1.0,
+                    "memory_admission_error": admission_error,
                 }
             sample = {
                     **geometry,
@@ -298,7 +433,8 @@ def main() -> None:
                     ),
                     "below_lower_cutoff": float(
                         args.lower_cutoff is not None
-                        and tree.owner.numel() < args.lower_cutoff
+                        and sampled is not None
+                        and sampled.node_count < args.lower_cutoff
                     ),
                 }
             samples.append(sample)
@@ -312,9 +448,9 @@ def main() -> None:
                 )
             print(
                 f"sample beta={beta:.4f} repeat={repeat} "
-                f"nodes={int(sample['nodes'])} "
+                f"nodes={sample['nodes']:.0f} "
                 f"stopped={int(sample['stop_cutoff_reached'])} "
-                f"pending={int(sample['pending_nodes'])} "
+                f"pending={sample['pending_nodes']:.0f} "
                 f"cutoff={int(diagnostics['upper_cutoff_batches'] > 0)} "
                 f"peak_allocated={torch.cuda.max_memory_allocated(device)} "
                 f"peak_reserved={torch.cuda.max_memory_reserved(device)}",
@@ -328,9 +464,9 @@ def main() -> None:
                     "measured CUDA peak exceeded hard-memory-bytes="
                     f"{args.hard_memory_bytes}"
                 )
-            if tree is not None:
-                del degree, leaf, leaf_depth, leaf_weight
-            del policy, reach, tree
+            if sampled is not None:
+                del degree, leaf, leaf_depth, leaf_weight, parent, path_weight, player_depth
+            del sampled
         records.append(
             {
                 "beta": beta,
@@ -354,7 +490,11 @@ def main() -> None:
             "total_memory_bytes": props.total_memory,
         },
         "storage_page_rows": args.storage_page_rows,
+        "family_batch_rows": cfg.rollout.family_batch_rows,
+        "queue_capacity_rows": cfg.rollout.queue_capacity_rows,
         "execution_memory_bytes": args.execution_memory_bytes,
+        "safe_tree_size": args.safe_tree_size,
+        "branching_min_nodes": args.branching_min_nodes,
         "analytical_rollout_memory_plan": asdict(backend.rollout_memory_plan),
         "analytical_rollout_peak_bytes": backend.rollout_memory_plan.peak_bytes,
         "upper_cutoff": args.upper_cutoff,
@@ -368,7 +508,10 @@ def main() -> None:
     }
     destination.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n")
     for record in records:
-        node = record["summary"]["nodes"]
+        node = record["summary"].get("nodes")
+        if node is None:
+            print(f"beta={record['beta']:.4f} no completed node samples")
+            continue
         print(
             f"beta={record['beta']:.4f} "
             f"nodes p50={node['p50']:.1f} p95={node['p95']:.1f} "

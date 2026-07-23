@@ -14,6 +14,7 @@ from typing import Any, Mapping
 import torch
 from torch import Tensor
 
+from pbg.core.adaptive_branching import gamma_deviance
 from pbg.core.partition import CompletionSpec, PartitionSet
 from pbg.core.storage import (
     RolloutStorage,
@@ -642,6 +643,7 @@ def build_branched_rb_targets(
     lam: float,
     *,
     leaf_microbatch_rows: int = 32,
+    calibration_metrics: dict[str, float] | None = None,
 ) -> TrainingStorage:
     """Build fixed/dynamic branched targets with a prebounded live frontier."""
 
@@ -921,6 +923,44 @@ def build_branched_rb_targets(
         del completed, posterior, value
     if node_slot[0] < 0 or len(free_slots) != plan.peak_slots - 1:
         raise RuntimeError("branched frontier did not finish with only the root slot")
+    if dynamic_heads and calibration_metrics is not None:
+        calibration_partitions = [
+            (partition_id, block)
+            for partition_id, block in rollout.partitions.items()
+            if block.decisions.rows
+        ]
+        if not calibration_partitions:
+            raise RuntimeError("cost calibration requires at least one decision")
+        calibration_rows = sum(
+            block.decisions.rows for _, block in calibration_partitions
+        )
+        underprediction = torch.empty(
+            calibration_rows, dtype=torch.float32, device=device
+        )
+        deviance_sum = torch.zeros((), dtype=torch.float32, device=device)
+        cursor = 0
+        for partition_id, block in calibration_partitions:
+            end = cursor + block.decisions.rows
+            prediction = _column(
+                block.decisions, "frozen_cost"
+            ).detach().float()
+            target = cost_target[partition_id].detach().float()
+            underprediction[cursor:end].copy_(
+                target / prediction.clamp_min(torch.finfo(prediction.dtype).tiny)
+            )
+            deviance_sum.add_(gamma_deviance(prediction, target).sum())
+            cursor = end
+        calibration_metrics.update(
+            {
+                "cost_calibration_rows": float(calibration_rows),
+                "cost_calibration_gamma_deviance_mean": float(
+                    deviance_sum / calibration_rows
+                ),
+                "cost_calibration_underprediction_p95": float(
+                    torch.quantile(underprediction, 0.95)
+                ),
+            }
+        )
     training: dict[int, TrainingPartition] = {}
     for partition_id, block in rollout.partitions.items():
         if not bool(decision_valid[partition_id].all()) or not bool(

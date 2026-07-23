@@ -88,3 +88,57 @@ class DistributedFailureAgreement:
         """Agree on an already-computed local terminal status."""
 
         self._agree(phase, local_detail)
+
+    def run_retryable(
+        self,
+        phase: str,
+        operation: Callable[[], T],
+        *,
+        retry_types: tuple[type[BaseException], ...],
+    ) -> tuple[T | None, BaseException | None, int | None]:
+        """Run one common attempt, distinguishing retryable from terminal failure.
+
+        The single preallocated control scalar encodes terminal ranks before
+        retry ranks, so every rank makes the same disposition without trying
+        to allocate communication storage on an OOM path.
+        """
+
+        if not self.distributed:
+            try:
+                return operation(), None, None
+            except retry_types as exc:
+                return None, exc, 0
+
+        rank = dist.get_rank(self.group)
+        world = dist.get_world_size(self.group)
+        result: T | None = None
+        retry: BaseException | None = None
+        terminal_detail: str | None = None
+        try:
+            result = operation()
+        except retry_types as exc:
+            retry = exc
+        except DistributedPhaseFailure:
+            raise
+        except Exception as exc:  # noqa: BLE001 - common terminal disposition
+            terminal_detail = f"{type(exc).__name__}: {exc}"
+
+        code = (
+            rank
+            if terminal_detail is not None
+            else world + rank
+            if retry is not None
+            else 2 * world
+        )
+        self._first_failure.fill_(code)
+        dist.all_reduce(self._first_failure, op=dist.ReduceOp.MIN, group=self.group)
+        common = int(self._first_failure)
+        if common < world:
+            raise DistributedPhaseFailure(
+                phase,
+                common,
+                terminal_detail if rank == common else None,
+            )
+        if common < 2 * world:
+            return None, retry if rank == common else None, common - world
+        return result, None, None

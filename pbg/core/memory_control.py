@@ -138,6 +138,33 @@ class MemoryAdmissionStop(RuntimeError):
     """A clean pre-draw or transactional stop; callers must not reroll."""
 
 
+class BranchedMemoryRejection(MemoryError):
+    """One fresh branched attempt was rejected before unsafe work."""
+
+    def __init__(
+        self,
+        *,
+        phase: str,
+        reason: str,
+        predicted_bytes: int,
+        hard_ceiling_bytes: int,
+        allocated_peak_bytes: int,
+        reserved_peak_bytes: int,
+    ) -> None:
+        self.phase = str(phase)
+        self.reason = str(reason)
+        self.predicted_bytes = int(predicted_bytes)
+        self.hard_ceiling_bytes = int(hard_ceiling_bytes)
+        self.allocated_peak_bytes = int(allocated_peak_bytes)
+        self.reserved_peak_bytes = int(reserved_peak_bytes)
+        super().__init__(
+            f"{self.phase} admission rejected {self.reason}: "
+            f"predicted={self.predicted_bytes}, ceiling={self.hard_ceiling_bytes}, "
+            f"allocated_peak={self.allocated_peak_bytes}, "
+            f"reserved_peak={self.reserved_peak_bytes}"
+        )
+
+
 @dataclass(frozen=True)
 class PhaseMemoryModel:
     """Monotone upper byte model for one physical iteration phase."""
@@ -367,15 +394,101 @@ class PhaseMemoryForecaster:
 
 
 @dataclass
-class SequentialMemoryController:
+class PhaseMemoryControl:
+    """Shared device ceiling and completed four-phase forecast ledger."""
+
+    device_bytes: int
+    guard_bytes: int
+    forecaster: PhaseMemoryForecaster
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.device_bytes, bool)
+            or self.device_bytes <= 0
+            or isinstance(self.guard_bytes, bool)
+            or self.guard_bytes < 0
+            or self.guard_bytes >= self.device_bytes
+        ):
+            raise ValueError("device/guard bytes do not define a positive hard ceiling")
+
+    @property
+    def hard_ceiling_bytes(self) -> int:
+        return self.device_bytes - self.guard_bytes
+
+    @staticmethod
+    def allocator_snapshot(device: torch.device) -> tuple[int, int, int]:
+        if device.type != "cuda":
+            return 0, 0, 0
+        return (
+            int(torch.cuda.memory_allocated(device)),
+            int(torch.cuda.max_memory_allocated(device)),
+            int(torch.cuda.max_memory_reserved(device)),
+        )
+
+    def observe_phases(
+        self,
+        units: int,
+        observations: Mapping[str, PhaseMemoryObservation],
+    ) -> None:
+        if isinstance(units, bool) or units <= 0:
+            raise ValueError("memory observations require positive logical units")
+        if set(observations) != set(MEMORY_PHASES):
+            raise ValueError("memory success must cover all four phases")
+        for phase, observation in observations.items():
+            if observation.roots_per_gpu != units:
+                raise ValueError("phase observations use the wrong logical-unit count")
+            self.forecaster.observe(phase, observation)
+
+    def admit(
+        self,
+        phase: str,
+        units: int,
+        *,
+        additional_units: int = 0,
+        workspace_bytes: int = 0,
+        device: torch.device | None = None,
+        reason: str = "phase forecast",
+    ) -> int:
+        """Admit one phase using forecast, allocator pressure, and workspace."""
+
+        if phase not in MEMORY_PHASES:
+            raise KeyError(f"unknown memory phase {phase!r}")
+        values = (units, additional_units, workspace_bytes)
+        if any(isinstance(value, bool) or value < 0 for value in values):
+            raise ValueError("phase admission sizes must be nonnegative")
+        planned = max(1, int(units) + int(additional_units))
+        forecast = self.forecaster.phase_model(phase).predict(planned)
+        selected = torch.device("cpu") if device is None else torch.device(device)
+        allocated, allocated_peak, reserved_peak = self.allocator_snapshot(selected)
+        reserved = (
+            int(torch.cuda.memory_reserved(selected))
+            if selected.type == "cuda"
+            else allocated
+        )
+        predicted = max(
+            forecast,
+            allocated + int(workspace_bytes),
+            reserved + int(workspace_bytes),
+        )
+        if predicted > self.hard_ceiling_bytes:
+            raise BranchedMemoryRejection(
+                phase=phase,
+                reason=reason,
+                predicted_bytes=predicted,
+                hard_ceiling_bytes=self.hard_ceiling_bytes,
+                allocated_peak_bytes=allocated_peak,
+                reserved_peak_bytes=reserved_peak,
+            )
+        return predicted
+
+
+@dataclass
+class SequentialMemoryController(PhaseMemoryControl):
     """Choose one common per-GPU root width solely from memory feasibility."""
 
     minimum_roots_per_gpu: int
     maximum_roots_per_gpu: int
     current_roots_per_gpu: int
-    device_bytes: int
-    guard_bytes: int
-    forecaster: PhaseMemoryForecaster
     growth_fraction: float = 0.10
     growth_delay: int = 8
     successful_streak: int = 0
@@ -387,6 +500,7 @@ class SequentialMemoryController:
     version: str = SEQUENTIAL_MEMORY_CONTROLLER_VERSION
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         values = (
             self.minimum_roots_per_gpu,
             self.maximum_roots_per_gpu,
@@ -400,18 +514,12 @@ class SequentialMemoryController:
             <= self.maximum_roots_per_gpu
         ):
             raise ValueError("current root width must lie within configured bounds")
-        if self.device_bytes <= 0 or self.guard_bytes < 0 or self.guard_bytes >= self.device_bytes:
-            raise ValueError("device/guard bytes do not define a positive hard ceiling")
         if not math.isfinite(self.growth_fraction) or not 0.0 < self.growth_fraction < 1.0:
             raise ValueError("growth_fraction must lie in (0,1)")
         if isinstance(self.growth_delay, bool) or self.growth_delay <= 0:
             raise ValueError("growth_delay must be positive")
         if self.version != SEQUENTIAL_MEMORY_CONTROLLER_VERSION:
             raise ValueError("unsupported sequential memory controller version")
-
-    @property
-    def hard_ceiling_bytes(self) -> int:
-        return self.device_bytes - self.guard_bytes
 
     def local_safe_width(self) -> int:
         """Integer monotone-search maximum whose worst phase fits locally."""
@@ -482,16 +590,12 @@ class SequentialMemoryController:
     ) -> dict[str, float]:
         """Commit a complete four-phase ledger for use by later iterations."""
 
-        if set(observations) != set(MEMORY_PHASES):
-            raise ValueError("a successful memory observation must cover all four phases")
         width = self.current_roots_per_gpu
-        if any(item.roots_per_gpu != width for item in observations.values()):
-            raise ValueError("phase observations must use the frozen current root width")
+        self.observe_phases(width, observations)
         covered = True
         for phase in MEMORY_PHASES:
             item = observations[phase]
             covered &= item.actual_peak_bytes <= item.predicted_peak_bytes
-            self.forecaster.observe(phase, item)
         self.last_actual_peaks = {
             phase: observations[phase].actual_peak_bytes for phase in MEMORY_PHASES
         }

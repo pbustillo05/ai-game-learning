@@ -27,6 +27,7 @@ from pbg.core.learner import (
     allocate_fixed_statistical_counts,
     global_stratum_alphas,
     mode_loss,
+    posterior_effective_hand_counts,
     select_reference_cache_set,
     validate_learner_input,
 )
@@ -406,8 +407,41 @@ def test_distributed_update_accepts_only_training_storage_and_arbitrary_tail() -
     assert result.metrics["statistical_rows"] == 5
     assert result.metrics["physical_subspans"] == 3
     assert result.metrics["flat_gradient_bytes"] == 4
+    assert result.metrics["posterior_effective_hands_rollout"] == 3
+    assert result.metrics["posterior_effective_hand_presentations_learner"] == 5
     with pytest.raises(TypeError, match="only TrainingStorage"):
         validate_learner_input(SimpleNamespace(), specs)
+
+
+def test_entropy_effective_hands_count_fresh_rows_and_learner_reuse() -> None:
+    storage, specs, _ = _fixture("sequential_rb")
+    assert storage.posterior_pool is not None
+    storage.posterior_pool.posterior.fill_(0.25)
+    counts = posterior_effective_hand_counts(storage)
+    assert torch.equal(counts, torch.full((3,), 4.0, dtype=torch.float64))
+    model = _Model()
+    learner = DistributedFixedRolloutUpdate(
+        model,
+        torch.optim.SGD(model.parameters(), lr=0.01),
+        torch.amp.GradScaler("cpu", enabled=False),
+        specs,
+        _Adapter(),
+        _loss_cfg(c_kl=0.0),
+        DistributedLearnerConfig(
+            statistical_counts={0: 5},
+            physical_shapes={0: (PhysicalShape(2, 18),)},
+            available_transient_bytes=20,
+        ),
+    )
+    result = learner(
+        storage,
+        torch.Generator().manual_seed(11),
+        optimizer_steps=2,
+        grad_clip=10.0,
+    )
+    assert result.metrics["posterior_effective_hands_rollout"] == 12
+    assert result.metrics["posterior_effective_hand_presentations_learner"] == 40
+    assert result.metrics["posterior_effective_hands_per_learner_sample"] == 4
 
 
 def test_sampled_reference_cache_preserves_update_and_rng() -> None:

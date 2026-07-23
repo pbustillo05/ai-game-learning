@@ -64,7 +64,18 @@ class RolloutConfig:
     memory_prediction_z: float = 3.0
     adaptive_kkt: AdaptiveKKTConfig | None = None
     branching_min_nodes: int | None = None
+    branching_ideal_nodes: float | None = None
     safe_tree_size: float | None = None
+    fixed_beta_scale_min: float = 0.25
+    fixed_beta_scale_max: float = 4.0
+    fixed_beta_ema: float = 0.20
+    fixed_beta_step: float = 0.10
+    branching_memory_pressure_target: float = 0.80
+    branching_emergency_backoff: float = 0.80
+    branching_oom_retry_limit: int = 2
+    safe_tree_activation_gamma_deviance_max: float = 0.1
+    safe_tree_activation_p95_underprediction_max: float = 2.0
+    safe_tree_activation_consecutive_iters: int = 8
     queue_capacity_rows: int | None = None
 
     def __post_init__(self) -> None:
@@ -115,6 +126,7 @@ class TrainingConfig:
     out_dir: str
     reproducibility: str = "strict"
     kl_ref_interval: int = 1
+    kl_ref_effective_hands_rollout: float | None = None
     optimizer: str = "adam"
     ppo_epochs: int | None = None
 
@@ -345,6 +357,89 @@ def _validate_config(cfg: RootConfig) -> None:
             positive("root.rollout.safe_tree_size", safe_tree_size)
             if safe_tree_size < 1.0:
                 raise ConfigError("root.rollout.safe_tree_size: must be at least one")
+        ideal_nodes = cfg.rollout.branching_ideal_nodes
+        if ideal_nodes is not None:
+            positive("root.rollout.branching_ideal_nodes", ideal_nodes)
+        if cfg.rollout.branching_mode == "fixed" and ideal_nodes is None:
+            raise ConfigError(
+                "root.rollout.branching_ideal_nodes: required when "
+                "branching_mode is 'fixed'"
+            )
+        if (
+            minimum_nodes is not None
+            and ideal_nodes is not None
+            and safe_tree_size is not None
+            and not float(minimum_nodes) < float(ideal_nodes) < float(safe_tree_size)
+        ):
+            raise ConfigError(
+                "root.rollout tree sizes must satisfy "
+                "branching_min_nodes < branching_ideal_nodes < safe_tree_size"
+            )
+        for name in (
+            "fixed_beta_scale_min",
+            "fixed_beta_scale_max",
+            "fixed_beta_ema",
+            "fixed_beta_step",
+            "branching_memory_pressure_target",
+            "branching_emergency_backoff",
+        ):
+            positive(f"root.rollout.{name}", getattr(cfg.rollout, name))
+        if cfg.rollout.fixed_beta_scale_min > cfg.rollout.fixed_beta_scale_max:
+            raise ConfigError(
+                "root.rollout fixed beta scale bounds must satisfy min <= max"
+            )
+        if not cfg.rollout.fixed_beta_scale_min <= 1.0 <= cfg.rollout.fixed_beta_scale_max:
+            raise ConfigError(
+                "root.rollout fixed beta scale bounds must contain the initial scale 1"
+            )
+        for name in (
+            "fixed_beta_ema",
+            "fixed_beta_step",
+            "branching_memory_pressure_target",
+            "branching_emergency_backoff",
+        ):
+            if getattr(cfg.rollout, name) > 1.0:
+                raise ConfigError(f"root.rollout.{name}: expected a value in (0,1]")
+        retries = cfg.rollout.branching_oom_retry_limit
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+            raise ConfigError(
+                "root.rollout.branching_oom_retry_limit: "
+                "expected a nonnegative integer"
+            )
+        gamma_max = cfg.rollout.safe_tree_activation_gamma_deviance_max
+        if (
+            isinstance(gamma_max, bool)
+            or not isinstance(gamma_max, (int, float))
+            or not math.isfinite(float(gamma_max))
+            or gamma_max < 0.0
+        ):
+            raise ConfigError(
+                "root.rollout.safe_tree_activation_gamma_deviance_max: "
+                "expected a finite nonnegative number"
+            )
+        underprediction_max = (
+            cfg.rollout.safe_tree_activation_p95_underprediction_max
+        )
+        if (
+            isinstance(underprediction_max, bool)
+            or not isinstance(underprediction_max, (int, float))
+            or not math.isfinite(float(underprediction_max))
+            or underprediction_max < 1.0
+        ):
+            raise ConfigError(
+                "root.rollout.safe_tree_activation_p95_underprediction_max: "
+                "expected a finite number at least one"
+            )
+        consecutive = cfg.rollout.safe_tree_activation_consecutive_iters
+        if (
+            isinstance(consecutive, bool)
+            or not isinstance(consecutive, int)
+            or consecutive < 1
+        ):
+            raise ConfigError(
+                "root.rollout.safe_tree_activation_consecutive_iters: "
+                "expected a positive integer"
+            )
     else:
         if cfg.rollout.branching_mode is not None:
             raise ConfigError(
@@ -357,6 +452,10 @@ def _validate_config(cfg: RootConfig) -> None:
         if cfg.rollout.branching_min_nodes is not None:
             raise ConfigError(
                 "root.rollout.branching_min_nodes: only valid for branched_rao_blackwell"
+            )
+        if cfg.rollout.branching_ideal_nodes is not None:
+            raise ConfigError(
+                "root.rollout.branching_ideal_nodes: only valid for branched_rao_blackwell"
             )
         if cfg.rollout.safe_tree_size is not None:
             raise ConfigError(
@@ -489,6 +588,9 @@ def _validate_config(cfg: RootConfig) -> None:
         raise ConfigError("root.training.out_dir: expected a nonempty path")
     if isinstance(cfg.training.kl_ref_interval, bool) or cfg.training.kl_ref_interval <= 0:
         raise ConfigError("root.training.kl_ref_interval: expected a positive integer")
+    threshold = cfg.training.kl_ref_effective_hands_rollout
+    if threshold is not None:
+        positive("root.training.kl_ref_effective_hands_rollout", threshold)
     if cfg.training.optimizer not in {"adam", "adamw"}:
         raise ConfigError("root.training.optimizer: expected 'adam' or 'adamw'")
     if cfg.training.ppo_epochs is not None:

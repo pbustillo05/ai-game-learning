@@ -5,6 +5,7 @@ game:
 rollout:
   sequential_roots_per_gpu_initial: 1
   branching_mode: fixed
+  branching_ideal_nodes: 3000.0
   safe_tree_size: 3800.0
   queue_capacity_rows: 4096
   beta:

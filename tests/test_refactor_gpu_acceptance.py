@@ -11,6 +11,10 @@ import torch
 
 from pbg.config import load_config
 from pbg.core.config import AdaptiveKKTConfig
+from pbg.core.memory_control import (
+    BranchedMemoryRejection,
+    SequentialMemoryController,
+)
 from pbg.runtime import train
 
 
@@ -62,6 +66,38 @@ def _tiny_config(mode: str, *, branching_mode: str = "fixed"):
         cfg.loss.name = "rb_ppo"
         cfg.loss.c_t = 1.0
         cfg.loss.c_c = 1.0
+    return cfg
+
+
+def _tiny_retry_config(
+    tmp_path: Path, branching_mode: str, retry_limit: int
+):
+    cfg = _tiny_config("branched_rao_blackwell", branching_mode=branching_mode)
+    cfg.rollout.family_batch_rows = 2
+    cfg.rollout.storage_page_rows = 8
+    cfg.rollout.branching_oom_retry_limit = retry_limit
+    cfg.rollout.branching_emergency_backoff = 0.8
+    cfg.rollout.fixed_beta_scale_min = 0.5
+    cfg.rollout.branching_ideal_nodes = 4.0
+    cfg.rollout.safe_tree_size = 16.0
+    cfg.completion.n_samples = 2
+    cfg.model = {
+        "d_model": 8,
+        "n_heads": 2,
+        "n_layers_pre": 1,
+        "n_layers_post": 1,
+        "m_raise": 1,
+        "k_act": 4,
+        "max_players": 2,
+        "class_embedding_dim": 4,
+        "use_branching_heads": True,
+    }
+    cfg.training.iters = 1
+    cfg.training.gd_steps_per_iter = 1
+    cfg.training.minibatch_size = 2
+    cfg.training.checkpoint_every = 1
+    cfg.training.out_dir = str(tmp_path / branching_mode)
+    cfg.training.amp = False
     return cfg
 
 
@@ -174,6 +210,102 @@ def test_tiny_gpu_training_modes_report_bounded_phase_memory(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+@pytest.mark.parametrize("branching_mode", ("fixed", "dynamic"))
+def test_tiny_cuda_branched_memory_retry_is_fresh_and_backed_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    branching_mode: str,
+) -> None:
+    cfg = _tiny_retry_config(tmp_path, branching_mode, 1)
+
+    original = SequentialMemoryController.admit
+    rejected = False
+
+    def reject_once(self, phase, realized_nodes, **kwargs):
+        nonlocal rejected
+        if not rejected and phase == "rollout":
+            rejected = True
+            raise BranchedMemoryRejection(
+                phase="rollout",
+                reason="injected CUDA retry",
+                predicted_bytes=self.hard_ceiling_bytes + 1,
+                hard_ceiling_bytes=self.hard_ceiling_bytes,
+                allocated_peak_bytes=int(torch.cuda.max_memory_allocated()),
+                reserved_peak_bytes=int(torch.cuda.max_memory_reserved()),
+            )
+        return original(self, phase, realized_nodes, **kwargs)
+
+    monkeypatch.setattr(SequentialMemoryController, "admit", reject_once)
+    train(cfg)
+
+    record = json.loads(
+        (Path(cfg.training.out_dir) / "metrics.jsonl").read_text(encoding="utf-8")
+    )
+    assert record["branching_retry_count"] == 1
+    assert record["branching_retry_cleanup_ok"] == 1
+    assert record["branching_attempt"] == 1
+    payload = torch.load(
+        Path(cfg.training.out_dir) / "ckpt_0000001.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    state = payload["branching_controller_state"]
+    scalar = state["scalar"] if branching_mode == "fixed" else state
+    assert scalar["emergency_backoffs"] == 1
+    assert scalar["updates"] == 1
+    histories = payload["adaptive_work_state"]["forecaster"]["observations"]
+    assert all(len(history) == 1 for history in histories.values())
+    assert payload["cost_safeguard_controller_state"]["observations"] == 1
+    assert record["optimizer_steps"] == 1
+    if branching_mode == "fixed":
+        assert math.exp(scalar["log_kappa"]) < 1.0
+    else:
+        assert math.exp(state["log_kappa"]) < cfg.rollout.adaptive_kkt.kappa_initial
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_cuda_retry_exhaustion_writes_last_completed_terminal_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _tiny_retry_config(tmp_path, "fixed", 0)
+    cfg.training.out_dir = str(tmp_path / "exhausted")
+
+    def reject(self, phase, realized_nodes, **kwargs):
+        del realized_nodes, kwargs
+        raise BranchedMemoryRejection(
+            phase=phase,
+            reason="injected terminal rejection",
+            predicted_bytes=self.hard_ceiling_bytes + 1,
+            hard_ceiling_bytes=self.hard_ceiling_bytes,
+            allocated_peak_bytes=int(torch.cuda.max_memory_allocated()),
+            reserved_peak_bytes=int(torch.cuda.max_memory_reserved()),
+        )
+
+    monkeypatch.setattr(SequentialMemoryController, "admit", reject)
+    train(cfg)
+    stop = json.loads(
+        (Path(cfg.training.out_dir) / "terminal_stop.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert stop["phase"] == "branched memory retry exhaustion"
+    assert stop["checkpoint"] == "ckpt_terminal_stop_0000000.pt"
+    payload = torch.load(
+        Path(cfg.training.out_dir) / stop["checkpoint"],
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert payload["iteration"] == 0
+    scalar = payload["branching_controller_state"]["scalar"]
+    assert scalar["emergency_backoffs"] == 1
+    assert scalar["updates"] == 0
+    histories = payload["adaptive_work_state"]["forecaster"]["observations"]
+    assert all(not history for history in histories.values())
+    assert payload["cost_safeguard_controller_state"]["observations"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize("mode", ("normal", "rao_blackwell"))
 def test_tiny_sequential_gpu_soak_has_stable_iteration_owners(
     tmp_path: Path, mode: str
@@ -249,6 +381,9 @@ def test_tiny_branched_gpu_safety_soak_exercises_scientific_controls(
         assert cfg.rollout.adaptive_kkt is not None
         cfg.rollout.adaptive_kkt.beta_max = 2.0
         cfg.rollout.safe_tree_size = 1.0
+        cfg.rollout.safe_tree_activation_gamma_deviance_max = 1.0e20
+        cfg.rollout.safe_tree_activation_p95_underprediction_max = 1.0e20
+        cfg.rollout.safe_tree_activation_consecutive_iters = 1
         cfg.rollout.adaptive_kkt.kappa_initial = 10.0
         cfg.rollout.adaptive_kkt.kappa_max = 10.0
     cfg.training.iters = 2

@@ -360,7 +360,7 @@ class ChunkedOccurrenceArena:
         """Drop every page after its final consumer and release its byte ledger."""
 
         if self._released:
-            raise RuntimeError("occurrence arena has already been released")
+            return
         for chunks in self._chunks.values():
             chunks.clear()
         self._chunk_lengths.clear()
@@ -766,7 +766,7 @@ class DeviceWorkQueue:
         """Release queue capacity after its final rollout consumer."""
 
         if self._released:
-            raise RuntimeError("work queue has already been released")
+            return
         if self._host_count:
             raise RuntimeError("cannot release a nonempty work queue")
         self._handles = torch.empty(0, dtype=torch.int64, device=self.device)

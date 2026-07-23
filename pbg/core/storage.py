@@ -696,9 +696,10 @@ class PagedTensorArena:
         return block, metrics
 
     def release(self) -> None:
-        """Drop source chunks and their accounting reservations exactly once."""
+        """Idempotently drop source chunks and their accounting reservations."""
 
-        self._check_live()
+        if self._released:
+            return
         self._pages.clear()
         self._lengths.clear()
         if self.accountant is not None:
@@ -1074,6 +1075,8 @@ class RecyclableTensorPool:
         self.arena.reset(release_pages=release_pages)
 
     def release(self) -> None:
+        if self.arena._released:
+            return
         self._free.clear()
         self._live_rows = 0
         self.high_water_live_rows = 0

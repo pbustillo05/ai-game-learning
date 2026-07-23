@@ -630,6 +630,7 @@ def test_dynamic_branched_targets_match_cost_trace_and_queue_correction_formulas
         frozen_t=[0.8, 0.8, 0.8],
         frozen_c=[1.0, 1.0, 1.0],
     )
+    calibration: dict[str, float] = {}
     result = build_branched_rb_targets(
         rollout,
         _spec(1, 1, (0,)),
@@ -639,6 +640,7 @@ def test_dynamic_branched_targets_match_cost_trace_and_queue_correction_formulas
         ),
         1.0,
         leaf_microbatch_rows=2,
+        calibration_metrics=calibration,
     ).partitions[0]
     assert result.columns["trace_variance_hat"].tolist() == pytest.approx(
         [1.6, 0.0, 0.0]
@@ -647,6 +649,13 @@ def test_dynamic_branched_targets_match_cost_trace_and_queue_correction_formulas
     assert result.columns["cost_hat"].tolist() == pytest.approx([3.0, 1.0, 1.0])
     assert "frozen_trace_variance" not in result.columns
     assert "frozen_cost" not in result.columns
+    assert calibration["cost_calibration_rows"] == 3.0
+    assert calibration["cost_calibration_gamma_deviance_mean"] == pytest.approx(
+        (2.0 - math.log(3.0)) / 3.0
+    )
+    assert calibration["cost_calibration_underprediction_p95"] == pytest.approx(
+        2.8
+    )
 
 
 def test_dynamic_branched_targets_protect_root_prefix_from_refill_children() -> None:
