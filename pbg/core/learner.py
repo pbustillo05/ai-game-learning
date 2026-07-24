@@ -7,7 +7,7 @@ graphs exist for one ordered physical subspan and are released after backward.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 import inspect
 import math
 import time
@@ -869,7 +869,9 @@ class DistributedLearnerConfig:
     hard_bytes: int | None = None
     resident_base_bytes: int = 0
     reference_candidates: tuple[ReferenceCacheCandidate, ...] = ()
-    reference_build_shapes: Mapping[int, tuple[PhysicalShape, ...]] = MappingProxyType({})
+    reference_build_shapes: Mapping[int, tuple[PhysicalShape, ...]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
     sampled_reference_cache: bool = False
     amp_enabled: bool = False
     amp_dtype: torch.dtype = torch.float16
