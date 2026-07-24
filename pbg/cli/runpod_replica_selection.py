@@ -84,12 +84,17 @@ def _run_stage(
     root: Path,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[runpod-selection] starting {name}", flush=True)
     command_path = output_dir / "command.json"
     command_path.write_text(
         json.dumps(command, indent=2) + "\n", encoding="utf-8"
     )
     remaining = deadline.remaining_seconds
     if remaining <= 1.0:
+        print(
+            f"[runpod-selection] skipped {name}: deadline exhausted",
+            flush=True,
+        )
         return {
             "name": name,
             "status": "deadline_exhausted",
@@ -112,6 +117,11 @@ def _run_stage(
                 env=os.environ.copy(),
             )
         status = "ok" if completed.returncode == 0 else "failed"
+        print(
+            f"[runpod-selection] finished {name}: {status} "
+            f"({time.monotonic() - started:.1f}s)",
+            flush=True,
+        )
         return {
             "name": name,
             "status": status,
@@ -119,6 +129,10 @@ def _run_stage(
             "seconds": time.monotonic() - started,
         }
     except subprocess.TimeoutExpired:
+        print(
+            f"[runpod-selection] stopped {name}: deadline exhausted",
+            flush=True,
+        )
         return {
             "name": name,
             "status": "deadline_exhausted",
