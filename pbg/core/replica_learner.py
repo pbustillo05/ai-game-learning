@@ -9,12 +9,26 @@ from typing import Any, Callable, Mapping, Sequence
 import torch
 from torch import Tensor, nn
 from torch.func import functional_call, grad_and_value, stack_module_state, vmap
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from pbg.core.replica_optimizer import ReplicaAdamW, ReplicaOptimizerStepResult
 
 
 class ReplicaTransformUnsupported(RuntimeError):
     """The selected model kernel cannot execute under the replica transform."""
+
+
+def replica_sdpa_kernel():
+    """Use SDPA primitives that carry the hidden replica batch.
+
+    Fused cuDNN, Flash, and memory-efficient SDPA backward operators do not
+    currently expose functorch batching rules.  Math SDPA preserves the same
+    attention equation and BF16 autocast while allowing ``vmap`` to batch its
+    constituent operations.  The context is deliberately scoped so ordinary
+    rollout inference keeps the configured hardware backend.
+    """
+
+    return sdpa_kernel(SDPBackend.MATH)
 
 
 @dataclass
@@ -253,7 +267,7 @@ def replica_forward(
         randomness="error",
     )
     try:
-        with torch.no_grad():
+        with torch.no_grad(), replica_sdpa_kernel():
             output = transformed(
                 replicas.parameters, replicas.buffers, *model_arguments
             )
@@ -319,9 +333,10 @@ def replica_grad_and_value(
         randomness="error",
     )
     try:
-        gradients, losses = transformed(
-            replicas.parameters, replicas.buffers, *lane_arguments
-        )
+        with replica_sdpa_kernel():
+            gradients, losses = transformed(
+                replicas.parameters, replicas.buffers, *lane_arguments
+            )
     except RuntimeError as exc:
         message = str(exc)
         transform_markers = (
@@ -391,4 +406,5 @@ __all__ = [
     "StackedModuleReplicas",
     "replica_forward",
     "replica_grad_and_value",
+    "replica_sdpa_kernel",
 ]

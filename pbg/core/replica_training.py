@@ -27,7 +27,11 @@ from pbg.core.learner import (
 )
 from pbg.core.preemption import PreemptionController
 from pbg.core.replica_checkpoint import ReplicaCheckpointManager
-from pbg.core.replica_learner import FunctionalReplicaLearner, StackedModuleReplicas
+from pbg.core.replica_learner import (
+    FunctionalReplicaLearner,
+    StackedModuleReplicas,
+    replica_sdpa_kernel,
+)
 from pbg.core.replica_update import ReplicaFixedRolloutUpdate
 from pbg.core.training import (
     _build_iteration_data,
@@ -237,6 +241,10 @@ def run_replica_training(
 
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
+    sdpa_runtime = {
+        "replica_transform": "math_sdpa",
+        "ordinary_rollout": cfg.hardware.attention_backend,
+    }
     _configure_reproducibility(cfg.training.reproducibility)
     amp_enabled, amp_dtype = _precision(cfg, device)
     if amp_enabled and amp_dtype == torch.float16:
@@ -481,13 +489,14 @@ def run_replica_training(
                     physical,
                     reference_model=legacy_reference,
                 )
-                legacy_update = legacy_learner(
-                    storages[0],
-                    legacy_generator,
-                    optimizer_steps=cfg.training.gd_steps_per_iter,
-                    iteration=iteration,
-                    grad_clip=cfg.training.grad_clip,
-                )
+                with replica_sdpa_kernel():
+                    legacy_update = legacy_learner(
+                        storages[0],
+                        legacy_generator,
+                        optimizer_steps=cfg.training.gd_steps_per_iter,
+                        iteration=iteration,
+                        grad_clip=cfg.training.grad_clip,
+                    )
             if benchmark_requested:
                 assert learner_benchmark_warmup is not None
                 assert learner_benchmark_steps is not None
@@ -563,6 +572,7 @@ def run_replica_training(
                         metrics["optimizer_steps_nonfinite"] == 0.0
                         for metrics in update.metrics
                     ],
+                    "sdpa_runtime": sdpa_runtime,
                 }
                 with (
                     Path(cfg.training.out_dir) / "learner_benchmark.json"
@@ -655,6 +665,7 @@ def run_replica_training(
                     "legacy_statistical_rows": legacy_update.metrics[
                         "statistical_rows"
                     ],
+                    "sdpa_runtime": sdpa_runtime,
                 }
                 parity["passed"] = (
                     parameter_error <= 5.0e-5

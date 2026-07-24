@@ -526,6 +526,18 @@ def main() -> None:
             else:
                 report["parity"][mode] = stage
 
+        failed_parity = [
+            mode
+            for mode in ("normal", "rb")
+            if report["parity"].get(mode, {}).get("passed") is not True
+        ]
+        if failed_parity:
+            raise RuntimeError(
+                "K=1 parity failed for "
+                + ", ".join(failed_parity)
+                + "; refusing to spend GPU time on selection benchmarks"
+            )
+
         for mode in ("normal", "rb"):
             report["learner"][mode] = []
             for replicas in args.replicas:
