@@ -60,7 +60,9 @@ class RaiseMixtureHead(nn.Module):
         return omega, mu, s, iota
 
 
-def dlogistic_tick(n_ticks: int, mu: Tensor, s: Tensor) -> Tensor:
+def dlogistic_tick(
+    n_ticks: int, mu: Tensor, s: Tensor, *, validate: bool = True
+) -> Tensor:
     """Return a normalized discretized logistic distribution ``[...,n_ticks]``."""
 
     if isinstance(n_ticks, bool) or not isinstance(n_ticks, int) or n_ticks <= 0:
@@ -69,11 +71,12 @@ def dlogistic_tick(n_ticks: int, mu: Tensor, s: Tensor) -> Tensor:
         raise ValueError("mu and s must have identical shapes")
     if not mu.is_floating_point() or not s.is_floating_point():
         raise TypeError("mu and s must be floating point")
-    positive = (s > 0).all()
-    if s.device.type == "cuda":
-        torch._assert_async(positive, "logistic scales must be positive")
-    elif not bool(positive):
-        raise ValueError("logistic scales must be positive")
+    if validate:
+        positive = (s > 0).all()
+        if s.device.type == "cuda":
+            torch._assert_async(positive, "logistic scales must be positive")
+        elif not bool(positive):
+            raise ValueError("logistic scales must be positive")
     # fp32 accumulation is important for wide mixtures under fp16 autocast.
     work_dtype = torch.float64 if mu.dtype == torch.float64 or s.dtype == torch.float64 else torch.float32
     location = mu.to(work_dtype)[..., None]

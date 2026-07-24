@@ -98,6 +98,8 @@ class PokerPolicyAdapter:
         raw: PolicyOutput | Mapping[str, Tensor],
         legal_event_ids: Tensor,
         legal_mask: Tensor,
+        *,
+        _prevalidated: bool = False,
     ) -> Tensor:
         """Return normalized probabilities over the supplied event columns."""
 
@@ -121,19 +123,25 @@ class PokerPolicyAdapter:
         if n_ticks <= 0:
             raise ValueError("the legal event set has no raise-tick width")
         type_logits = type_logits.float()
-        _require_device(
-            torch.stack(
-                [torch.isfinite(fields[name]).all() for name in sorted(required)]
-            ).all(),
-            "raw policy fields must be finite",
-        )
+        if not _prevalidated:
+            _require_device(
+                torch.stack(
+                    [
+                        torch.isfinite(fields[name]).all()
+                        for name in sorted(required)
+                    ]
+                ).all(),
+                "raw policy fields must be finite",
+            )
         type_probability = torch.softmax(type_logits, dim=-1)
         prefix = type_logits.shape[:-1]
         omega = fields["omega"].float()
         mu = fields["mu"].float()
         scale = fields["s"].float()
         iota = fields["iota"].float()
-        logistic = dlogistic_tick(n_ticks, mu, scale)
+        logistic = dlogistic_tick(
+            n_ticks, mu, scale, validate=not _prevalidated
+        )
         mixture = (omega[..., None] * logistic).sum(dim=-2)
         raise_mask = legal_mask[:, RAISE_OFFSET:].to(type_logits.device)
         mask_shape = (batch,) + (1,) * (mixture.ndim - 2) + (n_ticks,)
@@ -146,13 +154,11 @@ class PokerPolicyAdapter:
             tick_index,
             torch.full_like(tick_index, -1),
         ).max(1).values
-        allin = torch.zeros((batch, n_ticks), dtype=torch.float32, device=type_logits.device)
         has_raise = allin_index >= 0
-        allin.scatter_(
-            1,
-            allin_index.clamp_min(0)[:, None],
-            has_raise.to(torch.float32)[:, None],
-        )
+        allin = (
+            torch.arange(n_ticks, device=type_logits.device)[None, :]
+            == allin_index[:, None]
+        ).to(torch.float32) * has_raise.to(torch.float32)[:, None]
         allin = allin.reshape(mask_shape).expand_as(mixture)
         ticks = (1.0 - iota[..., None]) * mixture + iota[..., None] * allin
         ticks = ticks.masked_fill(~expanded_raise_mask, 0.0)
@@ -160,18 +166,20 @@ class PokerPolicyAdapter:
         # Preserve the ordinary probability-space path exactly.  This keeps
         # seeded rollout behavior unchanged except on the zero-mass corner
         # which previously raised a device-side assertion.
-        full = torch.zeros(
-            prefix + (RAISE_OFFSET + n_ticks,),
-            dtype=torch.float32,
-            device=type_logits.device,
-        )
         facing_bet = ((legal_event_ids == FOLD) & legal_mask).any(dim=1)
         facing = facing_bet.reshape((batch,) + (1,) * (type_logits.ndim - 2))
-        full[..., FOLD] = torch.where(facing, type_probability[..., 0], 0.0)
-        full[..., CHECK_CALL] = torch.where(
-            facing, type_probability[..., 1], type_probability[..., 0]
+        full = torch.cat(
+            (
+                torch.where(
+                    facing, type_probability[..., 0], 0.0
+                )[..., None],
+                torch.where(
+                    facing, type_probability[..., 1], type_probability[..., 0]
+                )[..., None],
+                type_probability[..., 2, None] * ticks,
+            ),
+            dim=-1,
         )
-        full[..., RAISE_OFFSET:] = type_probability[..., 2, None] * ticks
 
         # Condition on the currently legal raise grid before taking logs.  In
         # exact arithmetic the mixture already has positive mass on every
@@ -192,44 +200,46 @@ class PokerPolicyAdapter:
         # softmaxed all three action types, then discarded illegal types.  If
         # an illegal type exceeded every legal type by roughly 100 logits,
         # every supplied legal probability underflowed to exactly zero.
-        full_logits = torch.full(
-            prefix + (RAISE_OFFSET + n_ticks,),
-            -torch.inf,
-            dtype=torch.float32,
-            device=type_logits.device,
-        )
-        full_logits[..., FOLD] = type_logits[..., 0]
-        full_logits[..., CHECK_CALL] = torch.where(
-            facing, type_logits[..., 1], type_logits[..., 0]
-        )
         tick_logits = torch.where(
             stable_ticks > 0,
             torch.log(stable_ticks.clamp_min(self.eps)),
             torch.full_like(stable_ticks, -torch.inf),
         )
-        full_logits[..., RAISE_OFFSET:] = type_logits[..., 2, None] + tick_logits
-        ids = legal_event_ids.to(device=full_logits.device, dtype=torch.long)
-        _require_device(
-            ((ids >= 0) & (ids < full_logits.shape[-1])).all(),
-            "legal event id is outside the factorized event space",
+        full_logits = torch.cat(
+            (
+                type_logits[..., 0, None],
+                torch.where(
+                    facing, type_logits[..., 1], type_logits[..., 0]
+                )[..., None],
+                type_logits[..., 2, None] + tick_logits,
+            ),
+            dim=-1,
         )
+        ids = legal_event_ids.to(device=full_logits.device, dtype=torch.long)
+        if not _prevalidated:
+            _require_device(
+                ((ids >= 0) & (ids < full_logits.shape[-1])).all(),
+                "legal event id is outside the factorized event space",
+            )
         event_shape = (batch,) + (1,) * (type_logits.ndim - 2) + (ids.shape[1],)
         ids = ids.reshape(event_shape).expand(prefix + (ids.shape[1],))
         mask = legal_mask.to(full_logits.device).reshape(event_shape).expand_as(ids)
-        _require_device(
-            mask.any(-1).all(),
-            "each policy row must supply at least one legal event",
-        )
+        if not _prevalidated:
+            _require_device(
+                mask.any(-1).all(),
+                "each policy row must supply at least one legal event",
+            )
         probability = full.gather(-1, ids).masked_fill(~mask, 0.0)
         normalizer = probability.sum(dim=-1, keepdim=True)
         ordinary = probability / normalizer.clamp_min(self.eps)
         legal_logits = full_logits.gather(-1, ids).masked_fill(~mask, -torch.inf)
         fallback = torch.softmax(legal_logits, dim=-1).masked_fill(~mask, 0.0)
         probability = torch.where(normalizer > 0, ordinary, fallback)
-        _require_device(
-            torch.isfinite(probability).all(),
-            "legal-event probabilities must be finite",
-        )
+        if not _prevalidated:
+            _require_device(
+                torch.isfinite(probability).all(),
+                "legal-event probabilities must be finite",
+            )
         return probability
 
     compose = probabilities
@@ -243,7 +253,29 @@ class PokerPolicyAdapter:
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Compose log-probabilities, entropy, and KL with one current pass."""
 
-        probability = self.probabilities(raw, legal_event_ids, legal_mask)
+        return self._policy_terms(
+            raw,
+            reference,
+            legal_event_ids,
+            legal_mask,
+            prevalidated=False,
+        )
+
+    def _policy_terms(
+        self,
+        raw: PolicyOutput | Mapping[str, Tensor],
+        reference: PolicyOutput | Mapping[str, Tensor] | None,
+        legal_event_ids: Tensor,
+        legal_mask: Tensor,
+        *,
+        prevalidated: bool,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        probability = self.probabilities(
+            raw,
+            legal_event_ids,
+            legal_mask,
+            _prevalidated=prevalidated,
+        )
         event_shape = (probability.shape[0],) + (1,) * (probability.ndim - 2) + (
             probability.shape[-1],
         )
@@ -260,7 +292,10 @@ class PokerPolicyAdapter:
             kl = torch.zeros_like(entropy)
         else:
             reference_probability = self.probabilities(
-                reference, legal_event_ids, legal_mask
+                reference,
+                legal_event_ids,
+                legal_mask,
+                _prevalidated=prevalidated,
             )
             reference_log = torch.log(reference_probability.clamp_min(self.eps))
             kl = (
@@ -268,6 +303,23 @@ class PokerPolicyAdapter:
                 * (torch.where(mask, log_probability, 0.0) - reference_log)
             ).sum(-1)
         return log_probability, entropy, kl
+
+    def policy_terms_prevalidated(
+        self,
+        raw: PolicyOutput | Mapping[str, Tensor],
+        reference: PolicyOutput | Mapping[str, Tensor] | None,
+        legal_event_ids: Tensor,
+        legal_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Compose a pack whose inputs were validated before a transform."""
+
+        return self._policy_terms(
+            raw,
+            reference,
+            legal_event_ids,
+            legal_mask,
+            prevalidated=True,
+        )
 
     def log_prob(
         self,
@@ -278,7 +330,29 @@ class PokerPolicyAdapter:
     ) -> Tensor:
         """Return selected legal-event log probabilities ``[B,E_selected,X]``."""
 
-        probability = self.probabilities(raw, legal_event_ids, legal_mask)
+        return self._log_prob(
+            raw,
+            selected_event_ids,
+            legal_event_ids,
+            legal_mask,
+            prevalidated=False,
+        )
+
+    def _log_prob(
+        self,
+        raw: PolicyOutput | Mapping[str, Tensor],
+        selected_event_ids: Tensor,
+        legal_event_ids: Tensor,
+        legal_mask: Tensor,
+        *,
+        prevalidated: bool,
+    ) -> Tensor:
+        probability = self.probabilities(
+            raw,
+            legal_event_ids,
+            legal_mask,
+            _prevalidated=prevalidated,
+        )
         event_shape = (probability.shape[0],) + (1,) * (probability.ndim - 2) + (probability.shape[-1],)
         mask = legal_mask.to(probability.device).reshape(event_shape).expand_as(probability)
         log_rows = torch.where(
@@ -291,10 +365,11 @@ class PokerPolicyAdapter:
             legal_event_ids[:, None, :].to(selected_event_ids.device)
             == selected_event_ids[:, :, None]
         ) & legal_mask[:, None, :].to(selected_event_ids.device)
-        _require_device(
-            matches.any(-1).all(),
-            "selected_event_ids must select supplied legal events",
-        )
+        if not prevalidated:
+            _require_device(
+                matches.any(-1).all(),
+                "selected_event_ids must select supplied legal events",
+            )
         columns = matches.to(torch.int64).argmax(-1).to(log_rows.device)  # [B,E_selected]
         if log_rows.ndim != 3:
             raise ValueError("poker policy log rows must have shape [B,X,E_legal]")
@@ -303,9 +378,39 @@ class PokerPolicyAdapter:
         )  # [B,X,E_selected]
         return gathered.transpose(1, 2)  # [B,E_selected,X]
 
+    def log_prob_prevalidated(
+        self,
+        raw: PolicyOutput | Mapping[str, Tensor],
+        selected_event_ids: Tensor,
+        legal_event_ids: Tensor,
+        legal_mask: Tensor,
+    ) -> Tensor:
+        """Select events from a pack validated before a transform."""
+
+        return self._log_prob(
+            raw,
+            selected_event_ids,
+            legal_event_ids,
+            legal_mask,
+            prevalidated=True,
+        )
+
     def entropy(self, raw: PolicyOutput | Mapping[str, Tensor], legal_event_ids: Tensor, legal_mask: Tensor) -> Tensor:
         probability = self.probabilities(raw, legal_event_ids, legal_mask)
         return -(probability * torch.log(probability.clamp_min(self.eps))).sum(dim=-1)
+
+    def entropy_prevalidated(
+        self,
+        raw: PolicyOutput | Mapping[str, Tensor],
+        legal_event_ids: Tensor,
+        legal_mask: Tensor,
+    ) -> Tensor:
+        probability = self.probabilities(
+            raw, legal_event_ids, legal_mask, _prevalidated=True
+        )
+        return -(probability * torch.log(probability.clamp_min(self.eps))).sum(
+            dim=-1
+        )
 
     def kl(
         self, raw: PolicyOutput | Mapping[str, Tensor], reference: PolicyOutput | Mapping[str, Tensor],
@@ -315,6 +420,27 @@ class PokerPolicyAdapter:
         reference_probability = self.probabilities(reference, legal_event_ids, legal_mask)
         return (probability * (torch.log(probability.clamp_min(self.eps)) -
                                torch.log(reference_probability.clamp_min(self.eps)))).sum(dim=-1)
+
+    def kl_prevalidated(
+        self,
+        raw: PolicyOutput | Mapping[str, Tensor],
+        reference: PolicyOutput | Mapping[str, Tensor],
+        legal_event_ids: Tensor,
+        legal_mask: Tensor,
+    ) -> Tensor:
+        probability = self.probabilities(
+            raw, legal_event_ids, legal_mask, _prevalidated=True
+        )
+        reference_probability = self.probabilities(
+            reference, legal_event_ids, legal_mask, _prevalidated=True
+        )
+        return (
+            probability
+            * (
+                torch.log(probability.clamp_min(self.eps))
+                - torch.log(reference_probability.clamp_min(self.eps))
+            )
+        ).sum(dim=-1)
 
     def sample(
         self, raw: PolicyOutput | Mapping[str, Tensor], legal_event_ids: Tensor,

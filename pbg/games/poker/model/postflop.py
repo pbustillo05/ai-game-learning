@@ -475,8 +475,28 @@ class PostflopNet(nn.Module):
             for count, kind in type_groups
         ])
         scalar_tokens = scalar_tokens + self.public_type_embedding(scalar_type)[None]
-        scalar_tokens[:, 1 : 1 + players] += self.seat_embedding(relative)
-        scalar_tokens[:, 1 + players : 1 + 2 * players] += self.seat_embedding(relative)
+        seat_position = self.seat_embedding(relative)
+        scalar_tokens = scalar_tokens + torch.cat(
+            (
+                torch.zeros(
+                    (batch, 1, self.cfg.d_model),
+                    dtype=scalar_tokens.dtype,
+                    device=scalar.device,
+                ),
+                seat_position,
+                seat_position,
+                torch.zeros(
+                    (
+                        batch,
+                        scalar.shape[1] - 1 - 2 * players,
+                        self.cfg.d_model,
+                    ),
+                    dtype=scalar_tokens.dtype,
+                    device=scalar.device,
+                ),
+            ),
+            dim=1,
+        )
         board_mask = pub.board >= 0
         board_tokens = self.board_projection(self._card_embedding(pub.board).to(dtype))
         board_tokens = board_tokens + self.public_type_embedding(
@@ -484,10 +504,26 @@ class PostflopNet(nn.Module):
         )
         state = self.state_token.to(dtype)[None, None, :].expand(batch, 1, -1)
         token = torch.cat((state, scalar_tokens, board_tokens), dim=1)
-        scalar_valid = torch.ones(scalar.shape, dtype=torch.bool, device=scalar.device)
-        if pub.seat_mask is not None:
-            scalar_valid[:, 1 : 1 + players] = pub.seat_mask
-            scalar_valid[:, 1 + players : 1 + 2 * players] = pub.seat_mask
+        supplied_seat_mask = (
+            torch.ones(
+                (batch, players), dtype=torch.bool, device=scalar.device
+            )
+            if pub.seat_mask is None
+            else pub.seat_mask
+        )
+        scalar_valid = torch.cat(
+            (
+                torch.ones((batch, 1), dtype=torch.bool, device=scalar.device),
+                supplied_seat_mask,
+                supplied_seat_mask,
+                torch.ones(
+                    (batch, scalar.shape[1] - 1 - 2 * players),
+                    dtype=torch.bool,
+                    device=scalar.device,
+                ),
+            ),
+            dim=1,
+        )
         valid = torch.cat(
             (
                 torch.ones((batch, 1), dtype=torch.bool, device=scalar.device),
@@ -527,14 +563,29 @@ class PostflopNet(nn.Module):
         combo_ranges: Tensor,
         actor_seat: Tensor | None = None,
         masks: PostflopMasks | None = None,
+        *,
+        _prepared_metadata: tuple[
+            Tensor,
+            Tensor,
+            Tensor,
+            Tensor,
+            Tensor,
+            Tensor,
+            CompactMap,
+        ]
+        | None = None,
     ) -> PolicyOutput:
         """Return fixed-width actor outputs while running only supplied rows."""
 
         if masks is None:
             raise ValueError("postflop forward requires supplied compatibility")
+        if _prepared_metadata is None:
+            prepared = self._validate(pub, combo_ranges, actor_seat, masks)
+        else:
+            prepared = _prepared_metadata
         (
             actor, seat_mask, live_ids, live_valid, status, combo_mask, mapping
-        ) = self._validate(pub, combo_ranges, actor_seat, masks)
+        ) = prepared
         batch, players = combo_ranges.shape[:2]
         live_players = live_ids.shape[1]
         c, d = self.cfg, self.cfg.d_model
@@ -592,8 +643,17 @@ class PostflopNet(nn.Module):
         token = torch.cat((row_flat, public, anchors), dim=1)
         row_mask = compact_mask.reshape(batch, -1)
         key_mask = torch.cat((row_mask, public_mask, torch.ones((batch, c.k_act), dtype=torch.bool, device=row.device)), dim=1)
-        key_bias = torch.zeros(token.shape[:2], dtype=torch.float32, device=token.device)
-        key_bias[:, :row_flat.shape[1]] = corrected_log_reach.reshape(batch, -1).float()
+        key_bias = torch.cat(
+            (
+                corrected_log_reach.reshape(batch, -1).float(),
+                torch.zeros(
+                    (batch, token.shape[1] - row_flat.shape[1]),
+                    dtype=torch.float32,
+                    device=token.device,
+                ),
+            ),
+            dim=1,
+        )
         beta_square = expanded_geometry[..., self.n_cards :].square()
         side_parts = [
             expanded_combo, compact_ranges[..., None], log_range[..., None],
@@ -627,13 +687,20 @@ class PostflopNet(nn.Module):
                 (j, overlap_card * overlap_card, overlap_card * overlap_equal), dim=-1
             )
             complete_side = torch.cat((side_rows, dynamic), dim=-1)
-            side = torch.zeros(
-                token.shape[:2] + (complete_side.shape[-1],),
-                dtype=complete_side.dtype,
-                device=token.device,
-            )
-            side[:, :row_flat.shape[1]] = complete_side.reshape(
-                batch, row_flat.shape[1], -1
+            side = torch.cat(
+                (
+                    complete_side.reshape(batch, row_flat.shape[1], -1),
+                    torch.zeros(
+                        (
+                            batch,
+                            token.shape[1] - row_flat.shape[1],
+                            complete_side.shape[-1],
+                        ),
+                        dtype=complete_side.dtype,
+                        device=token.device,
+                    ),
+                ),
+                dim=1,
             )
             x = residual + ffn(torch.cat((norm(residual), side), dim=-1))
         final = self.final_norm(x)
@@ -690,15 +757,25 @@ class PostflopNet(nn.Module):
         seat_summary = torch.where(
             seat_mask[..., None], scattered_live, folded_summary
         )
-        actor_selector = torch.nn.functional.one_hot(actor, players).to(torch.bool)
+        actor_selector = (
+            torch.arange(players, device=actor.device)[None, :]
+            == actor[:, None]
+        )
         seat_summary = torch.where(actor_selector[..., None], actor_summary[:, None], seat_summary)
         seat_summary = seat_summary.masked_fill(~(pub.seat_mask if pub.seat_mask is not None else torch.ones_like(seat_mask))[..., None], 0.0)
         relative_index = relative[..., None].expand(-1, -1, d)
         ordered_seats = torch.zeros_like(seat_summary).scatter(1, relative_index, seat_summary)
-        padded_seats = torch.zeros(
-            (batch, c.max_players, d), dtype=seat_summary.dtype, device=seat_summary.device
+        padded_seats = torch.cat(
+            (
+                ordered_seats,
+                torch.zeros(
+                    (batch, c.max_players - players, d),
+                    dtype=seat_summary.dtype,
+                    device=seat_summary.device,
+                ),
+            ),
+            dim=1,
         )
-        padded_seats[:, :players] = ordered_seats
         global_feature = self.global_features(
             torch.cat(
                 (public_mean, actor_summary, padded_seats.reshape(batch, -1)), dim=-1
@@ -740,3 +817,48 @@ class PostflopNet(nn.Module):
             )
             t, cost = self.branching_heads(branching_public)
         return PolicyOutput(raw=raw, v=full_value, t=t, c=cost)
+
+    def prepare_forward(
+        self,
+        pub: PokerPublicBatch,
+        combo_ranges: Tensor,
+        actor_seat: Tensor | None = None,
+        masks: PostflopMasks | None = None,
+    ) -> tuple[
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        CompactMap,
+    ]:
+        """Validate one ordinary pack and construct its compact execution map."""
+
+        if masks is None:
+            raise ValueError("postflop forward requires supplied compatibility")
+        return self._validate(pub, combo_ranges, actor_seat, masks)
+
+    def forward_prevalidated(
+        self,
+        pub: PokerPublicBatch,
+        combo_ranges: Tensor,
+        masks: PostflopMasks,
+        prepared_metadata: tuple[
+            Tensor,
+            Tensor,
+            Tensor,
+            Tensor,
+            Tensor,
+            Tensor,
+            CompactMap,
+        ],
+    ) -> PolicyOutput:
+        """Run tensor math after :meth:`prepare_forward` validated the pack."""
+
+        return self.forward(
+            pub,
+            combo_ranges,
+            masks=masks,
+            _prepared_metadata=prepared_metadata,
+        )

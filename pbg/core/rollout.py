@@ -576,29 +576,27 @@ def _sample_trees_sequential(
                     )
                     capture = getattr(backend, capture_name, None)
                     if callable(capture):
-                        address = arena.gather_many(
-                            ("trajectory_id", "path_key"), stopped_rows
-                        )
-                        keys = logical_rng_keys(
-                            seed=logical_seed,
-                            iteration=iteration,
-                            trajectory=address["trajectory_id"],
-                            path=address["path_key"],
-                            draw=1,
-                            purpose=DrawPurpose.COMPLETION,
-                        )
                         tree_ids = buffer.tree_id[stopped_rows].to(torch.int64)
                         if probe_enabled:
                             assert probe_seats is not None
                             capture_leaf = capture(
                                 stopped_states,
                                 stopped_reach,
-                                root_profiles[tree_ids],
-                                keys,
                                 stopped_owners,
                                 probe_seats[tree_ids],
                             )
                         else:
+                            address = arena.gather_many(
+                                ("trajectory_id", "path_key"), stopped_rows
+                            )
+                            keys = logical_rng_keys(
+                                seed=logical_seed,
+                                iteration=iteration,
+                                trajectory=address["trajectory_id"],
+                                path=address["path_key"],
+                                draw=1,
+                                purpose=DrawPurpose.COMPLETION,
+                            )
                             capture_leaf = capture(
                                 stopped_states, root_profiles[tree_ids], keys
                             )

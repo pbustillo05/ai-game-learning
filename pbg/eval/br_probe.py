@@ -86,21 +86,71 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _selected_reward(
+def _selected_completed_reward(
     bundle: GameBundle,
     cfg: Any,
     sampled: Any,
     seats: Tensor,
     gen: torch.Generator,
 ) -> Tensor:
+    """Rao--Blackwellize one selected-seat payoff per stopped root."""
+
     sample = sampled.sample if isinstance(sampled, ProbeRollout) else sampled
-    leaf_tree = sample.leaf_source["root_id"].to(torch.int64)
+    leaves = sample.leaf_source
+    leaf_tree = leaves["root_id"].to(torch.int64)
     leaf_seats = seats[leaf_tree].to(torch.int64)
-    del bundle, cfg, gen
-    reward = sample.leaf_source["reward"]
+    selected_owner = leaves["selected_owner"].to(torch.int64)
+    if not torch.equal(selected_owner, leaf_seats):
+        raise RuntimeError("probe leaf selected owners disagree with evaluation seats")
+    service = bundle.completion_backend
+    complete_selected = getattr(service, "complete_selected_sealed", None)
+    if not callable(complete_selected):
+        raise TypeError(
+            "BR evaluation requires immutable selected-seat completion"
+        )
+    backend = bundle.rollout_backend
+    leaf_columns = {
+        name: leaves[name]
+        for name in (
+            "owner",
+            "selected_owner",
+            "fold_payoff",
+            "board_cards",
+            "stratum_level",
+            "payoff_baseline",
+            "stratum_amount",
+        )
+    }
+    leaf_columns["range_weights"] = backend.range_weights_from_log_reach(
+        leaves["log_reach"].detach().to(torch.float32)
+    )
+    leaf_columns["completion_key"] = sequential_leaf_logical_rng_keys(
+        leaves["root_id"],
+        leaves["path_key"],
+        cfg,
+        gen,
+        iteration=0,
+        purpose=DrawPurpose.COMPLETION,
+    ).to(torch.int64)
+    rows = torch.arange(leaves.rows, dtype=torch.int64, device=seats.device)
+    completed = complete_selected(
+        backend,
+        leaf_columns,
+        rows=rows,
+        n_samples=int(cfg.completion.n_samples),
+    ).for_learning()
+    posterior = completed.p_hat
+    value = completed.v_hat
+    if (
+        posterior.shape != value.shape
+        or posterior.shape != (leaves.rows, 1, backend.n_hands)
+    ):
+        raise RuntimeError(
+            "selected completion must return matching [L,1,H] posterior/value rows"
+        )
+    reward = (posterior[:, 0] * value[:, 0]).sum(dim=1)
     result = torch.empty(seats.shape[0], dtype=torch.float32, device=seats.device)
-    rows = torch.arange(sample.leaf_source.rows, device=seats.device)
-    result[leaf_tree] = reward[rows, leaf_seats]
+    result[leaf_tree] = reward
     return result
 
 
@@ -151,6 +201,7 @@ def evaluate_br_probe(
         "target_sha256": target_hash,
     }
     cfg = load_config_mapping(raw, hardware_profile=hardware_profile)
+    cfg.rollout.logical_seed = int(seed)
     players = cfg.game.n_players
     block = players * players
     if n_hands <= 1 or n_hands % block:
@@ -186,18 +237,23 @@ def evaluate_br_probe(
         mixed = sample_trees_sequential(bundle, cfg, gen, iteration=0)
         if not isinstance(mixed, ProbeRollout):
             raise RuntimeError("mixed evaluation did not produce a probe rollout")
-        mixed_reward = _selected_reward(bundle, cfg, mixed, seats, gen)
+        mixed_reward = _selected_completed_reward(
+            bundle, cfg, mixed, seats, gen
+        )
 
         baseline_bundle = GameBundle(
             model=target,
             rollout_backend=bundle.rollout_backend,
             policy_adapter=bundle.policy_adapter,
             completion_backend=bundle.completion_backend,
+            opponent_model=target,
         )
         baseline = sample_trees_sequential(
-            baseline_bundle, cfg, gen, return_profiles=True, iteration=0
+            baseline_bundle, cfg, gen, iteration=0
         )
-        baseline_reward = _selected_reward(
+        if not isinstance(baseline, ProbeRollout):
+            raise RuntimeError("baseline evaluation did not produce a probe rollout")
+        baseline_reward = _selected_completed_reward(
             baseline_bundle, cfg, baseline, seats, gen
         )
         differences.append((mixed_reward - baseline_reward).detach().cpu())
@@ -222,7 +278,9 @@ def evaluate_br_probe(
         per_seat_gain_bb_per_hand=per_seat,
         n_deals=n_hands,
         n_replays=2 * n_hands,
-        evaluation_completion_samples=2 * n_hands,
+        evaluation_completion_samples=(
+            2 * n_hands * int(cfg.completion.n_samples)
+        ),
         training_logical_trajectories=int(logical_work.get("trajectories", 0)),
         training_logical_completion_samples=int(
             logical_work.get("completion_samples", 0)

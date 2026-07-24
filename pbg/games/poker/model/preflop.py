@@ -474,11 +474,30 @@ class PreflopNet(nn.Module):
         ])
         token = self.public_scalar_affine(scalars[..., None]) + self.public_type_embedding(type_ids)[None, :, :]
         seat_position = self.seat_embedding(relative_seats)
-        token[:, 1 : 1 + players] = token[:, 1 : 1 + players] + seat_position
-        token[:, 1 + players : 1 + 2 * players] = token[:, 1 + players : 1 + 2 * players] + seat_position
-        valid = torch.ones(scalars.shape, dtype=torch.bool, device=device)
-        valid[:, 1 : 1 + players] = seat_mask
-        valid[:, 1 + players : 1 + 2 * players] = seat_mask
+        seat_prefix = torch.zeros(
+            (batch, 1, self.cfg.d_model), dtype=token.dtype, device=device
+        )
+        seat_suffix = torch.zeros(
+            (batch, scalars.shape[1] - 1 - 2 * players, self.cfg.d_model),
+            dtype=token.dtype,
+            device=device,
+        )
+        token = token + torch.cat(
+            (seat_prefix, seat_position, seat_position, seat_suffix), dim=1
+        )
+        valid = torch.cat(
+            (
+                torch.ones((batch, 1), dtype=torch.bool, device=device),
+                seat_mask,
+                seat_mask,
+                torch.ones(
+                    (batch, scalars.shape[1] - 1 - 2 * players),
+                    dtype=torch.bool,
+                    device=device,
+                ),
+            ),
+            dim=1,
+        )
         if pub.history is not None and pub.history.mask.shape[1]:
             history = pub.history
             numeric = torch.stack(
@@ -516,6 +535,11 @@ class PreflopNet(nn.Module):
         class_ranges: Tensor,
         actor_seat: Tensor | None = None,
         masks: PreflopMasks | Mapping[str, Tensor] | Tensor | None = None,
+        *,
+        _prepared_metadata: tuple[
+            Tensor, Tensor, Tensor, Tensor, Tensor, Tensor
+        ]
+        | None = None,
     ) -> PolicyOutput:
         """Return policy parameters and values for every actor class row.
 
@@ -524,10 +548,13 @@ class PreflopNet(nn.Module):
         bool seat mask directly.
         """
 
-        batch, players = self._validate_public(pub, class_ranges)
-        actor, seat_mask, class_mask, status, class_ids, relative_seats = self._metadata(
-            pub, class_ranges, actor_seat, masks
-        )
+        if _prepared_metadata is None:
+            batch, players = self._validate_public(pub, class_ranges)
+            prepared = self._metadata(pub, class_ranges, actor_seat, masks)
+        else:
+            batch, players = class_ranges.shape[:2]
+            prepared = _prepared_metadata
+        actor, seat_mask, class_mask, status, class_ids, relative_seats = prepared
         c = self.cfg
         d = c.d_model
         dc = c.class_embedding_dim
@@ -577,10 +604,19 @@ class PreflopNet(nn.Module):
 
         masked_range = class_ranges * class_mask.to(class_ranges.dtype)
         normalized = masked_range / masked_range.sum(dim=-1, keepdim=True).clamp_min(c.eps)
-        key_bias = torch.zeros(token.shape[:2], dtype=torch.float32, device=token.device)
-        key_bias[:, : players * self.n_classes] = torch.log(normalized.clamp_min(c.eps)).reshape(
-            batch, players * self.n_classes
-        ).float()
+        key_bias = torch.cat(
+            (
+                torch.log(normalized.clamp_min(c.eps))
+                .reshape(batch, players * self.n_classes)
+                .float(),
+                torch.zeros(
+                    (batch, token.shape[1] - players * self.n_classes),
+                    dtype=torch.float32,
+                    device=token.device,
+                ),
+            ),
+            dim=1,
+        )
 
         side_class = torch.cat(
             (expanded_emb, class_ranges[..., None], log_range[..., None], expanded_geometry),
@@ -610,13 +646,20 @@ class PreflopNet(nn.Module):
                 (j, overlap_card * overlap_card, overlap_card * overlap_equal), dim=-1
             )
             side_rows = torch.cat((side_class, dynamic), dim=-1)
-            side = torch.zeros(
-                token.shape[:2] + (side_rows.shape[-1],),
-                dtype=side_rows.dtype,
-                device=token.device,
-            )
-            side[:, : players * self.n_classes] = side_rows.reshape(
-                batch, players * self.n_classes, -1
+            side = torch.cat(
+                (
+                    side_rows.reshape(batch, players * self.n_classes, -1),
+                    torch.zeros(
+                        (
+                            batch,
+                            token.shape[1] - players * self.n_classes,
+                            side_rows.shape[-1],
+                        ),
+                        dtype=side_rows.dtype,
+                        device=token.device,
+                    ),
+                ),
+                dim=1,
             )
             x = x_hat + layer_ffn(torch.cat((layer_norm(x_hat), side), dim=-1))
 
@@ -643,14 +686,26 @@ class PreflopNet(nn.Module):
             ), dim=-1,
         )
         seat_summary = self.seat_ffn(torch.cat((pooled, seat_meta), dim=-1))
-        actor_selector = torch.nn.functional.one_hot(actor, players).to(torch.bool)
+        actor_selector = (
+            torch.arange(players, device=actor.device)[None, :]
+            == actor[:, None]
+        )
         seat_summary = torch.where(actor_selector[..., None], actor_summary[:, None, :], seat_summary)
         seat_summary = seat_summary.masked_fill(~seat_mask[..., None], 0.0)
         relative_index = relative_seats[..., None].expand(-1, -1, d)
         ordered_seats = torch.zeros_like(seat_summary).scatter(1, relative_index, seat_summary)
         ordered_mask = torch.zeros_like(seat_mask).scatter(1, relative_seats, seat_mask)
-        padded_seats = torch.zeros((batch, c.max_players, d), dtype=seat_summary.dtype, device=seat_summary.device)
-        padded_seats[:, :players] = ordered_seats
+        padded_seats = torch.cat(
+            (
+                ordered_seats,
+                torch.zeros(
+                    (batch, c.max_players - players, d),
+                    dtype=seat_summary.dtype,
+                    device=seat_summary.device,
+                ),
+            ),
+            dim=1,
+        )
         global_feature = self.global_ffn(
             torch.cat((public_mean, actor_summary, padded_seats.reshape(batch, c.max_players * d)), dim=-1)
         )
@@ -683,4 +738,34 @@ class PreflopNet(nn.Module):
             v=value,
             t=t,
             c=cost,
+        )
+
+    def prepare_forward(
+        self,
+        pub: PokerPublicBatch,
+        class_ranges: Tensor,
+        actor_seat: Tensor | None = None,
+        masks: PreflopMasks | Mapping[str, Tensor] | Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Validate one ordinary pack and return its parameter-free metadata."""
+
+        self._validate_public(pub, class_ranges)
+        return self._metadata(pub, class_ranges, actor_seat, masks)
+
+    def forward_prevalidated(
+        self,
+        pub: PokerPublicBatch,
+        class_ranges: Tensor,
+        prepared_metadata: tuple[
+            Tensor, Tensor, Tensor, Tensor, Tensor, Tensor
+        ],
+        masks: PreflopMasks | Mapping[str, Tensor] | Tensor | None = None,
+    ) -> PolicyOutput:
+        """Run tensor math after :meth:`prepare_forward` validated the pack."""
+
+        return self.forward(
+            pub,
+            class_ranges,
+            masks=masks,
+            _prepared_metadata=prepared_metadata,
         )

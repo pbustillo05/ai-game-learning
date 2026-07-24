@@ -1,0 +1,25 @@
+name: runpod_h100_sxm
+scheduler: none
+attention_backend: sdpa
+query_chunk_size: 128
+
+# Preserve the frozen 2080 Ti execution geometry for the selection run. The
+# replica dimension changes physical layout only; it does not alter logical
+# training or statistical hyperparameters.
+training_max_tokens: 65536
+training_max_token_pairs: 83886080
+inference_max_tokens: 16384
+inference_max_token_pairs: 134217728
+
+# Keep the process below the experiment's independent 70 GiB selection gate.
+reserve_vram_gib: 10.0
+max_memory_fraction: 0.875
+
+max_devices: 1
+expected_compute_capability: [9, 0]
+min_vram_gib: 75.0
+max_vram_gib: 85.0
+precision: bf16
+worker_count: 0
+checkpoint_every: null
+slurm: null

@@ -153,6 +153,38 @@ def test_execution_metrics_are_lossless_and_match_hand_counts() -> None:
     assert snapshot["execution_collective_bytes"] == 256
 
 
+def test_execution_metrics_resolve_model_time_by_family_and_batch(
+    monkeypatch,
+) -> None:
+    class FakeEvent:
+        def __init__(self, *, enable_timing: bool) -> None:
+            assert enable_timing
+
+        def record(self) -> None:
+            pass
+
+        def elapsed_time(self, other: object) -> float:
+            assert isinstance(other, FakeEvent)
+            return 12.5
+
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    metrics = ExecutionMetrics()
+    metrics.configure_model_timing(enabled=True, device=torch.device("cuda"))
+    with metrics.time_model_call("inference", "post_2", 84):
+        pass
+    with metrics.time_model_call("inference", "post_2", 24):
+        pass
+    snapshot = metrics.snapshot()
+
+    assert snapshot["execution_model_seconds"] == 0.025
+    assert snapshot["execution_model_seconds_max"] == 0.0125
+    assert snapshot["execution_inference_post_2_model_seconds"] == 0.025
+    assert (
+        snapshot["execution_inference_post_2_batch_size_84_model_seconds"]
+        == 0.0125
+    )
+
+
 def test_declared_control_sync_and_transfers_are_accounted_separately() -> None:
     metrics = ExecutionMetrics()
     metrics.record_scheduler_control_synchronization(seconds=0.002, nbytes=32)

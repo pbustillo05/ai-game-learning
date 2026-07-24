@@ -556,6 +556,8 @@ def _policy_terms(
     legal_mask: Tensor,
     adapter: Any,
     phi: Tensor,
+    *,
+    prevalidated: bool = False,
 ) -> tuple[Callable[[Tensor], Tensor], Tensor, Tensor]:
     """Return selected-logp closure, exact entropy, and exact current||ref KL."""
 
@@ -587,14 +589,17 @@ def _policy_terms(
             legal_ids[:, None, :].to(selected_events.device)
             == selected_events[:, :, None]
         ) & legal_mask[:, None, :].to(selected_events.device)
-        _require_selected = matches.any(-1)
-        if _require_selected.device.type == "cuda":
-            torch._assert_async(
-                _require_selected.all(),
-                "selected events must select supplied legal events",
-            )
-        elif not bool(_require_selected.all()):
-            raise ValueError("selected events must select supplied legal events")
+        if not prevalidated:
+            _require_selected = matches.any(-1)
+            if _require_selected.device.type == "cuda":
+                torch._assert_async(
+                    _require_selected.all(),
+                    "selected events must select supplied legal events",
+                )
+            elif not bool(_require_selected.all()):
+                raise ValueError(
+                    "selected events must select supplied legal events"
+                )
         columns = matches.to(torch.int64).argmax(-1).to(natural_log_rows.device)
         natural = natural_log_rows.gather(
             -1,
@@ -632,6 +637,8 @@ def mode_loss(
     *,
     iteration: int = 0,
     reference: Any | None = None,
+    prevalidated: bool = False,
+    entropy_coefficient_override: Tensor | None = None,
 ) -> ModeLossResult:
     """Exact production-v1 storage-to-math map for one physical subspan."""
 
@@ -641,10 +648,14 @@ def mode_loss(
     c_v = float(getattr(loss_cfg, "c_v"))
     c_kl = float(getattr(loss_cfg, "c_kl", 0.0))
     eps = float(getattr(loss_cfg, "clip_eps"))
-    entropy_coefficient = _entropy_coefficient(loss_cfg, iteration)
+    natural_value = output.v
+    entropy_coefficient = (
+        _entropy_coefficient(loss_cfg, iteration)
+        if entropy_coefficient_override is None
+        else entropy_coefficient_override.to(natural_value)
+    )
     clipped_value = getattr(loss_cfg, "value_loss", "mse") == "clipped"
     eps_v = float(getattr(loss_cfg, "clip_eps_v"))
-    natural_value = output.v
     branching_t = natural_value.new_zeros(natural_value.shape[0])
     branching_c = natural_value.new_zeros(natural_value.shape[0])
     branching_t_raw = natural_value.new_zeros(natural_value.shape[0])
@@ -687,7 +698,13 @@ def mode_loss(
         weight = torch.ones_like(per_decision)
     else:
         selected_logp, entropy, reference_kl = _policy_terms(
-            output, reference, legal_ids, legal_mask, adapter, phi
+            output,
+            reference,
+            legal_ids,
+            legal_mask,
+            adapter,
+            phi,
+            prevalidated=prevalidated,
         )
         exact_value = _exact_rows(natural_value, phi)
 

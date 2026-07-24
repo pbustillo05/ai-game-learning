@@ -93,6 +93,7 @@ from pbg.core.targets import (
 )
 from pbg.core.topology import BranchedTreeSpan, SequentialDecisionCSR
 from pbg.core.partition import CompletionSpec
+from pbg.core.preemption import PreemptionController
 from pbg.core.rollout import (
     _logical_seed,
     ProbeRollout,
@@ -2206,6 +2207,11 @@ def _one_iteration(
     model = bundle.model
     source = model.module if hasattr(model, "module") else model
     device = next(model.parameters()).device
+    if execution_metrics is not None:
+        execution_metrics.configure_model_timing(
+            enabled=profile and device.type == "cuda",
+            device=device,
+        )
     agreement = failure_agreement or DistributedFailureAgreement(device)
     memory_ledger = MemoryLedger(device)
     memory_metrics: dict[str, float] = {}
@@ -3222,6 +3228,8 @@ def run_training(
         dist.barrier()
     assert run_id is not None
     failure_agreement = DistributedFailureAgreement(device)
+    preemption = PreemptionController()
+    preemption.install()
 
     for iteration in range(start_iteration, cfg.training.iters):
         if memory_controller is not None:
@@ -3571,7 +3579,11 @@ def run_training(
             if cfg.hardware is None or cfg.hardware.checkpoint_every is None
             else cfg.hardware.checkpoint_every
         )
-        checkpoint_due = (iteration + 1) % checkpoint_every == 0
+        preemption_notice = preemption.synchronized_notice(device)
+        checkpoint_due = (
+            (iteration + 1) % checkpoint_every == 0
+            or preemption_notice.requested
+        )
         if rank == 0:
             with (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(
@@ -3595,8 +3607,9 @@ def run_training(
             else:
                 rank_rng_states = [local_rng_state]
         if rank == 0 and checkpoint_due:
+            checkpoint_path = out_dir / f"ckpt_{iteration + 1:07d}.pt"
             save_checkpoint(
-                out_dir / f"ckpt_{iteration + 1:07d}.pt",
+                checkpoint_path,
                 bundle.model,
                 optimizer,
                 scaler,
@@ -3631,6 +3644,27 @@ def run_training(
                 logical_work=logical_work,
                 initialization=initialization_metadata,
             )
+        if preemption_notice.requested:
+            if world > 1:
+                dist.barrier()
+            if rank == 0:
+                (out_dir / "preemption_stop.json").write_text(
+                    json.dumps(
+                        {
+                            "iter": iteration + 1,
+                            "run_id": run_id,
+                            "signal_number": preemption_notice.signal_number,
+                            "signal_name": preemption_notice.signal_name,
+                            "checkpoint": f"ckpt_{iteration + 1:07d}.pt",
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            break
+    preemption.restore()
     if world > 1 and dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()

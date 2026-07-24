@@ -14,10 +14,13 @@ from dataclasses import dataclass, field
 import re
 from typing import Mapping
 
+import torch
+
 
 _ADDITIVE_COUNTERS = (
     "model_calls",
     "model_rows",
+    "model_seconds",
     "policy_pack_calls",
     "policy_pack_rows",
     "policy_pack_padded_tokens",
@@ -57,6 +60,7 @@ _ADDITIVE_COUNTERS = (
 
 _MAXIMUM_COUNTERS = (
     "model_rows_max",
+    "model_seconds_max",
     "padded_tokens_max",
     "padded_token_pairs_max",
     "queue_depth_max",
@@ -101,6 +105,10 @@ class ExecutionMetrics:
     _batch_histogram: Counter[tuple[str, str, int]] = field(
         default_factory=Counter, init=False
     )
+    _pending_model_timings: list[
+        tuple[str, str, int, torch.cuda.Event, torch.cuda.Event]
+    ] = field(default_factory=list, init=False)
+    _model_timing_enabled: bool = field(default=False, init=False)
     _enabled: bool = field(default=True, init=False)
 
     def clear(self) -> None:
@@ -110,6 +118,58 @@ class ExecutionMetrics:
         self._maxima.clear()
         self._strata.clear()
         self._batch_histogram.clear()
+        self._pending_model_timings.clear()
+        self._model_timing_enabled = False
+
+    def configure_model_timing(
+        self, *, enabled: bool, device: torch.device
+    ) -> None:
+        """Enable opt-in CUDA-event timing for subsequent model calls."""
+
+        if enabled and device.type != "cuda":
+            raise ValueError("model timing requires a CUDA execution device")
+        self._pending_model_timings.clear()
+        self._model_timing_enabled = bool(enabled)
+
+    @contextmanager
+    def time_model_call(self, phase: str, family: str, rows: int):
+        """Time one model forward without synchronizing its execution stream."""
+
+        if not self._enabled or not self._model_timing_enabled:
+            yield
+            return
+        if isinstance(rows, bool) or not isinstance(rows, int) or rows <= 0:
+            raise ValueError("a timed model call must contain at least one row")
+        phase_key = _metric_component(phase)
+        family_key = _metric_component(family)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        try:
+            yield
+        except Exception:
+            raise
+        else:
+            end.record()
+            self._pending_model_timings.append(
+                (phase_key, family_key, rows, start, end)
+            )
+
+    def _resolve_model_timings(self) -> None:
+        """Fold completed CUDA events into phase/family aggregates."""
+
+        pending, self._pending_model_timings = self._pending_model_timings, []
+        for phase, family, rows, start, end in pending:
+            seconds = float(start.elapsed_time(end)) / 1_000.0
+            family_stratum = f"{phase}_{family}"
+            batch_stratum = f"{family_stratum}_batch_size_{rows}"
+            self.add("model_seconds", seconds)
+            self.maximum("model_seconds_max", seconds)
+            for destination in (family_stratum, batch_stratum):
+                self.add("model_seconds", seconds, stratum=destination)
+                self.maximum(
+                    "model_seconds_max", seconds, stratum=destination
+                )
 
     def add(
         self,
@@ -388,6 +448,7 @@ class ExecutionMetrics:
     def snapshot(self, *, prefix: str = "execution_") -> dict[str, float]:
         """Return a complete scalar snapshot, including zero-valued base fields."""
 
+        self._resolve_model_timings()
         result = {
             f"{prefix}{name}": float(self._totals.get(name, 0))
             for name in _ADDITIVE_COUNTERS

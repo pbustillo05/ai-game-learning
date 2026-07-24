@@ -155,9 +155,9 @@ def test_three_player_probe_fold_cuda_train_resume_and_evaluate(tmp_path: Path) 
     assert isinstance(sampled, ProbeRollout)
     assert sampled.sample.leaf_source.rows == 1
     assert sampled.sample.leaf_source["owner"].item() == PROBE_FOLD
-    reward = sampled.sample.leaf_source["reward"][0]
-    assert reward[0].item() == 0.0
-    assert not bool(reward[1:].any())
+    fold_payoff = sampled.sample.leaf_source["fold_payoff"][0]
+    assert fold_payoff[0].item() == 0.0
+    assert not bool(fold_payoff[1:].any())
 
     rollout, _, completion, _ = _seal_sequential_rollout_storage(
         cfg,
@@ -266,3 +266,4 @@ def test_three_player_probe_fold_cuda_train_resume_and_evaluate(tmp_path: Path) 
     )
     assert report.semantics == SHARED_RESPONSE_SEMANTICS
     assert math.isfinite(report.mean_gain_bb_per_hand)
+    assert report.evaluation_completion_samples == 2 * 9 * 4

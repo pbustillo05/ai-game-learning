@@ -243,6 +243,10 @@ defined as the sum of those per-seat gains. Evaluation balances every
 `(probe seat, button)` pair in blocks of $P^2$. The confidence interval covers
 paired evaluation sampling error only; it does not cover neural response-class
 restriction or finite-optimization error.
+Both the mixed and all-target replays stop at their pre-terminal leaves and use
+the sibling evaluator's selected-seat completion contract.  Their root payoff
+is Rao--Blackwellized as $\sum_h\widehat{\mathbb P}(h)\widehat V(h)$; evaluation
+does not read the learned value head or sample one fixed showdown reward.
 It also records paired evaluation work and wall time plus the probe
 checkpoint's cumulative logical trajectories, completion samples, minibatches,
 and optimizer steps. If omitted, `--batch-size` is chosen automatically as a

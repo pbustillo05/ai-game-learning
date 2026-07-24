@@ -2190,13 +2190,8 @@ def stopped_leaf_source_schema(mode: str, *, players: int, exact_width: int) -> 
     elif mode in {"sequential_rb", "branched_rb", "probe"}:
         fields.extend(_rb_completion_public_fields(players))
         if mode == "probe":
-            fields.extend(
-                (
-                    TensorFieldSchema("selected_owner", torch.int32, alignment=4),
-                    TensorFieldSchema(
-                        "reward", torch.float32, (players,), alignment=16
-                    ),
-                )
+            fields.append(
+                TensorFieldSchema("selected_owner", torch.int32, alignment=4)
             )
     else:
         raise ValueError("unknown rollout mode")

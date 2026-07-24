@@ -2153,6 +2153,8 @@ class PokerRolloutBackend:
         weights = torch.exp(reach - gauge).masked_fill(~finite, 0.0)
         pub = self.encode_public(states)
         positions = torch.arange(states.numel(), device=self.device)
+        label = "pre" if partition_id == 0 else f"post_{partition_id + 1}"
+        phase = "training" if torch.is_grad_enabled() else "inference"
         if partition_id == 0:
             class_ranges = torch.zeros(
                 (states.numel(), self.n_players, self.n_classes),
@@ -2162,7 +2164,12 @@ class PokerRolloutBackend:
             class_ids = self.combo_class[None, None, :].expand_as(weights)
             class_ranges.scatter_add_(2, class_ids, weights)
             masks = PreflopMasks(seat_mask=pub.seat_mask, status=pub.status)
-            output = frozen_model.forward_preflop(pub, class_ranges, pub.to_act, masks)
+            with self.execution_metrics.time_model_call(
+                phase, label, states.numel()
+            ):
+                output = frozen_model.forward_preflop(
+                    pub, class_ranges, pub.to_act, masks
+                )
             if output.v.shape[1] != self.n_classes:
                 raise ValueError("preflop rollout forward changed its natural class domain")
             self.batch_size_histograms["preflop"].append(states.numel())
@@ -2192,7 +2199,12 @@ class PokerRolloutBackend:
                 live_seat_ids=live_seat_ids,
                 compact_size=descriptor.compact_hand_width,
             )
-            output = frozen_model.forward_postflop(pub, weights, pub.to_act, masks)
+            with self.execution_metrics.time_model_call(
+                phase, label, states.numel()
+            ):
+                output = frozen_model.forward_postflop(
+                    pub, weights, pub.to_act, masks
+                )
             self.batch_size_histograms[f"postflop_{expected_live}"].append(
                 states.numel()
             )
@@ -2205,8 +2217,6 @@ class PokerRolloutBackend:
             partition_id,
             compact_hand_width=descriptor.compact_hand_width,
         )
-        label = "pre" if partition_id == 0 else f"post_{partition_id + 1}"
-        phase = "training" if torch.is_grad_enabled() else "inference"
         self.execution_metrics.record_model_call(
             phase,
             label,
@@ -2235,6 +2245,7 @@ class PokerRolloutBackend:
             raise TypeError("sealed poker inputs require natural range_weights")
         pub = self._public_from_immutable_inputs(inputs)
         batch_size = natural.shape[0]
+        phase = "training" if torch.is_grad_enabled() else "inference"
         if partition_id == 0:
             expected = (batch_size, self.n_players, self.n_classes)
             if tuple(natural.shape) != expected:
@@ -2244,12 +2255,15 @@ class PokerRolloutBackend:
                 "preflop partition contains a postflop state",
             )
             source = frozen_model.module if hasattr(frozen_model, "module") else frozen_model
-            output = source.preflop(
-                pub,
-                natural.to(torch.float32),
-                pub.to_act,
-                PreflopMasks(seat_mask=pub.seat_mask, status=pub.status),
-            )
+            with self.execution_metrics.time_model_call(
+                phase, "pre", batch_size
+            ):
+                output = source.preflop(
+                    pub,
+                    natural.to(torch.float32),
+                    pub.to_act,
+                    PreflopMasks(seat_mask=pub.seat_mask, status=pub.status),
+                )
             if output.v.shape[1] != self.n_classes:
                 raise ValueError("preflop learner forward expanded its natural domain")
             family = "pre"
@@ -2305,13 +2319,18 @@ class PokerRolloutBackend:
                 live_seat_ids=live_seat_ids,
                 compact_size=math.comb(self.n_cards - 3, 2),
             )
-            output = frozen_model.forward_postflop(pub, weights, pub.to_act, masks)
+            with self.execution_metrics.time_model_call(
+                phase, f"post_{live}", batch_size
+            ):
+                output = frozen_model.forward_postflop(
+                    pub, weights, pub.to_act, masks
+                )
             if output.v.shape[1] != self.n_hands:
                 raise ValueError("postflop learner forward changed the canonical domain")
             family = f"post_{live}"
         width = self._partition_maximum_width(frozen_model, partition_id)
         self.execution_metrics.record_model_call(
-            "training" if torch.is_grad_enabled() else "inference",
+            phase,
             family,
             batch_size,
             padded_tokens=batch_size * width,
@@ -2532,9 +2551,13 @@ class PokerRolloutBackend:
                 seat_mask=pre_pub.seat_mask,
                 status=pre_pub.status,
             )
-            output = frozen_model.forward_preflop(
-                pre_pub, class_ranges, pre_pub.to_act, masks
-            )
+            phase = "training" if torch.is_grad_enabled() else "inference"
+            with self.execution_metrics.time_model_call(
+                phase, "pre", preflop.shape[0]
+            ):
+                output = frozen_model.forward_preflop(
+                    pre_pub, class_ranges, pre_pub.to_act, masks
+                )
             if output.v.shape[1] == self.n_classes:
                 output = PolicyOutput(
                     raw={name: value[:, self.combo_class] for name, value in output.raw.items()},
@@ -2584,9 +2607,13 @@ class PokerRolloutBackend:
                     ).sort(1).values[:, :live],
                     compact_size=descriptor.compact_hand_width,
                 )
-                output = frozen_model.forward_postflop(
-                    post_pub, weights[positions], post_pub.to_act, masks
-                )
+                phase = "training" if torch.is_grad_enabled() else "inference"
+                with self.execution_metrics.time_model_call(
+                    phase, f"post_{live}", positions.shape[0]
+                ):
+                    output = frozen_model.forward_postflop(
+                        post_pub, weights[positions], post_pub.to_act, masks
+                    )
                 parts.append((positions, output))
                 self.batch_size_histograms[
                     f"postflop_{live}"
@@ -2832,28 +2859,22 @@ class PokerRolloutBackend:
         self,
         states: Tensor,
         reach: Tensor,
-        profiles: Tensor,
-        keys: Tensor,
         owners: Tensor,
         selected_seats: Tensor,
     ) -> dict[str, Tensor]:
-        """Materialize ordinary and explicit probe-cutoff leaves at last use."""
+        """Materialize selected-seat RB completion leaves at last use."""
 
         self._validate_handles(states)
         batch = states.numel()
         if reach.ndim != 3 or reach.shape[:2] != (batch, self.n_players):
             raise ValueError("probe leaf reach must have shape [B,P,X]")
-        if profiles.shape != (batch, self.n_players):
-            raise ValueError("probe leaf profiles must have shape [B,P]")
-        if keys.shape != states.shape or keys.dtype != torch.int64:
-            raise ValueError("probe leaf keys must be int64 [B]")
         if owners.shape != states.shape or owners.dtype != torch.int32:
             raise ValueError("probe leaf owners must be int32 [B]")
         if selected_seats.shape != states.shape or selected_seats.dtype != torch.int32:
             raise ValueError("selected probe seats must be int32 [B]")
         if any(
             value.device != self.device
-            for value in (reach, profiles, keys, owners, selected_seats)
+            for value in (reach, owners, selected_seats)
         ):
             raise ValueError("probe leaf inputs must be device-local")
         if bool(((selected_seats < 0) | (selected_seats >= self.n_players)).any()):
@@ -2864,11 +2885,6 @@ class PokerRolloutBackend:
         if bool((~cutoff & (owners != classified)).any()):
             raise ValueError("ordinary probe leaf owner disagrees with poker state")
 
-        reward = torch.zeros(
-            (states.numel(), self.n_players),
-            dtype=torch.float32,
-            device=self.device,
-        )
         rows = states.to(torch.int64)
         selected = selected_seats.to(torch.int64)
         fold_payoff = self.states.fold_payoff[rows].detach().to(torch.float32).clone()
@@ -2879,18 +2895,11 @@ class PokerRolloutBackend:
             payoff = -self.states.committed_total[
                 cutoff_rows, cutoff_seats
             ].to(torch.float32)
-            reward[positions, cutoff_seats] = payoff
             fold_payoff[positions] = 0.0
             fold_payoff[positions, cutoff_seats] = payoff
-        ordinary = ~cutoff
-        if bool(ordinary.any()):
-            reward[ordinary] = self.sampled_terminal_reward_keyed(
-                states[ordinary], profiles[ordinary], keys[ordinary]
-            ).to(torch.float32)
         completion = self.completion_inputs(states, reach)
         completion.pop("range_weights")
         return {
-            "reward": reward.detach(),
             "owner": owners.detach(),
             "selected_owner": selected_seats.detach(),
             "fold_payoff": fold_payoff,
