@@ -77,6 +77,22 @@ as its sole active game.
   intensity by the ordinary randomized-rounding rule. Do not give
   $\varnothing$ special multiplicity or branch there more aggressively.
 - In sequential mode (normal or Rao-Blackwell), this logic is reversed: only $\varnothing$ has branching.
+
+## Rollout physical queue policy
+
+- Physical rollout queues follow only the game-declared semantic execution
+  families. Never create a queue per poker street, board width, history length,
+  token width, padding bucket, or any cross-product of those properties.
+- Poker uses `pre` and `post_A` families. Flop, turn, and river nodes with the
+  same live-player count $A$ share one `post_A` FIFO.
+- Reduce padding only within the next stable FIFO prefix: choose the largest
+  feasible prefix, or consecutive subspans of it, and use the minimum realized
+  token width that covers each pack. Never skip or reorder older rows to form a
+  more uniform pack.
+- Queue allocation and admission must therefore scale with semantic families,
+  not with poker streets. This policy is required to remain robust as player
+  count grows.
+
 ## Actual Games
 - Kuhn, Leduc, and synthetic games are retired and archived because they are
   too small for this setup.
