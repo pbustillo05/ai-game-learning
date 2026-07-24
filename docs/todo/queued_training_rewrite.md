@@ -1,381 +1,413 @@
 # Unified dense queued training engine
 
-Status: ambitious throughput proposal; not an implementation contract.
+Status: implementation proposal; not yet an authoritative production contract.
 
-Date: 2026-07-23.
+Date: 2026-07-24.
 
 ## Executive proposal
 
-Replace the current rollout execution path in all three production modes with
-one fixed-address, device-resident queued engine built around dense
-per-family `FamilyWork` slabs.
+Replace the production rollout path in normal, sequential Rao--Blackwell, and
+branched Rao--Blackwell modes with one fixed-address queued engine built around
+flat, dense, per-family `FamilyWork` slabs.
+Key word being **replace**: the legacy implementation gets completely overridden and would disappear from the codebase.
 
 The central physical rule is:
 
-> Put a player occurrence into its final physical execution order once, when
-> the occurrence is created, and make every later hot consumer read a direct
-> contiguous FIFO prefix. Queue identity is semantic; poker street and padding
-> width never create another queue.
+> Assign every player occurrence its final family FIFO row when it is created.
+> Every later hot consumer reads a direct contiguous FIFO prefix. Queue identity
+> is semantic; poker street and padding width never create another queue.
 
-For physical family $m$, allocate a structure of arrays with leading capacity
-$N_m^{\rm cap}$:
+`FamilyWork` is a schema-generated structure of arrays with batch-major
+columns. It is flat and monotone within an admitted attempt: processed rows
+become dead to rollout, but their retained subcolumns stay live and their
+physical addresses are not recycled. This deliberately spends memory to
+eliminate occurrence handles, separate active-reach owners, page lookup,
+dequeue payload staging, status gathers/scatters, and hot scans whose cost
+grows with accumulated tree size.
 
-```text
-FamilyWork[m]
-  hot mutable columns
-    state fields              [N_m_cap, ...]
-    public history            [N_m_cap, T]
-    active range weights      [N_m_cap, P, H]
-    logical node/root id       [N_m_cap]
-    path key / ordinal         [N_m_cap]
-    branching path factors    [N_m_cap, ...]  # branched only
+For one dequeued parent pack, the intended execution is:
 
-  retained decision columns
-    forward-ready input        [N_m_cap, I_m]
-    owner and mode metadata    [N_m_cap, ...]
-    old model outputs          [N_m_cap, Y_m, ...]
+1. run the family model forward;
+2. reserve logical child, topology, and player-edge addresses;
+3. produce lightweight sampled child descriptors;
+4. compute stable destination offsets on device;
+5. update the public-trajectory and range fields and write each child directly
+   to its final family, leaf, or bounded chance-closure destination;
+6. publish only complete destination prefixes.
 
-  control
-    head
-    reserved_tail
-    ready_tail
-    oldest logical time
-```
+Small packs may fuse steps 3--5 in one CTA. Larger packs should use a
+descriptor-first pipeline so the large natural-input payload is written only
+once, at its final destination.
 
-All tensors are batch-major: `[N_m_cap, ...]`. A dequeue is a view:
+Branched targets use a separate GPU layer engine. It flattens the completed
+topology into root-depth order, carries all-node numerical state only in
+adjacent-layer workspace, writes exact player-node outputs to `SigmaTarget`
+and exact sampled-action outputs to `ActionTarget`, and executes the numerical
+recurrence deepest-to-root with launch count proportional to tree depth rather
+than node or edge count.
 
-```python
-rows = slice(head_m, head_m + batch_rows)
-state = family.state[rows]
-reach = family.range_weights[rows]
-model_input = family.input[rows]
-```
+Rollout publication is closed before target creation, but sealing occurs only
+after targets are complete. Seal deletes all hot columns, stable-deletes
+frozen-opponent rows in best response, compacts the surviving learner fields,
+reduces full topology to a minimal learner index, and atomically publishes the
+immutable training store.
 
-There is no occurrence-handle queue, dequeue staging tensor, hot page lookup,
-active-reach handle, reach gather, or status gather/scatter on the ordinary
-player path.
+The same design targets two hardware profiles:
 
-When a parent creates children, the child-materialization path:
+- **H100:** throughput-first tuning, with aggressive batch sizes, graph
+  capture, and measured overlap where they improve complete-iteration time.
+- **2080 Ti:** throughput under the tighter phase ceiling. Approximately
+  1 GiB of rollout slab storage is acceptable when the complete schema-derived
+  phase ledger fits without reducing the most valuable forward or backward
+  width.
 
-1. reserves logical topology and the parent's contiguous
-   `ActionProbability` span before any draws;
-2. samples the private profile and public event with logical RNG keys;
-3. performs the state transition and reach update;
-4. classifies the resulting child;
-5. appends a player child directly to its destination `FamilyWork` tail;
-6. appends a stopped child directly to final leaf storage;
-7. sends a chance child into a bounded device chance-closure workspace.
+The architecture and mathematical semantics are identical on both profiles.
+Only physical capacities, batch quanta, graph choices, and stream schedules may
+differ.
 
-The ultimate poker implementation fuses steps 2--7. The rejection sampler,
-event draw, transition, reach update, classification, stable destination
-offset calculation, and writes into family/leaf/chance destinations should be
-one CUDA pipeline with no host synchronization in the middle. Whether the
-fastest realization is one cooperative persistent kernel or a short captured
-kernel graph is a benchmark question; the storage and ownership contract
-should support both.
+## Authority and scope
 
-The rewrite deliberately spends memory to remove routing, allocator, and
-kernel-launch work. For heads-up full-deck poker,
+`docs/theory/core_math.tex` remains authoritative for all mathematical and statistical design. The pseudocode in `docs/theory/pseudocode/`
+remains authoritative for any algorithmic element not covered here.
 
-$$
-25{,}000\cdot 2\cdot 1326\cdot4
-=265{,}200{,}000\ {\rm bytes}
-\approx252.9\ {\rm MiB}
-$$
+### Intentional contract changes
 
-for the complete active-reach capacity. Even 50,000 rows cost only about
-505.8 MiB. This is small compared with the measured rollout/model workspace
-on the target 2080 Ti.
+The changes below require explicit amendments to the authoritative theory and
+pseudocode before production acceptance.
 
-The intended outcome is not merely a faster reach owner. It is removal of the
-hot occurrence, queue, active-reach, controller-routing, and mutable
-state/history indirection that makes later branched packs more expensive than
-earlier packs.
+#### Monotone total-work family slabs
 
-## Throughput rationale
+The current storage pseudocode requires active mutable state and reach capacity
+to follow live-frontier high water. This proposal instead preallocates a
+configured maximum number of player rows per family and advances a monotone
+tail without recycling the processed prefix during the attempt.
 
-The optimization unit is the complete dequeue-to-enqueue path. Direct family
-storage removes hot state, history, reach, occurrence, and controller
-indirection together. Fused materialization removes transient profile and
-routing traffic. Device-resident chance closure removes host launch and
-synchronization boundaries. The layered target engine separately makes target
-cost proportional to realized numerical work rather than CPU scheduling over
-nodes and actions.
+Processed rollout-only fields are logically dead after their children and
+retained outputs commit. Their stale bytes may never be read by targets or the
+learner. Nevertheless, the physical allocation is proportional to admitted
+total family work, not only the live frontier.
 
-This coordinated layout matters because every hot consumer receives direct
-contiguous storage, and every retained field is written in the physical order
-required by its next consumer.
+The proposal also replaces the separate mutable public-state and active-reach
+owners in the current pseudocode. Each committed player row owns exactly one
+immutable natural model input. That input contains the public trajectory and
+range representation needed by rollout and, when the row is trainable, by the
+learner; transition writes the child's input directly rather than updating a
+second state/reach copy. Best response is the row-lifetime exception:
+frozen-player inputs occupy ordinary family rows through target creation but
+are deleted rather than published to immutable learner storage.
 
-## Authority and required contract reconciliation
+This is an intentional implementation-contract change. V1 does not use a
+circular slab, epoch compactor, or fallback owner. Reclamation should be
+reconsidered only if admitted multiplayer or deep-stack measurements reject
+the total-work capacity.
 
-This proposal preserves the following mathematical and rollout contracts:
+#### Class-native preflop RB targets and losses
 
-- exactly one distinguished rooted tree per GPU in branched mode;
-- ordinary root branching and protected-cohort refill semantics;
-- nominal and executed child counts;
-- one distinct logical child per sampled outgoing occurrence, including
-  duplicate public events;
-- child and player-action source spans reserved before their random draws;
-- counter-based logical RNG addresses independent of queue order and physical
-  packing;
-- stable insertion-order FIFO prefixes;
-- the unchanged player/chance event laws and reach update;
-- no dropped, truncated, replayed, or silently rerolled sequential trajectory;
-- whole-attempt-only branched memory recovery;
-- exact retained inputs, topology, and leaves.
+The current pseudocode uses the exact-hand domain
+$X_{\mathsf{pre}}=X_{\mathsf{post}_A}=H$. This proposal changes every preflop
+posterior, moment, value, advantage, and loss row to the model-native quotient
+$K=R^2$, while postflop remains on $H=\binom{4R}{2}$. To avoid redefining the
+game's true private-state space, this document calls those proposed estimator
+domains $\mathcal Z_{\mathsf{pre},\mathsf{RB}}$ and
+$\mathcal Z_{\mathsf{post},\mathsf{RB}}$.
 
-One principal intentional conflict is with the current physical contract in
-`docs/theory/pseudocode/storage_lifecycle.tex`.
+This changes the finite-sample preflop estimator and nonlinear clipped loss,
+not merely storage. The change must be approved in `core_math.tex` and the
+storage pseudocode before the target engine becomes production authority.
 
-That document requires active-reach capacity to follow live-frontier high
-water and explicitly rejects a capacity proportional to total generated work.
-This proposal instead preallocates a configured maximum number of player work
-rows per family and normally advances a monotone tail without recycling the
-processed prefix during the attempt.
+### Non-goals
 
-Processed rows are logically dead immediately after their children and
-retained outputs commit. Their stale bytes are not a reach memo and may never
-be read by targets or the learner. Nevertheless, the physical slab capacity
-is intentionally proportional to configured queued-work capacity rather than
-observed live frontier.
+This proposal does not:
 
-Production acceptance therefore requires an explicit decision to amend that
-physical capacity/lifetime rule. Nothing under `docs/theory/` should be
-modified without the required approval. Until then, this document is an
-experimental proposal, not authority.
-
-The rewrite also supersedes the pseudocode's current occurrence-arena,
-active-reach-owner, and queue realization. Those are implementation-contract
-changes even where the mathematical semantics above are preserved, so the
-authoritative pseudocode must be revised alongside an accepted implementation,
-not left describing retired owners.
-
-A second intentional contract change is the preflop RB target and loss domain.
-The current pseudocode declares
-$X_{\mathsf{pre}}=X_{\mathsf{post}_A}=H$. This proposal instead uses the
-model-native preflop quotient $K=R^2$ for every preflop posterior, moment,
-value, advantage, and loss row, while postflop remains on
-$H=\binom{4R}{2}$. Exact-hand completion output is aggregated to preflop
-classes by summing posterior mass and posterior-weighted moment before
-conditionalization. This changes the finite-sample preflop estimator and
-clipped loss, not only storage. Production acceptance therefore also requires
-an explicit amendment to `core_math.tex` and `storage_lifecycle.tex`; until
-that approval, the class-native target engine is proposal semantics rather
-than authority.
-
-The proposal forbids street-specific poker partitions and queues. Poker
-continues to expose only `pre` and `post_A` semantic families. Token-width
-reduction is performed by minimally padding stable FIFO prefixes, as described
-below.
-
-## Design goals
-
-The replacement should satisfy all of these goals together:
-
-1. Every ordinary player dequeue reads direct contiguous views.
-2. The cost of a work pack is independent of accumulated tree size.
-3. No production hot access loops over historical pages or chunks.
-4. No player occurrence carries an indirect active-reach handle.
-5. No player queue copies handles into dequeue staging.
-6. Child routing performs one stable destination calculation per child.
-7. Chance closure performs no Python loop per chance generation.
-8. Rejection sampling does not allocate a returned profile tensor merely for
-   the next kernel to consume it.
-9. Family appends can overlap another ready family's model forward.
-10. Fixed addresses permit CUDA graph capture and reusable workspaces.
-11. Sequential modes use the same engine without paying branched-only work.
-12. Rollout slabs are released before targets/optimization so their deliberate
-    overcapacity does not reduce learner width.
-13. The surviving production implementation has fewer owners and APIs than
-    the current implementation.
-14. Queue count depends only on declared semantic partitions, never on street
-    or a physical padding category.
-15. Branched target work is stratified into device-executable dependency
-    layers, with no CPU loop over nodes or actions.
-16. Branched learner loss execution consumes exactly the realized flattened
-    target-child rows and never pads a decision batch to a maximum action
-    count.
-17. Preflop target propagation and losses use the model-native $K$ hand-class
-    quotient; postflop remains exact-hand $H$.
-
-## Non-goals
-
-This rewrite does not:
-
-- change the branching intensity law;
-- share one sampled private profile among branched siblings;
+- change branching intensity or queue-pressure laws;
+- change the mode-specific true-profile and posterior-sampling laws;
 - merge duplicate public-event children;
-- change completion sampling;
-- reorder retained target rows by a private quantity;
-- introduce CPU rollout state;
-- introduce a CPU or automatic device fallback;
-- change the PPO/RB objectives outside the explicit preflop
-  exact-hand-to-class quotient;
-- add a parallel legacy production path;
-- make the learner consume mutable rollout slabs;
-- split semantic queues by street, board width, token width, or padding bucket;
-- allocate any pair-indexed branched field as
-  `[decision, max_children, ...]`.
+- change the completion estimator;
+- retain a separate production legacy path;
+- make the learner consume mutable rollout fields;
+- introduce CPU rollout, loss, or target tensors;
+- introduce CPU, automatic-device, or fallback execution;
+- retain production $\widehat Q^\lambda$ rows for the deferred NeuRD work.
 
-## Physical family definition
+## Physical families and stable pack planning
 
-Core continues to schedule opaque public partitions supplied by the game.
-For poker:
+Core schedules opaque game-declared semantic families. Poker declares exactly
 
 $$
 \mathcal M
 =\{\mathsf{pre}\}\sqcup\{\mathsf{post}_A:2\le A\le P\}.
 $$
 
-Flop, turn, and river with the same live-player count remain in one
-`post_A` FIFO. This is important for semantic and implementation modularity:
-core never parses poker street.
+Flop, turn, and river rows with the same live-player count $A$ share one
+`post_A` FIFO.
+For a selected
+postflop prefix $Q$, the game-owned physical planner may use
 
-This is a permanent physical invariant, not merely a first implementation.
-The semantic layout has $P$ families: one `pre` family and $P-1$ postflop
-families. Crossing it with three postflop streets would produce $1+3(P-1)$
-queues: 16 at $P=6$ and 25 at $P=9$. That multiplies small tails, partial
-dequeues, capacity estimates, scheduler choices, and CUDA graph variants to
-save padding in only a fraction of rollout inference. It becomes less
-attractive as player count grows and as the rollout becomes less massive.
+$$
+b_{\min}(Q)=\min_{q\in Q}|\operatorname{board}(q)|,
+\qquad
+H_Q=\binom{4R-b_{\min}(Q)}2
+$$
 
-The physical planner may inspect the stable head prefix through the
-game-owned byte/work oracle. It may select a stable maximum-feasible prefix or
-stable consecutive subspans, but it may not reorder or skip an older row.
-Padding optimization changes pack boundaries and realized shapes, never queue
-identity or queue allocation.
+to compact board-legal model rows to the smallest width covering that prefix.
 
-## FamilyWork layout
+## Data structures, row domains, and lifetimes
 
-`FamilyWork` is a schema-generated structure of arrays. It is not one
-array-of-structs allocation. Each hot column has a direct batch-major leading
-axis and alignment chosen for its kernels.
+This section is the sole data-structure definition for the proposal. Later
+sections describe algorithms over these owners and do not redefine their
+fields.
 
-### Common hot fields
-
-Candidate common fields are:
-
-| Field | Shape | Purpose |
-|---|---:|---|
-| `node_id` | `[N_m] int32` | stable topology identity; implicit/optional in sequential mode |
-| `root_id` | `[N_m] int32` | sequential trajectory identity |
-| `path_key` | `[N_m] int64` | logical RNG address component |
-| public state columns | `[N_m,...]` | legality, transition, routing |
-| dense history | `[N_m,T,...]` | transition and forward-ready public context |
-| `range_weight` | `[N_m,P,H] fp32` | active exact reach in sampler-ready linear form |
-| `decision_row` | implicit or `[N_m] int32` | stable retained-row address |
-| enqueue time | `[N_m]` or run metadata | age scheduling |
-
-The preferred poker implementation stores public state inline in the family
-slab instead of storing a handle into another mutable state owner. State is
-small beside exact reach. Dense history is also preferred when its exact
-schema fits the admitted geometry; shared-history indirection should survive
-only if a measured deep/multiplayer case demonstrates that dense copying
-reduces end-to-end throughput or violates the hard ceiling.
-
-### Branched-only hot fields
-
-Candidate branched fields are:
-
-| Field | Shape | Purpose |
-|---|---:|---|
-| `log_weight` or path-mass factor | `[N_m]` | target/controller path mass |
-| `log_player_sum` | `[N_m] fp32` | dynamic KKT input |
-| `log_ancestor_product` | `[N_m] fp32` | dynamic KKT input |
-| queue-cost forecast | `[N_m] fp32` | optional scientific safeguard |
-| depth/player clocks | `[N_m,...] int32` | direct child metadata construction |
-| path weight | `[N_m] fp32/fp64` | direct topology write |
-
-Fields required only after rollout should be written directly to cold retained
-tables and omitted from the hot slab. The final schema follows consumers, not
-the current classes.
-
-### Retained decision fields
-
-Every player occurrence is a retained decision in the ordinary training
-rollouts. Align its family slot with its stable decision row whenever possible:
+Every allocation is generated from four independent schema axes:
 
 ```text
-family work row q
-    ↔ decision/input row q
+training_regime       self_play | best_response
+rollout_geometry      sequential | branched
+private_estimator     sampled | rao_blackwell
+beta_mode             fixed_beta | KKT_beta       # branched only
 ```
 
-At player-node creation, write the immutable forward-ready natural model
-input once. On dequeue, the model reads that direct family prefix. After the
-forward, write old outputs to the aligned retained decision row.
+Three domains must remain distinct:
 
-During rollout, selected player-event data uses one exact partition-local
-`ActionProbability[m]` source table:
+- $\mathcal H$ is poker's exact private-state domain. A realized $x_p$ is
+  always an exact two-card hand in $\mathcal H$, including preflop.
+- $\mathcal Y_m$ is family $m$'s natural model-row domain. Poker uses
+  $\mathcal Y_{\mathsf{pre}}=\mathcal K$ and
+  $\mathcal Y_{\mathsf{post}_A}=\mathcal H$.
+- $\mathcal Z_{m,e}$ is private estimator $e$'s target/loss domain. The
+  private-state axis is physically absent in sampled mode. Under the proposed
+  class-native RB contract,
+  $\mathcal Z_{\mathsf{pre},\mathsf{RB}}=\mathcal K$ and
+  $\mathcal Z_{\mathsf{post},\mathsf{RB}}=\mathcal H$.
+
+Thus preflop sampled training retains the exact hand $x_p\in\mathcal H$ but
+selects model row $c(x_p)\in\mathcal K$. Calling the hand itself a preflop
+class would conflate the game state with the model symmetry quotient.
+
+The four geometry/estimator combinations generate the following physical
+contracts:
+
+| Geometry | Private estimator | Row-lifetime true profile $x$ | `natural_input` contains $x_p$ | Target private axis | Rollout posterior-profile sampler |
+|---|---|---:|---:|---:|---|
+| sequential | sampled | yes | yes | absent | never |
+| sequential | Rao--Blackwell | yes | no | $\mathcal Z_{m,\mathsf{RB}}$ | never |
+| branched | sampled | yes | yes | absent | never |
+| branched | Rao--Blackwell | no | no | $\mathcal Z_{m,\mathsf{RB}}$ | independently per logical child |
+
+In both sequential modes, one $x\sim\mu$ is drawn at the root and carried
+through the trajectory. In sampled branched geometry, the realized profile is
+carried by the sampled tree according to that mode's sampling law. That mode
+still requires an explicit authoritative theory contract: in particular,
+sibling subtrees sharing $x$ are conditionally rather than marginally
+independent. In branched RB, the posterior profile is ephemeral child
+materialization state and is never committed to `FamilyWork`.
+
+The trace-variance and cost heads are always trained in branched geometry.
+`beta_mode` changes only whether their frozen outputs control branching
+intensity; it does not change `SigmaTarget`, `ActionTarget`, or the learner
+loss schema.
+
+The currently authoritative best-response workflow is sequential. The
+`best_response + branched` combinations below reserve the storage and
+ownership architecture for the planned branched extension; its sampling and
+loss law still require an explicit theory contract before production use.
+
+The principal owners are:
+
+1. monotone per-family `FamilyWork` slabs, divided only into hot and retained
+   columns;
+2. one compact sequential topology or a structural `FlattenedTargetTree` with
+   player-node and trainable-decision sidecars;
+3. pre/post-partitioned `SigmaTarget` and, in branched geometry only,
+   `ActionTarget`;
+4. pre/post-partitioned transient `LayerWork` in branched geometry;
+5. a shared sequential-RB posterior pool and the final minimal learner index;
+6. direct final leaf storage;
+7. fixed failure records and bounded phase workspaces.
+
+Topology owns identities and relationships. `FamilyWork.retained` owns
+rollout inputs and frozen-model outputs that survive rollout. `SigmaTarget`
+and `ActionTarget` own only outputs of target propagation. `LayerWork` owns
+only transient numerical recurrence state. No field is duplicated across
+these responsibilities.
+
+### Numerical domains and physical families
+
+The rollout families remain
+
+$$
+\mathcal M
+=\{\mathsf{pre}\}\sqcup\{\mathsf{post}_A:2\le A\le P\}.
+$$
+
+RB targets and RB `LayerWork` use exactly two numerical partitions:
+
+$$
+\mathcal Z_{\mathsf{pre},\mathsf{RB}}=\mathcal K,\quad
+|\mathcal K|=K=R^2,
+\qquad
+\mathcal Z_{\mathsf{post},\mathsf{RB}}=\mathcal H,\quad
+|\mathcal H|=H=\binom{4R}{2}.
+$$
+
+Board-empty nodes, including the flop-dealing chance parent and preflop
+completion leaves, use `pre`. Flop, turn, and river nodes use `post`,
+independent of live-player count. These numerical partitions are not rollout
+queues and never change semantic FIFO identity.
+
+Sampled targets have no private-state dimension and need no numerical-domain
+conversion. In RB, all direct children of a parent use the parent's recurrence
+input domain. The only cross-domain recurrence is:
 
 ```text
-action_ptr[D_m + 1]
-event[A_m]
-old_log_prob[A_m, Y_m]
+post <- post    H -> H
+pre  <- pre     K -> K
+pre  <- post    H -> K
 ```
 
-The rows for one player decision $\sigma$ are contiguous and aligned in order
-with its target-eligible child prefix. They are reserved before the draws and
-contain no maximum-child dimension. At target flattening, `event` and
-`old_log_prob` are copied into the corresponding flattened child rows and the
-source table is released. Posterior and advantage are later written into those
-same child rows by the layered target kernel.
+There is no `post <- pre` recurrence.
 
-This permits the model input itself to be direct and contiguous without
-reconstructing it from mutable state during every learner presentation.
+### `FamilyWork`: one FIFO with hot and retained columns
 
-Retained inputs and old outputs have a longer lifetime than mutable state and
-reach. They may occupy separate column groups under one family cursor. At seal,
-copy only realized prefixes into exact immutable partition blocks, then
-release all overprovisioned family capacity.
-
-## Linear active reach instead of active log reach
-
-The sibling evaluator accepts finite nonnegative `range_weights[P,H]` and is
-invariant to positive per-seat scaling. The current adapter converts active
-log reach to linear weights before rejection sampling.
-
-The proposed hot representation stores normalized or safely scaled linear
-`range_weight` directly:
+For family $m$, `FamilyWork[m]` is one monotone FIFO-addressed structure of
+arrays. `hot` and `retained` are lifetime groups inside that one FIFO, not
+separate queues or scheduling domains:
 
 ```text
-active rollout owner:      linear range_weight[P,H]
-retained model input:      model-ready natural range representation
-retained RB leaf:          completion-ready range_weight[P,H]
+FamilyWork[m]
+  hot
+    logical node/root identity
+    logical RNG path key
+    role/model selector                         # best_response
+    true_profile [P]                            # except branched RB
+    mode-specific controller/path fields
+    reservation/publication metadata
+    head
+    reserved_tail
+    ready_tail
+
+  retained
+    row-indexed                                # every player occurrence
+      natural_input
+
+    sigma-indexed                              # trainable player nodes
+      owner
+      old_v
+      action                                    # sequential implicit edge
+      old_log_pi                                # sequential implicit edge
+
+    control-indexed                            # every branched player node
+      old_t
+      old_c
+
+    action-indexed                              # branched trainable parents
+      action
+      old_log_pi
 ```
 
-For a player event, the fused transition multiplies the acting player's
-linear row by the selected policy likelihood and normalizes it. Other player
-rows pass through. At player-node creation, the natural-input capture writes
-the model's required log/range representation once. At a leaf, the linear
-reach is already evaluator-ready.
+The generated schema omits inapplicable fields. Normal mode stores scalar
+`old_v` and `old_log_pi` at the realized private type. RB modes store them on
+the natural model domain $\mathcal Y_m$. Branched `old_t` and `old_c` are
+scalars.
 
-Potential advantages:
-
-- eliminate repeated `_linear_reach` conversion before every branched
-  rejection-sampler call;
-- eliminate leaf log-to-linear conversion;
-- make the sampler consume family storage directly;
-- avoid storing both active log and active linear reach;
-- preserve the exact $H$ domain and scale-invariant evaluator contract.
-
-This changes floating-point execution order, not the mathematical reach law.
-It requires strict distributional, target, and gradient tolerance tests,
-including zero support, extreme policy probabilities, short decks, and long
-trajectories. If numerical evidence rejects linear active reach, retain log
-reach in `FamilyWork`; the rest of the architecture does not depend on this
-choice.
-
-## Queue semantics
-
-Each family has three monotone cursors:
+`natural_input` is the sole large player-row payload. It contains the public
+state and history, family-native range fields, any immutable folded-summary
+dependency, and, in sampled mode, the acting player's realized exact private
+state $x_p$. There is no second public-state, history, or active-reach owner.
+Poker supplies the following generated schemas:
 
 ```text
-head_m
-ready_tail_m
-reserved_tail_m
+NaturalInput[pre, sampled]
+  preflop public/model fields
+  range_weight[P, K]
+  acting_private_hand                         # exact two-card hand in H
+
+NaturalInput[pre, rao_blackwell]
+  preflop public/model fields
+  range_weight[P, K]
+
+NaturalInput[post_A, sampled]
+  postflop public/model fields
+  board
+  live_seat_map
+  range_weight[A, H]
+  folded_summary_ref                          # iff A < P
+  acting_private_hand                         # exact two-card hand in H
+
+NaturalInput[post_A, rao_blackwell]
+  postflop public/model fields
+  board
+  live_seat_map
+  range_weight[A, H]
+  folded_summary_ref                          # iff A < P
 ```
 
-They satisfy:
+The exact poker field encodings are owned by the immutable family
+specification; core treats each schema as an opaque fixed-stride input row.
+Bounded sampler or transition workspace derives any temporary
+symmetry-preserving exact-hand preflop range view. A folded-summary reference
+names an immutable game-owned dependency with an explicit last consumer and
+seal remapping; it is not an unowned external payload.
+
+Every FIFO row has exactly one `retained.natural_input` location, including a
+frozen-opponent row in best-response mode. Thus every model pack reads one
+direct contiguous family prefix with no tagged hot/retained input selection.
+At post-target seal, self-play keeps every trainable player row. Best response
+stable-deletes frozen-opponent rows and retains only exploitator inputs and
+their learner fields. The word `retained` therefore means that the column can
+survive rollout; it does not assert that every physical row survives seal.
+
+Retention is field-specific rather than row-wide. In future branched best
+response, a frozen-player natural input is consumed during rollout and its
+row is deleted at seal, while that node's scalar `old_t` and `old_c` remain
+available through target propagation. The selected player's `natural_input`
+and `old_v` survive through optimization. Frozen-player nodes have no retained
+`old_v`, action row, or learner target.
+
+In sequential sampled, sequential RB, and sampled branched geometry,
+`hot.true_profile` contains the realized joint profile $x$. Sequential modes
+copy it unchanged along the trajectory. Sampled branched geometry follows its
+declared true-profile tree law. The acting coordinate $x_p$ is additionally
+present in `natural_input` only in sampled mode because it is part of the
+model and learner input. In branched RB, a fresh posterior profile is sampled
+independently for each child, used only to draw and materialize that child's
+event, and discarded; no committed family row contains it. Root work and the
+bounded chance frontier carry `true_profile` in the three applicable modes
+before or between player-family rows.
+
+In sequential geometry the one sampled action is implicit in its player-node
+row, so `action` and `old_log_pi` are sigma-indexed. In branched geometry a
+trainable player node reserves one exact contiguous retained action span
+before draws:
+
+```text
+sampled
+  action[A_m]
+  old_log_pi[A_m]
+
+rao_blackwell
+  action[A_m]
+  old_log_pi[A_m, Y_m]
+```
+
+The span order equals the target-eligible child prefix. Frozen parents in
+branched best response create structural children but no retained action span.
+The complete old policy is never retained merely to reconstruct selected log
+probabilities.
+
+Names follow `core_math.tex`, with `old` denoting frozen rollout-model output:
+
+| Field | Mathematical quantity | Last consumer |
+|---|---|---|
+| `old_v` | $V^{\theta_k}(-,\sigma)$ | learner value clipping |
+| `old_log_pi` | $\log\pi^{\theta_k}(a\mid-,\sigma)$ | learner policy loss |
+| `old_t` | $T^{\theta_k}(\sigma)$ | branched target propagation |
+| `old_c` | $C^{\theta_k}(\sigma)$ | branched target propagation |
+
+`old_t` supplies $T^*$ when `target_degree == 1`; `old_c` supplies the
+$\lambda$ bootstrap of $\widehat C^\lambda`. Both are released after target
+propagation.
+
+Each family satisfies
 
 $$
 0\le\mathtt{head}_m
@@ -384,716 +416,597 @@ $$
 \le N_m^{\rm cap}.
 $$
 
-- `[0, head_m)` is processed and logically dead.
-- `[head_m, ready_tail_m)` is available to dequeue.
-- `[ready_tail_m, reserved_tail_m)` has destination storage reserved but an
-  asynchronous producer has not yet committed every column.
-- `[reserved_tail_m, N_m_cap)` is unused capacity.
+`[0, head)` is dead to rollout, though retained columns remain live.
+`[head, ready_tail)` is committed FIFO work,
+`[ready_tail, reserved_tail)` is reserved but incomplete, and the remaining
+capacity is unused. Publication exposes only the longest consecutively
+completed reservation prefix. The initial implementation uses ordered
+routing and commit; a completion scoreboard requires an end-to-end measured
+benefit.
 
-The scheduler computes ready depth as
+After target creation, seal copies the surviving natural-input, sigma, and
+action rows into compact immutable learner extents. It deletes every hot
+column, every target-only column, unused rollout capacity, and, in best
+response, every frozen-opponent row. A zero-copy retained view is allowed only
+when its measured phase peak and optimization width beat exact sealing.
+
+### Sequential topology
+
+Sequential geometry never allocates `FlattenedTargetTree` or `ActionTarget`.
+It stores one decision-only chronological structure:
+
+```text
+SequentialTargetTree
+  trajectory_ptr[G + 1]
+  family[D]
+  family_sigma_row[D]
+  sigma_target_partition[D]                   # pre | post
+  sigma_target_row[D]
+  posterior_row[D]                             # sequential RB only
+  leaf_row[G]
+```
+
+There is exactly one sampled action per retained player node, and it is
+implicit in that sigma row. Chance nodes and frozen-player decisions in best
+response are absent. In self-play all player decisions are present; in best
+response only exploitator decisions are present. Skipping chance and frozen
+opponent nodes requires no propagation weight in a realized sequential
+trajectory because neither advances the retained player's clock.
+
+Sequential RB does not copy the same completion posterior into every
+`SigmaTarget` row. `SequentialPosterior[pre|post]` stores it once per required
+`(trajectory, player, target partition)` and `posterior_row` references that
+shared row. A trajectory that has decisions on both sides of the pre/post
+boundary may therefore own one class row and one exact-hand row for the same
+player.
+
+### Branched topology
+
+Branched rollout first constructs append-only scalar topology with contiguous
+logical child spans. Target preparation builds one exact root-depth-major
+permutation and materializes:
+
+```text
+FlattenedTargetTree
+  layer_ptr[L + 1]
+  node                                        # N structural rows
+    parent
+    child_begin
+    degree
+    target_degree
+    nominal_degree
+    numerical_partition                       # pre | post; RB only
+    node_kind                                  # player | chance | leaf
+    leaf_row
+    player_row                                 # -1 unless player
+
+  player                                      # D_all player-node rows
+    node
+    owner
+    family
+    retained_control_row
+    trainable_decision_row                     # -1 for frozen BR player
+
+  trainable_decision                           # D_train learner rows
+    player_row
+    retained_sigma_row
+    retained_action_begin
+    sigma_target_partition
+    sigma_target_row
+    action_target_begin
+
+  protected root metadata
+```
+
+The structural table does not carry owner, family, control, learner, or target
+sentinels for chance and leaf nodes. The player sidecar does not carry learner
+fields for frozen best-response nodes. Topology alone owns node identity,
+parent/child relationships, target-eligible prefixes, source-to-retained
+mappings, and source-to-target mappings.
+`retained_action_begin` and `action_target_begin` each address exact
+`target_degree` spans in identical child order. Refill-only root children lie
+outside both root spans, while decisions below their subtrees remain ordinary
+training rows.
+
+Every direct child lies in the next root-depth layer, and stable sibling order
+is preserved. Source-node permutations and inverse construction maps are
+flattening scratch and are released after validation; they are not persistent
+topology fields.
+
+In self-play every player node has a retained sigma row and target row. In
+branched best response only exploitator nodes do. Frozen-player and chance
+nodes remain structurally present because their subtrees and public T/C
+recurrences contribute to exploitator targets. Every branched player node,
+including a frozen one, has a retained control row for `old_t` and `old_c`.
+
+### Target outputs
+
+`SigmaTarget` and `ActionTarget` contain only final numerical outputs written
+by target propagation. They contain no natural input, owner, topology,
+source-row mapping, action, or old model output.
+
+Both use exact pre/post numerical partitions:
+
+```text
+SigmaTarget[pre]
+SigmaTarget[post]
+ActionTarget[pre]                              # branched only
+ActionTarget[post]                             # branched only
+```
+
+A `SigmaTarget` row is indexed by one retained player node $\sigma$. Its
+generated fields are:
+
+```text
+sequential sampled
+  v_lambda_hat
+
+sequential RB
+  v_lambda_hat
+
+branched sampled
+  v_lambda_hat
+  t_hat
+  c_lambda_hat
+
+branched RB
+  p_hat
+  v_lambda_hat
+  t_hat
+  c_lambda_hat
+```
+
+Sampled fields are scalars and have no private-state axis. RB posterior and
+value rows use $\mathcal Z_{\mathsf{pre},\mathsf{RB}}$ or
+$\mathcal Z_{\mathsf{post},\mathsf{RB}}$. In both sequential estimators, the
+advantage for the unique implicit action is derived during the loss as
+`v_lambda_hat - old_v`; it is not stored. Sequential RB reads posterior mass
+through `SequentialTargetTree.posterior_row`, so its `SigmaTarget` also does
+not duplicate that row. No sequential action-position target row is created.
+
+An `ActionTarget` row exists only for a target-eligible sampled action
+$\sigma a$ of a retained branched player node:
+
+```text
+ActionTarget[pre|post, sampled]
+  a_lambda_hat
+
+ActionTarget[pre|post, RB]
+  p_hat
+  a_lambda_hat
+```
+
+Sampled action fields are scalars and have no private-state axis. The RB
+partition is the parent $\sigma$'s numerical domain. `ActionTarget` has no
+`action`, `old_log_pi`, `child_node`, parent, owner, pointer, count, or
+validity field. `FlattenedTargetTree` supplies the identity and mapping during
+target creation; `FamilyWork.retained` supplies `action` and `old_log_pi`.
+
+In branched RB, `SigmaTarget.p_hat` is the posterior for the sigma owner and
+`ActionTarget.p_hat` is the child posterior for the parent owner. Sampled
+targets contain neither. No all-node/all-player persistent posterior exists.
+During RB self-play the all-player recurrence is transient in `LayerWork`;
+during RB best response only the exploitator posterior moment need be carried
+through the numerical recurrence. Production does not retain
+$\widehat Q^\lambda$.
+
+No trace-validity mask is stored. `SigmaTarget.t_hat` is valid exactly when
+the corresponding source `FlattenedTargetTree.target_degree >= 2`;
+`LearnerIndex` carries that structural gate after seal. Likewise, there is no
+action-validity mask: `ActionTarget` rows exist exactly for the target-eligible
+child prefix.
+
+### Transient `LayerWork`
+
+`LayerWork` is schema-generated adjacent-layer numerical workspace. Sampled
+mode projects away the private-state dimension entirely:
+
+```text
+LayerWork[sampled]
+  v_vector_hat[rows, P]
+  c_lambda_hat_work[rows]
+  delta[rows]
+
+LayerWork[RB, pre]
+  p_hat[rows, P, K]                            # self_play
+  m_hat[rows, P, K]                            # self_play
+  p_hat[rows, K]                               # best_response
+  m_hat[rows, K]                               # best_response
+  v_vector_hat[rows, P]
+  c_lambda_hat_work[rows]
+  delta[rows]
+
+LayerWork[RB, post]
+  p_hat[rows, P, H]                            # self_play
+  m_hat[rows, P, H]                            # self_play
+  p_hat[rows, H]                               # best_response
+  m_hat[rows, H]                               # best_response
+  v_vector_hat[rows, P]
+  c_lambda_hat_work[rows]
+  delta[rows]
+```
+
+Only the schema-selected estimator and self-play or best-response columns are
+allocated. Sampled leaf rewards initialize `v_vector_hat` directly. In RB,
 
 $$
-Q_m^{\rm ready}=\mathtt{readyTail}_m-\mathtt{head}_m.
+\widehat M_p(-_p,\mathsf s)
+=\widehat{\mathbb P}(-_p\mid\mathsf s)
+ \widehat V_p(-_p,\mathsf s),
 $$
 
-It never selects pending rows. A producer publishes `ready_tail` only after
-all state, history, reach, logical-address, and retained-input writes for the
-contiguous append are ordered before the publication.
+so `p_hat` is probability mass and `m_hat` is posterior-weighted value moment.
+The workspace is sized to the exact maximum simultaneous adjacent layers and
+swaps source/destination roles after each launch. Leaf completion initializes
+the applicable `p_hat`, `m_hat`, `v_vector_hat`, zero cost, and zero delta
+rows. Child sums, leave-one-out sums, $\overline\Delta$,
+$\widehat T^{\rm exec}$, conditionalized continuations, and baselines remain
+kernel-local reductions.
 
-The dequeue operation:
+### Leaves, failures, and bounded workspaces
 
-1. chooses a stable prefix length;
-2. returns views of every required family column;
-3. advances `head`;
-4. never copies payload into staging;
-5. never changes an occurrence status field, because no such field exists.
+Stopped children are written directly into their final leaf schema:
 
-The cursor interval itself proves whether a row is unused, pending, queued, or
-processed.
+```text
+RB leaf
+  board and completion-public fields
+  range weights [P,H]
+  stratum/payoff fields
+  logical completion key
 
-## Capacity policy
+sampled leaf
+  terminal reward [P]
+  sequential trajectory or branched topology association
+```
 
-### Schema-derived total and semantic-family split
+A stopped child never enters a player family, generic occurrence owner,
+intermediate reach pool, or temporary leaf representation.
 
-For the initial HU 32 bb benchmark, use a schema-derived calibration plan with
-
-$$
-\sum_mN_m^{\rm cap}=25{,}000
-$$
-
-with family capacities selected from measured per-family high quantiles plus
-guard. If family skew makes 25,000 awkward, 50,000 total exact reach rows still
-cost only about 506 MiB in HU.
-
-That number is a calibration point, not an HU-shaped architecture. For any
-declared $P$, $H$, and realized-work target, derive the total bytes from the
-actual schema, then divide the admitted row budget among only the $P$ semantic
-families. The split may use lagged observed family shares and conservative
-guards and may change between attempts; addresses and capacities remain fixed
-within an admitted attempt. Do not allocate the total capacity independently
-to every family, and do not create street capacities. The estimation problem
-therefore grows linearly with the declared semantic families and remains
-tractable for larger player counts.
-
-Capacity values are physical execution parameters. They do not prescribe a
-desired number of sampled decisions.
-
-### Sequential failure
-
-Sequential roots and logical keys are fixed before current draws. A capacity
-overflow may not drop, reroll, or replace a trajectory. The capacity planner
-must use the existing lagged root-width controller and conservative
-per-family evidence. If an admitted sequential iteration nevertheless reaches
-a hard family capacity, it releases safely, checkpoints the last completed
-iteration, and stops.
-
-### Branched failure
-
-A branched family, node, edge, leaf, or chance-workspace overflow is a
-classified whole-attempt memory/admission failure. Release the entire attempt,
-perform the existing rank-common controller backoff, choose the disjoint next
-attempt address, and retry within the bounded limit.
-
-### Optional future reuse
-
-Do not begin with a circular ring. Monotone addresses are the cleanest and
-fastest implementation.
-
-If multiplayer/deep-stack evidence later shows that total-work capacity is
-unacceptable, evaluate a second-generation epoch compactor:
-
-- compact only the live suffix when a family reaches a declared epoch
-  boundary;
-- perform the copy asynchronously into the alternate fixed slab;
-- swap only after a stream event;
-- preserve FIFO order and stable logical identities.
-
-This must replace monotone capacity if accepted; it must not become a
-permanent fallback maze.
-
-## Fixed failure records and preallocated workspaces
-
-Every admitted attempt owns a fixed-address device failure record:
+Each admitted attempt owns:
 
 ```text
 DeviceFailure
   status
   phase
-  failure code
-  semantic family / owner
-  logical node or child address
-  requested extent
-  available extent
-  sampler attempt count when applicable
+  failure_code
+  semantic_family
+  logical_address
+  requested_extent
+  available_extent
+  sampler_attempt_count
 ```
 
-The first failing lane claims the record atomically. Diagnostics identify the
-logical work item, not its physical pack or lane, so changing batch width does
-not change the reported failure. Kernels may leave writes only in unpublished
-reserved ranges after a failure; no family, topology, `ActionProbability`, or
-leaf ready tail advances. An unpublished action reservation is not
-learner-visible. The host reads the record once at the declared control
-boundary and applies the sequential stop or whole-attempt branched recovery
-rule above.
-There is no per-lane error allocation or Python-visible check between fused
+Concurrent failures resolve to the minimum logical failing address. Every
+PBG-owned transient workspace is preallocated from the immutable schema:
+descriptor columns, route scans, destination counts, chance-frontier buffers,
+completion microbatches, flattening scratch, `LayerWork`, and learner ragged
+scratch. Model/compiler/library workspaces are calibrated and charged even
+though PBG does not allocate them directly.
+
+### Capacity and phase lifetimes
+
+Capacities are generated from the complete mode schema, configured $P,R,S$,
+model layouts, fixed workspaces, and lagged per-family observations. A
+calibration plan may begin near
+
+$$
+\sum_m N_m^{\rm cap}=25{,}000
+$$
+
+for HU 32 bb, but that count is not an admission rule. At $P=2$, $H=1326$,
+the postflop `[P,H]` range component of 25,000 natural inputs costs about
+252.9 MiB; at $P=6$ it costs about 758.7 MiB. The complete ledger also charges
+all other retained fields, exact topology and target extents, leaves, seal
+overlap, every bounded workspace, backend reservation, alignment, and the
+unused guard.
+
+Family capacities remain fixed within an admitted attempt and are divided
+only among semantic families, never poker streets. Objects with disjoint
+lifetimes are not added:
+
+```text
+rollout
+  FamilyWork hot and retained capacities
+  growing topology and leaves
+  routing/chance/inference workspace
+
+targets
+  rollout FamilyWork source capacities
+  topology and leaves
+  exact SigmaTarget and optional ActionTarget
+  sequential RB posterior pool
+  completion workspace and LayerWork
+
+seal
+  rollout FamilyWork source capacities
+  completed SigmaTarget and optional ActionTarget
+  exact compact learner FamilyWork extents
+  sequential RB posterior pool
+  minimal LearnerIndex destination
+  bounded copy/validation scratch
+
+optimization
+  compact immutable learner FamilyWork
+  minimal LearnerIndex
+  sequential RB posterior pool
+  SigmaTarget and optional ActionTarget
+  model/reference/optimizer and ragged learner workspace
+```
+
+Rollout first closes publication without copying or sealing the source slabs.
+After target propagation, release leaves, completion outputs, `LayerWork`,
+`old_t`, and `old_c`. Seal then deletes every hot column and unwanted
+best-response row, compacts the surviving learner columns, reduces sequential
+or branched topology to `LearnerIndex`, and releases the full source slabs and
+topology. Exact target and posterior arrays are already final-address outputs
+and need not be recopied merely to align their row numbers with compacted
+inputs. After the final optimizer step, release compact `FamilyWork`,
+`LearnerIndex`, the posterior pool, `SigmaTarget`, and `ActionTarget`.
+
+## Rollout execution
+
+### Mode behavior
+
+Sequential geometry admits a fixed root set before current draws. Offspring
+below the root is one. A capacity failure never drops, replaces, or rerolls a
+trajectory.
+
+Sampled sequential mode retains scalar sampled loss inputs and terminal
+rewards.
+Sequential RB additionally retains completion-ready leaves and decision-only
+chronological topology; bounded completion outputs are consumed while writing
+the shared posterior pool and exact pre/post `SigmaTarget` rows.
+
+Branched geometry creates exactly one root. Every non-preterminal node,
+including that root, uses the ordinary branching rule. In branched RB, every
+logical child samples an independent collision-conditioned posterior profile.
+In sampled branched geometry, the row-lifetime true profile follows that
+mode's declared tree law and no posterior-profile sampler is invoked.
+Duplicate public events remain distinct topology nodes with independent RNG
+addresses, descendants, and completion keys. Lower-size refill records the
+protected pre-refill root degree, rewrites final root transition/path masses
+using the augmented root degree, and leaves ordinary descendant decisions
+trainable.
+
+The engine is a shared physical protocol, not a union schema. Sequential rows
+do not carry branched-only path, controller, topology, or profile-sampler
+fields.
+
+Best response is a training-regime overlay on either geometry. Exploitator
+rows use the current model and retain learner inputs. Opponent rows use the
+frozen model. Their natural inputs occupy the same row-aligned retained column
+during rollout and target creation but are deleted at post-target seal.
+Stable consecutive role subspans select the current or frozen model without
+reordering the family FIFO. Sequential best response retains no opponent
+output. Branched best response retains only the frozen-player `old_t` and
+`old_c` scalars needed by the public target recurrence.
+
+### Parent transaction
+
+For one stable player-family prefix:
+
+1. reserve nominal/executed child counts, logical topology spans, RNG
+   identities, and exact player-edge spans;
+2. run the role-selected policy forward on the direct/compact family input;
+3. write `old_v` and sampled-action inputs for trainable rows; in branched
+   geometry also retain `old_t` and `old_c` for every player node; discard
+   every other frozen-opponent output after sampling;
+4. construct lightweight child descriptors;
+5. count and scan semantic destinations;
+6. reserve disjoint destination spans;
+7. materialize large payloads directly at those final addresses;
+8. atomically commit the complete multi-destination transaction.
+
+The complete parent policy output is never expanded to child shape. Descriptor
+rows carry a parent-position index and the selected action.
+
+Logical reservations occur before random draws. Physical destination
+reservations occur after classification reveals their exact family, leaf, or
+chance destination. A failed transaction may leave provisional logical or
+physical reservations and writes, but no ready tail advances. Sequential mode
+stops cleanly; branched mode discards the whole attempt through the declared
+recovery boundary.
+
+### Stage 1: lightweight child descriptors
+
+For each logical child, Stage 1 produces only bounded routing data:
+
+```text
+ChildDescriptor
+  parent_position
+  node_id
+  logical_key
+  ephemeral posterior profile ids              # branched RB only; omit if fused
+  action or chance event
+  old_log_pi source address
+  compact state delta/classification fields
+  destination
+  destination-local ordinal
+```
+
+In the other three geometry/estimator combinations, Stage 1 reads the
+row-lifetime true profile instead and the descriptor has no profile field.
+The applicable profile source, public event draw, compact
+transition/classification work, and chance-closure decision should be fused as
+far as their shared device code and register pressure permit.
+
+Crucially, Stage 1 does not materialize a large child range payload. Stable
+destination addresses are computed from small descriptors before the
+bandwidth-heavy natural-input write.
+
+### Shared sampler device core
+
+Branched-RB collision-conditioned profile sampling must have one canonical
+implementation and retain the sibling evaluator's statistical, RNG-version,
+legality, exhaustion, and row-local reproducibility contract.
+
+The sampler's CUDA device core should be factored into one shared source
+artifact that can be compiled into:
+
+- the sibling evaluator's public `sample_joint_profiles` operation; and
+- PBG's fused Stage 1/chance-closure kernel.
+
+PBG owns the surrounding poker transition, descriptor, routing, and
+chance-closure logic. The shared sampler core supplies accepted combo IDs in
+registers or shared memory and reports exhaustion through the common device
+failure record.
+
+This rollout sampler is invoked only in branched RB. Sequential sampled,
+sequential RB, and sampled branched execution use their carried true profile
+and must perform zero rejection-sampler calls. Completion remains a separate
+consumer of the sibling evaluator in the RB modes.
+
+A literal copied implementation must not remain independently maintained in
+both repositories. If ownership moves, both callers must compile or call the
+one moved source and the authority documents must change with it.
+
+This direct device integration is preferred over returning a newly allocated
+`combo_ids[B,M,P]` tensor. A preallocated output-buffer API is an acceptable
+development step, but it is not the intended final fused path.
+
+### Stable destination routing
+
+For a child pack small enough for one CTA:
+
+1. materialize descriptors and classify one or more children per lane;
+2. count destinations in shared memory;
+3. compute stable within-destination offsets;
+4. reserve one contiguous span per nonempty destination;
+5. perform Stage 2 final writes;
+6. commit all destinations together.
+
+For larger packs, use a bounded device pipeline:
+
+```text
+descriptor generation
+→ stable scan/partition of small descriptors
+→ destination reservation
+→ Stage 2 final materialization
+→ transaction commit
+```
+
+The initial large-pack path should use ordinary fixed-workspace kernels.
+Cooperative persistent execution or graph capture may replace launch
+boundaries only after a paired end-to-end benchmark.
+
+Cross-block atomics may count destinations, but they may not determine
+insertion order from nondeterministic block scheduling. FIFO order follows
+logical child order and the deterministic reservation sequence.
+
+### Stage 2: final materialization
+
+Once every destination base is known, Stage 2:
+
+- reads the parent's natural input directly from its family row;
+- applies the selected event to its public-trajectory and range fields;
+- writes the complete child natural input once at a player destination;
+- writes completion-ready fields at a stopped child;
+- forms only the bounded descriptor/frontier state needed by a continuing
+  chance child.
+
+This two-stage pipeline is the default for large packs because it minimizes
+large global-memory traffic. Kernel fusion is accepted when it removes a
+transient tensor or global round trip, not merely because it reduces launch
+count.
+
+### Device-resident chance closure
+
+Chance children remain in a bounded device workspace rather than a Python
+queue. Successive chance generations repeat the descriptor, stable-route, and
+final-write protocol until the chance frontier is empty.
+
+The host observes only the final committed family/leaf extents and any failure
+record at the declared control boundary. It does not loop over individual
+chance generations or synchronize between sampler, transition, and routing
 stages.
 
-All hot transient storage is preallocated from the admitted schema and
-physical bounds. This includes operation-specific scan storage, child routing
-columns, sampler output when it cannot be consumed in-kernel, stable
-destination counts and offsets, ping-pong chance frontiers, completion
-microbatches, and learner flattened-child gather/reduction scratch. Workspaces may
-be separate when their simultaneous use enables stream overlap; they are not
-forced into one universal arena. Allocation, accounting, graph capture, and
-failure injection use the same declared capacities. No ordinary rollout,
-target, or learner kernel grows a workspace or invokes the allocator.
-
-## Unified mode behavior
-
-### Normal sequential
-
-- Admit a fixed root set before draws.
-- Store the sampled root private profile once per live trajectory or copy its
-  tiny `[P]` combo vector into each work row.
-- Use offspring count one.
-- Materialize the selected action, state transition, reach update, and chance
-  closure through the fused sequential pipeline.
-- Append the next player occurrence directly to its family.
-- Capture terminal reward directly at the leaf.
-- Retain only decision-order trajectory metadata; do not build all-occurrence
-  sequential topology.
-
-### Sequential Rao--Blackwell
-
-Use the same physical engine as normal sequential, with:
-
-- exact active reach;
-- preterminal/terminal completion-ready leaf capture;
-- decision-only chronological topology;
-- no separate sampled-action table;
-- one posterior reference per required trajectory/player after completion.
-
-The sequential kernel receives the root-sampled private profile and does not
-invoke the branched rejection sampler at every edge.
-
-### Branched Rao--Blackwell
-
-- Create exactly one root.
-- Compute nominal/executed offspring counts with logical keys.
-- Reserve every logical child/topology span and its exact
-  `ActionProbability` span before the event draws.
-- Materialize every sibling independently.
-- Append player descendants directly into family tails.
-- Close chance descendants completely before exposing the next host scheduler
-  choice.
-- Release the parent's logical mutable ownership after all child destinations
-  commit.
-- Preserve root refill metadata and final path-mass correction.
-
-The hot family slot is not the topology identity. `node_id` maintains the map
-to the cold append-only tree.
-
-## Cold topology and retained outputs
-
-Branched targets still require a compact rooted topology. Keep a fixed-capacity
-global topology output with:
-
-```text
-parent[N]
-child_begin[N]
-degree[N]
-decision_partition[N]
-decision_row[N]
-leaf_row[N]
-nominal_degree[N] when consumed
-protected root metadata
-```
-
-It is cold during rollout:
-
-- child ID spans are reserved contiguously;
-- child rows are committed contiguously;
-- each player decision's `ActionProbability` source span has the same order as
-  its target-eligible child prefix;
-- parent compute metadata comes from `FamilyWork`, not from topology gathers;
-- targets consume it only after rollout.
-
-`ActionProbability[m]` has one row per realized target-eligible player child,
-grouped contiguously by source decision. The source `action_ptr` is a
-rollout/seal address only. Topology flattening aligns those rows with the
-corresponding child nodes, after which parent `child_begin` and
-`target_degree` provide the sole ragged grouping needed by targets and the
-learner. There is no parent-major action tensor and no capacity proportional
-to the maximum realized KKT degree.
-
-Sequential modes write decision-only trajectory CSR metadata directly and
-never instantiate the branched topology owner.
-
-The fixed topology/action/leaf capacities are admitted with `FamilyWork`.
-There is no page growth or allocator call during the hot rollout.
-
-## Fused child materialization
-
-The model forward remains a separate family-specific operation. Everything
-after the forward and before the next model-ready family rows should be fused
-as far as practical.
-
-### Player-parent fused pipeline
-
-For one bounded parent pack:
-
-1. compute nominal/executed offspring;
-2. device-scan offspring to obtain stable child offsets;
-3. reserve one contiguous topology range and the exact
-   `ActionProbability` span;
-4. for every logical child:
-   - derive its logical RNG keys;
-   - sample a collision-conditioned private profile in branched mode, or use
-     the trajectory profile in sequential mode;
-   - select the model row for the acting private hand;
-   - sample the public player event;
-   - compute selected old log probability;
-   - apply the public-state transition;
-   - update the active exact reach;
-   - classify terminal/chance/player and player partition;
-5. stably compact by destination;
-6. reserve destination tail spans;
-7. write player, leaf, and chance outputs directly;
-8. publish ready tails and failure flags.
-
-The complete parent `PolicyOutput` must not be copied to child shape. The
-kernel consumes parent outputs through `parent_position[child]`.
-
-### Chance-parent fused pipeline
-
-Chance parents do not need a model output. For each chance occurrence:
-
-1. reserve its logical children;
-2. sample collision-conditioned profiles in branched mode;
-3. sample keyed chance events;
-4. step public state;
-5. update exact reach according to the chance rule;
-6. classify results;
-7. append player/leaf destinations directly;
-8. compact remaining chance children into the next bounded chance frontier;
-9. repeat until the chance frontier is empty.
-
-The host should observe only the final per-family ready counts and any failure
-flag, not every intermediate chance wave.
-
-## Rejection-sampler fusion
-
-The sibling poker evaluator remains the sole implementation authority for
-collision-conditioned profile sampling. Do not copy its rejection sampler
-into this repository.
-
-The current contract returns `combo_ids[B,M,P]` and performs a Python-visible
-exhaustion check before the caller launches subsequent kernels. The fastest
-rollout path needs a lower-level device integration.
-
-Propose a versioned sibling deliverable:
-
-```text
-poker profile-sampler device library
-  weighted-draw and collision-rejection device primitives
-  immutable combo tables
-  row-local versioned RNG
-  device failure/attempt reporting
-  no allocation and no host check
-```
-
-The PBG poker rollout extension links against that sibling-owned device
-library. This preserves one sampler implementation while allowing a PBG-owned
-fused transition/routing kernel to consume accepted combo IDs in registers or
-shared memory.
-
-If a linkable device ABI is impractical, the fallback interface is:
-
-```python
-sample_joint_profiles_into(
-    board,
-    range_weights,
-    seeds,
-    output_combo_ids,
-    device_failure,
-)
-```
-
-followed by a captured transition/route kernel. This is still preferable to a
-fresh output allocation plus a per-call host exhaustion check.
-
-Sampling exhaustion sets a device flag with the first failing logical child
-address and attempt count. The host checks it once at the declared rollout or
-chance-close control boundary. It may never silently drop a lane.
-
-## Stable destination addressing without a CPU synchronization
-
-Correct destination addresses require counts per family, leaf, and chance
-continuation. This does not require a CPU round trip.
-
-### Small-pack single-CTA path
-
-For a bounded child pack small enough for one cooperative thread block:
-
-1. each lane materializes and classifies one child;
-2. shared-memory histograms count destinations;
-3. block-exclusive scans compute stable within-destination positions;
-4. one lane reserves each nonempty destination with a device `atomicAdd` on
-   `reserved_tail`;
-5. `__syncthreads()` publishes the returned bases;
-6. lanes write directly to `base[route] + local_position`;
-7. one lane publishes the destination's ready extent after a device fence.
-
-Producer packs execute in logical order on one routing stream, so destination
-FIFO order remains stable.
-
-### Larger-frontier path
-
-For a chance frontier requiring multiple blocks, use one of:
-
-1. a cooperative persistent kernel with grid-wide scans and barriers; or
-2. a fixed captured graph:
-   - materialize/classify;
-   - stable device scan/radix partition;
-   - reserve destination bases;
-   - scatter and form the next chance frontier.
-
-The captured graph is the recommended first implementation. It avoids
-cooperative-launch occupancy constraints and still removes Python and host
-synchronization between stages. A single persistent kernel should replace it
-only after a paired benchmark demonstrates a win.
-
-Destination order is part of the physical reproducibility contract. Do not use
-nondeterministic cross-block atomic reservation whose order depends on block
-scheduling.
-
-## Asynchronous execution
-
-Use at least three logical CUDA streams:
-
-```text
-model stream
-  family input pack
-  current-policy forward
-
-materialization stream
-  offspring scan
-  rejection sampling
-  event/transition/reach update
-  chance closure
-
-append/seal stream
-  routed family writes when not fused
-  cold retained/topology writes
-```
-
-Fixed addresses make stream dependencies explicit.
-
-For every asynchronous append:
-
-- reserve a disjoint destination range;
-- record the source-ready event;
-- retain or `record_stream` every source workspace;
-- publish `ready_tail` only after the destination-complete event;
-- let the scheduler choose another family from already-ready rows;
-- make the model stream wait only when it selects a pending destination.
-
-There is no device-wide synchronization in the ordinary rollout loop.
-
-Overlap is opportunistic. If the newly produced children are the only
-remaining work, their append/chance closure is on the critical path. If
-another family is ready, its model forward can hide the append.
-
-## Kernel-fusion boundaries
-
-Fusion is useful when it removes a transient tensor, a repeated global-memory
-round trip, or a launch-sized operation without extending a large allocation's
-lifetime. It is not a goal by itself.
-
-The first production fusion targets should be:
-
-1. **Player child materialization.** After offspring offsets are known, fuse
-   logical-key construction, profile sampling when the sibling device ABI
-   permits it, event sampling, transition, exact-reach update, classification,
-   `ActionProbability` writes, and direct destination writes. Keep the model
-   forward separate.
-2. **Chance closure.** Fuse one bounded chance generation from profile/event
-   sampling through next-frontier or final-destination writes. Run successive
-   generations device-resident through a captured loop or a measured
-   persistent implementation.
-3. **Small-pack routing.** Fuse destination histogram, stable local positions,
-   tail reservation, and scatter in one CTA. Retain the multi-kernel
-   scan/partition path for larger packs.
-4. **Leaf capture.** Fuse the final reach normalization/conversion and
-   completion-ready leaf write with stopped-child routing.
-5. **Layered branched targets.** Within one target-layer kernel, fuse child
-   reduction, conditionalization, the parent recurrence, controller
-   statistics, and child-row edge-target writes. Completion remains a separate
-   bounded service.
-6. **Learner elementwise work.** Once rollout and targets are stable, fuse
-   gathers, masks, ratio/clamp arithmetic, and reductions around the model
-   forward/backward where a custom kernel removes materialized intermediates.
-
-Keep a boundary at a library-scale model forward, a variable-size prefix scan,
-a phase-lifetime transition, or an operation whose fusion would retain a
-larger workspace. In particular, do not hand-fuse the model with stochastic
-tree mutation, do not fuse completion into the tree recurrence, and do not
-keep rollout slabs alive to save a seal copy. A persistent kernel must win a
-paired end-to-end benchmark; it receives no preference merely for reducing
-launch count.
-
-## CUDA graph strategy
-
-Fixed family addresses and bounded workspaces make selective graph capture
-possible, but graph capture is an optimization layer over an allocation-free
-eager path. It is not part of correctness and must never determine the storage
-model. A change to an admitted family-capacity plan invalidates affected
-captures; recapture only after the new plan is stable.
-
-Good initial capture units are:
-
-- one model-ready family pack at a common batch quantum and compact token
-  width;
-- the fixed multi-kernel large-frontier route/append sequence;
-- one bounded chance-generation step, replayed until the device frontier is
-  empty;
-- a fixed-shape learner forward/loss/backward microbatch after target storage
-  is immutable.
-
-Capture variants may depend on:
-
-```text
-mode
-semantic physical family
-batch quantum
-realized compact token width
-fixed/dynamic branching control
-```
-
-Street is not a graph or queue identity. The compact-width variant is selected
-for the next stable FIFO prefix. Tail rows use a validity mask or a very small
-set of common quanta.
-
-Do not capture the whole rollout iteration: scheduler choices, realized child
-counts, tree sizes, layer sizes, completion counts, and distributed control
-are genuinely dynamic. The flattened target recurrence should initially use
-one ordinary mixed-domain custom launch per non-leaf root-depth layer. Its
-launch count is bounded by tree height, not node count; bucketing, splitting
-pre/post specializations, or capturing layer kernels is worth considering only
-if profiling later shows an end-to-end win.
-
-The 2080 Ti admission rule is strict: reject a graph if its private pools or
-retained workspaces reduce the maximum feasible forward or backward batch.
-Those batches are currently memory-limited and dominate the value of a small
-launch saving. On H100, recapture the same fixed-address units more
-aggressively for pure throughput. In both cases, require identical outputs and
-measure end-to-end time; graph capture must not silently select a different
-compiled model path or stochastic topology.
-
-A capture is accepted only by a paired end-to-end benchmark against the
-allocation-free eager execution of the same unit. The comparison includes
-graph-owned allocator pools, retained workspace lifetimes, warmup and
-recapture frequency, tail handling, scheduler overlap, and any change in the
-largest feasible forward or backward batch. Kernel-time or launch-count wins
-alone are insufficient. If a capture does not improve complete-iteration
-throughput on a supported hardware profile, omit that capture rather than
-retaining an unused optimization path.
-
-## Minimal-padding stable FIFO prefixes
-
-Keep one stable `post_A` FIFO across flop, turn, and river. This remains true
-for every player count.
-
-For the next stable prefix $Q$, compute:
-
-$$
-b_{\min}(Q)=\min_{q\in Q}|\operatorname{board}(q)|,
-\qquad
-H_Q=\binom{4R-b_{\min}(Q)}2.
-$$
-
-The physical packer compacts only board-legal hand rows needed by that prefix
-and pads the pack only to $H_Q$. It does not change canonical retained
-$H$-wide targets or outputs.
-
-FIFO order naturally tends to expose later-street suffixes after older
-early-street rows drain. A river-only head prefix therefore uses river width
-without any street-specific queue or reorder.
-
-The planner begins with the largest FIFO prefix that fits the current
-forward-memory budget. It may choose between:
-
-- one large mixed prefix at its minimum required width; and
-- shortening that prefix at a public-width transition, then processing the
-  following consecutive subspan at its smaller width.
-
-It may not skip an older flop row to process a younger river row. The cost
-model must charge the extra model launch and the new tail batch against saved
-token pairs. This should make splitting rare on small mixed queues and useful
-on the naturally river-heavy suffixes of branched rollouts, where 60--70% of
-nodes may already share river width. It requires no per-street capacity guess,
-no extra queue tail, and no additional scheduler family.
-
-Required metrics include:
-
-- street composition of every dequeued prefix;
-- realized compact hand width;
-- padded tokens and token pairs;
-- model rows/call;
-- tail-batch distribution;
-- fraction of postflop rows processed at flop, turn, and river widths.
-
-## Direct leaf capture
-
-The fused router writes stopped children directly into the final
-completion-ready leaf schema:
-
-```text
-board cards
-range weights [P,H]
-stratum and payoff fields
-logical completion key
-```
-
-There is no intermediate live-reach pool row followed by:
-
-```text
-gather → clone → leaf append → release
-```
-
-The leaf append owns one stable destination range and writes the generated
-reach once to its last semantic consumer.
-
-The reservation and publication are transactional. A stopped child never
-enters a player family, chance frontier, generic occurrence owner, or
-intermediate reach pool. The router writes every field required by the sibling
-completion binding in its final dtype and layout, then publishes the leaf
-range only after all columns commit. Completion consumes stable contiguous
-leaf subspans directly; its bounded output workspace does not reconstruct or
-repack a discarded rollout representation.
-
-Normal terminal reward is similarly written directly into its final leaf row.
-
-## Seal and learner handoff
-
-At rollout completion, each family owns a realized prefix `[0,D_m)`.
-
-The learner's model forwards still consume partition-local input blocks, so
-there is no need to slide those inputs into one global $N$-row tensor. The
-later layer-flattened target tree stores output targets and source-row
-mappings; it does not replace these family-specific model-input schemas. For
-each family:
-
-1. allocate exact immutable destination columns of size $D_m$;
-2. issue direct contiguous copies from retained family prefixes;
-3. validate exact schemas and stable row mappings;
-4. release the entire overprovisioned `FamilyWork` slab, including active
-   reach, mutable state, history, and unused capacity.
-
-Because sources are already contiguous, seal needs no page routing, row-order
-gather, or bounded scratch for ordinary family columns.
-
-Branched protected-root topology may still require its declared reorder or
-two-span treatment. That exception must not reintroduce generic routing for
-family inputs.
-
-The default is to perform the exact copy. Seal is currently tiny, while
-retaining 25,000-row capacity through repeated learner passes would inflate
-the optimization base. A zero-copy prefix view is admitted only when measured
-end-to-end throughput improves and the larger optimization peak does not
-reduce backward width.
-
-## Layered GPU execution of branched targets
-
-The branched target builder should be replaced, not tuned around its current
-frontier loop. Today `plan_branched_frontier` copies structure to the host and
-simulates a slot allocator in Python. `build_branched_rb_targets` then copies
-more topology, owner, and action-pointer data to the host; advances a Python
-ready-counter tree from each completed leaf; constructs small device tensors
-per ready parent; and loops in Python over that parent's sampled actions.
-
-The replacement contract is explicit:
-
-> After one topology-flattening phase, every numerical branched-target
-> recurrence executes on GPU in deepest-to-root dependency-layer order. The
-> initial path launches one custom CUDA target kernel per non-leaf root-depth
-> layer, never one launch per node or sampled action.
+Poker chance closure continues to respect preterminal stopping. It does not
+locally replace sibling-owned completion, posterior, equity, or showdown
+evaluation.
+
+### Natural-input range representation
+
+The preferred natural-input representation is normalized or safely scaled
+linear range weight on the family's native domain:
+
+- the branched-RB sibling sampler and RB completion APIs consume finite
+  nonnegative linear weights;
+- each nonzero seat row is invariant to a finite positive scale;
+- player transitions multiply the acting row by the selected policy
+  likelihood and normalize it;
+- stopped children write exact completion-ready weights directly into the leaf
+  schema.
+
+Preflop input stores class weights on $K$. Exact-hand sampling or a transition
+out of preflop derives the symmetry-preserving $H$ view in bounded transient
+workspace. Postflop input stores exact live-player weights on $H$ and retains
+the natural-input reference to any folded-player summary. No mode retains a
+second “active reach” beside these natural-input fields.
+
+The representation is an empirical choice, not a dependency of the queued
+architecture. If long-trajectory, short-deck, zero-support, distributional,
+target, loss, or gradient tests reject linear fp32 range weights, the
+natural-input schema uses log weights instead. There is one accepted
+production representation, not two runtime fallback paths.
+
+### Asynchrony and streams
+
+Fixed addresses and explicit reservations permit overlap, but stream count is
+not a design invariant.
+
+The allocation-free eager implementation should begin with the simplest
+deterministic issue and commit order. Model forward, descriptor work, final
+materialization, and append/seal copies may use separate streams only where:
+
+- source and destination lifetimes are protected by events or
+  `record_stream`;
+- commit visibility remains deterministic;
+- queue-pressure decisions do not depend on completion timing;
+- the overlap improves complete-iteration throughput;
+- retained workspaces do not reduce feasible training width.
+
+There is no undeclared device-wide synchronization in the ordinary rollout
+loop.
+
+## Flattened branched target engine
+
+The current CPU ready-counter, per-parent, and per-action target loops are
+replaced completely. After one topology-only flattening phase, every numerical
+recurrence runs on GPU in deepest-to-root dependency-layer order.
 
 Completion remains a separate bounded service. The host may advance the
-root-depth loop and launch its kernels, but it never performs a numerical
-recurrence, constructs per-parent tensors, or loops over a parent's actions.
+root-depth layer loop, but it performs no numerical recurrence and constructs
+no per-parent device tensors.
 
-### Topology-only schedule construction
+### Topology flattening
 
-Input is the sealed CSR tree, `ActionProbability` pointers, and scalar
-protected-root metadata. Compute a root depth for every node:
+Build the exact `FlattenedTargetTree` defined in the data-structure section.
+Within each root depth, preserve stable source-node and child-ordinal order.
+Every direct child lies in the next root-depth layer, every sibling span
+remains contiguous, and retained action inputs and `ActionTarget` rows remain
+aligned with the target-eligible child prefix. The protected root uses its
+pre-refill target degree; refill-only root children remain ordinary learning
+data below the root but do not receive root action targets.
 
-$$
-d(\varnothing)=0,\qquad d(\sigma a)=d(\sigma)+1.
-$$
+Flattening is a deliberate locality optimization. The scalar permutation and
+topology rebuild are small compared with numerical target rows and make layer,
+sibling, edge, and learner access predictable.
 
-Create an exact layer-major permutation. Within each layer, retain stable
-parent and child-ordinal order, and rebuild `parent`, `child_begin`, and
-`degree` under the permutation. Every child of a parent is therefore in the
-next root-depth layer and every sibling span remains contiguous. Emit the
-global structural columns:
+The first implementation may use one bulk CPU transfer of scalar topology,
+perform a deterministic linear construction, and upload the result once. If
+that becomes visible on H100, replace it with a device histogram/stable sort
+without changing the flattened schema.
 
-```text
-LayeredTargetTree
-  layer_ptr[L + 1]
-  source_node[N]
-  source_to_flat[N]
-  parent[N]
-  child_begin[N]
-  degree[N]
-  target_degree[N]          # protected root; otherwise degree
-  nominal_degree[N]         # dynamic controller only
-  target_partition[N]       # pre or post
-  target_row[N]             # row inside that target partition
-  model_partition[N]        # pre or post_A learner/model family
-  source_decision_row[N]
-  leaf_row[N]
-```
+### Preflop class aggregation
 
-Target partitions are numerical domains, not rollout queues:
+Let $c:\mathcal H\to\mathcal K$ be the ordinary preflop class map. For exact
+posterior probability mass and posterior-weighted value moment, define
 
 $$
-\mathcal X_{\mathsf{pre}}=\mathcal K,\quad |\mathcal K|=K=R^2,
-\qquad
-\mathcal X_{\mathsf{post}}=\mathcal H,\quad
-|\mathcal H|=H=\binom{4R}{2}.
+(Gz)_k=\sum_{h:c(h)=k}z_h,
 $$
 
-All board-empty nodes, including the flop-dealing chance parent and a
-preflop terminal/completion leaf, use `pre`. Flop, turn, and river nodes use
-`post`, regardless of live-player count. Thus
-$N_{\mathsf{pre}}+N_{\mathsf{post}}=N$. This two-way target partition neither
-creates a rollout queue nor changes poker's `pre` and `post_A` rollout
-families. `model_partition` remains available because learner forwards still
-depend on live-player count postflop. The logical flop chance node remains in
-the topology even when chance closure is device-resident, so no player edge
-crosses directly from a $K$-wide preflop parent to an $H$-wide postflop child.
-All children of one parent therefore share a target partition; stable
-filtering into the two target blocks keeps each sibling span contiguous there
-as well as in the global node order.
-
-The first implementation may compute the permutation from one bulk CPU copy
-of scalar CSR columns and upload it once. That is bounded structural
-orchestration. It must be deterministic and linear in $N$. If the transfer and
-sort become visible on H100, replace them with device depth construction and a
-stable radix sort; the numerical target schemas and layer recurrence do not
-change.
-
-### Persistent final-output tree
-
-Allocate two structure-of-arrays blocks under the one logical flattened tree:
-
-```text
-TargetBlock[pre]                         TargetBlock[post]
-  flat_node[N_pre]                        flat_node[N_post]
-  event[N_pre]                            event[N_post]
-  old_log_prob[N_pre, K]                  old_log_prob[N_post, H]
-  old_value[N_pre, K]                     old_value[N_post, H]
-  frozen_trace_variance[N_pre]            frozen_trace_variance[N_post]
-  frozen_cost[N_pre]                      frozen_cost[N_post]
-  edge_posterior[N_pre, K]                edge_posterior[N_post, H]
-  edge_advantage[N_pre, K]                edge_advantage[N_post, H]
-  decision_value[N_pre, K]                decision_value[N_post, H]
-  trace_variance[N_pre]                   trace_variance[N_post]
-  trace_variance_mask[N_pre]              trace_variance_mask[N_post]
-  cost_target[N_pre]                      cost_target[N_post]
-  edge_valid[N_pre]                       edge_valid[N_post]
-  decision_valid[N_pre]                   decision_valid[N_post]
-```
-
-Mode-absent columns are omitted by schema. Optional rows are deliberately
-dense within each target block: a node reached from a player parent may own
-edge outputs even when it is a chance node or leaf; a player node owns
-decision outputs even when its incoming edge was chance; and a same-street
-player child commonly owns both. Independent validity masks express these
-overlaps. Refill-only root children outside `target_degree[0]` have no root
-edge outputs.
-
-During flattening, copy each source `ActionProbability[m]` span into the
-corresponding target-eligible flattened child rows. This populates `event` and
-natural-width `old_log_prob`; copy each player node's natural-width old value
-and frozen controller scalars at the same phase. Validate stable
-parent/child-ordinal alignment, then release the source topology and
-`ActionProbability` stores before allocating the large numerical workspace.
-The final posterior, advantage, value, trace, and cost columns remain
-uninitialized until their layer kernel writes them.
-
-### Class-native preflop targets
-
-Let $c:\mathcal H\to\mathcal K$ be the ordinary preflop hand-class map and
-define the linear aggregation
-
-$$
-(Gz)_k=\sum_{h:c(h)=k}z_h.
-$$
-
-Whenever exact-hand completion or a postflop child feeds a preflop-domain
-node, aggregate posterior mass and posterior-weighted moment separately:
+and aggregate before conditionalization:
 
 $$
 \widehat{\mathbb P}_{p,k}
@@ -1103,177 +1016,99 @@ $$
 =\sum_{h:c(h)=k}\widehat M_{p,h}.
 $$
 
-Conditionalize only after aggregation. This gives the class conditional
+Then
 
 $$
 \widehat V_{p,k}
-=\operatorname{Cond}(\widehat M_{p,k},\widehat{\mathbb P}_{p,k})
+=\operatorname{Cond}(\widehat M_{p,k},
+                       \widehat{\mathbb P}_{p,k}).
 $$
 
-and class-native posterior, advantage, value, and loss rows. The conversion is
-one-way during backward propagation:
+The same one-way aggregation seeds an RB preflop completion leaf and executes
+the RB `pre <- post` boundary. The RB learner sums preflop losses over $K$
+classes. Sampled target propagation has no private-state axis and performs no
+$H\to K$ aggregation. These equations are the proposal's intentional
+estimator change; the remaining recurrences are referenced from
+`core_math.tex` rather than duplicated here.
 
-```text
-post <- post    H -> H
-pre  <- pre     K -> K
-pre  <- post    H -> K     # flop chance boundary
-```
 
-There is no `post <- pre` recurrence. A preflop completion leaf likewise
-aggregates its evaluator-returned $H$-wide mass and moment directly into its
-$K$-wide layer-work row. The aggregation preserves the all-player Monte Carlo
-vector because summing moment over classes equals summing it over exact hands.
+### Layer kernel
 
-The learner consequently sums preflop losses over $K$ classes, not $H$ exact
-hands mapped repeatedly to the same model row. This removes suit-level Monte
-Carlo noise before the nonlinear clipped loss. It is an intentional estimator
-change and is subject to the theory reconciliation stated above.
+For each non-leaf depth, one mixed-domain custom launch initially processes
+every internal parent in that layer. A warp, CTA, or measured bounded group
+owns one degree-ragged parent and:
 
-### Adjacent-layer numerical workspace
+1. reduces child `v_vector_hat`, `c_lambda_hat_work`, and `delta`, and in RB
+   also reduces `p_hat` and `m_hat`;
+2. writes the parent's transient propagated `LayerWork` row;
+3. when `sigma_target_row >= 0`, writes scalar `v_lambda_hat`, `t_hat`, and
+   `c_lambda_hat` in sampled mode, or additionally writes vector `p_hat` in
+   RB;
+4. when `action_target_begin >= 0`, writes each target child's scalar
+   `a_lambda_hat` in sampled mode, or additionally writes vector `p_hat` in
+   RB;
+5. advances the acting player's scalar value recurrence in sampled mode; in
+   RB, bootstraps the acting player's `m_hat` with
+   `FamilyWork.retained.old_v`; best response does so only at exploitator
+   nodes;
+6. at every player node, bootstraps `c_lambda_hat_work` with
+   `FamilyWork.retained.old_c`;
+7. uses `FamilyWork.retained.old_t` as $T^*$ only when
+   `target_degree == 1`;
+8. applies the protected root prefix exactly.
 
-Final outputs persist for the learner, but mass, moment, Monte Carlo vector,
-propagated cost, and $\Delta$ are needed only until the parent layer consumes
-them. Allocate an exact phase-local workspace for two adjacent layers:
+The arithmetic is exactly `\eqref{eq:branched-backward-updates}`,
+`\eqref{eq:branched-targets}`,
+`\eqref{eq:branched-trace-variance-target}`, and
+`\algref{alg:branched-value}`, with the approved $H\to K$ aggregation inserted
+at the domain boundary.
 
-```text
-LayerWork[pre]
-  mass[rows, P, K]
-  moment[rows, P, K]
-  value_vector[rows, P]       # dynamic KKT only
-  work_cost[rows]             # dynamic KKT only
-  delta[rows]                 # dynamic KKT only
+Launch count is proportional to tree depth, never node or action count. A
+small fixed number of pre/post or degree-specialized launches per layer is
+allowed only if it wins end-to-end without changing storage or semantics.
 
-LayerWork[post]
-  mass[rows, P, H]
-  moment[rows, P, H]
-  value_vector[rows, P]       # dynamic KKT only
-  work_cost[rows]             # dynamic KKT only
-  delta[rows]                 # dynamic KKT only
-```
+After the root completes, target creation is complete. Release completion
+output, `LayerWork`, `old_t`, and `old_c`; the post-target seal below then
+reduces full topology to the minimal learner mapping.
 
-Let $W_{\ell,\mathsf{pre}}$ and $W_{\ell,\mathsf{post}}$ be the two target
-widths within root-depth layer $\ell$. The exact workspace byte requirement is
-the maximum over adjacent layers:
+### Post-target seal
 
-$$
-\max_\ell\left[
-  (W_{\ell,\mathsf{pre}}+W_{\ell+1,\mathsf{pre}})S_{\mathsf{pre}}
-  +(W_{\ell,\mathsf{post}}+W_{\ell+1,\mathsf{post}})S_{\mathsf{post}}
-\right],
-$$
+Seal is executed only after all target rows and sequential-RB shared posterior
+rows have been written and validated. It performs two deletions:
 
-where the dominant fp32 row payloads are
+1. column deletion: discard every `FamilyWork.hot` column and every
+   target-only retained column;
+2. row deletion: in best response, stable-delete every frozen-opponent family,
+   sigma, and action row.
 
-$$
-S_{\mathsf{pre}}=4(2PK+P+2),\qquad
-S_{\mathsf{post}}=4(2PH+P+2)
-$$
+It then copies the surviving `FamilyWork.retained` rows into exact immutable
+extents. Self-play normally copies ordinary realized prefixes; best response
+stable-compacts the exploitator subset. The default is an exact copy because
+keeping full rollout capacities alive through repeated learner passes inflates
+the optimization base. A zero-copy view is allowed only if measured peak
+memory and throughput improve without reducing backward width.
 
-when dynamic $T/C$ work is present. Fixed branching omits the absent scalar and
-vector columns. This workspace replaces full
-`mass[N,P,H]`/`moment[N,P,H]` target allocations. Its source and destination
-subspans are disjoint for one launch and swap roles after the layer completes.
+Seal also constructs compact `LearnerIndex` rows containing only the
+source/target row mappings, exact branched action spans, posterior references,
+target degree, sampling mass, and structural validity needed by optimization.
+It validates those mappings and then releases `SequentialTargetTree` or
+`FlattenedTargetTree`, leaves, source construction maps, and seal scratch.
+Family-input and target row numbers need not be aligned. If they happen to
+align naturally, redundant mappings may be omitted, but alignment is not a
+required optimization or a reason to complicate compaction.
 
-Leaves may occur at different depths. Seed the leaf positions of a layer
-through bounded completion before that layer becomes the next kernel's child
-input. A preflop leaf is projected $H\to K$ while seeding; a postflop leaf is
-written at $H$. Completion and the layer kernel use events rather than a
-device-wide synchronization.
+Final partition-local decision masses are computed after any root refill.
+Their log weights survive only through construction of the exact learner
+sampler and its normalization; transient path/controller factors are then
+released. The successful seal atomically publishes one complete immutable
+training store.
 
-### One CUDA target launch per dependency layer
+### Exact ragged learner
 
-After seeding the deepest layer, execute
-$\ell=L-2,\ldots,0$. One custom CUDA launch covers every internal parent in
-`layer_ptr[ell]:layer_ptr[ell+1]`. Each CTA or cooperative warp owns one
-parent, reads its contiguous target-child prefix from the layer-$\ell+1$
-workspace, and dispatches one of `pre <- pre`, `pre <- post`, or
-`post <- post` from the immutable row descriptor.
-
-Within that one launch, the kernel:
-
-1. reduces child posterior mass, moment, Monte Carlo value vector, propagated
-   cost, and $\Delta$;
-2. writes the completed parent work row in the destination layer span;
-3. at a player parent, writes every target child's posterior and advantage
-   directly into that child's persistent flattened row;
-4. writes the parent's value, trace-variance, and cost targets into its
-   persistent flattened row;
-5. only then bootstraps the acting-player moment and working cost propagated to
-   ancestors.
-
-For $n=\mathtt{targetDegree}(\mathsf s)\ge2$, reduce
-
-$$
-\mathbf v_{\rm sum}=\sum_i\widehat{\mathbf V}(\mathsf s\mathsf a_i),
-\qquad
-q_{\rm sum}=\sum_i\|\widehat{\mathbf V}(\mathsf s\mathsf a_i)\|_2^2
-$$
-
-and compute in the same launch
-
-$$
-\widehat T^{\rm exec}(\mathsf s)
-=\frac{q_{\rm sum}
--n\left\|\mathbf v_{\rm sum}/n\right\|_2^2}{n-1},
-\qquad
-\overline\Delta(\mathsf s)
-=\frac1n\sum_i\Delta(\mathsf s\mathsf a_i).
-$$
-
-At a player node, write
-
-$$
-\widehat T(\mathsf s)
-=\max\{0,\widehat T^{\rm exec}(\mathsf s)-\overline\Delta(\mathsf s)\}
-$$
-
-when $n\ge2$ and leave the trace mask false when $n=1$. For correction
-propagation use $T^*=\widehat T$ when present and the frozen
-$T^{\theta_k}(\sigma)$ otherwise:
-
-$$
-\Delta(\mathsf s)
-=\frac{T^*(\mathsf s)+\overline\Delta(\mathsf s)}{n}
--\frac{T^*(\mathsf s)}{\widetilde N(\mathsf s)}.
-$$
-
-A chance node writes no decision targets and propagates
-$\Delta(\mathsf s)=\overline\Delta(\mathsf s)/n$. The refilled root uses only
-its protected `target_degree` prefix for posterior, advantage, value, cost,
-trace covariance, and $\Delta$.
-
-The kernel is degree-ragged: a warp or CTA strides over the actual child span
-and reduces it cooperatively. A large degree increases work for that parent
-but never creates `[parent,max_degree,...]` storage. If profiling later proves
-that separate pre/post specialized launches beat the single mixed-domain
-kernel, a fixed small number of launches per dependency layer is acceptable;
-the invariant remains that launch count is proportional to tree depth, never
-nodes or actions.
-
-After the root completes, release completion outputs and the entire adjacent-
-layer workspace. Retain the flattened structural child spans and persistent
-pre/post target blocks through optimization. There is no post-target
-action/decision compaction: the learner reads final node rows directly and
-releases the flattened tree after the last optimizer step.
-
-For $N=20{,}000$ and $H=1326$, three all-postflop $N\times H$ final fp32
-columns for posterior, advantage, and value cost about 303.5 MiB. Preflop rows
-replace $H$ with $K$ and use only $K/H$ of those vector bytes, a reduction
-factor of $H/K$. The invalid final rows are deliberate; poker's player-node
-and player-edge densities make their overhead preferable to another scattered
-owner and compaction phase. The memory planner must separately admit
-persistent final outputs and the exact maximum-adjacent-layer workspace before
-numerical target execution.
-
-## Exact ragged branched learner execution
-
-After target construction, every player decision's sampled
-$(\sigma,a)$ rows are its contiguous flattened target-child prefix. The
-learner must preserve that ragged domain instead of turning a selected
-decision subspan into
-`[decision_rows, max_actions_per_decision]`.
-
-For a selected decision-index subspan $J$, build in one preallocated workspace:
+For a selected retained sigma subspan $J$, the learner follows
+`LearnerIndex` mappings and exact target-child spans. In one preallocated
+workspace it
+constructs:
 
 ```text
 local_edge_ptr[|J| + 1]
@@ -1281,448 +1116,410 @@ child_row[E_J]
 edge_to_local_decision[E_J]
 ```
 
-where $E_J$ is the exact sum of the selected nodes' `target_degree` values.
-The physical learner planner admits both $|J|$ and $E_J$ and selects the
-largest decision subspan whose exact child extent fits. It never introduces an
-immutable or transient maximum-action dimension.
+where $E_J$ is the exact sum of selected `target_degree` values. The planner
+admits both decision and edge counts and selects the largest feasible
+consecutive decision subspan.
 
-The current-policy forward remains decision-major. The policy adapter reads
-the appropriate decision output through `edge_to_local_decision` and evaluates
-only real child-row events. Posterior-weighted policy terms, ratios, clipping
-statistics, and edge contributions are reduced back to decisions with
-segmented reductions over `local_edge_ptr`. Preflop rows use the flattened
-tree's $K$-wide class targets and postflop rows use its $H$-wide exact-hand
-targets. There are no inactive edge slots, invented safe events, or
-child-count-dependent copies of the complete model output.
+The current-policy forward remains sigma-major. Action policy work gathers
+only real `FamilyWork.retained.action`,
+`FamilyWork.retained.old_log_pi`, and `ActionTarget.a_lambda_hat` rows, plus
+`ActionTarget.p_hat` in RB, then reduces contributions back to sigma rows with
+segmented reductions.
 
-`max_actions_per_decision` is therefore not part of immutable training
-storage, workspace admission, or a production loss API. Required physical
-bounds are expressed as decision rows and realized flattened child rows per
-learner subspan.
+RB value, entropy, and optional reference KL terms read
+`SigmaTarget.p_hat`; sampled losses use the retained realized $x_p$ and have no
+posterior row.
+$T/C$ losses read `SigmaTarget.t_hat` and
+`SigmaTarget.c_lambda_hat`; `t_hat` is gated by structural target degree.
 
-## Expected memory
+There is no immutable or transient `[decision,max_actions,...]` tensor, no
+invented safe action, no inactive event evaluation, and no
+`max_actions_per_decision` production API.
 
-For HU, $P=2$, $H=1326$, and total family capacity 25,000:
+## Memory admission and failure behavior
 
-| Owner | Approximate payload |
-|---|---:|
-| active exact reach | 252.9 MiB |
-| one 84-row child reach pack | 0.85 MiB |
-| double-buffered child/next reach | 1.70 MiB |
-| node IDs, keys, controller scalars | low tens of MiB or less |
-| dense HU history/state | geometry-dependent, small beside reach/model workspace |
+Admission is phase-specific and generated from allocated schemas rather than
+handwritten payload estimates:
 
-For six players at the same 25,000 total rows, active exact reach is about
-758.7 MiB. At 50,000 rows it is about 1.48 GiB.
+```text
+rollout
+  model/static
+  complete FamilyWork hot and retained capacities
+  growing topology and leaf capacities
+  descriptor/routing/chance workspaces
+  inference workspace
 
-All estimates must be replaced by schema-derived allocated capacity,
-alignment, workspace, and physical high-water accounting before admission.
-The slab overlaps rollout inference workspace but is released before targets
-and optimization.
+targets
+  rollout FamilyWork source capacities
+  sequential or flattened branched topology
+  exact SigmaTarget and optional ActionTarget
+  sequential RB posterior pool
+  completion workspace
+  maximum LayerWork
 
-## Why this can speed sequential mode
+seal
+  rollout FamilyWork source capacities
+  completed SigmaTarget and optional ActionTarget
+  sequential RB posterior pool
+  exact compact FamilyWork and LearnerIndex destinations
+  bounded copy/validation scratch
 
-Sequential mode is already much faster, so avoiding regression is the first
-gate. The unified engine can still improve it by removing:
+optimization
+  compact immutable FamilyWork learner inputs
+  LearnerIndex
+  sequential RB posterior pool
+  SigmaTarget and optional ActionTarget
+  gradient/collective buffers
+  one bounded ragged learner subspan
+  model/reference/optimizer workspaces
+```
 
-- occurrence status transitions;
-- handle-ring enqueue/dequeue copies;
-- state/reach gathers into family packs;
-- Python chance-closure iterations;
-- separate rejection/profile interfaces where sequential does not need them;
-- repeated small allocations around routing and transition;
-- avoidable model-input reconstruction;
-- seal routing from out-of-order family chunks.
+Objects with disjoint lifetimes are not added. Allocator-reserved and NVML
+peaks, graph-owned pools, compiler/library workspaces, alignment, and the
+unused guard are included.
 
-Sequential mode retains its special advantages:
+### Sequential failure
 
-- one private profile per trajectory;
-- offspring one;
-- no branched action table;
-- decision-only topology;
-- no T/C path factors unless explicitly consumed;
-- no sibling profile sampling.
+Sequential root width and logical keys are frozen before current draws. If a
+family, leaf, seal, completion, or learner transaction unexpectedly cannot
+fit, the run releases the current iteration, checkpoints the last completed
+iteration, and stops. It does not drop, replace, retry, or reroll a trajectory.
 
-The shared engine is a common physical protocol, not a union schema that makes
-sequential rows carry branched fields.
+### Branched failure
 
-## Why this can close the branched gap
+A family, topology, edge, leaf, descriptor, chance, seal, completion, or target
+workspace overflow is a classified whole-attempt admission failure. Every rank
+releases the entire attempt, agrees on the controller backoff and disjoint next
+attempt address, and retries within the bounded configured limit.
 
-The rewrite attacks nearly every non-model term named by the current storage
-analysis:
+Sampler exhaustion and non-memory correctness/evaluator failures remain
+terminal unless their authoritative contract explicitly classifies otherwise.
 
-- state/history/reach access becomes direct;
-- occurrence routing disappears;
-- controller input is direct;
-- child materialization is fused;
-- private-profile output is consumed without round-trip storage;
-- destination routing is one stable pass;
-- chance closure stays on device;
-- player children land in model-ready order;
-- later packs do not scan a larger historical tree;
-- known child/topology writes remain contiguous;
-- integrity checks become asynchronous device checks or end-of-phase
-  validation, not repeated `torch.equal` host boundaries.
+### Transactional publication
 
-It cannot remove the genuine extra private-profile sample per branched edge or
-the larger branched target recurrence. It can make those operations batched,
-allocation-free, and fused with their immediate consumers.
+One parent transaction may target several families, leaves, and chance
+frontiers. It publishes none of them until:
 
-## Performance targets
+- every exact destination extent fits;
+- sampler and transition stages report success;
+- every destination column has been written;
+- required stream dependencies are complete.
 
-Use paired production-path measurements, not microbenchmarks alone.
+Reserved tails may have advanced before failure; committed tails do not.
+Unpublished bytes are not learner-visible and are discarded with the failed
+sequential iteration or branched attempt.
 
-Initial practical gates:
+## CUDA graphs and optional overlap
 
-| Metric | Gate |
-|---|---:|
-| sequential RB rollout | no regression outside measurement noise |
-| sequential RB stretch | at least 300 decisions/s on the fixed benchmark geometry |
-| branched rollout first acceptance | at least 180 decisions/s on equivalent realized work |
-| branched rollout stretch | 220+ decisions/s |
-| branched/sequential per-decision gap | at most 1.5x stretch target |
-| undeclared host synchronizations | zero |
-| family dequeue payload gathers | zero |
-| all-page/all-chunk hot scans | zero |
-| OOM retries in accepted baseline | zero |
-| branched target host node/action loops | zero |
-| branched numerical target launches | one mixed-domain launch per non-leaf dependency layer initially |
-| learner maximum-action padding | zero |
+Graph capture is an optimization over the allocation-free eager path, never a
+correctness dependency or storage authority.
 
-The exact current time-to-beat must be re-established from the latest accepted
-production path with fixed logical seeds. Historical cross-commit rates are
-motivation, not acceptance evidence.
+Candidate capture units are:
 
-## Instrumentation
+- a common fixed-address family forward pack;
+- the large-pack descriptor/scan/materialization pipeline;
+- one bounded chance-generation step;
+- one fixed-shape ragged learner microbatch.
 
-Every iteration should report:
+Do not capture the complete rollout iteration: scheduler choices, realized
+offspring, family mixtures, layer widths, completion counts, and distributed
+control are genuinely dynamic.
 
-- family capacity, realized tail, ready high water, and maximum pending span;
-- per-family head/tail depth and age;
-- direct dequeued rows and bytes by column;
-- child rows by destination;
-- stable-route scan and append bytes;
-- rejection attempts, exhaustion flags, and time;
-- materialization/chance-close CUDA time;
-- time hidden under model work and exposed append time;
-- model calls, rows, realized token width, padded tokens, and token pairs;
-- chance generations and maximum chance frontier;
-- topology/action/leaf capacity and realized counts;
-- fixed failure status, code, phase, logical address, requested/available
-  extent, and operation-specific workspace capacity/high water;
-- flattening time, layer count, pre/post rows per layer, maximum adjacent-layer
-  workspace bytes, $H\to K$ projection rows/time, and maximum/mean degree;
-- target rows/s, action-target rows/s, CUDA launches and kernel time per layer, and
-  persistent pre/post flattened-tree bytes;
-- learner decision rows, exact flattened child rows, segmented-reduction time,
-  and maximum-action padding rows, which must remain zero;
-- CUDA graph hits/misses and uncaptured fallbacks during development;
-- graph-owned bytes and the batch-width delta versus uncaptured execution;
-- peak allocated/reserved/NVML bytes by phase;
-- allocator activity after rollout initialization;
-- exact work counts, targets, losses, and gradients.
+A capture is retained separately per supported hardware profile only when a
+paired end-to-end benchmark includes graph pools, warmup, recapture, tails,
+and batch-width effects and still wins. On the 2080 Ti, reject a capture that
+reduces the largest valuable forward or backward width. H100 may use more
+aggressive capture and overlap, but it receives no semantic or storage variant.
 
-Add an early-pack/late-pack comparison. A core acceptance invariant is that
-equal-shape family processing cost does not grow with accumulated topology
-extent.
+Persistent kernels, additional streams, degree bucketing, and learner
+elementwise fusion obey the same rule: one accepted production choice after
+measurement, not a permanent fallback matrix.
 
-## Correctness tests
+## Acceptance requirements
 
-### All modes
+### Correctness
 
-- identical logical RNG keys under different physical batch widths;
-- identical sampled events and public states for fixed keys;
-- identical retained natural inputs and old outputs;
-- exact FIFO insertion order;
-- identical queue count and identity under different street mixtures;
-- no street-, board-width-, or token-width-specific physical queue;
-- stable-prefix width planning never skips an older row;
-- no read from pending or processed family rows;
-- direct-prefix alias and stride checks;
-- capacity failure before partial publication;
-- deterministic first-failure records under different physical pack widths;
-- no allocator activity after the admitted phase workspaces are initialized;
-- stopped children appear only in final completion-ready or normal-reward leaf
-  rows, never in an intermediate occurrence or reach owner;
-- no CPU numerical target or rollout tensor staging; the one declared bulk
-  scalar-topology flattening transfer is allowed;
+All modes must prove:
+
+- identical logical RNG identities and sampled objects under different legal
+  pack widths;
+- exact FIFO order and semantic queue count under every street mixture;
+- no read from pending or processed rows;
+- direct natural-input family prefix alias/stride correctness;
+- no duplicate public-state, history, or active-reach owner for an ordinary
+  player row;
+- deterministic transaction commit and minimum-logical-address failure
+  reporting;
+- no partial destination publication;
+- no PBG-owned steady-state allocator growth;
+- direct final leaf capture;
+- targets are complete before seal publication;
+- exact seal extents and stable row mappings;
+- full rollout/target topology is absent during optimization;
 - clean CUDA teardown.
 
-### Sequential
+Mode-schema tests additionally prove that sampled natural inputs contain the
+realized exact $x_p$, sampled targets have no private-state axis or posterior
+row, RB natural inputs omit $x_p$, and branched RB commits no true profile to a
+family row. `hot.true_profile` is present in the other three combinations.
 
-- no reroll or replacement after admission;
+Sequential modes additionally prove:
+
 - one private profile per trajectory;
-- exact trajectory decision order and leaf association;
-- identical normal rewards and sequential-RB completion inputs;
-- capacity failure checkpoints and stops.
+- exact decision chronology and leaf association;
+- no reroll or replacement after admission;
+- equality to `\eqref{eq:sequential-lambda-return}` or
+  `\eqref{eq:rao-blackwell-lambda-return}`.
 
-### Branched
+The shared-response probe additionally proves that selected-seat rows alone
+reach retained learner storage, opponent natural inputs occupy the ordinary
+row-aligned input column before seal but are deleted by seal, and mixed-model
+subspans preserve FIFO order.
 
-- one distinguished root;
-- ordinary randomized root degree;
-- duplicate events retained as distinct children;
-- sibling logical draws remain independent;
-- every source `ActionProbability` span matches its decision's
-  target-eligible child prefix in event and child-ordinal order;
-- nominal/executed count correction;
-- protected root refill metadata;
-- whole-attempt-only capacity recovery;
-- exact topology, targets, and controller observations;
-- flatten permutation and inverse cover every realized node exactly once;
-- every nonroot flattened row has a parent in the preceding layer;
-- every flattened node belongs to exactly one `pre` or `post` target block;
-- preflop completion and `pre <- post` boundary rows agree with a reference
-  class aggregation of exact-hand mass and moment;
-- class aggregation preserves each player's summed moment and therefore the
-  all-player Monte Carlo value vector and trace calculation;
-- every parent recurrence reads only completed child rows;
-- pair $(\sigma,a)$ outputs are written only at child row $\sigma a$;
-- final preflop posterior, advantage, value, and loss rows have width $K$;
-- final postflop posterior, advantage, value, and loss rows have width $H$;
-- numerical target launch count equals the number of non-leaf dependency
-  layers for the initial mixed-domain kernel;
-- all-node mass, moment, value-vector, cost, and $\Delta$ allocations are
-  absent; their workspace high water matches the admitted adjacent-layer plan;
-- adversarial high KKT degree does not change any dense allocation width;
-- layered-kernel output agrees with a small-tree scalar reference;
-- branched learner subspans execute exactly their flattened target-child rows;
-- one adversarial high-degree decision changes realized pair work but does not
-  create a maximum-action allocation or inactive event evaluation.
+Branched mode additionally proves:
 
-### Fused sampler
+- one distinguished root with ordinary randomized rounding;
+- protected refill semantics;
+- independent per-child posterior profiles in branched RB;
+- the declared carried-true-profile law in sampled branched geometry;
+- duplicate events retained as distinct nodes;
+- exact nominal/executed counts;
+- whole-attempt-only recovery;
+- every flattened source node appears exactly once;
+- every child lies in the next root-depth layer;
+- stable sibling spans after flattening;
+- every retained player node writes exactly one pre/post `SigmaTarget` row;
+- every retained target-eligible sampled action writes exactly one pre/post
+  `ActionTarget` row;
+- retained action inputs, `ActionTarget` rows, and target-eligible child
+  prefixes have identical order;
+- RB preflop $H\to K$ aggregation agrees with the approved reference;
+- RB `m_hat` remains a posterior-weighted moment, never a probability mass;
+- sampled `LayerWork`, `SigmaTarget`, and `ActionTarget` have no private-state
+  axis and no `p_hat`;
+- layer outputs agree with a small scalar `BranchedValue` reference;
+- `t_hat` validity equals `target_degree >= 2`;
+- no retained $\widehat Q$, all-node/all-player posterior, trace-validity
+  mask, all-node `m_hat`, or maximum-action allocation;
+- `SigmaTarget` and `ActionTarget` contain no topology, natural input, action,
+  or old-model output.
 
-- exact evaluator contract and version reporting;
-- row-local RNG invariance to pack order and neighboring rows;
-- identical accepted profile distribution to the sibling reference;
+Sampler integration proves:
+
+- one canonical branched-RB sampler version and RNG contract;
 - collision and board legality;
-- deterministic exhaustion reporting;
+- row-local invariance to pack order and neighboring rows;
+- distributional agreement with the sibling public sampler;
+- deterministic bounded exhaustion reporting;
 - zero-support and nearly degenerate ranges;
-- $P=2,\ldots,6$ and $R=4,\ldots,13$;
-- no silent rejected lane.
+- zero rollout rejection-sampler calls in sequential sampled, sequential RB,
+  and sampled branched modes;
+- coverage for $P=2,\ldots,6$ and $R=4,\ldots,13$.
 
-### Numerical reach
+Sequential RB additionally proves that a completion posterior is stored once
+per required `(trajectory, player, target partition)`, every decision
+reference resolves to that row, and the implicit-action advantage is derived
+rather than stored.
 
-- log-versus-linear reference comparisons across long legal trajectories;
-- support masks preserved exactly;
-- per-seat positive mass;
-- posterior/profile distribution agreement;
-- completion target agreement;
-- finite model inputs;
-- loss and gradient agreement within predeclared fp32 tolerance.
+Linear reach acceptance covers long legal trajectories, exact support masks,
+extreme probabilities, short decks, profile distributions, completion
+outputs, targets, losses, and gradients against the log-reach reference.
 
-## Benchmark matrix
+### Performance
 
-Run on idle CUDA devices with explicit targeting and clean teardown:
+Acceptance uses paired production-path measurements with fixed logical seeds,
+not kernel microbenchmarks alone.
 
-1. HU 32 bb, $R=13$, normal.
-2. HU 32 bb, $R=13$, sequential RB.
-3. HU 32 bb, $R=13$, fixed branched RB at the recorded baseline geometry.
-4. HU 32 bb dynamic branching before and after warmup.
-5. HU short deck with $R=4$ and $R=8$.
-6. Six-player shallow and 128 bb stress configurations.
-7. Tiny-tree refill and large-tree drainage cases.
-8. Family-skew cases near each configured capacity.
-9. Rejection-sampler high-attempt and exhaustion injection.
-10. Mixed flop/turn/river FIFO heads at $P=2$ and $P=6$.
-11. Deep, bushy, and single-high-degree target topologies with equal node
-    counts.
+Required invariants are:
 
-Report per seed:
+- no sequential-RB regression outside measurement noise;
+- equal-shape family processing time does not grow with accumulated topology;
+- zero family dequeue payload gathers;
+- zero historical page/chunk scans;
+- no Python chance-generation loop;
+- no CPU numerical node/action target loop;
+- initial target launch count equals the number of non-leaf dependency layers;
+- zero learner maximum-action padding;
+- zero accepted-baseline OOM retries;
+- complete phase peaks fit the declared ledger and guard.
 
-- rollout seconds/player decision;
-- rollout seconds/total node;
-- end-to-end decisions/s;
-- exact work and model/evaluator rows;
-- phase peaks;
-- family capacity utilization;
-- exposed versus overlapped append time;
-- early versus late pack cost;
-- width-planner saved token pairs versus added partial launches;
-- target flatten time, pre/post rows per layer, $H\to K$ time, adjacent-layer
-  workspace high water, layer-kernel time, rows/s, launches, and exact bytes;
-- captured versus uncaptured batch width and end-to-end throughput;
-- postflop exact-hand and preflop class-aggregated target/gradient agreement.
+Report at minimum:
 
-## Proposal summary
+- decisions/s and nodes/s by mode;
+- model, sampler, materialization, chance, target, and learner time;
+- early-pack versus late-pack cost;
+- family capacities, realized tails, ready high water, and skew;
+- compact model widths and saved token pairs;
+- sampler attempts and failures;
+- descriptor, route, and final-write bytes;
+- layer sizes, $K/H$ rows, degree distribution, and target rows/s;
+- exact persistent and adjacent-layer target bytes;
+- learner decision/edge counts and segmented-reduction time;
+- allocated, reserved, graph-owned, and NVML peaks by phase;
+- captured versus eager batch width and end-to-end throughput.
 
-The architecture is:
-
-> `FamilyWork` is the sole hot player-occurrence owner; its stable contiguous
-> prefixes are the model packs; child kernels route directly into destination
-> tails; chance closure is device-resident; queue identity never depends on
-> poker street; and branched targets execute deepest-to-root on one persistent
-> layer-flattened output tree with $K$-wide preflop and $H$-wide postflop
-> blocks, child-row action outputs, and an adjacent-layer numerical workspace.
-
-For HU, the memory price of a 25,000-row exact-reach capacity is modest. For
-higher player counts, the schema-derived phase planner—not a multiplication of
-street queues—must admit the exact bytes. The potential reward is removal of
-the physical distinction that currently makes branched cost grow with its
-accumulated tree. Sequential mode receives the same direct, allocation-free
-queue engine without branched-only fields or sampling work.
-
-The design should aim for a world in which branching is slower only because it
-samples and learns from a larger stochastic object—not because every later
-family pack pays to rediscover where its state and reach were stored.
+Benchmark both hardware profiles on representative normal, sequential-RB,
+fixed-branched, dynamic-branched, short-deck, multiplayer, deep-stack, family
+skew, refill, mixed-street, sampler-stress, and bushy/high-degree target cases.
+The exact matrix belongs in the run manifest rather than being duplicated
+here.
 
 ## Implementation phases
 
-Every phase below ends in one production-ready implementation: fixed-seed
-correctness, hard-ceiling memory admission, CUDA benchmarks, failure cleanup,
-and deletion of the code it supersedes. Temporary evaluation scaffolding does
-not survive phase acceptance, and the production tree has no compatibility
-switch.
+Every accepted phase leaves one production implementation for the behavior it
+replaces. Temporary adapters and evaluation scaffolding are deleted at the
+phase gate; no compatibility switch survives final acceptance.
 
-### Phase 0: freeze contracts and measurements
+### Phase 0: freeze contracts and baselines
 
-- Record current rollout, completion, target, forward, backward, and optimizer
-  timings on the fixed benchmark matrix.
-- Record street mixtures inside each semantic FIFO, prefix widths, partial
-  batch counts, target layer candidates, degree histograms, and phase peaks.
-- Freeze the flattened topology, `ActionProbability` source, pre/post target
-  blocks, adjacent-layer workspace, `FamilyWork`, and exact memory-accounting
-  schemas.
-- Freeze the device failure record and every operation-specific workspace
-  schema, capacity, lifetime, and publication boundary.
-- Obtain the required authoritative decision on class-native preflop RB
-  targets/losses and the $H\to K$ mass/moment aggregation before implementing
-  the target replacement.
-- Decide the required authoritative capacity/lifetime amendment before the
-  monotone `FamilyWork` replacement. Phases 1--3 do not require that rollout
-  storage change.
+- Record current rollout, completion, target, learner, optimizer, memory, and
+  batch-width measurements on both hardware profiles.
+- Freeze generated schemas for `FamilyWork`, `SequentialTargetTree`,
+  `FlattenedTargetTree` and its sidecars, `SequentialPosterior`,
+  `LearnerIndex`, `SigmaTarget`, `ActionTarget`, leaves, failure records, and
+  every bounded workspace.
+- Obtain approval for monotone total-work slabs, single-copy natural-input
+  ownership, and class-native preflop targets/losses.
+- Freeze canonical names and their direct `core_math.tex` mappings.
+- Define deterministic issue, reservation, commit, and failure ordering.
 
-Stable result: unchanged production behavior with enough evidence to detect
-cost migration or a reduction in feasible training batch width.
+Gate: unchanged production behavior with complete phase ledgers and stable
+baselines capable of detecting cost migration.
 
-### Phase 1: replace branched target execution first
+### Phase 1: replace branched target execution
 
-- Implement the deterministic topology-only flattener using one bulk
-  structural host transfer.
-- Allocate the persistent $K$-wide preflop and $H$-wide postflop output blocks,
-  populate old action/value rows, and admit the exact maximum-adjacent-layer
-  workspace.
-- Seed leaf rows through the bounded completion service, aggregating
-  exact-hand mass/moment to classes for preflop-domain leaves.
-- Implement one mixed-domain custom CUDA target launch per non-leaf
-  root-depth layer, including `pre <- pre`, `pre <- post`, `post <- post`,
-  player/chance recurrence, $T/C/\Delta$, and direct child/decision target
-  writes.
-- Make the flattened tree the final learner target owner, then delete
-  `plan_branched_frontier`, the Python ready/slot allocator, and the per-parent
-  and per-action target loops.
+- Implement deterministic full root-depth topology flattening.
+- Allocate exact pre/post `SigmaTarget` and `ActionTarget` blocks.
+- Allocate estimator-generated adjacent-layer workspace: scalar sampled
+  recurrence, or pre/post RB `p_hat`, `m_hat`, and shared
+  `v_vector_hat`/`c_lambda_hat_work`/`delta`.
+- Seed leaves through bounded completion, including approved $H\to K$
+  aggregation.
+- Implement deepest-to-root mixed-domain layer kernels.
+- Write player-node outputs only to `SigmaTarget` and sampled-action outputs
+  only to `ActionTarget`.
+- Delete the Python ready/slot allocator and per-parent/per-action numerical
+  loops.
 
-Stable result: postflop targets agree with the prior exact-hand reference;
-preflop targets, losses, and gradients agree with an approved class-aggregated
-reference; controller observations agree; temporary bytes follow adjacent
-layer width rather than $N$; and numerical target launch count equals the
-number of non-leaf root-depth layers.
+Gate: exact agreement with approved scalar references, one initial numerical
+launch per non-leaf depth, exact target output extents, and workspace high
+water equal to the admitted adjacent-layer plan.
 
-### Phase 2: make flattened action outputs end-to-end
+### Phase 2: make retained action inputs and targets final
 
-- Use exact partition-local `ActionProbability[m]` source rows during rollout,
-  with every decision span aligned to its target-eligible child prefix.
-- During flattening, populate event and old log probability into the
-  corresponding child rows, validate the mapping, and release
-  `ActionProbability` before numerical targets.
-- Make learner sampling derive exact action rows only from flattened
-  `child_begin` and `target_degree`; no final `action_ptr`, action-table owner,
-  target compaction, or maximum-action dimension survives.
-- Remove the Phase 1 source-conversion adapter and every superseded
-  child/action payload schema.
+- Reserve exact `FamilyWork.retained` action spans aligned with target child
+  order.
+- Keep `action` and `old_log_pi` solely in those retained input rows.
+- Write `a_lambda_hat`, and in RB `p_hat`, solely to `ActionTarget`.
+- Write decision value/T/C outputs, and in RB decision posterior outputs,
+  solely to `SigmaTarget`.
+- Remove pre-target action compaction and target-layout conversion,
+  all-node persistent posterior, edge-validity masks, and trace-validity
+  masks. Post-target best-response row deletion remains part of seal.
+- Convert the learner to exact flattened child spans and segmented reductions.
 
-Stable result: `ActionProbability` is a rollout-to-flatten source only, while
-the persistent flattened child row is the sole final action-output and learner
-identity, including adversarial KKT degrees.
+Gate: `FlattenedTargetTree` is the sole action identity/mapping owner during
+target creation, `LearnerIndex` is its sole reduced successor after seal,
+`FamilyWork.retained` is the sole old action-input owner, `ActionTarget` is
+the sole action-target owner, and no maximum-action dimension remains.
 
 ### Phase 3: add minimal-padding FIFO planning
 
-- Keep exactly the semantic `pre` and `post_A` queues.
-- For the next FIFO head, compare the largest memory-feasible mixed prefix with
-  consecutive width-transition cut points.
-- Compact legal hand rows only to the selected prefix width, charge each
-  additional launch in the planner, and use validity masks for small tails.
-- Accept only an end-to-end win with unchanged FIFO order and no decrease in
-  feasible forward/backward batch size.
+- Preserve exactly `pre` and `post_A` semantic families.
+- Compare the largest feasible stable mixed prefix with consecutive
+  public-width transition cuts.
+- Use one bounded compact model pack and charge added launches against saved
+  token work.
+- Reject any plan that reorders FIFO rows or reduces feasible learner width
+  without an end-to-end win.
 
-Stable result: most river-heavy branching benefit without another queue,
-capacity estimate, scheduler family, or graph family.
+Gate: improved branched throughput on river-heavy queues without a new queue,
+capacity estimate, retained layout, or learner partition.
 
-### Phase 4: replace sequential hot rollout ownership
+### Phase 4: replace sequential hot ownership
 
-- Implement schema-derived `FamilyWork` slabs, monotone
-  head/reserved/ready cursors, exact byte accounting, and async publication.
-- Make sequential normal and RB model packs direct FIFO prefix views while
-  retaining their current event/profile calls initially.
-- Seal exact immutable prefixes and release rollout slabs before targets.
-- Remove the sequential occurrence queue, dequeue staging, hot reach/state
-  gathers, and superseded schemas after the no-regression gate passes.
+- Allocate monotone schema-derived `FamilyWork` slabs.
+- Put every player occurrence's natural input in one row-aligned retained
+  column, including frozen best-response opponents; allocate no separate
+  public-state, history, active-reach, or hot-input column.
+- Implement direct prefix views and deterministic reserve/ready publication.
+- Run sampled sequential and sequential RB through the shared transaction
+  protocol while
+  keeping their existing event/profile operations initially.
+- Run the shared-response probe through the same slabs, with selected rows
+  marked trainable and opponent rows marked for later deletion.
+- Close rollout publication, build `SequentialTargetTree`, create all
+  sequential targets, and store each RB completion posterior once in
+  `SequentialPosterior`; allocate no `ActionTarget`.
+- Derive sequential implicit-action advantages from `v_lambda_hat - old_v`;
+  retain no sequential advantage array.
+- Seal only after target creation, deleting hot columns and stable-compacting
+  selected rows in best response; retain no opponent learner input or probe
+  control.
+- Delete the sequential occurrence queue, separate active-reach handles,
+  payload staging, and superseded hot schemas.
 
-Stable result: the simpler modes prove the cursor, lifetime, failure, and seal
-protocol without paying for branched-only columns.
+Gate: direct-prefix correctness, clean capacity-stop behavior, exact sequential
+targets, selected-only probe storage, and no throughput regression.
 
 ### Phase 5: replace branched hot ownership and routing
 
-- Store all live branched state, history, reach, controller scalars, and node
-  identity directly in `FamilyWork`.
-- Reserve cold CSR child spans and exact `ActionProbability` spans before
-  random draws.
-- Route children through the stable single-CTA path or bounded multi-block
-  scan path directly into semantic family, leaf, or chance destinations.
-- Remove the occurrence arena, active-reach pool, handle queues, paged hot
-  topology access, per-destination sorts, and branched compatibility fields.
+- Split `FamilyWork` fields strictly by hot and retained lifetime, including
+  retained action inputs and target-only `old_t`/`old_c`.
+- Reserve topology and exact edge spans before draws.
+- Implement descriptor-first stable routing and direct Stage 2 destination
+  writes.
+- Implement deterministic multi-destination transaction commit.
+- Delete the occurrence arena, separate active-reach pool, handle queues, hot
+  topology pages, per-destination payload sorts, and compatibility columns.
 
-Stable result: later equal-shape packs cost the same as early packs, one failed
-attempt publishes nothing partial, and the production path has no indirect hot
-owner.
+Gate: equal-shape early and late packs have equal cost, failed attempts publish
+nothing, and no indirect hot owner survives.
 
-### Phase 6: fuse stochastic materialization and chance closure
+### Phase 6: fuse sampling and chance closure
 
-- Add the sibling-owned no-allocation sampler device ABI, or its
-  `sample_joint_profiles_into` fallback.
-- Fuse player sampling, event selection, transition, reach update,
-  classification, `ActionProbability` writes, and direct routing at the
-  boundaries specified above.
-- Write stopped children directly into the final completion-binding or normal
-  reward leaf schema and publish the leaf span only after every column commits.
-- Keep chance generations device-resident and report exhaustion once at the
-  declared control boundary.
-- Remove intermediate profile tensors, Python chance-generation loops, and
-  redundant state/reach traffic.
+- Factor one canonical branched-RB sampler device core shared with the sibling
+  evaluator.
+- Invoke that core only in branched-RB Stage 1 without a newly allocated
+  profile tensor; use `hot.true_profile` in the other three combinations.
+- Fuse sampled action/chance event, compact transition/classification, and
+  chance-continuation descriptor production.
+- Keep chance generations device-resident.
+- Write stopped children directly into final leaf schemas.
+- Remove Python sampler exhaustion boundaries, intermediate combo/profile
+  tensors, and Python chance loops.
 
-Stable result: allocation-free dequeue-to-enqueue execution with exact logical
-RNG identities and evaluator-equivalent sampling.
+Gate: evaluator-equivalent branched-RB distributions and failures, zero
+rejection-sampler calls in the other combinations, allocation-free
+dequeue-to-enqueue execution, and bounded device-resident chance closure.
 
-### Phase 7: add selective graphs, overlap, and learner fusion
+### Phase 7: select reach, graphs, overlap, and learner fusion
 
-- Capture only repeated fixed-address units that beat eager execution
-  end-to-end.
-- Add stream overlap between a ready family forward and independent
-  materialization/append work.
-- On 2080 Ti, do not retain captures whose memory pools reduce forward or
-  backward batch width. On H100, retune graph quanta and concurrency for
-  throughput.
-- Profile the layered target engine before considering bucketed layer capture;
-  never replace it with a whole-tree dynamic graph.
-- Fuse learner elementwise/reduction work after rollout and target peaks are
-  stable. Replace the fixed-width branched action expansion with exact
-  flattened-child gathers and segmented decision reductions, remove
-  `max_actions_per_decision`, then retune forward/backward batches.
+- Accept linear or log natural-input range weights from numerical and
+  end-to-end evidence, then delete the rejected production representation.
+- Capture only fixed-address units that beat eager execution on the relevant
+  hardware profile.
+- Add deterministic stream overlap where it hides exposed work.
+- Profile layer specialization before adding a small fixed variant set.
+- Fuse learner elementwise and segmented-reduction work only when it removes
+  materialized intermediates and improves complete optimization time.
 
-Stable result: graphs and fusion are removable performance choices over the
-same storage contract, with captured bytes, batch-width effects, and
-end-to-end wins recorded explicitly.
+Gate: each retained optimization has measured end-to-end value, charged
+workspace bytes, unchanged semantics, and no harmful 2080 Ti batch-width
+reduction.
 
 ### Phase 8: deletion and production audit
 
 - Prove every production and evaluation entry point uses the replacement
-  owners, class-native preflop targets, persistent flattened output tree, and
-  layered CUDA target path.
+  owners and target engine.
+- Amend authoritative theory/pseudocode for the accepted contract changes.
 - Delete obsolete allocators, schemas, staging conversions, configuration
   fields, tests, and stale implementation documentation.
-- Re-run the full CUDA correctness and benchmark matrix on idle devices,
-  verify clean teardown, and establish separate accepted 2080 Ti and H100
-  tuning profiles without changing semantics.
+- Run the complete CUDA correctness and benchmark manifests on idle devices
+  with explicit targeting and clean teardown.
+- Establish separate accepted 2080 Ti and H100 physical tuning profiles over
+  the same semantics and storage contract.
 
-Stable result: one production architecture, no dormant fallback, semantic
-queue cardinality, exact phase lifetimes, and measurements that explain every
+Gate: one production architecture, semantic queue cardinality, exact phase
+lifetimes, no dormant fallback, and measurements accounting for every
 remaining branched/sequential throughput gap.
