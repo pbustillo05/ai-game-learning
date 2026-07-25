@@ -200,16 +200,17 @@ There is no `post <- pre`.
 Let $\sigma$ be a player-node occurrence and let $\sigma a$ be one sampled action occurrence at that player node.
 
 - `FamilyWork` is **sigma-indexed**: every row represents one $\sigma$.
-- `ActionOccurence` is **action-indexed**: every row represents one
-  $\sigma a$.
+- `ActionOccurence` is **action-indexed** and exists only in branched
+  geometry: every row represents one $\sigma a$.
 - `SigmaTarget` is sigma-indexed over trainable $\sigma$ rows.
 - `ActionTarget` is action-indexed over target-eligible $\sigma a$ rows.
 
 Every sigma row that owns action rows points to one exact contiguous action span. No padded
 `[decision,max_actions,...]` array exists.
 
-Sequential geometry has exactly one retained sampled action per $\sigma$. Its action occurrence can therefore occupy
-the corresponding sigma row. Branched geometry has a ragged action span of exact `target_degree`.
+Sequential geometry has exactly one retained sampled action per $\sigma$, so `action` and `old_log_pi` occupy the
+corresponding `FamilyWork` sigma row. Branched geometry instead uses a ragged `ActionOccurence` span of exact
+`target_degree`.
 
 Below, `TreeTopology` is the append-only branched rollout structure, `SequentialTargetTopology` is the sequential
 decision chronology, and `FlattenedTargetTopology` is the depth-major branched target structure. The last two were
@@ -240,9 +241,11 @@ Allocate:
 
 ```text
 FamilyWork[input_type]
-ActionOccurence[output_type]
+ActionOccurence[output_type]                  # branched only
 TreeTopology                              # branched only
 Leaf[terminal output_type]
+DependencyStore                           # game-declared immutable dependencies only
+QueueBehaviorMetadata                     # queue-pressure safeguard only
 DeviceFailure
 
 descriptor workspace
@@ -261,7 +264,7 @@ $$
 
 The game/estimator terminal-boundary rule assigns each stopped child its output type; unlike
 $\operatorname{output}(i)$, this assignment does not imply that the stopped child owns a model-input row.
-There is one `FamilyWork` slab per $i\in\mathcal I$, one `ActionOccurence` slab per applicable
+There is one `FamilyWork` slab per $i\in\mathcal I$, in branched geometry one `ActionOccurence` slab per applicable
 $o\in\mathcal O$, and one `Leaf` slab only per $o\in\mathcal O_{\rm term}$. The notation
 `Leaf[terminal output_type]` means exactly this restriction; there is no leaf allocation for a nonterminal-only
 output block. Every row gets its final address when created, and addresses are not recycled within an admitted
@@ -297,6 +300,8 @@ FamilyWork[input_type]
     x_p                                   # sampled only
     owner
     old_v[size[output(input_type)]]
+    action                                # sequential only
+    old_log_pi[size[output(input_type)]]  # sequential only
     old_t                                 # branched only
     old_c                                 # branched only
 ```
@@ -308,7 +313,7 @@ state, history, range representation, and immutable dependency references.
 The realized $x_p$ is a separate retained column only for the sampled private-state estimator; it is not part of
 `natural_input`.
 
-`ActionOccurence[output_type]` contains:
+In branched geometry, `ActionOccurence[output_type]` contains:
 
 ```text
 ActionOccurence[output_type]
@@ -316,10 +321,9 @@ ActionOccurence[output_type]
   old_log_pi[size[output_type]]
 ```
 
-In branched geometry, each trainable sigma row reserves one exact contiguous `ActionOccurence` span before draws.
-Sequential geometry has one implicit action row per sigma row. For a sigma row in `FamilyWork[i]`, its action rows
-reside in `ActionOccurence[output(i)]`; refinement guarantees that their numerical width is
-`size[output(i)]`.
+Each trainable branched sigma row reserves one exact contiguous `ActionOccurence` span before draws. For a sigma row
+in `FamilyWork[i]`, its action rows reside in `ActionOccurence[output(i)]`; refinement guarantees that their numerical
+width is `size[output(i)]`.
 
 In branched geometry, `TreeTopology` is append-only and node-indexed:
 
@@ -351,6 +355,17 @@ and `old_t`/`old_c`, but no learner sigma or action rows.
 currently uses normalized linear range weights. If tests require log weights, they replace the one production schema
 rather than become a fallback.
 
+`DependencyStore` exists only when a game schema contains immutable dependency references. In poker it owns folded
+summaries. A dependency receives a final source address when created; descendant `natural_input` rows retain only its
+reference. Seal finds dependencies reachable from surviving learner rows, copies each reachable dependency once into
+an exact immutable extent, remaps those references, and releases the source store and unreachable rows. The compact
+dependency extent survives until the last model-input consumer.
+
+`QueueBehaviorMetadata` is a separate fixed owner, not a `FamilyWork` column or target field. When the queue-pressure
+safeguard is enabled, it maintains the existing frontier-cost forecast and controller counters. Enqueue adds the
+required C-head contribution and dequeue removes that same contribution under the existing queue law; any cached
+per-entry contribution is private queue-manager bookkeeping.
+
 ## 3. Rollout: assign and fill final rows
 
 ### 3.1 Mode laws
@@ -377,13 +392,13 @@ response is authoritative.
 
 For the next stable `input_type` prefix:
 
-1. Reserve child identities, logical child spans, topology rows, and exact
-   action spans before random draws.
+1. Reserve child identities and, in branched geometry, logical child spans, topology rows, and exact action spans
+   before random draws.
 2. Run the role-selected model directly on the `input_type` prefix.
-3. Write `old_v` for trainable sigma rows; write `old_t` and `old_c` for every
-   branched player row.
-4. Sample actions and immediately fill their reserved `ActionOccurence`
-   rows with `action` and `old_log_pi`.
+3. Write `old_v` for trainable sigma rows; in sequential geometry write the selected `action` and `old_log_pi` in
+   those same rows; write `old_t` and `old_c` for every branched player row.
+4. In branched geometry, sample actions and immediately fill their reserved `ActionOccurence` rows with `action` and
+   `old_log_pi`.
 5. Produce lightweight child descriptors and classify destinations.
 6. Compute stable destination offsets and reserve exact `FamilyWork`, `Leaf`,
    or bounded chance-frontier spans.
@@ -477,14 +492,13 @@ Each array has one exact extent per applicable `output_type`.
 `SigmaTarget` has one row per trainable $\sigma$; `ActionTarget` has one row per target-eligible branched $\sigma a$.
 In best response, these are exclusively exploiter-owned rows; frozen-player nodes receive neither target. Target
 address assignment already follows the stable order that seal will use. `SigmaTarget` and `ActionTarget` contain only
-numerical target outputs. `ActionOccurence` remains a separate input owner through optimization rather than being
-copied into a target array.
+numerical target outputs. In branched geometry, `ActionOccurence` remains a separate input owner through optimization
+rather than being copied into a target array.
 
 Generated target contents are:
 
 ```text
 SigmaTarget[output_type]
-  p_hat[size[output_type]]                  # branched RB only
   v_lambda_hat[size[output_type]]
   t_hat                                     # branched only
   c_lambda_hat                              # branched only
@@ -500,7 +514,8 @@ SequentialPosterior[output_type]             # sequential RB only
 Sampled targets are scalar. RB value/posterior fields have width `size[output_type]`, while the `old_v` row in
 `FamilyWork[input_type]` has width `size[output(input_type)]`. Sequential RB stores posterior mass once for each
 trajectory, player, and `output_type`, and derives advantage as `v_lambda_hat - old_v` within the common output
-domain.
+domain. Branched RB does not duplicate a posterior row in `SigmaTarget`: the sigma posterior used by value, entropy,
+and reference-KL losses is the exact mean of its target-eligible `ActionTarget.p_hat` rows.
 
 ### 4.1 Sequential target topology
 
@@ -531,7 +546,7 @@ FlattenedTargetTopology                    # branched only
 
   node
     TreeTopology.node columns
-    output_type
+    output_type                              # present for every structural node
 
   player
     TreeTopology.player columns
@@ -552,6 +567,10 @@ FlattenedTargetTopology                    # branched only
 Every child enters the next depth layer; sibling and target-action spans remain stable and contiguous. Frozen
 best-response players keep structural/control rows but no learner mapping. Flattening permutations are scratch; a bulk
 CPU scalar rebuild is acceptable until measurements justify a device stable sort.
+
+The `output_type` on every structural node selects its numerical `LayerWork` block. Each parent recurrence therefore
+knows both child and parent domains and applies the declared conversion (`post <- post`, `pre <- pre`, or
+`pre <- post`) without requiring a target row on that node.
 
 `LayerWork` holds only two adjacent depth layers:
 
@@ -603,8 +622,8 @@ ragged parent and:
 
 1. reduces child value, cost, delta, and in RB mass/moment;
 2. writes the parent's alternating `LayerWork` row;
-3. writes sigma-indexed value, T, C, and optional posterior outputs;
-4. writes each action-indexed advantage and optional posterior output;
+3. writes sigma-indexed value, T, and C outputs;
+4. writes each action-indexed advantage and optional RB posterior output;
 5. bootstraps acting-player moment/value with `old_v`;
 6. bootstraps cost with `old_c`;
 7. uses `old_t` as $T^*$ only when `target_degree == 1`;
@@ -626,13 +645,13 @@ stable order, so alignment is construction-time bookkeeping rather than a target
 1. Delete all `FamilyWork.hot` columns.
 2. In best response, stable-delete frozen-opponent `FamilyWork` and sigma rows.
 3. Stable-compact surviving `FamilyWork.retained` rows and seal
-   `ActionOccurence` into exact immutable extents.
+   branched `ActionOccurence` into exact immutable extents.
 4. Within each `output_type`, use one deterministic concatenation of its
    contributing `input_type` subspans. A base offset then aligns each sealed
    `FamilyWork[input_type]` row with its `SigmaTarget` row without a per-row
    mapping. Align branched `ActionOccurence` rows one-for-one with
-   `ActionTarget`; in sequential geometry align the unique occurrence with its
-   sigma row.
+   `ActionTarget`; sequential `action` and `old_log_pi` are already columns of
+   the aligned sigma row.
 5. Preserve, for every sigma row, the pointer and exact count of its
    contiguous $\sigma a$ rows in every action-indexed array.
 6. After any root refill, compute final partition-local decision masses.
@@ -640,7 +659,8 @@ stable order, so alignment is construction-time bookkeeping rather than a target
    release transient path/controller factors.
 7. Reduce sequential or flattened topology to `LearnerIndex`.
 8. Validate every alignment and action span.
-9. Release source slabs, full topology, construction maps, and seal scratch.
+9. Compact and remap reachable game dependencies, then release source slabs, source dependencies, full topology,
+   construction maps, and seal scratch.
 10. Atomically publish the complete immutable training store.
 
 `LearnerIndex` retains only posterior references, exact action spans, target degree, sampling mass, and structural
@@ -667,16 +687,17 @@ edge_to_local_decision[E_J]
 
 $E_J$ is the exact sum of action-span lengths. Admission constrains both sigma and edge counts.
 
-Sequential work gathers the unique `action` and `old_log_pi` from sealed `ActionOccurence` and derives advantage from
-`SigmaTarget.v_lambda_hat - FamilyWork.old_v`. Branched action work additionally gathers advantage and optional RB
-posterior rows from `ActionTarget`, then segment-reduces to sigma rows. RB value, entropy, and optional reference-KL
-terms use sigma posterior mass. Sampled losses use the retained exact $x_p$. T/C losses use `t_hat` and
-`c_lambda_hat`, structurally gating T by target degree.
+Sequential work reads the unique `action` and `old_log_pi` from its sealed `FamilyWork` sigma row and derives
+advantage from `SigmaTarget.v_lambda_hat - FamilyWork.old_v`. Branched action work additionally gathers advantage and
+optional RB posterior rows from `ActionTarget`, then segment-reduces to sigma rows. Branched RB derives sigma
+posterior mass as the exact mean over each action span; sequential RB reads `SequentialPosterior`. RB value, entropy,
+and optional reference-KL terms use that sigma posterior mass. Sampled losses use the retained exact $x_p$. T/C losses
+use `t_hat` and `c_lambda_hat`, structurally gating T by target degree.
 
 There is no padding, invented safe action, inactive-event evaluation, or `max_actions_per_decision` production API.
 
-After the final optimizer step, release compact `FamilyWork`, sealed `ActionOccurence`, `LearnerIndex`, shared
-posterior rows, `SigmaTarget`, and `ActionTarget`.
+After the final optimizer step, release compact `FamilyWork`, sealed branched `ActionOccurence`, compact game
+dependencies, `LearnerIndex`, shared posterior rows, `SigmaTarget`, and `ActionTarget`.
 
 ## 9. Failure, memory, and execution policy
 
@@ -702,13 +723,25 @@ Branched capacity overflow is a whole-attempt admission failure. All ranks relea
 a disjoint next attempt address, then retry within the configured bound. Sampler exhaustion and evaluator or
 correctness failures remain terminal unless their authoritative contract says otherwise.
 
+For a structure-of-arrays owner $X$ with $N_X$ rows and fields $f$, define
+
+$$
+\operatorname{bytes}(X,N_X)
+=\sum_{f\in X}
+  \operatorname{align}\!\left(N_X\,b_f,a_f\right)
++M_X^{\rm metadata},
+$$
+
+where $b_f$ is the byte width of one field element including its fixed trailing shape and $a_f$ is that column's
+required alignment. Alignment is applied to each allocation, not to a fictitious packed row.
+
 For phase $\phi$, let $\mathcal L_\phi$ be its simultaneously live owners. Admission computes
 
 $$
 M_{\rm required}
 =\max_\phi\left[
   \sum_{X\in\mathcal L_\phi}
-    N_X\,\operatorname{alignedRowBytes}(X)
+    \operatorname{bytes}(X,N_X)
   +W_\phi^{\rm bounded}
   +W_\phi^{\rm external}
 \right]
@@ -722,7 +755,8 @@ maximum of complete phases rather than adding objects with disjoint lifetimes:
 ```text
 rollout
   model/static
-  FamilyWork and ActionOccurence capacities
+  FamilyWork and applicable ActionOccurence capacities
+  source DependencyStore and QueueBehaviorMetadata when applicable
   topology and leaf capacities
   descriptor/routing/chance/inference workspaces
 
@@ -733,11 +767,13 @@ targets
 
 seal
   rollout sources and completed targets
-  exact compact FamilyWork and ActionOccurence destinations
+  exact compact FamilyWork and applicable ActionOccurence destinations
+  source and exact compact dependency extents
   LearnerIndex destination and copy/validation scratch
 
 optimization
-  compact FamilyWork, sealed ActionOccurence, targets, and LearnerIndex
+  compact FamilyWork, sealed applicable ActionOccurence, targets, and LearnerIndex
+  compact game dependencies
   model/reference/optimizer and gradient/collective buffers
   bounded ragged learner workspace
 ```

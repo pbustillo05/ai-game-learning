@@ -1481,6 +1481,16 @@ but the current data path also makes each later bounded pack route through
 more accumulated pages/chunks. Section 15 therefore treats the rollout gap as
 a physical data-handling defect until controlled attribution proves otherwise.
 
+A 2026-07-24 CUDA-event follow-up measured the family-model contribution
+directly on the later working tree. An 84-row postflop forward was about 18
+times slower than an 84-row preflop forward, but the family mix explained only
+53.5% of the matched total wall-time gap (46.9% after normalizing per
+decision). Branched postflop packs were slightly faster per row than normal
+postflop packs, while a material non-model residual remained. Thus the
+postflop architecture is a major cause, but it does not explain the entirety
+of the apparent branching inefficiency. See
+`docs/audit/nlhe_hu_32bb_family_timing_attribution_20260724.md`.
+
 ## 15.4 CUDA phase high-water marks
 
 `Allocated` and `reserved` are PyTorch CUDA high-water marks reset at each
