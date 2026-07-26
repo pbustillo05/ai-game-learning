@@ -1,19 +1,25 @@
 # Queued-training refactor proposals
 
-This folder designs the replacement before theory or production code changes. Current focused proposals are:
+This folder designs the replacement before theory or production code changes.
+[`storage_redesign.md`](storage_redesign.md) defines the storage and lifecycle contract; focused proposals refine its
+game hooks and implementation plan without overriding it:
 
 - [`storage_redesign.md`](storage_redesign.md): fixed-address queued storage and lifecycle.
-- [`poker_rejection_chance_closure.md`](poker_rejection_chance_closure.md): branched-RB sampling and closure.
+- [`poker_branched_rb_sample.md`](poker_branched_rb_sample.md): poker branched-RB implementation of `sample`.
 - [`poker_folded_statistics.md`](poker_folded_statistics.md): folded-state inputs, outputs, and refresh.
 - [`poker_policy_cuda_operator.md`](poker_policy_cuda_operator.md): canonical differentiable policy composition.
-- [`storage_redesign_refactorability.md`](storage_redesign_refactorability.md): migration analysis.
+- [`storage_redesign_refactorability.md`](storage_redesign_refactorability.md): implementation, cleanup, and cutover.
 
 ## Proposed repository boundary
 
-`ai-game-learning` owns rollout rejection sampling, `FoldedRanges`, folded-stat construction, policy composition, RNG,
-chance-card generation, routing, and materialization. `poker-gpu-evaluator` owns operations involving `hand_rank`,
-including showdown and completion. This supersedes current repository and theory ownership notes; those remain
-unchanged until the design is approved.
+`ai-game-learning` owns:
+
+- `sample`: posterior/profile draws, action/chance labels, and topology packets;
+- `commit`: routing, materialization, retained writes, and endpoint patches;
+- `FoldedRanges`, folded statistics, policy composition, RNG, and chance-card generation.
+
+`poker-gpu-evaluator` owns the exact `Leaf -> LayerWork` showdown and completion operations involving `hand_rank`.
+This proposal supersedes current ownership notes after the required theory and interface changes are approved.
 
 ## Configuration and calibration
 
@@ -26,8 +32,8 @@ deferred to kernel tuning. Initial tuning loads existing checkpoints, generates 
 ## Deferred
 
 - Standalone prototype versus full queued-storage implementation scope.
-- General duplicate-node computation and storage reuse.
-- Authoritative theory reconciliation for originating-profile reuse.
+- Duplicate-node computation reuse. Duplicate sampled children always keep distinct logical identities and topology
+  edges.
 
 The workflow is: finish the design here, approve and update theory/ownership contracts, then implement, test,
 benchmark, select hardware tables, and delete superseded production paths.

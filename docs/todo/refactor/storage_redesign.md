@@ -17,6 +17,22 @@ beta_mode             fixed_beta | KKT_beta       # branched only
 
 Mode-inapplicable fields shown below are omitted from the generated schema.
 
+`root_count >= 1` is an independent batch dimension, not a branching degree. Root row $r$ starts one rollout tree
+with local distinguished root $(r,\varnothing)$ and its own intrinsic fields.
+
+Sequential geometry is the specialization
+
+$$
+\beta(\mathsf s)=1
+\quad\Longrightarrow\quad
+N(\mathsf s)=\widetilde N(\mathsf s)=1
+$$
+
+at every node. Branched geometry permits $\beta(\mathsf s)\neq1$ and applies the ordinary branching law to each root.
+Both geometries accept any `root_count`. Multiple statistically identical roots are strongly discouraged in branched
+mode because branching already creates work; use them when roots differ intrinsically, such as sampled
+`true_profile`, stack size, or another model condition.
+
 ### 1.2 `input_partition` and `output_partition`
 
 `input_partition` refines `output_partition` on player nodes. An `input_type` selects a model-input schema and FIFO;
@@ -58,8 +74,10 @@ At a poker node, $A$ `live` players remain eligible; `folded` players take no fu
 ### 1.5 Authority and intentional contract changes
 
 `docs/theory/core_math.tex` remains authoritative for mathematics.
-`docs/theory/pseudocode/` will have to be updated but we are keeping: branching and queue-pressure laws, sampling laws, completion, and
-duplicate-child identity.
+`docs/theory/pseudocode/` must be updated for the root-batch definition, $\beta=1$ sequential geometry, and
+branched-RB `true_profile` reuse. Branching and queue-pressure laws, completion, and duplicate-child identity remain.
+The root batch intentionally replaces the current one-branched-tree-per-GPU repository convention; update that
+convention before implementation.
 CPU owns only compact topology and movement plans; numerical work and bulk storage remain on the accelerator.
 
 ## 2. Family-based Rollout
@@ -198,7 +216,7 @@ flowchart LR
   M --> W["family workspace<br/>raw heads"]
   W --> S["sample"]
   S -. "async compact D2H" .-> T["CPU Topology"]
-  S --> D["family workspace<br/>labels + descriptors"]
+  S --> D["family workspace<br/>labels + true_profile + descriptors"]
   D --> C["commit"]
   Q --> C
   C -. "async endpoint patches" .-> T
@@ -211,7 +229,8 @@ flowchart LR
 ```
 
 - `model` reads only `model_input` and writes raw heads to the workspace.
-- `sample` owns all draws. It writes labels to the workspace and queues their compact CPU `Topology` packet.
+- `sample` owns all draws. It writes labels and child `true_profile` rows to the workspace and queues their compact CPU
+  `Topology` packet.
 - `commit` moves the workspace into saved heads, writes all `FamilyWork`/`Leaf` destinations atomically, and queues
   compact endpoint patches.
 
@@ -237,21 +256,43 @@ later sample packets or commit endpoint patches close it.
 
 ### 2.3 Sampling laws
 
-| Geometry | `sample` |
-|---|---|
-| sequential | Draw one label. Sampled mode fixes one $x\sim\mu$ per root. |
-| branched | Draw $\widetilde N$, the executed $N$, then one labeled child per ordinal. The root uses the same law. |
-| branched RB | Also draw one fresh collision-conditioned posterior profile per logical child; discard it after `commit`. |
+There are three samplers:
 
-Sequential roots and RNG keys are fixed before draws; only root multiplicity branches.
-Only branched RB requires non-trivial sampling; the other modes need categorical draws and stable labels.
+1. The root sampler draws one uniform private `true_profile` per root and writes it to `FamilyWork.hot`.
+2. Every non-branched-RB node draws action or chance labels from its existing `true_profile`; `commit` copies that
+   profile to every non-leaf child.
+3. Branched RB uses the rejection kernel below.
+
+In sampled mode, the root `true_profile` is therefore copied unchanged through its whole rollout tree.
+
+For a branched-RB node $\mathsf s$ with $N(\mathsf s)\geq1$, designate logical child $0$ as the reuse child. For each
+logical child $j$:
+
+$$
+x_{\mathsf s,0}=\mathtt{true\_profile}[\mathsf s],
+\qquad
+x_{\mathsf s,j}\sim\mu_{\mathsf s}\ \text{ independently for }1\leq j<N(\mathsf s),
+$$
+
+then draw its action or chance label conditional on $x_{\mathsf s,j}$. `commit` writes
+$x_{\mathsf s,j}$ as the child's `FamilyWork.hot.true_profile`. A leaf consumes the profile during `commit` and stores
+no copy.
+
+Thus an $N$-child expansion rejection-samples only $N-1$ profiles. If $C$ player children enter chance, their $C$
+propagated profiles each seed one chance child; each chance parent samples only its remaining children.
+The reused action profile has the correct action-conditioned law after conditioning on its sampled action, and the
+reused chance profile has the correct board-conditioned law after conditioning on its sampled chance label.
+
+Root rows and RNG keys are fixed before draws. Root batching is independent of geometry.
+Only branched RB requires posterior-profile rejection; the other modes use their stored `true_profile` and categorical
+labels.
 Sampled-branched and branched-best-response sampling still require explicit theory contracts.
 
 Best response selects the learner or frozen model per stable FIFO subspan. Frozen decisions create `FamilyWork`, but
 no saved heads or targets.
 
-Root refill protects the original root action prefix. It recomputes descendant path masses using the final degree;
-refill-only children have no root action target.
+For each root, refill protects its original action prefix and recomputes descendant path masses using its final degree.
+Refill-only children have no root action target.
 
 ### 2.4 Queues, routing, and fusion
 
@@ -280,7 +321,7 @@ Poker stores folded normalized `r_pi` only in `FoldedRanges`: `K`-wide for `pre`
 `FamilyWork.hot` stores direct references; `model_input` stores compact folded statistics. A completion-bound `pre`
 row expands `K -> H` once when materializing `Leaf.range_weights`, because the evaluator API is $H$-native. See
 [`poker_folded_statistics.md`](poker_folded_statistics.md) and
-[`poker_rejection_chance_closure.md`](poker_rejection_chance_closure.md).
+[`poker_branched_rb_sample.md`](poker_branched_rb_sample.md).
 
 Commit advances every destination tail together after all writes and dependencies succeed. Failure advances none.
 Sequential overflow stops; admitted branched overflow may retry only the whole tree with a disjoint RNG address.
@@ -477,10 +518,10 @@ For each ready parent, the graph:
 
 Branched rows implement `BranchedValue` with batched ragged reductions; sequential rows are the one-action
 player-only case. `t_hat` exists exactly when `N_tgt>=2`; otherwise `SigmaHead.old_t` supplies $T^*$. Protected
-root reductions use the pre-refill target prefix.
+root reductions use each root's pre-refill target prefix.
 Rows with `sigma_head_row = -1` execute only the structural reduction path.
 
-After the root graph completes and targets validate, delete `LayeredTopology` and `LayerWork`. The five learner
+After the root layer completes and targets validate, delete `LayeredTopology` and `LayerWork`. The five learner
 arrays and `LearnerIndex` are already sealed; publish them atomically.
 
 ## 5. Learner
@@ -505,7 +546,7 @@ $$
 \omega_d=\prod_{s\prec d}\frac1{N(s)}.
 $$
 
-Root refill uses the final root degree in descendant masses. Best response contains only learner decisions.
+Root refill uses each root's final degree in descendant masses. Best response contains only learner decisions.
 The variance/cost allocator chooses integer statistical sample counts; physical GPU widths do not round them.
 
 ### 5.2 Physical batches
