@@ -12,6 +12,7 @@ from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import re
+import time
 from typing import Mapping
 
 import torch
@@ -21,6 +22,11 @@ _ADDITIVE_COUNTERS = (
     "model_calls",
     "model_rows",
     "model_seconds",
+    "timed_model_calls",
+    "timed_model_rows",
+    "cuda_work_calls",
+    "cuda_work_rows",
+    "cuda_work_seconds",
     "policy_pack_calls",
     "policy_pack_rows",
     "policy_pack_padded_tokens",
@@ -61,6 +67,7 @@ _ADDITIVE_COUNTERS = (
 _MAXIMUM_COUNTERS = (
     "model_rows_max",
     "model_seconds_max",
+    "cuda_work_seconds_max",
     "padded_tokens_max",
     "padded_token_pairs_max",
     "queue_depth_max",
@@ -106,9 +113,13 @@ class ExecutionMetrics:
         default_factory=Counter, init=False
     )
     _pending_model_timings: list[
-        tuple[str, str, int, torch.cuda.Event, torch.cuda.Event]
+        tuple[str | None, str, str, int, torch.cuda.Event, torch.cuda.Event]
+    ] = field(default_factory=list, init=False)
+    _pending_cuda_work_timings: list[
+        tuple[str, int, torch.cuda.Event, torch.cuda.Event]
     ] = field(default_factory=list, init=False)
     _model_timing_enabled: bool = field(default=False, init=False)
+    _model_timing_scope: str | None = field(default=None, init=False)
     _enabled: bool = field(default=True, init=False)
 
     def clear(self) -> None:
@@ -119,7 +130,9 @@ class ExecutionMetrics:
         self._strata.clear()
         self._batch_histogram.clear()
         self._pending_model_timings.clear()
+        self._pending_cuda_work_timings.clear()
         self._model_timing_enabled = False
+        self._model_timing_scope = None
 
     def configure_model_timing(
         self, *, enabled: bool, device: torch.device
@@ -129,7 +142,19 @@ class ExecutionMetrics:
         if enabled and device.type != "cuda":
             raise ValueError("model timing requires a CUDA execution device")
         self._pending_model_timings.clear()
+        self._pending_cuda_work_timings.clear()
         self._model_timing_enabled = bool(enabled)
+
+    @contextmanager
+    def model_timing_scope(self, scope: str):
+        """Attach a logical phase such as rollout or learner to timed calls."""
+
+        previous = self._model_timing_scope
+        self._model_timing_scope = _metric_component(scope)
+        try:
+            yield
+        finally:
+            self._model_timing_scope = previous
 
     @contextmanager
     def time_model_call(self, phase: str, family: str, rows: int):
@@ -152,24 +177,84 @@ class ExecutionMetrics:
         else:
             end.record()
             self._pending_model_timings.append(
-                (phase_key, family_key, rows, start, end)
+                (
+                    self._model_timing_scope,
+                    phase_key,
+                    family_key,
+                    rows,
+                    start,
+                    end,
+                )
             )
 
     def _resolve_model_timings(self) -> None:
         """Fold completed CUDA events into phase/family aggregates."""
 
         pending, self._pending_model_timings = self._pending_model_timings, []
-        for phase, family, rows, start, end in pending:
+        for scope, phase, family, rows, start, end in pending:
             seconds = float(start.elapsed_time(end)) / 1_000.0
             family_stratum = f"{phase}_{family}"
             batch_stratum = f"{family_stratum}_batch_size_{rows}"
             self.add("model_seconds", seconds)
             self.maximum("model_seconds_max", seconds)
-            for destination in (family_stratum, batch_stratum):
+            destinations = [family_stratum, batch_stratum]
+            scoped_destinations: list[str] = []
+            if scope is not None:
+                scoped = f"{scope}_{phase}_{family}"
+                scoped_destinations = [scoped, f"{scoped}_batch_size_{rows}"]
+                destinations.extend(scoped_destinations)
+            for destination in destinations:
                 self.add("model_seconds", seconds, stratum=destination)
                 self.maximum(
                     "model_seconds_max", seconds, stratum=destination
                 )
+            for destination in scoped_destinations:
+                self.add("timed_model_calls", 1, stratum=destination)
+                self.add("timed_model_rows", rows, stratum=destination)
+
+    @contextmanager
+    def time_cuda_work(self, component: str, *, rows: int = 0):
+        """Time one diagnostic CUDA interval without synchronizing its stream.
+
+        Component timers may be nested.  Nested totals are therefore diagnostic
+        scopes, not additive buckets; callers must subtract or compare them only
+        when the scopes are known to be nested or disjoint.
+        """
+
+        if not self._enabled or not self._model_timing_enabled:
+            yield
+            return
+        if isinstance(rows, bool) or not isinstance(rows, int) or rows < 0:
+            raise ValueError("timed CUDA work rows must be a nonnegative integer")
+        component_key = _metric_component(component)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        try:
+            yield
+        except Exception:
+            raise
+        else:
+            end.record()
+            self._pending_cuda_work_timings.append(
+                (component_key, rows, start, end)
+            )
+
+    def _resolve_cuda_work_timings(self) -> None:
+        """Fold completed component events into exact scope aggregates."""
+
+        pending, self._pending_cuda_work_timings = (
+            self._pending_cuda_work_timings,
+            [],
+        )
+        for component, rows, start, end in pending:
+            seconds = float(start.elapsed_time(end)) / 1_000.0
+            self.add("cuda_work_calls", 1, stratum=component)
+            self.add("cuda_work_rows", rows, stratum=component)
+            self.add("cuda_work_seconds", seconds, stratum=component)
+            self.maximum(
+                "cuda_work_seconds_max", seconds, stratum=component
+            )
 
     def add(
         self,
@@ -303,10 +388,16 @@ class ExecutionMetrics:
         self.add("evaluator_rejection_work", rejection_work)
 
     def record_host_synchronization(
-        self, *, seconds: float = 0.0, source: str | None = None
+        self,
+        *,
+        seconds: float = 0.0,
+        source: str | None = None,
+        nbytes: int = 0,
     ) -> None:
         """Record an undeclared synchronization discovered in a hot path."""
 
+        if seconds < 0 or isinstance(nbytes, bool) or nbytes < 0:
+            raise ValueError("host synchronization values are invalid")
         destinations = (None,) if source is None else (
             None,
             f"host_sync_{_metric_component(source)}",
@@ -315,6 +406,22 @@ class ExecutionMetrics:
             self.add("host_synchronizations", 1, stratum=destination)
             self.add("host_synchronization_seconds", seconds, stratum=destination)
             self.add("undeclared_host_synchronizations", 1, stratum=destination)
+        if nbytes:
+            self.record_transfer("d2h", nbytes=nbytes)
+
+    @contextmanager
+    def time_host_synchronization(self, source: str, *, nbytes: int):
+        """Measure one known scalar CUDA-to-host synchronization boundary."""
+
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.record_host_synchronization(
+                seconds=time.perf_counter() - started,
+                source=source,
+                nbytes=nbytes,
+            )
 
     def record_scheduler_control_synchronization(
         self, *, seconds: float, nbytes: int
@@ -449,6 +556,7 @@ class ExecutionMetrics:
         """Return a complete scalar snapshot, including zero-valued base fields."""
 
         self._resolve_model_timings()
+        self._resolve_cuda_work_timings()
         result = {
             f"{prefix}{name}": float(self._totals.get(name, 0))
             for name in _ADDITIVE_COUNTERS

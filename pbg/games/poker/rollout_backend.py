@@ -826,9 +826,12 @@ class PokerRolloutBackend:
         dealt = torch.ones(
             (states.shape[0], self.n_players), dtype=torch.bool, device=self.device
         )  # [B,P]
-        profiles = self.profile_sampler.sample(
-            reach, self.states.board[rows], dealt, 1, gen
-        )
+        with self.execution_metrics.time_cuda_work(
+            "rollout_rejection_sampler", rows=int(states.numel())
+        ):
+            profiles = self.profile_sampler.sample(
+                reach, self.states.board[rows], dealt, 1, gen
+            )
         self.execution_metrics.record_evaluator(rows=int(states.numel()))
         return profiles[:, 0].to(torch.int32)  # [B,P]
 
@@ -845,21 +848,24 @@ class PokerRolloutBackend:
             (states.shape[0], self.n_players), dtype=torch.bool, device=self.device
         )
         seeded = getattr(self.profile_sampler, "sample_seeded", None)
-        if callable(seeded):
-            profiles = seeded(
-                reach,
-                self.states.board[rows],
-                dealt,
-                1,
-                keys.to(device=self.device, dtype=torch.int64),
-            )
-        else:
-            # Test doubles predating the keyed facade are deterministic.  Real
-            # evaluator adapters expose sample_seeded and never take this path.
-            fallback = torch.Generator(device=self.device).manual_seed(0)
-            profiles = self.profile_sampler.sample(
-                reach, self.states.board[rows], dealt, 1, fallback
-            )
+        with self.execution_metrics.time_cuda_work(
+            "rollout_rejection_sampler", rows=int(states.numel())
+        ):
+            if callable(seeded):
+                profiles = seeded(
+                    reach,
+                    self.states.board[rows],
+                    dealt,
+                    1,
+                    keys.to(device=self.device, dtype=torch.int64),
+                )
+            else:
+                # Test doubles predating the keyed facade are deterministic.  Real
+                # evaluator adapters expose sample_seeded and never take this path.
+                fallback = torch.Generator(device=self.device).manual_seed(0)
+                profiles = self.profile_sampler.sample(
+                    reach, self.states.board[rows], dealt, 1, fallback
+                )
         self.execution_metrics.record_evaluator(rows=int(states.numel()))
         return profiles[:, 0].to(torch.int32)
 
@@ -1297,7 +1303,11 @@ class PokerRolloutBackend:
 
         live = partition_id + 1
         anchors = self.states.partition_cache_key[states.to(torch.int64)]
-        if bool((anchors < 0).any()):
+        with self.execution_metrics.time_host_synchronization(
+            "poker_folded_anchor_validation", nbytes=1
+        ):
+            invalid_anchor = bool((anchors < 0).any())
+        if invalid_anchor:
             raise RuntimeError("folded decision omitted its dependency anchor")
         unique_anchor, inverse = torch.unique(
             anchors.to(torch.int64), sorted=True, return_inverse=True
@@ -1392,7 +1402,11 @@ class PokerRolloutBackend:
             store.decision_arenas[partition_id] = decision_arena
         input_rows = input_arena.reserve_rows(count)
         decision_rows = decision_arena.reserve_rows(count)
-        if not torch.equal(input_rows, decision_rows):
+        with self.execution_metrics.time_host_synchronization(
+            "poker_decision_reservation_alignment", nbytes=1
+        ):
+            rows_aligned = torch.equal(input_rows, decision_rows)
+        if not rows_aligned:
             raise RuntimeError("natural input and policy row reservations diverged")
         return decision_rows
 
@@ -1408,7 +1422,10 @@ class PokerRolloutBackend:
         partition_id = int(partition_id)
         decision_arena = store.decision_arenas[partition_id]
         counts = counts.to(device=self.device, dtype=torch.int32)
-        total = int(counts.to(torch.int64).sum())
+        with self.execution_metrics.time_host_synchronization(
+            "poker_action_reservation_total", nbytes=8
+        ):
+            total = int(counts.to(torch.int64).sum())
         action_arena = store.action_arenas.get(partition_id)
         if action_arena is None:
             width = self.training_partition_specs()[partition_id].model_width

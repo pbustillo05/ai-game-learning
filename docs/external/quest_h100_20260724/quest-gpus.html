@@ -1,0 +1,696 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../../" data-theme="light">
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <meta property="article:modified_time" content="2026-07-15T20:02:02+00:00" />
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-8VW6NPDBRF"></script>
+    <script>
+        window.dataLayer = window.dataLayer || [];
+        function gtag(){dataLayer.push(arguments);}
+        gtag('js', new Date());
+        gtag('config', 'G-8VW6NPDBRF');
+    </script>
+    
+    <title>GPUs on Quest &#8212; Northwestern IT
+Research Computing and Data Services
+Northwestern University</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "light";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/styles/sphinx-book-theme.css?v=a3416100" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/tabs.css?v=a5c4661c" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/sphinx-design.min.css?v=95c83b7e" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/sphinxcontrib-images/LightBox2/lightbox2/dist/css/lightbox.min.css?v=6e7d0de0" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/sphinxcontrib-images/LightBox2/lightbox2-customize/pointer.css?v=c97663ff" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/css/nuit-rcds-docs.css?v=80855fb1" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../../../_static/documentation_options.js?v=9eb32ce0"></script>
+    <script src="../../../../_static/doctools.js?v=9bcbadda"></script>
+    <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../../_static/copybutton.js?v=35a8b989"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script src="../../../../_static/scripts/sphinx-book-theme.js?v=887ef09a"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="../../../../_static/design-tabs.js?v=f930bc37"></script>
+    <script src="../../../../_static/sphinxcontrib-images/LightBox2/lightbox2/dist/js/lightbox-plus-jquery.min.js?v=f0ca4bb6"></script>
+    <script src="../../../../_static/sphinxcontrib-images/LightBox2/lightbox2-customize/jquery-noconflict.js?v=12818e64"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <link rel="index" title="Index" href="../../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../../search.html" />
+    <link rel="next" title="Software on Quest" href="../../software/quest-software-list.html" />
+    <link rel="prev" title="Slurm Job Scheduler" href="../slurm/slurm.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+    <meta name="docbuild:last-update" content="2026-07-15"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="light">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+    
+    <img src="../../../../_static/rcds_logo.png" class="logo__image only-light" alt="Northwestern IT
+Research Computing and Data Services
+Northwestern University - Home"/>
+    <img src="../../../../_static/rcds_logo.png" class="logo__image only-dark pst-js-only" alt="Northwestern IT
+Research Computing and Data Services
+Northwestern University - Home"/>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../start/quest/quest-intro.html">Introduction to Quest</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../start/gcc/gcc-start.html">Genomics Compute Cluster Quick Start</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../start/quest/quest-tips.html">HPC Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../start/getting-help.html">Getting Help</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">System Guides</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="../../quest.html">Quest Compute Cluster</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/" target="_blank">Quest Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/procedural-guidelines.html" target="_blank">Policies and Guidelines <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../resources/quest-resource.html">Quest Resources</a></li>
+<li class="toctree-l2 current active has-children"><a class="reference internal" href="../quest-user-guide.html">User Guide</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="../login/login-quest.html">Logging In</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../filesystem/filesystem.html">File System</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../data-transfer/data-transfer.html">Transferring Data</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../modules/modules.html">Software Modules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../slurm/slurm.html">Slurm Job Scheduler</a></li>
+<li class="toctree-l3 current active"><a class="current reference internal" href="#">GPUs</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../software/quest-software-list.html">Software</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../software/alphafold/alphafold-quest.html">AlphaFold</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../software/knitro/knitro-quest.html">Knitro</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../software/matlab/matlab-quest.html">MATLAB</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../software/python/python-quest.html">Python</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../software/r/r-quest.html">R/RStudio</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../software/vasp/vasp-quest.html">VASP</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../software/abaqus/abaqus.html">Abaqus</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../quest-analytics/analytics.html">Quest Analytics Nodes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../quest-analytics/using_analytics.html">Analytics Nodes Usage Tips</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../ondemand/ondemand.html">Quest OnDemand</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../gcc/using-gcc.html">Genomics Compute Cluster</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../specs/index.html">Technical Specifications</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/specs.html" target="_blank">Quest Technical Specifications <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../specs/release-notes.html">Maintenance and Update Notes</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../rdss/rdss-index.html">Research Data Storage Service</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceDet?ID=96" target="_blank">Service Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../rdss/rdss-owners.html">Share Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../rdss/rdss-users.html">User Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../rdss/rdss-troubleshooting.html">Troubleshooting Guide</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../globus/globus-index.html">Globus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../globus/globus-login.html">Log in</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../globus/globus-collection.html">Access Data Using Collections</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../globus/globus-transfer.html">Transfer Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../globus/globus-sharing.html">Share Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../globus/globus-troubleshooting.html">Troubleshoot</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../sde/sde.html">Secure Data Enclave</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceDet?ID=380" target="_blank">Service Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../sde/sde-structure/sde-structure.html">SDE Structure</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-structure/sde-components.html">Environment Components</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-structure/roles.html">User Roles</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-structure/projects.html">Projects</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-structure/storage.html">Storage Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-structure/vms.html">Virtual Machines (VMs)</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../sde/sde-user-guide/sde-user-guide.html">SDE User Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/accessing-sde.html">Accessing the SDE</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/cli-tools.html">Installing Command Line Tools</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/using-vms.html">Using VMs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/managing-buckets.html">Managing Storage Buckets</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/ingress-egress.html">Importing and Exporting Data</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/coderepo.html">Managing Software and Code</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/sde-glossary.html">Glossary</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../sde/acceptable-use.html">Acceptable Use Policy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../sde/cost.html">Estimating Costs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../sde/requesting-support.html">Service Requests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../nightingale/nightingale.html">NU@Nightingale</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/additional-computing-resources/nightingale.html" target="_blank">Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference external" href="https://www.ncsa.illinois.edu/resources-and-services/compute-resources/nightingale/" target="_blank">Compute and Storage Resources <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../nightingale/onboarding.html">Onboarding Process</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../nightingale/access-ngl.html">Using Nightingale</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../nightingale/data-transfer-ngl.html">Importing and Exporting Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../nightingale/offboarding.html">Offboarding Process</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../nightingale/support.html">Getting Help</a></li>
+<li class="toctree-l2"><a class="reference external" href="https://docs.ncsa.illinois.edu/systems/nightingale/en/latest/index.html" target="_blank">NCSA Nightingale User Guide <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../coldfront/index.html">ColdFront</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../coldfront/cf-project.html">Projects in ColdFront</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../coldfront/cf-resource.html">Resource Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../coldfront/cf-user.html">User Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../coldfront/transition-to-coldfront.html">Transitioning to ColdFront</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Tutorials</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/software-management/software-management.html">Working on Quest</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/software-management/conda-mamba-quest/mamba-conda-quest.html">Mamba or Conda Virtual Environments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/software-management/git-quest/git-quest.html">Git on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/software-management/singularity/singularity-quest.html">Singularity on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/software-management/compiling-code/compiling-code-quest.html">Compiling Code on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/software-management/scaling-study/scaling-study.html">Scaling Studies on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/python/python-tutorials.html">Python</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-installation.html">Installing Python on Your Computer</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-selenium-quest.html">Python Selenium on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-gpus.html">Using GPUs with Python</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-llm-huggingface.html">Using Hugging Face on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-llm-ollama.html">Using Ollama on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/r/r-tutorials.html">R</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/r/r-installation.html">Installing R/RStudio on Your Computer</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/r/git-with-r.html">Git with R</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/git/git-tutorials.html">Git/GitHub</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/git/workshop-materials.html">Downloading Workshop Materials</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/r/git-with-r.html">Git with R</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/software-management/git-quest/git-quest.html">Git on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/cloud/aws/aws-index.html">AWS</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/cloud/aws/create-amazon-s3-bucket.html">Creating an Amazon S3 bucket</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/cloud/aws/s3-access-keys.html">Creating Amazon S3 Access Keys</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/cloud/aws/archiving-data-amazon-S3.html">Archiving Data in Amazon S3 Glacier Deep Archive</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/cloud/azure/azure-index.html">Azure</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/cloud/azure/azure-basics.html">Getting Familiar with Azure</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/cloud/azure/azure-openai.html">Using Azure AI and OpenAI Resources</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/ai/ai-tutorials.html">AI</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/ai/genai-coding.html">Coding with Generative AI Tools</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-llm-huggingface.html">Using Hugging Face on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-llm-ollama.html">Using Ollama on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/cloud/azure/azure-openai.html">Using Azure AI and OpenAI Resources</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../tutorials/video-list.html">Video Tutorials</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Resource Guides</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../guides/bash/bash-guide.html">Command Line</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/bash/command-line-start.html">Getting Started with the Command Line</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/bash/bash-scripting.html">Bash Scripting</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../guides/python/python-guide.html">Python</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/python/python-lang.html">Programming in Python</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/python/pandas.html">Pandas</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/python/python-deep-learning.html">Deep Learning Frameworks</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../guides/r/r-guide.html">R</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/r/learn-r.html">Learning R</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/r/ggplot2.html">ggplot2</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../guides/stats/stats-guides.html">Statistics</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/stats/clustering.html">Clustering</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/stats/linear-regression.html">Linear Regression</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../guides/other/other-guides.html">Additional Tools</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/other/git.html">Git and GitHub</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/other/gh-copilot.html">GitHub Copilot</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/other/sql.html">SQL</a></li>
+</ul>
+</details></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>GPUs on Quest</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#requesting-general-access-gpus">Requesting General Access GPUs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpus-for-interactive-sessions">GPUs for Interactive Sessions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#important-considerations-when-requesting-gpu-resources">Important Considerations When Requesting GPU Resources</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-to-consider-with-specific-nvidia-gpu-cards">What to Consider with Specific NVIDIA GPU Cards</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-to-consider-with-gpu-memory">What to consider with GPU Memory</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-to-consider-with-multi-gpu-jobs">What to Consider with Multi-GPU Jobs</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installing-and-validating-gpu-aware-applications">Installing and Validating GPU Aware Applications</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#compiling-cuda-code">Compiling CUDA Code</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-aware-application-list">GPU Aware Application List</a></li>
+</ul>
+</li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="gpus-on-quest">
+<span id="id1"></span><h1>GPUs on Quest<a class="headerlink" href="#gpus-on-quest" title="Link to this heading">#</a></h1>
+<p>Graphical Processing Units (GPUs) are important hardware that can significantly improve performance across a wide range of workloads, including machine learning, artificial intelligence, computational simulations, and traditional scientific computing. Due to their impact in computing, the demand for GPUs is continuously growing in almost every sector.</p>
+<p>When using GPU resources in a high-performance computing environment, it’s important to understand that wait times may be longer due to the resource demand. It’s also important to ensure that your code is using the GPUs as expected.</p>
+<p>This guide provides information on how you can leverage the GPU resources that are available to you in our systems.</p>
+<div class="admonition attention">
+<p class="admonition-title">Attention</p>
+<p>For technical details on the available GPUs in the General Access partitions, please see <a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/specs.html" target="_blank">Quest Technical Specifications <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a>.</p>
+</div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>NVIDIA driver version 570.86.15 is installed on all Quest GPU nodes which is compatible with applications built with CUDA Toolkit 12.8 or earlier.</p>
+</div>
+<section id="requesting-general-access-gpus">
+<h2>Requesting General Access GPUs<a class="headerlink" href="#requesting-general-access-gpus" title="Link to this heading">#</a></h2>
+<p>A common use case for researchers is the need to submit batch jobs to GPUs. The guide below provides the process to submit a simple GPU enabled batch job to the <code class="docutils literal notranslate"><span class="pre">gengpu</span></code> partition.</p>
+<p>Jobs on the General Access GPU nodes can run for a maximum of 48 hours. To submit jobs to General Access GPU nodes, set the <code class="docutils literal notranslate"><span class="pre">--partition</span></code> to <code class="docutils literal notranslate"><span class="pre">gengpu</span></code> and set the <code class="docutils literal notranslate"><span class="pre">--gres</span></code> option to the number of GPU cards required.</p>
+<p>Example batch job submission script header:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+<span class="c1">#SBATCH --account=&lt;account&gt;     ## Required: your Slurm account name, i.e. eXXXX, pXXXX or bXXXX</span>
+<span class="c1">#SBATCH --partition=&lt;partition&gt; ## Required: gengpu, genhimem, etc.</span>
+<span class="c1">#SBATCH --time=&lt;HH:MM:SS&gt;       ## Required: How long will the job need to run?  Limits vary by partition</span>
+<span class="c1">#SBATCH --gres=gpu:1            ## Required: How many GPUs are needed?  Do you need to specify which type of GPU card is needed?</span>
+<span class="c1">#SBATCH --nodes=&lt;#&gt;             ## How many computers/nodes do you need? Usually 1</span>
+<span class="c1">#SBATCH --ntasks=&lt;#&gt;            ## How many CPUs or processors do you need? (default value 1)</span>
+<span class="c1">#SBATCH --mem=&lt;#G&gt;              ## How much RAM do you need per computer/node? G = gigabytes</span>
+<span class="c1">#SBATCH --job-name=&lt;name&gt;       ## Used to identify the job</span>
+
+<span class="c1"># clear your environment</span>
+module<span class="w"> </span>purge
+
+<span class="c1"># load any modules needed</span>
+module<span class="w"> </span>load<span class="w"> </span>matlab/r2023b
+
+<span class="c1"># List the Available GPU Devices</span>
+matlab<span class="w"> </span>-batch<span class="w"> </span><span class="s1">&#39;gpuDeviceTable&#39;</span>
+</pre></div>
+</div>
+<p>The specific type of GPU card can also be specified with the <code class="docutils literal notranslate"><span class="pre">--gres</span></code> option. For example, to request one A100 GPU card, use <code class="docutils literal notranslate"><span class="pre">--gres=gpu:a100:1</span></code>.  To schedule an H100 card, change the option to <code class="docutils literal notranslate"><span class="pre">--gres=gpu:h100:1</span></code>. It can be important to reference the type of GPU as the memory and capabilities may differ by model. It can sometimes be beneficial to go for the older models due to availability even if their performance may not be as cutting-edge as the newer capabilities.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">--gres</span></code> option should also be used to request GPU resources for <a class="reference internal" href="../slurm/slurm.html#slurm-interactive-jobs"><span class="std std-ref">interactive jobs</span></a>.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Any Slurm <a class="reference internal" href="../slurm/slurm.html#opt-memory"><span class="std std-ref">memory settings</span></a>, such as with <code class="docutils literal notranslate"><span class="pre">--mem</span></code>, are for general, not GPU, memory.  Jobs automatically have access to all of the memory of the GPU cards requested.  GPU jobs may need as much or more general memory as the memory available on the GPU card (which is 40 GB or 80 GB as indicated in the technical specifications).</p>
+</div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>There are some limits on the General Access GPU partitions. The total number of GPUs any individual user can utilize across all running jobs is eight. If you submit additional jobs that put you above this limit your job will be set to pending (PD) with a reason of (QOSMaxGRESPerUser). As your active jobs complete and the sum total of GPUs you are running on goes below eight, your pending jobs will change their reason to the usual (RESOURCES) or (PRIORITY).</p>
+</div>
+</section>
+<section id="gpus-for-interactive-sessions">
+<span id="gpu-ondemand"></span><h2>GPUs for Interactive Sessions<a class="headerlink" href="#gpus-for-interactive-sessions" title="Link to this heading">#</a></h2>
+<p>You can request GPUs for applications like JupyterHub via <a class="reference internal" href="../../ondemand/ondemand.html#quest-ondemand"><span class="std std-ref">Quest OnDemand</span></a>. This can be done by selecting the <code class="docutils literal notranslate"><span class="pre">gengpu</span></code> partition in the <code class="docutils literal notranslate"><span class="pre">SLURM</span> <span class="pre">Partition</span></code> option for the application. After that, additional configuration options such as the type of GPU and number of GPUs required, should appear.</p>
+<p>As it was mentioned above, GPUs are often in higher demand. Because of this, we don’t recommend asking for a large amount of GPU resources for interactive jobs. If you do request a large amount of GPU resources, your job may be waiting for a long period of time before it becomes active and available to you. If you have a unique use case, we recommend you reach out to our team at <a class="reference external" href="mailto:quest-help&#37;&#52;&#48;northwestern&#46;edu" target="_blank">quest-help<span>&#64;</span>northwestern<span>&#46;</span>edu <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a> to discuss further.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>GPUs are not available as part of the <a class="reference internal" href="../../quest-analytics/analytics.html#quest-analytics-nodes"><span class="std std-ref">Quest Analytics</span></a> service.</p>
+</div>
+</section>
+<section id="important-considerations-when-requesting-gpu-resources">
+<span id="gpu-job-considerations"></span><h2>Important Considerations When Requesting GPU Resources<a class="headerlink" href="#important-considerations-when-requesting-gpu-resources" title="Link to this heading">#</a></h2>
+<p>There are several factors to consider before determining the appropriate GPU request.</p>
+<ul class="simple">
+<li><p>Does the job require a specific type of NVIDIA GPU Card?</p></li>
+<li><p>How much GPU memory does the job need?</p></li>
+<li><p>Does the job require the use of more than 1 GPU card?</p>
+<ul>
+<li><p>If so, is the data transfer speed between the cards important for the job?</p></li>
+</ul>
+</li>
+</ul>
+<section id="what-to-consider-with-specific-nvidia-gpu-cards">
+<span id="gpu-types"></span><h3>What to Consider with Specific NVIDIA GPU Cards<a class="headerlink" href="#what-to-consider-with-specific-nvidia-gpu-cards" title="Link to this heading">#</a></h3>
+<div class="admonition tip">
+<p class="admonition-title">Tip</p>
+<p>For shorter wait times, it is best to not specify a specific GPU card unless your job requires it.</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="c1">#SBATCH --gres=gpu:1 #This will schedule a job with the first available GPU regardless of GPU type. </span>
+</pre></div>
+</div>
+</div>
+<p>There are two types of General Access GPUs on Quest: the <strong>NVIDIA A100</strong> and the <strong>NVIDIA H100</strong>.</p>
+<p>When you are compiling your own software, it’s important to pay attention to the type of CUDA that you’re using in the compilation. If the GPU-enabled application has been compiled with CUDA Toolkit less than 11.8, then it will only run on the A100 card. If it was compiled with CUDA Toolkit greater than or equal to 11.8, then it should run on <em>both</em> the A100 and H100 cards. In the rare case that the application still does not run on the H100, it is possible that it was not compiled with the correct CUDA architecture option: <code class="docutils literal notranslate"><span class="pre">sm_90</span></code>.</p>
+<p>In some cases, a particular job (perhaps the training of a model), may run faster on the H100 versus the A100.</p>
+<p>If the job requires a specific GPU card type for one of the reasons above, use</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">#SBATCH</span> <span class="pre">--gres=gpu:h100:1</span></code> to request the H100 specifically.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">#SBATCH</span> <span class="pre">--gres=gpu:a100:1</span></code> to request the A100 specifically.</p></li>
+</ul>
+</section>
+<section id="what-to-consider-with-gpu-memory">
+<span id="gpu-memory"></span><h3>What to consider with GPU Memory<a class="headerlink" href="#what-to-consider-with-gpu-memory" title="Link to this heading">#</a></h3>
+<p>There are two groups of General Access GPUs: those with 40 GB of memory and those with 80 GB. All H100 cards have 80 GB of GPU memory, but for the A100s some have 40 GB and some have 80 GB.</p>
+<p>If the job requires a GPU card with over 40 GB of RAM, use the <code class="docutils literal notranslate"><span class="pre">--constraint</span></code> option:</p>
+<ul class="simple">
+<li><p>To request 80 GB A100 or H100 GPU cards, add the line: <code class="docutils literal notranslate"><span class="pre">#SBATCH</span> <span class="pre">--constraint=sxm</span></code> in addition to <code class="docutils literal notranslate"><span class="pre">--gres=gpu:1</span></code></p></li>
+</ul>
+</section>
+<section id="what-to-consider-with-multi-gpu-jobs">
+<span id="multi-gpu-jobs"></span><h3>What to Consider with Multi-GPU Jobs<a class="headerlink" href="#what-to-consider-with-multi-gpu-jobs" title="Link to this heading">#</a></h3>
+<p>Similar to the type of GPU, it’s important to consider the type of GPU connection for your job as well. This is especially important for jobs that utilize more than 1 GPU.</p>
+<p>Quest General Access GPUs have two different types of GPU interconnections: SXM and PCIe. SXM GPUs utilize NVLink, which offers much higher bandwidth (up to 900 GB/s for H100 SXM5) compared to PCIe (up to 128 GB/s for PCIe Gen 5) for inter-GPU communication. Multi-GPU jobs that require significant communication between GPU cards (for instance training or tuning for a LLM) will benefit from running on multiple GPUs with the SXM interconnect.</p>
+<ul class="simple">
+<li><p>To request SXM configured A100 or H100 GPU cards, add the line: <code class="docutils literal notranslate"><span class="pre">#SBATCH</span> <span class="pre">--constraint=sxm</span></code> in addition to <code class="docutils literal notranslate"><span class="pre">--gres=gpu:1</span></code></p></li>
+</ul>
+</section>
+</section>
+<section id="installing-and-validating-gpu-aware-applications">
+<span id="gpu-software"></span><h2>Installing and Validating GPU Aware Applications<a class="headerlink" href="#installing-and-validating-gpu-aware-applications" title="Link to this heading">#</a></h2>
+<section id="compiling-cuda-code">
+<span id="cudatoolkit-available-on-quest"></span><h3>Compiling CUDA Code<a class="headerlink" href="#compiling-cuda-code" title="Link to this heading">#</a></h3>
+<p>Some applications will require building CUDA code from source. The NVIDIA CUDA Toolkit provides a development environment for creating high-performance, GPU-accelerated applications.</p>
+<p>To see which versions of CUDA are available on Quest, run the command:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>spider<span class="w"> </span>cuda
+</pre></div>
+</div>
+<p>Using CUDA Toolkit 11.8 or greater and compiling with the A100 (<code class="docutils literal notranslate"><span class="pre">sm_80</span></code>) and H100 (<code class="docutils literal notranslate"><span class="pre">sm_90</span></code>) architectures will allow the application to run on both A100 and H100 GPU. The recommended CUDA toolkit for applications leveraging the H100 is CUDA Toolkit 12.2.</p>
+</section>
+<section id="gpu-aware-application-list">
+<h3>GPU Aware Application List<a class="headerlink" href="#gpu-aware-application-list" title="Link to this heading">#</a></h3>
+<p>Other examples of GPU aware code compilations include:</p>
+<ul class="simple">
+<li><p><a class="reference internal" href="../../software/matlab/matlab-quest.html#matlab-gpu-accelerated"><span class="std std-ref">MATLAB with GPUs</span></a></p></li>
+<li><p><a class="reference internal" href="../../../../tutorials/python/python-gpus.html#python-gpu"><span class="std std-ref">Python GPU packages</span></a></p></li>
+</ul>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../slurm/slurm.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Slurm Job Scheduler</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../../software/quest-software-list.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Software on Quest</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+  <div class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav class="bd-toc-nav page-toc">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#requesting-general-access-gpus">Requesting General Access GPUs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpus-for-interactive-sessions">GPUs for Interactive Sessions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#important-considerations-when-requesting-gpu-resources">Important Considerations When Requesting GPU Resources</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-to-consider-with-specific-nvidia-gpu-cards">What to Consider with Specific NVIDIA GPU Cards</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-to-consider-with-gpu-memory">What to consider with GPU Memory</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-to-consider-with-multi-gpu-jobs">What to Consider with Multi-GPU Jobs</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installing-and-validating-gpu-aware-applications">Installing and Validating GPU Aware Applications</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#compiling-cuda-code">Compiling CUDA Code</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-aware-application-list">GPU Aware Application List</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+             Last updated: 2026-07-15
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+
+
+<div id="footer-bottom">
+<div class="contain-1120">
+<span class="copyright" style="color:white">©
+<script>// <![CDATA[
+document.write(new Date().getFullYear())
+// ]]></script>
+Northwestern University | <a href="https://www.it.northwestern.edu/departments/it-services-support/research/">Northwestern IT Research Computing and Data Services</a></span>
+<!--
+<ul>
+<li><a href="https://www.facebook.com/NorthwesternU"> <span class="social facebook">Facebook</span> </a></li>
+<li><a href="https://www.twitter.com/northwesternu"> <span class="social twitter">Twitter</span> </a></li>
+<li><a href="https://www.instagram.com/northwesternu"> <span class="social instagram">Instagram</span> </a></li>
+<li><a href="https://www.youtube.com/user/NorthwesternU"> <span class="social youtube">YouTube</span> </a></li>
+<li><a href="https://www.tiktok.com/@northwestern.u"> <span class="social tiktok">TikTok</span> </a></li>
+<li><a href="https://www.linkedin.com/school/northwestern-university/"> <span class="social linkedin">LinkedIn</span> </a></li>
+</ul>
+-->
+<span class="right" style="color:white"><a style="color:white" href="https://www.northwestern.edu/disclaimer.html">Disclaimer</a></span>
+</div>
+</div>
+  </footer>
+  </body>
+</html>

@@ -170,9 +170,12 @@ def test_execution_metrics_resolve_model_time_by_family_and_batch(
     monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
     metrics = ExecutionMetrics()
     metrics.configure_model_timing(enabled=True, device=torch.device("cuda"))
-    with metrics.time_model_call("inference", "post_2", 84):
-        pass
+    with metrics.model_timing_scope("rollout"):
+        with metrics.time_model_call("inference", "post_2", 84):
+            pass
     with metrics.time_model_call("inference", "post_2", 24):
+        pass
+    with metrics.time_cuda_work("rollout chance closure", rows=31):
         pass
     snapshot = metrics.snapshot()
 
@@ -183,21 +186,37 @@ def test_execution_metrics_resolve_model_time_by_family_and_batch(
         snapshot["execution_inference_post_2_batch_size_84_model_seconds"]
         == 0.0125
     )
+    assert snapshot["execution_rollout_inference_post_2_model_seconds"] == 0.0125
+    assert snapshot["execution_rollout_inference_post_2_timed_model_calls"] == 1
+    assert snapshot["execution_rollout_inference_post_2_timed_model_rows"] == 84
+    assert snapshot["execution_rollout_chance_closure_cuda_work_calls"] == 1
+    assert snapshot["execution_rollout_chance_closure_cuda_work_rows"] == 31
+    assert snapshot["execution_rollout_chance_closure_cuda_work_seconds"] == 0.0125
 
 
 def test_declared_control_sync_and_transfers_are_accounted_separately() -> None:
     metrics = ExecutionMetrics()
     metrics.record_scheduler_control_synchronization(seconds=0.002, nbytes=32)
     metrics.record_transfer("h2d", nbytes=48)
+    with metrics.time_host_synchronization(
+        "action reservation total", nbytes=8
+    ):
+        pass
     snapshot = metrics.snapshot()
 
     assert snapshot["execution_scheduler_control_synchronizations"] == 1
     assert snapshot["execution_scheduler_control_bytes"] == 32
-    assert snapshot["execution_undeclared_host_synchronizations"] == 0
-    assert snapshot["execution_d2h_transfers"] == 1
-    assert snapshot["execution_d2h_bytes"] == 32
+    assert snapshot["execution_d2h_transfers"] == 2
+    assert snapshot["execution_d2h_bytes"] == 40
     assert snapshot["execution_h2d_transfers"] == 1
     assert snapshot["execution_h2d_bytes"] == 48
+    assert (
+        snapshot[
+            "execution_host_sync_action_reservation_total_host_synchronizations"
+        ]
+        == 1
+    )
+    assert snapshot["execution_undeclared_host_synchronizations"] == 1
 
 
 def test_alias_table_reconstructs_law_and_draws_from_it() -> None:

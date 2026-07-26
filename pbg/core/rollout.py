@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -313,6 +314,12 @@ def _sample_trees_sequential(
         raise ValueError("sequential_start_states must return device-local int32 [count]")
     root_owner = backend.classify(roots).to(torch.int32)
     metrics = getattr(backend, "execution_metrics", None)
+
+    def timed_cuda(component: str, rows: int):
+        if metrics is None:
+            return nullcontext()
+        return metrics.time_cuda_work(component, rows=rows)
+
     buffer = PagedRolloutTopology(start_count, p_max, device, page_rows=chunk_nodes)
     root_nodes = buffer.add_roots(roots, root_owner)
     arena = ChunkedOccurrenceArena(
@@ -658,16 +665,22 @@ def _sample_trees_sequential(
                 draw=1,
                 purpose=DrawPurpose.CHANCE,
             )
-            events = _sample_events_logical(
-                backend, states, profiles, None, bundle.policy_adapter, keys, gen
-            )
+            with timed_cuda("rollout_event_sampling", int(chance_count)):
+                events = _sample_events_logical(
+                    backend, states, profiles, None, bundle.policy_adapter, keys, gen
+                )
             step_chance = getattr(backend, "step_chance_batch", backend.step)
-            next_states = step_chance(states, events)
-            next_reach = backend.reach_update(reaches, states, events, None)
-            next_owner = backend.classify(next_states).to(torch.int32)
-            frontier = append_children(
-                chance_nodes, next_states, next_owner, events, next_reach
-            )
+            with timed_cuda("rollout_state_transition", int(chance_count)):
+                next_states = step_chance(states, events)
+                next_owner = backend.classify(next_states).to(torch.int32)
+            with timed_cuda("rollout_reach_update", int(chance_count)):
+                next_reach = backend.reach_update(
+                    reaches, states, events, None
+                )
+            with timed_cuda("rollout_child_commit", int(chance_count)):
+                frontier = append_children(
+                    chance_nodes, next_states, next_owner, events, next_reach
+                )
             release = getattr(backend, "release_state_rows", None)
             if callable(release):
                 release(states)
@@ -721,7 +734,8 @@ def _sample_trees_sequential(
                     "reserved_bytes_max",
                     admission_plan.committed_bytes(active_starts),
                 )
-            chance_close(roots_batch)
+            with timed_cuda("rollout_chance_closure", int(roots_batch.numel())):
+                chance_close(roots_batch)
             admitted = stop
             continue
         else:
@@ -810,15 +824,18 @@ def _sample_trees_sequential(
                         )
                     ),
                 )
-                role_events = _sample_events_logical(
-                    backend,
-                    role_states,
-                    role_profiles,
-                    output,
-                    bundle.policy_adapter,
-                    role_keys,
-                    gen,
-                )
+                with timed_cuda(
+                    "rollout_event_sampling", int(positions.numel())
+                ):
+                    role_events = _sample_events_logical(
+                        backend,
+                        role_states,
+                        role_profiles,
+                        output,
+                        bundle.policy_adapter,
+                        role_keys,
+                        gen,
+                    )
                 selected_logp_fn = getattr(
                     backend, "selected_policy_logp", None
                 )
@@ -833,19 +850,27 @@ def _sample_trees_sequential(
                     else None
                 )
                 step_player = getattr(backend, "step_player_batch", backend.step)
-                next_states[positions] = step_player(role_states, role_events)
-                if role_selected_logp is None:
-                    next_reach[positions] = backend.reach_update(
-                        role_reaches, role_states, role_events, output
+                with timed_cuda(
+                    "rollout_state_transition", int(positions.numel())
+                ):
+                    next_states[positions] = step_player(
+                        role_states, role_events
                     )
-                else:
-                    next_reach[positions] = backend.reach_update(
-                        role_reaches,
-                        role_states,
-                        role_events,
-                        output,
-                        selected_logp=role_selected_logp,
-                    )
+                with timed_cuda(
+                    "rollout_reach_update", int(positions.numel())
+                ):
+                    if role_selected_logp is None:
+                        next_reach[positions] = backend.reach_update(
+                            role_reaches, role_states, role_events, output
+                        )
+                    else:
+                        next_reach[positions] = backend.reach_update(
+                            role_reaches,
+                            role_states,
+                            role_events,
+                            output,
+                            selected_logp=role_selected_logp,
+                        )
                 event_ids[positions] = role_events.public_id
                 for name, value in role_events.payload.items():
                     destination = event_payload.get(name)
@@ -903,15 +928,17 @@ def _sample_trees_sequential(
             next_owner = torch.where(
                 cutoff, torch.full_like(next_owner, PROBE_FOLD), next_owner
             )
-        children = append_children(
-            batch_nodes, next_states, next_owner, events, next_reach
-        )
+        with timed_cuda("rollout_child_commit", int(batch_nodes.numel())):
+            children = append_children(
+                batch_nodes, next_states, next_owner, events, next_reach
+            )
         release = getattr(backend, "release_state_rows", None)
         if callable(release):
             release(states)
             buffer.state_ref[batch_nodes.to(torch.int64)] = -1
         DeviceWorkQueue.mark_done(arena, batch_nodes.to(torch.int64))
-        chance_close(children)
+        with timed_cuda("rollout_chance_closure", int(children.numel())):
+            chance_close(children)
 
     if admitted != start_count or active_starts != 0:
         raise RuntimeError(
@@ -925,13 +952,15 @@ def _sample_trees_sequential(
         "root_id", torch.arange(leaf_rows.size, device=device)
     )
     leaf_order = torch.argsort(leaf_root.to(torch.int64), stable=True)
-    leaf_block, leaf_metrics = leaf_rows.seal(
-        scratch_rows=chunk_nodes, row_order=leaf_order, release_source=True
-    )
+    with timed_cuda("rollout_internal_leaf_seal", int(leaf_rows.size)):
+        leaf_block, leaf_metrics = leaf_rows.seal(
+            scratch_rows=chunk_nodes, row_order=leaf_order, release_source=True
+        )
     verify_recycling = getattr(backend, "verify_state_recycling_boundary", None)
     if callable(verify_recycling):
         verify_recycling()
-    decision_inputs = seal_captures(decision_input_store)
+    with timed_cuda("rollout_internal_decision_seal", 0):
+        decision_inputs = seal_captures(decision_input_store)
     if not decision_inputs.node_ids.numel():
         raise RuntimeError("sequential rollout produced no decision rows")
     source_root = torch.empty_like(decision_inputs.node_ids)

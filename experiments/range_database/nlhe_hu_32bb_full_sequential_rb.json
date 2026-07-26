@@ -1,0 +1,30 @@
+{
+  "checkpoint": "/home/pablob/ai-game-learning/runs/nlhe_hu_32bb_full_sequential_rb/ckpt_0001110.pt",
+  "checkpoint_iteration": 1110,
+  "checkpoint_schema_version": "pbg-checkpoint-v3",
+  "checkpoint_sha256": "bced881945512f2a4152d3acd88a0a06395a00130cdf68a61aa2652bc1b5aebb",
+  "decision_node_count": 3980,
+  "dtype": "torch.float32",
+  "folded_rows": 0,
+  "hands": 1326,
+  "historical_source_revision": "537700f5b94873c3daa6e6a03ad00cfef4b8e88b",
+  "output": "/home/pablob/ai-game-learning/experiments/range_database/nlhe_hu_32bb_full_sequential_rb.pt",
+  "players": 2,
+  "range_semantics": "exp(log_reach - per-seat finite maximum); folded seats retained",
+  "runtime": "v3",
+  "sample_count": 100,
+  "sampling": "100 distinct decision rows sampled uniformly without replacement",
+  "seed": 910101,
+  "shape": [
+    100,
+    2,
+    1326
+  ],
+  "streets": [
+    33,
+    37,
+    20,
+    10
+  ],
+  "trajectory_count": 1000
+}

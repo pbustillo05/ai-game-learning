@@ -1,0 +1,833 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../" data-theme="light">
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <meta property="article:modified_time" content="2026-06-30T21:38:16+00:00" />
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-8VW6NPDBRF"></script>
+    <script>
+        window.dataLayer = window.dataLayer || [];
+        function gtag(){dataLayer.push(arguments);}
+        gtag('js', new Date());
+        gtag('config', 'G-8VW6NPDBRF');
+    </script>
+    
+    <title>Mamba or Conda Virtual Environments &#8212; Northwestern IT
+Research Computing and Data Services
+Northwestern University</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "light";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/styles/sphinx-book-theme.css?v=a3416100" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/tabs.css?v=a5c4661c" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/sphinx-design.min.css?v=95c83b7e" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/sphinxcontrib-images/LightBox2/lightbox2/dist/css/lightbox.min.css?v=6e7d0de0" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/sphinxcontrib-images/LightBox2/lightbox2-customize/pointer.css?v=c97663ff" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/css/nuit-rcds-docs.css?v=80855fb1" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../../_static/documentation_options.js?v=9eb32ce0"></script>
+    <script src="../../../_static/doctools.js?v=9bcbadda"></script>
+    <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../_static/copybutton.js?v=35a8b989"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script src="../../../_static/scripts/sphinx-book-theme.js?v=887ef09a"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="../../../_static/design-tabs.js?v=f930bc37"></script>
+    <script src="../../../_static/sphinxcontrib-images/LightBox2/lightbox2/dist/js/lightbox-plus-jquery.min.js?v=f0ca4bb6"></script>
+    <script src="../../../_static/sphinxcontrib-images/LightBox2/lightbox2-customize/jquery-noconflict.js?v=12818e64"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <link rel="index" title="Index" href="../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../search.html" />
+    <link rel="next" title="Git on Quest" href="../git-quest/git-quest.html" />
+    <link rel="prev" title="Tutorials for Working on Quest" href="../software-management.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+    <meta name="docbuild:last-update" content="2026-06-30"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="light">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+    
+    <img src="../../../_static/rcds_logo.png" class="logo__image only-light" alt="Northwestern IT
+Research Computing and Data Services
+Northwestern University - Home"/>
+    <img src="../../../_static/rcds_logo.png" class="logo__image only-dark pst-js-only" alt="Northwestern IT
+Research Computing and Data Services
+Northwestern University - Home"/>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../start/quest/quest-intro.html">Introduction to Quest</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../start/gcc/gcc-start.html">Genomics Compute Cluster Quick Start</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../start/quest/quest-tips.html">HPC Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../start/getting-help.html">Getting Help</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">System Guides</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../systems/quest/quest.html">Quest Compute Cluster</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/" target="_blank">Quest Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/procedural-guidelines.html" target="_blank">Policies and Guidelines <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/quest/resources/quest-resource.html">Quest Resources</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../systems/quest/user-guide/quest-user-guide.html">User Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/user-guide/login/login-quest.html">Logging In</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/user-guide/filesystem/filesystem.html">File System</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/user-guide/data-transfer/data-transfer.html">Transferring Data</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/user-guide/modules/modules.html">Software Modules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/user-guide/slurm/slurm.html">Slurm Job Scheduler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/user-guide/gpu/gpu.html">GPUs</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../systems/quest/software/quest-software-list.html">Software</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/software/alphafold/alphafold-quest.html">AlphaFold</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/software/knitro/knitro-quest.html">Knitro</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/software/matlab/matlab-quest.html">MATLAB</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/software/python/python-quest.html">Python</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/software/r/r-quest.html">R/RStudio</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/software/vasp/vasp-quest.html">VASP</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/software/abaqus/abaqus.html">Abaqus</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../systems/quest/quest-analytics/analytics.html">Quest Analytics Nodes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/quest-analytics/using_analytics.html">Analytics Nodes Usage Tips</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/quest/ondemand/ondemand.html">Quest OnDemand</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/quest/gcc/using-gcc.html">Genomics Compute Cluster</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../systems/quest/specs/index.html">Technical Specifications</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/specs.html" target="_blank">Quest Technical Specifications <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/quest/specs/release-notes.html">Maintenance and Update Notes</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../systems/rdss/rdss-index.html">Research Data Storage Service</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceDet?ID=96" target="_blank">Service Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/rdss/rdss-owners.html">Share Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/rdss/rdss-users.html">User Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/rdss/rdss-troubleshooting.html">Troubleshooting Guide</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../systems/globus/globus-index.html">Globus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/globus/globus-login.html">Log in</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/globus/globus-collection.html">Access Data Using Collections</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/globus/globus-transfer.html">Transfer Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/globus/globus-sharing.html">Share Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/globus/globus-troubleshooting.html">Troubleshoot</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../systems/sde/sde.html">Secure Data Enclave</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceDet?ID=380" target="_blank">Service Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../systems/sde/sde-structure/sde-structure.html">SDE Structure</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/sde/sde-structure/sde-components.html">Environment Components</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/sde/sde-structure/roles.html">User Roles</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/sde/sde-structure/projects.html">Projects</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/sde/sde-structure/storage.html">Storage Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/sde/sde-structure/vms.html">Virtual Machines (VMs)</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../systems/sde/sde-user-guide/sde-user-guide.html">SDE User Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/sde/sde-user-guide/accessing-sde.html">Accessing the SDE</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/sde/sde-user-guide/cli-tools.html">Installing Command Line Tools</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/sde/sde-user-guide/using-vms.html">Using VMs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/sde/sde-user-guide/managing-buckets.html">Managing Storage Buckets</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/sde/sde-user-guide/ingress-egress.html">Importing and Exporting Data</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/sde/sde-user-guide/coderepo.html">Managing Software and Code</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../systems/sde/sde-user-guide/sde-glossary.html">Glossary</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/sde/acceptable-use.html">Acceptable Use Policy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/sde/cost.html">Estimating Costs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/sde/requesting-support.html">Service Requests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../systems/nightingale/nightingale.html">NU@Nightingale</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/additional-computing-resources/nightingale.html" target="_blank">Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference external" href="https://www.ncsa.illinois.edu/resources-and-services/compute-resources/nightingale/" target="_blank">Compute and Storage Resources <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/nightingale/onboarding.html">Onboarding Process</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/nightingale/access-ngl.html">Using Nightingale</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/nightingale/data-transfer-ngl.html">Importing and Exporting Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/nightingale/offboarding.html">Offboarding Process</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/nightingale/support.html">Getting Help</a></li>
+<li class="toctree-l2"><a class="reference external" href="https://docs.ncsa.illinois.edu/systems/nightingale/en/latest/index.html" target="_blank">NCSA Nightingale User Guide <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../systems/coldfront/index.html">ColdFront</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/coldfront/cf-project.html">Projects in ColdFront</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/coldfront/cf-resource.html">Resource Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/coldfront/cf-user.html">User Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../systems/coldfront/transition-to-coldfront.html">Transitioning to ColdFront</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Tutorials</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="../software-management.html">Working on Quest</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Mamba or Conda Virtual Environments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../git-quest/git-quest.html">Git on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../singularity/singularity-quest.html">Singularity on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../compiling-code/compiling-code-quest.html">Compiling Code on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../scaling-study/scaling-study.html">Scaling Studies on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../python/python-tutorials.html">Python</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../python/python-installation.html">Installing Python on Your Computer</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../python/python-selenium-quest.html">Python Selenium on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../python/python-gpus.html">Using GPUs with Python</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../python/python-llm-huggingface.html">Using Hugging Face on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../python/python-llm-ollama.html">Using Ollama on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../r/r-tutorials.html">R</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../r/r-installation.html">Installing R/RStudio on Your Computer</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../r/git-with-r.html">Git with R</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../git/git-tutorials.html">Git/GitHub</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../git/workshop-materials.html">Downloading Workshop Materials</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../r/git-with-r.html">Git with R</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../git-quest/git-quest.html">Git on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../cloud/aws/aws-index.html">AWS</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../cloud/aws/create-amazon-s3-bucket.html">Creating an Amazon S3 bucket</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../cloud/aws/s3-access-keys.html">Creating Amazon S3 Access Keys</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../cloud/aws/archiving-data-amazon-S3.html">Archiving Data in Amazon S3 Glacier Deep Archive</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../cloud/azure/azure-index.html">Azure</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../cloud/azure/azure-basics.html">Getting Familiar with Azure</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../cloud/azure/azure-openai.html">Using Azure AI and OpenAI Resources</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../ai/ai-tutorials.html">AI</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../ai/genai-coding.html">Coding with Generative AI Tools</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../python/python-llm-huggingface.html">Using Hugging Face on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../python/python-llm-ollama.html">Using Ollama on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../cloud/azure/azure-openai.html">Using Azure AI and OpenAI Resources</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../video-list.html">Video Tutorials</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Resource Guides</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../guides/bash/bash-guide.html">Command Line</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/bash/command-line-start.html">Getting Started with the Command Line</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/bash/bash-scripting.html">Bash Scripting</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../guides/python/python-guide.html">Python</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/python/python-lang.html">Programming in Python</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/python/pandas.html">Pandas</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/python/python-deep-learning.html">Deep Learning Frameworks</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../guides/r/r-guide.html">R</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/r/learn-r.html">Learning R</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/r/ggplot2.html">ggplot2</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../guides/stats/stats-guides.html">Statistics</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/stats/clustering.html">Clustering</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/stats/linear-regression.html">Linear Regression</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../guides/other/other-guides.html">Additional Tools</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/other/git.html">Git and GitHub</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/other/gh-copilot.html">GitHub Copilot</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/other/sql.html">SQL</a></li>
+</ul>
+</details></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Mamba or Conda Virtual Environments</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#using-mamba-on-quest">Using Mamba on Quest</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#conda-activate-vs-source-activate">“conda activate” vs. “source activate”:</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#creating-mamba-conda-environments-and-installing-packages">Creating Mamba/Conda environments and installing packages</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#explaining-anaconda-channels">Explaining Anaconda “channels”</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#using-anaconda-in-a-slurm-job">Using Anaconda in a Slurm Job</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#accessing-mamba-conda-environments-in-jupyter">Accessing Mamba/Conda Environments in Jupyter</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#add-a-python-environment">Add a Python Environment</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#add-an-r-environment">Add an R Environment</a></li>
+</ul>
+</li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="mamba-or-conda-virtual-environments">
+<span id="id1"></span><h1>Mamba or Conda Virtual Environments<a class="headerlink" href="#mamba-or-conda-virtual-environments" title="Link to this heading">#</a></h1>
+<p><a class="reference external" href="https://mamba.readthedocs.io/en/latest/user_guide/mamba.html" target="_blank">Mamba <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a>
+is a package and environment manager primarily used for
+open-source data science packages for the Python and R programming
+languages. It also supports other programming languages like C, C++,
+FORTRAN, Java, Scala, Ruby, and Lua.</p>
+<div class="seealso admonition">
+<p class="admonition-title">Prefer Videos?</p>
+<p>Try watching the <a class="reference external" href="https://northwestern.hosted.panopto.com/Panopto/Pages/Viewer.aspx?id=5a4eec83-6947-4a83-a215-af420150f368" target="_blank">Anaconda Virtual Environments <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a> workshop recording.</p>
+</div>
+<section id="using-mamba-on-quest">
+<h2>Using Mamba on Quest<a class="headerlink" href="#using-mamba-on-quest" title="Link to this heading">#</a></h2>
+<p>To use Mamba, first load the corresponding module:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>purge
+<span class="gp">$ </span>module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+</pre></div>
+</div>
+<section id="conda-activate-vs-source-activate">
+<h3>“conda activate” vs. “source activate”:<a class="headerlink" href="#conda-activate-vs-source-activate" title="Link to this heading">#</a></h3>
+<p>Older conda/mamba versions used the <code class="docutils literal notranslate"><span class="pre">source</span> <span class="pre">activate</span> <span class="pre">&lt;environment</span> <span class="pre">name&gt;</span></code>
+syntax to activate an environment on Linux, which differed from how
+environments were activated on Windows. In order for conda to work
+consistently across platforms, its behavior changed slightly in version
+4.6, and now <code class="docutils literal notranslate"><span class="pre">conda/mamba</span> <span class="pre">activate</span> <span class="pre">&lt;environment</span> <span class="pre">name&gt;</span></code> works on all platforms.
+To use the new conda, run these commands one time to set up your
+environment:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="gp">$ </span>mamba<span class="w"> </span>init<span class="w"> </span>bash
+</pre></div>
+</div>
+<p>This modifies your <code class="docutils literal notranslate"><span class="pre">~/.bashrc</span></code> file so that <code class="docutils literal notranslate"><span class="pre">mamba/conda</span></code> is ready to use
+every time you log in (<em>without needing to load the module</em>).</p>
+<p>Then log out of Quest and log back in. Once you have done this, you can
+use conda activate instead of source activate, although <em>the latter will
+still work</em>, so existing batch scripts for example can continue to use
+source activate.</p>
+<p>If you want a newer version of Mamba than what is available in the
+module, you can also install them into your HOME directory as follows</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>curl<span class="w"> </span>-L<span class="w"> </span>-O<span class="w"> </span><span class="s2">&quot;https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-</span><span class="k">$(</span>uname<span class="k">)</span><span class="s2">-</span><span class="k">$(</span>uname<span class="w"> </span>-m<span class="k">)</span><span class="s2">.sh&quot;</span>
+<span class="gp">$ </span>bash<span class="w"> </span>Miniforge3-<span class="k">$(</span>uname<span class="k">)</span>-<span class="k">$(</span>uname<span class="w"> </span>-m<span class="k">)</span>.sh
+</pre></div>
+</div>
+<p>Conda/Mamba can also be configured with various options. <a class="reference external" href="https://docs.conda.io/projects/conda/en/latest/user-guide/configuration/use-condarc.html" target="_blank">Read more about Conda/Mamba
+configuration <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a>.</p>
+</section>
+</section>
+<section id="creating-mamba-conda-environments-and-installing-packages">
+<h2>Creating Mamba/Conda environments and installing packages<a class="headerlink" href="#creating-mamba-conda-environments-and-installing-packages" title="Link to this heading">#</a></h2>
+<p>You can create new Mamba/Conda environments in one of your available
+directories. Mamba/Conda environments are isolated project environments
+designed to manage distinct package requirements and dependencies for
+different projects. We recommend using the <code class="docutils literal notranslate"><span class="pre">mamba</span></code> command for faster
+package solving, downloading, and installing. However, you can use the
+<code class="docutils literal notranslate"><span class="pre">conda</span></code> command, with various options, to install and inspect Conda
+environments.</p>
+<p>The process for creating and using environments has a few basic steps:</p>
+<ul class="simple">
+<li><p>Create an environment with <code class="docutils literal notranslate"><span class="pre">mamba</span> <span class="pre">create</span></code></p></li>
+<li><p>Activate the environment with <code class="docutils literal notranslate"><span class="pre">mamba</span> <span class="pre">activate</span></code></p></li>
+<li><p>Install packages into the environment with <code class="docutils literal notranslate"><span class="pre">mamba</span> <span class="pre">install</span></code></p></li>
+</ul>
+<p>To create a new Conda environment in your home directory, enter:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="w"> </span>&lt;env_name&gt;
+</pre></div>
+</div>
+<p>where <code class="docutils literal notranslate"><span class="pre">&lt;env_name&gt;</span></code> is the name your want for your environment. Then
+activate the environment:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>activate<span class="w"> </span>&lt;env_name&gt;
+</pre></div>
+</div>
+<p>Once activated, you can then install packages into that environment:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>install<span class="w"> </span>&lt;pkg&gt;
+</pre></div>
+</div>
+<p>Below we demonstrate examples of using anaconda to install Python and R.
+The commands below will create an isolated environment in your HOME
+folder in the following location <code class="docutils literal notranslate"><span class="pre">~/.conda/envs/my-virtenv-py312</span></code> with
+only Python 3.12 installed.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="w"> </span>my-virtenv-py312<span class="w"> </span><span class="nv">python</span><span class="o">=</span><span class="m">3</span>.12<span class="w"> </span>--yes
+<span class="gp">$ </span>mamba<span class="w"> </span>activate<span class="w"> </span>my-virtenv-py312
+</pre></div>
+</div>
+<p>Once the environment is activated, you have full control over what
+Python packages are installed into the environment. In many ways, you
+are the system administrator of this Python installation as you have
+full read/write/execute privileges inside of that folder in your HOME
+directory. At this point, you can use <em>either</em> <code class="docutils literal notranslate"><span class="pre">conda</span></code> to install
+additional Python packages into the environment <em>or</em> Python’s native
+package manager, <a class="reference external" href="https://pypi.org/" target="_blank">PyPi <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a>, to install whatever Python
+package(s).</p>
+<p>The commands below will create an isolated environment in your HOME
+folder in the following location <code class="docutils literal notranslate"><span class="pre">~/.conda/envs/my-virtenv-R-4.4</span></code> with
+only R 4.4 installed.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="w"> </span>my-virtenv-R-4.4<span class="w"> </span>-c<span class="w"> </span>conda-forge<span class="w"> </span>r-base<span class="o">=</span><span class="m">4</span>.4<span class="w"> </span>--yes
+</pre></div>
+</div>
+</section>
+<section id="explaining-anaconda-channels">
+<h2>Explaining Anaconda “channels”<a class="headerlink" href="#explaining-anaconda-channels" title="Link to this heading">#</a></h2>
+<p>An overwhelming majority of research software (including R, Python,
+Julia and more) is available via anaconda in one of three locations.
+These locations are called “channels”, which can be thought of as the
+remote/cloud repository in which anaconda looks for the package. These
+three locations are</p>
+<p><a class="reference external" href="https://conda-forge.org/feedstock-outputs/" target="_blank">–channel=conda-forge <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></p>
+<p><a class="reference external" href="https://anaconda.org/anaconda/repo" target="_blank">–channel=anaconda  <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a>(a.k.a the
+default location)</p>
+<p><a class="reference external" href="https://anaconda.org/bioconda/repo" target="_blank">–channel=bioconda <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></p>
+<p>If you do opt to install packages directly from anaconda (which can help
+insure that all the packages are compatible with each other), it is good
+practice to make sure they are all installed from the same remote
+repository/channel.</p>
+<p>Finally, if you are need of C and/or C++ compilers you can install those
+directly into your environment via</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>install<span class="w"> </span>-c<span class="w"> </span>conda-forge<span class="w"> </span>gxx<span class="w"> </span>gcc
+</pre></div>
+</div>
+<p>To share an environment with others on your Project, you can
+create the environment in a specific directory.</p>
+<p>With conda, use the <code class="docutils literal notranslate"><span class="pre">--prefix</span></code> option to create the environment in a
+specific location, such as in your <code class="docutils literal notranslate"><span class="pre">/projects/&lt;account-name&gt;</span></code> directory.
+To use the environment (either interactively from the command line or as
+part of your job submission script), you then need to point to this
+directory when activating it.</p>
+<p>For example, to create a conda environment called <code class="docutils literal notranslate"><span class="pre">env1</span></code> in a subdirectory
+of a projects directory (here p10000 as an example), with the package
+sqlalchemy included, run the following:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="gp">$ </span><span class="nb">cd</span><span class="w"> </span>/projects/p10000
+<span class="gp">$ </span>mkdir<span class="w"> </span>pythonenvs
+<span class="gp">$ </span>mamba<span class="w"> </span>create<span class="w"> </span>--prefix<span class="w"> </span>/projects/p10000/pythonenvs/env1<span class="w"> </span>sqlalchemy<span class="w"> </span><span class="nv">python</span><span class="o">=</span><span class="m">3</span>.12<span class="w"> </span>--yes
+</pre></div>
+</div>
+<p>To use this environment, specify the full path to the environment when
+you activate it:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="gp">$ </span><span class="nb">source</span><span class="w"> </span>activate<span class="w"> </span>/projects/p10000/pythonenvs/env1
+</pre></div>
+</div>
+<p>Please note that a version of the main application you are using (e.g.,
+Python or R) is installed in the Conda environment, so the module
+versions of these should <em>not</em> be loaded when the Conda environment is
+activated. Enter <code class="docutils literal notranslate"><span class="pre">module</span> <span class="pre">purge</span></code> to unload all loaded modules.</p>
+<p>To deactivate an environment, enter:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>deactivate
+</pre></div>
+</div>
+<p>You can also create a new environment in your projects directory instead
+using the <code class="docutils literal notranslate"><span class="pre">--prefix</span></code> option. For example:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>create<span class="w"> </span>--prefix<span class="w"> </span>/projects/&lt;account_id&gt;/&lt;env_name&gt;
+</pre></div>
+</div>
+<p>where <code class="docutils literal notranslate"><span class="pre">&lt;account_id&gt;</span></code> identifies your storage directory. Then activate
+the environment:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>activate<span class="w"> </span>/project/&lt;account_id&gt;/&lt;env_name&gt;
+</pre></div>
+</div>
+<p>To view a list of all your Conda environments, enter:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>env<span class="w"> </span>list
+</pre></div>
+</div>
+<p>To remove a Conda environment, enter:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>env<span class="w"> </span>remove<span class="w"> </span>--name<span class="w"> </span>&lt;env_name&gt;
+</pre></div>
+</div>
+</section>
+<section id="using-anaconda-in-a-slurm-job">
+<span id="id2"></span><h2>Using Anaconda in a Slurm Job<a class="headerlink" href="#using-anaconda-in-a-slurm-job" title="Link to this heading">#</a></h2>
+<p>In order to submit jobs to the Slurm job scheduler, you will need to use
+the main application you are using with your Conda environment in batch
+mode. There are a few steps to follow:</p>
+<ol class="arabic simple">
+<li><p>Create an application script</p></li>
+<li><p>Create a Slurm job script that runs the application script</p></li>
+<li><p>Submit the job script to the job scheduler with <code class="docutils literal notranslate"><span class="pre">sbatch</span></code></p></li>
+</ol>
+<p>Your application script should consist of the sequence of commands
+needed for your analysis.</p>
+<p>A Slurm job script is a special type of Bash shell script that the Slurm
+job scheduler recognizes as a job. For a job using Anaconda, a Slurm job
+script should look something like the following:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+<span class="c1">#SBATCH --account=&lt;account-name&gt;</span>
+<span class="c1">#SBATCH --partition=&lt;partition_name&gt;</span>
+<span class="c1">#SBATCH --nodes=1</span>
+<span class="c1">#SBATCH --ntasks=1</span>
+<span class="c1">#SBATCH --mem=16GB</span>
+<span class="c1">#SBATCH --time=1:00:00</span>
+
+module<span class="w"> </span>purge
+
+<span class="nb">eval</span><span class="w"> </span><span class="s2">&quot;</span><span class="k">$(</span>conda<span class="w"> </span>shell.bash<span class="w"> </span>hook<span class="k">)</span><span class="s2">&quot;</span>
+
+conda<span class="w"> </span>activate<span class="w"> </span>/projects/pXXXXX/env
+
+python<span class="w"> </span>script.py
+</pre></div>
+</div>
+</section>
+<section id="accessing-mamba-conda-environments-in-jupyter">
+<span id="access-mamba-conda-kernel-from-jupyter"></span><h2>Accessing Mamba/Conda Environments in Jupyter<a class="headerlink" href="#accessing-mamba-conda-environments-in-jupyter" title="Link to this heading">#</a></h2>
+<p>By default, jupyter will use the “root” environment of the Anaconda
+module you have loaded. If you are using a conda environment, for
+example to be able to install specific versions of software or because
+you are sharing an environment with other people in your group, you will
+need to manually install the environment into your jupyter
+configuration. This can only be done from the command line, not within
+the jupyter notebook. First, load whichever Anaconda module you are
+using and activate your environment, for example:</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>To list all available Jupyter Kernels, run</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>$<span class="w"> </span>module<span class="w"> </span>load<span class="w"> </span>python-anaconda3/2019.10
+$<span class="w"> </span>jupyter<span class="w"> </span>kernelspec<span class="w"> </span>list
+</pre></div>
+</div>
+</div>
+<section id="add-a-python-environment">
+<h3>Add a Python Environment<a class="headerlink" href="#add-a-python-environment" title="Link to this heading">#</a></h3>
+<ol class="arabic simple">
+<li><p><a class="reference internal" href="../../../systems/quest/user-guide/login/login-quest.html#logging-in-to-quest"><span class="std std-ref">Connect to the Quest login nodes</span></a>.</p></li>
+<li><p>Create a new conda environment if you don’t already have one.  The environment needs to contain the <code class="docutils literal notranslate"><span class="pre">ipykernel</span></code> package.  For example:</p></li>
+</ol>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>purge<span class="w"> </span>all
+<span class="gp">$ </span>module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="gp">$ </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="w"> </span>jupyter-kernel-py312<span class="w"> </span>-c<span class="w"> </span>conda-forge<span class="w"> </span><span class="nv">python</span><span class="o">=</span><span class="m">3</span>.12<span class="w"> </span>numpy<span class="w"> </span>pandas<span class="w"> </span>matplotlib<span class="w"> </span>ipykernel<span class="w"> </span>--yes
+</pre></div>
+</div>
+<ol class="arabic simple" start="3">
+<li><p>Activate the environment and connect the environment to Jupyter.  For example, for an environment named <code class="docutils literal notranslate"><span class="pre">jupyter-kernel-py312</span></code></p></li>
+</ol>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span><span class="nb">source</span><span class="w"> </span>activate<span class="w"> </span>jupyter-kernel-py312
+<span class="gp">$ </span>python<span class="w"> </span>-m<span class="w"> </span>ipykernel<span class="w"> </span>install<span class="w"> </span>--user<span class="w"> </span>--name<span class="w"> </span>jupyter-kernel-py312<span class="w"> </span>--display-name<span class="w"> </span><span class="s2">&quot;Python (jupyter-kernel-py312)&quot;</span>
+</pre></div>
+</div>
+<p>The last command adds the environment to your list of available
+environments in Jupyter, and once you have done this it will be
+available for you under the “New” menu.</p>
+</section>
+<section id="add-an-r-environment">
+<h3>Add an R Environment<a class="headerlink" href="#add-an-r-environment" title="Link to this heading">#</a></h3>
+<ol class="arabic simple">
+<li><p><a class="reference internal" href="../../../systems/quest/user-guide/login/login-quest.html#logging-in-to-quest"><span class="std std-ref">Connect to the Quest login nodes</span></a>.</p></li>
+<li><p>Create a new conda environment if you don’t already have one.  The environment needs to contain the <code class="docutils literal notranslate"><span class="pre">r-irkernel</span></code> package.  For example:</p></li>
+</ol>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>purge<span class="w"> </span>all
+<span class="gp">$ </span>module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="gp">$ </span>mamba<span class="w"> </span>create<span class="w"> </span>-c<span class="w"> </span>conda-forge<span class="w"> </span>--name<span class="w"> </span>r-kernel<span class="w"> </span>r-irkernel<span class="w"> </span><span class="nv">r</span><span class="o">=</span><span class="m">4</span>.4<span class="w"> </span>jupyterlab
+</pre></div>
+</div>
+<ol class="arabic simple" start="3">
+<li><p>Activate the environment and connect the environment to Jupyter. For example, for an environment named <code class="docutils literal notranslate"><span class="pre">r-kernel</span></code></p></li>
+</ol>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span><span class="nb">source</span><span class="w"> </span>activate<span class="w"> </span>r-kernel
+<span class="gp">$ </span>R<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;IRkernel::installspec(name = &#39;ir44&#39;, displayname = &#39;R4.4&#39;)&quot;</span>
+</pre></div>
+</div>
+<p>The last command adds the environment to your list of available
+environments in Jupyter, and once you have done this it will be
+available for you under the “New” menu.</p>
+<p><img alt="jupyter new notebook menu" src="../../../_images/jupyter-notebook-kernel-selection.png" /></p>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../software-management.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Tutorials for Working on Quest</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../git-quest/git-quest.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Git on Quest</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+  <div class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav class="bd-toc-nav page-toc">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#using-mamba-on-quest">Using Mamba on Quest</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#conda-activate-vs-source-activate">“conda activate” vs. “source activate”:</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#creating-mamba-conda-environments-and-installing-packages">Creating Mamba/Conda environments and installing packages</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#explaining-anaconda-channels">Explaining Anaconda “channels”</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#using-anaconda-in-a-slurm-job">Using Anaconda in a Slurm Job</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#accessing-mamba-conda-environments-in-jupyter">Accessing Mamba/Conda Environments in Jupyter</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#add-a-python-environment">Add a Python Environment</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#add-an-r-environment">Add an R Environment</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+             Last updated: 2026-06-30
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+
+
+<div id="footer-bottom">
+<div class="contain-1120">
+<span class="copyright" style="color:white">©
+<script>// <![CDATA[
+document.write(new Date().getFullYear())
+// ]]></script>
+Northwestern University | <a href="https://www.it.northwestern.edu/departments/it-services-support/research/">Northwestern IT Research Computing and Data Services</a></span>
+<!--
+<ul>
+<li><a href="https://www.facebook.com/NorthwesternU"> <span class="social facebook">Facebook</span> </a></li>
+<li><a href="https://www.twitter.com/northwesternu"> <span class="social twitter">Twitter</span> </a></li>
+<li><a href="https://www.instagram.com/northwesternu"> <span class="social instagram">Instagram</span> </a></li>
+<li><a href="https://www.youtube.com/user/NorthwesternU"> <span class="social youtube">YouTube</span> </a></li>
+<li><a href="https://www.tiktok.com/@northwestern.u"> <span class="social tiktok">TikTok</span> </a></li>
+<li><a href="https://www.linkedin.com/school/northwestern-university/"> <span class="social linkedin">LinkedIn</span> </a></li>
+</ul>
+-->
+<span class="right" style="color:white"><a style="color:white" href="https://www.northwestern.edu/disclaimer.html">Disclaimer</a></span>
+</div>
+</div>
+  </footer>
+  </body>
+</html>

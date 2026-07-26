@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, fields, is_dataclass
 import math
 from typing import Any, Mapping
@@ -53,6 +54,7 @@ class BranchingDiagnosticLimits:
 
     upper_nodes: int | None = None
     stop_nodes: int | None = None
+    reuse_root_private_profile: bool = False
 
     def __post_init__(self) -> None:
         for name, value in (("upper_nodes", self.upper_nodes), ("stop_nodes", self.stop_nodes)):
@@ -60,6 +62,8 @@ class BranchingDiagnosticLimits:
                 isinstance(value, bool) or not isinstance(value, int) or value <= 1
             ):
                 raise ValueError(f"diagnostic {name} must be an integer greater than one")
+        if not isinstance(self.reuse_root_private_profile, bool):
+            raise TypeError("reuse_root_private_profile must be bool")
 
 
 def sample_branched_tree(
@@ -227,6 +231,17 @@ def _sample_branched_tree_impl(
             }
         )
     metrics = getattr(backend, "execution_metrics", None)
+
+    def timed_cuda(component: str, rows: int):
+        if metrics is None:
+            return nullcontext()
+        return metrics.time_cuda_work(component, rows=rows)
+
+    def timed_host_sync(source: str, nbytes: int):
+        if metrics is None:
+            return nullcontext()
+        return metrics.time_host_synchronization(source, nbytes=nbytes)
+
     roots = backend.branched_root_state()
     if roots.shape != (1,) or roots.dtype != torch.int32 or roots.device != device:
         raise ValueError("branched_root_state must return device-local int32 [1]")
@@ -470,6 +485,8 @@ def _sample_branched_tree_impl(
         }
     )
     queue_cost_total = 0.0
+    reused_private_profile: Tensor | None = None
+    reused_private_profile_rows = 0
 
     def admit_child_wave(count: int) -> None:
         """Admit every mutable child owner before draws or state mutation."""
@@ -554,6 +571,26 @@ def _sample_branched_tree_impl(
                 oldest_age=float(queue.oldest_age(scheduler_step)),
             )
 
+    def sample_private_profiles(
+        states: Tensor, reaches: Tensor, keys: Tensor
+    ) -> Tensor:
+        """Sample legally, or run the explicit one-profile diagnostic ablation."""
+
+        nonlocal reused_private_profile, reused_private_profile_rows
+        if not limits.reuse_root_private_profile:
+            return _sample_profiles_logical(backend, states, reaches, keys, gen)
+        if reused_private_profile is None:
+            sampled = _sample_profiles_logical(
+                backend,
+                states[:1],
+                reaches[:1],
+                keys[:1],
+                gen,
+            )
+            reused_private_profile = sampled[0].detach().clone()
+        reused_private_profile_rows += int(states.numel())
+        return reused_private_profile[None].expand(states.numel(), -1)
+
     def forecast_workspace(partition_id: int, rows: int) -> int:
         predictor = getattr(backend, "training_transient_bytes", None)
         if not callable(predictor):
@@ -592,7 +629,12 @@ def _sample_branched_tree_impl(
         nonlocal cutoff_active
         rows = nodes.to(torch.int64)
         states = buffer.state_ref[rows]
-        fixed_beta = _validate_beta(backend.beta_fn(states), nodes.numel(), device)
+        fixed_beta = _validate_beta(
+            backend.beta_fn(states),
+            nodes.numel(),
+            device,
+            metrics=metrics,
+        )
         if branching_mode == "fixed":
             fixed_beta = (fixed_beta * fixed_scale).clamp_min(1.0)
         if dynamic_active and partition_id is not None:
@@ -805,7 +847,8 @@ def _sample_branched_tree_impl(
                     dtype=torch.float32,
                     device=device,
                 )
-            children, edge_rows = buffer.reserve_children(parents, weights)
+            with timed_cuda("rollout_child_reservation", end - start):
+                children, edge_rows = buffer.reserve_children(parents, weights)
             expected_children = torch.arange(
                 first_child + start,
                 first_child + end,
@@ -818,28 +861,41 @@ def _sample_branched_tree_impl(
                 dtype=torch.int32,
                 device=device,
             )
-            if not torch.equal(children, expected_children) or not torch.equal(
-                edge_rows, expected_edges
-            ):
+            with timed_host_sync("branched_child_reservation_alignment", 1):
+                children_aligned = torch.equal(children, expected_children)
+            with timed_host_sync("branched_edge_reservation_alignment", 1):
+                edges_aligned = torch.equal(edge_rows, expected_edges)
+            if not children_aligned or not edges_aligned:
                 raise RuntimeError("branched logical child reservation lost stable order")
-            control_rows = control_arena.append(
-                {
-                    "nominal_count": torch.zeros(
-                        end - start, dtype=torch.int32, device=device
-                    ),
-                    "beta": torch.zeros(
-                        end - start, dtype=torch.float32, device=device
-                    ),
-                    "log_player_sum": torch.full(
-                        (end - start,), -torch.inf, dtype=torch.float32, device=device
-                    ),
-                    "log_ancestor_product": torch.zeros(end - start, device=device),
-                    "queue_cost": torch.zeros(end - start, device=device),
-                }
-            )
-            if not torch.equal(control_rows.to(torch.int32), children):
+            with timed_cuda("rollout_child_reservation", end - start):
+                control_rows = control_arena.append(
+                    {
+                        "nominal_count": torch.zeros(
+                            end - start, dtype=torch.int32, device=device
+                        ),
+                        "beta": torch.zeros(
+                            end - start, dtype=torch.float32, device=device
+                        ),
+                        "log_player_sum": torch.full(
+                            (end - start,),
+                            -torch.inf,
+                            dtype=torch.float32,
+                            device=device,
+                        ),
+                        "log_ancestor_product": torch.zeros(
+                            end - start, device=device
+                        ),
+                        "queue_cost": torch.zeros(end - start, device=device),
+                    }
+                )
+            with timed_host_sync("branched_control_reservation_alignment", 1):
+                controls_aligned = torch.equal(
+                    control_rows.to(torch.int32), children
+                )
+            if not controls_aligned:
                 raise RuntimeError("branched controller rows lost topology alignment")
-            child_handles = arena.allocate(end - start)
+            with timed_cuda("rollout_child_reservation", end - start):
+                child_handles = arena.allocate(end - start)
             if device.type == "cuda":
                 torch._assert_async(
                     (child_handles == children.to(torch.int64)).all(),
@@ -847,15 +903,16 @@ def _sample_branched_tree_impl(
                 )
             elif not torch.equal(child_handles, children.to(torch.int64)):
                 raise RuntimeError("branched occurrence and child handles diverged")
-            child_reach_handles = reach_pool.allocate(end - start)
-            expanded_paths = parent_paths[parent_positions]
-            arena.scatter_many(
-                child_handles,
-                {
-                    "path_key": child_path_keys(expanded_paths, ordinal),
-                    "reach_handle": child_reach_handles,
-                },
-            )
+            with timed_cuda("rollout_child_reservation", end - start):
+                child_reach_handles = reach_pool.allocate(end - start)
+                expanded_paths = parent_paths[parent_positions]
+                arena.scatter_many(
+                    child_handles,
+                    {
+                        "path_key": child_path_keys(expanded_paths, ordinal),
+                        "reach_handle": child_reach_handles,
+                    },
+                )
 
         for start in range(0, total, child_pack_rows):
             end = min(start + child_pack_rows, total)
@@ -877,8 +934,8 @@ def _sample_branched_tree_impl(
                 draw=ordinal,
                 purpose=DrawPurpose.POSTERIOR,
             )
-            profiles = _sample_profiles_logical(
-                backend, child_states, child_reach, posterior_keys, gen
+            profiles = sample_private_profiles(
+                child_states, child_reach, posterior_keys
             )
             child_output = None
             if partition_id is not None:
@@ -896,43 +953,47 @@ def _sample_branched_tree_impl(
                     else DrawPurpose.CHANCE
                 ),
             )
-            events = _sample_events_logical(
-                backend,
-                child_states,
-                profiles,
-                child_output,
-                bundle.policy_adapter,
-                event_keys,
-                gen,
-            )
+            with timed_cuda("rollout_event_sampling", end - start):
+                events = _sample_events_logical(
+                    backend,
+                    child_states,
+                    profiles,
+                    child_output,
+                    bundle.policy_adapter,
+                    event_keys,
+                    gen,
+                )
             if partition_id is None:
                 step_batch = getattr(backend, "step_chance_batch", backend.step)
             else:
                 step_batch = getattr(backend, "step_player_batch", backend.step)
-            next_states = step_batch(child_states, events)
-            next_reach = backend.reach_update(
-                child_reach, child_states, events, child_output
-            )
-            next_owner = backend.classify(next_states).to(torch.int32)
-            buffer.commit_children(
-                first_child + start,
-                first_edge + start,
-                next_states,
-                next_owner,
-                events.public_id,
-            )
-            child_reach_handles = arena.gather_many(
-                ("reach_handle",), children.to(torch.int64)
-            )["reach_handle"]
-            reach_pool.write(child_reach_handles, {"log_reach": next_reach})
-            child_log_sum, child_log_product = child_path_factors(
-                log_player_sum[rows][parent_positions],
-                log_ancestor_product[rows][parent_positions],
-                beta_rows[rows][parent_positions],
-                (next_owner >= 0) & (next_owner < p_max),
-            )
-            log_player_sum[children.to(torch.int64)] = child_log_sum
-            log_ancestor_product[children.to(torch.int64)] = child_log_product
+            with timed_cuda("rollout_state_transition", end - start):
+                next_states = step_batch(child_states, events)
+                next_owner = backend.classify(next_states).to(torch.int32)
+            with timed_cuda("rollout_reach_update", end - start):
+                next_reach = backend.reach_update(
+                    child_reach, child_states, events, child_output
+                )
+            with timed_cuda("rollout_child_commit", end - start):
+                buffer.commit_children(
+                    first_child + start,
+                    first_edge + start,
+                    next_states,
+                    next_owner,
+                    events.public_id,
+                )
+                child_reach_handles = arena.gather_many(
+                    ("reach_handle",), children.to(torch.int64)
+                )["reach_handle"]
+                reach_pool.write(child_reach_handles, {"log_reach": next_reach})
+                child_log_sum, child_log_product = child_path_factors(
+                    log_player_sum[rows][parent_positions],
+                    log_ancestor_product[rows][parent_positions],
+                    beta_rows[rows][parent_positions],
+                    (next_owner >= 0) & (next_owner < p_max),
+                )
+                log_player_sum[children.to(torch.int64)] = child_log_sum
+                log_ancestor_product[children.to(torch.int64)] = child_log_product
             if partition_id is not None and record_policy_node:
                 assert child_output is not None
                 legal_ids, legal_mask = backend.legal_events(child_states)
@@ -1081,6 +1142,12 @@ def _sample_branched_tree_impl(
             chance_nodes = partition.candidate_handles[-2, :chance_count].to(torch.int32)
             frontier = expand(chance_nodes, None)
 
+    def run_chance_close(frontier: Tensor) -> None:
+        """Time one complete chance-closure invocation, including host waits."""
+
+        with timed_cuda("rollout_chance_closure", int(frontier.numel())):
+            chance_close(frontier)
+
     def drain_player_queues() -> None:
         nonlocal scheduler_step, queue_cost_total
         while any(queue.host_count for queue in queues.values()):
@@ -1107,9 +1174,9 @@ def _sample_branched_tree_impl(
                 removed = read_float_control(queue_cost[nodes.to(torch.int64)].sum())
                 queue_cost_total -= removed
             record_queues()
-            chance_close(expand(nodes, partition_id, frontier_cost_forecast))
+            run_chance_close(expand(nodes, partition_id, frontier_cost_forecast))
 
-    chance_close(root_nodes)
+    run_chance_close(root_nodes)
     drain_player_queues()
 
     pre_refill_node_count: int | None = None
@@ -1145,7 +1212,7 @@ def _sample_branched_tree_impl(
                 forced_edge_weight=1.0 / root_pre_refill_child_count,
                 record_policy_node=False,
             )
-            chance_close(extra)
+            run_chance_close(extra)
             drain_player_queues()
         diagnostics.update(
             {
@@ -1196,13 +1263,17 @@ def _sample_branched_tree_impl(
         "node_id", torch.arange(leaf_rows.size, device=device)
     )
     leaf_order = torch.argsort(source_nodes.to(torch.int64), stable=True)
-    leaf_block, leaf_metrics = leaf_rows.seal(
-        scratch_rows=page_rows, row_order=leaf_order, release_source=True
-    )
+    with timed_cuda("rollout_internal_leaf_seal", int(leaf_rows.size)):
+        leaf_block, leaf_metrics = leaf_rows.seal(
+            scratch_rows=page_rows, row_order=leaf_order, release_source=True
+        )
     verify_recycling = getattr(backend, "verify_state_recycling_boundary", None)
     if callable(verify_recycling):
         verify_recycling()
-    decision_inputs = seal_captures(decision_input_store)
+    with timed_cuda(
+        "rollout_internal_decision_seal", int(completed_decision_rows)
+    ):
+        decision_inputs = seal_captures(decision_input_store)
     decision_nodes = decision_inputs.node_ids.to(torch.int64)
     decision_new_nodes = old_to_new[decision_nodes]
     decision_partition = torch.full(
@@ -1270,6 +1341,10 @@ def _sample_branched_tree_impl(
         "fixed_beta_scale": fixed_scale,
         "execution_accountant_limit_bytes": accountant.limit_bytes,
         "execution_accountant_high_water_bytes": accountant.high_water_bytes,
+        "diagnostic_reuse_root_private_profile": int(
+            limits.reuse_root_private_profile
+        ),
+        "diagnostic_reused_private_profile_rows": reused_private_profile_rows,
     }
     arena.release()
     buffer.release()
@@ -1292,12 +1367,36 @@ def _sample_branched_tree_impl(
 
 
 
-def _validate_beta(beta: Tensor, count: int, device: torch.device) -> Tensor:
+def _validate_beta(
+    beta: Tensor,
+    count: int,
+    device: torch.device,
+    *,
+    metrics: Any | None = None,
+) -> Tensor:
     """Validate and return fixed intensities as fp32 ``[B]``."""
 
     if beta.shape != (count,) or beta.dtype != torch.float32 or beta.device != device:
         raise ValueError("beta_fn must return device-local fp32 [B]")
-    if not bool(torch.isfinite(beta).all()) or bool((beta < 1.0).any()):
+    timing = (
+        nullcontext()
+        if metrics is None
+        else metrics.time_host_synchronization(
+            "branched_beta_finite_validation", nbytes=1
+        )
+    )
+    with timing:
+        finite = bool(torch.isfinite(beta).all())
+    timing = (
+        nullcontext()
+        if metrics is None
+        else metrics.time_host_synchronization(
+            "branched_beta_lower_bound_validation", nbytes=1
+        )
+    )
+    with timing:
+        below_one = bool((beta < 1.0).any())
+    if not finite or below_one:
         raise ValueError("rollout beta must be finite and at least one")
     return beta
 

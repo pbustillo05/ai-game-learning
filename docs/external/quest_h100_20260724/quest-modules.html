@@ -1,0 +1,659 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../../" data-theme="light">
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <meta property="article:modified_time" content="2025-09-25T13:07:35+00:00" />
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-8VW6NPDBRF"></script>
+    <script>
+        window.dataLayer = window.dataLayer || [];
+        function gtag(){dataLayer.push(arguments);}
+        gtag('js', new Date());
+        gtag('config', 'G-8VW6NPDBRF');
+    </script>
+    
+    <title>Software Module System &#8212; Northwestern IT
+Research Computing and Data Services
+Northwestern University</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "light";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/styles/sphinx-book-theme.css?v=a3416100" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/tabs.css?v=a5c4661c" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/sphinx-design.min.css?v=95c83b7e" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/sphinxcontrib-images/LightBox2/lightbox2/dist/css/lightbox.min.css?v=6e7d0de0" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/sphinxcontrib-images/LightBox2/lightbox2-customize/pointer.css?v=c97663ff" />
+    <link rel="stylesheet" type="text/css" href="../../../../_static/css/nuit-rcds-docs.css?v=80855fb1" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../../../_static/documentation_options.js?v=9eb32ce0"></script>
+    <script src="../../../../_static/doctools.js?v=9bcbadda"></script>
+    <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../../_static/copybutton.js?v=35a8b989"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script src="../../../../_static/scripts/sphinx-book-theme.js?v=887ef09a"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="../../../../_static/design-tabs.js?v=f930bc37"></script>
+    <script src="../../../../_static/sphinxcontrib-images/LightBox2/lightbox2/dist/js/lightbox-plus-jquery.min.js?v=f0ca4bb6"></script>
+    <script src="../../../../_static/sphinxcontrib-images/LightBox2/lightbox2-customize/jquery-noconflict.js?v=12818e64"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <link rel="index" title="Index" href="../../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../../search.html" />
+    <link rel="next" title="Slurm Job Scheduler" href="../slurm/slurm.html" />
+    <link rel="prev" title="Transferring Data To and From Quest" href="../data-transfer/data-transfer.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+    <meta name="docbuild:last-update" content="2025-09-25"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="light">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+    
+    <img src="../../../../_static/rcds_logo.png" class="logo__image only-light" alt="Northwestern IT
+Research Computing and Data Services
+Northwestern University - Home"/>
+    <img src="../../../../_static/rcds_logo.png" class="logo__image only-dark pst-js-only" alt="Northwestern IT
+Research Computing and Data Services
+Northwestern University - Home"/>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../start/quest/quest-intro.html">Introduction to Quest</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../start/gcc/gcc-start.html">Genomics Compute Cluster Quick Start</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../start/quest/quest-tips.html">HPC Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../start/getting-help.html">Getting Help</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">System Guides</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="../../quest.html">Quest Compute Cluster</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/" target="_blank">Quest Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/procedural-guidelines.html" target="_blank">Policies and Guidelines <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../resources/quest-resource.html">Quest Resources</a></li>
+<li class="toctree-l2 current active has-children"><a class="reference internal" href="../quest-user-guide.html">User Guide</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="../login/login-quest.html">Logging In</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../filesystem/filesystem.html">File System</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../data-transfer/data-transfer.html">Transferring Data</a></li>
+<li class="toctree-l3 current active"><a class="current reference internal" href="#">Software Modules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../slurm/slurm.html">Slurm Job Scheduler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../gpu/gpu.html">GPUs</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../software/quest-software-list.html">Software</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../software/alphafold/alphafold-quest.html">AlphaFold</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../software/knitro/knitro-quest.html">Knitro</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../software/matlab/matlab-quest.html">MATLAB</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../software/python/python-quest.html">Python</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../software/r/r-quest.html">R/RStudio</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../software/vasp/vasp-quest.html">VASP</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../software/abaqus/abaqus.html">Abaqus</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../quest-analytics/analytics.html">Quest Analytics Nodes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../quest-analytics/using_analytics.html">Analytics Nodes Usage Tips</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../ondemand/ondemand.html">Quest OnDemand</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../gcc/using-gcc.html">Genomics Compute Cluster</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../specs/index.html">Technical Specifications</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/specs.html" target="_blank">Quest Technical Specifications <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../specs/release-notes.html">Maintenance and Update Notes</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../rdss/rdss-index.html">Research Data Storage Service</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceDet?ID=96" target="_blank">Service Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../rdss/rdss-owners.html">Share Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../rdss/rdss-users.html">User Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../rdss/rdss-troubleshooting.html">Troubleshooting Guide</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../globus/globus-index.html">Globus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../globus/globus-login.html">Log in</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../globus/globus-collection.html">Access Data Using Collections</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../globus/globus-transfer.html">Transfer Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../globus/globus-sharing.html">Share Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../globus/globus-troubleshooting.html">Troubleshoot</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../sde/sde.html">Secure Data Enclave</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceDet?ID=380" target="_blank">Service Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../sde/sde-structure/sde-structure.html">SDE Structure</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-structure/sde-components.html">Environment Components</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-structure/roles.html">User Roles</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-structure/projects.html">Projects</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-structure/storage.html">Storage Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-structure/vms.html">Virtual Machines (VMs)</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../sde/sde-user-guide/sde-user-guide.html">SDE User Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/accessing-sde.html">Accessing the SDE</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/cli-tools.html">Installing Command Line Tools</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/using-vms.html">Using VMs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/managing-buckets.html">Managing Storage Buckets</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/ingress-egress.html">Importing and Exporting Data</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/coderepo.html">Managing Software and Code</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../sde/sde-user-guide/sde-glossary.html">Glossary</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../sde/acceptable-use.html">Acceptable Use Policy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../sde/cost.html">Estimating Costs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../sde/requesting-support.html">Service Requests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../nightingale/nightingale.html">NU@Nightingale</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/additional-computing-resources/nightingale.html" target="_blank">Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference external" href="https://www.ncsa.illinois.edu/resources-and-services/compute-resources/nightingale/" target="_blank">Compute and Storage Resources <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../nightingale/onboarding.html">Onboarding Process</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../nightingale/access-ngl.html">Using Nightingale</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../nightingale/data-transfer-ngl.html">Importing and Exporting Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../nightingale/offboarding.html">Offboarding Process</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../nightingale/support.html">Getting Help</a></li>
+<li class="toctree-l2"><a class="reference external" href="https://docs.ncsa.illinois.edu/systems/nightingale/en/latest/index.html" target="_blank">NCSA Nightingale User Guide <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../coldfront/index.html">ColdFront</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../coldfront/cf-project.html">Projects in ColdFront</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../coldfront/cf-resource.html">Resource Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../coldfront/cf-user.html">User Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../coldfront/transition-to-coldfront.html">Transitioning to ColdFront</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Tutorials</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/software-management/software-management.html">Working on Quest</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/software-management/conda-mamba-quest/mamba-conda-quest.html">Mamba or Conda Virtual Environments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/software-management/git-quest/git-quest.html">Git on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/software-management/singularity/singularity-quest.html">Singularity on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/software-management/compiling-code/compiling-code-quest.html">Compiling Code on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/software-management/scaling-study/scaling-study.html">Scaling Studies on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/python/python-tutorials.html">Python</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-installation.html">Installing Python on Your Computer</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-selenium-quest.html">Python Selenium on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-gpus.html">Using GPUs with Python</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-llm-huggingface.html">Using Hugging Face on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-llm-ollama.html">Using Ollama on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/r/r-tutorials.html">R</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/r/r-installation.html">Installing R/RStudio on Your Computer</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/r/git-with-r.html">Git with R</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/git/git-tutorials.html">Git/GitHub</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/git/workshop-materials.html">Downloading Workshop Materials</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/r/git-with-r.html">Git with R</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/software-management/git-quest/git-quest.html">Git on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/cloud/aws/aws-index.html">AWS</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/cloud/aws/create-amazon-s3-bucket.html">Creating an Amazon S3 bucket</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/cloud/aws/s3-access-keys.html">Creating Amazon S3 Access Keys</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/cloud/aws/archiving-data-amazon-S3.html">Archiving Data in Amazon S3 Glacier Deep Archive</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/cloud/azure/azure-index.html">Azure</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/cloud/azure/azure-basics.html">Getting Familiar with Azure</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/cloud/azure/azure-openai.html">Using Azure AI and OpenAI Resources</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../tutorials/ai/ai-tutorials.html">AI</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/ai/genai-coding.html">Coding with Generative AI Tools</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-llm-huggingface.html">Using Hugging Face on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/python/python-llm-ollama.html">Using Ollama on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../tutorials/cloud/azure/azure-openai.html">Using Azure AI and OpenAI Resources</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../tutorials/video-list.html">Video Tutorials</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Resource Guides</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../guides/bash/bash-guide.html">Command Line</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/bash/command-line-start.html">Getting Started with the Command Line</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/bash/bash-scripting.html">Bash Scripting</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../guides/python/python-guide.html">Python</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/python/python-lang.html">Programming in Python</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/python/pandas.html">Pandas</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/python/python-deep-learning.html">Deep Learning Frameworks</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../guides/r/r-guide.html">R</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/r/learn-r.html">Learning R</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/r/ggplot2.html">ggplot2</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../guides/stats/stats-guides.html">Statistics</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/stats/clustering.html">Clustering</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/stats/linear-regression.html">Linear Regression</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../guides/other/other-guides.html">Additional Tools</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/other/git.html">Git and GitHub</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/other/gh-copilot.html">GitHub Copilot</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../guides/other/sql.html">SQL</a></li>
+</ul>
+</details></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Software Module System</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#available-modules">Available Modules</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-a-new-module">Request a New Module</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#loading-a-module">Loading a Module</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#module-versions">Module Versions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#useful-module-commands">Useful Module Commands</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="software-module-system">
+<span id="module-system-on-quest"></span><h1>Software Module System<a class="headerlink" href="#software-module-system" title="Link to this heading">#</a></h1>
+<p>Centrally-installed software on Quest is managed through modules.</p>
+<p>Because high-performance computing clusters are shared environments, modules allow software and applications to be shared to all users in the environment. This can be very beneficial when you need to ensure that you are using the same version of something like MATLAB as the other users in your lab.</p>
+<p>Modules are used to manage:</p>
+<ul class="simple">
+<li><p>multiple versions of applications, tools, and libraries</p></li>
+<li><p>software where complex changes to the environment are necessary</p></li>
+<li><p>software where name conflicts with other software would cause
+problems</p></li>
+</ul>
+<p>Quest uses the <a class="reference external" href="https://lmod.readthedocs.io/en/latest/" target="_blank">LMOD <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a> module system.</p>
+<p>One of the most common variables in a Unix operating system is <code class="docutils literal notranslate"><span class="pre">$PATH</span></code>. This variable tells the system where to look for specific applications. Another common variable is <code class="docutils literal notranslate"><span class="pre">$LD_LIBRARY_PATH</span></code>. Similar to <code class="docutils literal notranslate"><span class="pre">$PATH</span></code>, this tells the system where to look for specific libraries that are used by the applications.</p>
+<p>Loading a module for a particular piece of software often adds the path
+to the executable to <code class="docutils literal notranslate"><span class="pre">$PATH</span></code>, the path to the library to
+<code class="docutils literal notranslate"><span class="pre">$LD_LIBRARY_PATH</span></code>, and so on. Loading a module
+relieves the user of having to remember and type long path
+names and modify environment variables to use the software.</p>
+<section id="available-modules">
+<h2>Available Modules<a class="headerlink" href="#available-modules" title="Link to this heading">#</a></h2>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>View a list of available software modules at <a class="reference internal" href="../../software/quest-software-list.html#software-list"><span class="std std-ref">Quest Software</span></a></p>
+</div>
+<p>Often, you won’t know which modules are available to you when you first connect to the system. To see all of the modules, use the command below:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>avail
+</pre></div>
+</div>
+</section>
+<section id="request-a-new-module">
+<h2>Request a New Module<a class="headerlink" href="#request-a-new-module" title="Link to this heading">#</a></h2>
+<p>If after viewing the available software modules on Quest you do not see the software you are looking for or if you have questions on how to install a particular software on Quest yourself, then please see our service page for information on how to <a class="reference external" href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceOfferingDet?ID=66" target="_blank">request software on Quest <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a>.</p>
+</section>
+<section id="loading-a-module">
+<h2>Loading a Module<a class="headerlink" href="#loading-a-module" title="Link to this heading">#</a></h2>
+<p>To access almost every software application on Quest, you must first
+load the appropriate module:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>load<span class="w"> </span>&lt;modulename&gt;
+</pre></div>
+</div>
+<p>Then you can reference software commands by name.</p>
+</section>
+<section id="module-versions">
+<h2>Module Versions<a class="headerlink" href="#module-versions" title="Link to this heading">#</a></h2>
+<p>There are multiple versions of many software programs on Quest. Modules
+are named with the format <code class="docutils literal notranslate"><span class="pre">softwarename/version</span></code>. For example,
+if you look at the modules available for Python, you’ll see several
+versions:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>avail<span class="w"> </span>matlab
+
+<span class="go">----------------------------------------------- /hpc/software/Modules/3.2.9/modulefiles -----------------------------------------------</span>
+<span class="go">   matlab/r2014a    matlab/r2017a          matlab/r2018b        matlab/r2021b    matlab/r2023b</span>
+<span class="go">   matlab/r2015a    matlab/r2018a          matlab/r2019b        matlab/r2022a    matlab/r2024a</span>
+<span class="go">   matlab/r2016a    matlab/r2018b-rhel8    matlab/r2020b (D)    matlab/r2022b</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">(D)</span></code> indicates which module will be loaded if you don’t
+specify the version (e.g. <code class="docutils literal notranslate"><span class="pre">module</span> <span class="pre">load</span> <span class="pre">matlab</span></code>).</p>
+<div class="admonition important">
+<p class="admonition-title">Important</p>
+<p>Defaults can change over time, however, so it is <strong>strongly recommended that you always specify the module version</strong> even if you are using the default version.</p>
+</div>
+<p>An example of loading the MATLAB module with a specific version is included below:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>load<span class="w"> </span>matlab/r2024a
+</pre></div>
+</div>
+</section>
+<section id="useful-module-commands">
+<h2>Useful Module Commands<a class="headerlink" href="#useful-module-commands" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p><div style="width:250px">Command</div></p></th>
+<th class="head"><p>Action</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">module</span> <span class="pre">avail</span></code></p></td>
+<td><p>Shows the available software packages</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">module</span> <span class="pre">avail</span> <span class="pre">&lt;search&gt;</span></code></p></td>
+<td><p>Shows all modules that have <code class="docutils literal notranslate"><span class="pre">&lt;search&gt;</span></code> in the main part of the name (not in the version, which comes after the <code class="docutils literal notranslate"><span class="pre">/</span></code>). <code class="docutils literal notranslate"><span class="pre">&lt;search&gt;</span></code> is case sensitive. This is useful for viewing the versions available for a particular program instead of having to sort through the long list of all modules.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">module</span> <span class="pre">-r</span> <span class="pre">spider</span> <span class="pre">'^p'</span></code><br><br><code class="docutils literal notranslate"><span class="pre">module</span> <span class="pre">-r</span> <span class="pre">spider</span> <span class="pre">mpi</span></code><br><br><code class="docutils literal notranslate"><span class="pre">module</span> <span class="pre">-r</span> <span class="pre">spider</span> <span class="pre">'2.0$'</span></code></p></td>
+<td><p>Finds all the modules that start with “p” or “P”<br><br>Finds all modules that have “mpi” in their name including the version part of the name<br><br>Finds all modules where the name including the version part of the name end in “2.0”</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">module</span> <span class="pre">list</span></code></p></td>
+<td><p>Shows which modules are currently loaded</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">module</span> <span class="pre">load</span> <span class="pre">&lt;module_name&gt;</span></code></p></td>
+<td><p>Loads a software package’s path information into your local environment so your session can find the software to run it</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">module</span> <span class="pre">purge</span> <span class="pre">&lt;module_name&gt;</span></code></p></td>
+<td><p>Takes the software package’s information out of your local environment; this is generally more reliable than <code class="docutils literal notranslate"><span class="pre">module</span> <span class="pre">unload</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">module</span> <span class="pre">purge</span> <span class="pre">all</span></code></p></td>
+<td><p>Unloads all of the module packages  currently in your local environment</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">module</span> <span class="pre">display</span> <span class="pre">&lt;foo&gt;</span></code></p></td>
+<td><p>Displays the changes that are made to the environment by loading the module <code class="docutils literal notranslate"><span class="pre">&lt;foo&gt;</span></code> without actually loading it</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../data-transfer/data-transfer.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Transferring Data To and From Quest</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../slurm/slurm.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Slurm Job Scheduler</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+  <div class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav class="bd-toc-nav page-toc">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#available-modules">Available Modules</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-a-new-module">Request a New Module</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#loading-a-module">Loading a Module</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#module-versions">Module Versions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#useful-module-commands">Useful Module Commands</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+             Last updated: 2025-09-25
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+
+
+<div id="footer-bottom">
+<div class="contain-1120">
+<span class="copyright" style="color:white">©
+<script>// <![CDATA[
+document.write(new Date().getFullYear())
+// ]]></script>
+Northwestern University | <a href="https://www.it.northwestern.edu/departments/it-services-support/research/">Northwestern IT Research Computing and Data Services</a></span>
+<!--
+<ul>
+<li><a href="https://www.facebook.com/NorthwesternU"> <span class="social facebook">Facebook</span> </a></li>
+<li><a href="https://www.twitter.com/northwesternu"> <span class="social twitter">Twitter</span> </a></li>
+<li><a href="https://www.instagram.com/northwesternu"> <span class="social instagram">Instagram</span> </a></li>
+<li><a href="https://www.youtube.com/user/NorthwesternU"> <span class="social youtube">YouTube</span> </a></li>
+<li><a href="https://www.tiktok.com/@northwestern.u"> <span class="social tiktok">TikTok</span> </a></li>
+<li><a href="https://www.linkedin.com/school/northwestern-university/"> <span class="social linkedin">LinkedIn</span> </a></li>
+</ul>
+-->
+<span class="right" style="color:white"><a style="color:white" href="https://www.northwestern.edu/disclaimer.html">Disclaimer</a></span>
+</div>
+</div>
+  </footer>
+  </body>
+</html>

@@ -1,0 +1,1342 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../" data-theme="light">
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <meta property="article:modified_time" content="2026-07-06T15:44:38+00:00" />
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-8VW6NPDBRF"></script>
+    <script>
+        window.dataLayer = window.dataLayer || [];
+        function gtag(){dataLayer.push(arguments);}
+        gtag('js', new Date());
+        gtag('config', 'G-8VW6NPDBRF');
+    </script>
+    
+    <title>Quest Compute Cluster Maintenance and Update Notes &#8212; Northwestern IT
+Research Computing and Data Services
+Northwestern University</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "light";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/styles/sphinx-book-theme.css?v=a3416100" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/tabs.css?v=a5c4661c" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/sphinx-design.min.css?v=95c83b7e" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/sphinxcontrib-images/LightBox2/lightbox2/dist/css/lightbox.min.css?v=6e7d0de0" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/sphinxcontrib-images/LightBox2/lightbox2-customize/pointer.css?v=c97663ff" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/css/nuit-rcds-docs.css?v=80855fb1" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../../_static/documentation_options.js?v=9eb32ce0"></script>
+    <script src="../../../_static/doctools.js?v=9bcbadda"></script>
+    <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../_static/copybutton.js?v=35a8b989"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script src="../../../_static/scripts/sphinx-book-theme.js?v=887ef09a"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="../../../_static/design-tabs.js?v=f930bc37"></script>
+    <script src="../../../_static/sphinxcontrib-images/LightBox2/lightbox2/dist/js/lightbox-plus-jquery.min.js?v=f0ca4bb6"></script>
+    <script src="../../../_static/sphinxcontrib-images/LightBox2/lightbox2-customize/jquery-noconflict.js?v=12818e64"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <link rel="index" title="Index" href="../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../search.html" />
+    <link rel="next" title="Research Data Storage Service" href="../../rdss/rdss-index.html" />
+    <link rel="prev" title="Technical Specifications" href="index.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+    <meta name="docbuild:last-update" content="2026-07-06"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="light">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+    
+    <img src="../../../_static/rcds_logo.png" class="logo__image only-light" alt="Northwestern IT
+Research Computing and Data Services
+Northwestern University - Home"/>
+    <img src="../../../_static/rcds_logo.png" class="logo__image only-dark pst-js-only" alt="Northwestern IT
+Research Computing and Data Services
+Northwestern University - Home"/>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../start/quest/quest-intro.html">Introduction to Quest</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../start/gcc/gcc-start.html">Genomics Compute Cluster Quick Start</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../start/quest/quest-tips.html">HPC Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../start/getting-help.html">Getting Help</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">System Guides</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="../quest.html">Quest Compute Cluster</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/" target="_blank">Quest Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/procedural-guidelines.html" target="_blank">Policies and Guidelines <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../resources/quest-resource.html">Quest Resources</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../user-guide/quest-user-guide.html">User Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/login/login-quest.html">Logging In</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/filesystem/filesystem.html">File System</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/data-transfer/data-transfer.html">Transferring Data</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/modules/modules.html">Software Modules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/slurm/slurm.html">Slurm Job Scheduler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../user-guide/gpu/gpu.html">GPUs</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../software/quest-software-list.html">Software</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../software/alphafold/alphafold-quest.html">AlphaFold</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../software/knitro/knitro-quest.html">Knitro</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../software/matlab/matlab-quest.html">MATLAB</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../software/python/python-quest.html">Python</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../software/r/r-quest.html">R/RStudio</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../software/vasp/vasp-quest.html">VASP</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../software/abaqus/abaqus.html">Abaqus</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../quest-analytics/analytics.html">Quest Analytics Nodes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../quest-analytics/using_analytics.html">Analytics Nodes Usage Tips</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../ondemand/ondemand.html">Quest OnDemand</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../gcc/using-gcc.html">Genomics Compute Cluster</a></li>
+<li class="toctree-l2 current active has-children"><a class="reference internal" href="index.html">Technical Specifications</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l3"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/specs.html" target="_blank">Quest Technical Specifications <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l3 current active"><a class="current reference internal" href="#">Maintenance and Update Notes</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../rdss/rdss-index.html">Research Data Storage Service</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceDet?ID=96" target="_blank">Service Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../rdss/rdss-owners.html">Share Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../rdss/rdss-users.html">User Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../rdss/rdss-troubleshooting.html">Troubleshooting Guide</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../globus/globus-index.html">Globus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../globus/globus-login.html">Log in</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../globus/globus-collection.html">Access Data Using Collections</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../globus/globus-transfer.html">Transfer Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../globus/globus-sharing.html">Share Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../globus/globus-troubleshooting.html">Troubleshoot</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../sde/sde.html">Secure Data Enclave</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceDet?ID=380" target="_blank">Service Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../sde/sde-structure/sde-structure.html">SDE Structure</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../sde/sde-structure/sde-components.html">Environment Components</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../sde/sde-structure/roles.html">User Roles</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../sde/sde-structure/projects.html">Projects</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../sde/sde-structure/storage.html">Storage Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../sde/sde-structure/vms.html">Virtual Machines (VMs)</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../sde/sde-user-guide/sde-user-guide.html">SDE User Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../sde/sde-user-guide/accessing-sde.html">Accessing the SDE</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../sde/sde-user-guide/cli-tools.html">Installing Command Line Tools</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../sde/sde-user-guide/using-vms.html">Using VMs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../sde/sde-user-guide/managing-buckets.html">Managing Storage Buckets</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../sde/sde-user-guide/ingress-egress.html">Importing and Exporting Data</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../sde/sde-user-guide/coderepo.html">Managing Software and Code</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../sde/sde-user-guide/sde-glossary.html">Glossary</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../sde/acceptable-use.html">Acceptable Use Policy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../sde/cost.html">Estimating Costs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../sde/requesting-support.html">Service Requests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../nightingale/nightingale.html">NU@Nightingale</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/additional-computing-resources/nightingale.html" target="_blank">Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference external" href="https://www.ncsa.illinois.edu/resources-and-services/compute-resources/nightingale/" target="_blank">Compute and Storage Resources <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../nightingale/onboarding.html">Onboarding Process</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../nightingale/access-ngl.html">Using Nightingale</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../nightingale/data-transfer-ngl.html">Importing and Exporting Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../nightingale/offboarding.html">Offboarding Process</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../nightingale/support.html">Getting Help</a></li>
+<li class="toctree-l2"><a class="reference external" href="https://docs.ncsa.illinois.edu/systems/nightingale/en/latest/index.html" target="_blank">NCSA Nightingale User Guide <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../coldfront/index.html">ColdFront</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../coldfront/cf-project.html">Projects in ColdFront</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../coldfront/cf-resource.html">Resource Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../coldfront/cf-user.html">User Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../coldfront/transition-to-coldfront.html">Transitioning to ColdFront</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Tutorials</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../tutorials/software-management/software-management.html">Working on Quest</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/software-management/conda-mamba-quest/mamba-conda-quest.html">Mamba or Conda Virtual Environments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/software-management/git-quest/git-quest.html">Git on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/software-management/singularity/singularity-quest.html">Singularity on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/software-management/compiling-code/compiling-code-quest.html">Compiling Code on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/software-management/scaling-study/scaling-study.html">Scaling Studies on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../tutorials/python/python-tutorials.html">Python</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/python/python-installation.html">Installing Python on Your Computer</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/python/python-selenium-quest.html">Python Selenium on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/python/python-gpus.html">Using GPUs with Python</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/python/python-llm-huggingface.html">Using Hugging Face on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/python/python-llm-ollama.html">Using Ollama on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../tutorials/r/r-tutorials.html">R</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/r/r-installation.html">Installing R/RStudio on Your Computer</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/r/git-with-r.html">Git with R</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../tutorials/git/git-tutorials.html">Git/GitHub</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/git/workshop-materials.html">Downloading Workshop Materials</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/r/git-with-r.html">Git with R</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/software-management/git-quest/git-quest.html">Git on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../tutorials/cloud/aws/aws-index.html">AWS</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/cloud/aws/create-amazon-s3-bucket.html">Creating an Amazon S3 bucket</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/cloud/aws/s3-access-keys.html">Creating Amazon S3 Access Keys</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/cloud/aws/archiving-data-amazon-S3.html">Archiving Data in Amazon S3 Glacier Deep Archive</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../tutorials/cloud/azure/azure-index.html">Azure</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/cloud/azure/azure-basics.html">Getting Familiar with Azure</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/cloud/azure/azure-openai.html">Using Azure AI and OpenAI Resources</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../tutorials/ai/ai-tutorials.html">AI</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/ai/genai-coding.html">Coding with Generative AI Tools</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/python/python-llm-huggingface.html">Using Hugging Face on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/python/python-llm-ollama.html">Using Ollama on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/cloud/azure/azure-openai.html">Using Azure AI and OpenAI Resources</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../tutorials/video-list.html">Video Tutorials</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Resource Guides</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../guides/bash/bash-guide.html">Command Line</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/bash/command-line-start.html">Getting Started with the Command Line</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/bash/bash-scripting.html">Bash Scripting</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../guides/python/python-guide.html">Python</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/python/python-lang.html">Programming in Python</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/python/pandas.html">Pandas</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/python/python-deep-learning.html">Deep Learning Frameworks</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../guides/r/r-guide.html">R</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/r/learn-r.html">Learning R</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/r/ggplot2.html">ggplot2</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../guides/stats/stats-guides.html">Statistics</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/stats/clustering.html">Clustering</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/stats/linear-regression.html">Linear Regression</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../guides/other/other-guides.html">Additional Tools</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/other/git.html">Git and GitHub</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/other/gh-copilot.html">GitHub Copilot</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../guides/other/sql.html">SQL</a></li>
+</ul>
+</details></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Quest Compute Cluster Maintenance and Update Notes</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="quest-compute-cluster-maintenance-and-update-notes">
+<span id="quest-release-notes"></span><h1>Quest Compute Cluster Maintenance and Update Notes<a class="headerlink" href="#quest-compute-cluster-maintenance-and-update-notes" title="Link to this heading">#</a></h1>
+<p>Major updates to Northwestern’s HPC system Quest are documented here.</p>
+<details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3">
+<summary class="sd-summary-title sd-card-header">
+<span class="sd-summary-text">ColdFront Platform Launch - June 2026</span><span class="sd-summary-state-marker sd-summary-chevron-right"><svg version="1.1" width="1.5em" height="1.5em" class="sd-octicon sd-octicon-chevron-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.72 18.78a.75.75 0 0 1 0-1.06L14.44 12 8.72 6.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0Z"></path></svg></span></summary><div class="sd-summary-content sd-card-body docutils">
+<ul class="simple">
+<li><p class="sd-card-text">The <a class="reference external" href="https://coldfront.it.northwestern.edu" target="_blank">ColdFront <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a> platform is live and available for researchers.</p></li>
+<li><p class="sd-card-text"><a class="reference external" href="https://rcdsdocs.it.northwestern.edu/systems/coldfront/index.html" target="_blank">ColdFront documentation <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a> is available to help researchers with the new platform’s functionality.</p></li>
+</ul>
+</div>
+</details><details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3">
+<summary class="sd-summary-title sd-card-header">
+<span class="sd-summary-text">Slurm and GPU performance updates - June 2026</span><span class="sd-summary-state-marker sd-summary-chevron-right"><svg version="1.1" width="1.5em" height="1.5em" class="sd-octicon sd-octicon-chevron-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.72 18.78a.75.75 0 0 1 0-1.06L14.44 12 8.72 6.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0Z"></path></svg></span></summary><div class="sd-summary-content sd-card-body docutils">
+<ul class="simple">
+<li><p class="sd-card-text">Upgraded Quest’s job scheduler, Slurm, to version 25.11.5 that provides options for faster job recovery and improved job monitoring. Reference the <a class="reference external" href="https://github.com/SchedMD/slurm/releases/tag/slurm-25-11-5-1" target="_blank">full Slurm changelog <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a> for details.</p></li>
+<li><p class="sd-card-text">Updated the GPU driver to CUDA 13.3 for improved GPU performance, enhanced libraries, updated tooling, and support for emerging AI models.</p></li>
+<li><p class="sd-card-text">Upgraded GPU-to-GPU communications: Multi-GPU jobs can now utilize direct GPU-to-GPU communication with the new CUDA-aware UCX upgrade.</p></li>
+<li><p class="sd-card-text">Updated FastX to version 4 to provide a more reliable and secure remote desktop experience.</p></li>
+<li><p class="sd-card-text">Upgraded the storage system firmware and InfiniBand interconnect drivers and applied security patches to system software to enhance cluster stability.</p></li>
+<li><p class="sd-card-text">Performed power and cooling equipment maintenance to ensure the healthy operation of the computing infrastructure.</p></li>
+</ul>
+</div>
+</details><details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3">
+<summary class="sd-summary-title sd-card-header">
+<span class="sd-summary-text">Slurm and license server updates - September 2025</span><span class="sd-summary-state-marker sd-summary-chevron-right"><svg version="1.1" width="1.5em" height="1.5em" class="sd-octicon sd-octicon-chevron-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.72 18.78a.75.75 0 0 1 0-1.06L14.44 12 8.72 6.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0Z"></path></svg></span></summary><div class="sd-summary-content sd-card-body docutils">
+<ul class="simple">
+<li><p class="sd-card-text">Upgraded Quest’s job scheduler, Slurm, to version 24.11.6. Reference the <a class="reference external" href="https://github.com/SchedMD/slurm/blob/slurm-24.11/CHANGELOG/slurm-24.11.md" target="_blank">full Slurm changelog <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a> for details.</p></li>
+<li><p class="sd-card-text">Upgraded the license server for licensed software on Quest and applied patches to all nodes to improve the security of the cluster.</p></li>
+<li><p class="sd-card-text">Upgraded the storage system firmware and InfiniBand interconnect drivers to enhance cluster stability.</p></li>
+<li><p class="sd-card-text">Performed power and cooling equipment maintenance to ensure the healthy operation of the computing infrastructure.</p></li>
+</ul>
+</div>
+</details><details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3">
+<summary class="sd-summary-title sd-card-header">
+<span class="sd-summary-text">OS and Storage Update - 31 March 2025</span><span class="sd-summary-state-marker sd-summary-chevron-right"><svg version="1.1" width="1.5em" height="1.5em" class="sd-octicon sd-octicon-chevron-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.72 18.78a.75.75 0 0 1 0-1.06L14.44 12 8.72 6.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0Z"></path></svg></span></summary><div class="sd-summary-content sd-card-body docutils">
+<ul class="simple">
+<li><p class="sd-card-text">Updated operating system on all nodes from RHEL7 to RHEL8.</p></li>
+<li><p class="sd-card-text">Storage migration</p></li>
+<li><p class="sd-card-text">Flash storage addition</p></li>
+<li><p class="sd-card-text">Firewall changes</p></li>
+<li><p class="sd-card-text">Replaced many system libraries with modules</p></li>
+</ul>
+<details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3">
+<summary class="sd-summary-title sd-card-header">
+<span class="sd-summary-text">List of Modules Replacing Previous System Libraries</span><span class="sd-summary-state-marker sd-summary-chevron-right"><svg version="1.1" width="1.5em" height="1.5em" class="sd-octicon sd-octicon-chevron-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.72 18.78a.75.75 0 0 1 0-1.06L14.44 12 8.72 6.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0Z"></path></svg></span></summary><div class="sd-summary-content sd-card-body docutils">
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p class="sd-card-text">RHEL7 System Library</p></th>
+<th class="head"><p class="sd-card-text">Module on RHEL8</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p class="sd-card-text">libasound.so.2</p></td>
+<td><p class="sd-card-text">alsa-lib/1.2.3.2-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libatk-bridge-2.0.so.0</p></td>
+<td><p class="sd-card-text">at-spi2-atk/2.38.0-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libatspi.so.0</p></td>
+<td><p class="sd-card-text">at-spi2-core/2.48.0-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libcrypto.so.10</p></td>
+<td><p class="sd-card-text">openssl/1.0.2k-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libgcrypt.so.11</p></td>
+<td><p class="sd-card-text">libgcrypt/1.5.3-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libdrm.so.2</p></td>
+<td><p class="sd-card-text">libdrm/2.4.110-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libgbm.so.1</p></td>
+<td><p class="sd-card-text">mesa/20.2.1-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libgdk-3.so.0</p></td>
+<td><p class="sd-card-text">gtkplus/3.24.26-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libgfortran.so.3</p></td>
+<td><p class="sd-card-text">gcc/4.8.5-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libGL.so.1</p></td>
+<td><p class="sd-card-text">mesa/20.2.1-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libGLU.so.1</p></td>
+<td><p class="sd-card-text">mesa-glu/9.0.2-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libglut.so.3</p></td>
+<td><p class="sd-card-text">freeglut/3.0.0-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libffi.so.7</p></td>
+<td><p class="sd-card-text">libffi/3.3-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libevent-2.0.so.5</p></td>
+<td><p class="sd-card-text">libevent/2.0.21-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libidn.so.11</p></td>
+<td><p class="sd-card-text">libidn/1.28-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libltdl.so.7</p></td>
+<td><p class="sd-card-text">libtool/2.4.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libpq.so.5</p></td>
+<td><p class="sd-card-text">postgresql/9.6.12-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libXv.so.1</p></td>
+<td><p class="sd-card-text">libxv/1.0.10-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libopenjp2.so.7</p></td>
+<td><p class="sd-card-text">openjpeg/2.3.1-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libepoxy.so.0</p></td>
+<td><p class="sd-card-text">libepoxy/1.4.3-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libnotify.so.4</p></td>
+<td><p class="sd-card-text">libnotify/0.7.9-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libgcrypt.so.11</p></td>
+<td><p class="sd-card-text">libgcrypt/1.5.3-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libxslt.so.1</p></td>
+<td><p class="sd-card-text">libgcrypt/1.10.2-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libicudata.so.50</p></td>
+<td><p class="sd-card-text">icu4c/50.2-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libicui18n.so.50</p></td>
+<td><p class="sd-card-text">icu4c/50.2-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libicuuc.so.50</p></td>
+<td><p class="sd-card-text">icu4c/50.2-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libodbc.so.2/libodbcinst.so.2</p></td>
+<td><p class="sd-card-text">unixodbc/2.3.4-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libpng12.so.0</p></td>
+<td><p class="sd-card-text">libpng/1.2.57-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libpng15.so.15</p></td>
+<td><p class="sd-card-text">libpng/1.5.30-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libpq.so.5</p></td>
+<td><p class="sd-card-text">postgresql/9.6.12-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libtinfow.so.5</p></td>
+<td><p class="sd-card-text">ncurses/5.9-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libreadline.so.6</p></td>
+<td><p class="sd-card-text">readline/6.3-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libXpm.so.4</p></td>
+<td><p class="sd-card-text">libxpm/3.5.12-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libssl.so.10</p></td>
+<td><p class="sd-card-text">openssl/1.0.2k-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libX11-xcb.so.1</p></td>
+<td><p class="sd-card-text">libx11/1.8.4-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libXp.so.6</p></td>
+<td><p class="sd-card-text">libxp/1.0.3-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libXss.so.1</p></td>
+<td><p class="sd-card-text">libxscrnsaver/1.2.2-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libXtst.so.6</p></td>
+<td><p class="sd-card-text">libxtst/1.2.3-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libhdf5.so.8</p></td>
+<td><p class="sd-card-text">hdf5/1.8.12-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libnetcdf.so.7</p></td>
+<td><p class="sd-card-text">netcdf-c/4.3.3.1-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libQt3Support.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libQtCLucene.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libQtCore.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libQtDBus.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libQtDeclarative.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libQtDesignerComponents.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libQtDesigner.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libQtGui.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libQtHelp.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libQtMultimedia.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libQtNetwork.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libQtOpenGL.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libQtScript.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libQtScriptTools.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libQtSql.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libQtSvg.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libQtTest.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libQtWebKit.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libQtXmlPatterns.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libQtXml.so.4</p></td>
+<td><p class="sd-card-text">qt/4.8.7-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libcairo-gobject.so.2</p></td>
+<td><p class="sd-card-text">cairo/1.16.0-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libICE.so.6</p></td>
+<td><p class="sd-card-text">libsm/1.2.3-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libSM.so.6</p></td>
+<td><p class="sd-card-text">libsm/1.2.3-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libXm.so.4</p></td>
+<td><p class="sd-card-text">motif/2.3.8-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libblas.so.3</p></td>
+<td><p class="sd-card-text">netlib-lapack/3.4.2-gcc-6.4.0</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">liblapack.so.3</p></td>
+<td><p class="sd-card-text">netlib-lapack/3.4.2-gcc-6.4.0</p></td>
+</tr>
+<tr class="row-even"><td><p class="sd-card-text">libOpenCL.so.1</p></td>
+<td><p class="sd-card-text">ocl-icd/2.2.12-gcc-4.8.5</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text">libnotify.so.4</p></td>
+<td><p class="sd-card-text">libnotify/0.7.9-gcc-4.8.5</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</details></div>
+</details><details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3">
+<summary class="sd-summary-title sd-card-header">
+<span class="sd-summary-text">Module Deprecation - 17 February 2025</span><span class="sd-summary-state-marker sd-summary-chevron-right"><svg version="1.1" width="1.5em" height="1.5em" class="sd-octicon sd-octicon-chevron-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.72 18.78a.75.75 0 0 1 0-1.06L14.44 12 8.72 6.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0Z"></path></svg></span></summary><div class="sd-summary-content sd-card-body docutils">
+<p class="sd-card-text">Outdated and unused modules were removed. These modules are no longer recommended for use and were deprecated October 21, 2024.</p>
+<details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3">
+<summary class="sd-summary-title sd-card-header">
+<span class="sd-summary-text">List of Modules Deprecated</span><span class="sd-summary-state-marker sd-summary-chevron-right"><svg version="1.1" width="1.5em" height="1.5em" class="sd-octicon sd-octicon-chevron-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.72 18.78a.75.75 0 0 1 0-1.06L14.44 12 8.72 6.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0Z"></path></svg></span></summary><div class="sd-summary-content sd-card-body docutils">
+<ul class="simple">
+<li><p class="sd-card-text">ADF/2014.04, ADF/2016.107, ADF/2017.105, ADF/2017.112, ADF/2020.102, ADF/2021.102</p></li>
+<li><p class="sd-card-text">ATACgraph/latest</p></li>
+<li><p class="sd-card-text">ATLAS/3.10.1-grail, ATLAS/3.10.1-quest1, ATLAS/3.10.1-quest2, ATLAS/3.10.3-quest4, ATLAS/3.10.3-quest5, ATLAS/3.10.3-quest6</p></li>
+<li><p class="sd-card-text">Ansys-Fluent/18.2, Ansys-Fluent/19.4</p></li>
+<li><p class="sd-card-text">AnsysEM/18.2, AnsysEM/19.4</p></li>
+<li><p class="sd-card-text">BBMap/38.90</p></li>
+<li><p class="sd-card-text">BCBToolKit/2018</p></li>
+<li><p class="sd-card-text">CfitsIO/3.49</p></li>
+<li><p class="sd-card-text">CrisprCasFinder/4.2.20</p></li>
+<li><p class="sd-card-text">FastTreeMP/2.1.10</p></li>
+<li><p class="sd-card-text">GRASS/7.8.4</p></li>
+<li><p class="sd-card-text">Gaussian.E01/g09, Gaussian/g09, Gaussian16/g16_sse4</p></li>
+<li><p class="sd-card-text">GeneTorrent/3.8.6</p></li>
+<li><p class="sd-card-text">GenomeBrowse/1, GenomeBrowse/3</p></li>
+<li><p class="sd-card-text">GeoMx/2.3.3.10</p></li>
+<li><p class="sd-card-text">GotoBlas/GotoBlas-quest2, GotoBlas/GotoBlas-quest3, GotoBlas/GotoBlas-quest4</p></li>
+<li><p class="sd-card-text">HiFi-human-WGS-WDL/1.0.3</p></li>
+<li><p class="sd-card-text">IRFinder/2.0.0</p></li>
+<li><p class="sd-card-text">ImageJ/1.51</p></li>
+<li><p class="sd-card-text">ImageMagick/7.0.6</p></li>
+<li><p class="sd-card-text">M-CRIB-S/LastDrawEMVersion</p></li>
+<li><p class="sd-card-text">M-CRIB-S/1.1</p></li>
+<li><p class="sd-card-text">MS-Ropen/3.4.2</p></li>
+<li><p class="sd-card-text">NAMD/namd-2.9-impi, NAMD/namd-2.9-ompi-gcc, NAMD/namd-2.9-ompi-intel, NAMD/2.12, NAMD/2.13-smp, NAMD/2.13</p></li>
+<li><p class="sd-card-text">OpenBugs/3.2.3</p></li>
+<li><p class="sd-card-text">PRScsx/1.0.0</p></li>
+<li><p class="sd-card-text">PRSice/2.3.3</p></li>
+<li><p class="sd-card-text">R/2.15.3, R/3.0.2, R/3.1.2, R/3.4.3, R/3.4.4, R/3.5.1a</p></li>
+<li><p class="sd-card-text">SOAPdenovo2/r240</p></li>
+<li><p class="sd-card-text">STAR-Fusion/1.4.0, STAR-Fusion/1.9.0</p></li>
+<li><p class="sd-card-text">SimBA/1.55, SimBA/1.77.9</p></li>
+<li><p class="sd-card-text">SolexaQA++/3.7.1</p></li>
+<li><p class="sd-card-text">SuiteSparse/4.0.2</p></li>
+<li><p class="sd-card-text">Tramonto/4.0.1</p></li>
+<li><p class="sd-card-text">Unifying-Privacy-Policy-Detection/2.0.0</p></li>
+<li><p class="sd-card-text">abaqus/6.11-2, abaqus/6.12-2, abaqus/2016, abaqus/2017, abaqus/2019</p></li>
+<li><p class="sd-card-text">abinit/8.10.3-openmpi-4.0.5-intel-19.0.5.281</p></li>
+<li><p class="sd-card-text">alphafold/2.2.4-only-msas-and-alphafold-config-yaml</p></li>
+<li><p class="sd-card-text">ambertools/17</p></li>
+<li><p class="sd-card-text">ampl/ampl-intel64, ampl/20160919, ampl/20220730</p></li>
+<li><p class="sd-card-text">anaconda3/2018.12.BAK</p></li>
+<li><p class="sd-card-text">anicalculator/2014</p></li>
+<li><p class="sd-card-text">ansys/19.4, ansys/2021R2</p></li>
+<li><p class="sd-card-text">ansysedt/2023R2</p></li>
+<li><p class="sd-card-text">ant/1.10.7-gcc</p></li>
+<li><p class="sd-card-text">anvio/2.1.0, anvio/5.4.0</p></li>
+<li><p class="sd-card-text">apptainer/1.1.8</p></li>
+<li><p class="sd-card-text">arcasHLA/0.5.0</p></li>
+<li><p class="sd-card-text">armadillo/8.300.4</p></li>
+<li><p class="sd-card-text">aspect/2.6.0-debug, aspect/2.6.0-release</p></li>
+<li><p class="sd-card-text">aspera/3.10.0</p></li>
+<li><p class="sd-card-text">assimp/5.0.1-gcc</p></li>
+<li><p class="sd-card-text">at-spi2-atk/2.0.2, at-spi2-core/2.28.0</p></li>
+<li><p class="sd-card-text">atk/2.36</p></li>
+<li><p class="sd-card-text">atom/1.57.0</p></li>
+<li><p class="sd-card-text">autoconf-archive/2019.01.06-gcc, autoconf-archive/2023.02.20-gcc-4.8.5, autoconf-archive/2023.02.20-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">autoconf/2.68, autoconf/2.69-gcc, autoconf/2.69-gcc-4.8.5, autoconf/2.69-gcc-10.4.0, autoconf/2.69-intel, autoconf/2.69-intel-2021.4.0, autoconf/2.69</p></li>
+<li><p class="sd-card-text">automake/1.14, automake/1.14.1, automake/1.15, automake/1.16, automake/1.16.3-gcc, automake/1.16.3-intel, automake/1.16.5-gcc-4.8.5, automake/1.16.5-gcc-10.4.0, automake/1.16.5-intel-2021.4.0</p></li>
+<li><p class="sd-card-text">avogadro/1.2.0</p></li>
+<li><p class="sd-card-text">azure-cli/2.31.0</p></li>
+<li><p class="sd-card-text">bamtools/2.5.2-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">baron/1.82</p></li>
+<li><p class="sd-card-text">bart/0.7.00-gcc-10.2.0, bart/0.7.00</p></li>
+<li><p class="sd-card-text">basespace/0.8.1</p></li>
+<li><p class="sd-card-text">bazel/0.3.1</p></li>
+<li><p class="sd-card-text">bcbio_nextgen/1.2.4</p></li>
+<li><p class="sd-card-text">bcl2fastq/2.17.1.14</p></li>
+<li><p class="sd-card-text">bdftopcf/1.0.5-gcc, bdftopcf/1.0.5-intel</p></li>
+<li><p class="sd-card-text">berkeley-db/18.1.40-gcc-4.8.5</p></li>
+<li><p class="sd-card-text">beta/1.0.7</p></li>
+<li><p class="sd-card-text">bidscoin/3.0.8, bidscoin/3.7.2</p></li>
+<li><p class="sd-card-text">binutils/2.25.1, binutils/2.37_new</p></li>
+<li><p class="sd-card-text">bis35/2016</p></li>
+<li><p class="sd-card-text">bismarkmultimappinglocations/master</p></li>
+<li><p class="sd-card-text">bison/3.8, bison/3.8.2-gcc, bison/3.8.2-gcc-10.4.0, bison/3.8.2-intel</p></li>
+<li><p class="sd-card-text">blas-lapack/3.4.0_intel, blas-lapack/3.7.0_gcc, blas-lapack/3.8.0_gcc, blas-lapack/3.8.0_intel</p></li>
+<li><p class="sd-card-text">blast/2.4.0, blast/2.11.0</p></li>
+<li><p class="sd-card-text">blatsuite/36</p></li>
+<li><p class="sd-card-text">blaze/3.8-intel</p></li>
+<li><p class="sd-card-text">blcr/0.8.4, blcr/0.8.5, blcr/0.8.6.b4</p></li>
+<li><p class="sd-card-text">boost/1.55, boost/1.57.0, boost/1.58.0, boost/1.64.0, boost/1.70.0-openmpi-4.0.5-intel-19.0.5.281, boost/1.70.0, boost/1.77.0-gcc, boost/1.78.0, boost/1.79.0-gcc, boost/1.79.0, boost/1.81.0-gcc-10.4.0, boost/1.81.0</p></li>
+<li><p class="sd-card-text">braker/2.1.6</p></li>
+<li><p class="sd-card-text">bsmap/2.90</p></li>
+<li><p class="sd-card-text">bwrap/0.4.1</p></li>
+<li><p class="sd-card-text">cairo/1.16-gcc-8.4.0</p></li>
+<li><p class="sd-card-text">capnproto/0.5.0, capnproto/0.10.2</p></li>
+<li><p class="sd-card-text">casa/5.3.0</p></li>
+<li><p class="sd-card-text">cassi/2.51</p></li>
+<li><p class="sd-card-text">celloracle/0.12.1</p></li>
+<li><p class="sd-card-text">cellprofiler/4.2.5_singularity, cellprofiler/4.2.5</p></li>
+<li><p class="sd-card-text">cellranger-atac/1.1.0</p></li>
+<li><p class="sd-card-text">cellranger/2.0.2, cellranger/3.0.1</p></li>
+<li><p class="sd-card-text">centrifuge/1.0.4</p></li>
+<li><p class="sd-card-text">cgal/4.9_rhel7, cgal/5.4</p></li>
+<li><p class="sd-card-text">charm/charm-6.5.0-impi, charm/charm-6.5.0-ompi-gcc, charm/charm-6.5.0-ompi-intel</p></li>
+<li><p class="sd-card-text">charmpp/6.10.2-openmpi-intel-2021.4.0</p></li>
+<li><p class="sd-card-text">chemaxon_marvin/18.23</p></li>
+<li><p class="sd-card-text">chemaxon_structure_rep/18.23</p></li>
+<li><p class="sd-card-text">chimera/1.14</p></li>
+<li><p class="sd-card-text">chrome/54, chrome/72</p></li>
+<li><p class="sd-card-text">clair3/1.0.1</p></li>
+<li><p class="sd-card-text">cloog/0.18.4</p></li>
+<li><p class="sd-card-text">cmake/3.1.0, cmake/3.21.4-intel</p></li>
+<li><p class="sd-card-text">cmdstan/2.18.0</p></li>
+<li><p class="sd-card-text">cobra/0.19.0</p></li>
+<li><p class="sd-card-text">coinutils/2.11.6</p></li>
+<li><p class="sd-card-text">compass/1.0.0</p></li>
+<li><p class="sd-card-text">compositeproto/0.4.2-gcc</p></li>
+<li><p class="sd-card-text">comsol/6.0_mse_emery, comsol/6.0_upgrade, comsol/6.0, comsol/6.1_koch</p></li>
+<li><p class="sd-card-text">connectome_workbench/1.4.2a</p></li>
+<li><p class="sd-card-text">copasul/0.8.19</p></li>
+<li><p class="sd-card-text">cp2k/2.3, cp2k/2.5, cp2k/5.1</p></li>
+<li><p class="sd-card-text">cpio/2.13-gcc-10.4.0, cpio/2.13-intel, cpio/2.13-intel-2021.4.0</p></li>
+<li><p class="sd-card-text">cplex/12.6.2 cplex/22.1.1</p></li>
+<li><p class="sd-card-text">crass/1.0.1</p></li>
+<li><p class="sd-card-text">crispresso2/2.2.9</p></li>
+<li><p class="sd-card-text">crisprtools/0.1.8</p></li>
+<li><p class="sd-card-text">cromwell/86</p></li>
+<li><p class="sd-card-text">cuda/cuda_4.0.17, cuda/cuda_4.1.28, cuda/cuda_5.0.35, cuda/cuda_6.0.26_rc, cuda/cuda_7.0.28_mpich, cuda/cuda_7.0.28, cuda/cuda_7.5.18_mpich, cuda/cuda_8.0.61_mpich, cuda/11.2.2-intel</p></li>
+<li><p class="sd-card-text">cufflinks/2.1.1, cufflinks/2.2.1b</p></li>
+<li><p class="sd-card-text">curl/7.79.0-intel, curl/8.0.1-intel-2021.4.0</p></li>
+<li><p class="sd-card-text">cutruntools/2.0</p></li>
+<li><p class="sd-card-text">cython/0.22</p></li>
+<li><p class="sd-card-text">cytoscape/3.4.0</p></li>
+<li><p class="sd-card-text">damageproto/1.2.1-gcc</p></li>
+<li><p class="sd-card-text">dbus/1.12.8-gcc</p></li>
+<li><p class="sd-card-text">dcm2niix/v1.0.20220720</p></li>
+<li><p class="sd-card-text">ddd/3.3.12</p></li>
+<li><p class="sd-card-text">dealii/9.5.0</p></li>
+<li><p class="sd-card-text">diamond/0.8.29</p></li>
+<li><p class="sd-card-text">dicom/3.6.7</p></li>
+<li><p class="sd-card-text">diffreps/1.55.3</p></li>
+<li><p class="sd-card-text">diffutils/3.8-gcc, diffutils/3.8-intel, diffutils/3.8-intel-2021.4.0, diffutils/3.9-gcc-4.8.5, diffutils/3.9-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">double-conversion/3.1.5-gcc</p></li>
+<li><p class="sd-card-text">doxygen/1.9.2-gcc</p></li>
+<li><p class="sd-card-text">dsi_studio/latest</p></li>
+<li><p class="sd-card-text">dtiplayground/0.4.1, dtiplayground/0.4.4b4</p></li>
+<li><p class="sd-card-text">dynare/4.5.0, dynare/4.5.6</p></li>
+<li><p class="sd-card-text">dyninst/9.3.2</p></li>
+<li><p class="sd-card-text">eclipse/4.2</p></li>
+<li><p class="sd-card-text">eigen/3.2.8, eigen/3.4.0-gcc, eigen/3.4.0-intel</p></li>
+<li><p class="sd-card-text">elfutils/0.176</p></li>
+<li><p class="sd-card-text">emacs/24.4-compute, emacs/25.3-compute</p></li>
+<li><p class="sd-card-text">energyplus/23.1.0</p></li>
+<li><p class="sd-card-text">enrich2/1.3.1</p></li>
+<li><p class="sd-card-text">epacts/3.3.2</p></li>
+<li><p class="sd-card-text">epic2/0.0.52</p></li>
+<li><p class="sd-card-text">esmfold/2.0.1</p></li>
+<li><p class="sd-card-text">espresso/5.0.3, espresso/6.2-d3q, espresso/6.2</p></li>
+<li><p class="sd-card-text">expansionhunter/2.5.5</p></li>
+<li><p class="sd-card-text">expat/2.2.0</p></li>
+<li><p class="sd-card-text">fMRIPrep/20.2.1</p></li>
+<li><p class="sd-card-text">fastq_utils/0.25.2</p></li>
+<li><p class="sd-card-text">faststructure/1.0</p></li>
+<li><p class="sd-card-text">fenics27/1.5.0</p></li>
+<li><p class="sd-card-text">fftw/2.1.5-gcc, fftw/2.1.5-intel, fftw/2.1.5-mpich-intel, fftw/2.1.5-ompi-intel, fftw/3.3.3-gcc-sse2, fftw/3.3.4-openmpi-4.0.5-intel-19.0.5.281</p></li>
+<li><p class="sd-card-text">findutils/4.8.0-gcc, findutils/4.8.0-intel, findutils/4.9.0-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">firefox/14, firefox/22, firefox/26, firefox/27, firefox/31, firefox/50</p></li>
+<li><p class="sd-card-text">fixesproto/5.0-gcc</p></li>
+<li><p class="sd-card-text">flex/2.6.3-gcc, flex/2.6.3-gcc-10.4.0, flex/2.6.3-intel, flex/2.6.4</p></li>
+<li><p class="sd-card-text">flook/0.8.1</p></li>
+<li><p class="sd-card-text">fmriprep/21.0.1, fmriprep/23.0.1_singularity, fmriprep/23.0.1</p></li>
+<li><p class="sd-card-text">font-util/1.3.2-intel</p></li>
+<li><p class="sd-card-text">fontconfig/2.13.1-gcc</p></li>
+<li><p class="sd-card-text">fontsproto/2.1.3-gcc, fontsproto/2.1.3-intel</p></li>
+<li><p class="sd-card-text">fragpipe/19.1</p></li>
+<li><p class="sd-card-text">freeimage/3.18.0-gcc</p></li>
+<li><p class="sd-card-text">freesurfer/7dev</p></li>
+<li><p class="sd-card-text">freetype/2.7.1-intel, freetype/2.10.2-gcc, freetype/2.10.4-gcc-10.2.0</p></li>
+<li><p class="sd-card-text">fribidi/1.0.5-intel</p></li>
+<li><p class="sd-card-text">games/2.0.0</p></li>
+<li><p class="sd-card-text">gap/4.7.5</p></li>
+<li><p class="sd-card-text">gatk/3.6.0, gatk/4.0.0, gatk/4.0.4</p></li>
+<li><p class="sd-card-text">gauss/gauss17</p></li>
+<li><p class="sd-card-text">gawk/5.2.1-gcc-4.8.5, gawk/5.2.1-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">gcc/mine, gcc/4.7.0</p></li>
+<li><p class="sd-card-text">gcloud/322.0.0</p></li>
+<li><p class="sd-card-text">gcta/1.94.0</p></li>
+<li><p class="sd-card-text">gdb/7.5, gdb/7.12, gdb/8.0.1</p></li>
+<li><p class="sd-card-text">gdbm/1.18.1-intel-19.0.5.281, gdbm/1.19-intel-19.0.5.281, gdbm/1.23-gcc-4.8.5</p></li>
+<li><p class="sd-card-text">gdc-client/1.3.0</p></li>
+<li><p class="sd-card-text">gdk-pixbuf/2.40.0</p></li>
+<li><p class="sd-card-text">geany/1.33</p></li>
+<li><p class="sd-card-text">genie/3.04.00</p></li>
+<li><p class="sd-card-text">gettext/0.19.4, gettext/0.21-intel-19.0.5.281, gettext/0.21.1-gcc-4.8.5</p></li>
+<li><p class="sd-card-text">ghc/7.10.3, ghc/8.2.1</p></li>
+<li><p class="sd-card-text">giflib/5.2.1-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">git/2.1.3</p></li>
+<li><p class="sd-card-text">glib/2.66.2</p></li>
+<li><p class="sd-card-text">glibc/2.17</p></li>
+<li><p class="sd-card-text">glibmm/2.4</p></li>
+<li><p class="sd-card-text">glproto/1.4.17-gcc</p></li>
+<li><p class="sd-card-text">gmake/4.3-gcc, gmake/4.4.1-intel-2021.4.0</p></li>
+<li><p class="sd-card-text">gnomix/12082022</p></li>
+<li><p class="sd-card-text">gnumeric/1.12.38</p></li>
+<li><p class="sd-card-text">go/1.20.4</p></li>
+<li><p class="sd-card-text">gold/1</p></li>
+<li><p class="sd-card-text">gpaw/21.1.0</p></li>
+<li><p class="sd-card-text">gperf/3.1-gcc, gperf/3.1-intel</p></li>
+<li><p class="sd-card-text">gradle/5.2.1</p></li>
+<li><p class="sd-card-text">graphlib/3.0.0</p></li>
+<li><p class="sd-card-text">grass-gis/7.8.8</p></li>
+<li><p class="sd-card-text">gromacs/4.6.5, gromacs/4.6.7-cuda, gromacs/4.6.7</p></li>
+<li><p class="sd-card-text">gsl/1.16-intel, gsl/2.1-gcc4.8.3</p></li>
+<li><p class="sd-card-text">gstreamer/1.14</p></li>
+<li><p class="sd-card-text">gtk+/gtk+-3.22.30</p></li>
+<li><p class="sd-card-text">gtool/0.7.5</p></li>
+<li><p class="sd-card-text">gulp/6.1.2</p></li>
+<li><p class="sd-card-text">guppy/6.2.1_cpu, guppy/6.2.1_gpu</p></li>
+<li><p class="sd-card-text">gurobi/6.5.2, gurobi/7.5.1, gurobi/7.5.1-3.6, gurobi/9.1.0</p></li>
+<li><p class="sd-card-text">gwastools/current</p></li>
+<li><p class="sd-card-text">hdf5/1.10.7-nvhpc-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">hemoMIPs/1.1</p></li>
+<li><p class="sd-card-text">hipstr/0.6.2</p></li>
+<li><p class="sd-card-text">hisat2/2.0.4</p></li>
+<li><p class="sd-card-text">homer/4.8.3</p></li>
+<li><p class="sd-card-text">hwloc/1.4.2, hwloc/1.11.8</p></li>
+<li><p class="sd-card-text">hypre/2.9.0, hypre/2.20.0-openmpi-4.0.5-gcc-10.2.0</p></li>
+<li><p class="sd-card-text">icu4c/67.1-intel</p></li>
+<li><p class="sd-card-text">idba/2016_12_longread, idba/2016_12</p></li>
+<li><p class="sd-card-text">idr/2.0.4</p></li>
+<li><p class="sd-card-text">igv/2.8.13, igv/2.11.6, igv/2.12.0</p></li>
+<li><p class="sd-card-text">impute2/2.3.2</p></li>
+<li><p class="sd-card-text">imsl/fnl_7.1.0</p></li>
+<li><p class="sd-card-text">indelocator/1.0</p></li>
+<li><p class="sd-card-text">inputproto/2.3.2-intel</p></li>
+<li><p class="sd-card-text">intel-oneapi-compilers/2023.1.0-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">intel-oneapi-mkl/2021.4.0-gcc</p></li>
+<li><p class="sd-card-text">intel-oneapi-mpi/2021.4.0-intel</p></li>
+<li><p class="sd-card-text">intel-oneapi-tbb/2021.4.0-gcc</p></li>
+<li><p class="sd-card-text">intltool/0.40.0, intltool/0.51.0</p></li>
+<li><p class="sd-card-text">ipopt/3.13.2</p></li>
+<li><p class="sd-card-text">iread/0.8.5</p></li>
+<li><p class="sd-card-text">jags/4.2.0, jags/4.3.0_qa, jags/4.3.0-gcc-5.1.0</p></li>
+<li><p class="sd-card-text">jellyfish/2.2.7, jellyfish/2.3.0</p></li>
+<li><p class="sd-card-text">jsoncpp/1.9.4-gcc, jsoncpp/1.9.5-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">julia/0.5.2, julia/0.6.2, julia/1.3.1</p></li>
+<li><p class="sd-card-text">kSNP/3.0.21</p></li>
+<li><p class="sd-card-text">kallisto/0.43.1</p></li>
+<li><p class="sd-card-text">kbproto/1.0.7-intel</p></li>
+<li><p class="sd-card-text">knitro/9.1.orig, knitro/9.1</p></li>
+<li><p class="sd-card-text">krona/2.7</p></li>
+<li><p class="sd-card-text">lammps/lammps-gcc-mkl, lammps/lammps-intel-mkl, lammps/lammps-intel, lammps/lammps-mpich, lammps/lammps-31Mar17-mpich</p></li>
+<li><p class="sd-card-text">launchmon/1.0.1</p></li>
+<li><p class="sd-card-text">layoutparser/0.3.2</p></li>
+<li><p class="sd-card-text">lazarus/2.0.10</p></li>
+<li><p class="sd-card-text">lcms/2.9-gcc, lcms/2.13.1</p></li>
+<li><p class="sd-card-text">ldblockshow/1.40</p></li>
+<li><p class="sd-card-text">ldsc/1.0.0</p></li>
+<li><p class="sd-card-text">leptonica/1.74.4</p></li>
+<li><p class="sd-card-text">lftp/4.8.4-fedora, lftp/4.8.4</p></li>
+<li><p class="sd-card-text">libdrm/2.4.100-gcc</p></li>
+<li><p class="sd-card-text">libdwarf/20190110</p></li>
+<li><p class="sd-card-text">libedit/3.1-20210216-gcc</p></li>
+<li><p class="sd-card-text">libepoxy/1.2</p></li>
+<li><p class="sd-card-text">libffi/3.2.1</p></li>
+<li><p class="sd-card-text">libfontenc/1.1.3-gcc, libfontenc/1.1.3-intel</p></li>
+<li><p class="sd-card-text">libgcrypt/1.10.2-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">libgdiplus/2.10.9</p></li>
+<li><p class="sd-card-text">libgpg-error/1.47-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">libice/1.0.9-intel</p></li>
+<li><p class="sd-card-text">libiconv/1.17-gcc-4.8.5</p></li>
+<li><p class="sd-card-text">libidn2/2.3.0-intel</p></li>
+<li><p class="sd-card-text">libjpeg-turbo/2.1.0-intel</p></li>
+<li><p class="sd-card-text">libjpeg/8</p></li>
+<li><p class="sd-card-text">libmng/2.0.3-gcc</p></li>
+<li><p class="sd-card-text">libpciaccess/0.16-intel</p></li>
+<li><p class="sd-card-text">libpng/1.6.37-intel</p></li>
+<li><p class="sd-card-text">libpthread-stubs/0.4-intel</p></li>
+<li><p class="sd-card-text">libsigsegv/2.14-gcc-4.8.5, libsigsegv/2.14-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">libsm/1.2.3-intel</p></li>
+<li><p class="sd-card-text">libsvm/3.21</p></li>
+<li><p class="sd-card-text">libtiff/4.1.0, libtiff/4.3.0-gcc</p></li>
+<li><p class="sd-card-text">libtool/2.4.2, libtool/2.4.6-gcc, libtool/2.4.6-intel, libtool/2.4.6, libtool/2.4.7-gcc-4.8.5, libtool/2.4.7-gcc-10.4.0, libtool/2.4.7-intel-2021.4.0</p></li>
+<li><p class="sd-card-text">libunistring/0.9.10-intel</p></li>
+<li><p class="sd-card-text">libvdwxc/0.4.0-openmpi-4.0.5-intel-19.0.5.281</p></li>
+<li><p class="sd-card-text">libwayland-cursor/1.18.91</p></li>
+<li><p class="sd-card-text">libx11/1.7.0-intel</p></li>
+<li><p class="sd-card-text">libxau/1.0.8-intel</p></li>
+<li><p class="sd-card-text">libxc/2.2.2-intel-19.0.5.281, libxc/5.1.0, libxc/6.1.0-intel-2021.4.0</p></li>
+<li><p class="sd-card-text">libxcb/1.8, libxcb/1.14-intel</p></li>
+<li><p class="sd-card-text">libxcomposite/0.4.4-gcc</p></li>
+<li><p class="sd-card-text">libxcursor/1.1.14-gcc</p></li>
+<li><p class="sd-card-text">libxdamage/1.1.4-gcc</p></li>
+<li><p class="sd-card-text">libxdmcp/1.1.2-intel</p></li>
+<li><p class="sd-card-text">libxext/1.3.3-intel</p></li>
+<li><p class="sd-card-text">libxfixes/5.0.2-gcc</p></li>
+<li><p class="sd-card-text">libxfont/1.5.2-gcc, libxfont/1.5.2-intel</p></li>
+<li><p class="sd-card-text">libxi/1.7.6-gcc</p></li>
+<li><p class="sd-card-text">libxkbcommon/0.8.2-gcc</p></li>
+<li><p class="sd-card-text">libxkbfile/1.0.9-gcc</p></li>
+<li><p class="sd-card-text">libxml2/2.10.3-gcc-4.8.5</p></li>
+<li><p class="sd-card-text">libxmu/1.1.2-intel</p></li>
+<li><p class="sd-card-text">libxrandr/1.5.0-gcc</p></li>
+<li><p class="sd-card-text">libxrender/0.9.10-intel</p></li>
+<li><p class="sd-card-text">libxscrnsaver/1.2.2-intel</p></li>
+<li><p class="sd-card-text">libxslt/1.1.33-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">libxsmm/1.16.1-intel-19.0.5.281</p></li>
+<li><p class="sd-card-text">libxt/1.1.5-intel</p></li>
+<li><p class="sd-card-text">libxtst/1.2.2-gcc</p></li>
+<li><p class="sd-card-text">libxxf86vm/1.1.4-gcc</p></li>
+<li><p class="sd-card-text">llama-cpp-python/0.2.22</p></li>
+<li><p class="sd-card-text">llvm/12.0.1-gcc, llvm/16.0.6</p></li>
+<li><p class="sd-card-text">lp_solve/5.5.2.0</p></li>
+<li><p class="sd-card-text">lsdyna/12.0.0</p></li>
+<li><p class="sd-card-text">lua/5.1.4, lua/5.1.5</p></li>
+<li><p class="sd-card-text">lumerical/device-6.0.125, lumerical/8.11.318, lumerical/8.12.631, lumerical/8.17.1057-test, lumerical/8.17.1057, lumerical/2020r2</p></li>
+<li><p class="sd-card-text">lz4/1.9.3-gcc</p></li>
+<li><p class="sd-card-text">lzo/2.10-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">m4/1.4.16-gcc-4.8.5, m4/1.4.16-gcc-10.4.0, m4/1.4.16-intel-2021.4.0, m4/1.4.16-nvhpc-23.3</p></li>
+<li><p class="sd-card-text">mageck/0.5.6_py27, mageck/0.5.6_py34</p></li>
+<li><p class="sd-card-text">mageck_vispr/09082016</p></li>
+<li><p class="sd-card-text">magma/1.10</p></li>
+<li><p class="sd-card-text">makedepf90/2.8.8</p></li>
+<li><p class="sd-card-text">maker/2.31.11</p></li>
+<li><p class="sd-card-text">manta/1.5.0</p></li>
+<li><p class="sd-card-text">mathematica/10.3.0, mathematica/10.4.1, mathematica/12.0</p></li>
+<li><p class="sd-card-text">matlab/r2013a, matlab/r2014b, matlab/r2015a, matlab/r2015b, matlab/r2020b_gcc-8.4.0</p></li>
+<li><p class="sd-card-text">matlabstan/2.15.1.0</p></li>
+<li><p class="sd-card-text">medaka/1.6.0</p></li>
+<li><p class="sd-card-text">meep/1.1.1, meep/1.2.1</p></li>
+<li><p class="sd-card-text">meson/0.60.0-gcc, meson/0.60.0-intel</p></li>
+<li><p class="sd-card-text">metamap/2016</p></li>
+<li><p class="sd-card-text">metaphlan/3.0.14, metaphlan/3.1.0</p></li>
+<li><p class="sd-card-text">metapro/2.2.0</p></li>
+<li><p class="sd-card-text">metaxa2/2.2</p></li>
+<li><p class="sd-card-text">metis/5.0.2</p></li>
+<li><p class="sd-card-text">mgreml/1.0.0</p></li>
+<li><p class="sd-card-text">minkowskiengine/0.5.4</p></li>
+<li><p class="sd-card-text">mkfontdir/1.0.7-gcc, mkfontdir/1.0.7-intel</p></li>
+<li><p class="sd-card-text">mkfontscale/1.1.2-gcc, mkfontscale/1.1.2-intel</p></li>
+<li><p class="sd-card-text">mlpack/3.0.4</p></li>
+<li><p class="sd-card-text">modulus/22.03</p></li>
+<li><p class="sd-card-text">mono/3.4.0, mono/5.0.1.1, mono/6.12.0.199</p></li>
+<li><p class="sd-card-text">motif/2.3.8</p></li>
+<li><p class="sd-card-text">mpb/1.5</p></li>
+<li><p class="sd-card-text">mpc/1.0</p></li>
+<li><p class="sd-card-text">mpfr/3.1.1</p></li>
+<li><p class="sd-card-text">mpi/mpich-3.0.4-gcc-4.6.3, mpi/mpich-3.0.4-gcc-4.8.3, mpi/mpich-3.0.4-gcc-5.1.0, mpi/mpich-3.4.2-intel, mpi/mvapich2-gcc-4.8.3-cuda8, mpi/mvapich2-gcc-4.8.3</p></li>
+<li><p class="sd-card-text">mrnet/4.0.0</p></li>
+<li><p class="sd-card-text">mrtrix3/2018</p></li>
+<li><p class="sd-card-text">mujoco-py/2.1.2.14</p></li>
+<li><p class="sd-card-text">mumps/5.3.5-openmpi-4.0.5-gcc-10.2.0</p></li>
+<li><p class="sd-card-text">muscle/3.8.31</p></li>
+<li><p class="sd-card-text">mutect/1.1.4</p></li>
+<li><p class="sd-card-text">nasm/2.15.05-gcc, nasm/2.15.05-gcc-10.4.0, nasm/2.15.05-intel</p></li>
+<li><p class="sd-card-text">ncbi-toolkit/26_0_1-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">ncurses/6.4-gcc-4.8.5, ncurses/6.4-gcc-8.4.0</p></li>
+<li><p class="sd-card-text">nda-tools/0.2.19-py-3.6, nda-tools/0.2.19-py-3.8, nda-tools/0.2.21-py-3.8, nda-tools/0.2.22-py-3.8</p></li>
+<li><p class="sd-card-text">ndiff/2.0</p></li>
+<li><p class="sd-card-text">netcdf-c/4.7.4-openmpi-4.0.5-intel-19.0.5.281, netcdf-c/4.8.1-openmpi-gcc, netcdf-c/4.8.1-openmpi-intel</p></li>
+<li><p class="sd-card-text">netcdf-cxx/4.2-openmpi-gcc</p></li>
+<li><p class="sd-card-text">netcdf-fortran/4.5.3-openmpi-intel, netcdf-fortran/4.5.3-openmpi-4.0.5-intel-19.0.5.281</p></li>
+<li><p class="sd-card-text">netlib-scalapack/2.2.0-openmpi-intel-2021.4.0</p></li>
+<li><p class="sd-card-text">netlogo/5.3.1, netlogo/6.0.1</p></li>
+<li><p class="sd-card-text">nextflow/22.04.3</p></li>
+<li><p class="sd-card-text">nextneopi/1.3.1</p></li>
+<li><p class="sd-card-text">ngsutils/0.5.9</p></li>
+<li><p class="sd-card-text">ninja/1.10.2-gcc, ninja/1.10.2-intel</p></li>
+<li><p class="sd-card-text">nlopt/2.4.2, nlopt/2.6.1</p></li>
+<li><p class="sd-card-text">nspr/4.31-gcc</p></li>
+<li><p class="sd-card-text">nss/3.67-gcc</p></li>
+<li><p class="sd-card-text">nvhpc/21.9-intel</p></li>
+<li><p class="sd-card-text">nwchem/6.1.1/openmpi-1.6.3-intel2011.3, nwchem/6.5.0, nwchem/6.6.0-patched, nwchem/6.6.0, nwchem/6.6.1</p></li>
+<li><p class="sd-card-text">ocaml/4.05.0</p></li>
+<li><p class="sd-card-text">octave/3.6.3, octave/4.2.1</p></li>
+<li><p class="sd-card-text">oncotator/1.9.8.0</p></li>
+<li><p class="sd-card-text">openbabel/2.3.0</p></li>
+<li><p class="sd-card-text">openblas/0.3.18-gcc</p></li>
+<li><p class="sd-card-text">openmd/2.5, openmd/2.6</p></li>
+<li><p class="sd-card-text">opera/12.16</p></li>
+<li><p class="sd-card-text">orca/4.0.1.2</p></li>
+<li><p class="sd-card-text">osu-micro-benchmarks/5.3.2-mpich, osu-micro-benchmarks/5.3.2</p></li>
+<li><p class="sd-card-text">oxconsole/7.20</p></li>
+<li><p class="sd-card-text">oxedit/7.20</p></li>
+<li><p class="sd-card-text">pBWA/1.21</p></li>
+<li><p class="sd-card-text">paml/4.10.6</p></li>
+<li><p class="sd-card-text">pandoc/2.14.0.3-gcc</p></li>
+<li><p class="sd-card-text">papi/4.1.3</p></li>
+<li><p class="sd-card-text">paraview/3.98-openmpi, paraview/3.98, paraview/4.4, paraview/5.9.0</p></li>
+<li><p class="sd-card-text">parsec/1.3.6</p></li>
+<li><p class="sd-card-text">patchelf/0.13-gcc, patchelf/0.13-intel, patchelf/0.17.2-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">pbs-drmaa/1.0.19</p></li>
+<li><p class="sd-card-text">pcntoolkit/0.25-py.3.6, pcntoolkit/0.25</p></li>
+<li><p class="sd-card-text">pcre/8.39, pcre/8.44-gcc-4.8.5, pcre/8.44-intel, pcre/8.45-gcc-10.4.0, pcre2/10.36-gcc, pcre2/10.42-intel-2021.4.0</p></li>
+<li><p class="sd-card-text">pdflib-lite/7.0.4p4</p></li>
+<li><p class="sd-card-text">penncnv/1.0.5</p></li>
+<li><p class="sd-card-text">perl-data-dumper/2.173-gcc</p></li>
+<li><p class="sd-card-text">perl/5.14, perl/5.36.0-gcc-4.8.5</p></li>
+<li><p class="sd-card-text">petsc/3.3-p7, petsc/3.4.4, petsc/3.5.1-shared, petsc/3.5.1-static, petsc/3.7.2-opt, petsc/3.7.2, petsc/3.14.4-openmpi-4.0.5-gcc-10.2.0</p></li>
+<li><p class="sd-card-text">phamb/master</p></li>
+<li><p class="sd-card-text">pharmcat/1.6.0</p></li>
+<li><p class="sd-card-text">phast/1.4</p></li>
+<li><p class="sd-card-text">phylocsf/latest</p></li>
+<li><p class="sd-card-text">phyloflash/3.4.2</p></li>
+<li><p class="sd-card-text">pindel/2017</p></li>
+<li><p class="sd-card-text">pixman/0.40.0-intel</p></li>
+<li><p class="sd-card-text">pkg-config/0.27.1</p></li>
+<li><p class="sd-card-text">pkgconf/1.9.5-gcc-4.8.5</p></li>
+<li><p class="sd-card-text">plink/1.07, plink/2.0-alpha-2.3, plink/2.0-alpha-3.3</p></li>
+<li><p class="sd-card-text">plinkseq/0.10</p></li>
+<li><p class="sd-card-text">plumed/2.6.2-openmpi-4.0.5-intel-19.0.5.281, plumed/2.9.0</p></li>
+<li><p class="sd-card-text">pnetcdf/1.12.2</p></li>
+<li><p class="sd-card-text">polyfun/1.0.0</p></li>
+<li><p class="sd-card-text">poppler/0.47, poppler/0.48</p></li>
+<li><p class="sd-card-text">povray/3.7</p></li>
+<li><p class="sd-card-text">prada/1.2</p></li>
+<li><p class="sd-card-text">proj/6.2.1</p></li>
+<li><p class="sd-card-text">protobuf/3.1.0, protobuf/3.21.12-gcc-8.4.0</p></li>
+<li><p class="sd-card-text">pvactools/3.0.1</p></li>
+<li><p class="sd-card-text">py-cython/0.29.33-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">py-mako/1.1.4-gcc</p></li>
+<li><p class="sd-card-text">py-markupsafe/1.1.1-gcc, py-markupsafe/2.0.1-gcc</p></li>
+<li><p class="sd-card-text">py-pip/23.0-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">py-setuptools/44.1.0-gcc, py-setuptools/58.2.0-gcc, py-setuptools/58.2.0-intel</p></li>
+<li><p class="sd-card-text">py-wheel/0.37.1-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">pypy/2.5.1</p></li>
+<li><p class="sd-card-text">python/ActivePython-3.2, python/epd-7.3-2</p></li>
+<li><p class="sd-card-text">qchem/4.0, qchem/4.1.2, qchem/4.3, qchem/4.4, qchem/5.0, qchem/5.2, qchem/5.4</p></li>
+<li><p class="sd-card-text">qctool/1.0, qctool/1.4, qctool/1.5, qctool/2.0-rc4</p></li>
+<li><p class="sd-card-text">qe/6.5</p></li>
+<li><p class="sd-card-text">qhull/2015.2, qhull/2020.1-gcc-10.2.0</p></li>
+<li><p class="sd-card-text">qiime2/2021.11</p></li>
+<li><p class="sd-card-text">qsiprep/0.19.1</p></li>
+<li><p class="sd-card-text">qt/4.6.2, qt/5.0.0</p></li>
+<li><p class="sd-card-text">qt/5.9.1</p></li>
+<li><p class="sd-card-text">quast/5.0.2</p></li>
+<li><p class="sd-card-text">r/4.2.2-gcc</p></li>
+<li><p class="sd-card-text">random-metal/0.1.0</p></li>
+<li><p class="sd-card-text">randrproto/1.5.0-gcc</p></li>
+<li><p class="sd-card-text">readline/6.2, readline/8.0-intel-19.0.5.281, readline/8.2-gcc-4.8.5</p></li>
+<li><p class="sd-card-text">reco/0.0.1</p></li>
+<li><p class="sd-card-text">recordproto/1.14.2-gcc, renderproto/0.11.1-intel</p></li>
+<li><p class="sd-card-text">rfmix/2.0</p></li>
+<li><p class="sd-card-text">rgt/1.0.0</p></li>
+<li><p class="sd-card-text">ribotricer/1.3.2</p></li>
+<li><p class="sd-card-text">rmats2sashimiplot/2.0.3</p></li>
+<li><p class="sd-card-text">rnaseqc/2.3.5</p></li>
+<li><p class="sd-card-text">rnashapes/2.1.6</p></li>
+<li><p class="sd-card-text">root/5.34, root/6.28.02</p></li>
+<li><p class="sd-card-text">rsem/1.2.28</p></li>
+<li><p class="sd-card-text">ruby/2.0.0</p></li>
+<li><p class="sd-card-text">rufus/latest</p></li>
+<li><p class="sd-card-text">ruptura/latest</p></li>
+<li><p class="sd-card-text">sage/9.4</p></li>
+<li><p class="sd-card-text">salmon/0.8.2, salmon/0.9.1, salmon/1.2.1</p></li>
+<li><p class="sd-card-text">samplot/1.3.0</p></li>
+<li><p class="sd-card-text">samtools/0.1.19</p></li>
+<li><p class="sd-card-text">sasview/5.0.6</p></li>
+<li><p class="sd-card-text">scala/2.12.2</p></li>
+<li><p class="sd-card-text">scalapack/2.0.2_gcc, scalapack/2.0.2_intel</p></li>
+<li><p class="sd-card-text">scallop/0.9.8</p></li>
+<li><p class="sd-card-text">scons/2.5.0</p></li>
+<li><p class="sd-card-text">scrnaseq/2.0.0</p></li>
+<li><p class="sd-card-text">scrnsaverproto/1.2.2-intel</p></li>
+<li><p class="sd-card-text">sdpt3/4.0</p></li>
+<li><p class="sd-card-text">shapeit/v2.r837</p></li>
+<li><p class="sd-card-text">simbaathena/1.1.18</p></li>
+<li><p class="sd-card-text">sirius/6.5.7-openmpi-4.0.5-gcc-10.2.0</p></li>
+<li><p class="sd-card-text">slepc/3.7.4</p></li>
+<li><p class="sd-card-text">slurm-drmaa/latest</p></li>
+<li><p class="sd-card-text">smrtlink/11.0.0.146107</p></li>
+<li><p class="sd-card-text">snpEff/4.3, snpEff/5.1</p></li>
+<li><p class="sd-card-text">snptest/2.5, snptest/2.5.2</p></li>
+<li><p class="sd-card-text">soapdenovo2/2.04-r240</p></li>
+<li><p class="sd-card-text">soci/4.0.2-gcc</p></li>
+<li><p class="sd-card-text">specfem3d_globe/7.0.0</p></li>
+<li><p class="sd-card-text">speedseq/0.1.2-with-cnvnator, speedseq/0.1.2</p></li>
+<li><p class="sd-card-text">spla/1.3.0-openmpi-4.0.5-intel-19.0.5.281</p></li>
+<li><p class="sd-card-text">spyder/5.4.3</p></li>
+<li><p class="sd-card-text">sqlite/3.19.2, sqlite/3.19.3</p></li>
+<li><p class="sd-card-text">sratoolkit/2.8.0</p></li>
+<li><p class="sd-card-text">stacks/2.64-gcc-9.2.0</p></li>
+<li><p class="sd-card-text">stat/4.0.1</p></li>
+<li><p class="sd-card-text">stata/14-b1041</p></li>
+<li><p class="sd-card-text">stattransfer/14, stattransfer/15</p></li>
+<li><p class="sd-card-text">stockfish/15.1</p></li>
+<li><p class="sd-card-text">strdenovotools/1.0.0</p></li>
+<li><p class="sd-card-text">strelka/2.9.2</p></li>
+<li><p class="sd-card-text">stress/latest</p></li>
+<li><p class="sd-card-text">stringtie/1.3.0</p></li>
+<li><p class="sd-card-text">subread/1.5.1, subread/1.6.1</p></li>
+<li><p class="sd-card-text">superlu-dist/6.4.0-openmpi-4.0.5-gcc-10.2.0</p></li>
+<li><p class="sd-card-text">superlu/5.2.0</p></li>
+<li><p class="sd-card-text">suppa/2.3</p></li>
+<li><p class="sd-card-text">swig/3.0.0, swig/3.0.10, swig/3.0.12, swig/4.0.2_gcc-4.8.5, swig/4.0.2-gcc</p></li>
+<li><p class="sd-card-text">talon/5.0</p></li>
+<li><p class="sd-card-text">tar/1.34-gcc-4.8.5</p></li>
+<li><p class="sd-card-text">tau/2.23.1</p></li>
+<li><p class="sd-card-text">tcl/8.6.11-intel, tcl/8.6.12-intel-2021.4.0</p></li>
+<li><p class="sd-card-text">telseq/2.4.1</p></li>
+<li><p class="sd-card-text">tesseract/3.05.01</p></li>
+<li><p class="sd-card-text">texinfo/6.5-gcc, texinfo/6.5-intel, texinfo/7.0.3-gcc-4.8.5, texinfo/7.0.3-gcc-10.4.0</p></li>
+<li><p class="sd-card-text">texlive/2012</p></li>
+<li><p class="sd-card-text">thermo-calc/2022b</p></li>
+<li><p class="sd-card-text">tickwrite/7.1</p></li>
+<li><p class="sd-card-text">tig/2.5.1</p></li>
+<li><p class="sd-card-text">tobias/0.13.3</p></li>
+<li><p class="sd-card-text">tomlab/277</p></li>
+<li><p class="sd-card-text">toppic/1.5.3</p></li>
+<li><p class="sd-card-text">tpp/6.0.0</p></li>
+<li><p class="sd-card-text">trinity/2.14.0</p></li>
+<li><p class="sd-card-text">uchime/4.2.40</p></li>
+<li><p class="sd-card-text">unibind/latest</p></li>
+<li><p class="sd-card-text">unirep/11_18_2022</p></li>
+<li><p class="sd-card-text">util-macros/1.19.3-gcc, util-macros/1.19.3-gcc-10.4.0, util-macros/1.19.3-intel</p></li>
+<li><p class="sd-card-text">valgrind/3.13.0</p></li>
+<li><p class="sd-card-text">vasp/4.6.38, vasp/5.3, vasp/5.3.3.vtst, vasp/5.3.3, vasp/5.3.5.vtst.beef, vasp/5.3.5, vasp/5.4.1_intel_ompi, vasp/5.4.1_vtst, vasp/5.4.4-openmpi-4.0.5-intel-19.0.5.281-cuda-11.2.1, vasp/5.4.4-vtst-openmpi-4.0.5-intel-19.0.5.281</p></li>
+<li><p class="sd-card-text">vcftools/current, vcftools/0.1.14, vcftools/0.1.15</p></li>
+<li><p class="sd-card-text">vcontact2/0.11.0</p></li>
+<li><p class="sd-card-text">velvet/1.2.10</p></li>
+<li><p class="sd-card-text">vesta/3.4.4</p></li>
+<li><p class="sd-card-text">viennaRNA/2.5.0</p></li>
+<li><p class="sd-card-text">vim/8.0.2.7</p></li>
+<li><p class="sd-card-text">visit/2.6.0, visit/2.12.2</p></li>
+<li><p class="sd-card-text">voxcraft-sim/3.0</p></li>
+<li><p class="sd-card-text">vtk/9.2.5</p></li>
+<li><p class="sd-card-text">wannier/2.1.0_new, wannier/2.1.0</p></li>
+<li><p class="sd-card-text">which/2.21-gcc</p></li>
+<li><p class="sd-card-text">wine/2.0</p></li>
+<li><p class="sd-card-text">wxwidgets/3.1.2</p></li>
+<li><p class="sd-card-text">xander_assembler/2017</p></li>
+<li><p class="sd-card-text">xcb-proto/1.14.1-intel</p></li>
+<li><p class="sd-card-text">xcb-util-image/0.4.0-gcc, xcb-util-keysyms/0.4.0-gcc, xcb-util-renderutil/0.3.9-gcc, xcb-util-wm/0.4.1-gcc, xcb-util/0.4.0-gcc</p></li>
+<li><p class="sd-card-text">xerces-c/3.1.1, xerces-c/3.2.3</p></li>
+<li><p class="sd-card-text">xextproto/7.3.0-intel</p></li>
+<li><p class="sd-card-text">xf86vidmodeproto/2.3.1-gcc</p></li>
+<li><p class="sd-card-text">xkbcomp/1.4.4-gcc</p></li>
+<li><p class="sd-card-text">xkbdata/1.0.1-gcc</p></li>
+<li><p class="sd-card-text">xpdf/4.02</p></li>
+<li><p class="sd-card-text">xproto/7.0.31-intel</p></li>
+<li><p class="sd-card-text">xrandr/1.5.0-gcc</p></li>
+<li><p class="sd-card-text">xtrans/1.3.5-intel</p></li>
+<li><p class="sd-card-text">xz/5.4.1-gcc-4.8.5</p></li>
+<li><p class="sd-card-text">yaml-cpp/0.5.3, yaml-cpp/0.6.3-gcc, yaml-cpp/0.7.0</p></li>
+<li><p class="sd-card-text">yarn/1.22.4-gcc</p></li>
+<li><p class="sd-card-text">z3/4.8.9-gcc</p></li>
+<li><p class="sd-card-text">zlib/1.3</p></li>
+<li><p class="sd-card-text">zsh/5.8-gcc-4.8.5</p></li>
+</ul>
+</div>
+</details></div>
+</details><details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3">
+<summary class="sd-summary-title sd-card-header">
+<span class="sd-summary-text">Quest Analytics R and RStudio Version Change - 9 October 2024</span><span class="sd-summary-state-marker sd-summary-chevron-right"><svg version="1.1" width="1.5em" height="1.5em" class="sd-octicon sd-octicon-chevron-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.72 18.78a.75.75 0 0 1 0-1.06L14.44 12 8.72 6.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0Z"></path></svg></span></summary><div class="sd-summary-content sd-card-body docutils">
+<ul class="simple">
+<li><p class="sd-card-text">Updated R version on Quest Analytics Nodes from R 4.2.3 to R 4.4.0</p></li>
+<li><p class="sd-card-text">Updated RStudio version to 2023.12.2-407</p></li>
+<li><p class="sd-card-text">Implemented configuration change to end inactive R sessions after 12 hours</p></li>
+</ul>
+</div>
+</details></section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="index.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Technical Specifications</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../../rdss/rdss-index.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Research Data Storage Service</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+             Last updated: 2026-07-06
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+
+
+<div id="footer-bottom">
+<div class="contain-1120">
+<span class="copyright" style="color:white">©
+<script>// <![CDATA[
+document.write(new Date().getFullYear())
+// ]]></script>
+Northwestern University | <a href="https://www.it.northwestern.edu/departments/it-services-support/research/">Northwestern IT Research Computing and Data Services</a></span>
+<!--
+<ul>
+<li><a href="https://www.facebook.com/NorthwesternU"> <span class="social facebook">Facebook</span> </a></li>
+<li><a href="https://www.twitter.com/northwesternu"> <span class="social twitter">Twitter</span> </a></li>
+<li><a href="https://www.instagram.com/northwesternu"> <span class="social instagram">Instagram</span> </a></li>
+<li><a href="https://www.youtube.com/user/NorthwesternU"> <span class="social youtube">YouTube</span> </a></li>
+<li><a href="https://www.tiktok.com/@northwestern.u"> <span class="social tiktok">TikTok</span> </a></li>
+<li><a href="https://www.linkedin.com/school/northwestern-university/"> <span class="social linkedin">LinkedIn</span> </a></li>
+</ul>
+-->
+<span class="right" style="color:white"><a style="color:white" href="https://www.northwestern.edu/disclaimer.html">Disclaimer</a></span>
+</div>
+</div>
+  </footer>
+  </body>
+</html>

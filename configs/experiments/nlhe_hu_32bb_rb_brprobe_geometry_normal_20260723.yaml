@@ -1,0 +1,74 @@
+game:
+  n_players: 2
+  stack_bb: 32.0
+  rank_count: 13
+
+rollout:
+  sequential_roots_per_gpu_initial: 4096
+  beta: null
+  family_batch_rows: 84
+  max_active_trajectories: 64
+  storage_page_rows: 256
+  execution_memory_bytes: 2147483648
+  sequential_roots_per_gpu_minimum: 4096
+  sequential_roots_per_gpu_maximum: 4096
+  memory_calibration_window: 32
+  memory_growth_fraction: 0.10
+  memory_growth_delay: 8
+  memory_prediction_z: 3.0
+
+device: cuda
+completion:
+  n_samples: 1024
+
+model:
+  d_model: 128
+  n_heads: 4
+  n_layers_pre: 4
+  n_layers_post: 6
+  m_raise: 2
+  k_act: 5
+  s_min: 0.02
+  max_players: 2
+  class_embedding_dim: 32
+  ffn_hidden: null
+  use_branching_heads: false
+  max_history_tokens: 42
+  folder_beta_rank: 0
+  folder_line_dim: 8
+  eps: 1.0e-8
+
+training:
+  mode: rao_blackwell
+  iters: 1
+  gd_steps_per_iter: 1
+  ppo_epochs: null
+  minibatch_size: 256
+  lr: 0.00005
+  adam_betas: [0.9, 0.999]
+  optimizer: adamw
+  grad_clip: 0.5
+  amp: true
+  seed: 101
+  checkpoint_every: 1
+  out_dir: runs/experiments/nlhe_hu_32bb_rb_brprobe_geometry_normal_20260723
+  reproducibility: throughput
+  kl_ref_interval: 100
+  kl_ref_effective_hands_rollout: 172800000.0
+
+loss:
+  name: rb_ppo
+  lam: 0.95
+  clip_eps: 0.2
+  clip_eps_v: 0.2
+  c_v: 0.125
+  c_h: 0.025
+  c_kl: 0.05
+  entropy_schedule: linear_decay
+  entropy_decay_iters: 500
+  utility_normalization: stack
+  value_loss: clipped
+
+probe:
+  target_checkpoint: runs/experiments/nlhe_hu_32bb_rb_brprobe_targets_20260723/normal_ckpt_0000700_v8.pt
+  initialization: target

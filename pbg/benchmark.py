@@ -19,6 +19,7 @@ from pbg.core.checkpointing import load_checkpoint_payload
 from pbg.core.branching import BranchingDiagnosticLimits
 from pbg.core.execution import LOGICAL_RNG_VERSION
 from pbg.core.training import (
+    _build_iteration_data,
     _one_iteration,
     _precision,
     _scaler,
@@ -178,15 +179,25 @@ def benchmark_modes(
     checkpoint: str | Path | None = None,
     branching_upper_cutoff_nodes: int | None = None,
     branching_queue_capacity_rows: int | None = None,
+    rollout_only: bool = False,
+    reuse_root_private_profile: bool = False,
 ) -> dict[str, Any]:
     """Profile modes and return median phase/cost metrics plus raw samples."""
 
     if warmup < 0 or repeats <= 0:
         raise ValueError("warmup must be nonnegative and repeats must be positive")
+    modes = tuple(modes)
     checkpoint_state, checkpoint_metadata = _benchmark_checkpoint(checkpoint)
     diagnostic_limits = BranchingDiagnosticLimits(
-        upper_nodes=branching_upper_cutoff_nodes
+        upper_nodes=branching_upper_cutoff_nodes,
+        reuse_root_private_profile=reuse_root_private_profile,
     )
+    if reuse_root_private_profile and any(
+        mode != "branched_rao_blackwell" for mode in modes
+    ):
+        raise ValueError(
+            "root-private-profile reuse is a branched-only diagnostic"
+        )
     initialization_protocol = (
         CHECKPOINT_INITIALIZATION_PROTOCOL
         if checkpoint_state is not None
@@ -259,18 +270,30 @@ def benchmark_modes(
         )
         environment = _environment(device)
         for iteration in range(warmup):
-            _one_iteration(
-                local,
-                bundle,
-                optimizer,
-                scaler,
-                torch_gen,
-                iteration,
-                profile=False,
-                reference_model=reference_model,
-                safeguard_controller=safeguard_controller,
-                branching_diagnostic_limits=diagnostic_limits,
-            )
+            if rollout_only:
+                warmup_data = _build_iteration_data(
+                    local,
+                    bundle,
+                    torch_gen,
+                    iteration=iteration,
+                    profile=False,
+                    safeguard_controller=safeguard_controller,
+                    branching_diagnostic_limits=diagnostic_limits,
+                )
+                del warmup_data
+            else:
+                _one_iteration(
+                    local,
+                    bundle,
+                    optimizer,
+                    scaler,
+                    torch_gen,
+                    iteration,
+                    profile=False,
+                    reference_model=reference_model,
+                    safeguard_controller=safeguard_controller,
+                    branching_diagnostic_limits=diagnostic_limits,
+                )
         model_state = _cpu_snapshot(bundle.model.state_dict())
         optimizer_state = _cpu_snapshot(optimizer.state_dict())
         scaler_state = _cpu_snapshot(scaler.state_dict())
@@ -296,18 +319,90 @@ def benchmark_modes(
             )
             torch_gen, _ = seed_all(repeat_seed, 0, device)
             local.rollout.logical_seed = repeat_seed
-            sample = _one_iteration(
-                local,
-                bundle,
-                optimizer,
-                scaler,
-                torch_gen,
-                profile_iteration,
-                profile=True,
-                reference_model=reference_model,
-                safeguard_controller=safeguard_controller,
-                branching_diagnostic_limits=diagnostic_limits,
-            )
+            if rollout_only:
+                execution_metrics = getattr(
+                    bundle.rollout_backend, "execution_metrics", None
+                )
+                if execution_metrics is not None:
+                    execution_metrics.clear()
+                    execution_metrics.configure_model_timing(
+                        enabled=device.type == "cuda",
+                        device=device,
+                    )
+                built = _build_iteration_data(
+                    local,
+                    bundle,
+                    torch_gen,
+                    profile=True,
+                    iteration=profile_iteration,
+                    safeguard_controller=safeguard_controller,
+                    branching_diagnostic_limits=diagnostic_limits,
+                )
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                sample = dict(built.profile_metrics)
+                sample.update(
+                    {
+                        "trajectories": float(local.rollout.roots_per_gpu),
+                        "decisions": float(built.decision_count),
+                        "leaves": float(built.leaf_count),
+                        "optimizer_steps": 0.0,
+                        "minibatches": 0.0,
+                        **{
+                            key: float(value)
+                            for key, value in built.completion_quality.items()
+                            if isinstance(value, (int, float))
+                        },
+                    }
+                )
+                if execution_metrics is not None:
+                    sample.update(execution_metrics.snapshot())
+                sample["profiled_iteration_seconds"] = sum(
+                    float(sample.get(f"phase_{name}_seconds", 0.0))
+                    for name in ("snapshot", "rollout", "seal", "backward")
+                )
+                completion_seconds = float(
+                    sample.get(
+                        "execution_completion_cuda_work_seconds", 0.0
+                    )
+                )
+                target_total_seconds = float(
+                    sample.get(
+                        "execution_target_total_cuda_work_seconds", 0.0
+                    )
+                )
+                sample["phase_completion_seconds"] = completion_seconds
+                sample["phase_target_total_cuda_seconds"] = (
+                    target_total_seconds
+                )
+                sample["phase_target_propagation_cuda_seconds"] = max(
+                    0.0, target_total_seconds - completion_seconds
+                )
+                sample["phase_internal_seal_cuda_seconds"] = sum(
+                    float(sample.get(key, 0.0))
+                    for key in (
+                        "execution_rollout_internal_leaf_seal_cuda_work_seconds",
+                        "execution_rollout_internal_decision_seal_cuda_work_seconds",
+                    )
+                )
+                sample["phase_all_seal_seconds"] = (
+                    sample["phase_internal_seal_cuda_seconds"]
+                    + float(sample.get("phase_seal_seconds", 0.0))
+                )
+                del built
+            else:
+                sample = _one_iteration(
+                    local,
+                    bundle,
+                    optimizer,
+                    scaler,
+                    torch_gen,
+                    profile_iteration,
+                    profile=True,
+                    reference_model=reference_model,
+                    safeguard_controller=safeguard_controller,
+                    branching_diagnostic_limits=diagnostic_limits,
+                )
             decisions = float(sample["decisions"])
             if decisions <= 0:
                 raise RuntimeError("performance samples require realized decisions")
@@ -344,6 +439,10 @@ def benchmark_modes(
                     "safe_tree_size": local.rollout.safe_tree_size,
                     "safe_tree_activation_consecutive_iters": (
                         local.rollout.safe_tree_activation_consecutive_iters
+                    ),
+                    "rollout_only": rollout_only,
+                    "diagnostic_reuse_root_private_profile": (
+                        reuse_root_private_profile
                     ),
                 },
                 "metrics": _median_metrics(samples),
@@ -408,6 +507,10 @@ def benchmark_modes(
             "branching_queue_capacity_rows": branching_queue_capacity_rows,
             "warmup": warmup,
             "repeats": repeats,
+            "rollout_only": rollout_only,
+            "diagnostic_reuse_root_private_profile": (
+                reuse_root_private_profile
+            ),
         },
         "modes": results,
     }

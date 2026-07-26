@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+
+<script async="async" src="https://www.googletagmanager.com/gtag/js?id=G-WL1LE772RM"></script>
+<script>
+  if (!window.location.hostname.includes('proto12')) {
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-WL1LE772RM');
+    gtag('config', 'G-7XLBH2NC54'); // combo
+  }
+</script>
+
+
+
+    <meta content="IE=Edge" http-equiv="X-UA-Compatible"/>
+    <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+    <meta content="origin-when-cross-origin" name="referrer"/>
+        <title>Quest Technical Specifications : Information Technology - Northwestern University</title>
+        <link href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/specs.html" rel="canonical"/>
+<link href="https://common.northwestern.edu" rel="preconnect"/>
+<meta content="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/specs.html" property="og:url"/>
+<meta content="Quest Technical Specifications : Information Technology - Northwestern University" property="og:title"/>
+<meta content="//common.northwestern.edu/v8/images/northwestern-thumbnail.jpg" property="og:image"/>
+    
+    
+    <meta content="c83fd3cd816977782e3a484d494c93a9" name="pageID"/>
+    <link href="https://common.northwestern.edu/dept/3.0/styles.css" media="screen" rel="stylesheet" type="text/css"/>
+<link href="https://common.northwestern.edu/dept/3.0/swiper.min.css" media="screen" rel="stylesheet" type="text/css"/>
+<link href="https://common.northwestern.edu/dept/3.0/print.css" media="print" rel="stylesheet" type="text/css"/>
+<link href="../../../../../css/it.css" media="screen" rel="stylesheet" type="text/css"/>
+
+    
+    <link href="//common.northwestern.edu/favicon.ico" rel="shortcut icon" type="image/x-icon"/>
+<link href="//common.northwestern.edu/v8/icons/favicon-16.png" rel="icon" sizes="16x16" type="image/png"/>
+<link href="//common.northwestern.edu/v8/icons/favicon-32.png" rel="icon" sizes="32x32" type="image/png"/>
+<link href="//common.northwestern.edu/v8/icons/favicon-180.png" rel="apple-touch-icon" sizes="180x180"/>
+<meta content="Northwestern" name="application-name"/>
+<meta content="#4e2a84" name="msapplication-TileColor"/>
+<meta content="//common.northwestern.edu/v8/icons/mstile-144x144.png" name="msapplication-TileImage"/>
+<meta content="#ffffff" name="theme-color"/>
+<meta content="//common.northwestern.edu/v8/icons/ieconfig.xml" name="msapplication-config"/>
+</head>
+<body>
+    
+    
+<script>
+    document.getElementsByTagName('body')[0].setAttribute('class','standard-page');
+</script>
+    <header>
+ 
+
+<a class="screen-reader-shortcut" href="#main-content">Skip to main content</a><div id="top-bar"><div class="contain-1120"><div id="left"><div id="northwestern"><a href="https://www.northwestern.edu/" title="Northwestern University Home"><span class="hide-label">Northwestern University</span></a></div></div><nav aria-label="global links" id="global-links"><ul><li id="resources">I want to
+                            <span class="dropdown-arrow"></span><ul aria-label="global links submenu" aria-labelledby="resources"><li><a href="https://services.northwestern.edu/TDClient/30/Portal/KB/ArticleDet?ID=1399" target="_blank">Change my NetID password</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/KB/ArticleDet?ID=1818" target="_blank">Use GlobalProtect VPN</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/KB/ArticleDet?ID=1489" target="_blank">Clear my browser cache</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/KB/ArticleDet?ID=1851" target="_blank">Connect to wireless</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/KB/ArticleDet?ID=1494" target="_blank">Use Duo authentication</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceDet?ID=140" target="_blank">Use Zoom</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/KB/ArticleDet?ID=1986 " target="_blank">Share Files</a></li></ul></li><li><a href="/support/login/index.html">Access System Logins</a></li></ul></nav></div></div>
+
+        <nav aria-label="quick links" id="quick-links">
+        </nav>
+        <div class="contain-1120" id="bottom-bar">
+            <div id="site-name"><a href="../../../../../index.html" title="Information Technology Home">Information Technology</a></div>
+            <div id="status">
+    <div class="heading">IT Service Status</div>
+    <statuspage-widget src="https://northwesternuniversity.statuspage.io"/>
+</div>
+        </div>
+        <div id="mobile-links">
+            <a class="mobile-link mobile-nav-link" href="#mobile-nav"><span class="hide-label">Menu</span></a>
+            <nav aria-label="mobile menu" id="mobile-nav">
+ 
+
+<ul><li><a aria-haspopup="true" href="#" role="button">Get Help<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/support/index.html">Get Help Overview</a></li><li><a href="/support/service-desk/index.html">IT Service Desk</a></li><li><a aria-haspopup="true" href="#" role="button">System Logins<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/support/login/index.html">System Logins Overview</a></li><li><a href="/support/login/canvas.html">Canvas</a></li><li><a href="/support/login/aws.html">Amazon Web Services Access Portal Login</a></li><li><a href="/support/login/it-system-audit-tool.html">Administrative Access Review Portal Login</a></li></ul></li><li><a href="/support/faculty-staff/index.html">For Faculty and Staff</a></li><li><a href="/support/researchers/index.html">For Researchers</a></li><li><a aria-haspopup="true" href="#" role="button">For Students<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/support/students/index.html">For Students Overview</a></li><li><a href="/support/students/graduating-student-tech-tips.html">Technology Tips for Graduating Students</a></li></ul></li><li><a href="/support/instructional-resources/index.html">Resources for Instruction</a></li></ul></li><li><a aria-haspopup="true" href="#" role="button">Explore Services<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/services/index.html">Explore Services Overview</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=4">Administrative and Business</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=13">Communication and Collaboration</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=18">Desktop and Mobile Computing</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=21">Infrastructure</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=31">Professional Services</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=38">Research Technologies and Support</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=46">Information Security</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=50">Teaching and Learning</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=55">Software and Applications</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=64">Distributed IT</a></li></ul></li><li><a aria-haspopup="true" href="#" role="button">Access AI<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/ai/index.html">Access AI Overview</a></li><li><a href="/ai/security-and-data-governance/index.html">Security and Data Governance </a></li><li><a aria-haspopup="true" href="#" role="button">Tools and Use Guidance<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/ai/tools-and-use-guidance/index.html">Tools and Use Guidance Overview</a></li><li><a href="/ai/tools-and-use-guidance/build-your-ai-skills-with-copilot-and-beyond.html">Build Your AI Skills with Copilot and Beyond </a></li><li><a href="/ai/tools-and-use-guidance/tools-and-use-guidance.html">Tools and Use Guidance</a></li><li><a href="/ai/tools-and-use-guidance/getting-started-with-generative-ai.html">Getting Started with Generative AI</a></li><li><a href="/ai/tools-and-use-guidance/ai-workshops.html">AI Workshops</a></li></ul></li><li><a aria-haspopup="true" href="#" role="button">Working with AI<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/ai/working-with-ai/index.html">Working with AI Overview</a></li><li><a href="/ai/working-with-ai/everyday-ai-use-cases-for-staff-work.html">Everyday AI Use Cases for Staff Work</a></li></ul></li><li><a aria-haspopup="true" href="#" role="button">Teaching with AI<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/ai/teaching-with-ai/index.html">Teaching with AI Overview</a></li><li><a href="/ai/teaching-with-ai/building-a-genai-activity.html">Building a GenAI Activity</a></li><li><a href="/ai/teaching-with-ai/instructor-options.html">Instructor Options</a></li><li><a href="/ai/teaching-with-ai/wrap-up-learning-in-the-context-of-generative-ai.html">Wrap-up—Learning in the Context of Generative AI</a></li><li><a href="/ai/teaching-with-ai/video-reflections.html">Video Reflections</a></li></ul></li><li><a href="/ai/learning-with-ai/index.html">Learning with AI</a></li><li><a aria-haspopup="true" href="#" role="button">Researching with AI<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/ai/research-with-ai/index.html">Researching with AI Overview</a></li><li><a href="/ai/research-with-ai/ai-transcription-of-research-interviews.html">AI Transcription of Research Interviews </a></li></ul></li></ul></li><li><a aria-haspopup="true" href="#" role="button">Stay Secure<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/security/index.html">Stay Secure Overview</a></li><li><a aria-haspopup="true" href="#" role="button">Avoiding Phishing <span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/security/phishing/index.html">Avoiding Phishing  Overview</a></li><li><a href="/security/phishing/phishing-attempts-at-northwestern.html">Phishing Attempts at Northwestern</a></li></ul></li><li><a aria-haspopup="true" href="#" role="button">Protect Your Information and Identity<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/security/protect-information/index.html">Protect Your Information and Identity Overview</a></li><li><a href="/security/protect-information/secure-data-tips.html">Protect Your Data</a></li><li><a href="/security/protect-information/work-environment.html">Securing Your Work Environment</a></li><li><a href="/security/protect-information/iot.html">Securing Your IoT</a></li><li><a href="/security/protect-information/secure-password.html">Protect Your Password</a></li><li><a href="/security/protect-information/securing-your-social-media.html">Securing Your Social Media</a></li><li><a href="/security/protect-information/identity-tips.html">Protect Your Identity</a></li><li><a href="/security/protect-information/illegal-downloading.html">Illegal Peer-to-Peer File Sharing</a></li><li><a href="/security/protect-information/secure-travel.html">Stay Secure During Travel</a></li><li><a href="/security/protect-information/device-tips.html">Protect Your Devices</a></li><li><a href="/security/protect-information/hackers/index.html">Thwarting Hackers</a></li></ul></li><li><a href="/security/protect-research/index.html">Protect Your Research</a></li><li><a href="/security/community-resources/index.html">Resources for the IT Community</a></li><li><a href="/security/assistance/index.html">Report an Information Security Incident</a></li></ul></li><li><a aria-haspopup="true" href="#" role="button">View Departments<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/departments/index.html">View Departments Overview</a></li><li><a aria-haspopup="true" href="#" role="button">Office of the Vice President for Information Technology and Chief Information Officer <span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/departments/ovp-information-technology/index.html">Office of the Vice President for Information Technology and Chief Information Officer  Overview</a></li><li><a href="/departments/ovp-information-technology/biography.html">Biography</a></li><li><a href="/departments/ovp-information-technology/it-assessment-and-planning-documents.html">Strategy and Planning</a></li><li><a href="/departments/ovp-information-technology/senior-leadership-team.html">Senior Leadership Team</a></li></ul></li><li><a href="/departments/af/index.html">Administration and Finance</a></li><li><a aria-haspopup="true" href="#" role="button">Administrative Systems<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/departments/as/index.html">Administrative Systems Overview</a></li><li><a href="/departments/as/capabilities.html">Business Capabilities Analysis</a></li><li><a href="/departments/as/opm/index.html">Office of Portfolio Management</a></li></ul></li><li><a href="/departments/cyberinfrastructure/index.html">Cyberinfrastructure</a></li><li><a href="/departments/information-security/index.html">Information Security Office</a></li><li><a aria-haspopup="true" href="#" role="button">IT Services and Support<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/departments/it-services-support/index.html">IT Services and Support Overview</a></li><li><a href="/departments/it-services-support/it-communications/index.html">IT Communications</a></li><li><a href="/departments/it-services-support/research/index.html">Research Computing and Data Services</a></li><li><a href="/departments/it-services-support/teaching/index.html">Teaching and Learning Technologies</a></li></ul></li><li><a href="/departments/icair/index.html">International Center for Advanced Internet Research</a></li></ul></li><li><a aria-haspopup="true" href="#" role="button">About IT<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/about/index.html">About IT Overview</a></li><li><a aria-haspopup="true" href="#" role="button">Organization and Leadership<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/about/organization/index.html">Organization and Leadership Overview</a></li><li><a href="/about/organization/organizational-chart.html">Organizational Chart</a></li><li><a href="/about/organization/mission.html">Mission</a></li><li><a href="/about/organization/governance/index.html">IT Governance </a></li><li><a href="/about/organization/it-by-the-numbers.html">IT by the Numbers</a></li></ul></li><li><a href="/about/policies/index.html">Policies, Standards, and Guidelines</a></li><li><a aria-haspopup="true" href="#" role="button">Projects and Initiatives<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/about/it-projects/index.html">Projects and Initiatives Overview</a></li><li><a href="/about/it-projects/campus-wired-data-network-refresh/index.html">Campus Wired Data Network Refresh</a></li><li><a href="/about/it-projects/canvas-accessibility/index.html">Canvas Accessibility</a></li><li><a href="/about/it-projects/data-network-authentication-deployment/index.html">Data Network Authentication Deployment</a></li><li><a href="/about/it-projects/ssl-pki-certificate-renewal-automation-process-implementation/index.html">SSL-PKI Certificate Renewal Automation Process Implementation </a></li><li><a href="/about/it-projects/password-manager/index.html">Password Manager</a></li></ul></li><li><a aria-haspopup="true" href="#" role="button">News and Events<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/about/news-events/index.html">News and Events Overview</a></li><li><a href="/about/news-events/2024/index.html">2024</a></li><li><a href="/about/news-events/2025/index.html">2025</a></li><li><a href="/about/news-events/2026/index.html">2026</a></li><li><a href="/about/news-events/newsletter.html">Northwestern IT Newsletter</a></li><li><a href="/about/news-events/event-calendar.html">Event Calendar</a></li></ul></li><li><a href="/about/employment/index.html">Employment Opportunities</a></li><li><a aria-haspopup="true" href="#" role="button">Inside IT (Internal)<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/about/inside-it/index.html">Inside IT (Internal) Overview</a></li><li><a href="/about/inside-it/careers/index.html">Careers</a></li><li><a href="/about/inside-it/organization/index.html">Our Community</a></li><li><a href="/about/inside-it/take-5/index.html">Take 5</a></li><li><a href="/about/inside-it/recognition/index.html">Staff Recognition</a></li><li><a href="/about/inside-it/resources/index.html">Resources</a></li><li><a href="/about/inside-it/it-staff-events.html">IT Staff Events</a></li></ul></li><li><a aria-haspopup="true" href="#" role="button">Community Collaboration<span class="arrow"></span></a><ul aria-expanded="false" aria-hidden="true"><li class="home"><a href="/about/community-collaboration/index.html">Community Collaboration Overview</a></li><li><a href="/about/community-collaboration/communities-of-practice/index.html">Communities of Practice</a></li></ul></li></ul></li></ul>
+
+                <div id="mobile-nav-bottom"><ul id="mobile-nav-bottom-left"><li><a href="https://services.northwestern.edu/TDClient/30/Portal/KB/ArticleDet?ID=1399" target="_blank">Change my NetID password</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/KB/ArticleDet?ID=1818" target="_blank">Use GlobalProtect VPN</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/KB/ArticleDet?ID=1489" target="_blank">Clear my browser cache</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/KB/ArticleDet?ID=1851" target="_blank">Connect to wireless</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/KB/ArticleDet?ID=1494" target="_blank">Use Duo authentication</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceDet?ID=140" target="_blank">Use Zoom</a></li><li><a href="https://services.northwestern.edu/TDClient/30/Portal/KB/ArticleDet?ID=1986 " target="_blank">Share Files</a></li><li><a href="../../../../../support/login/index.html">Access System Logins</a></li></ul></div>
+            </nav>
+            <a class="mobile-link mobile-search-link" href="#mobile-search"><span class="hide-label">Search mobile site</span></a>
+<div id="mobile-search">
+    <div class="search-form">
+        <form action="https://search.northwestern.edu/it3/" method="get" role="search">
+            <label class="hide-label" for="q-mobile">Search this site</label> 
+            <input id="q-mobile" name="q" placeholder="Search this site" type="text"/> 
+            <input name="as_sitesearch" type="hidden" value="https://www.it.northwestern.edu"/> 
+            <input name="sitetitle" type="hidden" value="Information Technology"/> 
+            <button type="submit"><span class="hide-label">Search</span></button>
+        </form>
+    </div>
+</div>
+
+        </div>
+    </header>
+ 
+
+
+
+
+
+
+
+
+
+
+
+    <nav aria-label="main menu" id="top-nav">
+                        <ul>
+                                            <li id="menu1">
+                                         <a href="/support/index.html">Get Help <span class="dropdown-arrow"></span></a>
+                                                                                                    <ul aria-labelledby="menu1" class="dropdown-quick-links">
+                    <li class="nav-links">
+                <ul>
+                    <li class="home"><a href="/support/index.html">Get Help Overview</a>
+                    	                    		                    	                    </li>
+                                                                <li>
+                                                                                             <a href="/support/service-desk/index.html">IT Service Desk</a>
+            <span>Get help via telephone, email, walk-in, or through the Knowledge Base.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/support/login/index.html">System Logins</a>
+            <span>Access essential campus systems.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/support/faculty-staff/index.html">For Faculty and Staff</a>
+            <span>Access IT resources, tools, and services that enable your work at Northwestern.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/support/researchers/index.html">For Researchers</a>
+            <span>Explore the specialized resources that IT offers to Northwestern's research community.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/support/students/index.html">For Students</a>
+            <span>Access technology assistance for incoming, current, and graduating students.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/support/instructional-resources/index.html">Resources for Instruction</a>
+            <span>Find resources for instructors, teaching assistants, and course coordinators to enhance instruction.</span>
+                                                        </li>
+                                    </ul>
+            </li>
+            
+                                        <li aria-label="navigation submenu quick links" class="nav-quick-links">
+                    <p>Related Links:</p>
+                    <ul>
+                                                    <li>
+                                                                        <a href="https://services.northwestern.edu/TDClient/30/Portal/KB/?CategoryID=2">How-To Guides</a>
+                                                                </li>
+                                                    <li>
+                                                                        <a href="https://northwesternuniversity.statuspage.io/">IT Service Status</a>
+                                                                </li>
+                                            </ul>
+                </li>
+                    </ul>
+                    </li>
+                                    <li id="menu2">
+                                         <a href="/services/index.html">Explore Services <span class="dropdown-arrow"></span></a>
+                                                                                                    <ul aria-labelledby="menu2" class="dropdown-three-column">
+                    <li class="nav-links">
+                <ul>
+                    <li class="home"><a href="/services/index.html">Explore Services Overview</a>
+                    	                    		                    	                    </li>
+                                                                <li>
+                                                                                            <a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=4">Administrative and Business</a>
+            <span>CATracks system, NUPlans software, reporting via BI System, and more</span>
+                                                        </li>
+                                            <li>
+                                                                                            <a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=13">Communication and Collaboration</a>
+            <span>Email, file-sharing, document storage, telephone services, and mass communication tools</span>
+                                                        </li>
+                                            <li>
+                                                                                            <a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=18">Desktop and Mobile Computing</a>
+            <span>Desktop and mobile device support, software delivery, patching, and other workstation-related support</span>
+                                                        </li>
+                                            <li>
+                                                                                            <a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=21">Infrastructure</a>
+            <span>Enterprise-level hardware, software, systems, and network infrastructure </span>
+                                                        </li>
+                                            <li>
+                                                                                            <a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=31">Professional Services</a>
+            <span>Consultation services including workflow design, vulnerability assessment, application development, and more</span>
+                                                        </li>
+                                            <li>
+                                                                                            <a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=38">Research Technologies and Support</a>
+            <span>Specialized research storage and computation, Quest (HPC), visualization, and lab-management systems</span>
+                                                        </li>
+                                            <li>
+                                                                                            <a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=46">Information Security</a>
+            <span>Infrastructure and services that provide security, data integrity, and compliance</span>
+                                                        </li>
+                                            <li>
+                                                                                            <a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=50">Teaching and Learning</a>
+            <span>Canvas Learning Management System, instructional design, and other instructional tools and resources </span>
+                                                        </li>
+                                            <li>
+                                                                                            <a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=55">Software and Applications</a>
+            <span>Campus-licensed software options for purchase or download </span>
+                                                        </li>
+                                            <li>
+                                                                                            <a href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceCatalog?CategoryID=64">Distributed IT</a>
+            <span>Services provided by School and Department IT units</span>
+                                                        </li>
+                                    </ul>
+            </li>
+            
+                                </ul>
+                    </li>
+                                    <li id="menu3">
+                                         <a href="/ai/index.html">Access AI <span class="dropdown-arrow"></span></a>
+                                                                                                    <ul aria-labelledby="menu3" class="dropdown-quick-links">
+                    <li class="nav-links">
+                <ul>
+                    <li class="home"><a href="/ai/index.html">Access AI Overview</a>
+                    	                    		                    	                    </li>
+                                                                <li>
+                                                                                             <a href="/ai/security-and-data-governance/index.html">Security and Data Governance </a>
+            <span>Understanding what to look for when adopting AI is key to ensuring the intended use is met while protecting University data.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/ai/tools-and-use-guidance/index.html">Tools and Use Guidance</a>
+            <span>Get familiar with what AI tools are available and how to use them to support drafting content, summarizing meetings, developing code, analyzing data, and more. </span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/ai/working-with-ai/index.html">Working with AI</a>
+            <span>Access to AI that simplifies daily tasks, enhances communication, and boosts overall productivity.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/ai/teaching-with-ai/index.html">Teaching with AI</a>
+            <span>Find tools and strategies that help faculty design courses, streamline grading, and enhance student engagement.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/ai/learning-with-ai/index.html">Learning with AI</a>
+            <span>Explore resources that support studying, writing, organizing work, and building new academic skills.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/ai/research-with-ai/index.html">Researching with AI</a>
+            <span>Identify advanced tools that accelerate discovery, support data analysis, and strengthen scholarly work.</span>
+                                                        </li>
+                                    </ul>
+            </li>
+            
+                                        <li aria-label="navigation submenu quick links" class="nav-quick-links">
+                    <p>Related Links:</p>
+                    <ul>
+                                                    <li>
+                                                                        <a href="https://www.northwestern.edu/provost/about/committees/generative-ai-advisory-committee/">Generative AI Advisory Committee: Office of the Provost</a>
+                                                                </li>
+                                                    <li>
+                                                                        <a href="https://www.nnci.northwestern.edu">Northwestern Network for Collaborative Intelligence</a>
+                                                                </li>
+                                                    <li>
+                                                                        <a href="https://www.nnci.northwestern.edu/overview/institutes-and-centers.html">University Institutes and Centers </a>
+                                                                </li>
+                                            </ul>
+                </li>
+                    </ul>
+                    </li>
+                                    <li id="menu4">
+                                         <a href="/security/index.html">Stay Secure <span class="dropdown-arrow"></span></a>
+                                                                                                    <ul aria-labelledby="menu4" class="dropdown-quick-links">
+                    <li class="nav-links">
+                <ul>
+                    <li class="home"><a href="/security/index.html">Stay Secure Overview</a>
+                    	                    		                    	                    </li>
+                                                                <li>
+                                                                                             <a href="/security/phishing/index.html">Avoiding Phishing </a>
+            <span>Find clues for how to identify a phishing attempt. </span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/security/protect-information/index.html">Protect Your Information and Identity</a>
+            <span>Find tips and best practices for securing your identity, devices, work environment, and more.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/security/protect-research/index.html">Protect Your Research</a>
+            <span>Find security practices for protecting research data and information. </span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/security/community-resources/index.html">Resources for the IT Community</a>
+            <span>Find security services and information for IT teams at Northwestern.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/security/assistance/index.html">Report an Information Security Incident</a>
+            <span>Get help from the Information Security Office. </span>
+                                                        </li>
+                                    </ul>
+            </li>
+            
+                                        <li aria-label="navigation submenu quick links" class="nav-quick-links">
+                    <p>Related Links:</p>
+                    <ul>
+                                                    <li>
+                                                                        <a href="/security/phishing/phishing-attempts-at-northwestern.html">Phishing Attempts at Northwestern</a>
+                                                                </li>
+                                            </ul>
+                </li>
+                    </ul>
+                    </li>
+                                    <li id="menu5">
+                                         <a href="/departments/index.html">View Departments <span class="dropdown-arrow"></span></a>
+                                                                                                    <ul aria-labelledby="menu5" class="dropdown-quick-links">
+                    <li class="nav-links">
+                <ul>
+                    <li class="home"><a href="/departments/index.html">View Departments Overview</a>
+                    	                    		                    	                    </li>
+                                                                <li>
+                                                                                             <a href="/departments/ovp-information-technology/index.html">Office of the Vice President for Information Technology and Chief Information Officer </a>
+            <span>The office provides leadership for the ongoing development of an innovative, robust, and secure information technology environment.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/departments/af/index.html">Administration and Finance</a>
+            <span>We provide Northwestern IT staff with administrative, financial planning, contractual, and human resources support.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/departments/as/index.html">Administrative Systems</a>
+            <span>We offer a holistic approach to administrative systems delivery and support and allow for focused resources on project management, business analysis, reporting activities, and other common activities across these systems.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/departments/cyberinfrastructure/index.html">Cyberinfrastructure</a>
+            <span>We provide and support an infrastructure that meets the needs of the University's teaching, research, and administrative community.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/departments/information-security/index.html">Information Security Office</a>
+            <span>We protect the University's informational assets and provide essential resources to help our community keep institutional and personal information secure.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/departments/it-services-support/index.html">IT Services and Support</a>
+            <span>We are a customer-focused organization that works across the University to support students, faculty, and staff in their use of technology.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/departments/icair/index.html">International Center for Advanced Internet Research</a>
+            <span>We provide a focal point for leading-edge Internet research, innovation, and pre-production deployment.</span>
+                                                        </li>
+                                    </ul>
+            </li>
+            
+                                        <li aria-label="navigation submenu quick links" class="nav-quick-links">
+                    <p>Related Links:</p>
+                    <ul>
+                                                    <li>
+                                                                        <a href="/departments/it-services-support/it-communications/index.html">IT Communications</a>
+                                                                </li>
+                                                    <li>
+                                                                        <a href="https://mti.it.northwestern.edu/">Media and Technology Innovation</a>
+                                                                </li>
+                                                    <li>
+                                                                        <a href="/departments/as/opm/index.html">Office of Portfolio Management</a>
+                                                                </li>
+                                                    <li>
+                                                                        <a href="/departments/it-services-support/research/index.html">Research Computing and Data Services</a>
+                                                                </li>
+                                                    <li>
+                                                                        <a href="/departments/it-services-support/teaching/index.html">Teaching and Learning Technologies</a>
+                                                                </li>
+                                            </ul>
+                </li>
+                    </ul>
+                    </li>
+                                    <li id="menu6">
+                                         <a href="/about/index.html">About IT <span class="dropdown-arrow"></span></a>
+                                                                                                    <ul aria-labelledby="menu6" class="dropdown-two-column">
+                    <li class="nav-links">
+                <ul>
+                    <li class="home"><a href="/about/index.html">About IT Overview</a>
+                    	                    		                    	                    </li>
+                                                                <li>
+                                                                                             <a href="/about/organization/index.html">Organization and Leadership</a>
+            <span>Learn more about the Northwestern IT organization, governance committees, and impact across Northwestern.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/about/policies/index.html">Policies, Standards, and Guidelines</a>
+            <span>Find policies related to technology usage, data storage, network access, electronic communications, and more.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/about/it-projects/index.html">Projects and Initiatives</a>
+            <span>Learn about Northwestern IT projects and initiatives. </span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/about/news-events/index.html">News and Events</a>
+            <span>Find technology-related news and announcements.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/about/employment/index.html">Employment Opportunities</a>
+            <span>Review open positions in Northwestern IT for staff and students. </span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/about/inside-it/index.html">Inside IT (Internal)</a>
+            <span>Access news, information, tools, and resources for current Northwestern IT staff.</span>
+                                                        </li>
+                                            <li>
+                                                                                             <a href="/about/community-collaboration/index.html">Community Collaboration</a>
+            <span>Learn about our commitment to driving institutional success through a culture of collaboration and service excellence. </span>
+                                                        </li>
+                                    </ul>
+            </li>
+            
+                                </ul>
+                    </li>
+                <li id="it-search-button"><a href="#"> <span class="hide-label">Click to open search menu</span></a></li>
+        </ul>
+            <div id="it-search-dropdown">
+            <div class="wrapper">
+                <div class="contain-1120">     
+                    <div class="it-search-form">
+                        <form action="https://search.northwestern.edu/it3/" method="get" role="search">
+                            <label class="hide-label" for="q-desktop">Search IT sites</label> 
+                            <input id="q-desktop" name="q" placeholder="Find a topic, service or answers..." type="text"/> 
+                            <button type="submit">Search</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+
+     <main id="main-content"> 
+        <div id="mobile-status"><div class="heading">IT Service Status</div><statuspage-widget src="https://northwesternuniversity.statuspage.io"/></div>
+        <div id="standard-wrap">
+            <nav aria-label="section navigation menu" id="left-nav" tabindex="-1"><div class="section-name"><a href="../../../../index.html">View Departments</a></div><ul><li><a href="../../../../ovp-information-technology/index.html">Office of the Vice President for Information Technology and Chief Information Officer </a></li><li><a href="../../../../af/index.html">Administration and Finance</a></li><li><a href="../../../../as/index.html">Administrative Systems</a></li><li><a href="../../../../cyberinfrastructure/index.html">Cyberinfrastructure</a></li><li><a href="../../../../information-security/index.html">Information Security Office</a></li><li><a class="active" href="../../../index.html">IT Services and Support</a><ul><li><a href="../../../it-communications/index.html">IT Communications</a></li><li><a class="active" href="../../index.html">Research Computing and Data Services</a><ul><li><a href="../../data-storage/index.html">Data Management and Storage</a></li><li><a href="../../training-and-consultation/index.html">Training and Consultation</a></li><li><a href="../../research-events.html">Research Events</a></li><li><a href="../../rcds-case-studies/index.html">Case Studies</a></li><li><a href="../../data-science-statistics-visualization/index.html">Data Science, Statistics, and Visualization</a></li><li><a href="../../staff/index.html">Meet Our Team</a></li><li><a class="active" href="../index.html">Computing Services</a><ul><li><a class="active" href="index.html">Quest High-Performance Computing Cluster</a><ul class="open"><li><a href="data-security-guidance.html">Quest Data Security Guidance</a></li><li><a class="active" href="specs.html">Quest Technical Specifications </a></li><li><a href="quest-analytics-nodes.html">Quest Analytics Nodes</a></li><li><a href="genomics-compute-cluster.html">Genomics Compute Cluster</a></li><li><a href="procedural-guidelines.html">Quest Policies and Guidelines</a></li><li><a href="quest-access-and-allocations.html">Quest Access and Resources</a></li><li><a href="acknowledgement-of-use.html">Acknowledgement of Use</a></li></ul></li><li><a href="../interactive-computing/index.html">Interactive Computing Resources</a></li><li><a href="../computing-support-resources/index.html">Computing Support Resources</a></li><li><a href="../batch-computing/index.html">High-Performance and Batch Computing</a></li><li><a href="../gpu/index.html">GPU Computing</a></li><li><a href="../additional-computing-resources/index.html">Additional Computing Resources</a></li></ul></li></ul></li><li><a href="../../../teaching/index.html">Teaching and Learning Technologies</a></li></ul></li><li><a href="../../../../icair/index.html">International Center for Advanced Internet Research</a></li></ul> </nav>
+            <div class="content" tabindex="-1">
+                <ul id="breadcrumbs"><li><a href="../../../../../index.html">Home</a></li><li><a href="../../../../index.html">View Departments</a></li><li><a href="../../../index.html">IT Services and Support</a></li><li><a href="../../index.html">Research Computing and Data Services</a></li><li><a href="../index.html">Computing Services</a></li><li><a href="index.html">Quest High-Performance Computing Cluster</a></li><li class="active">Quest Technical Specifications </li></ul> 
+                <h1>Quest Technical Specifications </h1><p>Northwestern has regularly invested in<a href="index.html"> Quest</a>&#160;to refresh and expand computing resources to meet the needs of the research community. This includes hundreds of nodes that are available free of charge as <a href="quest-access-and-allocations.html#general-access">General Access resources</a>, as well as Priority Access,&#160;<a href="../../../../../secure/purchasing-resources.html">purchased resources</a>.</p>
+<h2>Quest Storage</h2>
+<p>Quest has an IBM GPFS parallel file system with ESS storage totaling approximately 12 PB. All users have access to a small (80 GB) home directory. Users may also request storage resources to gain access to a project directory optimized for high-performance computing operations.</p>
+<p>Users with access to computing resources on Quest will automatically be allocated 5 TB of scratch space that can be used for temporary file storage. Backed by a 500 TB flash disk drive, scratch space provides very high performance for file operations. It is specific to the user&#8217;s NetID and cannot be expanded beyond 5 TB. Files that haven&#8217;t been modified within 30 days are automatically removed from the scratch space.</p>
+<p>Users who are only utilizing Quest Analytics and no other compute resources will need to submit a ticket to <a href="mailto:quest-help@northwestern.edu">quest-help@northwestern.edu</a> requesting scratch space.</p>
+<h2>Compute Resources</h2>
+<p>Quest comprises 7 login nodes and over 1200 compute nodes, with a total of over 80,000 cores. These nodes include over 91 GPU nodes and 22 high-memory nodes. Both the login and compute nodes are running the Red Hat Enterprise Linux 8.10 operating system.</p>
+<h3>Regular Compute Nodes</h3>
+<p>Quest currently consists of the following architectures:</p>
+<p><strong>Quest 13 - Intel Emerald Rapids</strong></p>
+<ul>
+<li>Number of Nodes: 140 nodes with 17920 cores total, 128 cores per node</li>
+<li>Processor: Intel(R) Xeon(R) Platinum 8592+ CPU @ 1.9GHz</li>
+<li>Memory: Per node (per core) 512 GB (4 GB), Type: DDR5 5600 MHz</li>
+<li>Interconnect: Infiniband HDR</li>
+<li>Expected retirement: Spring 2030</li>
+</ul>
+<p><strong>Quest 12 - Intel Ice Lake</strong></p>
+<ul>
+<li>Number of Nodes: 214 nodes with 13696 cores total, 64 cores per node</li>
+<li>Processor: Intel(R) Xeon(R) Gold 6338 CPU @ 2.0GHz</li>
+<li>Memory: Per node (per core) 256 GB (4 GB), Type: DDR4 3200 MHz</li>
+<li>Interconnect: Infiniband HDR</li>
+<li>Expected retirement: Fall 2028</li>
+</ul>
+<p><strong>Quest 11 - Intel Ice Lake</strong></p>
+<ul>
+<li>Number of Nodes: 209 nodes with 13376 cores total, 64 cores per node</li>
+<li>Processor: Intel(R) Xeon(R) Gold 6338 CPU @ 2.0GHz</li>
+<li>Memory: Per node (per core) 256 GB (4 GB), Type: DDR4 3200 MHz</li>
+<li>Interconnect: Infiniband HDR Compatible</li>
+<li>Expected retirement: Fall 2027</li>
+</ul>
+<p><strong>Quest 10 - Intel Cascade Lake</strong></p>
+<ul>
+<li>Number of Nodes: 555 nodes with 28860 cores total, 52 cores per node</li>
+<li>Processor: Intel(R) Xeon(R) Gold 6230 CPU @ 2.10GHz</li>
+<li>Memory: Per node (per core) 192 GB (3.7 GB), Type: DDR4 2933MHz</li>
+<li>Interconnect: Infiniband EDR</li>
+<li>Expected retirement: Fall 2026</li>
+</ul>
+<h3>GPU Nodes</h3>
+<p>Quest has a total of 269 GPU cards on 91 <a href="../gpu/index.html">GPU nodes</a> across General Access and Priority Access allocations. GPU resources available to General Access allocations:</p>
+<p><strong>Quest 13 - Intel Emerald Rapids with NVIDIA H100 GPUs</strong></p>
+<ul>
+<li>Number of Nodes: 24 nodes with 1536 cores total, 64 cores per node</li>
+<li>Processor: Intel(R) Xeon(R) Platinum 8562Y+ CPU @ 2.8 GHz (Emerald Rapids)</li>
+<li>Memory: Per node (Per Core) 1 TB (16 GB), Type: DDR5 5600 MHz</li>
+<li>GPU cards per node: 4 x 80 GB NVIDIA H100 (Connected with SXM5 and HBM3)</li>
+<li>Interconnect: Infiniband NDR</li>
+<li>Expected retirement: Fall 2029</li>
+</ul>
+<p><strong>Quest 12 - Intel Ice Lake with NVIDIA A100 GPUs</strong></p>
+<ul>
+<li>Number of Nodes: 18 nodes with 1152 cores total, 64 cores per node</li>
+<li>Processor: Intel(R) Xeon(R) Gold 6338 CPU @ 2.0 GHz (Ice Lake)</li>
+<li>Memory: Per node (Per Core) 512 GB (8 GB), Type: DDR4 3200 MHz</li>
+<li>GPU cards per node: 4 x 80 GB NVIDIA A100 (Connected with SXM4 and HBM2)</li>
+<li>Interconnect: Infiniband HDR</li>
+<li>Expected retirement: Fall 2028</li>
+</ul>
+<p><strong>Quest 10 - Intel Cascade Lake with NVIDIA A100 GPUs</strong></p>
+<ul>
+<li>Number of Nodes: 16 nodes with 832 cores total, 52 cores per node&#8239;</li>
+<li>Processor: Intel(R) Xeon(R) Gold 6230 CPU @ 2.10 GHz&#8239; (Cascade Lake)</li>
+<li>Memory: Per node (Per Core) 192 GB (3.7 GB), Type: DDR4 2933 MHz</li>
+<li>GPU cards per node: 2 x 40 GB NVIDIA A100 (Connected with PCIe)</li>
+<li>Expected retirement: Fall 2026</li>
+</ul>
+<p>Quest GPU resources can support multiple versions of the modern CUDA Toolkit. More information is available&#160;in the&#160;<a href="https://rcdsdocs.it.northwestern.edu/systems/quest/user-guide/gpu/gpu.html">Quest GPU documentation</a>.&#160;</p>
+<h3>High-Memory Nodes</h3>
+<p>Quest has 4 General Access nodes, each with 52 cores and 1.5 TB memory. For more information on how to run jobs on a high-memory node, see <a href="https://rcdsdocs.it.northwestern.edu/systems/quest/user-guide/slurm/slurm.html#partitions">Quest Partitions/Queues</a>. High-memory nodes can be <a href="index.html#dedicated-access">purchased&#160;for Priority Access</a> on Quest.</p>
+            </div>
+        </div>
+     </main> 
+ 
+
+	<aside class="info-box-wrap">
+		<div class="info-box">
+			<a aria-label="Expand information box" class="header" href="#">Request Help</a>
+			<div aria-hidden="true" class="info-toggle" style="display: none;">
+				<div class="info-message">
+				    <h2>IT Service Desk</h2>
+											<p>Available by phone and email from 8 a.m. to 6 p.m. (CDT), Monday to Friday. University Library Walk-In location open Monday to Thursday, from 10 a.m. to 4 p.m. (CDT).</p>
+										<ul>
+					    <li class="phone">847-491-4357 (1-HELP)</li>
+					    					    <li class="email"><a href="mailto:consultant@northwestern.edu">consultant@northwestern.edu</a></li>
+					    <li class="address">University Library<br/>
+1970 Campus Drive<br/>
+First Floor, 1704</li>
+					</ul>
+				</div>
+			</div>
+		</div>
+		<a aria-label="Close information box" class="header hide-text" href="#">Close</a>
+	</aside>
+
+
+    
+    <footer>
+        <div class="contain-1120">
+            <a href="https://www.northwestern.edu">
+                <div class="footer-logo"><span class="hide-text">Northwestern University</span></div>
+            </a>
+            <div class="footer-wrap">
+ 
+
+<div class="footer-content contact"><h2>Information Technology</h2><div class="address"><div class="icon"><span>Address</span></div><div class="text"><p>1800 Sherman Avenue<br/>Evanston, IL 60201</p></div></div><div class="phone"><div class="icon"><span>Phone number</span></div><div class="text"><p>847-491-4357 (1-HELP)</p></div></div><div class="email"><div class="icon"><span>Email address</span></div><div class="text"><p><a href="mailto:consultant@northwestern.edu">consultant@northwestern.edu</a></p></div></div></div><div class="footer-content connect"><h2>Social Media</h2><a class="social instagram" href="https://www.instagram.com/northwestern_it">Instagram</a><a class="social twitter" href="https://twitter.com/Northwestern_IT">Twitter</a><a class="social youtube" href="https://www.youtube.com/channel/UC0yn-1BDJ65fsXcFlBkaxpA">YouTube</a></div>
+
+                <div class="footer-content resources jos" data-jos_animation="fade-up">
+<h2>Northwestern Resources</h2>
+<ul>
+<li><a href="https://www.northwestern.edu/accessibility/report/">Accessibility</a></li>
+<li><a href="https://www.northwestern.edu/facilities/building-campus-access/building-access/">Building Access</a></li>
+<li><a href="https://www.northwestern.edu/emergency/">Campus Emergency Information</a></li>
+<li><a href="https://hr.northwestern.edu/careers/">Careers</a></li>
+<li><a href="https://www.northwestern.edu/contact.html">Contact Northwestern University</a></li>
+<li><a href="https://www.northwestern.edu/privacy/">Privacy Statement</a></li>
+<li><a href="https://www.northwestern.edu/report/">Report a Concern</a></li>
+<li><a href="https://policies.northwestern.edu/">University Policies</a></li>
+</ul>
+</div>
+            </div>
+        </div>
+        <div id="footer-bottom">
+            <div class="contain-1120">
+                <span class="copyright">© 2026 Northwestern University</span>
+<ul>
+<li><a href="https://www.facebook.com/NorthwesternU"> <span class="social facebook">Facebook</span> </a></li>
+<li><a href="https://www.twitter.com/northwesternu"> <span class="social twitter">Twitter</span> </a></li>
+<li><a href="https://www.instagram.com/northwesternu"> <span class="social instagram">Instagram</span> </a></li>
+<li><a href="https://www.youtube.com/user/NorthwesternU"> <span class="social youtube">YouTube</span> </a></li>
+<li><a href="https://www.tiktok.com/@northwestern.u"> <span class="social tiktok">TikTok</span> </a></li>
+<li><a href="https://www.linkedin.com/school/northwestern-university/"> <span class="social linkedin">LinkedIn</span> </a></li>
+</ul>
+<span class="right"><a href="https://www.northwestern.edu/disclaimer.html">Disclaimer</a>
+</span>
+            </div>
+        </div>
+    </footer>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.4.1/jquery.min.js"></script>
+<script src="https://common.northwestern.edu/dept/3.0/js/scripts.js"></script> 
+<script src="https://common.northwestern.edu/dept/3.0/js/swiper.min.js"></script> 
+<script src="../../../../../js/it-scripts.js"></script> 
+<script src="https://cdnjs.cloudflare.com/polyfill/v2/polyfill.js"></script>
+<script src="https://unpkg.com/@webcomponents/webcomponentsjs@2.1.3/webcomponents-bundle.js"></script>
+<script src="../../../../../js/status-widget.js"></script>
+    
+     <!--Siteimprove Usability code snippet-->
+<script>
+/*<![CDATA[*/
+(function() {
+ var sz = document.createElement('script'); sz.type = 'text/javascript'; sz.async = true;
+ sz.src = '//siteimproveanalytics.com/js/siteanalyze_55710.js';
+ var s = document.getElementsByTagName('script')[0]; s.parentNode.insertBefore(sz, s);
+})();
+/*]]>*/
+</script>
+</body>
+</html><script id="f5_cspm">(function(){var f5_cspm={f5_p:'GEIPMIJKNEIBABAKALOHDIEHKFLLGAJDJFKMJJLKPKACNMMIJJCENMFDABOPDPJKEECBMPHCAACIOEAAKIHAAGEFAAKGLJKFCMIJHEBHCLJPHFAMPBNPBMAEBKCEKMPH',setCharAt:function(str,index,chr){if(index>str.length-1)return str;return str.substr(0,index)+chr+str.substr(index+1);},get_byte:function(str,i){var s=(i/16)|0;i=(i&15);s=s*32;return((str.charCodeAt(i+16+s)-65)<<4)|(str.charCodeAt(i+s)-65);},set_byte:function(str,i,b){var s=(i/16)|0;i=(i&15);s=s*32;str=f5_cspm.setCharAt(str,(i+16+s),String.fromCharCode((b>>4)+65));str=f5_cspm.setCharAt(str,(i+s),String.fromCharCode((b&15)+65));return str;},set_latency:function(str,latency){latency=latency&0xffff;str=f5_cspm.set_byte(str,40,(latency>>8));str=f5_cspm.set_byte(str,41,(latency&0xff));str=f5_cspm.set_byte(str,35,2);return str;},wait_perf_data:function(){try{var wp=window.performance.timing;if(wp.loadEventEnd>0){var res=wp.loadEventEnd-wp.navigationStart;if(res<60001){var cookie_val=f5_cspm.set_latency(f5_cspm.f5_p,res);window.document.cookie='f5avr0747108135aaaaaaaaaaaaaaaa_cspm_='+encodeURIComponent(cookie_val)+';path=/;'+'';}
+return;}}
+catch(err){return;}
+setTimeout(f5_cspm.wait_perf_data,100);return;},go:function(){var chunk=window.document.cookie.split(/\s*;\s*/);for(var i=0;i<chunk.length;++i){var pair=chunk[i].split(/\s*=\s*/);if(pair[0]=='f5_cspm'&&pair[1]=='1234')
+{var d=new Date();d.setTime(d.getTime()-1000);window.document.cookie='f5_cspm=;expires='+d.toUTCString()+';path=/;'+';';setTimeout(f5_cspm.wait_perf_data,100);}}}}
+f5_cspm.go();}());</script>

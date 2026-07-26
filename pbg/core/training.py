@@ -12,6 +12,7 @@ import os
 import platform
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -1282,7 +1283,12 @@ def _build_iteration_data(
         )
 
     def sample_normal_rollout() -> Any:
-        with torch.autocast(
+        timing = (
+            nullcontext()
+            if execution_metrics is None
+            else execution_metrics.model_timing_scope("rollout")
+        )
+        with timing, torch.autocast(
             device_type=device.type, enabled=amp_enabled, dtype=amp_dtype
         ):
             return sample_trees_sequential(
@@ -1294,7 +1300,12 @@ def _build_iteration_data(
             )
 
     def sample_rb_rollout() -> Any:
-        with torch.autocast(
+        timing = (
+            nullcontext()
+            if execution_metrics is None
+            else execution_metrics.model_timing_scope("rollout")
+        )
+        with timing, torch.autocast(
             device_type=device.type, enabled=amp_enabled, dtype=amp_dtype
         ):
             return sample_trees(
@@ -1305,6 +1316,17 @@ def _build_iteration_data(
                 branching_attempt=branching_attempt,
                 branching_diagnostic_limits=branching_diagnostic_limits,
             )
+
+    def build_timed_targets(rows: int, function: Any) -> Any:
+        timing = (
+            nullcontext()
+            if execution_metrics is None
+            else execution_metrics.time_cuda_work(
+                "target_total", rows=int(rows)
+            )
+        )
+        with timing:
+            return function()
 
     with torch.no_grad():
         if normal:
@@ -1356,8 +1378,11 @@ def _build_iteration_data(
                 "backward",
                 device,
                 profile,
-                lambda: build_normal_targets(
-                    rollout, partitions, cfg.loss.lam
+                lambda: build_timed_targets(
+                    sampled_decisions,
+                    lambda: build_normal_targets(
+                        rollout, partitions, cfg.loss.lam
+                    ),
                 ),
             )
             del rollout
@@ -1405,6 +1430,7 @@ def _build_iteration_data(
             else:
                 sample = rb_sample
             sampled_nodes = sample.node_count
+            sampled_decisions = int(sample.decision_inputs.node_ids.numel())
             sampled_offspring_mean = sampled_offspring_max = None
             if profile:
                 sampled_offspring_mean = float(
@@ -1447,12 +1473,15 @@ def _build_iteration_data(
                 "backward",
                 device,
                 profile,
-                lambda: build_sequential_rb_targets(
-                    rollout,
-                    partitions,
-                    completion,
-                    cfg.loss.lam,
-                    leaf_microbatch_rows=completion_rows,
+                lambda: build_timed_targets(
+                    sampled_decisions,
+                    lambda: build_sequential_rb_targets(
+                        rollout,
+                        partitions,
+                        completion,
+                        cfg.loss.lam,
+                        leaf_microbatch_rows=completion_rows,
+                    ),
                 ),
             )
             del rollout, completion
@@ -1489,6 +1518,9 @@ def _build_iteration_data(
             if isinstance(rb_sample, ProbeRollout):
                 raise RuntimeError("branched rollout cannot be an opponent probe")
             sampled_nodes = rb_sample.node_count
+            sampled_decisions = int(
+                rb_sample.decision_inputs.node_ids.numel()
+            )
             if branching_memory_controller is not None:
                 branching_memory_controller.admit(
                     "targets",
@@ -1536,13 +1568,16 @@ def _build_iteration_data(
                 "backward",
                 device,
                 profile,
-                lambda: build_branched_rb_targets(
-                    rollout,
-                    partitions,
-                    completion,
-                    cfg.loss.lam,
-                    leaf_microbatch_rows=completion_rows,
-                    calibration_metrics=profile_metrics,
+                lambda: build_timed_targets(
+                    sampled_decisions,
+                    lambda: build_branched_rb_targets(
+                        rollout,
+                        partitions,
+                        completion,
+                        cfg.loss.lam,
+                        leaf_microbatch_rows=completion_rows,
+                        calibration_metrics=profile_metrics,
+                    ),
                 ),
             )
             del rollout, completion
@@ -1802,12 +1837,21 @@ def _seal_sequential_rollout_storage(
         def complete_leaf_rows(
             columns: Mapping[str, Tensor], *, rows: Tensor
         ) -> BatchedCompletionStats:
-            result = complete_sealed(
-                backend,
-                columns,
-                rows=rows,
-                n_samples=int(cfg.completion.n_samples),
-            ).for_learning()
+            execution_metrics = getattr(backend, "execution_metrics", None)
+            timing = (
+                nullcontext()
+                if execution_metrics is None
+                else execution_metrics.time_cuda_work(
+                    "completion", rows=int(rows.numel())
+                )
+            )
+            with timing:
+                result = complete_sealed(
+                    backend,
+                    columns,
+                    rows=rows,
+                    n_samples=int(cfg.completion.n_samples),
+                ).for_learning()
             scaled = _scale_completion_utility(result, cfg)
             quality_parts.append(
                 (
@@ -2009,12 +2053,21 @@ def _seal_branched_rollout_storage(
     def complete_leaf_rows(
         columns: Mapping[str, Tensor], *, rows: Tensor
     ) -> BatchedCompletionStats:
-        result = complete_sealed(
-            backend,
-            columns,
-            rows=rows,
-            n_samples=int(cfg.completion.n_samples),
-        ).for_learning()
+        execution_metrics = getattr(backend, "execution_metrics", None)
+        timing = (
+            nullcontext()
+            if execution_metrics is None
+            else execution_metrics.time_cuda_work(
+                "completion", rows=int(rows.numel())
+            )
+        )
+        with timing:
+            result = complete_sealed(
+                backend,
+                columns,
+                rows=rows,
+                n_samples=int(cfg.completion.n_samples),
+            ).for_learning()
         scaled = _scale_completion_utility(result, cfg)
         quality_parts.append(
             (
@@ -2667,13 +2720,19 @@ def _one_iteration(
         update_steps = cfg.training.ppo_epochs * math.ceil(
             decisions / cfg.training.minibatch_size
         )
-    update = learner(
-        storage,
-        torch_gen,
-        optimizer_steps=update_steps,
-        iteration=iteration,
-        grad_clip=cfg.training.grad_clip,
+    timing = (
+        nullcontext()
+        if execution_metrics is None
+        else execution_metrics.model_timing_scope("learner")
     )
+    with timing:
+        update = learner(
+            storage,
+            torch_gen,
+            optimizer_steps=update_steps,
+            iteration=iteration,
+            grad_clip=cfg.training.grad_clip,
+        )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     optimization_seconds = time.perf_counter() - optimization_started

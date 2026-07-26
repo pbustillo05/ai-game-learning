@@ -1,0 +1,986 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" data-theme="light">
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <meta property="article:modified_time" content="2025-07-03T15:39:25+00:00" />
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-8VW6NPDBRF"></script>
+    <script>
+        window.dataLayer = window.dataLayer || [];
+        function gtag(){dataLayer.push(arguments);}
+        gtag('js', new Date());
+        gtag('config', 'G-8VW6NPDBRF');
+    </script>
+    
+    <title>GPUs in Python &#8212; Northwestern IT
+Research Computing and Data Services
+Northwestern University</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "light";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/sphinx-book-theme.css?v=a3416100" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/tabs.css?v=a5c4661c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/sphinx-design.min.css?v=95c83b7e" />
+    <link rel="stylesheet" type="text/css" href="../../_static/sphinxcontrib-images/LightBox2/lightbox2/dist/css/lightbox.min.css?v=6e7d0de0" />
+    <link rel="stylesheet" type="text/css" href="../../_static/sphinxcontrib-images/LightBox2/lightbox2-customize/pointer.css?v=c97663ff" />
+    <link rel="stylesheet" type="text/css" href="../../_static/css/nuit-rcds-docs.css?v=80855fb1" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../_static/documentation_options.js?v=9eb32ce0"></script>
+    <script src="../../_static/doctools.js?v=9bcbadda"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=35a8b989"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script src="../../_static/scripts/sphinx-book-theme.js?v=887ef09a"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="../../_static/design-tabs.js?v=f930bc37"></script>
+    <script src="../../_static/sphinxcontrib-images/LightBox2/lightbox2/dist/js/lightbox-plus-jquery.min.js?v=f0ca4bb6"></script>
+    <script src="../../_static/sphinxcontrib-images/LightBox2/lightbox2-customize/jquery-noconflict.js?v=12818e64"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Using Hugging Face on Quest" href="python-llm-huggingface.html" />
+    <link rel="prev" title="Python Selenium on Quest" href="python-selenium-quest.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+    <meta name="docbuild:last-update" content="2025-07-03"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="light">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+    
+    <img src="../../_static/rcds_logo.png" class="logo__image only-light" alt="Northwestern IT
+Research Computing and Data Services
+Northwestern University - Home"/>
+    <img src="../../_static/rcds_logo.png" class="logo__image only-dark pst-js-only" alt="Northwestern IT
+Research Computing and Data Services
+Northwestern University - Home"/>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../start/quest/quest-intro.html">Introduction to Quest</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../start/gcc/gcc-start.html">Genomics Compute Cluster Quick Start</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../start/quest/quest-tips.html">HPC Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../start/getting-help.html">Getting Help</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">System Guides</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../systems/quest/quest.html">Quest Compute Cluster</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/" target="_blank">Quest Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/procedural-guidelines.html" target="_blank">Policies and Guidelines <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/quest/resources/quest-resource.html">Quest Resources</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../systems/quest/user-guide/quest-user-guide.html">User Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/user-guide/login/login-quest.html">Logging In</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/user-guide/filesystem/filesystem.html">File System</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/user-guide/data-transfer/data-transfer.html">Transferring Data</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/user-guide/modules/modules.html">Software Modules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/user-guide/slurm/slurm.html">Slurm Job Scheduler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/user-guide/gpu/gpu.html">GPUs</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../systems/quest/software/quest-software-list.html">Software</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/software/alphafold/alphafold-quest.html">AlphaFold</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/software/knitro/knitro-quest.html">Knitro</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/software/matlab/matlab-quest.html">MATLAB</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/software/python/python-quest.html">Python</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/software/r/r-quest.html">R/RStudio</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/software/vasp/vasp-quest.html">VASP</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/software/abaqus/abaqus.html">Abaqus</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../systems/quest/quest-analytics/analytics.html">Quest Analytics Nodes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/quest-analytics/using_analytics.html">Analytics Nodes Usage Tips</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/quest/ondemand/ondemand.html">Quest OnDemand</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/quest/gcc/using-gcc.html">Genomics Compute Cluster</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../systems/quest/specs/index.html">Technical Specifications</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/quest/specs.html" target="_blank">Quest Technical Specifications <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/quest/specs/release-notes.html">Maintenance and Update Notes</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../systems/rdss/rdss-index.html">Research Data Storage Service</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceDet?ID=96" target="_blank">Service Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/rdss/rdss-owners.html">Share Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/rdss/rdss-users.html">User Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/rdss/rdss-troubleshooting.html">Troubleshooting Guide</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../systems/globus/globus-index.html">Globus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/globus/globus-login.html">Log in</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/globus/globus-collection.html">Access Data Using Collections</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/globus/globus-transfer.html">Transfer Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/globus/globus-sharing.html">Share Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/globus/globus-troubleshooting.html">Troubleshoot</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../systems/sde/sde.html">Secure Data Enclave</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://services.northwestern.edu/TDClient/30/Portal/Requests/ServiceDet?ID=380" target="_blank">Service Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../systems/sde/sde-structure/sde-structure.html">SDE Structure</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/sde/sde-structure/sde-components.html">Environment Components</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/sde/sde-structure/roles.html">User Roles</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/sde/sde-structure/projects.html">Projects</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/sde/sde-structure/storage.html">Storage Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/sde/sde-structure/vms.html">Virtual Machines (VMs)</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../systems/sde/sde-user-guide/sde-user-guide.html">SDE User Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/sde/sde-user-guide/accessing-sde.html">Accessing the SDE</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/sde/sde-user-guide/cli-tools.html">Installing Command Line Tools</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/sde/sde-user-guide/using-vms.html">Using VMs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/sde/sde-user-guide/managing-buckets.html">Managing Storage Buckets</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/sde/sde-user-guide/ingress-egress.html">Importing and Exporting Data</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/sde/sde-user-guide/coderepo.html">Managing Software and Code</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../systems/sde/sde-user-guide/sde-glossary.html">Glossary</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/sde/acceptable-use.html">Acceptable Use Policy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/sde/cost.html">Estimating Costs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/sde/requesting-support.html">Service Requests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../systems/nightingale/nightingale.html">NU@Nightingale</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference external" href="https://www.it.northwestern.edu/departments/it-services-support/research/computing/additional-computing-resources/nightingale.html" target="_blank">Overview <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference external" href="https://www.ncsa.illinois.edu/resources-and-services/compute-resources/nightingale/" target="_blank">Compute and Storage Resources <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/nightingale/onboarding.html">Onboarding Process</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/nightingale/access-ngl.html">Using Nightingale</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/nightingale/data-transfer-ngl.html">Importing and Exporting Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/nightingale/offboarding.html">Offboarding Process</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/nightingale/support.html">Getting Help</a></li>
+<li class="toctree-l2"><a class="reference external" href="https://docs.ncsa.illinois.edu/systems/nightingale/en/latest/index.html" target="_blank">NCSA Nightingale User Guide <svg aria-hidden="true" height="1.0em" style="display: inline-block; vertical-align: middle; fill: currentColor;" version="1.1" viewbox="0 0 16 16" width="1.0em"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../systems/coldfront/index.html">ColdFront</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/coldfront/cf-project.html">Projects in ColdFront</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/coldfront/cf-resource.html">Resource Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/coldfront/cf-user.html">User Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../systems/coldfront/transition-to-coldfront.html">Transitioning to ColdFront</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Tutorials</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../software-management/software-management.html">Working on Quest</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../software-management/conda-mamba-quest/mamba-conda-quest.html">Mamba or Conda Virtual Environments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../software-management/git-quest/git-quest.html">Git on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../software-management/singularity/singularity-quest.html">Singularity on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../software-management/compiling-code/compiling-code-quest.html">Compiling Code on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../software-management/scaling-study/scaling-study.html">Scaling Studies on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="python-tutorials.html">Python</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="python-installation.html">Installing Python on Your Computer</a></li>
+<li class="toctree-l2"><a class="reference internal" href="python-selenium-quest.html">Python Selenium on Quest</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Using GPUs with Python</a></li>
+<li class="toctree-l2"><a class="reference internal" href="python-llm-huggingface.html">Using Hugging Face on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="python-llm-ollama.html">Using Ollama on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../r/r-tutorials.html">R</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../r/r-installation.html">Installing R/RStudio on Your Computer</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../r/git-with-r.html">Git with R</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../git/git-tutorials.html">Git/GitHub</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../git/workshop-materials.html">Downloading Workshop Materials</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../r/git-with-r.html">Git with R</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../software-management/git-quest/git-quest.html">Git on Quest</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../cloud/aws/aws-index.html">AWS</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../cloud/aws/create-amazon-s3-bucket.html">Creating an Amazon S3 bucket</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cloud/aws/s3-access-keys.html">Creating Amazon S3 Access Keys</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cloud/aws/archiving-data-amazon-S3.html">Archiving Data in Amazon S3 Glacier Deep Archive</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../cloud/azure/azure-index.html">Azure</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../cloud/azure/azure-basics.html">Getting Familiar with Azure</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cloud/azure/azure-openai.html">Using Azure AI and OpenAI Resources</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../ai/ai-tutorials.html">AI</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../ai/genai-coding.html">Coding with Generative AI Tools</a></li>
+<li class="toctree-l2"><a class="reference internal" href="python-llm-huggingface.html">Using Hugging Face on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="python-llm-ollama.html">Using Ollama on Quest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cloud/azure/azure-openai.html">Using Azure AI and OpenAI Resources</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../video-list.html">Video Tutorials</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Resource Guides</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../guides/bash/bash-guide.html">Command Line</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../guides/bash/command-line-start.html">Getting Started with the Command Line</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../guides/bash/bash-scripting.html">Bash Scripting</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../guides/python/python-guide.html">Python</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../guides/python/python-lang.html">Programming in Python</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../guides/python/pandas.html">Pandas</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../guides/python/python-deep-learning.html">Deep Learning Frameworks</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../guides/r/r-guide.html">R</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../guides/r/learn-r.html">Learning R</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../guides/r/ggplot2.html">ggplot2</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../guides/stats/stats-guides.html">Statistics</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../guides/stats/clustering.html">Clustering</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../guides/stats/linear-regression.html">Linear Regression</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../guides/other/other-guides.html">Additional Tools</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../guides/other/git.html">Git and GitHub</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../guides/other/gh-copilot.html">GitHub Copilot</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../guides/other/sql.html">SQL</a></li>
+</ul>
+</details></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>GPUs in Python</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installing-and-validating-gpu-aware-python-packages">Installing and Validating GPU Aware Python Packages</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#jax">Jax</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#installation">Installation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#validation">Validation</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorflow">Tensorflow</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Installation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Validation</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#pytorch">PyTorch</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id3">Installation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id4">Validation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#validate-pytorch-for-use-with-multiple-nodes-with-multiple-gpus">Validate PyTorch for use with Multiple Nodes with Multiple GPUs</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cupy">CUpy</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id5">Installation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id6">Validation</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#rapids">Rapids</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id7">Installation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id8">Validation</a></li>
+</ul>
+</li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="gpus-in-python">
+<span id="python-gpu"></span><h1>GPUs in Python<a class="headerlink" href="#gpus-in-python" title="Link to this heading">#</a></h1>
+<p>It is a common researcher use case to require the ability to utilize GPUs in your Python environment. This page covers some of the more common GPU implementations in Python.</p>
+<section id="installing-and-validating-gpu-aware-python-packages">
+<h2>Installing and Validating GPU Aware Python Packages<a class="headerlink" href="#installing-and-validating-gpu-aware-python-packages" title="Link to this heading">#</a></h2>
+<p>GPU resources require software designed to manage and take advantage of those resources.  Multiple frameworks exist for using GPUs with Python code:</p>
+<ul class="simple">
+<li><p>Jax</p></li>
+<li><p>Tensorflow</p></li>
+<li><p>PyTorch</p></li>
+<li><p>CUpy</p></li>
+<li><p>Rapids</p></li>
+</ul>
+<p>The sections below demonstrate how to use <a class="reference internal" href="../software-management/conda-mamba-quest/mamba-conda-quest.html#mamba-or-conda-virtual-environments"><span class="std std-ref">mamba</span></a> to create a virtual environment with the required GPU software.  Once the GPU software is installed, additional packages should also be installed as needed in the same environment.  See the tutorial on <a class="reference internal" href="../software-management/conda-mamba-quest/mamba-conda-quest.html#mamba-or-conda-virtual-environments"><span class="std std-ref">Mamba/Conda Virtual Environments</span></a> for more detail if you’re new to using virtual environments.</p>
+<p>Installing these GPU aware Python packages take on the following workflow.</p>
+<ol class="arabic simple">
+<li><p>Determine what version(s) of the package will work for the application being installed</p></li>
+<li><p>Determine what version(s) of CUDA those packages have been built with. If possible, ensure that the package has been compiled with at least CUDA 11.8 so that the software will work on both the A100 and H100 GPUs.</p></li>
+<li><p>After determining the CUDA version, set the environmental variable <code class="docutils literal notranslate"><span class="pre">CONDA_OVERRIDE_CUDA</span></code> accordingly.</p></li>
+<li><p>Create the virtual environment.</p></li>
+<li><p>Validate that the GPU aware application can see and use the A100 and/or H100 GPU cards.</p></li>
+</ol>
+<p>To determine the second piece of information, you can use <a class="reference external" href="https://docs.conda.io/projects/conda/en/latest/commands/search.html" target="_blank"><code class="docutils literal notranslate"><span class="pre">mamba</span> <span class="pre">search</span></code> <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a>. The structure of the search will look as follows (replace the placeholders including the <code class="docutils literal notranslate"><span class="pre">&lt;&gt;</span></code>):</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>search<span class="w"> </span><span class="s1">&#39;&lt;package-name&gt;[channel=conda-forge,subdir=linux-64,build=*cuda*]&gt;=&lt;version-lower&gt;,&lt;=&lt;version-higher&gt;&#39;</span>
+</pre></div>
+</div>
+<p>Below is an example of following these steps using tensorflow as an example.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>search<span class="w"> </span><span class="s1">&#39;tensorflow[channel=conda-forge,subdir=linux-64,build=*cuda*]&gt;=2.13.1,&lt;=2.17.0&#39;</span>
+<span class="go">Loading channels: done</span>
+<span class="gp"># </span>Name<span class="w">                       </span>Version<span class="w">           </span>Build<span class="w">  </span>Channel<span class="w">             </span>
+<span class="go">tensorflow                    2.13.1 cuda112py310he87a039_1  conda-forge         </span>
+<span class="go">tensorflow                    2.13.1 cuda118py310h189a05f_1  conda-forge         </span>
+<span class="go">tensorflow                    2.14.0 cuda118py310h148f8e3_0  conda-forge         </span>
+<span class="go">tensorflow                    2.14.0 cuda118py311heb1bdc4_0  conda-forge         </span>
+<span class="go">tensorflow                    2.14.0 cuda118py39hc3a5e0e_0  conda-forge         </span>
+<span class="go">...</span>
+<span class="go">...</span>
+<span class="go">tensorflow                    2.17.0 cuda120py312h02ad488_201  conda-forge         </span>
+<span class="go">tensorflow                    2.17.0 cuda120py312h02ad488_202  conda-forge         </span>
+<span class="go">tensorflow                    2.17.0 cuda120py312h02ad488_203  conda-forge         </span>
+<span class="go">tensorflow                    2.17.0 cuda120py39h298b457_203  conda-forge  </span>
+</pre></div>
+</div>
+<p>The CUDA (and python) versions used to build tensorflow can be found in the “Build” column. The string <code class="docutils literal notranslate"><span class="pre">cuda120py312h02ad488_201</span></code> says that this tensorflow is built with Python 3.12 and CUDA Toolkit 12.0.</p>
+<p>From this output, tensorflow 2.17.0 has been built with CUDA 12.0 and would be a good candidate to install as it will run on both the A100 and H100. Attempts to install tensorflow without also setting the environmental variable <code class="docutils literal notranslate"><span class="pre">CONDA_OVERRIDE_CUDA</span></code> to the version of CUDA that tensorflow was built with will result in the following error.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="o">=</span>tensorflow<span class="w"> </span><span class="s1">&#39;tensorflow[channel=conda-forge,subdir=linux-64,build=*cuda*]==2.17.0&#39;</span>
+<span class="go">The following package could not be installed</span>
+<span class="go">└─ tensorflow &gt;=2.13.1,&lt;=2.17.0 *cuda* is not installable because it requires</span>
+<span class="go">   └─ __cuda, which is missing on the system.</span>
+</pre></div>
+</div>
+<p>An example of setting <code class="docutils literal notranslate"><span class="pre">CONDA_OVERRIDE_CUDA</span></code> correctly and installing tensorflow into a virtual environment called <code class="docutils literal notranslate"><span class="pre">tensorflow</span></code> is shown below.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span><span class="nv">CONDA_OVERRIDE_CUDA</span><span class="o">=</span><span class="s2">&quot;12.0&quot;</span><span class="w"> </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="o">=</span>tensorflow<span class="w"> </span><span class="s1">&#39;tensorflow[channel=conda-forge,subdir=linux-64,build=*cuda*]==2.17.0&#39;</span>
+<span class="go">...</span>
+<span class="go">  + tensorflow-base                2.17.0  cuda120py312hbec54f7_203  conda-forge      386MB</span>
+<span class="go">  + tensorflow-estimator           2.17.0  cuda120py312hfa0f5ef_203  conda-forge      696kB</span>
+<span class="go">  + tensorflow                     2.17.0  cuda120py312h02ad488_203  conda-forge       43kB</span>
+<span class="go">...</span>
+</pre></div>
+</div>
+</section>
+<section id="jax">
+<span id="install-jaxlib"></span><h2>Jax<a class="headerlink" href="#jax" title="Link to this heading">#</a></h2>
+<p><a class="reference external" href="https://docs.jax.dev/en/latest/" target="_blank">JAX <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a> is a Python library for accelerator-oriented array computation and program transformation, designed for high-performance numerical computing and large-scale machine learning.</p>
+<section id="installation">
+<h3>Installation<a class="headerlink" href="#installation" title="Link to this heading">#</a></h3>
+<p>Example workflow to create a virtual environment named <code class="docutils literal notranslate"><span class="pre">jaxlib</span></code>. Please run the command that come after the $.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>purge<span class="w">  </span>
+<span class="gp">$ </span>module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="gp">#</span><span class="c1"># CUDA 12.0 Built Versions</span>
+<span class="gp">$ </span><span class="nv">CONDA_OVERRIDE_CUDA</span><span class="o">=</span><span class="m">12</span>.0<span class="w"> </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="o">=</span>jaxlib<span class="w"> </span><span class="s1">&#39;jaxlib[channel=conda-forge,subdir=linux-64,build=*cuda*]&gt;=0.4.26,&lt;=0.4.34&#39;</span>
+<span class="gp">#</span><span class="c1">## CUDA 12.6 Built Versions</span>
+<span class="gp">$ </span><span class="nv">CONDA_OVERRIDE_CUDA</span><span class="o">=</span><span class="m">12</span>.6<span class="w"> </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="o">=</span>jaxlib<span class="w"> </span><span class="s1">&#39;jaxlib[channel=conda-forge,subdir=linux-64,build=*cuda*]&gt;0.4.34&#39;</span>
+</pre></div>
+</div>
+</section>
+<section id="validation">
+<h3>Validation<a class="headerlink" href="#validation" title="Link to this heading">#</a></h3>
+<p>A short Python script can be used to verify that Jax was installed correct and can see and use the GPU devices on Quest.</p>
+<p><code class="docutils literal notranslate"><span class="pre">test_gpu.py</span></code></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">jax</span><span class="w"> </span><span class="kn">import</span> <span class="n">extend</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">extend</span><span class="o">.</span><span class="n">backend</span><span class="o">.</span><span class="n">get_backend</span><span class="p">()</span><span class="o">.</span><span class="n">platform</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">extend</span><span class="o">.</span><span class="n">backend</span><span class="o">.</span><span class="n">get_backend</span><span class="p">()</span><span class="o">.</span><span class="n">platform_version</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">extend</span><span class="o">.</span><span class="n">backend</span><span class="o">.</span><span class="n">get_backend</span><span class="p">()</span><span class="o">.</span><span class="n">local_devices</span><span class="p">())</span>
+</pre></div>
+</div>
+<p>Create the file <code class="docutils literal notranslate"><span class="pre">test_gpu.py</span></code>.  Then test everything is working correctly with a batch job similar to:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+<span class="c1">#SBATCH --account=pXXXX</span>
+<span class="c1">#SBATCH --partition=gengpu</span>
+<span class="c1">#SBATCH --gres=gpu:1</span>
+<span class="c1">#SBATCH --time=00:05:00</span>
+<span class="c1">#SBATCH --nodes=1</span>
+<span class="c1">#SBATCH --ntasks-per-node=1</span>
+<span class="c1">#SBATCH --mem=4G</span>
+
+module<span class="w"> </span>purge
+module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="nb">source</span><span class="w"> </span>activate<span class="w"> </span>jaxlib
+
+python<span class="w"> </span>test_gpu.py
+</pre></div>
+</div>
+<p>The output from the job above should be similar to:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">gpu</span>
+<span class="n">PJRT</span> <span class="n">C</span> <span class="n">API</span>
+<span class="n">cuda</span> <span class="mi">12030</span>
+<span class="p">[</span><span class="n">CudaDevice</span><span class="p">(</span><span class="nb">id</span><span class="o">=</span><span class="mi">0</span><span class="p">)]</span>
+</pre></div>
+</div>
+<p>Once the installation is verified, use a similar workflow to run your actual Python code.</p>
+</section>
+</section>
+<section id="tensorflow">
+<span id="install-tensorflow"></span><h2>Tensorflow<a class="headerlink" href="#tensorflow" title="Link to this heading">#</a></h2>
+<p><a class="reference external" href="https://www.tensorflow.org/" target="_blank">TensorFlow <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a> is an end-to-end open source platform
+for machine learning. It has a comprehensive, flexible ecosystem of
+<a class="reference external" href="https://www.tensorflow.org/resources/tools" target="_blank">tools <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a>,
+<a class="reference external" href="https://www.tensorflow.org/resources/libraries-extensions" target="_blank">libraries <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a>, and
+<a class="reference external" href="https://www.tensorflow.org/community" target="_blank">community <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a> resources that lets
+researchers push the state-of-the-art in ML and developers easily build and
+deploy ML-powered applications.</p>
+<section id="id1">
+<h3>Installation<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
+<p>Example workflow to create a virtual environment named <code class="docutils literal notranslate"><span class="pre">tensorflow</span></code>. Please run the command that come after the $.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>purge
+<span class="gp">$ </span>module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="gp">#</span><span class="c1"># CUDA 11.8 Built Versions</span>
+<span class="gp">$ </span><span class="nv">CONDA_OVERRIDE_CUDA</span><span class="o">=</span><span class="m">12</span>.0<span class="w"> </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="o">=</span>tensorflow<span class="w"> </span><span class="s1">&#39;tensorflow[channel=conda-forge,subdir=linux-64,build=*cuda*]&gt;=2.13.1,&lt;2.15.0&#39;</span>
+<span class="gp">#</span><span class="c1"># CUDA 12.0 Built Versions</span>
+<span class="gp">$ </span><span class="nv">CONDA_OVERRIDE_CUDA</span><span class="o">=</span><span class="m">12</span>.0<span class="w"> </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="o">=</span>tensorflow<span class="w"> </span><span class="s1">&#39;tensorflow[channel=conda-forge,subdir=linux-64,build=*cuda*]&gt;=2.15.0,&lt;=2.17.0&#39;</span>
+<span class="gp">#</span><span class="c1">## CUDA 12.6 Built Versions</span>
+<span class="gp">$ </span><span class="nv">CONDA_OVERRIDE_CUDA</span><span class="o">=</span><span class="m">12</span>.6<span class="w"> </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="o">=</span>tensorflow<span class="w"> </span><span class="s1">&#39;tensorflow[channel=conda-forge,subdir=linux-64,build=*cuda*]&gt;2.17.0&#39;</span>
+</pre></div>
+</div>
+</section>
+<section id="id2">
+<h3>Validation<a class="headerlink" href="#id2" title="Link to this heading">#</a></h3>
+<p>A short Python script can be used to verify that Tensorflow was installed correct and can see and use the GPU devices on Quest.</p>
+<p><code class="docutils literal notranslate"><span class="pre">test_gpu.py</span></code></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">tensorflow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">tf</span>
+
+<span class="n">physical_devices</span> <span class="o">=</span> <span class="n">tf</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">list_physical_devices</span><span class="p">(</span><span class="s1">&#39;GPU&#39;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Num GPUs:&quot;</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">physical_devices</span><span class="p">))</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;GPUs: &quot;</span><span class="p">,</span> <span class="n">physical_devices</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Tensorflow Built With CUDA Support </span><span class="si">{0}</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">tf</span><span class="o">.</span><span class="n">test</span><span class="o">.</span><span class="n">is_built_with_cuda</span><span class="p">()))</span>
+</pre></div>
+</div>
+<p>Create the file <code class="docutils literal notranslate"><span class="pre">test_gpu.py</span></code>.  Then test everything is working correctly with a batch job similar to:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+<span class="c1">#SBATCH --account=pXXXX</span>
+<span class="c1">#SBATCH --partition=gengpu</span>
+<span class="c1">#SBATCH --gres=gpu:1</span>
+<span class="c1">#SBATCH --time=00:05:00</span>
+<span class="c1">#SBATCH --nodes=1</span>
+<span class="c1">#SBATCH --ntasks-per-node=1</span>
+<span class="c1">#SBATCH --mem=4G</span>
+
+module<span class="w"> </span>purge
+module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="nb">source</span><span class="w"> </span>activate<span class="w"> </span>tensorflow
+
+python<span class="w"> </span>test_gpu.py
+</pre></div>
+</div>
+<p>The output from the job above should be similar to:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">Num</span> <span class="n">GPUs</span><span class="p">:</span> <span class="mi">1</span>
+<span class="n">GPUs</span><span class="p">:</span>  <span class="p">[</span><span class="n">PhysicalDevice</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;/physical_device:GPU:0&#39;</span><span class="p">,</span> <span class="n">device_type</span><span class="o">=</span><span class="s1">&#39;GPU&#39;</span><span class="p">)]</span>
+<span class="n">Tensorflow</span> <span class="n">Built</span> <span class="n">With</span> <span class="n">CUDA</span> <span class="n">Support</span> <span class="kc">True</span>
+</pre></div>
+</div>
+<p>Once the installation is verified, use a similar workflow to run your actual Python code.</p>
+</section>
+</section>
+<section id="pytorch">
+<span id="install-pytorch"></span><h2>PyTorch<a class="headerlink" href="#pytorch" title="Link to this heading">#</a></h2>
+<p>PyTorch is a Python package that provides two high-level features:</p>
+<ul class="simple">
+<li><p>Tensor computation (like NumPy) with strong GPU acceleration</p></li>
+<li><p>Deep neural networks built on a tape-based autograd system</p></li>
+</ul>
+<section id="id3">
+<h3>Installation<a class="headerlink" href="#id3" title="Link to this heading">#</a></h3>
+<p>Example workflow to create a virtual environment named <code class="docutils literal notranslate"><span class="pre">pytorch</span></code>. Please run the command that come after the $.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>purge
+<span class="gp">$ </span>module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="gp">#</span><span class="c1"># CUDA 12.0 Built Versions</span>
+<span class="gp">$ </span><span class="nv">CONDA_OVERRIDE_CUDA</span><span class="o">=</span><span class="m">12</span>.0<span class="w"> </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="o">=</span>pytorch<span class="w"> </span><span class="s1">&#39;pytorch[channel=conda-forge,subdir=linux-64,build=*cuda*]&gt;=2.0.0,&lt;=2.5.1&#39;</span>
+<span class="gp">#</span><span class="c1">## CUDA 12.6 Built Versions</span>
+<span class="gp">$ </span><span class="nv">CONDA_OVERRIDE_CUDA</span><span class="o">=</span><span class="m">12</span>.6<span class="w"> </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="o">=</span>pytorch<span class="w"> </span><span class="s1">&#39;pytorch[channel=conda-forge,subdir=linux-64,build=*cuda*]&gt;=2.5.1&#39;</span>
+</pre></div>
+</div>
+</section>
+<section id="id4">
+<h3>Validation<a class="headerlink" href="#id4" title="Link to this heading">#</a></h3>
+<p>A short Python script can be used to verify that PyTorch was installed correct and can see and use the GPU devices on Quest.</p>
+<p><code class="docutils literal notranslate"><span class="pre">test_gpu.py</span></code></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Num GPUs: &quot;</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">device_count</span><span class="p">())</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;GPUs: &quot;</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_name</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;PyTorch Built With CUDA Support </span><span class="si">{0}</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()))</span>
+</pre></div>
+</div>
+<p>Create the file <code class="docutils literal notranslate"><span class="pre">test_gpu.py</span></code>.  Then test everything is working correctly with a batch job similar to:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+<span class="c1">#SBATCH --account=pXXXX</span>
+<span class="c1">#SBATCH --partition=gengpu</span>
+<span class="c1">#SBATCH --gres=gpu:1</span>
+<span class="c1">#SBATCH --time=00:05:00</span>
+<span class="c1">#SBATCH --nodes=1</span>
+<span class="c1">#SBATCH --ntasks-per-node=1</span>
+<span class="c1">#SBATCH --mem=4G</span>
+
+module<span class="w"> </span>purge
+module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="nb">source</span><span class="w"> </span>activate<span class="w"> </span>pytorch
+
+python<span class="w"> </span>test_gpu.py
+</pre></div>
+</div>
+<p>The output from the job above should be similar to:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">Num</span> <span class="n">GPUs</span><span class="p">:</span> <span class="mi">1</span>
+<span class="n">GPUs</span><span class="p">:</span> <span class="n">NVIDIA</span> <span class="n">H100</span> <span class="n">PCIe</span>
+<span class="n">PyTorch</span> <span class="n">Built</span> <span class="n">With</span> <span class="n">CUDA</span> <span class="n">Support</span> <span class="kc">True</span>
+</pre></div>
+</div>
+</section>
+<section id="validate-pytorch-for-use-with-multiple-nodes-with-multiple-gpus">
+<h3>Validate PyTorch for use with Multiple Nodes with Multiple GPUs<a class="headerlink" href="#validate-pytorch-for-use-with-multiple-nodes-with-multiple-gpus" title="Link to this heading">#</a></h3>
+<p>PyTorch can also be leveraged to run multinode multi-gpu jobs.
+The batch submission script below shows how to use multiple nodes with
+multiple GPUs with PyTorch. Please check out the GitHub page
+that provides the Python code for setting this up.</p>
+<p>GitHub Repo: <a class="github reference external" href="https://github.com/nuitrcs/examplejobs/tree/master/python/pytorch_ddp" target="_blank">nuitrcs/examplejobs <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a></p>
+<p>You can modify the Python code to suit your needs.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+<span class="c1">#SBATCH --account=pXXXX</span>
+<span class="c1">#SBATCH --partition=gengpu</span>
+<span class="c1">#SBATCH --time=04:00:00</span>
+<span class="c1">#SBATCH --job-name=multinode-example</span>
+<span class="c1">#SBATCH --nodes=2</span>
+<span class="c1">#SBATCH --ntasks-per-node=2</span>
+<span class="c1">#SBATCH --gres=gpu:2</span>
+<span class="c1">#SBATCH --mem=20G</span>
+<span class="c1">#SBATCH --cpus-per-task=4</span>
+
+module<span class="w"> </span>purge
+module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="nb">source</span><span class="w"> </span>activate<span class="w"> </span>pytorch
+
+<span class="nb">export</span><span class="w"> </span><span class="nv">LOGLEVEL</span><span class="o">=</span>INFO
+
+srun<span class="w"> </span>torchrun<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--nnodes<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--nproc_per_node<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--rdzv_id<span class="w"> </span><span class="nv">$RANDOM</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--rdzv_backend<span class="w"> </span>c10d<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--rdzv_endpoint<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$SLURMD_NODENAME</span><span class="s2">:29500&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>./multinode_torchrun.py<span class="w"> </span><span class="m">10000</span><span class="w"> </span><span class="m">100</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="cupy">
+<span id="install-cupy"></span><h2>CUpy<a class="headerlink" href="#cupy" title="Link to this heading">#</a></h2>
+<p><a class="reference external" href="https://docs.cupy.dev/en/stable/overview.html" target="_blank">CuPy <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a> is a NumPy/SciPy-compatible array library for GPU-accelerated computing with Python. CuPy acts as a <a class="reference external" href="https://docs.cupy.dev/en/stable/reference/comparison.html" target="_blank">drop-in replacement <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a> to run existing NumPy/SciPy code on NVIDIA CUDA or AMD ROCm platforms.</p>
+<p>All instructions will utilize the software management utility mamba. Please see Using Python on QUEST for more information on Mamba virtual environments.</p>
+<section id="id5">
+<h3>Installation<a class="headerlink" href="#id5" title="Link to this heading">#</a></h3>
+<p>Please run the command that come after the $.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>purge
+<span class="gp">$ </span>module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="gp">$ </span>mamba<span class="w"> </span>create<span class="w"> </span>--name<span class="o">=</span>cupy<span class="w"> </span>cupy<span class="w"> </span>
+</pre></div>
+</div>
+</section>
+<section id="id6">
+<h3>Validation<a class="headerlink" href="#id6" title="Link to this heading">#</a></h3>
+<p>A short Python script can be used to verify that CUpy was installed correct and can see and use the GPU devices on Quest.</p>
+<p><code class="docutils literal notranslate"><span class="pre">test_gpu.py</span></code></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">cupy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">cp</span>
+<span class="n">x_gpu</span> <span class="o">=</span> <span class="n">cp</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">])</span>
+<span class="n">l2_gpu</span> <span class="o">=</span> <span class="n">cp</span><span class="o">.</span><span class="n">linalg</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">x_gpu</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">x_gpu</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">l2_gpu</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Create the file <code class="docutils literal notranslate"><span class="pre">test_gpu.py</span></code>.  Then test everything is working correctly with a batch job similar to:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+<span class="c1">#SBATCH --account=pXXXX</span>
+<span class="c1">#SBATCH --partition=gengpu</span>
+<span class="c1">#SBATCH --gres=gpu:1</span>
+<span class="c1">#SBATCH --time=00:05:00</span>
+<span class="c1">#SBATCH --nodes=1</span>
+<span class="c1">#SBATCH --ntasks-per-node=1</span>
+<span class="c1">#SBATCH --mem=4G</span>
+
+module<span class="w"> </span>purge
+module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="nb">source</span><span class="w"> </span>activate<span class="w"> </span>cupy
+
+python<span class="w"> </span>test_gpu.py
+</pre></div>
+</div>
+<p>The output from the job above should be similar to:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">[</span><span class="mi">1</span> <span class="mi">2</span> <span class="mi">3</span><span class="p">]</span>
+<span class="mf">3.7416573867739413</span>
+</pre></div>
+</div>
+<p>Once the installation is verified, use a similar workflow to run your actual Python code.</p>
+</section>
+</section>
+<section id="rapids">
+<span id="install-rapids"></span><h2>Rapids<a class="headerlink" href="#rapids" title="Link to this heading">#</a></h2>
+<p>These install instructions should work for rapidsai v24.10. It may work for newer releases of rapidsai but that will depend on the version of CUDA that was used to compile the conda package. If the version is older than CUDA 12.0 and newer than CUDA 12.8, it will not work with the Quest GPUs.</p>
+<section id="id7">
+<h3>Installation<a class="headerlink" href="#id7" title="Link to this heading">#</a></h3>
+<p>Please run the command that come after the $.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>module<span class="w"> </span>purge
+<span class="gp">$ </span>module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="gp">$ </span>mamba<span class="w"> </span>create<span class="w"> </span>-n<span class="w"> </span>rapids-25.04<span class="w"> </span>-c<span class="w"> </span>rapidsai<span class="w"> </span>-c<span class="w"> </span>conda-forge<span class="w"> </span>-c<span class="w"> </span>nvidia<span class="w">  </span><span class="se">\</span>
+<span class="w">    </span><span class="nv">rapids</span><span class="o">=</span><span class="m">25</span>.04<span class="w"> </span><span class="nv">python</span><span class="o">=</span><span class="m">3</span>.12<span class="w"> </span><span class="s1">&#39;cuda-version&gt;=12.0,&lt;=12.8&#39;</span>
+</pre></div>
+</div>
+<p><strong>Note</strong>: Please see <a class="reference external" href="https://rapids.ai/start.html" target="_blank">getting started with rapids <svg version="1.1" width="1.0em" height="1.0em" viewBox="0 0 16 16" aria-hidden="true" style="display: inline-block; vertical-align: middle; fill: currentColor;"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path></svg></a> for more details.</p>
+</section>
+<section id="id8">
+<h3>Validation<a class="headerlink" href="#id8" title="Link to this heading">#</a></h3>
+<p>A short Python script can be used to verify that CUpy was installed correct and can see and use the GPU devices on Quest.</p>
+<p><code class="docutils literal notranslate"><span class="pre">test_gpu.py</span></code></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">cudf</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">pandas</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pd</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+
+<span class="n">rng</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">default_rng</span><span class="p">(</span><span class="n">seed</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+<span class="n">num_rows</span> <span class="o">=</span> <span class="mi">1_000_000</span>
+
+<span class="n">pdf</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">(</span>
+    <span class="p">{</span>
+        <span class="s2">&quot;numbers&quot;</span><span class="p">:</span> <span class="n">rng</span><span class="o">.</span><span class="n">integers</span><span class="p">(</span><span class="o">-</span><span class="mi">1000</span><span class="p">,</span> <span class="mi">1000</span><span class="p">,</span> <span class="n">num_rows</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">&quot;int64&quot;</span><span class="p">),</span>
+        <span class="s2">&quot;business&quot;</span><span class="p">:</span> <span class="n">rng</span><span class="o">.</span><span class="n">choice</span><span class="p">(</span>
+            <span class="p">[</span><span class="s2">&quot;McD&quot;</span><span class="p">,</span> <span class="s2">&quot;Buckees&quot;</span><span class="p">,</span> <span class="s2">&quot;Walmart&quot;</span><span class="p">,</span> <span class="s2">&quot;Costco&quot;</span><span class="p">],</span> <span class="n">size</span><span class="o">=</span><span class="n">num_rows</span>
+        <span class="p">),</span>
+    <span class="p">}</span>
+<span class="p">)</span>
+
+<span class="n">gdf</span> <span class="o">=</span> <span class="n">cudf</span><span class="o">.</span><span class="n">from_pandas</span><span class="p">(</span><span class="n">pdf</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">gdf</span><span class="o">.</span><span class="n">value_counts</span><span class="p">())</span>
+</pre></div>
+</div>
+<p>Create the file <code class="docutils literal notranslate"><span class="pre">test_gpu.py</span></code>.  Then test everything is working correctly with a batch job similar to:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+<span class="c1">#SBATCH --account=pXXXX</span>
+<span class="c1">#SBATCH --partition=gengpu</span>
+<span class="c1">#SBATCH --gres=gpu:1</span>
+<span class="c1">#SBATCH --time=00:05:00</span>
+<span class="c1">#SBATCH --nodes=1</span>
+<span class="c1">#SBATCH --ntasks-per-node=1</span>
+<span class="c1">#SBATCH --mem=12G</span>
+
+module<span class="w"> </span>purge
+module<span class="w"> </span>load<span class="w"> </span>mamba/24.3.0
+<span class="nb">source</span><span class="w"> </span>activate<span class="w"> </span>rapids-25.04
+
+python<span class="w"> </span>test_gpu.py
+</pre></div>
+</div>
+<p>The output from the job above should be similar to:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">numbers</span>  <span class="n">business</span>
+<span class="o">-</span><span class="mi">452</span>     <span class="n">McD</span>         <span class="mi">169</span>
+ <span class="mi">785</span>     <span class="n">McD</span>         <span class="mi">165</span>
+ <span class="mi">997</span>     <span class="n">Walmart</span>     <span class="mi">164</span>
+ <span class="mi">368</span>     <span class="n">McD</span>         <span class="mi">162</span>
+<span class="o">-</span><span class="mi">792</span>     <span class="n">Buckees</span>     <span class="mi">162</span>
+                    <span class="o">...</span> 
+ <span class="mi">26</span>      <span class="n">Costco</span>       <span class="mi">90</span>
+ <span class="mi">308</span>     <span class="n">Walmart</span>      <span class="mi">90</span>
+<span class="o">-</span><span class="mi">320</span>     <span class="n">Walmart</span>      <span class="mi">85</span>
+<span class="o">-</span><span class="mi">934</span>     <span class="n">Walmart</span>      <span class="mi">85</span>
+ <span class="mi">692</span>     <span class="n">Costco</span>       <span class="mi">82</span>
+<span class="n">Name</span><span class="p">:</span> <span class="n">count</span><span class="p">,</span> <span class="n">Length</span><span class="p">:</span> <span class="mi">8000</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="n">int64</span>
+</pre></div>
+</div>
+<p>Once the installation is verified, use a similar workflow to run your actual Python code.</p>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="python-selenium-quest.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Python Selenium on Quest</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="python-llm-huggingface.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Using Hugging Face on Quest</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+  <div class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav class="bd-toc-nav page-toc">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installing-and-validating-gpu-aware-python-packages">Installing and Validating GPU Aware Python Packages</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#jax">Jax</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#installation">Installation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#validation">Validation</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorflow">Tensorflow</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Installation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Validation</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#pytorch">PyTorch</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id3">Installation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id4">Validation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#validate-pytorch-for-use-with-multiple-nodes-with-multiple-gpus">Validate PyTorch for use with Multiple Nodes with Multiple GPUs</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cupy">CUpy</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id5">Installation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id6">Validation</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#rapids">Rapids</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id7">Installation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id8">Validation</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+             Last updated: 2025-07-03
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+
+
+<div id="footer-bottom">
+<div class="contain-1120">
+<span class="copyright" style="color:white">©
+<script>// <![CDATA[
+document.write(new Date().getFullYear())
+// ]]></script>
+Northwestern University | <a href="https://www.it.northwestern.edu/departments/it-services-support/research/">Northwestern IT Research Computing and Data Services</a></span>
+<!--
+<ul>
+<li><a href="https://www.facebook.com/NorthwesternU"> <span class="social facebook">Facebook</span> </a></li>
+<li><a href="https://www.twitter.com/northwesternu"> <span class="social twitter">Twitter</span> </a></li>
+<li><a href="https://www.instagram.com/northwesternu"> <span class="social instagram">Instagram</span> </a></li>
+<li><a href="https://www.youtube.com/user/NorthwesternU"> <span class="social youtube">YouTube</span> </a></li>
+<li><a href="https://www.tiktok.com/@northwestern.u"> <span class="social tiktok">TikTok</span> </a></li>
+<li><a href="https://www.linkedin.com/school/northwestern-university/"> <span class="social linkedin">LinkedIn</span> </a></li>
+</ul>
+-->
+<span class="right" style="color:white"><a style="color:white" href="https://www.northwestern.edu/disclaimer.html">Disclaimer</a></span>
+</div>
+</div>
+  </footer>
+  </body>
+</html>

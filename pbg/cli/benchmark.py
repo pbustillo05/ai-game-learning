@@ -58,6 +58,19 @@ def main() -> None:
     parser.add_argument("--completion-samples", type=int, default=None)
     parser.add_argument("--minibatch-size", type=int, default=None)
     parser.add_argument("--gd-steps", type=int, default=None)
+    parser.add_argument(
+        "--rollout-only",
+        action="store_true",
+        help="profile sample, sealing, completion, and targets without a learner update",
+    )
+    parser.add_argument(
+        "--reuse-root-private-profile",
+        action="store_true",
+        help=(
+            "branched diagnostic only: sample one valid root-conditioned private "
+            "profile and reuse it throughout the tree"
+        ),
+    )
     parser.add_argument("--output", default=None, help="optional JSON result/baseline path")
     parser.add_argument("--baseline", default=None, help="JSON baseline to enforce")
     parser.add_argument("--max-regression", type=float, default=0.20)
@@ -103,6 +116,8 @@ def main() -> None:
         checkpoint=args.checkpoint,
         branching_upper_cutoff_nodes=args.branching_upper_cutoff_nodes,
         branching_queue_capacity_rows=args.branching_queue_capacity_rows,
+        rollout_only=args.rollout_only,
+        reuse_root_private_profile=args.reuse_root_private_profile,
     )
     encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output:
