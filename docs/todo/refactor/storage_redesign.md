@@ -2,12 +2,6 @@
 
 Status: implementation proposal; not yet an authoritative production contract.
 
-Date: 2026-07-24.
-
-This is a chronological presentation of `docs/todo/queued_training_rewrite.md`. It proposes the same replacement:
-normal, sequential Rao--Blackwell (RB), and branched RB training use one fixed-address queued engine, and the legacy
-production path is deleted after all consumers migrate.
-
 ## 1. Fundamentals
 
 ### 1.1 One schema, four independent axes
@@ -21,588 +15,333 @@ private_estimator     sampled | rao_blackwell
 beta_mode             fixed_beta | KKT_beta       # branched only
 ```
 
-Inapplicable fields do not exist. The shared engine is a protocol, not a union of every mode's data. `beta_mode`
-changes only whether frozen trace-variance and cost heads control branching intensity. Branched training always learns
-those heads.
-
-Throughout this document, a data-structure block is a catalog of every field that the structure can have in any mode.
-Mode-dependent fields remain in that one block and carry an applicability comment such as `# branched only` or
-`# except branched RB`. These are documentation supersets, not runtime union schemas: schema generation omits every
-field whose applicability condition is false.
+Mode-inapplicable fields shown below are omitted from the generated schema.
 
 ### 1.2 `input_partition` and `output_partition`
 
-Fix a run and let $\Sigma$ be its set of possible player-node occurrences. The game and estimator declare two literal
-partitions of the same $\Sigma$:
-
-$$
-\Pi_{\rm in}=\{I_i:i\in\mathcal I\},
-\qquad
-\Pi_{\rm out}=\{O_o:o\in\mathcal O\}.
-$$
-
-Here $\mathcal I$ is the set of `input_type` labels and $\mathcal O$ is the set of `output_type` labels. An
-`input_type` or `output_type` below means its labeled partition block when no confusion can result.
-
-The input partition must refine the output partition:
-
-$$
-\Pi_{\rm in}\preceq\Pi_{\rm out}
-\quad\Longleftrightarrow\quad
-\forall i\in\mathcal I\;\exists!\,o\in\mathcal O:\ I_i\subseteq O_o.
-$$
-
-This refinement induces the total map
-
-$$
-\operatorname{output}:\mathcal I\longrightarrow\mathcal O,
-\qquad
-\operatorname{output}(i)=o
-\ \Longleftrightarrow\
-I_i\subseteq O_o.
-$$
-
-A declaration is invalid if an input block crosses output blocks. Thus `input_partition` is always at least as fine
-as `output_partition`; an `output_type` may combine several complete `input_type` blocks but may never split one.
-
-Each `input_type` owns one model-work FIFO. Queue identity is therefore semantic and game-defined.
-
-Street, observation width, history length, token width, padding width, and their cross-products never create extra
-queues. Within the next stable FIFO prefix, the game may choose the minimum physical width covering that prefix or
-split it into consecutive feasible subspans. It may never skip or reorder rows to improve padding.
-
-Numerical target arrays are partitioned by `output_type`. Sampled mode has a singleton `output_partition`, whose rows
-are scalar. Rao--Blackwell (RB) mode may have several `output_type` elements with different private-state domains.
-
-The two partitions serve different purposes:
-
-- `input_type` selects a model-input schema and schedules model execution.
-- `output_type` selects a numerical target domain and target storage.
-- A sigma row of `input_type` $i$ has `output_type` $\operatorname{output}(i)$. Storage may materialize both labels for
-  routing, but they are not independent.
-- Output partitioning never creates rollout queues.
-
-For poker,
-
-$$
-\mathcal I
-=\{\mathsf{pre}\}\sqcup\{\mathsf{post}_A:2\le A\le P\},
-$$
-
-while the estimator gives
+`input_partition` refines `output_partition` on player nodes. An `input_type` selects a model-input schema and FIFO;
+an `output_type` selects a numerical target domain. The refinement defines:
 
 ```text
-sampled
-  output_partition     = {all}
-  output(pre)          = all
-  output(post_A)       = all             for every A
-
-rao_blackwell
-  output_partition     = {pre, post}
-  output(pre)          = pre
-  output(post_A)       = post            for every A
+output : input_partition -> output_partition
+size : input_partition -> int
+size : output_partition -> int
 ```
 
-Flop, turn, and river rows with the same live-player count $A$ share the `post_A` `input_type`. All postflop RB targets
-use the `post` `output_type`, independent of $A$. Thus `post_2` and `post_6` are distinct `input_type` elements but map
-to the same `output_type`.
-
-For a poker `post_A` prefix, the game-owned planner may use the minimum board width in that prefix to select the
-smallest legal exact-hand width covering every row.
-
-### 1.3 Input sizes, output sizes, and exact private states
-
-Each type has one declared size, but input and output sizes measure different objects:
-
-$$
-\operatorname{size}_{\rm in}[i]
-  :=\dim(\operatorname{input\_schema}(i)),
-\quad i\in\mathcal I,
-\qquad
-\mathcal D_o
-  :=\operatorname{output\_domain}(o),
-\quad
-\operatorname{size}_{\rm out}[o]
-  :=|\mathcal D_o|,
-\quad o\in\mathcal O.
-$$
-
-In typed schema notation these may be shortened to `size[input_type]` and `size[output_type]`; the subscripts are
-retained in mathematics whenever labels such as `pre` occur in both partitions. Input size is the logical flattened
-row width. Output size is the trailing numerical width of one row, not the number of rows in its slab. The byte/work
-contract separately applies field dtypes, alignment, and pack-specific transient widths.
-
-For poker, let
-
-$$
-B_i
-=\max_{\sigma\in I_i}
-  |\operatorname{public/history}(\sigma)|
-$$
-
-denote the fixed schema capacity of all non-range input fields, including public state, board/history fields, and
-immutable dependency references. The logical input sizes are schematically
-
-$$
-\operatorname{size}_{\rm in}[\mathsf{pre}]
-  =PK+B_{\mathsf{pre}},
-\qquad
-\operatorname{size}_{\rm in}[\mathsf{post}_A]
-  =AH+B_{\mathsf{post}_A}.
-$$
-
-Thus, in particular, a `post_A` natural-input row has the requested $A H$ live-range coordinates plus the maximum
-public/history extent for that input block. Here $K=R^2$ and $H=\binom{4R}{2}$.
-
-The output sizes are
+For poker:
 
 ```text
-sampled
-  size_out[all]          = 1
-
-rao_blackwell
-  size_out[pre]          = K
-  size_out[post]         = H
+input_partition = {pre}\sqcup{post_A : 2 <= A <= P}
 ```
 
-After the model forward and any estimator-specific selection, the retained value and selected-action log-probability
-rows for `input_type` $i$ lie on $\mathcal D_{\operatorname{output}(i)}$. Targets of `output_type` $o$ use that same
-$\mathcal D_o$. Consequently, combining several input blocks into one output block is sound precisely because their
-retained numerical rows share one output domain. The model's transient unsliced head may be wider in sampled mode.
-
-Keep the following three objects distinct:
-
-- `private_domain`: the game's exact private-state domain.
-- `input_schema(input_type)`: the natural model-input row, of width `size[input_type]`.
-- `output_domain(output_type)`: the retained numerical and target/loss domain, of width
-  `size[output_type]`.
-
-For poker, `private_domain` is $\mathcal H$, and a realized $x_p$ is always an exact two-card hand in $\mathcal H$,
-including preflop. Sampled targets have no private-state axis. Preflop sampled training therefore carries exact
-$x_p\in\mathcal H$ while selecting the scalar policy/value entry associated with model class
-$c(x_p)\in\mathcal K$. In RB, `output(pre)` uses $\mathcal K$ and `output(post_A)` uses $\mathcal H$.
-
-Board-empty poker nodes, including the flop-dealing chance parent and preflop completion leaves, use the `pre`
-`output_type`. Flop, turn, and river nodes use the `post` `output_type`.
-
-The poker RB recurrence conversions are:
+Here `post_A` means postflop with $A$ live players. The estimator defines:
 
 ```text
-post <- post    H -> H
-pre  <- pre     K -> K
-pre  <- post    H -> K
+sampled                output_partition = {all} with size[all] = 1
+rao_blackwell          output_partition = {pre, post} with size[pre] = R^2 and size[post] = 2R(4R-1)
 ```
 
-There is no `post <- pre`.
+### 1.3 Indexing
 
-### 1.4 Sigma indexing and action indexing
+Each data-structure is indexed by some type of nodes:
 
-Let $\sigma$ be a player-node occurrence and let $\sigma a$ be one sampled action occurrence at that player node.
+- `FamilyWork` is **player-node-indexed**; `SigmaHead` and `SigmaTarget` contain only learner-owned player nodes
+- `ActionHead` and `ActionTarget` are **action-indexed**: sequential mode has one action row per learner player node; branched mode has one per target-eligible child
+- `Topology` and `LayeredTopology` are **structural-node-indexed** as defined in Section 2.2.
 
-- `FamilyWork` is **sigma-indexed**: every row represents one $\sigma$.
-- `ActionOccurence` is **action-indexed** and exists only in branched
-  geometry: every row represents one $\sigma a$.
-- `SigmaTarget` is sigma-indexed over trainable $\sigma$ rows.
-- `ActionTarget` is action-indexed over target-eligible $\sigma a$ rows.
+`trained` and `learner-owned` are synonymous: every player in self-play, only the exploiter in best response.
 
-Every sigma row that owns action rows points to one exact contiguous action span. No padded
-`[decision,max_actions,...]` array exists.
+### 1.4 Live vs Folded
 
-Sequential geometry has exactly one retained sampled action per $\sigma$, so `action` and `old_log_pi` occupy the
-corresponding `FamilyWork` sigma row. Branched geometry instead uses a ragged `ActionOccurence` span of exact
-`target_degree`.
-
-Below, `TreeTopology` is the append-only branched rollout structure, `SequentialTargetTopology` is the sequential
-decision chronology, and `FlattenedTargetTopology` is the depth-major branched target structure. The last two were
-called `SequentialTargetTree` and `FlattenedTargetTree` in the original document.
+At a poker node, $A$ `live` players remain eligible; `folded` players take no further actions.
 
 ### 1.5 Authority and intentional contract changes
 
-`docs/theory/core_math.tex` remains authoritative for mathematics and `docs/theory/pseudocode/` for implementation
-philosophy. Production acceptance requires explicit amendments for two intentional changes:
+`docs/theory/core_math.tex` remains authoritative for mathematics.
+`docs/theory/pseudocode/` will have to be updated but we are keeping: branching and queue-pressure laws, sampling laws, completion, and
+duplicate-child identity.
+CPU owns only compact topology and movement plans; numerical work and bulk storage remain on the accelerator.
 
-1. `FamilyWork` slabs are sized by admitted total input work and advance
-   monotonically. They replace separate mutable public-state and active-reach
-   owners, rather than tracking only the live-frontier high water.
-2. RB preflop posteriors, moments, values, advantages, and losses use the
-   model-native class domain $\mathcal K$. This changes the finite-sample
-   estimator and nonlinear clipped loss, not just storage.
+## 2. Family-based Rollout
 
-Everything else keeps the original contract: branching and queue-pressure laws, sampling laws, completion, and
-duplicate-child identity. There is no legacy path, production $\widehat Q^\lambda$, or CPU/automatic/fallback
-execution.
-
-## 2. Before rollout: derive capacities and allocate fixed owners
-
-Admission derives exact schemas and phase ledgers from the run configuration, model/workspace calibration, lagged
-per-`input_type` observations, alignment, allocator reservation, and an unused guard.
-
-Allocate:
+Fix `player_node_cap : input_partition -> int`. For each `input_type` and
+$0\leq\sigma<\mathtt{player\_node\_cap[input\_type]}$:
 
 ```text
-FamilyWork[input_type]
-ActionOccurence[output_type]                  # branched only
-TreeTopology                              # branched only
-Leaf[terminal output_type]
-DependencyStore                           # game-declared immutable dependencies only
-QueueBehaviorMetadata                     # queue-pressure safeguard only
-DeviceFailure
+FamilyWork[input_type] <player_node_cap[input_type]>
+  hot[sigma]
+    logical RNG path key
+    role selector                          # best_response only: trained or frozen
+    true_profile <P>
+    folded_range_row <P-A>                 # for A the number of live ranges
+    mode-specific controller/path fields
+    reservation/publication metadata
 
-descriptor workspace
-routing workspace
-chance-frontier workspace
-inference workspace
-completion workspace                      # RB only
+  retained[sigma]
+    model_input <size[input_type]>
+    x_p                                   # sampled only
+    owner
 ```
 
-Let
+Fix `trained_player_cap : input_partition -> int`. For each `input_type` and
+$0\leq i<\mathtt{trained\_player\_cap[input\_type]}$:
 
-$$
-\mathcal O_{\rm term}
-=\{o\in\mathcal O:\text{a stopped child can have output type }o\}.
-$$
+```text
+SigmaHead[input_type] <trained_player_cap[input_type]>
+  old_v[i] <size[output(input_type)]>
+  old_t[i]                                 # branched only
+  old_c[i]                                 # branched only
+```
 
-The game/estimator terminal-boundary rule assigns each stopped child its output type; unlike
-$\operatorname{output}(i)$, this assignment does not imply that the stopped child owns a model-input row.
-There is one `FamilyWork` slab per $i\in\mathcal I$, in branched geometry one `ActionOccurence` slab per applicable
-$o\in\mathcal O$, and one `Leaf` slab only per $o\in\mathcal O_{\rm term}$. The notation
-`Leaf[terminal output_type]` means exactly this restriction; there is no leaf allocation for a nonterminal-only
-output block. Every row gets its final address when created, and addresses are not recycled within an admitted
-attempt.
+Let `action_partition = input_partition` and `action_output = output` in sequential mode. In branched mode,
+`action_partition = output_partition` and `action_output` is the identity. Fix
+`action_cap : action_partition -> int`. For each `action_type` and
+$0\leq a<\mathtt{action\_cap[action\_type]}$:
 
-For each `input_type`:
+```text
+ActionHead[action_type] <action_cap[action_type]>
+  action[a]
+  old_log_pi[a] <size[action_output(action_type)]>
+```
+
+Let `K_strata` be the width of the evaluator's nested-pot axis. Fix `leaf_cap : int`.
+For each $0\leq\tau<\mathtt{leaf\_cap}$, sampled mode stores exactly the batched
+row inputs of `evaluate_showdowns`:
+
+```text
+Leaf <leaf_cap>                             # sampled
+  board_cards[tau] : uint8 <5>
+  combo_ids[tau] : int32 <P>
+  stratum_level[tau] : int32 <P>
+  payoff_baseline[tau] : float32 <P>
+  stratum_amount[tau] : float32 <K_strata>
+```
+
+For the same row $\tau$, RB mode stores exactly the batched row inputs of `complete`;
+best response adds `selected_player[tau]` and calls `complete_selected`:
+
+```text
+Leaf <leaf_cap>                             # RB
+  board_cards[tau] : uint8 <5>
+  range_weights[tau] : float32 <P,H>
+  selected_player[tau] : int32             # best_response only
+  stratum_level[tau] : int32 <P>
+  payoff_baseline[tau] : float32 <P>
+  stratum_amount[tau] : float32 <K_strata>
+  seed[tau] : int64
+```
+
+This is contract v2 from `/home/pablob/poker-gpu-evaluator/docs/api.md`. `n_samples` is call-level configuration,
+not a `Leaf` column.
+
+Fix `topology_cap` and `topology_edge_cap`. For each topology row $s$ and child edge $e$:
+
+```text
+Topology <topology_cap>
+  parent[s]                   # nearest retained ancestor
+  child_begin[s]              # into TopologyChild
+  N[s]
+  N_tilde[s]
+  N_tgt[s]
+  owner[s]
+  familywork_row[s]           # -1 if absent
+  sigma_head_row[s]           # -1 if untrained
+  action_begin[s]             # -1 if untrained
+
+TopologyChild <topology_edge_cap>
+  label[e]                    # action or chance label
+  path_length[e]              # original edges represented by this edge
+  target_kind[e]              # Topology or Leaf
+  target_row[e]
+```
+
+For each `folded_type \in {pre, post}` and folded-range row $f$:
+
+```text
+FoldedRanges[folded_type] <folded_range_cap[folded_type]>
+  r_pi[f] <width[folded_type]>
+```
+
+Here `width[pre] = K` and `width[post] = H`; every `post_A` family shares `FoldedRanges[post]`.
+
+For each `input_type`, queue metadata contains:
+
+```text
+QueueBehaviorMetadata <|input_partition|>
+  head[input_type]
+  ready_tail[input_type]
+  reserved_tail[input_type]
+  frontier_cost[input_type]                 # safeguard only
+  controller_state                          # safeguard only
+```
 
 $$
 0
 \le\mathtt{head[input\_type]}
-\le\mathtt{readyTail[input\_type]}
-\le\mathtt{reservedTail[input\_type]}
-\le N_{\mathtt{input\_type}}^{\rm cap}.
+\le\mathtt{ready\_tail[input\_type]}
+\le\mathtt{reserved\_tail[input\_type]}
+\le {\tt player\_node\_cap[input\_type]}
 $$
 
-`[head,ready_tail)` is committed FIFO work and `[ready_tail,reserved_tail)` is reserved but unpublished. Publication
-exposes only the longest consecutively completed reservation prefix.
+`[head,ready_tail)` is committed FIFO work; `[ready_tail,reserved_tail)` is reserved but unpublished.
+When enabled, enqueue and dequeue add and remove the same declared C-head contribution from `frontier_cost`.
 
-`FamilyWork[input_type]` is a batch-major, sigma-indexed structure of arrays:
+%%%HERE
 
-```text
-FamilyWork[input_type]
-  hot
-    logical node/root identity
-    logical RNG path key
-    role/model selector                    # best_response only
-    true_profile[P]                        # except branched RB
-    mode-specific controller/path fields
-    reservation/publication metadata
+### 2.1 Data flow
 
-  retained
-    natural_input[size[input_type]]
-    x_p                                   # sampled only
-    owner
-    old_v[size[output(input_type)]]
-    action                                # sequential only
-    old_log_pi[size[output(input_type)]]  # sequential only
-    old_t                                 # branched only
-    old_c                                 # branched only
+Every stable family prefix runs `model -> sample -> commit`:
+
+```mermaid
+flowchart LR
+  Q["FamilyWork[input_type] FIFO"] --> M["model(model_input)"]
+  M --> W["family workspace<br/>raw heads"]
+  W --> S["sample"]
+  S -. "async compact D2H" .-> T["CPU Topology"]
+  S --> D["family workspace<br/>labels + descriptors"]
+  D --> C["commit"]
+  Q --> C
+  C -. "async endpoint patches" .-> T
+  C --> H["SigmaHead + ActionHead"]
+  C --> Q2["FamilyWork[next input_type] FIFO"]
+  C --> L["Leaf FIFO"]
+  Q2 --> M
+  L --> E["poker-gpu-evaluator"]
+  E --> R["LayerWork buffer 0<br/>Leaf order"]
 ```
 
-The whole structure is sigma-indexed; `hot` and `retained` are column lifetimes, not row kinds or queues.
-`natural_input` is an opaque fixed-stride schema selected only by `input_type`, containing the game-defined public
-state, history, range representation, and immutable dependency references.
+- `model` reads only `model_input` and writes raw heads to the workspace.
+- `sample` owns all draws. It writes labels to the workspace and queues their compact CPU `Topology` packet.
+- `commit` moves the workspace into saved heads, writes all `FamilyWork`/`Leaf` destinations atomically, and queues
+  compact endpoint patches.
 
-The realized $x_p$ is a separate retained column only for the sampled private-state estimator; it is not part of
-`natural_input`.
+`SigmaHead` copies direct model outputs. `ActionHead` selects the sampled entries of the model action head.
+The GPU does not wait for the topology transfer. The policy tensor is never expanded to child shape.
 
-In branched geometry, `ActionOccurence[output_type]` contains:
+### 2.2 Compact topology
+
+During rollout,
+
+$$
+\mathtt{Topology}
+=\{\text{trained player nodes}\}\cup\{\mathsf s:\widetilde N(\mathsf s)\geq2\}.
+$$
+
+In best response, trained player nodes exclude frozen opponents. Non-player nodes satisfy $N=\widetilde N$;
+an omitted frozen player also has $\widetilde N=1$. Every omitted node therefore has $N=\widetilde N=1$.
+A compressed edge stores its original `path_length`, preserving layer distance and unary cost. Its endpoint domains
+determine output conversion. Duplicate sampled labels remain distinct edges.
+
+`sample` publishes degrees and labels in logical order. Descendant family rows carry the unresolved edge handle;
+later sample packets or commit endpoint patches close it.
+
+### 2.3 Sampling laws
+
+| Geometry | `sample` |
+|---|---|
+| sequential | Draw one label. Sampled mode fixes one $x\sim\mu$ per root. |
+| branched | Draw $\widetilde N$, the executed $N$, then one labeled child per ordinal. The root uses the same law. |
+| branched RB | Also draw one fresh collision-conditioned posterior profile per logical child; discard it after `commit`. |
+
+Sequential roots and RNG keys are fixed before draws; only root multiplicity branches.
+Only branched RB requires non-trivial sampling; the other modes need categorical draws and stable labels.
+Sampled-branched and branched-best-response sampling still require explicit theory contracts.
+
+Best response selects the learner or frozen model per stable FIFO subspan. Frozen decisions create `FamilyWork`, but
+no saved heads or targets.
+
+Root refill protects the original root action prefix. It recomputes descendant path masses using the final degree;
+refill-only children have no root action target.
+
+### 2.4 Queues, routing, and fusion
+
+Each family processes its largest feasible stable FIFO prefix; it never skips older rows to reduce padding.
+Advancing `head` empties queue work. `FamilyWork.hot` and `FamilyWork.retained` remain allocated until
+align-and-seal.
+Only declared `input_type` families create queues; street, width, and padding properties do not.
+
+`Leaf` is another FIFO. Bounded calls to `evaluate_showdowns`, `complete`, or `complete_selected` write into
+`LayerWork`; the consumed `Leaf` row then becomes dead.
+
+Chance closure repeats `sample -> commit` in a bounded device frontier without a host synchronization per generation.
+
+For a one-CTA pack, fuse sampling, destination counts, stable offsets, materialization, and commit when resources
+permit. Larger packs use:
 
 ```text
-ActionOccurence[output_type]
-  action
-  old_log_pi[size[output_type]]
+sample/descriptors -> stable scan -> reserve -> materialize -> commit
 ```
 
-Each trainable branched sigma row reserves one exact contiguous `ActionOccurence` span before draws. For a sigma row
-in `FamilyWork[i]`, its action rows reside in `ActionOccurence[output(i)]`; refinement guarantees that their numerical
-width is `size[output(i)]`.
+Branched-RB rejection sampling, folded-stat construction, transition, classification, and chance closure should
+fuse. Showdown and completion stay in `poker-gpu-evaluator`.
+Fixed-address model packs and bounded chance steps are additional CUDA-graph capture units.
 
-In branched geometry, `TreeTopology` is append-only and node-indexed:
+Poker stores folded normalized `r_pi` only in `FoldedRanges`: `K`-wide for `pre`, `H`-wide for shared `post`.
+`FamilyWork.hot` stores direct references; `model_input` stores compact folded statistics. A completion-bound `pre`
+row expands `K -> H` once when materializing `Leaf.range_weights`, because the evaluator API is $H$-native. See
+[`poker_folded_statistics.md`](poker_folded_statistics.md) and
+[`poker_rejection_chance_closure.md`](poker_rejection_chance_closure.md).
 
-```text
-TreeTopology                               # branched only
-  node
-    parent
-    child_begin
-    degree
-    nominal_degree
-    target_degree
-    node_kind
-    leaf_row
-    player_row
-
-  player
-    node
-    familywork_sigma_row
-    action_occurrence_begin
-```
-
-Topology rows and child spans are assigned when created and filled as their `input_type` runs. Sequential geometry
-reconstructs its chronology from `FamilyWork.hot` root/path identities and needs no structural tree.
-
-Best response creates action rows only for the learner's decisions. Frozen branched parents keep structural children
-and `old_t`/`old_c`, but no learner sigma or action rows.
-
-`natural_input` is the sole large state/range payload; no second active reach or public-state owner exists. Poker
-currently uses normalized linear range weights. If tests require log weights, they replace the one production schema
-rather than become a fallback.
-
-`DependencyStore` exists only when a game schema contains immutable dependency references. In poker it owns folded
-summaries. A dependency receives a final source address when created; descendant `natural_input` rows retain only its
-reference. Seal finds dependencies reachable from surviving learner rows, copies each reachable dependency once into
-an exact immutable extent, remaps those references, and releases the source store and unreachable rows. The compact
-dependency extent survives until the last model-input consumer.
-
-`QueueBehaviorMetadata` is a separate fixed owner, not a `FamilyWork` column or target field. When the queue-pressure
-safeguard is enabled, it maintains the existing frontier-cost forecast and controller counters. Enqueue adds the
-required C-head contribution and dequeue removes that same contribution under the existing queue law; any cached
-per-entry contribution is private queue-manager bookkeeping.
-
-## 3. Rollout: assign and fill final rows
-
-### 3.1 Mode laws
-
-- Sequential modes freeze roots and logical keys before draws, sample one
-  $x\sim\mu$ per root, and carry it unchanged. Only the root branches.
-- Branched mode creates one labeled tree rooted at $\varnothing$; the root uses
-  the ordinary randomized-rounding rule. Duplicate public events remain
-  distinct nodes.
-- Sampled branched mode carries its declared tree-law profile. Branched RB
-  samples a fresh collision-conditioned posterior profile per logical child
-  and discards it after materialization.
-- Root refill protects the pre-refill target degree, then recomputes final root
-  transition/path masses using the augmented realized degree. Refill-only root
-  children receive no root action target, but their descendant decisions
-  remain trainable.
-- Best response selects current/frozen models through stable FIFO subspans.
-  Frozen `FamilyWork` rows survive through targets and disappear at seal.
-
-Sampled-branched and branched-best-response laws still need explicit theory contracts; currently only sequential best
-response is authoritative.
-
-### 3.2 One parent transaction
-
-For the next stable `input_type` prefix:
-
-1. Reserve child identities and, in branched geometry, logical child spans, topology rows, and exact action spans
-   before random draws.
-2. Run the role-selected model directly on the `input_type` prefix.
-3. Write `old_v` for trainable sigma rows; in sequential geometry write the selected `action` and `old_log_pi` in
-   those same rows; write `old_t` and `old_c` for every branched player row.
-4. In branched geometry, sample actions and immediately fill their reserved `ActionOccurence` rows with `action` and
-   `old_log_pi`.
-5. Produce lightweight child descriptors and classify destinations.
-6. Compute stable destination offsets and reserve exact `FamilyWork`, `Leaf`,
-   or bounded chance-frontier spans.
-7. Materialize each large child payload once at its final destination.
-8. Publish every destination together only after the whole transaction is
-   complete.
-
-The full policy output is never expanded to child shape. Descriptors contain only routing/transition scalars and, when
-unavoidable, ephemeral branched-RB combo IDs. Logical reservations precede draws; exact physical reservations follow
-classification.
-
-Before any ready tail advances, every destination extent must fit, sampling and transition must report success, every
-required destination column must be written, and all required stream dependencies must complete. All destinations
-then publish together. Failure may leave reserved, unpublished bytes, but never advances a committed tail; those bytes
-are discarded with the failed iteration or attempt.
-
-The partition abstraction remains the core/game boundary. Core removes a stable `input_type` prefix and invokes its
-declared model and game hooks. The game may fuse action/event sampling, transition, chance closure, range
-rescaling/normalization, destination classification, and final writes, but every resulting player row lands directly
-in `FamilyWork[next_input_type]` and every stopped row in `Leaf[terminal output_type]`. Core reasons only about
-declared schemas, sizes, mappings, and byte/work contracts.
-
-For poker, this means that `pre` batches carry class-native ranges and `post_A` batches carry live-player exact-hand
-ranges. A transition may derive a bounded symmetry-preserving exact-hand view, multiply an acting range by the
-selected policy likelihood, safely normalize or rescale it, close intervening chance events, and write either the next
-`pre`/`post_A` row or completion-ready leaf fields. Folded-player summaries remain immutable referenced dependencies
-with an explicit last consumer and seal remapping; none of these poker details creates another core queue.
-
-### 3.3 Stable routing and poker CUDA fusion
-
-For a one-CTA pack, fuse descriptor generation, destination counting, stable offsets, reservations, final writes, and
-commit when register/shared-memory pressure permits.
-
-Larger packs use bounded fixed workspaces:
+Commit advances every destination tail together after all writes and dependencies succeed. Failure advances none.
+Sequential overflow stops; admitted branched overflow may retry only the whole tree with a disjoint RNG address.
 
 ```text
-descriptor generation
--> stable scan/routing
--> destination reservation
--> final materialization
--> transaction commit
-```
-
-Atomics may count destinations, but deterministic logical order fixes insertion order.
-
-Branched-RB rejection sampling, transition, classification, and chance closure should fuse. Its collision-conditioned
-sampler shares one CUDA device source with the sibling evaluator's `sample_joint_profiles`, preserving legality, RNG
-version, exhaustion, and row-local reproducibility. Failures use `DeviceFailure`.
-
-The other geometry/estimator combinations make zero rejection-sampler calls. RB completion remains a separate
-sibling-evaluator consumer. A preallocated accepted-ID buffer is only an intermediate step toward the fused path.
-
-### 3.4 Device-resident chance closure
-
-Chance children remain in a bounded GPU frontier and repeat the same route and commit protocol until empty. The host
-does not synchronize per generation.
-
-Stopped children write directly to final leaf rows of their terminal output type:
-
-```text
-Leaf[terminal output_type]
-  terminal_reward[P]                      # sampled only
-  trajectory_or_topology_row              # sampled only
-  completion_public_fields                # RB only
-  range_weights                           # RB only
-  stratum_fields                          # RB only
-  payoff_fields                           # RB only
-  logical_completion_key                  # RB only
-```
-
-A stopped child never visits a generic occurrence store or temporary leaf format.
-
-When all `input_type` queues and chance frontiers are empty, close rollout publication. Do not seal yet: target
-creation still consumes retained `FamilyWork` columns, topology, and leaves.
-
-## 4. After rollout: create target-addressed storage
-
-Allocate exact extents from realized work:
-
-```text
-SequentialTargetTopology                      # sequential only
-FlattenedTargetTopology                       # branched only
-SigmaTarget[output_type]
-ActionTarget[output_type]                      # branched only
-LayerWork[output_type]                         # branched only
-SequentialPosterior[output_type]               # sequential RB only
-```
-
-Each array has one exact extent per applicable `output_type`.
-
-`SigmaTarget` has one row per trainable $\sigma$; `ActionTarget` has one row per target-eligible branched $\sigma a$.
-In best response, these are exclusively exploiter-owned rows; frozen-player nodes receive neither target. Target
-address assignment already follows the stable order that seal will use. `SigmaTarget` and `ActionTarget` contain only
-numerical target outputs. In branched geometry, `ActionOccurence` remains a separate input owner through optimization
-rather than being copied into a target array.
-
-Generated target contents are:
-
-```text
-SigmaTarget[output_type]
-  v_lambda_hat[size[output_type]]
-  t_hat                                     # branched only
-  c_lambda_hat                              # branched only
-
-ActionTarget[output_type]                    # branched only
-  p_hat[size[output_type]]                  # RB only
-  a_lambda_hat[size[output_type]]
-
-SequentialPosterior[output_type]             # sequential RB only
-  p_hat[size[output_type]]
-```
-
-Sampled targets are scalar. RB value/posterior fields have width `size[output_type]`, while the `old_v` row in
-`FamilyWork[input_type]` has width `size[output(input_type)]`. Sequential RB stores posterior mass once for each
-trajectory, player, and `output_type`, and derives advantage as `v_lambda_hat - old_v` within the common output
-domain. Branched RB does not duplicate a posterior row in `SigmaTarget`: the sigma posterior used by value, entropy,
-and reference-KL losses is the exact mean of its target-eligible `ActionTarget.p_hat` rows.
-
-### 4.1 Sequential target topology
-
-Build a decision-only chronological mapping:
-
-```text
-SequentialTargetTopology                  # sequential only
-  trajectory_ptr
+DeviceFailure
+  status
+  phase
+  failure_code
   input_type
-  familywork_sigma_row
-  output_type
-  sigma_target_row
-  posterior_row                          # RB only
-  leaf_row
+  logical_address
+  requested_extent
+  available_extent
+  sampler_attempt_count
 ```
 
-Chance and frozen-opponent decisions are absent because neither advances the retained player's clock in a realized
-trajectory.
+Concurrent failures resolve to the minimum logical address; all ranks take the same boundary decision.
 
-### 4.2 Branched flattening
+## 3. Seal and Completion
 
-`TreeTopology` owns append-only node identity, parent/child spans, node kind, leaf rows, target-eligible prefixes, and
-mappings to input/player/action rows. Flatten it once into stable root-depth order:
+### 3.1 `LayerWork`
+
+Completion may overlap rollout. For each leaf row $\tau$, buffer `0` first exposes the evaluator's exact output view:
 
 ```text
-FlattenedTargetTopology                    # branched only
-  layer_ptr[L+1]
-
-  node
-    TreeTopology.node columns
-    output_type                              # present for every structural node
-
-  player
-    TreeTopology.player columns
-    owner
-    input_type
-    retained_control_row
-    trainable_decision_row
-
-  trainable_decision
-    player_row
-    action_occurrence_begin
-    sigma_target_row
-    action_target_begin
-
-  protected root metadata
+LayerWork.completion <leaf_cap>
+  payoff[tau] : float32 <P>                # sampled: evaluate_showdowns
+  p_hat[tau] : float32 <P,H>               # RB self_play: complete
+  v_hat[tau] : float32 <P,H>
+  p_hat[tau] : float32 <H>                 # RB best_response: complete_selected
+  v_hat[tau] : float32 <H>
+  n_eff[tau] : float32                     # RB
 ```
 
-Every child enters the next depth layer; sibling and target-action spans remain stable and contiguous. Frozen
-best-response players keep structural/control rows but no learner mapping. Flattening permutations are scratch; a bulk
-CPU scalar rebuild is acceptable until measurements justify a device stable sort.
+The completion epilogue validates `n_eff`, converts `v_hat` in-place to
+$m_hat=p_hat*v_hat$, and reduces `m_hat` to vector value. A requested evaluator option may return `m_hat` instead of
+`v_hat`, eliminating the multiply and the `v_hat` interpretation without adding a field.
 
-The `output_type` on every structural node selects its numerical `LayerWork` block. Each parent recurrence therefore
-knows both child and parent domains and applies the declared conversion (`post <- post`, `pre <- pre`, or
-`pre <- post`) without requiring a target row on that node.
-
-`LayerWork` holds only two adjacent depth layers:
+Let `P_train = P` in self-play and `P_train = 1` in best response. For each `output_type`, buffer
+$b\in\{0,1\}$, and frontier row $j$, propagation uses:
 
 ```text
-LayerWork[output_type]                     # branched only
-  p_hat[P,Z]                              # RB only; omit P axis in best_response
-  m_hat[P,Z]                              # RB only; omit P axis in best_response
-  v_vector_hat[P]
-  c_lambda_hat_work
-  delta
+LayerWork[output_type] <2, leaf_cap>
+  p_hat[b,j] <P_train, size[output_type]>   # RB only
+  m_hat[b,j] <P_train, size[output_type]>   # RB only
+  v_vector_hat[b,j] <P_train>
+  c_lambda_hat_work[b,j]
+  delta[b,j]
 ```
 
-Here $Z=\mathtt{size[output\_type]}$ in RB. Size the two alternating buffers to the exact largest adjacent-layer
-requirement.
+Sampled `payoff` becomes `v_vector_hat`, selecting the exploiter component in best response. RB completion produces
+the remaining fields. Cost and delta start at zero.
 
-## 5. Completion: initialize leaves and direct target outputs
+`output_partition` declares an upstream conversion DAG. For every edge `early <- late`,
+`size[early] <= size[late]`. Logical `LayerWork[output_type]` views share two physical arenas: after the last
+consumer of a later row, its wider bytes may back earlier rows. Early rows keep their compact logical shape; only
+their backing bytes are reused. Poker uses `pre <- post`.
 
-In RB, run sibling-evaluator completion in bounded microbatches.
-
-Sampled leaves initialize `v_vector_hat` directly. RB completion initializes probability mass `p_hat`,
-posterior-weighted moment
-
-$$
-\widehat M_p(-_p,\mathsf s)
-=\widehat{\mathbb P}(-_p\mid\mathsf s)
- \widehat V_p(-_p,\mathsf s),
-$$
-
-plus `v_vector_hat`, zero cost, and zero delta. Sequential completion writes its exact `SigmaTarget` values and shared
-`SequentialPosterior` rows directly.
-
-For the RB `pre <- post` boundary, aggregate exact-hand mass and moment before conditionalization:
+For a `pre` leaf, the evaluator first writes its $H$-shaped completion view; the epilogue writes the $K$-shaped
+propagation view into the other arena. At every `pre <- post` edge, aggregate mass and moment before
+conditionalization:
 
 $$
 (Gz)_k=\sum_{h:c(h)=k}z_h,\qquad
@@ -611,189 +350,192 @@ $$
                            \sum_{h:c(h)=k}\widehat{\mathbb P}_{p,h}\right).
 $$
 
-The same aggregation seeds preflop completion leaves. Sampled mode performs no $H\to K$ aggregation.
+### 3.2 `align-and-seal`
 
-## 6. Propagate deepest-to-root
+As soon as family/chance queues and topology transfers finish, the CPU computes
 
-Sequential targets batch equal reverse-time positions and use one CUDA launch per realized trajectory depth.
+$$
+L(\sigma)
+=\max_{\tau\text{ terminal below }\sigma}|\tau\setminus\sigma|
+=\max_{e:\sigma\to u}\left(\mathtt{path\_length}[e]+L(u)\right),
+\qquad L(\mathtt{Leaf})=0.
+$$
 
-Branched targets use one mixed-domain CUDA launch per non-leaf depth. A warp, CTA, or measured bounded group owns one
-ragged parent and:
-
-1. reduces child value, cost, delta, and in RB mass/moment;
-2. writes the parent's alternating `LayerWork` row;
-3. writes sigma-indexed value, T, and C outputs;
-4. writes each action-indexed advantage and optional RB posterior output;
-5. bootstraps acting-player moment/value with `old_v`;
-6. bootstraps cost with `old_c`;
-7. uses `old_t` as $T^*$ only when `target_degree == 1`;
-8. applies the protected root target prefix.
-
-Arithmetic remains exactly the authoritative branched backward, target, trace-variance, and value recurrences, with
-only the approved $H\to K$ aggregation inserted.
-
-Launch count is proportional to tree/trajectory depth, never node or edge count. A small fixed number of domain- or
-degree-specialized launches per depth is acceptable only when end-to-end measurements win.
-
-After root completion, release leaves, completion outputs, `LayerWork`, `old_t`, and `old_c`.
-
-## 7. Seal and atomically publish the learner store
-
-Sealing begins only after every target and shared posterior row validates. Target addresses were assigned in this same
-stable order, so alignment is construction-time bookkeeping rather than a target reshuffle.
-
-1. Delete all `FamilyWork.hot` columns.
-2. In best response, stable-delete frozen-opponent `FamilyWork` and sigma rows.
-3. Stable-compact surviving `FamilyWork.retained` rows and seal
-   branched `ActionOccurence` into exact immutable extents.
-4. Within each `output_type`, use one deterministic concatenation of its
-   contributing `input_type` subspans. A base offset then aligns each sealed
-   `FamilyWork[input_type]` row with its `SigmaTarget` row without a per-row
-   mapping. Align branched `ActionOccurence` rows one-for-one with
-   `ActionTarget`; sequential `action` and `old_log_pi` are already columns of
-   the aligned sigma row.
-5. Preserve, for every sigma row, the pointer and exact count of its
-   contiguous $\sigma a$ rows in every action-indexed array.
-6. After any root refill, compute final partition-local decision masses.
-   Retain their log weights through exact learner-sampler normalization, then
-   release transient path/controller factors.
-7. Reduce sequential or flattened topology to `LearnerIndex`.
-8. Validate every alignment and action span.
-9. Compact and remap reachable game dependencies, then release source slabs, source dependencies, full topology,
-   construction maps, and seal scratch.
-10. Atomically publish the complete immutable training store.
-
-`LearnerIndex` retains only posterior references, exact action spans, target degree, sampling mass, and structural
-gates that optimization needs.
-
-No node, parent, child, or layer topology survives sealing.
-
-`t_hat` is valid exactly when `target_degree >= 2`; no validity mask is stored. Action rows exist exactly for
-target-eligible children.
-
-Exact copying is the default because rollout capacity should not remain live through repeated learner passes. A
-zero-copy view is allowed only if measured phase peak and optimization width improve.
-
-## 8. Learner
-
-The current-policy forward remains sigma-major. For each largest feasible consecutive sigma subspan $J$, construct in
-one preallocated workspace:
+Let `layer_count`, `layered_node_count`, `layered_edge_count`, and `carry_count` be the realized exact counts.
+Shorter branches carry forward until their parent layer is ready. For each layer $\ell$, node $s$, child edge $e$,
+and carry row $c$, the CPU emits:
 
 ```text
-local_edge_ptr[|J|+1]
-child_row[E_J]
-edge_to_local_decision[E_J]
+LayeredTopology
+  layer_ptr <layer_count+1>
+  carry_ptr <layer_count+1>
+
+  node <layered_node_count>
+    child_begin[s]
+    N[s]
+    N_tgt[s]
+    N_tilde[s]
+    owner[s]
+    input_type[s]
+    output_type[s]
+    destination_work_row[s]
+    sigma_head_row[s]                     # -1 if structural
+    sigma_target_row[s]                   # -1 if structural
+    action_begin[s]                       # -1 if structural
+
+  child <layered_edge_count>
+    path_length[e]
+    source_work_row[e]
+
+  carry <carry_count>
+    output_type[c]
+    source_work_row[c]
+    destination_work_row[c]
 ```
 
-$E_J$ is the exact sum of action-span lengths. Admission constrains both sigma and edge counts.
+Layer $\ell$ owns node rows in `[layer_ptr[ell],layer_ptr[ell+1])` and carry rows in
+`[carry_ptr[ell],carry_ptr[ell+1])`. In best response, delete frozen `FamilyWork` rows; any frozen topology row is
+already a headless $\widetilde N\geq2$ structural reduction.
 
-Sequential work reads the unique `action` and `old_log_pi` from its sealed `FamilyWork` sigma row and derives
-advantage from `SigmaTarget.v_lambda_hat - FamilyWork.old_v`. Branched action work additionally gathers advantage and
-optional RB posterior rows from `ActionTarget`, then segment-reduces to sigma rows. Branched RB derives sigma
-posterior mass as the exact mean over each action span; sequential RB reads `SequentialPosterior`. RB value, entropy,
-and optional reference-KL terms use that sigma posterior mass. Sampled losses use the retained exact $x_p$. T/C losses
-use `t_hat` and `c_lambda_hat`, structurally gating T by target degree.
-
-There is no padding, invented safe action, inactive-event evaluation, or `max_actions_per_decision` production API.
-
-After the final optimizer step, release compact `FamilyWork`, sealed branched `ActionOccurence`, compact game
-dependencies, `LearnerIndex`, shared posterior rows, `SigmaTarget`, and `ActionTarget`.
-
-## 9. Failure, memory, and execution policy
-
-`DeviceFailure` is a fixed device record:
+Let `trained_player_count[input_type]` and `trained_action_count[action_type]` be realized exact counts.
+Stable-compact `FamilyWork.retained` and `SigmaHead` to the player counts and `ActionHead` to the action counts.
+For each learner player row $i$ and learner action row $a$, allocate aligned targets:
 
 ```text
-status
-phase
-failure_code
-input_type
-logical_address
-requested_extent
-available_extent
-sampler_attempt_count
+SigmaTarget[input_type] <trained_player_count[input_type]>
+  v_lambda_hat[i] <size[output(input_type)]>
+  t_hat[i]                                  # branched only
+  c_lambda_hat[i]                           # branched only
+
+ActionTarget[action_type] <trained_action_count[action_type]>
+  p_hat[a] <size[action_output(action_type)]> # RB only
+  a_lambda_hat[a] <size[action_output(action_type)]>
 ```
 
-Concurrent failures resolve to the minimum logical failing address.
-
-Sequential overflow releases the iteration, checkpoints the last completed iteration, and stops. It never drops,
-replaces, retries, or rerolls a trajectory.
-
-Branched capacity overflow is a whole-attempt admission failure. All ranks release it, agree on controller backoff and
-a disjoint next attempt address, then retry within the configured bound. Sampler exhaustion and evaluator or
-correctness failures remain terminal unless their authoritative contract says otherwise.
-
-For a structure-of-arrays owner $X$ with $N_X$ rows and fields $f$, define
-
-$$
-\operatorname{bytes}(X,N_X)
-=\sum_{f\in X}
-  \operatorname{align}\!\left(N_X\,b_f,a_f\right)
-+M_X^{\rm metadata},
-$$
-
-where $b_f$ is the byte width of one field element including its fixed trailing shape and $a_f$ is that column's
-required alignment. Alignment is applied to each allocation, not to a fictitious packed row.
-
-For phase $\phi$, let $\mathcal L_\phi$ be its simultaneously live owners. Admission computes
-
-$$
-M_{\rm required}
-=\max_\phi\left[
-  \sum_{X\in\mathcal L_\phi}
-    \operatorname{bytes}(X,N_X)
-  +W_\phi^{\rm bounded}
-  +W_\phi^{\rm external}
-\right]
-+M^{\rm guard}
-\le M^{\rm budget}.
-$$
-
-Exact realized arrays use their realized row counts; capacity owners use admitted capacities. The ledger takes the
-maximum of complete phases rather than adding objects with disjoint lifetimes:
+Sequential mode stratifies all five arrays by `input_type`. For each sequential learner row $i$, their row order is:
 
 ```text
-rollout
-  model/static
-  FamilyWork and applicable ActionOccurence capacities
-  source DependencyStore and QueueBehaviorMetadata when applicable
-  topology and leaf capacities
-  descriptor/routing/chance/inference workspaces
-
-targets
-  rollout sources, topology, and leaves
-  exact SigmaTarget, ActionTarget, and SequentialPosterior
-  completion workspace and maximum LayerWork
-
-seal
-  rollout sources and completed targets
-  exact compact FamilyWork and applicable ActionOccurence destinations
-  source and exact compact dependency extents
-  LearnerIndex destination and copy/validation scratch
-
-optimization
-  compact FamilyWork, sealed applicable ActionOccurence, targets, and LearnerIndex
-  compact game dependencies
-  model/reference/optimizer and gradient/collective buffers
-  bounded ragged learner workspace
+FamilyWork[input_type].retained[i]
+SigmaHead[input_type][i]
+SigmaTarget[input_type][i]
+ActionHead[input_type][i]
+ActionTarget[input_type][i]
 ```
 
-`W_\phi^{\rm external}` includes calibrated compiler/library workspaces, backend and allocator reservation, and
-graph-owned pools even when PBG does not allocate them directly. Calibration reconciles allocator-reserved and
-NVML-observed peaks. Alignment and the unused guard are mandatory charges.
+Branched mode aligns `FamilyWork.retained`/`SigmaHead`/`SigmaTarget` by `input_type` and
+`ActionHead`/`ActionTarget` by `output_type`. Each sigma row stores its contiguous target-eligible action span.
 
-Start with deterministic allocation-free eager execution. Add streams only when event-protected lifetimes,
-deterministic publication, queue-pressure decisions, complete-iteration throughput, and feasible learner width all
-remain sound. Ordinary rollout has no undeclared device-wide synchronization.
+For each `input_type` and learner row $i$:
 
-CUDA graphs are optimizations, never correctness or storage authorities. Candidate capture units are a fixed-address
-`input_type` forward, the large-pack route pipeline, one bounded chance-generation step, and one fixed-shape learner
-microbatch. Do not capture the whole dynamic iteration.
+```text
+LearnerIndex[input_type] <trained_player_count[input_type]>
+  action_begin[i]                           # branched only; sequential uses i
+  action_count[i]                           # branched only; sequential is 1
+  N_tgt[i]
+  log_sampling_weight[i]                    # branched only
+```
 
-H100 may favor larger batches, more capture, and measured overlap. The 2080 Ti must reject any graph pool or overlap
-schedule that reduces the most valuable forward/backward width; roughly 1 GiB of rollout slabs is acceptable when the
-full phase ceiling still fits. Hardware profiles may change capacity, batch quantum, graph selection, and stream
-schedule, but never semantics or storage layout.
+CPU planning, learner-array copies, and the `LayeredTopology` upload may overlap remaining completion. After
+completion finishes, permute buffer `0` from `Leaf` order into the initial frontier in buffer `1`.
+Delete `FamilyWork.hot`, `Leaf`, `FoldedRanges`, CPU `Topology`, source capacities, and permutation scratch.
 
-Persistent kernels, degree specialization, extra streams, and elementwise fusion follow the same rule: keep one
-measured production choice, not a permanent fallback matrix.
+The operation is transactional. Admission includes simultaneous source and exact destination arrays, both
+`LayerWork` arenas, bounded scratch, library/graph workspaces, and a guard:
+
+$$
+\max_\phi\left(M_{\mathrm{owners},\phi}+M_{\mathrm{bounded},\phi}
++M_{\mathrm{external},\phi}\right)+M_{\mathrm{guard}}\leq M_{\mathrm{budget}}.
+$$
+
+## 4. Target Propagation
+
+Target construction is the CUDA graph:
+
+```mermaid
+flowchart LR
+  subgraph G["CUDA graph"]
+    G1["layer 1 kernels"] --> G2["layer 2 kernels"] --> GD["..."] --> GL["root layer kernels"]
+  end
+  SH["SigmaHead"] --> G1
+  LT["LayeredTopology"] --> G1
+  W["initial LayerWork frontier"] --> G1
+  G1 -.-> T["SigmaTarget + ActionTarget"]
+  G2 -.-> T
+  GL -.-> T
+```
+
+Each layer may use several domain- or degree-specialized kernels. Kernels within a layer are independent; graph edges
+encode every dependency on earlier layers.
+
+For each ready parent, the graph:
+
+1. averages child value, cost, delta, and RB mass/moment;
+2. applies the edge `path_length` cost offset, the child nominal multiplier, and any `late -> early` conversion;
+3. writes the parent's next-frontier `LayerWork` row;
+4. at learner player nodes, uses `SigmaHead` to write `SigmaTarget` and the `ActionTarget` span;
+5. carries rows whose parent is not ready into the other buffer.
+
+Branched rows implement `BranchedValue` with batched ragged reductions; sequential rows are the one-action
+player-only case. `t_hat` exists exactly when `N_tgt>=2`; otherwise `SigmaHead.old_t` supplies $T^*$. Protected
+root reductions use the pre-refill target prefix.
+Rows with `sigma_head_row = -1` execute only the structural reduction path.
+
+After the root graph completes and targets validate, delete `LayeredTopology` and `LayerWork`. The five learner
+arrays and `LearnerIndex` are already sealed; publish them atomically.
+
+## 5. Learner
+
+### 5.1 Sampling
+
+Sequential mode creates one `randperm` per `input_type` and epoch, then chunks it. The same indices gather all five
+aligned arrays.
+
+For each non-empty branched learner/input stratum $m$ with $D_m$ rows and each $0\leq d<D_m$:
+
+```text
+BranchedSampler <|strata|>
+  log_Z[m] : float64
+  alias_threshold[m] : float64 <D_m>
+  alias_index[m] : int32 <D_m>
+```
+
+The alias table samples sigma row $d$ with normalized decision mass
+
+$$
+\omega_d=\prod_{s\prec d}\frac1{N(s)}.
+$$
+
+Root refill uses the final root degree in descendant masses. Best response contains only learner decisions.
+The variance/cost allocator chooses integer statistical sample counts; physical GPU widths do not round them.
+
+### 5.2 Physical batches
+
+Sequential batches need one index vector. Branched batches use:
+
+```text
+sigma_index <B>
+action_ptr <B+1>
+action_index <E>
+```
+
+Admission bounds both $B$ and $E$. Gather the aligned sigma arrays and, in branched mode, the aligned action spans.
+Run the current model once per sigma, compute the loss, and backward immediately in one bounded workspace.
+
+### 5.3 Loss inputs
+
+```text
+model input              FamilyWork.retained.model_input
+sampled private state    FamilyWork.retained.x_p
+old sigma heads          SigmaHead
+sigma targets            SigmaTarget
+action + old log policy  ActionHead
+advantage + posterior    ActionTarget
+```
+
+The sigma RB posterior is the mean of its action posterior rows. Sequential action spans have length one, so every
+action reduction is identity. T/C losses use `N_tgt` as the T-validity condition.
+
+There is no action padding, invented safe action, inactive-event evaluation, or `max_actions_per_decision` API.
+Fixed-shape learner microbatches are CUDA-graph candidates. Hardware profiles may change pack widths, streams,
+fusion, and graph shapes, but not schemas or sampling laws. Release transient gathers after each backward and the
+sealed store after the final optimizer step.
