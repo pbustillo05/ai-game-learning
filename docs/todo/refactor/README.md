@@ -8,6 +8,7 @@ game hooks and implementation plan without overriding it:
 - [`poker_branched_rb_sample.md`](poker_branched_rb_sample.md): poker branched-RB implementation of `sample`.
 - [`poker_folded_statistics.md`](poker_folded_statistics.md): folded-state inputs, outputs, and refresh.
 - [`poker_policy_cuda_operator.md`](poker_policy_cuda_operator.md): canonical differentiable policy composition.
+- [`layered_target_creation.md`](layered_target_creation.md): sole layered CUDA target path.
 - [`storage_redesign_refactorability.md`](storage_redesign_refactorability.md): implementation, cleanup, and cutover.
 
 ## Proposed repository boundary
@@ -25,13 +26,13 @@ This proposal supersedes current ownership notes after the required theory and i
 
 One common run-level `rollout.beta_max` bounds fixed and adaptive ordinary-node intensity. Ordinary player and chance
 degrees share `N_max = ceil(beta_max)`; no second degree-bound hyperparameter exists.
-Hardware-selected warp counts and chance-closure variants belong in `configs/hardware/`, with their exact schema
-deferred to kernel tuning. Initial tuning loads existing checkpoints, generates short RTX 2080 Ti trajectories for
-`P in {2,6}`, and captures their actual work; experimental outputs belong under `runs/experiments/`.
+Capacities are fixed run hyperparameters. Hardware profiles tune launch shapes, not algorithms.
+Initial tuning loads existing checkpoints and captures short RTX 2080 Ti trajectories for `P in {2,6}`;
+experimental outputs belong under `runs/experiments/`.
+Experiments select one implementation; production deletes every alternative.
 
 ## Deferred
 
-- Standalone prototype versus full queued-storage implementation scope.
 - Duplicate-node computation reuse. Duplicate sampled children always keep distinct logical identities and topology
   edges.
 

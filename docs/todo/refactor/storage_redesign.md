@@ -4,23 +4,22 @@ Status: implementation proposal; not yet an authoritative production contract.
 
 ## 1. Fundamentals
 
-### 1.1 One schema, four independent axes
+### 1.1 One schema, twelve modes
 
 Every allocation is generated from:
 
 ```text
 training_regime       self_play | best_response
-rollout_geometry      sequential | branched
+rollout_mode          sequential | branched.fixed | branched.KKT
 private_estimator     sampled | rao_blackwell
-beta_mode             fixed_beta | KKT_beta       # branched only
 ```
 
-Mode-inapplicable fields shown below are omitted from the generated schema.
+The $2\times3\times2$ mode row determines fields and behavior. Inapplicable fields are absent.
 
 `root_count >= 1` is an independent batch dimension, not a branching degree. Root row $r$ starts one rollout tree
 with local distinguished root $(r,\varnothing)$ and its own intrinsic fields.
 
-Sequential geometry is the specialization
+Sequential mode is the specialization
 
 $$
 \beta(\mathsf s)=1
@@ -28,8 +27,8 @@ $$
 N(\mathsf s)=\widetilde N(\mathsf s)=1
 $$
 
-at every node. Branched geometry permits $\beta(\mathsf s)\neq1$ and applies the ordinary branching law to each root.
-Both geometries accept any `root_count`. Multiple statistically identical roots are strongly discouraged in branched
+at every node. Branched modes permit $\beta(\mathsf s)\neq1$ and apply the ordinary branching law to each root.
+All modes accept any `root_count`. Multiple statistically identical roots are strongly discouraged in branched
 mode because branching already creates work; use them when roots differ intrinsically, such as sampled
 `true_profile`, stack size, or another model condition.
 
@@ -63,7 +62,7 @@ Each data-structure is indexed by some type of nodes:
 
 - `FamilyWork` is **player-node-indexed**; `SigmaHead` and `SigmaTarget` contain only learner-owned player nodes
 - `ActionHead` and `ActionTarget` are **action-indexed**: sequential mode has one action row per learner player node; branched mode has one per target-eligible child
-- `Topology` and `LayeredTopology` are **structural-node-indexed** as defined in Section 2.2.
+- `Topology` and `LayerPlan` are **structural-node-indexed** as defined in Section 2.2.
 
 `trained` and `learner-owned` are synonymous: every player in self-play, only the exploiter in best response.
 
@@ -81,6 +80,9 @@ convention before implementation.
 CPU owns only compact topology and movement plans; numerical work and bulk storage remain on the accelerator.
 
 ## 2. Family-based Rollout
+
+All `*_cap` values are fixed run hyperparameters. Each owner uses one aligned SoA arena; every field is contiguous
+over rows. In particular, a stable `FamilyWork[input_type]` prefix is a direct model batch.
 
 Fix `player_node_cap : input_partition -> int`. For each `input_type` and
 $0\leq\sigma<\mathtt{player\_node\_cap[input\_type]}$:
@@ -202,9 +204,8 @@ $$
 $$
 
 `[head,ready_tail)` is committed FIFO work; `[ready_tail,reserved_tail)` is reserved but unpublished.
+`[0,head)` remains allocated until `align-and-seal`; indices never wrap or repeat.
 When enabled, enqueue and dequeue add and remove the same declared C-head contribution from `frontier_cost`.
-
-%%%HERE
 
 ### 2.1 Data flow
 
@@ -229,13 +230,22 @@ flowchart LR
 ```
 
 - `model` reads only `model_input` and writes raw heads to the workspace.
-- `sample` owns all draws. It writes labels and child `true_profile` rows to the workspace and queues their compact CPU
+- `sample` owns all draws. It writes labels and child `true_profile` rows to workspace and stages a compact CPU
   `Topology` packet.
 - `commit` moves the workspace into saved heads, writes all `FamilyWork`/`Leaf` destinations atomically, and queues
-  compact endpoint patches.
+  compact endpoint patches. The CPU accepts both only after the transaction's commit marker.
 
 `SigmaHead` copies direct model outputs. `ActionHead` selects the sampled entries of the model action head.
 The GPU does not wait for the topology transfer. The policy tensor is never expanded to child shape.
+
+Only one `model + sample` batch runs at once. Its commit may overlap the next batch:
+
+```text
+model/sample stream:  [model+sample k]       [model+sample k+1]
+commit stream:                    [commit k]                  [commit k+1]
+```
+
+Degrees, scans, extent totals, and reservations stay on-device. The next batch uses only published queue rows.
 
 ### 2.2 Compact topology
 
@@ -248,11 +258,11 @@ $$
 
 In best response, trained player nodes exclude frozen opponents. Non-player nodes satisfy $N=\widetilde N$;
 an omitted frozen player also has $\widetilde N=1$. Every omitted node therefore has $N=\widetilde N=1$.
-A compressed edge stores its original `path_length`, preserving layer distance and unary cost. Its endpoint domains
-determine output conversion. Duplicate sampled labels remain distinct edges.
+A compressed edge stores `path_length`, preserving unary cost. Frozen best-response opponents
+need no head metadata. Endpoint domains determine output conversion. Duplicate labels remain distinct edges.
 
-`sample` publishes degrees and labels in logical order. Descendant family rows carry the unresolved edge handle;
-later sample packets or commit endpoint patches close it.
+`sample` stages degrees and labels in logical order. Descendant rows carry unresolved edge handles; later packets or
+commit patches close them. Transaction sequence numbers prevent partial topology publication.
 
 ### 2.3 Sampling laws
 
@@ -263,7 +273,8 @@ There are three samplers:
    profile to every non-leaf child.
 3. Branched RB uses the rejection kernel below.
 
-In sampled mode, the root `true_profile` is therefore copied unchanged through its whole rollout tree.
+In sampled mode, one root uses one joint profile for its whole tree. Sampled branching intentionally correlates
+siblings and is an experimental biased mode.
 
 For a branched-RB node $\mathsf s$ with $N(\mathsf s)\geq1$, designate logical child $0$ as the reuse child. For each
 logical child $j$:
@@ -283,13 +294,12 @@ propagated profiles each seed one chance child; each chance parent samples only 
 The reused action profile has the correct action-conditioned law after conditioning on its sampled action, and the
 reused chance profile has the correct board-conditioned law after conditioning on its sampled chance label.
 
-Root rows and RNG keys are fixed before draws. Root batching is independent of geometry.
+Root rows and RNG keys are fixed before draws. Root batching is independent of rollout mode.
 Only branched RB requires posterior-profile rejection; the other modes use their stored `true_profile` and categorical
 labels.
-Sampled-branched and branched-best-response sampling still require explicit theory contracts.
 
 Best response selects the learner or frozen model per stable FIFO subspan. Frozen decisions create `FamilyWork`, but
-no saved heads or targets.
+no saved heads or targets; their rows are discarded at `align-and-seal`.
 
 For each root, refill protects its original action prefix and recomputes descendant path masses using its final degree.
 Refill-only children have no root action target.
@@ -300,6 +310,9 @@ Each family processes its largest feasible stable FIFO prefix; it never skips ol
 Advancing `head` empties queue work. `FamilyWork.hot` and `FamilyWork.retained` remain allocated until
 align-and-seal.
 Only declared `input_type` families create queues; street, width, and padding properties do not.
+
+Full queues precede partial queues. Within either set, choose the earliest input-type preorder, then greatest
+`(load, age)` for full work or `(fill, age)` for partial work.
 
 `Leaf` is another FIFO. Bounded calls to `evaluate_showdowns`, `complete`, or `complete_selected` write into
 `LayerWork`; the consumed `Leaf` row then becomes dead.
@@ -315,7 +328,6 @@ sample/descriptors -> stable scan -> reserve -> materialize -> commit
 
 Branched-RB rejection sampling, folded-stat construction, transition, classification, and chance closure should
 fuse. Showdown and completion stay in `poker-gpu-evaluator`.
-Fixed-address model packs and bounded chance steps are additional CUDA-graph capture units.
 
 Poker stores folded normalized `r_pi` only in `FoldedRanges`: `K`-wide for `pre`, `H`-wide for shared `post`.
 `FamilyWork.hot` stores direct references; `model_input` stores compact folded statistics. A completion-bound `pre`
@@ -324,7 +336,11 @@ row expands `K -> H` once when materializing `Leaf.range_weights`, because the e
 [`poker_branched_rb_sample.md`](poker_branched_rb_sample.md).
 
 Commit advances every destination tail together after all writes and dependencies succeed. Failure advances none.
-Sequential overflow stops; admitted branched overflow may retry only the whole tree with a disjoint RNG address.
+Overflow discards the whole attempt and uses a disjoint RNG address. Sequential recovery reduces `root_count`;
+branched recovery reduces fixed beta or the KKT controller scale. Caps never change. Recovery at minimum controls
+fails the run.
+Each iteration logs capacity, high-water tail, used rows, overflow extent, retry address, and old/new controls.
+Recovered attempts are reported as control changes, not law-equivalent retries.
 
 ```text
 DeviceFailure
@@ -361,28 +377,29 @@ $m_hat=p_hat*v_hat$, and reduces `m_hat` to vector value. A requested evaluator 
 `v_hat`, eliminating the multiply and the `v_hat` interpretation without adding a field.
 
 Let `P_train = P` in self-play and `P_train = 1` in best response. For each `output_type`, buffer
-$b\in\{0,1\}$, and frontier row $j$, propagation uses:
+$b\in\{0,1\}$, and row $j$, propagation uses:
 
 ```text
-LayerWork[output_type] <2, leaf_cap>
-  p_hat[b,j] <P_train, size[output_type]>   # RB only
-  m_hat[b,j] <P_train, size[output_type]>   # RB only
-  v_vector_hat[b,j] <P_train>
-  c_lambda_hat_work[b,j]
+sampled
+  return_value[b,j] <P_train, size[output_type]>
+
+rao_blackwell
+  mass[b,j] <P_train, size[output_type]>
+  moment[b,j] <P_train, size[output_type]>
+
+branched only
+  trace_vector[b,j] <P_train>
+  cost[b,j]
   delta[b,j]
 ```
 
-Sampled `payoff` becomes `v_vector_hat`, selecting the exploiter component in best response. RB completion produces
-the remaining fields. Cost and delta start at zero.
+`return_value` is lambda-bootstrapped; `trace_vector` is not. Cost and delta start at zero.
 
-`output_partition` declares an upstream conversion DAG. For every edge `early <- late`,
-`size[early] <= size[late]`. Logical `LayerWork[output_type]` views share two physical arenas: after the last
-consumer of a later row, its wider bytes may back earlier rows. Early rows keep their compact logical shape; only
-their backing bytes are reused. Poker uses `pre <- post`.
+Logical views share two fixed SoA arenas. Poker's only conversion is `post -> pre`; it sums mass and moment before
+conditionalization. [`layered_target_creation.md`](layered_target_creation.md) is the exact work and kernel contract.
 
 For a `pre` leaf, the evaluator first writes its $H$-shaped completion view; the epilogue writes the $K$-shaped
-propagation view into the other arena. At every `pre <- post` edge, aggregate mass and moment before
-conditionalization:
+propagation view into the other arena:
 
 $$
 (Gz)_k=\sum_{h:c(h)=k}z_h,\qquad
@@ -397,49 +414,18 @@ As soon as family/chance queues and topology transfers finish, the CPU computes
 
 $$
 L(\sigma)
-=\max_{\tau\text{ terminal below }\sigma}|\tau\setminus\sigma|
-=\max_{e:\sigma\to u}\left(\mathtt{path\_length}[e]+L(u)\right),
+=1+\max_{e:\sigma\to u}L(u),
 \qquad L(\mathtt{Leaf})=0.
 $$
 
 Let `layer_count`, `layered_node_count`, `layered_edge_count`, and `carry_count` be the realized exact counts.
-Shorter branches carry forward until their parent layer is ready. For each layer $\ell$, node $s$, child edge $e$,
-and carry row $c$, the CPU emits:
-
-```text
-LayeredTopology
-  layer_ptr <layer_count+1>
-  carry_ptr <layer_count+1>
-
-  node <layered_node_count>
-    child_begin[s]
-    N[s]
-    N_tgt[s]
-    N_tilde[s]
-    owner[s]
-    input_type[s]
-    output_type[s]
-    destination_work_row[s]
-    sigma_head_row[s]                     # -1 if structural
-    sigma_target_row[s]                   # -1 if structural
-    action_begin[s]                       # -1 if structural
-
-  child <layered_edge_count>
-    path_length[e]
-    source_work_row[e]
-
-  carry <carry_count>
-    output_type[c]
-    source_work_row[c]
-    destination_work_row[c]
-```
-
-Layer $\ell$ owns node rows in `[layer_ptr[ell],layer_ptr[ell+1])` and carry rows in
-`[carry_ptr[ell],carry_ptr[ell+1])`. In best response, delete frozen `FamilyWork` rows; any frozen topology row is
-already a headless $\widetilde N\geq2$ structural reduction.
+Shorter branches carry until their parent layer. The CPU emits the exact `LayerPlan` schema in
+[`layered_target_creation.md`](layered_target_creation.md). Frozen best-response rows are deleted; a frozen
+$\widetilde N\geq2$ node remains only as a headless structural reduction.
 
 Let `trained_player_count[input_type]` and `trained_action_count[action_type]` be realized exact counts.
-Stable-compact `FamilyWork.retained` and `SigmaHead` to the player counts and `ActionHead` to the action counts.
+Learner head and action indices are final when created. Self-play retained rows already align; best response compacts
+only trained inputs.
 For each learner player row $i$ and learner action row $a$, allocate aligned targets:
 
 ```text
@@ -476,12 +462,12 @@ LearnerIndex[input_type] <trained_player_count[input_type]>
   log_sampling_weight[i]                    # branched only
 ```
 
-CPU planning, learner-array copies, and the `LayeredTopology` upload may overlap remaining completion. After
+CPU planning, best-response input compaction, and the `LayerPlan` upload may overlap remaining completion. After
 completion finishes, permute buffer `0` from `Leaf` order into the initial frontier in buffer `1`.
 Delete `FamilyWork.hot`, `Leaf`, `FoldedRanges`, CPU `Topology`, source capacities, and permutation scratch.
 
-The operation is transactional. Admission includes simultaneous source and exact destination arrays, both
-`LayerWork` arenas, bounded scratch, library/graph workspaces, and a guard:
+The operation is transactional. Admission includes source and destination arrays, both work arenas, bounded scratch,
+library workspaces, and a guard:
 
 $$
 \max_\phi\left(M_{\mathrm{owners},\phi}+M_{\mathrm{bounded},\phi}
@@ -490,39 +476,18 @@ $$
 
 ## 4. Target Propagation
 
-Target construction is the CUDA graph:
+[`layered_target_creation.md`](layered_target_creation.md) is the sole target contract:
 
-```mermaid
-flowchart LR
-  subgraph G["CUDA graph"]
-    G1["layer 1 kernels"] --> G2["layer 2 kernels"] --> GD["..."] --> GL["root layer kernels"]
-  end
-  SH["SigmaHead"] --> G1
-  LT["LayeredTopology"] --> G1
-  W["initial LayerWork frontier"] --> G1
-  G1 -.-> T["SigmaTarget + ActionTarget"]
-  G2 -.-> T
-  GL -.-> T
+```text
+Leaf completion
+  -> initial permutation
+  -> one asynchronous CUDA kernel per layer
+  -> validation
+  -> atomic learner publication
 ```
 
-Each layer may use several domain- or degree-specialized kernels. Kernels within a layer are independent; graph edges
-encode every dependency on earlier layers.
-
-For each ready parent, the graph:
-
-1. averages child value, cost, delta, and RB mass/moment;
-2. applies the edge `path_length` cost offset, the child nominal multiplier, and any `late -> early` conversion;
-3. writes the parent's next-frontier `LayerWork` row;
-4. at learner player nodes, uses `SigmaHead` to write `SigmaTarget` and the `ActionTarget` span;
-5. carries rows whose parent is not ready into the other buffer.
-
-Branched rows implement `BranchedValue` with batched ragged reductions; sequential rows are the one-action
-player-only case. `t_hat` exists exactly when `N_tgt>=2`; otherwise `SigmaHead.old_t` supplies $T^*$. Protected
-root reductions use each root's pre-refill target prefix.
-Rows with `sigma_head_row = -1` execute only the structural reduction path.
-
-After the root layer completes and targets validate, delete `LayeredTopology` and `LayerWork`. The five learner
-arrays and `LearnerIndex` are already sealed; publish them atomically.
+One CTA owns one parent or carry row. The host enqueues every layer without synchronization. Sequential mode is the
+$N=N_{\rm tgt}=\widetilde N=1$ specialization.
 
 ## 5. Learner
 

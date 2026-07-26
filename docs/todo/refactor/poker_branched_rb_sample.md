@@ -41,15 +41,15 @@ SampleOutput <G>
 are fused; otherwise it occupies bounded family workspace. `commit` writes it to a non-leaf child's
 `FamilyWork.hot.true_profile`; no second profile owner exists. The reuse child has `attempt_count[0] = 0`.
 
-`sample` also queues a compact asynchronous D2H packet containing degrees, labels, logical edges, and unresolved edge
-handles for CPU `Topology`. `commit`, not `sample`, later queues endpoint patches.
+`sample` stages a compact asynchronous D2H packet containing degrees, labels, logical edges, and unresolved edge
+handles. The CPU accepts it with `commit`'s endpoint patches and transaction marker.
 
 | Owner | Contents | Last consumer |
 |---|---|---|
 | parent `FamilyWork.hot.true_profile` | inherited private profile | `sample` |
 | family parent | public transition state, live exact ranges, folded references | `commit` |
 | family workspace | raw model heads, `SampleOutput` | `commit` |
-| sampler shared memory | base CDFs and optional actor CDFs | parent CTA |
+| sampler shared memory | base CDFs and selected actor-proposal scratch | parent CTA |
 | sampler registers | combo IDs, masks, search bounds, RNG counters | proposal or fused `commit` |
 | child `FamilyWork.hot` | committed `true_profile` | child's `sample` |
 | topology packet | degrees, labels, unresolved edges | CPU `Topology` builder |
@@ -152,8 +152,8 @@ The group leader gathers the $P$ selected card masks and accepts exactly when th
 fixed upper-bound search selects the first CDF entry greater than `target`; zero-mass plateaus are unreachable.
 $K$ rows use eight steps and $H$ rows use eleven.
 
-Rejection increments the logical attempt ordinal. Exhaustion writes `DeviceFailure`. When few children remain,
-several groups may test consecutive attempts for one child; the lowest successful attempt wins.
+Rejection increments the logical attempt ordinal. Groups test fixed consecutive attempt waves, synchronize, and
+publish the lowest success. Exhaustion writes `DeviceFailure`.
 
 RNG addresses contain version, logical child, attempt, seat, and purpose. Results are invariant under pack
 subdivision and physical scheduling.
@@ -182,19 +182,17 @@ action-conditioned law after conditioning on that action, so logical chance chil
 $1,\ldots,N-1$ draw additional profiles from the action-conditioned posterior.
 
 If $C$ player children enter chance, their $C$ inherited profiles each seed one chance child. The fused frontier saves
-$C$ posterior draws before considering any further reuse below those children. Chance degree and variant selection
-remain independent of profile values and RNG outcomes.
+$C$ posterior draws before sampling further children.
 
-| Strategy | Additional action-conditioned profile |
-|---|---|
-| likelihood thinning | draw from the parent proposal and accept with $\pi(a\mid h_{\rm actor})$ |
-| tight-envelope thinning | accept with $\pi(a\mid h_{\rm actor})/\max_h\pi(a\mid h)$ |
-| post-action CDF | replace the actor CDF by $r_{\rm actor}(h)\pi(a\mid h)$, then reject collisions |
-| overlapped CDF | build actor CDFs for the at most two actions that can reach chance |
+For an observed action $a$, the actor proposal is proportional to:
 
-The CDF variants change only the actor's independent proposal row. Post-action overwrite reuses the base `<P,H>`
-shared footprint. Overlap adds at most two `<H>` CDF rows. A deterministic hardware table may choose among exact
-variants.
+$$
+r_{\rm actor}(h)\pi(a\mid h).
+$$
+
+Poker permits at most two distinct action labels from one frontier to reach chance; duplicate sampled labels reuse
+the same proposal. Prototype thinning and actor-CDF samplers, select one by complete `sample -> commit` time, and
+delete the others. Production has no sampler selector.
 
 For each inherited or sampled chance profile, form the remaining-deck mask. Draw one card, or three cards without
 replacement for the flop, with unbiased bounded integers and set-bit selection. Sort flop cards into the canonical
@@ -211,8 +209,8 @@ The semantic boundary is:
 model -> sample -> commit
 ```
 
-`sample` ends after writing labels and their generating `true_profile` rows to `SampleOutput`, then queueing its
-topology packet. `commit` performs destination classification, stable count/scan, exact reservation, range
+`sample` ends after writing labels and their generating `true_profile` rows to `SampleOutput`, then staging its
+topology packet. `commit` performs destination classification, device count/scan/reservation, range
 materialization, folded-stat updates, retained-head writes, child `true_profile` writes, endpoint patches, and atomic
 publication.
 
@@ -241,11 +239,13 @@ $$
 | 5 | 25.90 |
 | 6 | 31.08 |
 
-Optional overlapped actor CDFs add:
+The largest prototype workspace adds at most:
 
 $$
 M_{\rm actorCDF}=4C_aH,\qquad 0\leq C_a\leq2.
 $$
+
+The final schema retains only the selected sampler's exact bound.
 
 For factorized policy width $F=4+3m_{\rm raise}$ and inference bytes $b_{\rm inf}$:
 
@@ -255,6 +255,7 @@ $$
 
 For `m_raise=2` and `b_inf=2`, this is 25.90 KiB per parent. Policy access is pointwise; no global CDF is stored.
 An $N=1$ parent uses its inherited profile and needs no proposal CDF.
+Sampler experiments use `experiments/range_database`; the evaluator may test the same CDF/rejection design separately.
 
 ## 7. Root profiles
 
@@ -280,8 +281,8 @@ Root generation needs neither range CDFs nor collision rejection.
 - No retained-array, destination, or endpoint-patch write by the logical `sample` stage.
 - Minimum-address terminal failure with no published destination.
 - CUDA coverage for $P=2,\ldots,6$, every street, duplicate labels, and concentrated or zero-heavy ranges.
-- Hardware calibration of CTA warps and exact chance-profile variants using complete `sample -> commit` time plus
-  rejection tails, spills, eligible warps, and memory traffic.
+- Select one profile sampler using complete `sample -> commit` time, rejection tails, spills, eligible warps, and
+  memory traffic; delete every losing implementation.
 
 ## 9. Ownership
 

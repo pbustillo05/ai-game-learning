@@ -11,11 +11,11 @@ Implement the storage redesign and delete the superseded data path as one projec
 
 The replacement lives under `pbg/core/queued/` until cutover. New and old rollout, storage, topology, target, and
 learner representations never cross. The replacement becomes the sole implementation only after all production and
-evaluation consumers migrate; then delete the old dependency closure, temporary selection surface, obsolete tests,
+evaluation consumers migrate; then delete the old dependency closure, comparison harness, obsolete tests,
 configuration, tools, and documentation.
 
-A parallel runtime selector requires an explicit, time-bounded migration exception. Without that approval, comparison
-uses test or benchmark harnesses that invoke each implementation independently; production exposes no second engine.
+Comparison harnesses invoke each implementation independently. Production exposes no runtime selector or second
+engine.
 
 Temporary code growth is allowed only when every addition has a named deletion credit and the projected final tree
 stays below budget.
@@ -121,8 +121,8 @@ Do not create a compatibility DTO between implementations.
 
 ## 6. Target responsibilities
 
-Exact schemas, indexing, lifetimes, and algorithms come only from
-[`storage_redesign.md`](storage_redesign.md). The implementation should converge toward:
+Storage contracts come from [`storage_redesign.md`](storage_redesign.md); target contracts come from
+[`layered_target_creation.md`](layered_target_creation.md). The implementation should converge toward:
 
 ```text
 pbg/core/
@@ -134,13 +134,13 @@ pbg/core/
   observability.py          metrics
 
   queued/
-    contracts.py            four-axis schemas and conversion DAG
+    contracts.py            twelve-mode schemas and conversion DAG
     slabs.py                fixed SoA allocation, reservation, publication
     stores.py               owners and last-consumer validation
     rollout.py              family scheduling and model -> sample -> commit
-    topology.py             CPU Topology -> LayeredTopology planning
+    topology.py             CPU Topology -> LayerPlan planning
     completion.py           Leaf -> evaluator -> LayerWork binding
-    targets.py              layered CUDA target graph
+    targets.py              layered CUDA target executor
     learner.py              aligned and ragged minibatch assembly
     memory.py               phase ledger, admission, failure records
     engine.py               iteration composition
@@ -164,7 +164,7 @@ remain under `pbg/games/poker/`. Core sees generated schemas and opaque hooks, n
 
 | Operation | Sole authority |
 |---|---|
-| mode fields, partitions, widths | immutable four-axis schema |
+| mode fields, partitions, widths | immutable twelve-mode schema |
 | queue choice and stable prefix | semantic queue scheduler |
 | RNG address and draw | logical RNG |
 | bytes, alignment, capacity | field schema and phase ledger |
@@ -174,14 +174,13 @@ remain under `pbg/games/poker/`. Core sees generated schemas and opaque hooks, n
 | routing, materialization, retained writes | `commit` |
 | showdown and completion | evaluator facade consuming exact `Leaf` |
 | rollout structure | CPU `Topology` |
-| propagation structure | GPU `LayeredTopology` |
-| targets | one layered CUDA graph |
+| propagation structure | GPU `LayerPlan` |
+| targets | one layered CUDA executor |
 | learner batches | one sequential/branched sampler |
 | align, compact, release | `align-and-seal` |
 
-Use classes only for mutable resource lifetimes, invariant-bearing schemas, controller state, or external protocols.
-Prefer functions and tensor collections for transformations. Do not create mode class hierarchies or generic field
-lookup layers.
+Use shared objects for schemas, slabs, lifetimes, mode contracts, controllers, and external protocols.
+Use functions for transformations. Do not create mode class hierarchies or generic field lookup layers.
 
 ## 8. Required data flow
 
@@ -198,9 +197,9 @@ Leaf FIFO
   -> LayerWork in Leaf order
 
 CPU Topology
-  -> LayeredTopology and movement plan
+  -> LayerPlan and movement plan
   -> align-and-seal
-  -> layered CUDA target graph
+  -> layered CUDA target executor
   -> cleanup and atomic learner publication
   -> minibatches
   -> optimizer
@@ -210,8 +209,8 @@ Sequential and branched modes share this path. Their generated schemas, sampling
 sampling differ; they do not get separate storage or target engines.
 
 Physical fusion may combine `sample`, descriptor scans, materialization, and `commit`. Fixed-address model packs and
-bounded chance closure are additional CUDA-graph capture units; target propagation is one strict layered CUDA graph.
-Fusion and graph capture never change logical ownership.
+bounded chance closure may be captured after profiling. Target propagation uses the sole executor in
+[`layered_target_creation.md`](layered_target_creation.md).
 
 ## 9. Storage primitives
 
@@ -219,7 +218,7 @@ Implement only:
 
 ```text
 SoASchema          immutable fields, dtype, shape, alignment, lifetime
-MonotoneSlab       admitted capacity and reserve/fill/publish tails
+MonotoneSlab       fixed-capacity aligned arena and reserve/fill/publish tails
 ExactBlock         sealed realized extent
 ```
 
@@ -227,6 +226,7 @@ They provide:
 
 - exact aligned byte calculation;
 - fixed allocation before admitted work;
+- field-contiguous SoA views and direct family-prefix model batches;
 - atomic multi-destination `reserve -> fill -> publish`;
 - stable addresses and logical order;
 - exact stable compaction and reference remapping;
@@ -235,7 +235,7 @@ They provide:
 
 Do not add convenience stores beyond the owners in `storage_redesign.md`:
 `FamilyWork`, `SigmaHead`, `ActionHead`, `Leaf`, `Topology`, `TopologyChild`, `FoldedRanges`,
-`QueueBehaviorMetadata`, two `LayerWork` arenas, `LayeredTopology`, `SigmaTarget`, `ActionTarget`, `LearnerIndex`, and
+`QueueBehaviorMetadata`, two work arenas, `LayerPlan`, `SigmaTarget`, `ActionTarget`, `LearnerIndex`, and
 `DeviceFailure`.
 
 ## 10. Memory authority
@@ -251,13 +251,13 @@ Its phases are:
 ```text
 rollout + overlapping completion
 align-and-seal
-target graph
+target execution
 optimization
 ```
 
-Admission covers source and destination learner arrays, both `leaf_cap` LayerWork arenas, compaction/permutation
-scratch, `LayeredTopology`, graph/library workspace, and a safety guard. Logical sample counts are never reduced to fit
-a physical pack; physical work streams through bounded workspaces.
+Admission covers source and destination learner arrays, both `leaf_cap` work arenas, permutation scratch,
+`LayerPlan`, library workspace, and a guard. Caps are fixed. Whole-attempt overflow reduces root count or beta and
+restarts with a disjoint RNG address.
 
 ## 11. Implementation phases
 
@@ -270,7 +270,7 @@ a physical pack; physical work streams through bounded workspaces.
 
 ### Phase 2 — contracts and transactions
 
-- generate every four-axis schema;
+- generate every twelve-mode schema;
 - implement exact byte accounting, slabs, transactions, failures, and last-consumer checks;
 - test absent fields, dimensions, alignment, atomic publication, and overflow on CUDA.
 
@@ -288,7 +288,7 @@ Use tensor fixtures to test:
 - headless frozen structural reductions;
 - CPU layering, carry rows, and output conversion;
 - two `leaf_cap` ping-pong arenas;
-- `SigmaTarget` and `ActionTarget` from one layered CUDA graph.
+- `SigmaTarget` and `ActionTarget` from the sole layered CUDA executor.
 
 This prevents sequential geometry from defining the abstractions.
 
@@ -299,9 +299,9 @@ Implement normal sequential poker through:
 ```text
 model -> sample -> commit
 Leaf -> LayerWork
-Topology -> LayeredTopology
+Topology -> LayerPlan
 align-and-seal
-target graph
+target execution
 randperm learner
 optimizer
 ```
@@ -319,12 +319,13 @@ Add:
 - post-to-pre `LayerWork` reuse;
 - fixed/KKT controllers, refill, retry, and failure behavior;
 - alias-table sigma sampling and ragged action gathers.
+- benchmark action-conditioned sampler prototypes, retain one, and delete the rest.
 
 The repository owns rejection sampling. The evaluator owns only `Leaf -> LayerWork` showdown/completion operations.
 
 ### Phase 6 — complete axes and consumers
 
-Implement sequential RB, sampled branched, best response, and every declared fixed/KKT combination. Migrate:
+Implement all twelve declared modes. Sampled branching intentionally shares one joint profile per tree. Migrate:
 
 - training and distributed/replica training;
 - best-response and inference workflows;
@@ -332,15 +333,13 @@ Implement sequential RB, sampled branched, best response, and every declared fix
 - checkpoints and resume;
 - benchmarks and operational tools.
 
-Unsupported combinations fail at schema construction.
-
 ### Phase 7 — cutover and deletion
 
 After the complete acceptance matrix passes:
 
 1. make the replacement the sole path;
 2. delete the old rollout, storage, branching, topology, target, learner, seal, and memory closure;
-3. delete temporary selectors, adapters, configurations, tests, tools, and documentation;
+3. delete comparison harnesses, sampler prototypes, adapters, configurations, tests, tools, and documentation;
 4. move valid test/tool-only remnants out of `pbg/`;
 5. run reachability, duplication, configuration, and line-count audits;
 6. consolidate redundancy inside the replacement.
@@ -355,14 +354,15 @@ Validate:
 
 - family FIFO order and pack-subdivision invariance;
 - `model -> sample -> commit` transaction atomicity;
+- one-profile-per-root sampled branching;
 - inherited-child plus $N-1$ branched-RB profile sampling, profile propagation, and topology packets;
 - exact evaluator `Leaf` rows and `LayerWork` completion epilogue;
 - CPU topology flattening, carries, permutations, and frozen-row deletion;
-- CUDA-graph targets against `BranchedValue` and sequential references;
+- layered CUDA targets against `BranchedValue` and sequential references;
 - sequential five-array alignment and `randperm` gathering;
 - branched weighted sigma sampling and separate ragged action gathers;
 - analytical, admitted, allocated, reserved, and device-observed memory;
-- overflow, exhaustion, NaN, evaluator, and rank-common failure injection;
+- overflow backoff, exhaustion, NaN, evaluator, and rank-common failure injection;
 - checkpoint/resume and distributed equivalence;
 - target and learner throughput on supported CUDA hardware.
 
@@ -372,12 +372,14 @@ Every validation artifact names the ledger entries it closes.
 
 Delete the legacy path only when:
 
-- every supported four-axis schema creates only applicable fields;
+- every supported mode creates only applicable fields;
 - poker has only `pre` and `post_A` physical queues;
 - all modes use `model -> sample -> commit`;
+- exact reservations require no per-pack host scalar read;
+- poker has one production action-conditioned sampler;
 - `Leaf` and `LayerWork` exactly match evaluator input and output contracts;
 - topology contains exactly trained player nodes and nodes with `N_tilde >= 2`;
-- all targets use the layered CUDA graph;
+- all targets use the sole layered CUDA executor;
 - sequential learner rows are five-array aligned;
 - branched learner sampling uses decision weights and exact action spans;
 - no maximum-action padding or inactive action exists;
@@ -391,13 +393,13 @@ Delete the legacy path only when:
 ## 14. End state
 
 ```text
-immutable four-axis contract
+immutable twelve-mode contract
 -> semantic family FIFOs
 -> model -> sample -> commit
 -> Leaf -> LayerWork
--> CPU Topology -> GPU LayeredTopology
+-> CPU Topology -> GPU LayerPlan
 -> align-and-seal
--> layered target CUDA graph
+-> layered CUDA target executor
 -> aligned/ragged learner
 -> optimizer
 ```
