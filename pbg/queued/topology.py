@@ -812,12 +812,32 @@ class LayerPlan:
                 )
         for lane in range(n_replica):
             for input_type, name in enumerate(self.input_names):
-                if self.sigma_rows[lane][input_type] > trained_caps[name]:
+                rows = self.sigma_rows[lane][input_type]
+                if rows < 0 or rows > trained_caps[name]:
                     raise TopologyError("realized sigma rows exceed trained capacity")
+                actual = {
+                    row
+                    for actual_lane, actual_type, row in sigma_destinations
+                    if actual_lane == lane and actual_type == input_type
+                }
+                if actual != set(range(rows)):
+                    raise TopologyError(
+                        "LayerPlan sigma targets do not match their exact extent"
+                    )
             action_names = self.output_names if self.branched else self.input_names
             for action_type, name in enumerate(action_names):
-                if self.action_rows[lane][action_type] > action_caps[name]:
+                rows = self.action_rows[lane][action_type]
+                if rows < 0 or rows > action_caps[name]:
                     raise TopologyError("realized action rows exceed action capacity")
+                actual = {
+                    row
+                    for actual_lane, actual_type, row in action_destinations
+                    if actual_lane == lane and actual_type == action_type
+                }
+                if actual != set(range(rows)):
+                    raise TopologyError(
+                        "LayerPlan action targets do not match their exact extent"
+                    )
 
 
 def _depths(topology: Topology) -> list[int]:

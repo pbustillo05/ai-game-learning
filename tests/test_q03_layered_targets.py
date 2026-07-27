@@ -575,6 +575,36 @@ def test_layer_plan_rejects_duplicate_sigma_and_action_destinations() -> None:
         )
 
 
+@CUDA
+def test_layer_plan_rejects_inflated_or_gapped_target_extents() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    mode = mode_schema("self_play", "sequential", "sampled")
+    topology, bindings = _topology(mode)
+    manifest = _manifest(mode, device)
+    plan = build_layer_plan(
+        mode,
+        _partitions(mode.private_estimator),
+        (topology,),
+        (bindings,),
+        p_train=2,
+        manifest=manifest,
+    )
+    with pytest.raises(TopologyError, match="sigma targets.*exact extent"):
+        replace(plan, sigma_rows=((2, 0),)).assert_admitted(manifest)
+    with pytest.raises(TopologyError, match="action targets.*exact extent"):
+        replace(plan, action_rows=((2, 0),)).assert_admitted(manifest)
+    with pytest.raises(TopologyError, match="sigma targets.*exact extent"):
+        replace(
+            plan,
+            sigma_target_row=_i32([1]),
+            sigma_rows=((2, 0),),
+        ).assert_admitted(manifest)
+    with pytest.raises(TopologyError, match="action targets.*exact extent"):
+        replace(
+            plan,
+            action_begin=_i32([1]),
+            action_rows=((2, 0),),
+        ).assert_admitted(manifest)
 def test_layer_plan_rejects_nonpermutation_leaf_rows() -> None:
     mode = mode_schema("self_play", "sequential", "sampled")
     topology, bindings = _topology(mode)
