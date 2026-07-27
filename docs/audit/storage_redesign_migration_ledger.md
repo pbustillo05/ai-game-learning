@@ -37,6 +37,14 @@ reservation-bound asynchronous topology, bounded chance closure, and strict
 definitions remain open until their consumer phases land and cutover deletes
 their old callers.
 
+Phase 6 replacement evidence passed against candidate
+`df25d020284c16f4600ae90603ba3de594d7e98c`: all four sequential modes,
+K/H RB domains and selected completion, compact trained/frozen roles, retained
+signed folded summaries with raw mass and U/C semantics, event refresh/copy
+and exact release, shared-response cutoff and paired evaluation, exact probe
+identity, and approved RB/probe conversion. Legacy folded, completion, and
+probe definitions remain open until cutover deletes their old callers.
+
 Disposition meanings:
 
 - `move`: representation-independent behavior relocates once to its final
@@ -207,3 +215,17 @@ reservation-bound topology, chance exhaustion, and exact matching
 remaining critical or high-severity executable issue. See
 `queued_phase4_report_20260727.md` and
 `../queued/rollout_transactions.md`.
+
+Phase 6 candidate `df25d020284c16f4600ae90603ba3de594d7e98c`
+passed 31 focused CUDA tests, 152 cumulative Phase 1–6 tests, 22 targeted
+authority/profiler/workspace/multiway gates, and 30 warmed Phase 5 regressions
+on explicitly selected GPU 0. Evidence covers all four sequential optimizer
+rows, selected evaluator equivalence, deterministic K/H conversion, signed
+folded oracles and retained lifetime, compact trained/frozen roles, synthetic
+probe cutoff, complete paired seat/button blocks, numerical Student-$t$
+reporting, converter identity, and exact resident/concurrent/first-use
+workspace admission. Weak-reference instrumentation proved the cached
+conversion mask dead at completion's last consumer. The final independent
+read-only audit found no remaining critical or high-severity issue. See
+`queued_phase6_report_20260727.md` and
+`../queued/sequential_modes.md`.
