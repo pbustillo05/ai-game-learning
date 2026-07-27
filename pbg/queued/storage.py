@@ -724,9 +724,7 @@ class MonotoneSlab:
             raise KeyError(f"{self.schema.name} has no field {field!r}")
         return self._columns[field][lane, :tail]
 
-    def reset_failed_lane(self, lane: int) -> int:
-        """Discard one complete failed attempt without touching other lanes."""
-
+    def _prepare_reset_failed_lane(self, lane: int) -> list[int]:
         state = self._lane_state(lane)
         if not state[self._POISONED] and self.failure_state.snapshot(lane) is None:
             raise StorageError("only a failed lane may start a retry epoch")
@@ -737,6 +735,12 @@ class MonotoneSlab:
         ]
         if open_tokens:
             raise StorageError("failed lane still owns an open reservation")
+        return state
+
+    def reset_failed_lane(self, lane: int) -> int:
+        """Discard one complete failed attempt without touching other lanes."""
+
+        state = self._prepare_reset_failed_lane(lane)
         for field in self.schema.fields:
             self._columns[field.name][lane].fill_(field.fill)
         lifetime_high_water = state[self._LIFETIME_HIGH_WATER]
@@ -774,6 +778,14 @@ class PublicationTransaction:
     def __init__(self, reservations: tuple[SlabReservation, ...]) -> None:
         if not reservations:
             raise ValueError("a publication transaction requires destinations")
+        lanes = {reservation.lane for reservation in reservations}
+        failures = {
+            id(reservation._slab.failure_state) for reservation in reservations
+        }
+        if len(lanes) != 1 or len(failures) != 1:
+            raise ValueError(
+                "transaction destinations must share one lane and failure state"
+            )
         identities = tuple(
             (id(reservation._slab), reservation.lane)
             for reservation in reservations
@@ -801,6 +813,12 @@ class PublicationTransaction:
         identities = tuple((id(item.slab), item.lane) for item in requests)
         if len(set(identities)) != len(identities):
             raise ValueError("a transaction may reserve a slab lane only once")
+        if len({item.lane for item in requests}) != 1 or len(
+            {id(item.slab.failure_state) for item in requests}
+        ) != 1:
+            raise ValueError(
+                "transaction destinations must share one lane and failure state"
+            )
 
         failures: list[DeviceFailure] = []
         for request in requests:
@@ -827,21 +845,8 @@ class PublicationTransaction:
                     )
                 )
         if failures:
-            registries = {
-                id(request.slab.failure_state): request.slab.failure_state
-                for request in requests
-            }
-            for registry in registries.values():
-                relevant = [
-                    failure
-                    for failure in failures
-                    if any(
-                        request.lane == failure.lane
-                        and request.slab.failure_state is registry
-                        for request in requests
-                    )
-                ]
-                registry.record_many(relevant)
+            registry = requests[0].slab.failure_state
+            registry.record_many(failures)
             minimum = min(
                 failures,
                 key=lambda item: (
@@ -850,11 +855,7 @@ class PublicationTransaction:
                     item.input_type,
                 ),
             )
-            recorded = next(
-                request.slab.failure_state.snapshot(minimum.lane)
-                for request in requests
-                if request.lane == minimum.lane
-            )
+            recorded = registry.snapshot(minimum.lane)
             raise StorageOverflow(recorded or minimum)
 
         reservations: list[SlabReservation] = []

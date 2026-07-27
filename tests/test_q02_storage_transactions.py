@@ -452,6 +452,57 @@ def test_failed_lane_retry_does_not_corrupt_completed_lane() -> None:
 
 
 @CUDA
+def test_generated_owner_retry_discards_whole_lane_attempt_only() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    mode = MODE_SCHEMAS[0]
+    plan = build_storage_plan(
+        mode,
+        _partitions(mode.private_estimator),
+        _manifest(mode, device=device),
+        _layout(),
+        device,
+    )
+    owners = GeneratedOwners(plan)
+    owners.enter_phase(ExecutionPhase.ROLLOUT)
+    family = owners.slab("FamilyWork", "pre")
+    completed = family.reserve(
+        1,
+        1,
+        phase="commit",
+        input_type="pre",
+        logical_address=1,
+    )
+    completed.fill(_values(family, 1, 3))
+    PublicationTransaction((completed,)).publish()
+    lane_one_before = family.published(1, "model_input").clone()
+
+    leaf = owners.slab("Leaf")
+    with pytest.raises(StorageOverflow):
+        leaf.reserve(
+            0,
+            leaf.capacity + 1,
+            phase="commit",
+            input_type="pre",
+            logical_address=8,
+        )
+    failure = owners.abort_failed_lane(0)
+    assert failure.logical_address == 8
+    for key in owners.live_keys:
+        slab = owners.slab(key.owner, key.partition)
+        assert slab.epoch(0) == 1
+        assert slab.tail(0) == 0
+    assert family.epoch(1) == 0
+    assert family.tail(1) == 1
+    assert torch.equal(family.published(1, "model_input"), lane_one_before)
+
+    owners.release_after(ExecutionPhase.ROLLOUT)
+    for phase in tuple(ExecutionPhase)[1:]:
+        owners.enter_phase(phase)
+        owners.release_after(phase)
+    owners.close()
+
+
+@CUDA
 def test_exact_block_has_immutable_extent_exact_bytes_and_explicit_release() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     block = ExactBlock(_small_schema("exact"), 3, device)

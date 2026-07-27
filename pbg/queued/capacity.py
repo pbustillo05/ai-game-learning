@@ -944,6 +944,8 @@ class GeneratedOwners:
         if failure is None:
             raise StorageError("lane has no recorded failure")
         for slab in self._live.values():
+            slab._prepare_reset_failed_lane(lane)
+        for slab in self._live.values():
             slab.reset_failed_lane(lane)
         self.failure_state.clear_lane(lane)
         return failure
