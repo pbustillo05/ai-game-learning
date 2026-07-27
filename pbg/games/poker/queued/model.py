@@ -393,7 +393,10 @@ class QueuedPokerModel(nn.Module):
             live = int(input_type[5:])
             if not 2 <= live <= self.geometry.players:
                 raise PokerModelError("postflop family has an invalid live-seat count")
-            if self.geometry.folded_summary_width:
+            if (
+                self.geometry.folded_summary_width
+                and not isinstance(self.postflop, PostflopNet)
+            ):
                 state = self._state(model_input)
                 if not bool(
                     (
