@@ -1202,6 +1202,27 @@ class SequentialPokerHooks:
         class_count = torch.bincount(
             classes, minlength=self.geometry.rank_count**2
         ).float()
+        state = self.machine.state_from_model_input(
+            refreshed,
+            torch.zeros(
+                (refreshed.shape[0], self.geometry.players),
+                dtype=torch.int32,
+                device=refreshed.device,
+            ),
+        )
+        combo_cards = self.machine.combo_cards(
+            torch.arange(
+                self.geometry.private_hands,
+                dtype=torch.int32,
+                device=refreshed.device,
+            )
+        )
+        board_conflict = (
+            state.board_cards.ne(PAD_CARD)[..., None, None]
+            & state.board_cards.long()[..., None, None].eq(
+                combo_cards[None]
+            )
+        ).any(1).any(-1)
         pre = self._owner_slab("FoldedRanges", "pre").columns["range"][0]
         post = self._owner_slab("FoldedRanges", "post").columns["range"][0]
         for seat in range(self.geometry.players):
@@ -1228,6 +1249,7 @@ class SequentialPokerHooks:
             else:
                 post_weight = post.index_select(0, safe_post)
             weight = torch.where(pre_mask[:, None], pre_weight, post_weight)
+            weight = weight.masked_fill(board_conflict, 0.0)
             active = pre_mask | post_mask
             weight = weight.masked_fill(~active[:, None], 0.0)
             log_weight = torch.log(

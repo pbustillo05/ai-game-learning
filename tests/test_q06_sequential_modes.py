@@ -12,6 +12,7 @@ from pbg.games.poker.queued.folded import folded_statistics
 from pbg.games.poker.queued.hooks import (
     FOLDED,
     NLHEGeometry,
+    PAD_CARD,
     PokerForwardInput,
     PokerStateMachine,
     SequentialPokerHooks,
@@ -330,6 +331,29 @@ def test_folded_owner_refreshes_model_input_and_releases_at_seal() -> None:
     reconstructed.scatter_add_(0, classes, weights[0])
     torch.testing.assert_close(reconstructed, class_range)
     assert torch.equal(refreshed, hooks._resolved_model_input(batch))
+    board = torch.tensor(
+        [[geometry.first_card, geometry.first_card + 1, geometry.first_card + 2,
+          PAD_CARD, PAD_CARD]],
+        dtype=torch.uint8,
+        device=device,
+    )
+    post_state = replace(
+        state,
+        street=torch.ones_like(state.street),
+        board_cards=board,
+    )
+    batch.fields["model_input"] = machine.direct_model_input(post_state)[None]
+    chance_refreshed = hooks._resolved_model_input(batch)
+    chance_reach, _ = machine.model_context(chance_refreshed)
+    combo_cards = machine.combo_cards(
+        torch.arange(
+            geometry.private_hands, dtype=torch.int32, device=device
+        )
+    )
+    conflict = combo_cards[None].eq(
+        board[0, :3, None, None]
+    ).any(0).any(-1)
+    assert torch.isneginf(chance_reach[0, 0, conflict]).all()
     owners.release_after(ExecutionPhase.ROLLOUT)
     for phase in (
         ExecutionPhase.QUEUE_DRAIN,
