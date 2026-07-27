@@ -356,11 +356,14 @@ def _convert_scaler(legacy: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-def convert_legacy_sequential_sampled(
+def convert_legacy_sequential(
     source_path: str | os.PathLike[str],
     destination_path: str | os.PathLike[str],
+    *,
+    expected_training_regime: str | None = None,
+    expected_estimator: str | None = None,
 ) -> dict[str, object]:
-    """Convert one selected v8 normal checkpoint exactly once, offline."""
+    """Convert an approved sequential sampled, RB, or probe artifact offline."""
 
     source = Path(source_path)
     destination = Path(destination_path)
@@ -383,18 +386,30 @@ def convert_legacy_sequential_sampled(
         legacy["cost_safeguard_controller_schema_version"] is not None
         or legacy["cost_safeguard_controller_state"] is not None
     ):
-        raise PersistenceError(
-            "sequential sampled artifact cannot carry a cost safeguard"
-        )
+        raise PersistenceError("sequential artifact cannot carry a cost safeguard")
     config = legacy["config"]
-    if (
-        config["training"]["mode"] != "nor" + "mal"
-        or config["rollout"]["branching_mode"] is not None
-        or config["completion"]["n_samples"] is not None
-    ):
-        raise PersistenceError(
-            "Phase 5 converter accepts only sequential sampled artifacts"
+    legacy_mode = config["training"]["mode"]
+    if config["rollout"]["branching_mode"] is not None:
+        raise PersistenceError("sequential converter rejects branched artifacts")
+    completion_samples = config["completion"]["n_samples"]
+    if legacy_mode == "nor" + "mal" and completion_samples is None:
+        regime, estimator = "self_play", "sampled"
+    elif legacy_mode == "rao_blackwell" and completion_samples is not None:
+        probe = config.get("probe")
+        regime, estimator = (
+            ("best_response", "rao_blackwell")
+            if probe is not None
+            else ("self_play", "rao_blackwell")
         )
+    else:
+        raise PersistenceError("legacy artifact is not an approved sequential mode")
+    if (
+        expected_training_regime is not None
+        and regime != expected_training_regime
+    ) or (
+        expected_estimator is not None and estimator != expected_estimator
+    ):
+        raise PersistenceError("legacy artifact mode differs from requested conversion")
     training = config["training"]
     legacy_loss = config["loss"]
     model = dict(config["model"])
@@ -472,6 +487,26 @@ def convert_legacy_sequential_sampled(
     # The converter itself must produce the strict public scientific schema,
     # not merely a mapping sufficient to reconstruct model parameters.
     scientific = Phase5Config.from_mapping(scientific).scientific_mapping()
+    scientific["mode"] = {
+        "training_regime": regime,
+        "rollout_mode": "sequential",
+        "private_estimator": estimator,
+    }
+    if estimator == "rao_blackwell":
+        scientific["completion"] = {
+            "n_samples": int(completion_samples),
+            "strata": config["completion"].get("strata", "default"),
+        }
+    if regime == "best_response":
+        probe = config["probe"]
+        target_hash = probe.get("target_sha256") or probe.get("checkpoint_sha256")
+        if not isinstance(target_hash, str) or len(target_hash) != 64:
+            raise PersistenceError("probe target must have a content hash")
+        scientific["frozen_profile"] = {"sha256": target_hash}
+        scientific["response_initialization"] = str(
+            probe.get("initialization", "random")
+        )
+        scientific["probe"] = {"target_sha256": target_hash}
     execution = {
         "hardware_profile": dict(legacy["hardware_profile"]),
         "checkpoint_cadence": config["training"].get("checkpoint_every"),
@@ -538,7 +573,7 @@ def convert_legacy_sequential_sampled(
             "schema": CONVERSION_SCHEMA,
             "source_sha256": source_hash,
             "source_schema": source_schema,
-            "mode": "self_play/sequential/sampled",
+            "mode": f"{regime}/sequential/{estimator}",
         },
     }
     # Conversion provenance is recorded beside the strict runtime payload,
@@ -574,6 +609,20 @@ def convert_legacy_sequential_sampled(
         )
         _atomic_json_save(artifact, artifact_path)
     return result
+
+
+def convert_legacy_sequential_sampled(
+    source_path: str | os.PathLike[str],
+    destination_path: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Phase 5 compatibility spelling for the sole offline converter."""
+
+    return convert_legacy_sequential(
+        source_path,
+        destination_path,
+        expected_training_regime="self_play",
+        expected_estimator="sampled",
+    )
 
 
 def trim_metrics_after_checkpoint(

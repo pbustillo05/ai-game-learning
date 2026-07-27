@@ -122,6 +122,7 @@ from pbg.queued.topology import (
 )
 from pbg.queued.config import (
     Phase5Config,
+    SequentialModeConfig,
     Phase5GameConfig,
     Phase5ModelConfig,
     Phase5Precision,
@@ -159,6 +160,7 @@ from pbg.queued.persistence import (
     PersistenceError,
     RunState,
     convert_legacy_sequential_sampled,
+    convert_legacy_sequential,
     load_checkpoint,
     save_checkpoint,
     sha256_file,
@@ -313,6 +315,8 @@ __all__ = [
     "device_exclusive_scan",
     "conditionalize",
     "convert_legacy_sequential_sampled",
+    "convert_legacy_sequential",
+    "SequentialModeConfig",
     "convert_value_head_units",
     "initialize_work_arenas",
     "logical_categorical",

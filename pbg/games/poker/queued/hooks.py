@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 
 from pbg.queued.contracts import (
+    ConversionSpec,
     ModeSchema,
     Partition,
     PartitionContract,
@@ -23,6 +24,7 @@ from pbg.queued.contracts import (
     PrivateEstimator,
     RolloutMode,
     TrainingRegime,
+    mode_schema,
 )
 from pbg.queued.rollout import (
     CommitCoverage,
@@ -145,6 +147,38 @@ def sampled_partitions(players: int) -> PartitionContract:
         ),
         conversions=(),
     )
+
+
+def rb_partitions(geometry: NLHEGeometry) -> PartitionContract:
+    """Natural learner domains for sequential Rao--Blackwell poker."""
+
+    k = geometry.rank_count**2
+    h = geometry.private_hands
+    inputs = (Partition("pre", k),) + tuple(
+        Partition(f"post_{live}", h)
+        for live in range(2, geometry.players + 1)
+    )
+    return PartitionContract(
+        inputs=inputs,
+        outputs=(Partition("pre", k), Partition("post", h)),
+        folded=(Partition("pre", k), Partition("post", h)),
+        input_to_output=(
+            PartitionMap("pre", "pre"),
+            *(
+                PartitionMap(f"post_{live}", "post")
+                for live in range(2, geometry.players + 1)
+            ),
+        ),
+        conversions=(ConversionSpec("post", "pre", "sum_classes"),),
+    )
+
+
+def poker_partitions(
+    geometry: NLHEGeometry, schema: ModeSchema
+) -> PartitionContract:
+    if schema.private_estimator is PrivateEstimator.RAO_BLACKWELL:
+        return rb_partitions(geometry)
+    return sampled_partitions(geometry.players)
 
 
 @dataclass(frozen=True)
@@ -1004,6 +1038,50 @@ class PokerStateMachine:
             }
         )
 
+    def rb_leaf(
+        self,
+        state: PokerState,
+        log_reach: Tensor,
+        *,
+        seed: Tensor,
+        selected_player: Tensor | None = None,
+    ) -> Mapping[str, Tensor]:
+        """Capture evaluator-v2 completion inputs in exact-hand space."""
+
+        if (
+            log_reach.shape
+            != (state.rows, self.geometry.players, self.geometry.private_hands)
+            or log_reach.dtype != torch.float32
+            or log_reach.device != state.device
+        ):
+            raise QueuedPokerError("RB leaf reaches must be CUDA FP32 [B,P,H]")
+        sampled = self.sampled_leaf(
+            replace(state, terminal=torch.ones_like(state.terminal))
+        )
+        finite = torch.isfinite(log_reach)
+        gauge = log_reach.masked_fill(~finite, -torch.inf).amax(
+            -1, keepdim=True
+        )
+        range_weights = torch.exp(
+            log_reach - gauge.masked_fill(~torch.isfinite(gauge), 0.0)
+        ).masked_fill(~finite, 0.0)
+        result: dict[str, Tensor] = {
+            # RB completion retains the public pre-terminal board.  Unlike
+            # sampled showdown, an early fold must not be padded with invented
+            # cards because that would change its pre/post output partition.
+            "board_cards": state.board_cards.contiguous(),
+            "stratum_level": sampled["stratum_level"],
+            "payoff_baseline": sampled["payoff_baseline"],
+            "stratum_amount": sampled["stratum_amount"],
+            "range_weights": range_weights.contiguous(),
+            "seed": seed.to(dtype=torch.int64, device=state.device).contiguous(),
+        }
+        if selected_player is not None:
+            result["selected_player"] = selected_player.to(
+                dtype=torch.int32, device=state.device
+            ).contiguous()
+        return MappingProxyType(result)
+
 
 @dataclass(frozen=True)
 class PokerForwardInput:
@@ -1013,10 +1091,11 @@ class PokerForwardInput:
     model_input: Tensor
     sampled_private_state: Tensor
     owner: Tensor
+    role_selector: Tensor | None = None
 
 
-class SequentialSampledPokerHooks:
-    """NLHE implementation of the Phase 4 opaque rollout hook boundary.
+class SequentialPokerHooks:
+    """NLHE implementation shared by every sequential mode.
 
     The hook writes no retained owner directly.  It returns one atomic plan
     containing the aligned heads plus exactly one leaf or next-family row for
@@ -1031,11 +1110,21 @@ class SequentialSampledPokerHooks:
         *,
         seed: int,
         iteration: int,
+        mode: ModeSchema | None = None,
         policy: PokerPolicyOperator | None = None,
     ) -> None:
         if owners.n_replica != 1:
             raise ValueError("ordinary Phase 5 poker hooks require one replica")
-        expected = tuple(item.name for item in sampled_partitions(geometry.players).inputs)
+        self.mode = (
+            mode_schema("self_play", "sequential", "sampled")
+            if mode is None
+            else mode
+        )
+        if self.mode.rollout_mode is not RolloutMode.SEQUENTIAL:
+            raise ValueError("sequential poker hooks require sequential mode")
+        expected = tuple(
+            item.name for item in poker_partitions(geometry, self.mode).inputs
+        )
         if tuple(queues) != expected:
             raise ValueError("poker queues do not cover the sampled input preorder")
         self.geometry = geometry
@@ -1062,10 +1151,17 @@ class SequentialSampledPokerHooks:
             batch.fields["model_input"].reshape(
                 *shape, self.geometry.direct_model_input_width
             ),
-            batch.fields["sampled_private_state"].reshape(
+            batch.fields.get(
+                "sampled_private_state", batch.fields["true_profile"]
+            ).reshape(
                 *shape, self.geometry.players
             ),
             batch.fields["owner"].reshape(*shape),
+            (
+                batch.fields["role_selector"].reshape(*shape)
+                if "role_selector" in batch.fields
+                else None
+            ),
         )
 
     def sample(self, request: SampleRequest) -> SampleWorkspace:
@@ -1074,10 +1170,17 @@ class SequentialSampledPokerHooks:
             request.batch.fields["model_input"].reshape(
                 -1, self.geometry.direct_model_input_width
             ),
-            request.batch.fields["sampled_private_state"].reshape(
+            request.batch.fields.get(
+                "sampled_private_state", request.batch.fields["true_profile"]
+            ).reshape(
                 -1, self.geometry.players
             ),
             request.batch.fields["owner"].reshape(-1),
+            (
+                request.batch.fields["role_selector"].reshape(-1)
+                if "role_selector" in request.batch.fields
+                else None
+            ),
         )
         state = self.machine.state_from_model_input(
             forward.model_input, forward.sampled_private_state
@@ -1142,13 +1245,48 @@ class SequentialSampledPokerHooks:
             index = index.expand((value.shape[0], source_row.shape[1], *value.shape[2:]))
             destination[name].index_copy_(0, lanes, value.gather(1, index))
 
+    def _natural_rows(self, value: Tensor, input_type: str) -> Tensor:
+        """Select one deterministic exact-hand representative per pre class."""
+
+        if input_type != "pre":
+            return value.float()
+        ranks = self.geometry.rank_count
+        cards = self.machine.combo_cards(
+            torch.arange(
+                self.geometry.private_hands,
+                dtype=torch.int32,
+                device=value.device,
+            )
+        )
+        rank = cards.long() // 4 - (13 - ranks)
+        high, low = rank.max(1).values, rank.min(1).values
+        hp, lp = ranks - 1 - high, ranks - 1 - low
+        suited_or_pair = rank[:, 0].eq(rank[:, 1]) | cards[:, 0].remainder(4).eq(
+            cards[:, 1].remainder(4)
+        )
+        classes = torch.where(
+            suited_or_pair, hp * ranks + lp, lp * ranks + hp
+        )
+        representatives = torch.full(
+            (ranks * ranks,), -1, dtype=torch.int64, device=value.device
+        )
+        # Reverse assignment leaves the smallest exact-hand row in each class.
+        for combo in range(self.geometry.private_hands - 1, -1, -1):
+            representatives[classes[combo]] = combo
+        torch._assert_async(
+            representatives.ge(0).all(), "preflop class map is incomplete"
+        )
+        return value.index_select(1, representatives).float()
+
     def transition(self, request: TransitionRequest) -> CommitPlan:
         batch = request.batch
         lane_count, rows = batch.lane_count, batch.rows
         flat_input = batch.fields["model_input"].reshape(
             -1, self.geometry.direct_model_input_width
         )
-        flat_private = batch.fields["sampled_private_state"].reshape(
+        flat_private = batch.fields.get(
+            "sampled_private_state", batch.fields["true_profile"]
+        ).reshape(
             -1, self.geometry.players
         )
         state = self.machine.state_from_model_input(flat_input, flat_private)
@@ -1242,17 +1380,60 @@ class SequentialSampledPokerHooks:
         )
         address.index_copy_(0, batch.lanes, logical[..., 0].amin(1))
         destinations: list[DeviceDestinationRequest] = []
+        sampled_mode = (
+            self.mode.private_estimator is PrivateEstimator.SAMPLED
+        )
+        response = self.mode.training_regime is TrainingRegime.BEST_RESPONSE
+        owner = batch.fields["owner"].reshape(-1).to(torch.int64)
+        selected_player = (
+            batch.fields["role_selector"].reshape(-1).to(torch.int64)
+            if response
+            else owner
+        )
+        trained_flat = (
+            owner.eq(selected_player)
+            if response
+            else torch.ones_like(owner, dtype=torch.bool)
+        )
+        trained = trained_flat.reshape(lane_count, rows)
+        trained_order = torch.argsort(~trained, dim=1, stable=True)
+        trained_counts = torch.zeros_like(full_counts)
+        trained_counts.index_copy_(
+            0, batch.lanes, trained.sum(1, dtype=torch.int64)
+        )
 
         leaf = next(
             slab for slab in self.owners.slabs if slab.schema.name == "Leaf"
         )
         leaf_values = self._defaults(leaf, rows)
-        leaf_source = self.machine.sampled_leaf(
-            replace(
-                next_state,
-                terminal=torch.ones_like(next_state.terminal),
+        terminal_state = replace(
+            next_state, terminal=torch.ones_like(next_state.terminal)
+        )
+        leaf_source = (
+            self.machine.sampled_leaf(terminal_state)
+            if sampled_mode
+            else self.machine.rb_leaf(
+                terminal_state,
+                log_reach,
+                seed=logical_rng_keys(
+                    seed=self.seed,
+                    iteration=self.iteration,
+                    root=root,
+                    path=path,
+                    draw=0,
+                    purpose=DrawPurpose.COMPLETION,
+                    retry_epoch=retry,
+                ),
+                selected_player=selected_player if response else None,
             )
         )
+        if sampled_mode and response:
+            leaf_source = MappingProxyType(
+                {
+                    **dict(leaf_source),
+                    "selected_player": selected_player.to(torch.int32),
+                }
+            )
         reshaped_leaf = {
             name: value.reshape(lane_count, rows, *value.shape[1:])
             for name, value in leaf_source.items()
@@ -1275,19 +1456,25 @@ class SequentialSampledPokerHooks:
         )
         sigma_values = self._defaults(sigma, rows)
         value = request.model.values["value"]
-        owner = batch.fields["owner"].reshape(-1).to(torch.int64)
         private = flat_private
         flat_row = torch.arange(owner.numel(), device=state.device)
-        actor_hand = private[flat_row, owner].to(torch.int64)
-        selected_value = value[flat_row, actor_hand].reshape(
-            lane_count, rows, 1
+        selected_value = (
+            value[flat_row, private[flat_row, owner].to(torch.int64), None]
+            if sampled_mode
+            else self._natural_rows(value, batch.input_type)
+        ).reshape(lane_count, rows, -1)
+        selected_value = selected_value.gather(
+            1,
+            trained_order[..., None].expand(
+                -1, -1, selected_value.shape[-1]
+            ),
         )
         sigma_values["old_value"].index_copy_(
             0, batch.lanes, selected_value
         )
         destinations.append(
             DeviceDestinationRequest(
-                sigma, full_counts, sigma_values, batch.input_type, address
+                sigma, trained_counts, sigma_values, batch.input_type, address
             )
         )
 
@@ -1298,17 +1485,26 @@ class SequentialSampledPokerHooks:
         )
         action_values = self._defaults(action_head, rows)
         action_values["action"].index_copy_(
-            0, batch.lanes, request.sample.values["action"]
-        )
-        action_values["old_log_policy"].index_copy_(
             0,
             batch.lanes,
-            request.sample.values["selected_log_policy"][..., None],
+            request.sample.values["action"].gather(1, trained_order),
+        )
+        retained_log = (
+            request.sample.values["selected_log_policy"].reshape(-1, 1)
+            if sampled_mode
+            else self._natural_rows(selected_log, batch.input_type)
+        ).reshape(lane_count, rows, -1)
+        retained_log = retained_log.gather(
+            1,
+            trained_order[..., None].expand(-1, -1, retained_log.shape[-1]),
+        )
+        action_values["old_log_policy"].index_copy_(
+            0, batch.lanes, retained_log
         )
         destinations.append(
             DeviceDestinationRequest(
                 action_head,
-                full_counts,
+                trained_counts,
                 action_values,
                 batch.input_type,
                 address,
@@ -1333,8 +1529,11 @@ class SequentialSampledPokerHooks:
             "true_profile": next_private,
             "model_input": next_input,
             "owner": next_owner,
-            "sampled_private_state": next_private,
         }
+        if sampled_mode:
+            family_source["sampled_private_state"] = next_private
+        if response:
+            family_source["role_selector"] = batch.fields["role_selector"]
         published_queues: list[SemanticFamilyFIFO] = []
         for family_index, (name, queue) in enumerate(self.queues.items()):
             values = self._defaults(queue.family, rows)
@@ -1366,14 +1565,23 @@ class SequentialSampledPokerHooks:
         destination_ordinal = torch.zeros_like(source_ordinal)
         ordinal = torch.arange(rows, dtype=torch.int64, device=state.device)
         for local_lane, lane in ((0, 0),):
-            valid[lane].fill_(True)
+            valid[lane, 2::3].fill_(True)
+            valid[lane, 0::3].copy_(trained[local_lane])
+            valid[lane, 1::3].copy_(trained[local_lane])
             source_ordinal[lane, 0::3].copy_(ordinal)
             source_ordinal[lane, 1::3].copy_(ordinal)
             source_ordinal[lane, 2::3].copy_(ordinal)
             destination[lane, 0::3].fill_(1)
             destination[lane, 1::3].fill_(2)
-            destination_ordinal[lane, 0::3].copy_(ordinal)
-            destination_ordinal[lane, 1::3].copy_(ordinal)
+            compact_ordinal = trained[local_lane].cumsum(
+                0, dtype=torch.int64
+            ) - 1
+            destination_ordinal[lane, 0::3].copy_(
+                compact_ordinal.clamp_min(0)
+            )
+            destination_ordinal[lane, 1::3].copy_(
+                compact_ordinal.clamp_min(0)
+            )
             selected_family = route_family[local_lane]
             route_ordinal = torch.zeros_like(ordinal)
             route_destination = torch.zeros_like(ordinal)
@@ -1393,19 +1601,39 @@ class SequentialSampledPokerHooks:
             destination[lane, 2::3].copy_(route_destination)
             destination_ordinal[lane, 2::3].copy_(route_ordinal)
 
+        topology_next_family = next_family[0]
+        if not sampled_mode:
+            leaf_family = torch.where(
+                next_state.board_cards.reshape(
+                    lane_count, rows, 5
+                )[0, :, 0].eq(PAD_CARD),
+                torch.zeros_like(topology_next_family),
+                torch.ones_like(topology_next_family),
+            )
+            topology_next_family = torch.where(
+                terminal[0], leaf_family, topology_next_family
+            )
         topology = DeferredUnaryTopologyPublication(
             lane=0,
             sequence=self._topology_sequence,
             input_type_index=self.input_index[batch.input_type],
             logical_rng_key=logical[0],
             next_logical_rng_key=next_logical[0],
-            next_input_type=next_family[0],
+            next_input_type=topology_next_family,
             terminal=terminal[0],
-            owner=batch.fields["owner"][0],
+            owner=(
+                torch.zeros_like(batch.fields["owner"][0])
+                if response
+                else batch.fields["owner"][0]
+            ),
             action=request.sample.values["action"][0],
             familywork_row=batch.row[0],
             leaf_reservation_index=0,
             leaf_target_ordinal=route_ordinal,
+            trained=trained[0],
+            sigma_reservation_index=1,
+            action_reservation_index=2,
+            trained_target_ordinal=compact_ordinal.clamp_min(0),
         )
         self._topology_sequence += 1
         self.last_topology = topology
@@ -1417,6 +1645,10 @@ class SequentialSampledPokerHooks:
             published_queues=tuple(published_queues),
             deferred_topology=(topology,),
         )
+
+
+# Phase 5 imports retain their public spelling while using the shared engine.
+SequentialSampledPokerHooks = SequentialPokerHooks
 
 
 class PokerLearnerPolicy:
@@ -1441,6 +1673,15 @@ class PokerLearnerPolicy:
         reference_raw: Mapping[str, Tensor] | None,
     ) -> PolicyEvaluation:
         del owner
+        if sampled_private_state.shape != (
+            model_input.shape[0],
+            self.machine.geometry.players,
+        ):
+            sampled_private_state = torch.zeros(
+                (model_input.shape[0], self.machine.geometry.players),
+                dtype=torch.int32,
+                device=model_input.device,
+            )
         state = self.machine.state_from_model_input(
             model_input, sampled_private_state.to(torch.int32)
         )
@@ -1507,12 +1748,26 @@ class SampledShowdownBinding:
         ).reshape(
             batch.lanes.numel(), batch.rows, self.geometry.players
         ).mul(self.utility_scale)
+        p_train = self.layer_work.schema.by_name[
+            "return_value"
+        ].shape[1]
+        if p_train == 1:
+            if "selected_player" not in fields:
+                raise QueuedPokerError(
+                    "best-response sampled leaf omitted selected_player"
+                )
+            selected = fields["selected_player"].reshape(
+                batch.lanes.numel(), batch.rows
+            ).to(torch.int64)
+            payoff = payoff.gather(2, selected[..., None])
+        elif p_train != self.geometry.players:
+            raise QueuedPokerError("sampled LayerWork has invalid trained width")
         values = torch.zeros(
             (
                 self.n_replica,
                 self.pack_cap,
                 2,
-                self.geometry.players,
+                p_train,
                 1,
             ),
             dtype=torch.float32,
@@ -1553,6 +1808,178 @@ class SampledShowdownBinding:
         )
 
 
+class RBCompletionBinding:
+    """Evaluator-v2 completion followed by FP32 mass/moment publication."""
+
+    def __init__(
+        self,
+        geometry: NLHEGeometry,
+        layer_work: Mapping[str, MonotoneSlab],
+        algebra: object,
+        *,
+        mode: ModeSchema,
+        n_replica: int,
+        pack_cap: int,
+        n_samples: int,
+        utility: str = "raw_bb",
+    ) -> None:
+        from pbg.queued.targets import TargetAlgebra
+
+        if mode.private_estimator is not PrivateEstimator.RAO_BLACKWELL:
+            raise ValueError("RB completion requires an RB schema")
+        if not isinstance(algebra, TargetAlgebra):
+            raise TypeError("RB completion requires the target algebra")
+        if isinstance(n_samples, bool) or n_samples <= 0:
+            raise ValueError("completion samples must be positive")
+        try:
+            import poker_gpu_evaluator as poker
+        except ImportError as exc:
+            raise QueuedPokerError("poker-gpu-evaluator is required") from exc
+        if str(getattr(poker, "CONTRACT_VERSION", "")) != "2":
+            raise QueuedPokerError("poker evaluator contract v2 is required")
+        self.evaluator = poker.bind(rank_count=geometry.rank_count)
+        self.geometry = geometry
+        self.layer_work = MappingProxyType(dict(layer_work))
+        self.algebra = algebra
+        self.mode = mode
+        self.n_replica = int(n_replica)
+        self.pack_cap = int(pack_cap)
+        self.n_samples = int(n_samples)
+        if utility not in ("raw_bb", "stack_normalized"):
+            raise ValueError("completion utility must be raw_bb or stack_normalized")
+        self.utility_scale = 1.0 if utility == "raw_bb" else 1.0 / geometry.stack_bb
+
+    def leaf_to_layer_work(self, batch: CompletionBatch) -> CompletionPlan:
+        from pbg.queued.targets import rb_completion
+
+        fields = batch.fields
+        flat = batch.lanes.numel() * batch.rows
+        common = {
+            "board_cards": fields["board_cards"].reshape(flat, 5).contiguous(),
+            "range_weights": fields["range_weights"].reshape(
+                flat, self.geometry.players, self.geometry.private_hands
+            ).contiguous(),
+            "stratum_level": fields["stratum_level"].reshape(
+                flat, self.geometry.players
+            ).contiguous(),
+            "payoff_baseline": fields["payoff_baseline"].reshape(
+                flat, self.geometry.players
+            ).contiguous(),
+            "stratum_amount": fields["stratum_amount"].reshape(
+                flat, -1
+            ).contiguous(),
+            "n_samples": self.n_samples,
+            "seed": fields["seed"].reshape(flat).contiguous(),
+        }
+        response = self.mode.training_regime is TrainingRegime.BEST_RESPONSE
+        completed = (
+            self.evaluator.complete_selected(
+                **common,
+                selected_player=fields["selected_player"].reshape(flat).contiguous(),
+            )
+            if response
+            else self.evaluator.complete(**common)
+        )
+        p_train = 1 if response else self.geometry.players
+        p_hat = completed.p_hat.reshape(
+            flat, p_train, self.geometry.private_hands
+        ).float().contiguous()
+        v_hat = completed.v_hat.reshape_as(p_hat).float()
+        v_hat.mul_(self.utility_scale)
+        lane_count = batch.lanes.numel()
+        pre = fields["board_cards"].reshape(
+            lane_count, batch.rows, 5
+        )[:, :, 0].eq(PAD_CARD)
+        route_family = (~pre).to(torch.int32)
+        route = stable_route(
+            route_family,
+            torch.ones_like(route_family, dtype=torch.bool),
+            (0, 1),
+            declared_values=torch.tensor(
+                (0, 1), dtype=torch.int32, device=p_hat.device
+            ),
+        )
+        p_hat_rows = p_hat.reshape(
+            lane_count, batch.rows, p_train, self.geometry.private_hands
+        )
+        v_hat_rows = v_hat.reshape_as(p_hat_rows)
+        destination_names = ("pre", "post")
+        requests: list[DeviceDestinationRequest] = []
+        for destination_index, name in enumerate(destination_names):
+            slab = self.layer_work[name]
+            values = {
+                field.name: torch.full(
+                    (self.n_replica, self.pack_cap, *field.shape),
+                    field.fill,
+                    dtype=field.dtype,
+                    device=p_hat.device,
+                )
+                for field in slab.schema.fields
+            }
+            source_row = route.source_row[:, destination_index]
+            gather = source_row[..., None, None].expand_as(p_hat_rows)
+            selected_p = p_hat_rows.gather(1, gather).reshape(
+                flat, p_train, self.geometry.private_hands
+            ).contiguous()
+            selected_v = v_hat_rows.gather(1, gather).reshape_as(
+                selected_p
+            ).contiguous()
+            work = rb_completion(
+                selected_p,
+                selected_v,
+                branched=False,
+                algebra=self.algebra,
+                source_output="post",
+                destination_output=name,
+            )
+            values["mass"][batch.lanes, : batch.rows, 0] = work.mass.reshape(
+                lane_count, batch.rows, p_train, -1
+            )
+            values["moment"][batch.lanes, : batch.rows, 0] = work.moment.reshape(
+                lane_count, batch.rows, p_train, -1
+            )
+            counts = torch.zeros(
+                self.n_replica, dtype=torch.int64, device=p_hat.device
+            )
+            counts.index_copy_(
+                0, batch.lanes, route.counts[:, destination_index]
+            )
+            requests.append(
+                DeviceDestinationRequest(
+                    slab,
+                    counts,
+                    values,
+                    name,
+                    torch.where(
+                        counts > 0,
+                        batch.row[:, 0],
+                        torch.full_like(counts, torch.iinfo(torch.int64).max),
+                    ),
+                )
+            )
+        valid = torch.zeros(
+            (self.n_replica, self.pack_cap),
+            dtype=torch.bool,
+            device=p_hat.device,
+        )
+        valid[batch.lanes, : batch.rows] = True
+        source = torch.arange(
+            self.pack_cap, dtype=torch.int64, device=p_hat.device
+        )[None].expand(self.n_replica, -1).clone()
+        destination = torch.zeros_like(source)
+        ordinal = torch.zeros_like(source)
+        destination[batch.lanes, : batch.rows] = route_family.to(torch.int64)
+        ordinal[batch.lanes, : batch.rows] = torch.where(
+            pre,
+            pre.cumsum(1, dtype=torch.int64) - 1,
+            (~pre).cumsum(1, dtype=torch.int64) - 1,
+        )
+        return CompletionPlan(
+            tuple(requests),
+            CommitCoverage(valid, source, destination, ordinal),
+        )
+
+
 def validate_phase5_mode(schema: ModeSchema) -> None:
     if (
         schema.training_regime is not TrainingRegime.SELF_PLAY
@@ -1575,7 +2002,11 @@ __all__ = [
     "PokerStateMachine",
     "QueuedPokerError",
     "SampledShowdownBinding",
+    "RBCompletionBinding",
     "SequentialSampledPokerHooks",
+    "SequentialPokerHooks",
     "sampled_partitions",
+    "rb_partitions",
+    "poker_partitions",
     "validate_phase5_mode",
 ]

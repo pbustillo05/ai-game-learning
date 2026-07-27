@@ -282,8 +282,6 @@ class SequentialLearnerBatch:
 class SealedSequentialInputs:
     """Generated retained learner-input owner after rollout-hot release."""
 
-    _FIELDS = ("model_input", "sampled_private_state", "owner")
-
     def __init__(
         self,
         slab: MonotoneSlab,
@@ -291,7 +289,12 @@ class SealedSequentialInputs:
         input_type: str,
         lane: int,
     ) -> None:
-        if tuple(slab.columns) != self._FIELDS:
+        expected = (
+            ("model_input", "sampled_private_state", "owner")
+            if "sampled_private_state" in slab.columns
+            else ("model_input", "owner")
+        )
+        if tuple(slab.columns) != expected:
             raise LearnerError("sealed sequential input has the wrong field contract")
         if slab.schema.name != f"LearnerIndex.{input_type}":
             raise LearnerError("sealed input is not the generated learner owner")
@@ -300,6 +303,7 @@ class SealedSequentialInputs:
         self.lane = lane
         self.rows = slab.tail(lane)
         self.device = slab.device
+        self.fields = expected
 
     @classmethod
     def seal(
@@ -315,23 +319,40 @@ class SealedSequentialInputs:
         if not 0 <= lane < family.n_replica:
             raise LearnerError("input sealing lane is outside replicas")
         by_name = family.schema.by_name
-        missing = set(cls._FIELDS).difference(by_name)
+        fields = (
+            ("model_input", "sampled_private_state", "owner")
+            if "sampled_private_state" in destination.columns
+            else ("model_input", "owner")
+        )
+        missing = set(fields).difference(by_name)
         if missing:
             raise LearnerError(f"family input lacks fields {sorted(missing)}")
         if (
             destination.schema.name != f"LearnerIndex.{input_type}"
-            or tuple(destination.columns) != cls._FIELDS
+            or tuple(destination.columns) != fields
             or destination.n_replica != family.n_replica
             or destination.device != family.device
             or destination.failure_state is not family.failure_state
         ):
             raise LearnerError("generated learner-input owner is incompatible")
         rows = family.tail(lane)
+        selected: Tensor | None = None
+        if "role_selector" in family.columns:
+            selected = torch.nonzero(
+                family.columns["role_selector"][lane, :rows].to(torch.int64)
+                == family.columns["owner"][lane, :rows].to(torch.int64),
+                as_tuple=False,
+            ).flatten()
+            rows = int(selected.numel())
         if rows <= 0:
             return cls(destination, input_type=input_type, lane=lane)
         values = {
-            name: family.columns[name][:, :rows]
-            for name in cls._FIELDS
+            name: (
+                family.columns[name][:, :rows]
+                if selected is None
+                else family.columns[name][lane, selected][None]
+            )
+            for name in fields
         }
         counts = torch.zeros(
             family.n_replica, dtype=torch.int64, device=family.device
@@ -376,15 +397,6 @@ class SealedSequentialInputs:
 class AlignedSequentialStore:
     """Validated five-owner view for one sequential input partition."""
 
-    _OWNER_FIELDS = MappingProxyType(
-        {
-            "SigmaHead": ("old_value",),
-            "SigmaTarget": ("value_target",),
-            "ActionHead": ("action", "old_log_policy"),
-            "ActionTarget": ("advantage_target",),
-        }
-    )
-
     def __init__(
         self,
         owners: GeneratedOwners,
@@ -394,14 +406,8 @@ class AlignedSequentialStore:
         lane: int = 0,
     ) -> None:
         mode = owners.plan.mode
-        if (
-            mode.training_regime is not TrainingRegime.SELF_PLAY
-            or mode.rollout_mode is not RolloutMode.SEQUENTIAL
-            or mode.private_estimator is not PrivateEstimator.SAMPLED
-        ):
-            raise LearnerError(
-                "Phase 5 aligned stores require self-play sequential sampled mode"
-            )
+        if mode.rollout_mode is not RolloutMode.SEQUENTIAL:
+            raise LearnerError("aligned stores require a sequential mode")
         if input_type not in tuple(item.name for item in owners.plan.partitions.inputs):
             raise LearnerError(f"unknown learner input partition {input_type!r}")
         if not 0 <= lane < owners.plan.manifest.n_replica:
@@ -412,10 +418,17 @@ class AlignedSequentialStore:
             or sealed_inputs.device != owners.plan.device
         ):
             raise LearnerError("sealed learner input identity differs from owners")
-        slabs = {
-            name: owners.slab(name, input_type)
-            for name in self._OWNER_FIELDS
+        owner_fields = {
+            "SigmaHead": ("old_value",),
+            "SigmaTarget": ("value_target",),
+            "ActionHead": ("action", "old_log_policy"),
+            "ActionTarget": (
+                ("advantage_target",)
+                if mode.private_estimator is PrivateEstimator.SAMPLED
+                else ("posterior", "advantage_target")
+            ),
         }
+        slabs = {name: owners.slab(name, input_type) for name in owner_fields}
         counts = {name: slab.tail(lane) for name, slab in slabs.items()}
         counts["SealedInput"] = sealed_inputs.rows
         if len(set(counts.values())) != 1:
@@ -423,7 +436,7 @@ class AlignedSequentialStore:
                 "sequential learner owners are not exactly row aligned: "
                 + ", ".join(f"{name}={count}" for name, count in counts.items())
             )
-        for owner, fields in self._OWNER_FIELDS.items():
+        for owner, fields in owner_fields.items():
             missing = set(fields).difference(slabs[owner].columns)
             if missing:
                 raise LearnerError(
@@ -435,6 +448,7 @@ class AlignedSequentialStore:
         self.lane = lane
         self.sealed_inputs = sealed_inputs
         self.slabs = MappingProxyType(slabs)
+        self.owner_fields = MappingProxyType(owner_fields)
         self.rows = next(iter(counts.values()))
         self.device = next(iter(slabs.values())).device
 
@@ -455,7 +469,7 @@ class AlignedSequentialStore:
         fields: dict[str, Tensor] = {}
         for name, value in self.sealed_inputs.columns.items():
             fields[name] = value[selected]
-        for owner, names in self._OWNER_FIELDS.items():
+        for owner, names in self.owner_fields.items():
             columns = self.slabs[owner].columns
             for name in names:
                 if name in fields:
@@ -784,12 +798,8 @@ class LearnerOperation:
         *,
         precision: str = "fp32",
     ) -> None:
-        if (
-            mode.training_regime is not TrainingRegime.SELF_PLAY
-            or mode.rollout_mode is not RolloutMode.SEQUENTIAL
-            or mode.private_estimator is not PrivateEstimator.SAMPLED
-        ):
-            raise LearnerError("Phase 5 learner accepts only its delivered mode row")
+        if mode.rollout_mode is not RolloutMode.SEQUENTIAL:
+            raise LearnerError("the aligned learner operation requires sequential mode")
         self.mode = mode
         self.loss = loss
         self.model_operation = model_operation
@@ -824,60 +834,73 @@ class LearnerOperation:
             evaluation = self.model_operation(
                 batch.input_type,
                 fields["model_input"],
-                fields["sampled_private_state"],
+                fields.get("sampled_private_state", fields["owner"][:, None]),
                 fields["owner"],
             )
-            evaluation = ModelEvaluation(
-                MappingProxyType(
+            sampled = self.mode.private_estimator is PrivateEstimator.SAMPLED
+            if sampled:
+                evaluation = ModelEvaluation(
+                    MappingProxyType(
+                        {
+                            name: _select_sampled_private(
+                                value,
+                                fields["sampled_private_state"],
+                                fields["owner"],
+                            )
+                            for name, value in evaluation.policy_raw.items()
+                        }
+                    ),
+                    _select_sampled_private(
+                        evaluation.value,
+                        fields["sampled_private_state"],
+                        fields["owner"],
+                    ),
+                )
+            if reference_cache is not None:
+                if reference_operation is not None:
+                    raise LearnerError(
+                        "reference cache and reference operation are mutually exclusive"
+                    )
+                cached = reference_cache.gather(batch.indices)
+                reference = (
                     {
                         name: _select_sampled_private(
                             value,
                             fields["sampled_private_state"],
                             fields["owner"],
                         )
-                        for name, value in evaluation.policy_raw.items()
+                        for name, value in cached.items()
                     }
-                ),
-                _select_sampled_private(
-                    evaluation.value,
-                    fields["sampled_private_state"],
-                    fields["owner"],
-                ),
-            )
-            if reference_cache is not None:
-                if reference_operation is not None:
-                    raise LearnerError(
-                        "reference cache and reference operation are mutually exclusive"
-                    )
-                reference = {
-                    name: _select_sampled_private(
-                        value,
-                        fields["sampled_private_state"],
-                        fields["owner"],
-                    )
-                    for name, value in reference_cache.gather(
-                        batch.indices
-                    ).items()
-                }
+                    if sampled
+                    else dict(cached)
+                )
             else:
                 reference = (
                     None
                     if reference_operation is None
                     else {
-                        name: _select_sampled_private(
-                            value,
-                            fields["sampled_private_state"],
-                            fields["owner"],
+                        name: (
+                            _select_sampled_private(
+                                value,
+                                fields["sampled_private_state"],
+                                fields["owner"],
+                            )
+                            if sampled
+                            else value
                         )
                         for name, value in reference_operation(
                             batch.input_type,
                             fields["model_input"],
-                            fields["sampled_private_state"],
+                            fields.get("sampled_private_state", fields["owner"][:, None]),
                             fields["owner"],
                         ).policy_raw.items()
                     }
                 )
-        compact_private = torch.zeros_like(fields["sampled_private_state"])
+        compact_private = (
+            torch.zeros_like(fields["sampled_private_state"])
+            if sampled
+            else fields["owner"][:, None]
+        )
         policy = self.policy_operation(
             batch.input_type,
             fields["model_input"],
@@ -887,53 +910,58 @@ class LearnerOperation:
             fields["owner"].to(torch.int64),
             reference,
         )
-        current_log = _scalar_private_row(
-            policy.selected_log_policy,
-            compact_private,
-            fields["owner"],
-        )
-        entropy = _scalar_private_row(
-            policy.entropy,
-            compact_private,
-            fields["owner"],
-        )
-        reference_kl = _scalar_private_row(
-            policy.reference_kl,
-            compact_private,
-            fields["owner"],
-        )
-        current_value = _scalar_private_row(
-            evaluation.value,
-            compact_private,
-            fields["owner"],
-        )
-        old_log = fields["old_log_policy"].float().reshape(batch.rows, -1)[:, 0]
-        old_value = fields["old_value"].float().reshape(batch.rows, -1)[:, 0]
-        target_value = fields["value_target"].float().reshape(batch.rows, -1)[:, 0]
-        advantage = fields["advantage_target"].float().reshape(batch.rows, -1)[:, 0]
-        if not all(
-            tensor.shape == (batch.rows,)
-            for tensor in (
-                current_log,
-                entropy,
-                reference_kl,
-                current_value,
-                old_log,
-                old_value,
-                target_value,
-                advantage,
+        if sampled:
+            current_log = _scalar_private_row(
+                policy.selected_log_policy, compact_private, fields["owner"]
             )
-        ):
-            raise LearnerError("learner scalar reductions are not batch aligned")
+            entropy = _scalar_private_row(
+                policy.entropy, compact_private, fields["owner"]
+            )
+            reference_kl = _scalar_private_row(
+                policy.reference_kl, compact_private, fields["owner"]
+            )
+            current_value = _scalar_private_row(
+                evaluation.value, compact_private, fields["owner"]
+            )
+        else:
+            current_log = policy.selected_log_policy.float()
+            entropy = policy.entropy.float()
+            reference_kl = policy.reference_kl.float()
+            current_value = evaluation.value.float()
+        old_log = fields["old_log_policy"].float()
+        old_value = fields["old_value"].float()
+        target_value = fields["value_target"].float()
+        advantage = fields["advantage_target"].float()
+        if sampled:
+            old_log = old_log.reshape(batch.rows, -1)[:, 0]
+            old_value = old_value.reshape(batch.rows, -1)[:, 0]
+            target_value = target_value.reshape(batch.rows, -1)[:, 0]
+            advantage = advantage.reshape(batch.rows, -1)[:, 0]
+        if not all(tensor.shape == current_log.shape for tensor in (
+            entropy, reference_kl, current_value, old_log, old_value,
+            target_value, advantage,
+        )):
+            raise LearnerError("learner fields are not batch/domain aligned")
+        posterior = (
+            torch.ones_like(current_log)
+            if sampled
+            else fields["posterior"].float()
+        )
+        if posterior.shape != current_log.shape:
+            raise LearnerError("RB posterior is not aligned to the natural domain")
+        posterior_mass = posterior.sum(-1, keepdim=True).clamp_min(
+            torch.finfo(torch.float32).tiny
+        )
+        posterior = posterior / posterior_mass
         log_ratio = current_log - old_log
         ratio = torch.exp(log_ratio)
         clipped_ratio = ratio.clamp(
             1.0 - self.loss.clip_epsilon,
             1.0 + self.loss.clip_epsilon,
         )
-        policy_loss = -torch.minimum(
+        policy_term = -torch.minimum(
             ratio * advantage, clipped_ratio * advantage
-        ).mean()
+        )
         error = (current_value - target_value).square()
         if self.loss.value_loss == "clipped":
             clipped_value = old_value + (current_value - old_value).clamp(
@@ -941,9 +969,16 @@ class LearnerOperation:
                 self.loss.value_clip_epsilon,
             )
             error = torch.maximum(error, (clipped_value - target_value).square())
-        value_loss = error.mean()
-        entropy_mean = entropy.mean()
-        reference_kl_mean = reference_kl.mean()
+        if sampled:
+            policy_loss = policy_term.mean()
+            value_loss = error.mean()
+            entropy_mean = entropy.mean()
+            reference_kl_mean = reference_kl.mean()
+        else:
+            policy_loss = (posterior * policy_term).sum(-1).mean()
+            value_loss = (posterior * error).sum(-1).mean()
+            entropy_mean = (posterior * entropy).sum(-1).mean()
+            reference_kl_mean = (posterior * reference_kl).sum(-1).mean()
         total = (
             policy_loss
             + self.loss.value_coefficient * value_loss
@@ -965,8 +1000,18 @@ class LearnerOperation:
             value_loss,
             entropy_mean,
             reference_kl_mean,
-            ((ratio - 1.0) - log_ratio).mean(),
-            (torch.abs(ratio - 1.0) > self.loss.clip_epsilon).float().mean(),
+            (
+                (((ratio - 1.0) - log_ratio) * posterior).sum(-1).mean()
+                if not sampled else ((ratio - 1.0) - log_ratio).mean()
+            ),
+            (
+                (
+                    (torch.abs(ratio - 1.0) > self.loss.clip_epsilon).float()
+                    * posterior
+                ).sum(-1).mean()
+                if not sampled
+                else (torch.abs(ratio - 1.0) > self.loss.clip_epsilon).float().mean()
+            ),
         )
 
 

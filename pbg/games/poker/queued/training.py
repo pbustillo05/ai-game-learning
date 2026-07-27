@@ -18,7 +18,9 @@ from pbg.games.poker.queued.hooks import (
     PokerForwardInput,
     PokerLearnerPolicy,
     PokerStateMachine,
+    RBCompletionBinding,
     SampledShowdownBinding,
+    SequentialPokerHooks,
     SequentialSampledPokerHooks,
 )
 from pbg.games.poker.queued.policy import PokerPolicyOperator
@@ -28,7 +30,12 @@ from pbg.queued.capacity import (
     StoragePlan,
 )
 from pbg.queued.config import Phase5Config
-from pbg.queued.contracts import ModeSchema
+from pbg.queued.contracts import (
+    ModeSchema,
+    PrivateEstimator,
+    RolloutMode,
+    TrainingRegime,
+)
 from pbg.queued.learner import (
     AlignedSequentialStore,
     LearnerOperation,
@@ -62,7 +69,7 @@ from pbg.queued.storage import (
     DeviceDestinationRequest,
     PublicationTransaction,
 )
-from pbg.queued.targets import LayeredTargetExecutor, TargetAlgebra
+from pbg.queued.targets import ConversionMap, LayeredTargetExecutor, TargetAlgebra
 from pbg.queued.topology import (
     build_layer_plan,
 )
@@ -88,8 +95,8 @@ class PokerIterationResult:
     target_layers: int
 
 
-class SequentialSampledPokerIteration:
-    """Run roots through rollout, evaluator, targets, learner, and optimizer."""
+class SequentialPokerIteration:
+    """Run any sequential schema through the sole queued engine."""
 
     def __init__(
         self,
@@ -99,6 +106,7 @@ class SequentialSampledPokerIteration:
         mode: ModeSchema,
         model: nn.Module,
         model_operation: ModelOperation,
+        rollout_operation: ModelOperation | None = None,
         optimizer: DenseAdam,
         loss: LossConfig,
         schedule: LearnerSchedule,
@@ -112,6 +120,8 @@ class SequentialSampledPokerIteration:
         reproducibility: str = "strict",
         run_state: RunState | None = None,
         reference_operation: ModelOperation | None = None,
+        frozen_operation: ModelOperation | None = None,
+        completion_samples: int = 0,
     ) -> None:
         if owners.plan.mode != mode:
             raise ValueError("poker iteration mode differs from generated owners")
@@ -121,12 +131,29 @@ class SequentialSampledPokerIteration:
             raise ValueError("poker iteration geometry differs from its manifest")
         if generator.device != owners.plan.device:
             raise ValueError("poker learner RNG must use the selected CUDA device")
+        if mode.rollout_mode is not RolloutMode.SEQUENTIAL:
+            raise ValueError("sequential poker iteration requires sequential mode")
+        if (
+            mode.training_regime is TrainingRegime.BEST_RESPONSE
+            and frozen_operation is None
+        ):
+            raise ValueError("best response requires a frozen profile operation")
+        if (
+            mode.private_estimator is PrivateEstimator.RAO_BLACKWELL
+            and completion_samples <= 0
+        ):
+            raise ValueError("RB poker requires positive completion_samples")
         self.geometry = geometry
         self.owners = owners
         self.mode = mode
         self.model = model
         self.model_operation = model_operation
+        self.rollout_operation = (
+            model_operation if rollout_operation is None else rollout_operation
+        )
         self.reference_operation = reference_operation
+        self.frozen_operation = frozen_operation
+        self.completion_samples = int(completion_samples)
         self.optimizer = optimizer
         self.loss = loss
         self.schedule = schedule
@@ -197,7 +224,14 @@ class SequentialSampledPokerIteration:
         values["true_profile"][0] = state.combo_ids
         values["model_input"][0] = machine.direct_model_input(state)
         values["owner"][0] = state.to_act
-        values["sampled_private_state"][0] = state.combo_ids
+        if "sampled_private_state" in values:
+            values["sampled_private_state"][0] = state.combo_ids
+        if "role_selector" in values:
+            # Root identity is the counter-keyed seat draw.  Consecutive roots
+            # form the preferred cyclic balance whenever the count permits it.
+            values["role_selector"][0] = (
+                logical_root.remainder(self.geometry.players).to(torch.uint8)
+            )
         counts = torch.tensor([roots], dtype=torch.int64, device=state.device)
         transaction = PublicationTransaction.begin_device(
             (
@@ -261,14 +295,6 @@ class SequentialSampledPokerIteration:
     def _model(
         self, forward: PokerForwardInput, _lanes: Tensor
     ) -> Mapping[str, Tensor]:
-        if (
-            forward.input_type.startswith("post_")
-            and int(forward.input_type[5:]) != self.geometry.players
-        ):
-            raise PokerIterationError(
-                "Phase 5 cannot train folded postflop rows; "
-                "folded summaries land in Phase 6"
-            )
         autocast_dtype = {
             "fp32": torch.float32,
             "fp16": torch.float16,
@@ -279,12 +305,53 @@ class SequentialSampledPokerIteration:
             dtype=autocast_dtype,
             enabled=self.precision != "fp32",
         ):
-            evaluation = self.model_operation(
-                forward.input_type,
-                forward.model_input,
-                forward.sampled_private_state,
-                forward.owner,
-            )
+            if self.mode.training_regime is TrainingRegime.SELF_PLAY:
+                evaluation = self.rollout_operation(
+                    forward.input_type,
+                    forward.model_input,
+                    forward.sampled_private_state,
+                    forward.owner,
+                )
+            else:
+                assert self.frozen_operation is not None
+                frozen = self.frozen_operation(
+                    forward.input_type,
+                    forward.model_input,
+                    forward.sampled_private_state,
+                    forward.owner,
+                )
+                if forward.role_selector is None:
+                    raise PokerIterationError(
+                        "best-response forward omitted selected roles"
+                    )
+                trained = forward.owner.to(torch.int64).eq(
+                    forward.role_selector.to(torch.int64)
+                )
+                learned = self.rollout_operation(
+                    forward.input_type,
+                    forward.model_input,
+                    forward.sampled_private_state,
+                    forward.owner,
+                )
+                shape = (trained.shape[0],) + (1,) * (learned.value.ndim - 1)
+                evaluation = ModelEvaluation(
+                    MappingProxyType(
+                        {
+                            name: torch.where(
+                                trained.reshape(
+                                    (trained.shape[0],)
+                                    + (1,) * (value.ndim - 1)
+                                ),
+                                value,
+                                frozen.policy_raw[name],
+                            )
+                            for name, value in learned.policy_raw.items()
+                        }
+                    ),
+                    torch.where(
+                        trained.reshape(shape), learned.value, frozen.value
+                    ),
+                )
         if not isinstance(evaluation, ModelEvaluation):
             raise PokerIterationError("rollout model returned the wrong contract")
         return MappingProxyType(
@@ -327,16 +394,22 @@ class SequentialSampledPokerIteration:
             logical_base=logical_base,
             retry_epoch=retry_epoch,
         )
-        hooks = SequentialSampledPokerHooks(
+        hooks = SequentialPokerHooks(
             self.geometry,
             registry,
             queues,
             seed=self.seed,
             iteration=iteration,
+            mode=self.mode,
             policy=self.policy,
         )
         topology_publisher = AsyncTopologyPublisher(
-            registry, p_train=self.geometry.players
+            registry,
+            p_train=(
+                self.geometry.players
+                if self.mode.training_regime is TrainingRegime.SELF_PLAY
+                else 1
+            ),
         )
         transaction = RolloutTransaction(
             self.mode,
@@ -404,7 +477,15 @@ class SequentialSampledPokerIteration:
             raise PokerIterationError("poker rollout produced no player nodes")
         topology, bindings, leaf_count = (
             topology_publisher.seal_deferred_unary(
-                input_count=len(input_names)
+                input_count=len(input_names),
+                input_output=tuple(
+                    tuple(
+                        item.name for item in owners.plan.partitions.outputs
+                    ).index(
+                        owners.plan.partitions.output_for(name).name
+                    )
+                    for name in input_names
+                ),
             )
         )
         topology_publisher.assert_drained()
@@ -413,7 +494,11 @@ class SequentialSampledPokerIteration:
             owners.plan.partitions,
             (topology,),
             (bindings,),
-            p_train=self.geometry.players,
+            p_train=(
+                self.geometry.players
+                if self.mode.training_regime is TrainingRegime.SELF_PLAY
+                else 1
+            ),
             manifest=owners.plan.manifest,
         )
         owners.release_after(ExecutionPhase.ROLLOUT)
@@ -431,12 +516,29 @@ class SequentialSampledPokerIteration:
                 1, dtype=torch.int64, device=owners.plan.device
             ),
         )
-        binding = SampledShowdownBinding(
-            self.geometry,
-            owners.slab("LayerWork", "all"),
-            n_replica=1,
-            pack_cap=owners.plan.manifest.completion_pack_cap,
-            utility=self.utility,
+        algebra = self._target_algebra()
+        binding = (
+            SampledShowdownBinding(
+                self.geometry,
+                owners.slab("LayerWork", "all"),
+                n_replica=1,
+                pack_cap=owners.plan.manifest.completion_pack_cap,
+                utility=self.utility,
+            )
+            if self.mode.private_estimator is PrivateEstimator.SAMPLED
+            else RBCompletionBinding(
+                self.geometry,
+                {
+                    name: owners.slab("LayerWork", name)
+                    for name in ("pre", "post")
+                },
+                algebra,
+                mode=self.mode,
+                n_replica=1,
+                pack_cap=owners.plan.manifest.completion_pack_cap,
+                n_samples=self.completion_samples,
+                utility=self.utility,
+            )
         )
         remaining_leaves = leaf_count
         while remaining_leaves:
@@ -453,21 +555,18 @@ class SequentialSampledPokerIteration:
             torch._assert_async(success.all(), "poker completion failed")
             remaining_leaves -= rows
         completion.release()
-        work = owners.slab("LayerWork", "all")
-        missing = plan.arena_rows[0][0] - work.tail(0)
-        if missing < 0:
-            raise PokerIterationError("completion exceeded the target arena plan")
-        if missing:
-            padding = PublicationTransaction.begin(
-                (
-                    DestinationRequest(
-                        work, 0, missing, "all", leaf_count
-                    ),
-                ),
-                phase="poker_target_arena_padding",
-            )
-            padding.fill_defaults(0)
-            padding.publish()
+        for output, name in enumerate(plan.output_names):
+            work = owners.slab("LayerWork", name)
+            missing = plan.arena_rows[0][output] - work.tail(0)
+            if missing < 0:
+                raise PokerIterationError("completion exceeded the target arena plan")
+            if missing:
+                padding = PublicationTransaction.begin(
+                    (DestinationRequest(work, 0, missing, name, leaf_count),),
+                    phase="poker_target_arena_padding",
+                )
+                padding.fill_defaults(0)
+                padding.publish()
         owners.release_after(ExecutionPhase.COMPLETION)
 
         owners.enter_phase(ExecutionPhase.ALIGN_AND_SEAL)
@@ -484,7 +583,7 @@ class SequentialSampledPokerIteration:
         owners.enter_phase(ExecutionPhase.TARGETS)
         target_result = LayeredTargetExecutor(
             self.mode,
-            TargetAlgebra(owners.plan.partitions, ()),
+            algebra,
             lambda_=self.lambda_,
         ).execute(owners, plan)
         if target_result.failed_lanes:
@@ -558,7 +657,9 @@ class SequentialSampledPokerIteration:
                     evaluation = self.reference_operation(
                         name,
                         columns["model_input"],
-                        columns["sampled_private_state"],
+                        columns.get(
+                            "sampled_private_state", columns["owner"][:, None]
+                        ),
                         columns["owner"],
                     )
                 batch_calls = max(
@@ -662,6 +763,31 @@ class SequentialSampledPokerIteration:
             leaves=leaf_count,
             target_layers=plan.layer_count,
         )
+
+    def _target_algebra(self) -> TargetAlgebra:
+        if self.mode.private_estimator is PrivateEstimator.SAMPLED:
+            return TargetAlgebra(self.owners.plan.partitions, ())
+        cards = PokerStateMachine(self.geometry).combo_cards(
+            torch.arange(self.geometry.private_hands, dtype=torch.int32)
+        )
+        ranks = self.geometry.rank_count
+        rank = cards.long() // 4 - (13 - ranks)
+        high, low = rank.max(1).values, rank.min(1).values
+        hp, lp = ranks - 1 - high, ranks - 1 - low
+        suited_or_pair = rank[:, 0].eq(rank[:, 1]) | cards[:, 0].remainder(4).eq(
+            cards[:, 1].remainder(4)
+        )
+        classes = torch.where(
+            suited_or_pair, hp * ranks + lp, lp * ranks + hp
+        )
+        return TargetAlgebra(
+            self.owners.plan.partitions,
+            (ConversionMap("post", "pre", tuple(int(x) for x in classes.tolist())),),
+        )
+
+
+# Phase 5 public imports continue to name the shared implementation.
+SequentialSampledPokerIteration = SequentialPokerIteration
 
 
 def _discard_rollout_attempt(owners: GeneratedOwners) -> None:
@@ -1048,4 +1174,5 @@ __all__ = [
     "PokerIterationResult",
     "RecoveringSequentialSampledPokerIteration",
     "SequentialSampledPokerIteration",
+    "SequentialPokerIteration",
 ]

@@ -28,6 +28,7 @@ from pbg.games.poker.queued.hooks import (
     PokerState,
     PokerStateMachine,
 )
+from pbg.games.poker.queued.folded import folded_statistics
 
 
 class PokerModelError(RuntimeError):
@@ -281,6 +282,15 @@ class QueuedPokerModel(nn.Module):
             ~finite, -torch.inf
         ).max(2, keepdim=True).values
         ranges = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
+        summary = folded_statistics(
+            self.geometry,
+            board_cards=state.board_cards,
+            range_weights=ranges.float(),
+            status=state.status,
+            combo_cards=self.combo_cards,
+            beta_rank=getattr(self.postflop.cfg, "folder_beta_rank", 0),
+            line_dim=getattr(self.postflop.cfg, "folder_line_dim", 0),
+        )
         return self._evaluation(
             self.postflop(
                 public,
@@ -291,7 +301,7 @@ class QueuedPokerModel(nn.Module):
                     seat_mask=public.seat_mask,
                     combo_mask=ranges.bool(),
                     status=public.status,
-                    evaluator_summary=None,
+                    evaluator_summary=summary,
                     live_seat_ids=live_ids,
                 ),
             )
@@ -331,12 +341,13 @@ class QueuedPokerModel(nn.Module):
             if live != self.geometry.players:
                 raise PokerModelError(
                     "Phase 5 postflop inference cannot omit folded summaries; "
-                    "use Phase 6"
+                    "use the sequential Phase 6 operation"
                 )
             state = self._state(model_input)
             torch._assert_async(
                 (~state.status.eq(FOLDED).any(1)).all(),
-                "Phase 5 postflop inference cannot omit folded summaries; use Phase 6",
+                "Phase 5 postflop inference cannot omit folded summaries; "
+                "use the sequential Phase 6 operation",
             )
             result = (
                 self._call_postflop(input_type, model_input)
@@ -353,6 +364,61 @@ class QueuedPokerModel(nn.Module):
         )
         return result
 
+    def forward_natural_partition(
+        self, input_type: str, model_input: Tensor
+    ) -> ModelEvaluation:
+        """Return K-wide preflop or H-wide postflop learner outputs."""
+
+        if input_type == "pre":
+            result = (
+                self._call_preflop(model_input)
+                if isinstance(self.preflop, PreflopNet)
+                else self._call_direct(self.preflop, model_input)
+            )
+            _validate_output(
+                result,
+                batch=model_input.shape[0],
+                width=self.geometry.rank_count**2,
+                device=model_input.device,
+            )
+            return result
+        if input_type.startswith("post_") and input_type[5:].isdigit():
+            result = (
+                self._call_postflop(input_type, model_input)
+                if isinstance(self.postflop, PostflopNet)
+                else self._call_direct(self.postflop, model_input)
+            )
+            _validate_output(
+                result,
+                batch=model_input.shape[0],
+                width=self.geometry.private_hands,
+                device=model_input.device,
+            )
+            return result
+        raise PokerModelError(f"unknown poker input partition {input_type!r}")
+
+    def forward_sequential_partition(
+        self, input_type: str, model_input: Tensor
+    ) -> ModelEvaluation:
+        """Phase 6 rollout path with repository-owned folded summaries."""
+
+        if input_type == "pre":
+            return self.forward_partition(input_type, model_input)
+        if input_type.startswith("post_") and input_type[5:].isdigit():
+            result = (
+                self._call_postflop(input_type, model_input)
+                if isinstance(self.postflop, PostflopNet)
+                else self._call_direct(self.postflop, model_input)
+            )
+            _validate_output(
+                result,
+                batch=model_input.shape[0],
+                width=self.geometry.private_hands,
+                device=model_input.device,
+            )
+            return result
+        raise PokerModelError(f"unknown poker input partition {input_type!r}")
+
     def learner_operation(
         self,
         input_type: str,
@@ -361,6 +427,33 @@ class QueuedPokerModel(nn.Module):
         _owner: Tensor,
     ) -> ModelEvaluation:
         return self.forward_partition(input_type, model_input)
+
+    def rollout_operation(
+        self,
+        input_type: str,
+        model_input: Tensor,
+        _private_state: Tensor,
+        _owner: Tensor,
+    ) -> ModelEvaluation:
+        return self.forward_partition(input_type, model_input)
+
+    def sequential_rollout_operation(
+        self,
+        input_type: str,
+        model_input: Tensor,
+        _private_state: Tensor,
+        _owner: Tensor,
+    ) -> ModelEvaluation:
+        return self.forward_sequential_partition(input_type, model_input)
+
+    def rb_learner_operation(
+        self,
+        input_type: str,
+        model_input: Tensor,
+        _private_state: Tensor,
+        _owner: Tensor,
+    ) -> ModelEvaluation:
+        return self.forward_natural_partition(input_type, model_input)
 
 
 def build_model_from_config(

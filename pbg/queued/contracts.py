@@ -328,8 +328,8 @@ def _owners(
         leaf_fields.append("combo_ids")
     else:
         leaf_fields.extend(("range_weights", "seed"))
-        if response:
-            leaf_fields.append("selected_player")
+    if response:
+        leaf_fields.append("selected_player")
 
     layer_fields = ["return_value"] if sampled else ["mass", "moment"]
     if branched:
@@ -343,14 +343,15 @@ def _owners(
     if not sampled:
         action_target_fields.insert(0, "posterior")
 
-    # Sequential sampled rows retain their learner inputs in the generated
-    # align-to-backward owner.  This is the admitted handoff that permits the
-    # rollout-hot FamilyWork slabs to die before optimization.
+    # Every sequential row retains the direct model input and owner in the
+    # generated align-to-backward handoff.  Sampled rows additionally retain
+    # their realized profile; RB rows stay in their natural output partition
+    # and therefore need no sampled private state in the learner.
     learner_index_fields = (
-        ["model_input", "sampled_private_state", "owner"]
-        if sampled and not branched
-        else ["target_degree"]
+        ["model_input", "owner"] if not branched else ["target_degree"]
     )
+    if sampled and not branched:
+        learner_index_fields.insert(1, "sampled_private_state")
     if branched:
         learner_index_fields.extend(
             ("action_begin", "action_count", "log_sampling_weight")

@@ -120,7 +120,7 @@ def test_inapplicable_fields_are_absent() -> None:
         assert ("combo_ids" in leaf) is is_sampled
         assert ("range_weights" in leaf) is (not is_sampled)
         assert ("seed" in leaf) is (not is_sampled)
-        assert ("selected_player" in leaf) is (is_response and not is_sampled)
+        assert ("selected_player" in leaf) is is_response
         assert ("old_trace" in sigma_head) is is_branched
         assert ("old_cost" in sigma_head) is is_branched
         assert ("trace_target" in sigma_target) is is_branched

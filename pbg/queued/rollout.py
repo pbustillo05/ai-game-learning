@@ -1183,6 +1183,10 @@ class DeferredUnaryTopologyPublication:
     familywork_row: Tensor
     leaf_reservation_index: int
     leaf_target_ordinal: Tensor
+    trained: Tensor | None = None
+    sigma_reservation_index: int = -1
+    action_reservation_index: int = -1
+    trained_target_ordinal: Tensor | None = None
 
     def __post_init__(self) -> None:
         if min(
@@ -1219,6 +1223,19 @@ class DeferredUnaryTopologyPublication:
                 raise TopologyError(
                     f"deferred topology {name} must be CUDA [rows]"
                 )
+        if self.trained is not None and (
+            self.trained.device != device
+            or self.trained.dtype != torch.bool
+            or self.trained.shape != (rows,)
+        ):
+            raise TopologyError("deferred trained mask must be CUDA bool [rows]")
+        if self.trained_target_ordinal is not None and (
+            self.trained_target_ordinal.device != device
+            or self.trained_target_ordinal.shape != (rows,)
+        ):
+            raise TopologyError(
+                "deferred trained ordinals must be CUDA [rows]"
+            )
         for name in ("logical_rng_key", "next_logical_rng_key"):
             value = getattr(self, name)
             if (
@@ -1290,7 +1307,7 @@ class AsyncTopologyPublisher:
         )
         self._accept_stream = torch.cuda.Stream(device=owners.device)
         self._deferred_buffer = torch.empty(
-            (owners.topology_cap, 11),
+            (owners.topology_cap, 14),
             dtype=torch.int64,
             pin_memory=True,
         )
@@ -1351,6 +1368,19 @@ class AsyncTopologyPublisher:
             raise TopologyError("deferred leaf endpoint must bind to Leaf")
         if publication.terminal.numel() > self.owners.topology_packet_cap:
             raise TopologyError("deferred topology packet exceeds its cap")
+        if publication.trained is not None:
+            for index, expected in (
+                (publication.sigma_reservation_index, "SigmaHead."),
+                (publication.action_reservation_index, "ActionHead."),
+            ):
+                if not 0 <= index < len(requests):
+                    raise TopologyError(
+                        "deferred trained reservation is outside commit plan"
+                    )
+                if not requests[index].slab.schema.name.startswith(expected):
+                    raise TopologyError(
+                        "deferred trained reservation has the wrong owner"
+                    )
 
     def stage_deferred(
         self, publication: DeferredUnaryTopologyPublication
@@ -1390,6 +1420,30 @@ class AsyncTopologyPublisher:
             publication.leaf_reservation_index
         ][publication.lane]
         leaf_row = leaf_begin + publication.leaf_target_ordinal
+        trained = (
+            torch.ones(rows, dtype=torch.bool, device=self.owners.device)
+            if publication.trained is None
+            else publication.trained
+        )
+        trained_ordinal = (
+            publication.familywork_row
+            if publication.trained_target_ordinal is None
+            else publication.trained_target_ordinal
+        )
+        if publication.sigma_reservation_index >= 0:
+            sigma_begin = transaction.begins[
+                publication.sigma_reservation_index
+            ][publication.lane]
+            sigma_row = sigma_begin + trained_ordinal
+            action_begin = transaction.begins[
+                publication.action_reservation_index
+            ][publication.lane]
+            action_row = action_begin + trained_ordinal
+        else:
+            sigma_row = publication.familywork_row
+            action_row = publication.familywork_row
+        sigma_row = torch.where(trained, sigma_row, -1)
+        action_row = torch.where(trained, action_row, -1)
         packed = torch.cat(
             (
                 publication.logical_rng_key,
@@ -1406,6 +1460,9 @@ class AsyncTopologyPublisher:
                     device=self.owners.device,
                 ),
                 leaf_row.to(torch.int64)[:, None],
+                trained.to(torch.int64)[:, None],
+                sigma_row.to(torch.int64)[:, None],
+                action_row.to(torch.int64)[:, None],
             ),
             1,
         )
@@ -1838,7 +1895,10 @@ class AsyncTopologyPublisher:
                 self._deferred_reserved_rows -= publication.terminal.numel()
 
     def seal_deferred_unary(
-        self, *, input_count: int
+        self,
+        *,
+        input_count: int,
+        input_output: Sequence[int] | None = None,
     ) -> tuple[Topology, TopologyBindings, int]:
         """Aggregate once, then link the committed unary logical trace."""
 
@@ -1860,17 +1920,30 @@ class AsyncTopologyPublisher:
         ]
         if not ordered:
             raise TopologyError("deferred topology is empty")
+        output_for_input = (
+            tuple(0 for _ in range(input_count))
+            if input_output is None
+            else tuple(int(value) for value in input_output)
+        )
+        if len(output_for_input) != input_count or any(
+            value < 0 for value in output_for_input
+        ):
+            raise TopologyError("deferred input/output map is invalid")
         trace = torch.cat(ordered, 0)
         logical_to_node: dict[tuple[int, int], int] = {}
         pending_parent: dict[tuple[int, int], int] = {}
         parent: list[int] = []
         owner: list[int] = []
         familywork_row: list[int] = []
+        sigma_head_row: list[int] = []
+        action_begin: list[int] = []
         label: list[int] = []
         target_kind: list[int] = []
         target_key: list[tuple[int, int] | None] = []
         target_row: list[int] = []
         input_type: list[int] = []
+        output_type: list[int] = []
+        child_output_type: list[int] = []
         leaves = 0
         for values in trace.tolist():
             logical = (int(values[0]), int(values[1]))
@@ -1879,13 +1952,26 @@ class AsyncTopologyPublisher:
             node = len(parent)
             parent.append(pending_parent.pop(logical, -1))
             logical_to_node[logical] = node
-            owner.append(int(values[6]))
-            familywork_row.append(int(values[8]))
+            trained = bool(values[11])
+            owner.append(int(values[6]) if trained else -1)
+            # Align-and-seal compacts trained best-response inputs.  The
+            # retained learner identity is therefore the resolved Sigma row,
+            # while headless frozen rows retain no FamilyWork address.
+            familywork_row.append(int(values[12]) if trained else -1)
+            sigma_head_row.append(int(values[12]) if trained else -1)
+            action_begin.append(int(values[13]) if trained else -1)
             label.append(int(values[7]))
             input_index = int(values[9])
             if not 0 <= input_index < input_count:
                 raise TopologyError("deferred input type is outside preorder")
-            input_type.append(input_index)
+            input_type.append(input_index if trained else -1)
+            output_type.append(output_for_input[input_index])
+            next_input = int(values[4])
+            if not 0 <= next_input < input_count:
+                raise TopologyError(
+                    "deferred next input type is outside preorder"
+                )
+            child_output_type.append(output_for_input[next_input])
             if bool(values[5]):
                 target_kind.append(int(TargetKind.LEAF))
                 target_key.append(None)
@@ -1924,8 +2010,8 @@ class AsyncTopologyPublisher:
             target_degree=torch.ones(nodes, dtype=torch.int32),
             owner=i32(owner),
             familywork_row=i32(familywork_row),
-            sigma_head_row=i32(familywork_row),
-            action_begin=i32(familywork_row),
+            sigma_head_row=i32(sigma_head_row),
+            action_begin=i32(action_begin),
             label=i32(label),
             path_length=torch.ones(nodes, dtype=torch.int32),
             target_kind=i32(target_kind),
@@ -1933,11 +2019,12 @@ class AsyncTopologyPublisher:
         )
         bindings = TopologyBindings(
             input_type=i32(input_type),
-            output_type=torch.zeros(nodes, dtype=torch.int32),
-            sigma_target_row=i32(familywork_row),
-            child_output_type=torch.zeros(nodes, dtype=torch.int32),
+            output_type=i32(output_type),
+            sigma_target_row=i32(sigma_head_row),
+            child_output_type=i32(child_output_type),
         )
         topology.validate(bindings, p_train=self.p_train)
+        topology, bindings = topology.compact(bindings, p_train=self.p_train)
         return topology, bindings, leaves
 
     @property

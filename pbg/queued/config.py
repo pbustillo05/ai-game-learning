@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 import math
+from types import MappingProxyType
 from typing import Mapping, TypeVar
 
 from pbg.queued.learner import LearnerSchedule, LossConfig
@@ -317,10 +318,126 @@ class Phase5Config:
         }
 
 
+@dataclass(frozen=True)
+class SequentialModeConfig:
+    """Closed Phase 6 scientific configuration for all sequential rows."""
+
+    mode: Mapping[str, str]
+    common: Phase5Config
+    applicable: Mapping[str, object]
+
+    @classmethod
+    def from_mapping(
+        cls, value: Mapping[str, object]
+    ) -> "SequentialModeConfig":
+        source = dict(_mapping(value, "root"))
+        mode = dict(_mapping(source.get("mode"), "root.mode"))
+        allowed_mode = {
+            "training_regime": ("self_play", "best_response"),
+            "rollout_mode": ("sequential",),
+            "private_estimator": ("sampled", "rao_blackwell"),
+        }
+        if set(mode) != set(allowed_mode):
+            raise ValueError("root.mode: sequential mode axes are incomplete")
+        for name, choices in allowed_mode.items():
+            if mode[name] not in choices:
+                raise ValueError(f"root.mode.{name}: invalid sequential axis")
+        response = mode["training_regime"] == "best_response"
+        rb = mode["private_estimator"] == "rao_blackwell"
+        extensions = {
+            "completion",
+            "frozen_profile",
+            "response_initialization",
+            "probe",
+        }
+        base_source = {
+            key: item for key, item in source.items() if key not in extensions
+        }
+        base_source["mode"] = {
+            "training_regime": "self_play",
+            "rollout_mode": "sequential",
+            "private_estimator": "sampled",
+        }
+        common = Phase5Config.from_mapping(base_source)
+        applicable: dict[str, object] = {}
+        if rb:
+            completion = dict(
+                _mapping(source.get("completion"), "root.completion")
+            )
+            if set(completion) != {"n_samples", "strata"}:
+                raise ValueError(
+                    "root.completion: RB requires exactly n_samples and strata"
+                )
+            if (
+                isinstance(completion["n_samples"], bool)
+                or not isinstance(completion["n_samples"], int)
+                or completion["n_samples"] <= 0
+            ):
+                raise ValueError("root.completion.n_samples: must be positive")
+            applicable["completion"] = completion
+        elif "completion" in source:
+            raise ValueError("root.completion: inapplicable to sampled mode")
+        if response:
+            frozen = dict(
+                _mapping(source.get("frozen_profile"), "root.frozen_profile")
+            )
+            if set(frozen) != {"sha256"} or (
+                not isinstance(frozen["sha256"], str)
+                or len(frozen["sha256"]) != 64
+            ):
+                raise ValueError(
+                    "root.frozen_profile.sha256: content hash is required"
+                )
+            initialization = source.get("response_initialization")
+            if initialization not in ("random", "target"):
+                raise ValueError(
+                    "root.response_initialization: expected random or target"
+                )
+            applicable["frozen_profile"] = frozen
+            applicable["response_initialization"] = initialization
+            if "probe" in source:
+                if not rb:
+                    raise ValueError(
+                        "root.probe: shared-response probe requires sequential RB"
+                    )
+                probe = dict(_mapping(source["probe"], "root.probe"))
+                if set(probe) != {"target_sha256"} or (
+                    probe["target_sha256"] != frozen["sha256"]
+                ):
+                    raise ValueError(
+                        "root.probe.target_sha256: must identify the frozen profile"
+                    )
+                applicable["probe"] = probe
+        elif any(
+            name in source
+            for name in ("frozen_profile", "response_initialization", "probe")
+        ):
+            raise ValueError(
+                "root.frozen_profile: response fields require best_response"
+            )
+        return cls(
+            MappingProxyType(mode),
+            common,
+            MappingProxyType(applicable),
+        )
+
+    def scientific_mapping(self) -> dict[str, object]:
+        result = self.common.scientific_mapping()
+        result["mode"] = dict(self.mode)
+        result.update(
+            {
+                name: dict(value) if isinstance(value, Mapping) else value
+                for name, value in self.applicable.items()
+            }
+        )
+        return result
+
+
 __all__ = [
     "Phase5Config",
     "Phase5GameConfig",
     "Phase5ModelConfig",
     "Phase5Precision",
     "ReferenceConfig",
+    "SequentialModeConfig",
 ]
