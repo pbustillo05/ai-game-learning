@@ -16,6 +16,7 @@ from pbg.queued.contracts import (
     Partition,
     PartitionContract,
     RolloutMode,
+    TrainingRegime,
 )
 from pbg.queued.storage import (
     DeviceFailure,
@@ -490,29 +491,36 @@ def _field(
     if field_name in (
         "old_value",
         "old_log_policy",
-        "return_value",
-        "mass",
-        "moment",
-        "trace_vector",
         "value_target",
         "posterior",
         "advantage_target",
     ):
-        # LayerWork owns both fixed ping-pong arenas in its immutable shape.
-        prefix = (2,) if owner_name == "LayerWork" else ()
-        return SoAField(field_name, torch.float32, (*prefix, width), alignment)
+        return SoAField(field_name, torch.float32, (width,), alignment)
+    if field_name in ("return_value", "mass", "moment"):
+        p_train = (
+            players if mode.training_regime is TrainingRegime.SELF_PLAY else 1
+        )
+        # One row owns both fixed ping-pong arenas and every trained channel.
+        return SoAField(
+            field_name, torch.float32, (2, p_train, width), alignment
+        )
+    if field_name == "trace_vector":
+        p_train = (
+            players if mode.training_regime is TrainingRegime.SELF_PLAY else 1
+        )
+        return SoAField(field_name, torch.float32, (2, p_train), alignment)
     if field_name in (
         "path_mass",
         "old_trace",
         "old_cost",
         "frontier_cost",
-        "cost",
-        "delta",
         "trace_target",
         "cost_target",
         "log_sampling_weight",
     ):
         return SoAField(field_name, torch.float32, (), alignment)
+    if field_name in ("cost", "delta"):
+        return SoAField(field_name, torch.float32, (2,), alignment)
     raise CapacityError(f"no physical field contract for {owner_name}.{field_name}")
 
 
