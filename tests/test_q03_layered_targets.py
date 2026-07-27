@@ -530,9 +530,22 @@ def test_unbalanced_last_consumer_slots_match_reference_without_carry_traffic() 
         {(0, "all"): sampled_completion(payoff, branched=True)},
         2,
     )
-    result = LayeredTargetExecutor(
-        mode, _algebra(mode.private_estimator), lambda_=1.0
-    ).execute(owners, plan)
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        acc_events=True,
+    ) as profile:
+        result = LayeredTargetExecutor(
+            mode, _algebra(mode.private_estimator), lambda_=1.0
+        ).execute(owners, plan)
+    layer_kernels = [
+        event
+        for event in profile.events()
+        if "layered_target_kernel" in event.name
+    ]
+    assert len(layer_kernels) == plan.layer_count
     assert result.counters.carry_count == 0
     assert result.counters.carry_payload_bytes == 0
     sigma = owners.slab("SigmaTarget", "pre").published(0, "value_target")
@@ -686,8 +699,6 @@ def test_post_to_pre_reduces_mass_and_moment_before_conditionalization() -> None
 
 @CUDA
 def test_direct_sibling_sum_avoids_total_minus_child_cancellation() -> None:
-    from pbg.queued.targets import _direct_sibling_sum
-
     device = torch.device("cuda", torch.cuda.current_device())
     values = torch.tensor(
         [[[1.0e8], [1.0], [1.0], [-1.0e8]]],
@@ -695,7 +706,13 @@ def test_direct_sibling_sum_avoids_total_minus_child_cancellation() -> None:
         device=device,
     )
     mask = torch.ones((1, 4), dtype=torch.bool, device=device)
-    direct = _direct_sibling_sum(values, mask)
+    ordinal = torch.arange(4, device=device)
+    sibling = mask[:, None, :] & (
+        ordinal[None, :, None] != ordinal[None, None, :]
+    )
+    direct = (
+        values[:, None] * sibling[..., None]
+    ).sum(dim=2)
     total_minus = values.sum(1, keepdim=True) - values
     # For the middle child the direct logical-order sum is exactly zero, while
     # total-minus-child loses the unit term in the total and returns -1.

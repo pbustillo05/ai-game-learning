@@ -71,7 +71,6 @@ from pbg.queued.targets import (
     sampled_completion,
 )
 from pbg.queued.topology import (
-    LayerGroup,
     LayerPlan,
     TargetKind,
     Topology,
@@ -104,7 +103,6 @@ __all__ = [
     "GameHooks",
     "GeneratedOwners",
     "HardwareLimits",
-    "LayerGroup",
     "LayerPlan",
     "LayeredTargetExecutor",
     "MemoryReport",

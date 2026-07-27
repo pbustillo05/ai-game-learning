@@ -15,6 +15,7 @@ import torch
 from torch import Tensor
 
 from pbg.queued.capacity import GeneratedOwners
+from pbg.queued.cuda_layer import layered_target_cuda
 from pbg.queued.contracts import (
     ModeSchema,
     PartitionContract,
@@ -30,7 +31,7 @@ from pbg.queued.storage import (
     SoASchema,
     StorageError,
 )
-from pbg.queued.topology import LayerGroup, LayerPlan
+from pbg.queued.topology import LayerPlan
 
 
 class TargetError(RuntimeError):
@@ -489,19 +490,6 @@ class TargetResult:
     counters: TargetCounters
 
 
-def _direct_sibling_sum(value: Tensor, target_mask: Tensor) -> Tensor:
-    """Sum siblings directly in logical order, excluding each target child."""
-
-    count = value.shape[1]
-    ordinal = torch.arange(count, device=value.device)
-    sibling = (
-        target_mask[:, None, :]
-        & (ordinal[None, :, None] != ordinal[None, None, :])
-    )
-    shape = sibling.shape + (1,) * (value.ndim - 2)
-    return (value[:, None, ...] * sibling.reshape(shape)).sum(dim=2)
-
-
 class LayeredTargetExecutor:
     """The sole target executor generated from one immutable ``ModeSchema``."""
 
@@ -537,10 +525,6 @@ class LayeredTargetExecutor:
         if device_plan.allocated_bytes > owners.plan.manifest.movement_scratch_bytes:
             device_plan.release()
             raise TargetError("exact LayerPlan upload exceeds admitted scratch bytes")
-        algebra = self.algebra.device(device)
-        nodes = device_plan.nodes.columns
-        children = device_plan.children.columns
-
         transactions: dict[int, PublicationTransaction] = {}
         sigma_views: dict[tuple[int, int, str], Tensor] = {}
         action_views: dict[tuple[int, int, str], Tensor] = {}
@@ -594,59 +578,145 @@ class LayeredTargetExecutor:
                         else:
                             action_views[key] = reservation.view(field)
 
-            lane_failed = torch.zeros(
-                n_replica, dtype=torch.bool, device=device
+            empty = torch.empty(0, dtype=torch.float32, device=device)
+            output_slabs = [
+                owners.slab("LayerWork", name) for name in plan.output_names
+            ]
+            work0 = [
+                slab.columns["return_value" if self.sampled else "mass"]
+                for slab in output_slabs
+            ]
+            work1 = (
+                [empty for _ in output_slabs]
+                if self.sampled
+                else [slab.columns["moment"] for slab in output_slabs]
             )
-            node_invalid = torch.zeros(
-                plan.node_count, dtype=torch.bool, device=device
+            traces = (
+                [slab.columns["trace_vector"] for slab in output_slabs]
+                if self.branched
+                else [empty for _ in output_slabs]
             )
-            carry_payload_bytes = 0
-            mass_read = 0
-            mass_written = 0
-            target_written = 0
-            # One logical executor launch is enqueued per reverse layer.  Its
-            # immutable partition groups are vectorized subspans, not
-            # node/action launches.
-            kernel_launches = plan.layer_count
+            costs = (
+                [slab.columns["cost"] for slab in output_slabs]
+                if self.branched
+                else [empty for _ in output_slabs]
+            )
+            deltas = (
+                [slab.columns["delta"] for slab in output_slabs]
+                if self.branched
+                else [empty for _ in output_slabs]
+            )
+            head_slabs = [
+                owners.slab("SigmaHead", name) for name in plan.input_names
+            ]
+            head_v = [slab.columns["old_value"] for slab in head_slabs]
+            head_t = [
+                slab.columns["old_trace"] if self.branched else empty
+                for slab in head_slabs
+            ]
+            head_c = [
+                slab.columns["old_cost"] if self.branched else empty
+                for slab in head_slabs
+            ]
+            sigma_v: list[Tensor] = []
+            sigma_t: list[Tensor] = []
+            sigma_c: list[Tensor] = []
+            for lane in range(n_replica):
+                for input_type in range(len(plan.input_names)):
+                    sigma_v.append(
+                        sigma_views.get((lane, input_type, "value_target"), empty)
+                    )
+                    sigma_t.append(
+                        sigma_views.get((lane, input_type, "trace_target"), empty)
+                    )
+                    sigma_c.append(
+                        sigma_views.get((lane, input_type, "cost_target"), empty)
+                    )
+            action_names = (
+                plan.output_names if self.branched else plan.input_names
+            )
+            action_p: list[Tensor] = []
+            action_a: list[Tensor] = []
+            for lane in range(n_replica):
+                for action_type in range(len(action_names)):
+                    action_p.append(
+                        action_views.get((lane, action_type, "posterior"), empty)
+                    )
+                    action_a.append(
+                        action_views.get(
+                            (lane, action_type, "advantage_target"), empty
+                        )
+                    )
+            max_width = max(self.algebra.widths)
+            conversion = torch.full(
+                (
+                    len(plan.output_names),
+                    len(plan.output_names),
+                    max_width,
+                ),
+                -1,
+                dtype=torch.int32,
+            )
+            for source in range(len(plan.output_names)):
+                for destination in range(len(plan.output_names)):
+                    if source == destination:
+                        conversion[source, destination, : self.algebra.widths[source]] = (
+                            torch.arange(
+                                self.algebra.widths[source], dtype=torch.int32
+                            )
+                        )
+                    elif (source, destination) in self.algebra._cpu_masks:
+                        mask = self.algebra._cpu_masks[(source, destination)]
+                        for component in range(self.algebra.widths[source]):
+                            selected = torch.nonzero(
+                                mask[:, component], as_tuple=False
+                            )
+                            if selected.numel():
+                                conversion[source, destination, component] = selected[0, 0]
+            conversion = conversion.flatten().to(device=device)
+            extension = layered_target_cuda()
             start_events = [
                 torch.cuda.Event(enable_timing=True),
                 torch.cuda.Event(enable_timing=True),
             ]
             start_events[0].record()
-
-            for layer in range(plan.layer_count):
-                src_arena = layer & 1
-                dst_arena = (layer + 1) & 1
-                for group in (
-                    item for item in plan.groups if item.layer == layer
-                ):
-                    invalid, written, mm_read, mm_written = self._execute_group(
-                        owners,
-                        plan,
-                        device_plan,
-                        algebra,
-                        group,
-                        src_arena,
-                        dst_arena,
-                        p_train,
-                        lane_failed,
-                        sigma_views,
-                        action_views,
+            failure_min = extension.run_layers(
+                plan.layer_ptr,
+                list(device_plan.nodes.columns.values()),
+                list(device_plan.children.columns.values()),
+                work0,
+                work1,
+                traces,
+                costs,
+                deltas,
+                head_v,
+                head_t,
+                head_c,
+                sigma_v,
+                sigma_t,
+                sigma_c,
+                action_p,
+                action_a,
+                conversion,
+                [slab.capacity for slab in output_slabs],
+                [slab.capacity for slab in head_slabs],
+                list(self.algebra.widths),
+                [
+                    plan.output_names.index(
+                        self.algebra.partitions.output_for(name).name
                     )
-                    node_invalid[group.begin : group.end] = invalid
-                    target_written += written
-                    mass_read += mm_read
-                    mass_written += mm_written
-                carry_payload_bytes += self._execute_carries(
-                    owners,
-                    plan,
-                    device_plan,
-                    layer,
-                    src_arena,
-                    dst_arena,
-                    lane_failed,
-                )
-
+                    for name in plan.input_names
+                ],
+                n_replica,
+                len(plan.input_names),
+                len(plan.output_names),
+                len(action_names),
+                p_train,
+                max_width,
+                self.lambda_,
+                self.sampled,
+                self.branched,
+            )
             start_events[1].record()
             # The sole target boundary synchronization validates and publishes;
             # no layer above read a device scalar or synchronized the stream.
@@ -655,14 +725,10 @@ class LayeredTargetExecutor:
             failed_lanes: list[int] = []
             published_lanes: list[int] = []
             for lane in range(n_replica):
-                failed = bool(lane_failed[lane].item())
+                logical = int(failure_min[lane].item())
+                failed = logical != torch.iinfo(torch.int32).max
                 if failed:
                     failed_lanes.append(lane)
-                    logical = self._minimum_failure_row(
-                        device_plan.nodes.columns["replica"],
-                        node_invalid,
-                        lane,
-                    )
                     owners.failure_state.record(
                         DeviceFailure(
                             lane=lane,
@@ -691,12 +757,23 @@ class LayeredTargetExecutor:
                         for layer in range(plan.layer_count)
                     ),
                     carry_count=plan.carry_count,
-                    carry_payload_bytes=carry_payload_bytes,
+                    carry_payload_bytes=0,
                     child_edges_read=plan.edge_count,
-                    mass_moment_bytes_read=mass_read,
-                    mass_moment_bytes_written=mass_written,
-                    target_bytes_written=target_written,
-                    kernel_launches=kernel_launches,
+                    mass_moment_bytes_read=(
+                        0
+                        if self.sampled
+                        else plan.edge_count * p_train * max_width * 8
+                    ),
+                    mass_moment_bytes_written=(
+                        0
+                        if self.sampled
+                        else plan.node_count * p_train * max_width * 8
+                    ),
+                    target_bytes_written=sum(
+                        tensor.numel() * tensor.element_size()
+                        for tensor in (*sigma_v, *sigma_t, *sigma_c, *action_p, *action_a)
+                    ),
+                    kernel_launches=plan.layer_count,
                     cuda_seconds=elapsed,
                 ),
             )
@@ -707,477 +784,6 @@ class LayeredTargetExecutor:
         finally:
             device_plan.release()
         return result
-
-    @staticmethod
-    def _minimum_failure_row(
-        replica: Tensor, invalid: Tensor, lane: int
-    ) -> int:
-        lane_mask = replica == lane
-        candidates = torch.nonzero(
-            invalid & lane_mask, as_tuple=False
-        ).flatten()
-        return int(candidates[0].item()) if candidates.numel() else 0
-
-    def _execute_group(
-        self,
-        owners: GeneratedOwners,
-        plan: LayerPlan,
-        device_plan: DeviceLayerPlan,
-        algebra: _DeviceAlgebra,
-        group: LayerGroup,
-        src_arena: int,
-        dst_arena: int,
-        p_train: int,
-        lane_failed: Tensor,
-        sigma_views: Mapping[tuple[int, int, str], Tensor],
-        action_views: Mapping[tuple[int, int, str], Tensor],
-    ) -> tuple[Tensor, int, int, int]:
-        nodes = device_plan.nodes.columns
-        children = device_plan.children.columns
-        sl = slice(group.begin, group.end)
-        replica = nodes["replica"][sl].long()
-        count = nodes["child_count"][sl].long()
-        target_count = nodes["target_degree"][sl].long()
-        destination = nodes["destination_work_row"][sl].long()
-        begin = nodes["child_begin"][sl].long()
-        owner_slot = nodes["owner_slot"][sl].long()
-        batch = replica.numel()
-        n_max = max(1, owners.plan.manifest.beta_max)
-        ordinal = torch.arange(n_max, device=replica.device)
-        edge = begin[:, None] + ordinal[None, :]
-        valid = ordinal[None, :] < count[:, None]
-        target = ordinal[None, :] < target_count[:, None]
-        safe_edge = torch.where(valid, edge, torch.zeros_like(edge))
-        encoded_source_row = children["source_work_row"][safe_edge].long()
-        source_type = children["source_output_type"][safe_edge].long()
-        width = algebra.widths[group.output_type]
-        payload_shape = (batch, n_max, p_train, width)
-        if self.sampled:
-            child_primary = torch.zeros(
-                payload_shape, dtype=torch.float32, device=replica.device
-            )
-            child_secondary = None
-        else:
-            child_primary = torch.zeros(
-                payload_shape, dtype=torch.float32, device=replica.device
-            )
-            child_secondary = torch.zeros_like(child_primary)
-        child_trace = (
-            torch.zeros(
-                (batch, n_max, p_train),
-                dtype=torch.float32,
-                device=replica.device,
-            )
-            if self.branched
-            else None
-        )
-        child_cost = (
-            torch.zeros(
-                (batch, n_max), dtype=torch.float32, device=replica.device
-            )
-            if self.branched
-            else None
-        )
-        child_delta = torch.zeros_like(child_cost) if self.branched else None
-
-        for source, source_name in enumerate(plan.output_names):
-            work = owners.slab("LayerWork", source_name).columns
-            for source_arena in (0, 1):
-                arena_mask = (
-                    encoded_source_row >= 0
-                    if source_arena == 0
-                    else encoded_source_row < 0
-                )
-                mask = valid & (source_type == source) & arena_mask
-                decoded_row = torch.where(
-                    encoded_source_row >= 0,
-                    encoded_source_row,
-                    -encoded_source_row - 1,
-                )
-                safe_row = torch.where(
-                    mask, decoded_row, torch.zeros_like(decoded_row)
-                )
-                if self.sampled:
-                    gathered = work["return_value"][
-                        replica[:, None], safe_row, source_arena
-                    ]
-                    converted = algebra.convert(
-                        gathered, source, group.output_type
-                    )
-                    child_primary = torch.where(
-                        mask[..., None, None], converted, child_primary
-                    )
-                else:
-                    gathered_mass = work["mass"][
-                        replica[:, None], safe_row, source_arena
-                    ]
-                    gathered_moment = work["moment"][
-                        replica[:, None], safe_row, source_arena
-                    ]
-                    converted_mass = algebra.convert(
-                        gathered_mass, source, group.output_type
-                    )
-                    converted_moment = algebra.convert(
-                        gathered_moment, source, group.output_type
-                    )
-                    child_primary = torch.where(
-                        mask[..., None, None], converted_mass, child_primary
-                    )
-                    assert child_secondary is not None
-                    child_secondary = torch.where(
-                        mask[..., None, None],
-                        converted_moment,
-                        child_secondary,
-                    )
-                if self.branched:
-                    assert child_trace is not None
-                    assert child_cost is not None and child_delta is not None
-                    child_trace = torch.where(
-                        mask[..., None],
-                        work["trace_vector"][
-                            replica[:, None], safe_row, source_arena
-                        ],
-                        child_trace,
-                    )
-                    child_cost = torch.where(
-                        mask,
-                        work["cost"][
-                            replica[:, None], safe_row, source_arena
-                        ],
-                        child_cost,
-                    )
-                    child_delta = torch.where(
-                        mask,
-                        work["delta"][
-                            replica[:, None], safe_row, source_arena
-                        ],
-                        child_delta,
-                    )
-
-        divisor = target_count.to(torch.float32).reshape(batch, 1, 1)
-        target_payload_mask = target[..., None, None]
-        parent_primary = (
-            child_primary * target_payload_mask
-        ).sum(dim=1) / divisor
-        if child_secondary is not None:
-            parent_secondary = (
-                child_secondary * target_payload_mask
-            ).sum(dim=1) / divisor
-        else:
-            parent_secondary = None
-        trained = owner_slot >= 0
-        safe_owner = owner_slot.clamp_min(0)
-        row_index = torch.arange(batch, device=replica.device)
-        active = ~lane_failed[replica]
-        target_bytes = 0
-        target_finite = torch.ones(
-            batch, dtype=torch.bool, device=replica.device
-        )
-
-        if group.input_type >= 0:
-            old_value = owners.slab(
-                "SigmaHead", plan.input_names[group.input_type]
-            ).columns["old_value"][
-                replica, nodes["sigma_head_row"][sl].long()
-            ]
-            if self.sampled:
-                q = child_primary[
-                    row_index[:, None],
-                    ordinal[None, :],
-                    safe_owner[:, None],
-                ]
-                sibling_sum = _direct_sibling_sum(
-                    child_primary[
-                        row_index[:, None],
-                        ordinal[None, :],
-                        safe_owner[:, None],
-                    ],
-                    target,
-                )
-                sibling_mean = sibling_sum / (
-                    (target_count - 1).clamp_min(1).to(torch.float32)[
-                        :, None, None
-                    ]
-                )
-                baseline = torch.where(
-                    (target_count > 1)[:, None, None],
-                    self.lambda_ * sibling_mean
-                    + (1.0 - self.lambda_) * old_value[:, None],
-                    old_value[:, None],
-                )
-                advantage = q - baseline
-                sigma_value = parent_primary[row_index, safe_owner]
-                propagated = parent_primary.clone()
-                propagated[row_index, safe_owner] = (
-                    self.lambda_ * sigma_value
-                    + (1.0 - self.lambda_) * old_value
-                )
-                parent_primary = propagated
-                posterior = None
-            else:
-                assert parent_secondary is not None
-                assert child_secondary is not None
-                child_mass = child_primary[
-                    row_index[:, None],
-                    ordinal[None, :],
-                    safe_owner[:, None],
-                ]
-                child_moment = child_secondary[
-                    row_index[:, None],
-                    ordinal[None, :],
-                    safe_owner[:, None],
-                ]
-                q = conditionalize(child_moment, child_mass)
-                sibling_mass = _direct_sibling_sum(child_mass, target)
-                sibling_moment = _direct_sibling_sum(child_moment, target)
-                sibling_value = conditionalize(sibling_moment, sibling_mass)
-                baseline = torch.where(
-                    (target_count > 1)[:, None, None],
-                    self.lambda_ * sibling_value
-                    + (1.0 - self.lambda_) * old_value[:, None],
-                    old_value[:, None],
-                )
-                advantage = q - baseline
-                sigma_value = conditionalize(
-                    parent_secondary[row_index, safe_owner],
-                    parent_primary[row_index, safe_owner],
-                )
-                propagated = parent_secondary.clone()
-                propagated[row_index, safe_owner] = (
-                    self.lambda_ * parent_secondary[row_index, safe_owner]
-                    + (1.0 - self.lambda_)
-                    * parent_primary[row_index, safe_owner]
-                    * old_value
-                )
-                parent_secondary = propagated
-                posterior = child_mass
-            target_finite &= torch.isfinite(sigma_value).flatten(1).all(1)
-            target_finite &= torch.where(
-                target[..., None],
-                torch.isfinite(advantage),
-                torch.ones_like(advantage, dtype=torch.bool),
-            ).flatten(1).all(1)
-            if posterior is not None:
-                target_finite &= torch.where(
-                    target[..., None],
-                    torch.isfinite(posterior) & (posterior >= 0),
-                    torch.ones_like(posterior, dtype=torch.bool),
-                ).flatten(1).all(1)
-
-            action_partition = (
-                group.output_type if self.branched else group.input_type
-            )
-            action_rows = nodes["action_begin"][sl].long()[:, None] + ordinal
-            flat_valid = target & trained[:, None] & active[:, None]
-            for lane in range(owners.plan.manifest.n_replica):
-                lane_rows = flat_valid & (replica == lane)[:, None]
-                rows = action_rows[lane_rows]
-                if rows.numel():
-                    action_views[
-                        (lane, action_partition, "advantage_target")
-                    ][rows] = advantage[lane_rows]
-                    target_bytes += (
-                        rows.numel() * width * torch.tensor([], dtype=torch.float32).element_size()
-                    )
-                    if posterior is not None:
-                        action_views[
-                            (lane, action_partition, "posterior")
-                        ][rows] = posterior[lane_rows]
-                        target_bytes += rows.numel() * width * 4
-                lane_nodes = trained & active & (replica == lane)
-                sigma_rows = nodes["sigma_target_row"][sl].long()[lane_nodes]
-                if sigma_rows.numel():
-                    sigma_views[
-                        (lane, group.input_type, "value_target")
-                    ][sigma_rows] = sigma_value[lane_nodes]
-                    target_bytes += sigma_rows.numel() * width * 4
-        else:
-            sigma_value = None
-
-        if self.branched:
-            assert child_trace is not None
-            assert child_cost is not None and child_delta is not None
-            trace_mean = (
-                child_trace * target[..., None]
-            ).sum(1) / target_count.to(torch.float32)[:, None]
-            delta_bar = (
-                child_delta * target
-            ).sum(1) / target_count.to(torch.float32)
-            path = children["path_length"][safe_edge].to(torch.float32)
-            multiplier = children["cost_multiplier"][safe_edge]
-            cost_raw = (
-                (path + multiplier * child_cost) * target
-            ).sum(1) / target_count.to(torch.float32)
-            if group.input_type >= 0:
-                old_trace = owners.slab(
-                    "SigmaHead", plan.input_names[group.input_type]
-                ).columns["old_trace"][
-                    replica, nodes["sigma_head_row"][sl].long()
-                ]
-                old_cost = owners.slab(
-                    "SigmaHead", plan.input_names[group.input_type]
-                ).columns["old_cost"][
-                    replica, nodes["sigma_head_row"][sl].long()
-                ]
-                centered = child_trace - trace_mean[:, None]
-                trace_exec = (
-                    centered.square().sum(-1) * target
-                ).sum(1) / (target_count - 1).clamp_min(1).to(torch.float32)
-                trace_hat = (trace_exec - delta_bar).clamp_min(0.0)
-                has_trace = target_count >= 2
-                t_star = torch.where(has_trace, trace_hat, old_trace)
-                parent_delta = (
-                    (t_star + delta_bar) / target_count.to(torch.float32)
-                    - t_star / nodes["nominal_degree"][sl].to(torch.float32)
-                )
-                parent_cost = (
-                    self.lambda_ * cost_raw + (1.0 - self.lambda_) * old_cost
-                )
-                target_finite &= (
-                    torch.isfinite(trace_hat)
-                    & torch.isfinite(cost_raw)
-                    & torch.isfinite(parent_delta)
-                    & torch.isfinite(parent_cost)
-                )
-                for lane in range(owners.plan.manifest.n_replica):
-                    lane_nodes = trained & active & (replica == lane)
-                    sigma_rows = nodes["sigma_target_row"][sl].long()[lane_nodes]
-                    if sigma_rows.numel():
-                        sigma_views[
-                            (lane, group.input_type, "trace_target")
-                        ][sigma_rows] = torch.where(
-                            has_trace[lane_nodes],
-                            trace_hat[lane_nodes],
-                            torch.zeros_like(trace_hat[lane_nodes]),
-                        )
-                        sigma_views[
-                            (lane, group.input_type, "cost_target")
-                        ][sigma_rows] = cost_raw[lane_nodes]
-                        target_bytes += sigma_rows.numel() * 8
-            else:
-                parent_delta = delta_bar / target_count.to(torch.float32)
-                parent_cost = cost_raw
-        else:
-            trace_mean = parent_delta = parent_cost = None
-
-        finite = (
-            torch.isfinite(child_primary)
-            .where(
-                valid[..., None, None],
-                torch.ones_like(child_primary, dtype=torch.bool),
-            )
-            .flatten(1)
-            .all(1)
-        )
-        finite &= torch.isfinite(parent_primary).flatten(1).all(1)
-        if parent_secondary is not None:
-            assert child_secondary is not None
-            child_valid = valid[..., None, None]
-            finite &= torch.where(
-                child_valid,
-                torch.isfinite(child_secondary),
-                torch.ones_like(child_secondary, dtype=torch.bool),
-            ).flatten(1).all(1)
-            finite &= torch.where(
-                child_valid,
-                child_primary >= 0,
-                torch.ones_like(child_primary, dtype=torch.bool),
-            ).flatten(1).all(1)
-            finite &= torch.where(
-                child_valid & (child_primary == 0),
-                child_secondary.abs() <= 1.0e-7,
-                torch.ones_like(child_secondary, dtype=torch.bool),
-            ).flatten(1).all(1)
-            finite &= torch.isfinite(parent_secondary).flatten(1).all(1)
-            finite &= (parent_primary >= 0).flatten(1).all(1)
-            zero_mass = parent_primary == 0
-            finite &= (
-                (~zero_mass)
-                | (parent_secondary.abs() <= 1.0e-7)
-            ).flatten(1).all(1)
-        if self.branched:
-            assert trace_mean is not None
-            assert parent_delta is not None and parent_cost is not None
-            finite &= torch.isfinite(trace_mean).flatten(1).all(1)
-            finite &= torch.isfinite(parent_delta) & torch.isfinite(parent_cost)
-        finite &= target_finite
-        invalid = ~finite
-        for lane in range(owners.plan.manifest.n_replica):
-            lane_failed[lane] |= (invalid & (replica == lane)).any()
-        write = active & finite & ~lane_failed[replica]
-        destination_work = owners.slab(
-            "LayerWork", plan.output_names[group.output_type]
-        ).columns
-        selected_replica = replica[write]
-        selected_destination = destination[write]
-        if self.sampled:
-            destination_work["return_value"][
-                selected_replica, selected_destination, dst_arena
-            ] = parent_primary[write]
-        else:
-            destination_work["mass"][
-                selected_replica, selected_destination, dst_arena
-            ] = parent_primary[write]
-            assert parent_secondary is not None
-            destination_work["moment"][
-                selected_replica, selected_destination, dst_arena
-            ] = parent_secondary[write]
-        if self.branched:
-            assert trace_mean is not None
-            assert parent_cost is not None and parent_delta is not None
-            destination_work["trace_vector"][
-                selected_replica, selected_destination, dst_arena
-            ] = trace_mean[write]
-            destination_work["cost"][
-                selected_replica, selected_destination, dst_arena
-            ] = parent_cost[write]
-            destination_work["delta"][
-                selected_replica, selected_destination, dst_arena
-            ] = parent_delta[write]
-
-        elements = batch * n_max * p_train * width
-        mm_read = 0 if self.sampled else elements * 2 * 4
-        mm_written = (
-            0 if self.sampled else batch * p_train * width * 2 * 4
-        )
-        return invalid, target_bytes, mm_read, mm_written
-
-    def _execute_carries(
-        self,
-        owners: GeneratedOwners,
-        plan: LayerPlan,
-        device_plan: DeviceLayerPlan,
-        layer: int,
-        src_arena: int,
-        dst_arena: int,
-        lane_failed: Tensor,
-    ) -> int:
-        first = int(plan.carry_ptr[layer])
-        stop = int(plan.carry_ptr[layer + 1])
-        if first == stop:
-            return 0
-        carries = device_plan.carries.columns
-        payload_bytes = 0
-        for output, name in enumerate(plan.output_names):
-            host_selected = (
-                plan.carry_output_type[first:stop] == output
-            ).nonzero(as_tuple=False).flatten()
-            if not host_selected.numel():
-                continue
-            index = host_selected.to(device=owners.plan.device) + first
-            replica = carries["replica"][index].long()
-            active = ~lane_failed[replica]
-            source = carries["source_work_row"][index].long()
-            destination = carries["destination_work_row"][index].long()
-            work = owners.slab("LayerWork", name).columns
-            for field in self.mode.owner("LayerWork").fields:
-                value = work[field][replica, source, src_arena]
-                work[field][
-                    replica[active], destination[active], dst_arena
-                ] = value[active]
-                payload_bytes += value[active].numel() * value.element_size()
-        return payload_bytes
-
 
 __all__ = [
     "ConversionMap",

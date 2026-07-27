@@ -441,15 +441,6 @@ def assemble_topology_packets(
     return topology.compact(bindings, p_train=p_train)
 
 
-@dataclass(frozen=True, order=True)
-class LayerGroup:
-    layer: int
-    output_type: int
-    input_type: int
-    begin: int
-    end: int
-
-
 @dataclass(frozen=True)
 class LayerPlan:
     """Exact CPU movement and reverse-layer execution plan."""
@@ -480,7 +471,6 @@ class LayerPlan:
     movement_source_leaf_row: Tensor
     movement_destination_work_row: Tensor
     movement_output_type: Tensor
-    groups: tuple[LayerGroup, ...]
     arena_rows: tuple[tuple[int, ...], ...]
     sigma_rows: tuple[tuple[int, ...], ...]
     action_rows: tuple[tuple[int, ...], ...]
@@ -683,7 +673,6 @@ def build_layer_plan(
     carry_records: list[tuple[int, int, int, int]] = []
     layer_ptr = [0]
     carry_ptr = [0]
-    groups: list[LayerGroup] = []
 
     for layer in range(layer_count):
         selected: list[tuple[int, int, int, int]] = []
@@ -705,24 +694,9 @@ def build_layer_plan(
         consumed_slots: set[tuple[int, int, int, int]] = set()
         new_results: dict[tuple[int, int, int, int], int] = {}
         root_destinations: list[tuple[int, int, int, int]] = []
-        group_key: tuple[int, int] | None = None
-        group_begin = len(node_records)
         destination_arena = (layer + 1) & 1
 
         for output, input_type, lane, node in selected:
-            if group_key != (output, input_type):
-                if group_key is not None:
-                    groups.append(
-                        LayerGroup(
-                            layer,
-                            group_key[0],
-                            group_key[1],
-                            group_begin,
-                            len(node_records),
-                        )
-                    )
-                group_key = (output, input_type)
-                group_begin = len(node_records)
             topology, binding = compacted[lane]
             child_begin = len(child_records)
             first = int(topology.child_begin[node])
@@ -794,17 +768,6 @@ def build_layer_plan(
                 root_destinations.append(
                     (lane, output, destination_arena, destination)
                 )
-        if group_key is not None:
-            groups.append(
-                LayerGroup(
-                    layer,
-                    group_key[0],
-                    group_key[1],
-                    group_begin,
-                    len(node_records),
-                )
-            )
-
         next_current = {
             key: source for key, source in current.items() if key not in consumed
         }
@@ -891,7 +854,6 @@ def build_layer_plan(
         movement_source_leaf_row=i32_column(movement, 1),
         movement_destination_work_row=i32_column(movement, 2),
         movement_output_type=i32_column(movement, 3),
-        groups=tuple(groups),
         arena_rows=tuple(tuple(values) for values in arena_max),
         sigma_rows=tuple(tuple(values) for values in sigma_rows),
         action_rows=tuple(tuple(values) for values in action_rows),
@@ -904,7 +866,6 @@ def build_layer_plan(
 
 
 __all__ = [
-    "LayerGroup",
     "LayerPlan",
     "TargetKind",
     "Topology",
