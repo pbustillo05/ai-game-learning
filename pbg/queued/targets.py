@@ -226,82 +226,9 @@ class DeviceLayerPlan:
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise TargetError("LayerPlan uploads require CUDA")
-        i32 = torch.int32
-        f32 = torch.float32
-        self.nodes = ExactBlock(
-            _schema(
-                "LayerPlanNode",
-                tuple(
-                    SoAField(name, i32)
-                    for name in (
-                        "replica",
-                        "child_begin",
-                        "child_count",
-                        "destination_work_row",
-                        "input_type",
-                        "output_type",
-                        "owner_slot",
-                        "nominal_degree",
-                        "target_degree",
-                        "sigma_head_row",
-                        "sigma_target_row",
-                        "action_begin",
-                    )
-                ),
-            ),
-            plan.node_count,
-            self.device,
-        )
-        self.children = ExactBlock(
-            _schema(
-                "LayerPlanChild",
-                (
-                    SoAField("source_work_row", i32),
-                    SoAField("source_output_type", i32),
-                    SoAField("path_length", i32),
-                    SoAField("cost_multiplier", f32),
-                ),
-            ),
-            plan.edge_count,
-            self.device,
-        )
-        self.carries = ExactBlock(
-            _schema(
-                "LayerPlanCarry",
-                (
-                    SoAField("replica", i32),
-                    SoAField("source_work_row", i32),
-                    SoAField("destination_work_row", i32),
-                    SoAField("output_type", i32),
-                ),
-            ),
-            plan.carry_count,
-            self.device,
-        )
-        self.movement = ExactBlock(
-            _schema(
-                "LayerPlanMovement",
-                (
-                    SoAField("replica", i32),
-                    SoAField("source_leaf_row", i32),
-                    SoAField("destination_work_row", i32),
-                    SoAField("output_type", i32),
-                ),
-            ),
-            plan.movement_count,
-            self.device,
-        )
-        self.pointers = ExactBlock(
-            _schema(
-                "LayerPlanPointer",
-                (
-                    SoAField("layer_ptr", i32, (plan.layer_count + 1,)),
-                    SoAField("carry_ptr", i32, (plan.layer_count + 1,)),
-                ),
-            ),
-            1,
-            self.device,
-        )
+        node_schema, child_schema = self._schemas()
+        self.nodes = ExactBlock(node_schema, plan.node_count, self.device)
+        self.children = ExactBlock(child_schema, plan.edge_count, self.device)
         node_sources = {
             "replica": plan.replica,
             "child_begin": plan.child_begin,
@@ -322,33 +249,55 @@ class DeviceLayerPlan:
             "path_length": plan.child_path_length,
             "cost_multiplier": plan.child_cost_multiplier,
         }
-        carry_sources = {
-            "replica": plan.carry_replica,
-            "source_work_row": plan.carry_source_work_row,
-            "destination_work_row": plan.carry_destination_work_row,
-            "output_type": plan.carry_output_type,
-        }
-        movement_sources = {
-            "replica": plan.movement_replica,
-            "source_leaf_row": plan.movement_source_leaf_row,
-            "destination_work_row": plan.movement_destination_work_row,
-            "output_type": plan.movement_output_type,
-        }
         for block, sources in (
             (self.nodes, node_sources),
             (self.children, child_sources),
-            (self.carries, carry_sources),
-            (self.movement, movement_sources),
         ):
             for name, source in sources.items():
-                block.columns[name].copy_(source.to(device=self.device))
-        self.pointers.columns["layer_ptr"][0].copy_(
-            plan.layer_ptr.to(device=self.device)
-        )
-        self.pointers.columns["carry_ptr"][0].copy_(
-            plan.carry_ptr.to(device=self.device)
-        )
+                block.columns[name].copy_(source)
         self._released = False
+
+    @staticmethod
+    def _schemas() -> tuple[SoASchema, SoASchema]:
+        i32 = torch.int32
+        return (
+            _schema(
+                "LayerPlanNode",
+                tuple(
+                    SoAField(name, i32)
+                    for name in (
+                        "replica",
+                        "child_begin",
+                        "child_count",
+                        "destination_work_row",
+                        "input_type",
+                        "output_type",
+                        "owner_slot",
+                        "nominal_degree",
+                        "target_degree",
+                        "sigma_head_row",
+                        "sigma_target_row",
+                        "action_begin",
+                    )
+                ),
+            ),
+            _schema(
+                "LayerPlanChild",
+                (
+                    SoAField("source_work_row", i32),
+                    SoAField("source_output_type", i32),
+                    SoAField("path_length", i32),
+                    SoAField("cost_multiplier", torch.float32),
+                ),
+            ),
+        )
+
+    @classmethod
+    def required_bytes(cls, plan: LayerPlan) -> int:
+        node_schema, child_schema = cls._schemas()
+        return node_schema.allocation_bytes(
+            plan.node_count
+        ) + child_schema.allocation_bytes(plan.edge_count)
 
     @property
     def allocated_bytes(self) -> int:
@@ -359,35 +308,15 @@ class DeviceLayerPlan:
             for block in (
                 self.nodes,
                 self.children,
-                self.carries,
-                self.movement,
-                self.pointers,
             )
         )
 
     def release(self) -> None:
         if self._released:
             raise StorageError("device layer plan has been released")
-        for block in (
-            self.pointers,
-            self.movement,
-            self.carries,
-            self.children,
-            self.nodes,
-        ):
+        for block in (self.children, self.nodes):
             block.release()
         self._released = True
-
-
-def _zero_values(slab, count: int) -> dict[str, Tensor]:
-    return {
-        field.name: torch.zeros(
-            (count, *field.shape),
-            dtype=field.dtype,
-            device=slab.device,
-        )
-        for field in slab.schema.fields
-    }
 
 
 def initialize_work_arenas(
@@ -398,11 +327,24 @@ def initialize_work_arenas(
     """Apply the exact leaf movement plan and atomically publish work arenas."""
 
     n_replica = owners.plan.manifest.n_replica
+    expected_inputs = tuple(
+        item.name for item in owners.plan.partitions.inputs
+    )
+    expected_outputs = tuple(
+        item.name for item in owners.plan.partitions.outputs
+    )
+    if plan.input_names != expected_inputs or plan.output_names != expected_outputs:
+        raise TargetError("LayerPlan partitions differ from generated owners")
+    if plan.branched != owners.plan.mode.rollout_mode.is_branched:
+        raise TargetError("LayerPlan rollout family differs from generated owners")
     if len(plan.arena_rows) != n_replica:
         raise TargetError("LayerPlan replica count differs from generated owners")
+    plan.assert_admitted(owners.plan.manifest)
     for lane in range(n_replica):
         requests: list[DestinationRequest] = []
-        values: list[dict[str, Tensor]] = []
+        operations: list[
+            tuple[int, str, Tensor, Tensor, LeafWork | None]
+        ] = []
         for output, name in enumerate(plan.output_names):
             count = plan.arena_rows[lane][output]
             if count == 0:
@@ -417,13 +359,13 @@ def initialize_work_arenas(
                     logical_address=output,
                 )
             )
-            current = _zero_values(slab, count)
             selected = (
                 (plan.movement_replica == lane)
                 & (plan.movement_output_type == output)
             )
             destinations = plan.movement_destination_work_row[selected].long()
             sources = plan.movement_source_leaf_row[selected].long()
+            payload: LeafWork | None = None
             if destinations.numel():
                 try:
                     payload = completion[(lane, name)]
@@ -431,38 +373,48 @@ def initialize_work_arenas(
                     raise TargetError(
                         f"missing completion payload for lane {lane}, {name}"
                     ) from exc
-                if isinstance(payload, SampledLeafWork):
-                    if "return_value" not in current:
-                        raise TargetError("sampled completion used with RB work schema")
-                    current["return_value"][destinations, 0] = (
-                        payload.return_value[sources]
-                    )
-                    if "trace_vector" in current:
-                        if payload.trace_vector is None:
-                            raise TargetError("branched completion lacks trace vector")
-                        current["trace_vector"][destinations, 0] = (
-                            payload.trace_vector[sources]
-                        )
-                else:
-                    if "mass" not in current:
-                        raise TargetError("RB completion used with sampled work schema")
-                    current["mass"][destinations, 0] = payload.mass[sources]
-                    current["moment"][destinations, 0] = payload.moment[sources]
-                    if "trace_vector" in current:
-                        if payload.trace_vector is None:
-                            raise TargetError("branched completion lacks trace vector")
-                        current["trace_vector"][destinations, 0] = (
-                            payload.trace_vector[sources]
-                        )
-            values.append(current)
+            operations.append((output, name, destinations, sources, payload))
         if not requests:
             continue
         transaction = PublicationTransaction.begin(
             requests, phase="completion_movement"
         )
         try:
-            for index, current in enumerate(values):
-                transaction.fill(index, current)
+            for index, (_, _, destinations, sources, payload) in enumerate(
+                operations
+            ):
+                transaction.fill_defaults(index)
+                if payload is None:
+                    continue
+                reservation = transaction.reservations[index]
+                fields = tuple(
+                    field.name for field in reservation._slab.schema.fields
+                )
+                if isinstance(payload, SampledLeafWork):
+                    if "return_value" not in fields:
+                        raise TargetError("sampled completion used with RB work schema")
+                    reservation.view("return_value")[destinations, 0] = (
+                        payload.return_value[sources]
+                    )
+                    if "trace_vector" in fields:
+                        if payload.trace_vector is None:
+                            raise TargetError("branched completion lacks trace vector")
+                        reservation.view("trace_vector")[destinations, 0] = (
+                            payload.trace_vector[sources]
+                        )
+                else:
+                    if "mass" not in fields:
+                        raise TargetError("RB completion used with sampled work schema")
+                    reservation.view("mass")[destinations, 0] = payload.mass[sources]
+                    reservation.view("moment")[destinations, 0] = (
+                        payload.moment[sources]
+                    )
+                    if "trace_vector" in fields:
+                        if payload.trace_vector is None:
+                            raise TargetError("branched completion lacks trace vector")
+                        reservation.view("trace_vector")[destinations, 0] = (
+                            payload.trace_vector[sources]
+                        )
             transaction.publish()
         except BaseException:
             transaction.abort()
@@ -479,6 +431,7 @@ class TargetCounters:
     mass_moment_bytes_read: int
     mass_moment_bytes_written: int
     target_bytes_written: int
+    scratch_bytes: int
     kernel_launches: int
     cuda_seconds: float
 
@@ -506,11 +459,48 @@ class LayeredTargetExecutor:
         self.sampled = mode.private_estimator is PrivateEstimator.SAMPLED
         self.branched = mode.rollout_mode.is_branched
 
+    def required_scratch_bytes(
+        self, plan: LayerPlan, n_replica: int
+    ) -> int:
+        output_count = len(plan.output_names)
+        input_count = len(plan.input_names)
+        action_count = output_count if self.branched else input_count
+        max_width = max(self.algebra.widths)
+        pointer_entries = (
+            5 * output_count
+            + 3 * input_count
+            + 3 * n_replica * input_count
+            + 2 * n_replica * action_count
+        )
+        scalar_entries = 2 * output_count + input_count + n_replica
+        transient_bytes = (
+            pointer_entries * 8
+            + scalar_entries * 4
+            + output_count * output_count * max_width * 4
+        )
+        return DeviceLayerPlan.required_bytes(plan) + transient_bytes
+
     def execute(
         self,
         owners: GeneratedOwners,
         plan: LayerPlan,
     ) -> TargetResult:
+        if owners.plan.mode != self.mode:
+            raise TargetError("executor mode differs from generated owners")
+        if owners.plan.partitions != self.algebra.partitions:
+            raise TargetError("target algebra differs from generated owners")
+        if plan.input_names != self.algebra.input_names:
+            raise TargetError("LayerPlan inputs differ from target algebra")
+        if plan.output_names != self.algebra.output_names:
+            raise TargetError("LayerPlan outputs differ from target algebra")
+        if plan.output_widths != self.algebra.widths:
+            raise TargetError("LayerPlan widths differ from target algebra")
+        if plan.branched != self.branched:
+            raise TargetError("LayerPlan rollout family differs from executor")
+        if plan.supported_conversions != tuple(
+            sorted(self.algebra._cpu_masks)
+        ):
+            raise TargetError("LayerPlan conversions differ from target algebra")
         device = owners.plan.device
         n_replica = owners.plan.manifest.n_replica
         p_train = (
@@ -521,10 +511,61 @@ class LayeredTargetExecutor:
         if len(plan.arena_rows) != n_replica:
             raise TargetError("LayerPlan replica count differs from owners")
         plan.assert_admitted(owners.plan.manifest)
+        input_output = torch.tensor(
+            [
+                plan.output_names.index(
+                    self.algebra.partitions.output_for(name).name
+                )
+                for name in plan.input_names
+            ],
+            dtype=torch.int32,
+        )
+        trained = plan.input_type >= 0
+        if bool(
+            (
+                trained
+                & (
+                    plan.output_type
+                    != input_output[plan.input_type.clamp_min(0)]
+                )
+            ).any()
+        ):
+            raise TargetError("LayerPlan input/output binding is invalid")
+        if bool(
+            (
+                (plan.owner_slot >= p_train)
+                | (plan.owner_slot < -1)
+            ).any()
+        ):
+            raise TargetError("LayerPlan owner slot is outside P_train")
+        output_count = len(plan.output_names)
+        input_count = len(plan.input_names)
+        max_width = max(self.algebra.widths)
+        required_scratch = self.required_scratch_bytes(plan, n_replica)
+        if required_scratch > owners.plan.manifest.movement_scratch_bytes:
+            raise TargetError(
+                "layer executor scratch exceeds admitted movement scratch bytes"
+            )
+        for output, name in enumerate(plan.output_names):
+            slab = owners.slab("LayerWork", name)
+            for lane in range(n_replica):
+                if slab.tail(lane) < plan.arena_rows[lane][output]:
+                    raise TargetError("LayerPlan addresses unpublished work rows")
+        for input_type, name in enumerate(plan.input_names):
+            slab = owners.slab("SigmaHead", name)
+            for lane in range(n_replica):
+                rows = plan.replica == lane
+                rows &= plan.input_type == input_type
+                if bool(rows.any()):
+                    maximum = int(plan.sigma_head_row[rows].max())
+                    if maximum >= slab.tail(lane):
+                        raise TargetError(
+                            "LayerPlan addresses an unpublished sigma head"
+                        )
         device_plan = DeviceLayerPlan(plan, device)
-        if device_plan.allocated_bytes > owners.plan.manifest.movement_scratch_bytes:
+        if device_plan.allocated_bytes != DeviceLayerPlan.required_bytes(plan):
             device_plan.release()
-            raise TargetError("exact LayerPlan upload exceeds admitted scratch bytes")
+            raise TargetError("LayerPlan device bytes differ from exact preflight")
         transactions: dict[int, PublicationTransaction] = {}
         sigma_views: dict[tuple[int, int, str], Tensor] = {}
         action_views: dict[tuple[int, int, str], Tensor] = {}
@@ -569,9 +610,9 @@ class LayeredTargetExecutor:
                 transactions[lane] = transaction
                 for index, (kind, partition) in enumerate(tags):
                     reservation = transaction.reservations[index]
-                    zero = _zero_values(reservation._slab, reservation.rows)
-                    transaction.fill(index, zero)
-                    for field in zero:
+                    transaction.fill_defaults(index)
+                    for schema_field in reservation._slab.schema.fields:
+                        field = schema_field.name
                         key = (lane, partition, field)
                         if kind == "sigma":
                             sigma_views[key] = reservation.view(field)
@@ -647,7 +688,6 @@ class LayeredTargetExecutor:
                             (lane, action_type, "advantage_target"), empty
                         )
                     )
-            max_width = max(self.algebra.widths)
             conversion = torch.full(
                 (
                     len(plan.output_names),
@@ -701,12 +741,6 @@ class LayeredTargetExecutor:
                 [slab.capacity for slab in output_slabs],
                 [slab.capacity for slab in head_slabs],
                 list(self.algebra.widths),
-                [
-                    plan.output_names.index(
-                        self.algebra.partitions.output_for(name).name
-                    )
-                    for name in plan.input_names
-                ],
                 n_replica,
                 len(plan.input_names),
                 len(plan.output_names),
@@ -747,6 +781,16 @@ class LayeredTargetExecutor:
                     published_lanes.append(lane)
                     if lane in transactions:
                         transactions[lane].publish()
+            rb_read_bytes = 0
+            rb_written_bytes = 0
+            if not self.sampled:
+                rb_read_bytes = 8 * (
+                    p_train * plan.rb_first_source_components
+                    + plan.rb_owner_source_components
+                )
+                rb_written_bytes = (
+                    8 * p_train * plan.rb_written_components
+                )
             result = TargetResult(
                 published_lanes=tuple(published_lanes),
                 failed_lanes=tuple(failed_lanes),
@@ -759,20 +803,13 @@ class LayeredTargetExecutor:
                     carry_count=plan.carry_count,
                     carry_payload_bytes=0,
                     child_edges_read=plan.edge_count,
-                    mass_moment_bytes_read=(
-                        0
-                        if self.sampled
-                        else plan.edge_count * p_train * max_width * 8
-                    ),
-                    mass_moment_bytes_written=(
-                        0
-                        if self.sampled
-                        else plan.node_count * p_train * max_width * 8
-                    ),
+                    mass_moment_bytes_read=rb_read_bytes,
+                    mass_moment_bytes_written=rb_written_bytes,
                     target_bytes_written=sum(
                         tensor.numel() * tensor.element_size()
                         for tensor in (*sigma_v, *sigma_t, *sigma_c, *action_p, *action_a)
                     ),
+                    scratch_bytes=required_scratch,
                     kernel_launches=plan.layer_count,
                     cuda_seconds=elapsed,
                 ),

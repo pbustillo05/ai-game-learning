@@ -348,6 +348,7 @@ class StoragePlan:
     """A fully validated, allocation-free generated owner plan."""
 
     mode: ModeSchema
+    partitions: PartitionContract
     manifest: CapacityManifest
     layout: PhysicalLayout
     allocations: tuple[OwnerAllocation, ...]
@@ -802,6 +803,7 @@ def build_storage_plan(
         )
     return StoragePlan(
         mode=mode,
+        partitions=partitions,
         manifest=manifest,
         layout=layout,
         allocations=tuple(allocations),

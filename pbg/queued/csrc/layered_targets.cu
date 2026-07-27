@@ -27,7 +27,6 @@ struct Tables {
   const int32_t* work_cap;
   const int32_t* head_cap;
   const int32_t* width;
-  const int32_t* input_output;
   const int32_t* conversion;
 };
 
@@ -151,14 +150,19 @@ __global__ void layered_target_kernel(
       const int edge = begin + a;
       const int source = child_source_type[edge];
       const int encoded = child_source_row[edge];
-      mass_sum += converted(
+      const float child0 = converted(
           tables.work0, tables, source, output, lane, encoded, p, d, p_train,
           output_count, max_width);
+      mass_sum += child0;
       if (!sampled) {
-        moment_sum += converted(
+        const float child1 = converted(
             tables.work1, tables, source, output, lane, encoded, p, d, p_train,
             output_count, max_width);
+        moment_sum += child1;
+        if (!isfinite(child1) || child0 < 0.0f ||
+            (child0 == 0.0f && fabsf(child1) > 1.0e-7f)) bad = true;
       }
+      if (!isfinite(child0)) bad = true;
     }
     float parent0 = mass_sum / static_cast<float>(ntgt);
     float parent1 = sampled ? 0.0f : moment_sum / static_cast<float>(ntgt);
@@ -217,7 +221,8 @@ __global__ void layered_target_kernel(
         const int target_row = action_begin[node] + a;
         action_a_ptr[target_row * width + d] = q - baseline;
         if (action_p_ptr) action_p_ptr[target_row * width + d] = child0;
-        if (!isfinite(q) || !isfinite(baseline) || child0 < 0.0f ||
+        if (!isfinite(q) || !isfinite(baseline) ||
+            (!sampled && child0 < 0.0f) ||
             (!sampled && child0 == 0.0f && fabsf(child1) > 1.0e-7f)) {
           bad = true;
         }
@@ -339,7 +344,7 @@ Tensor run_layers(
     std::vector<Tensor> sigma_c, std::vector<Tensor> action_p,
     std::vector<Tensor> action_a, Tensor conversion,
     std::vector<int64_t> work_cap, std::vector<int64_t> head_cap,
-    std::vector<int64_t> width, std::vector<int64_t> input_output,
+    std::vector<int64_t> width,
     int64_t n_replica, int64_t input_count, int64_t output_count,
     int64_t action_partition_count, int64_t p_train, int64_t max_width,
     double lambda, bool sampled, bool branched) {
@@ -365,7 +370,6 @@ Tensor run_layers(
   Tensor work_cap_t = int_tensor(work_cap, like);
   Tensor head_cap_t = int_tensor(head_cap, like);
   Tensor width_t = int_tensor(width, like);
-  Tensor input_output_t = int_tensor(input_output, like);
   Tables tables{
       work0_ptr.data_ptr<int64_t>(), work1_ptr.data_ptr<int64_t>(),
       trace_ptr.data_ptr<int64_t>(), cost_ptr.data_ptr<int64_t>(),
@@ -375,7 +379,7 @@ Tensor run_layers(
       sigma_c_ptr.data_ptr<int64_t>(), action_p_ptr.data_ptr<int64_t>(),
       action_a_ptr.data_ptr<int64_t>(), work_cap_t.data_ptr<int32_t>(),
       head_cap_t.data_ptr<int32_t>(), width_t.data_ptr<int32_t>(),
-      input_output_t.data_ptr<int32_t>(), conversion.data_ptr<int32_t>()};
+      conversion.data_ptr<int32_t>()};
   const int32_t* ptr = layer_ptr_cpu.data_ptr<int32_t>();
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   for (int layer = 0; layer + 1 < layer_ptr_cpu.numel(); ++layer) {

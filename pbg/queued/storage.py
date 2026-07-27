@@ -457,6 +457,14 @@ class SlabReservation:
         self._slab._fill(self, values)
         self._filled = True
 
+    def fill_defaults(self) -> None:
+        """Initialize the reservation in place without staging another tensor."""
+
+        if self._closed:
+            raise StorageError("reservation is closed")
+        self._slab._fill_defaults(self)
+        self._filled = True
+
     def view(self, field: str) -> Tensor:
         if self._closed:
             raise StorageError("reservation is closed")
@@ -683,6 +691,11 @@ class MonotoneSlab:
         for field in self.schema.fields:
             self._reservation_view(reservation, field.name).copy_(values[field.name])
 
+    def _fill_defaults(self, reservation: SlabReservation) -> None:
+        self._require_reservation(reservation)
+        for field in self.schema.fields:
+            self._reservation_view(reservation, field.name).fill_(field.fill)
+
     def _prepare_publish(self, reservation: SlabReservation) -> None:
         self._require_reservation(reservation)
         if not reservation.filled:
@@ -882,6 +895,15 @@ class PublicationTransaction:
             raise TransactionError("transaction is closed")
         try:
             self.reservations[index].fill(values)
+        except BaseException:
+            self.abort()
+            raise
+
+    def fill_defaults(self, index: int) -> None:
+        if self._closed:
+            raise TransactionError("transaction is closed")
+        try:
+            self.reservations[index].fill_defaults()
         except BaseException:
             self.abort()
             raise

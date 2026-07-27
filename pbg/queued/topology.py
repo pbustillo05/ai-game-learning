@@ -321,7 +321,6 @@ class Topology:
                 while kind == int(TargetKind.TOPOLOGY) and not keep[row]:
                     unary_edge = columns["child_begin"][row]
                     path += columns["path_length"][unary_edge]
-                    label = columns["label"][unary_edge]
                     kind = columns["target_kind"][unary_edge]
                     row = columns["target_row"][unary_edge]
                     endpoint_output = child_output[unary_edge]
@@ -476,6 +475,12 @@ class LayerPlan:
     action_rows: tuple[tuple[int, ...], ...]
     input_names: tuple[str, ...]
     output_names: tuple[str, ...]
+    output_widths: tuple[int, ...]
+    supported_conversions: tuple[tuple[int, int], ...]
+    rb_first_source_components: int
+    rb_owner_source_components: int
+    rb_written_components: int
+    branched: bool
 
     @property
     def layer_count(self) -> int:
@@ -535,6 +540,69 @@ class LayerPlan:
         return sum(value.numel() * value.element_size() for value in tensors)
 
     def assert_admitted(self, manifest: CapacityManifest) -> None:
+        i32_node_fields = (
+            "replica",
+            "child_begin",
+            "child_count",
+            "destination_work_row",
+            "input_type",
+            "output_type",
+            "owner_slot",
+            "nominal_degree",
+            "target_degree",
+            "sigma_head_row",
+            "sigma_target_row",
+            "action_begin",
+        )
+        i32_edge_fields = (
+            "child_source_work_row",
+            "child_source_output_type",
+            "child_path_length",
+        )
+        for name in i32_node_fields:
+            _cpu_vector(name, getattr(self, name), self.node_count, torch.int32)
+        for name in i32_edge_fields:
+            _cpu_vector(name, getattr(self, name), self.edge_count, torch.int32)
+        _cpu_vector(
+            "child_cost_multiplier",
+            self.child_cost_multiplier,
+            self.edge_count,
+            torch.float32,
+        )
+        _cpu_vector(
+            "layer_ptr", self.layer_ptr, self.layer_count + 1, torch.int32
+        )
+        layer_ptr = self.layer_ptr.tolist()
+        if (
+            not layer_ptr
+            or layer_ptr[0] != 0
+            or layer_ptr[-1] != self.node_count
+            or any(left > right for left, right in zip(layer_ptr, layer_ptr[1:]))
+        ):
+            raise TopologyError("LayerPlan layer pointers are invalid")
+        carry_fields = (
+            self.carry_replica,
+            self.carry_source_work_row,
+            self.carry_destination_work_row,
+            self.carry_output_type,
+        )
+        if self.carry_count or any(value.numel() for value in carry_fields):
+            raise TopologyError("physical carry rows are not supported")
+        _cpu_vector(
+            "carry_ptr", self.carry_ptr, self.layer_count + 1, torch.int32
+        )
+        if bool((self.carry_ptr != 0).any()):
+            raise TopologyError("last-consumer plans require empty carry pointers")
+        movement_fields = (
+            "movement_replica",
+            "movement_source_leaf_row",
+            "movement_destination_work_row",
+            "movement_output_type",
+        )
+        for name in movement_fields:
+            _cpu_vector(
+                name, getattr(self, name), self.movement_count, torch.int32
+            )
         if self.node_count > manifest.topology_cap:
             raise TopologyError("realized LayerPlan exceeds topology_cap")
         if self.edge_count > manifest.topology_edge_cap:
@@ -547,6 +615,183 @@ class LayerPlan:
             raise TopologyError("realized LayerPlan exceeds target_arena_cap")
         if self.nbytes > manifest.movement_scratch_bytes:
             raise TopologyError("LayerPlan upload exceeds movement scratch admission")
+        n_replica = manifest.n_replica
+        input_count = len(self.input_names)
+        output_count = len(self.output_names)
+        if (
+            len(self.output_widths) != output_count
+            or any(width <= 0 for width in self.output_widths)
+        ):
+            raise TopologyError("LayerPlan output widths are invalid")
+        trained_caps = manifest.partition_rows("trained_player_cap")
+        action_caps = manifest.partition_rows("action_cap")
+        if len(self.arena_rows) != n_replica:
+            raise TopologyError("LayerPlan arena replica axis is invalid")
+        if len(self.sigma_rows) != n_replica or len(self.action_rows) != n_replica:
+            raise TopologyError("LayerPlan target replica axis is invalid")
+        if any(len(rows) != output_count for rows in self.arena_rows):
+            raise TopologyError("LayerPlan arena partition axis is invalid")
+        if any(len(rows) != input_count for rows in self.sigma_rows):
+            raise TopologyError("LayerPlan sigma partition axis is invalid")
+        action_count = output_count if self.branched else input_count
+        if any(len(rows) != action_count for rows in self.action_rows):
+            raise TopologyError("LayerPlan action partition axis is invalid")
+        if (
+            len(set(self.supported_conversions))
+            != len(self.supported_conversions)
+            or any(
+                source == destination
+                or not 0 <= source < output_count
+                or not 0 <= destination < output_count
+                for source, destination in self.supported_conversions
+            )
+        ):
+            raise TopologyError("LayerPlan conversion vocabulary is invalid")
+        child_lane = [-1] * self.edge_count
+        child_owner = [-1] * self.edge_count
+        for first, stop in zip(layer_ptr, layer_ptr[1:]):
+            destinations: set[tuple[int, int, int]] = set()
+            for row in range(first, stop):
+                key = (
+                    int(self.replica[row]),
+                    int(self.output_type[row]),
+                    int(self.destination_work_row[row]),
+                )
+                if key in destinations:
+                    raise TopologyError(
+                        "LayerPlan layer destinations are not distinct"
+                    )
+                destinations.add(key)
+        for row in range(self.node_count):
+            lane = int(self.replica[row])
+            output = int(self.output_type[row])
+            destination = int(self.destination_work_row[row])
+            if not 0 <= lane < n_replica or not 0 <= output < output_count:
+                raise TopologyError("LayerPlan node lane/output address is invalid")
+            if not 0 <= destination < self.arena_rows[lane][output]:
+                raise TopologyError("LayerPlan node destination is outside its arena")
+            begin = int(self.child_begin[row])
+            count = int(self.child_count[row])
+            target_count = int(self.target_degree[row])
+            nominal = int(self.nominal_degree[row])
+            if (
+                begin < 0
+                or begin + count > self.edge_count
+                or not 1 <= target_count <= count <= manifest.beta_max
+                or nominal < 1
+            ):
+                raise TopologyError("LayerPlan child span is out of bounds")
+            for edge in range(begin, begin + count):
+                if child_lane[edge] != -1:
+                    raise TopologyError("LayerPlan child spans overlap")
+                child_lane[edge] = lane
+                child_owner[edge] = row
+            input_type = int(self.input_type[row])
+            owner = int(self.owner_slot[row])
+            if input_type < 0 or owner < 0:
+                if (
+                    input_type != -1
+                    or owner != -1
+                    or min(
+                        int(self.sigma_head_row[row]),
+                        int(self.sigma_target_row[row]),
+                        int(self.action_begin[row]),
+                    )
+                    != -1
+                ):
+                    raise TopologyError("LayerPlan structural row addresses targets")
+                continue
+            if input_type >= input_count or owner >= manifest.geometry.players:
+                raise TopologyError("LayerPlan input type is out of bounds")
+            input_name = self.input_names[input_type]
+            if not 0 <= int(self.sigma_head_row[row]) < trained_caps[input_name]:
+                raise TopologyError("LayerPlan sigma head address is out of bounds")
+            if not 0 <= int(self.sigma_target_row[row]) < trained_caps[input_name]:
+                raise TopologyError("LayerPlan sigma target address is out of bounds")
+            if int(self.sigma_target_row[row]) >= self.sigma_rows[lane][input_type]:
+                raise TopologyError(
+                    "LayerPlan sigma target exceeds its realized reservation"
+                )
+            action_type = output if self.branched else input_type
+            action_name = (
+                self.output_names[action_type]
+                if self.branched
+                else self.input_names[action_type]
+            )
+            action_stop = int(self.action_begin[row]) + int(self.target_degree[row])
+            if int(self.action_begin[row]) < 0 or action_stop > action_caps[action_name]:
+                raise TopologyError("LayerPlan action target span is out of bounds")
+            if action_stop > self.action_rows[lane][action_type]:
+                raise TopologyError(
+                    "LayerPlan action target exceeds its realized reservation"
+                )
+        if any(lane < 0 for lane in child_lane):
+            raise TopologyError("LayerPlan child spans do not cover every edge")
+        for edge in range(self.edge_count):
+            output = int(self.child_source_output_type[edge])
+            encoded = int(self.child_source_work_row[edge])
+            if not 0 <= output < output_count:
+                raise TopologyError("LayerPlan child output type is out of bounds")
+            local_row = encoded if encoded >= 0 else -encoded - 1
+            lane = child_lane[edge]
+            if not 0 <= local_row < self.arena_rows[lane][output]:
+                raise TopologyError("LayerPlan child source is outside its arena")
+            owner_row = child_owner[edge]
+            destination = int(self.output_type[owner_row])
+            if (
+                output != destination
+                and (output, destination) not in self.supported_conversions
+            ):
+                raise TopologyError("LayerPlan uses an unsupported conversion")
+            if int(self.child_path_length[edge]) < 1:
+                raise TopologyError("LayerPlan child path length is invalid")
+            if not bool(torch.isfinite(self.child_cost_multiplier[edge])):
+                raise TopologyError("LayerPlan child cost multiplier is invalid")
+        first_components = 0
+        owner_components = 0
+        written_components = 0
+        for row in range(self.node_count):
+            begin = int(self.child_begin[row])
+            target_count = int(self.target_degree[row])
+            source_components = sum(
+                self.output_widths[int(self.child_source_output_type[edge])]
+                for edge in range(begin, begin + target_count)
+            )
+            first_components += source_components
+            if int(self.owner_slot[row]) >= 0:
+                owner_components += target_count * source_components
+            written_components += self.output_widths[int(self.output_type[row])]
+        if (
+            self.rb_first_source_components != first_components
+            or self.rb_owner_source_components != owner_components
+            or self.rb_written_components != written_components
+        ):
+            raise TopologyError("LayerPlan traffic summary is inconsistent")
+        movement_destinations: set[tuple[int, int, int]] = set()
+        for movement in range(self.movement_count):
+            lane = int(self.movement_replica[movement])
+            output = int(self.movement_output_type[movement])
+            source = int(self.movement_source_leaf_row[movement])
+            destination = int(self.movement_destination_work_row[movement])
+            if (
+                not 0 <= lane < n_replica
+                or not 0 <= output < output_count
+                or not 0 <= source < manifest.leaf_cap
+                or not 0 <= destination < self.arena_rows[lane][output]
+            ):
+                raise TopologyError("LayerPlan movement address is out of bounds")
+            key = (lane, output, destination)
+            if key in movement_destinations:
+                raise TopologyError("LayerPlan movement destinations overlap")
+            movement_destinations.add(key)
+        for lane in range(n_replica):
+            for input_type, name in enumerate(self.input_names):
+                if self.sigma_rows[lane][input_type] > trained_caps[name]:
+                    raise TopologyError("realized sigma rows exceed trained capacity")
+            action_names = self.output_names if self.branched else self.input_names
+            for action_type, name in enumerate(action_names):
+                if self.action_rows[lane][action_type] > action_caps[name]:
+                    raise TopologyError("realized action rows exceed action capacity")
 
 
 def _depths(topology: Topology) -> list[int]:
@@ -607,6 +852,14 @@ def build_layer_plan(
         index: output_names.index(partitions.output_for(name).name)
         for index, name in enumerate(input_names)
     }
+    supported_conversions = {
+        (
+            output_names.index(item.source),
+            output_names.index(item.destination),
+        )
+        for item in partitions.conversions
+    }
+    output_widths = tuple(item.width for item in partitions.outputs)
     for topology, binding in compacted:
         topology.validate(binding, p_train=p_train, compact=True)
         if bool(
@@ -633,6 +886,29 @@ def build_layer_plan(
             ).any()
         ):
             raise TopologyError("trained input/output partition binding is invalid")
+        if manifest is not None:
+            player_caps = manifest.partition_rows("player_node_cap")
+            for node in range(topology.node_count):
+                input_type = int(binding.input_type[node])
+                if input_type < 0:
+                    continue
+                name = input_names[input_type]
+                family_row = int(topology.familywork_row[node])
+                if not 0 <= family_row < player_caps[name]:
+                    raise TopologyError(
+                        "topology family-work address is out of bounds"
+                    )
+        for node in range(topology.node_count):
+            destination = int(binding.output_type[node])
+            begin = int(topology.child_begin[node])
+            count = int(topology.executed_degree[node])
+            for edge in range(begin, begin + count):
+                source = int(binding.child_output_type[edge])
+                if (
+                    source != destination
+                    and (source, destination) not in supported_conversions
+                ):
+                    raise TopologyError("topology uses an unsupported conversion")
 
     depths = [_depths(topology) for topology, _ in compacted]
     layer_count = max((max(value, default=0) for value in depths), default=0)
@@ -670,7 +946,6 @@ def build_layer_plan(
 
     node_records: list[tuple[int, ...]] = []
     child_records: list[tuple[int, int, int, float]] = []
-    carry_records: list[tuple[int, int, int, int]] = []
     layer_ptr = [0]
     carry_ptr = [0]
 
@@ -788,7 +1063,7 @@ def build_layer_plan(
                     next_slot[lane][output][1],
                 )
         layer_ptr.append(len(node_records))
-        carry_ptr.append(len(carry_records))
+        carry_ptr.append(0)
 
     def i32_column(records: Sequence[tuple], index: int) -> Tensor:
         return torch.tensor(
@@ -818,6 +1093,30 @@ def build_layer_plan(
         action_seen.setdefault((lane, action_partition), set()).update(
             range(action, action + target_degree)
         )
+    rb_first_source_components = 0
+    rb_owner_source_components = 0
+    rb_written_components = 0
+    for record in node_records:
+        (
+            _,
+            child_begin,
+            _,
+            _,
+            _,
+            output,
+            owner,
+            _,
+            target_degree,
+            *_,
+        ) = record
+        source_components = sum(
+            output_widths[int(child_records[edge][1])]
+            for edge in range(child_begin, child_begin + target_degree)
+        )
+        rb_first_source_components += source_components
+        if owner >= 0:
+            rb_owner_source_components += target_degree * source_components
+        rb_written_components += output_widths[output]
     for (lane, partition), rows in sigma_seen.items():
         if rows != set(range(len(rows))):
             raise TopologyError("sigma target rows are not dense and unique")
@@ -846,10 +1145,10 @@ def build_layer_plan(
         child_source_output_type=i32_column(child_records, 1),
         child_path_length=i32_column(child_records, 2),
         child_cost_multiplier=f32_column(child_records, 3),
-        carry_replica=i32_column(carry_records, 0),
-        carry_source_work_row=i32_column(carry_records, 1),
-        carry_destination_work_row=i32_column(carry_records, 2),
-        carry_output_type=i32_column(carry_records, 3),
+        carry_replica=torch.empty(0, dtype=torch.int32),
+        carry_source_work_row=torch.empty(0, dtype=torch.int32),
+        carry_destination_work_row=torch.empty(0, dtype=torch.int32),
+        carry_output_type=torch.empty(0, dtype=torch.int32),
         movement_replica=i32_column(movement, 0),
         movement_source_leaf_row=i32_column(movement, 1),
         movement_destination_work_row=i32_column(movement, 2),
@@ -859,6 +1158,12 @@ def build_layer_plan(
         action_rows=tuple(tuple(values) for values in action_rows),
         input_names=input_names,
         output_names=output_names,
+        output_widths=output_widths,
+        supported_conversions=tuple(sorted(supported_conversions)),
+        rb_first_source_components=rb_first_source_components,
+        rb_owner_source_components=rb_owner_source_components,
+        rb_written_components=rb_written_components,
+        branched=mode.rollout_mode.is_branched,
     )
     if manifest is not None:
         plan.assert_admitted(manifest)
