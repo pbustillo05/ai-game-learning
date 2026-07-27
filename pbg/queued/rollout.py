@@ -718,7 +718,8 @@ class CommitCoverage:
                 "commit coverage exceeds its generated descriptor bound"
             )
         temporary_bytes = (
-            active.numel() * batch.rows * 8
+            self.valid.numel() * (1 + 3 * 8)
+            + active.numel() * batch.rows * 8
             + sum(
                 active.numel() * request.max_rows * 16
                 for request in requests
@@ -860,6 +861,7 @@ class RolloutOwnerRegistry:
         chance_generation_cap: int,
         descriptor_cap: int,
         workspace_byte_cap: int,
+        completion_workspace_byte_cap: int,
         _token: object | None = None,
     ) -> None:
         if _token is not _OWNER_REGISTRY_TOKEN:
@@ -891,6 +893,7 @@ class RolloutOwnerRegistry:
             chance_generation_cap,
             descriptor_cap,
             workspace_byte_cap,
+            completion_workspace_byte_cap,
         )
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
@@ -907,6 +910,7 @@ class RolloutOwnerRegistry:
             self.chance_generation_cap,
             self.descriptor_cap,
             self.workspace_byte_cap,
+            self.completion_workspace_byte_cap,
         ) = bounds
         self._ids = frozenset(id(slab) for slab in self.slabs)
 
@@ -929,6 +933,9 @@ class RolloutOwnerRegistry:
             descriptor_cap=sum(slab.capacity for slab in slabs),
             workspace_byte_cap=plan.admission(
                 ExecutionPhase.ROLLOUT
+            ).bounded_workspace_bytes,
+            completion_workspace_byte_cap=plan.admission(
+                ExecutionPhase.COMPLETION
             ).bounded_workspace_bytes,
             _token=_OWNER_REGISTRY_TOKEN,
         )
@@ -965,6 +972,9 @@ class RolloutOwnerRegistry:
             ),
             descriptor_cap=descriptor_cap,
             workspace_byte_cap=max(
+                1, replica * descriptor_cap * 64
+            ),
+            completion_workspace_byte_cap=max(
                 1, replica * descriptor_cap * 64
             ),
             _token=_OWNER_REGISTRY_TOKEN,
@@ -1040,6 +1050,7 @@ class TopologyDraftPacket:
     unresolved_edges: tuple[int, ...]
     declared_node_count: int
     declared_edge_count: int
+    validation_event: torch.cuda.Event
     ready_event: torch.cuda.Event
     device_valid: Tensor
 
@@ -1355,10 +1366,6 @@ class AsyncTopologyPublisher:
         torch._assert_async(
             (patch.target_ordinal >= 0).all(),
             "endpoint ordinal must be nonnegative",
-        )
-        torch._assert_async(
-            draft.device_valid.all(),
-            "device topology validation failed before commit",
         )
 
     def resolve_rows(
@@ -1823,6 +1830,14 @@ class RolloutTransaction:
             with torch.cuda.stream(self.commit_stream):
                 self.commit_stream.wait_event(sample_ready)
                 for publication in plan.topology:
+                    self.commit_stream.wait_event(
+                        publication.draft.validation_event
+                    )
+                    torch._assert_async(
+                        publication.draft.device_valid.all(),
+                        "device topology validation failed before commit",
+                    )
+                for publication in plan.topology:
                     self.topology.stage(publication)
                 transaction = PublicationTransaction.begin_device(
                     destinations,
@@ -2123,7 +2138,10 @@ class CompletionFIFO:
                 raise ValueError(
                     f"completion {name} must be owner workspace int64 [n_replica]"
                 )
-        if 2 * owners.n_replica * 8 > owners.workspace_byte_cap:
+        if (
+            2 * owners.n_replica * 8
+            > owners.completion_workspace_byte_cap
+        ):
             raise ValueError(
                 "completion cursor exceeds admitted workspace bytes"
             )
@@ -2216,7 +2234,7 @@ class CompletionFIFO:
             plan.destinations,
             active,
             descriptor_cap=self.owners.descriptor_cap,
-            workspace_byte_cap=self.owners.workspace_byte_cap,
+            workspace_byte_cap=self.owners.completion_workspace_byte_cap,
         )
         destinations = tuple(
             DeviceDestinationRequest(

@@ -230,11 +230,13 @@ def _draft(
         unresolved_edges=(0,),
         declared_node_count=1,
         declared_edge_count=1,
+        validation_event=torch.cuda.Event(blocking=False),
         ready_event=torch.cuda.Event(blocking=False),
         device_valid=torch.ones(
             1, dtype=torch.bool, device=device
         ),
     )
+    draft.validation_event.record(torch.cuda.current_stream(device))
     draft.ready_event.record(torch.cuda.current_stream(device))
     patch = EndpointPatch(
         sequence=sequence,
