@@ -180,28 +180,21 @@ class DenseAdam:
         self.config = config
         self.gradients = DenseGradientOwner(module)
         self.parameters = self.gradients.parameters
-        self.parameter_views = self.gradients.views
-        self.flat_parameters = torch.cat(
-            tuple(parameter.detach().reshape(-1) for parameter in self.parameters)
-        )
-        offset = 0
-        for parameter in self.parameters:
-            end = offset + parameter.numel()
-            parameter.data = self.flat_parameters[offset:end].view_as(parameter)
-            offset = end
         self.exp_avg = torch.zeros_like(self.gradients.flat)
         self.exp_avg_sq = torch.zeros_like(self.gradients.flat)
         self.step_count = 0
         self.scaler = LossScaler() if scaler is None else scaler
 
-    def _parameter_vector(self) -> Tensor:
-        base = self.flat_parameters.untyped_storage().data_ptr()
-        if any(
-            parameter.untyped_storage().data_ptr() != base
-            for parameter in self.parameters
-        ):
-            raise OptimizationError("a parameter lost its dense FP32 owner")
-        return self.flat_parameters
+    def _flat_views(self, value: Tensor) -> tuple[Tensor, ...]:
+        if value.ndim != 1 or value.numel() != self.gradients.flat.numel():
+            raise OptimizationError("optimizer vector has the wrong shape")
+        offset = 0
+        result = []
+        for parameter in self.parameters:
+            end = offset + parameter.numel()
+            result.append(value[offset:end].view_as(parameter))
+            offset = end
+        return tuple(result)
 
     @torch.no_grad()
     def step(self) -> OptimizerStep:
@@ -228,11 +221,12 @@ class DenseAdam:
         self.gradients.flat.mul_(clip_scale)
         self.step_count += 1
         beta1, beta2 = self.config.beta1, self.config.beta2
-        parameter_vector = self._parameter_vector()
         gradient = self.gradients.flat
         if self.config.name == "adam" and self.config.weight_decay:
-            gradient = gradient.add(
-                parameter_vector, alpha=self.config.weight_decay
+            torch._foreach_add_(
+                self.gradients.views,
+                self.parameters,
+                alpha=self.config.weight_decay,
             )
         self.exp_avg.mul_(beta1).add_(gradient, alpha=1.0 - beta1)
         self.exp_avg_sq.mul_(beta2).addcmul_(
@@ -244,10 +238,15 @@ class DenseAdam:
         denominator.add_(self.config.epsilon)
         direction = self.exp_avg / correction1 / denominator
         if self.config.name == "adamw" and self.config.weight_decay:
-            parameter_vector.mul_(
-                1.0 - self.config.learning_rate * self.config.weight_decay
+            torch._foreach_mul_(
+                self.parameters,
+                1.0 - self.config.learning_rate * self.config.weight_decay,
             )
-        parameter_vector.add_(direction, alpha=-self.config.learning_rate)
+        torch._foreach_add_(
+            self.parameters,
+            self._flat_views(direction),
+            alpha=-self.config.learning_rate,
+        )
         self.scaler.update(True)
         return OptimizerStep(
             True,

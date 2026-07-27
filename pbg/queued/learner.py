@@ -24,7 +24,11 @@ from pbg.queued.contracts import (
     RolloutMode,
     TrainingRegime,
 )
-from pbg.queued.storage import ExactBlock, MonotoneSlab, SoASchema
+from pbg.queued.storage import (
+    DeviceDestinationRequest,
+    MonotoneSlab,
+    PublicationTransaction,
+)
 
 
 class LearnerError(RuntimeError):
@@ -83,12 +87,13 @@ def allocate_statistical_counts(
     return counts.to(torch.int32)
 
 
-@dataclass(frozen=True)
+@dataclass
 class ReferenceOutputCache:
     """Admitted immutable reference outputs for one exact sealed presentation."""
 
     fields: Mapping[str, Tensor]
     allocated_bytes: int
+    released: bool = False
 
     @classmethod
     def admit(
@@ -119,6 +124,21 @@ class ReferenceOutputCache:
             {name: value.detach().clone() for name, value in fields.items()}
         )
         return cls(cached, payload)
+
+    def gather(self, indices: Tensor) -> Mapping[str, Tensor]:
+        if self.released:
+            raise LearnerError("reference output cache was released")
+        return MappingProxyType(
+            {
+                name: value[indices.to(torch.int64)]
+                for name, value in self.fields.items()
+            }
+        )
+
+    def release(self) -> None:
+        self.fields = MappingProxyType({})
+        self.allocated_bytes = 0
+        self.released = True
 
 
 @dataclass(frozen=True)
@@ -247,36 +267,45 @@ class SequentialLearnerBatch:
     input_type: str
     indices: Tensor
     fields: Mapping[str, Tensor]
+    logical_step: int = 0
+    logical_rows: int | None = None
 
     @property
     def rows(self) -> int:
         return int(self.indices.numel())
 
+    @property
+    def objective_rows(self) -> int:
+        return self.rows if self.logical_rows is None else self.logical_rows
+
 
 class SealedSequentialInputs:
-    """Exact retained learner inputs copied before rollout-hot release."""
+    """Generated retained learner-input owner after rollout-hot release."""
 
     _FIELDS = ("model_input", "sampled_private_state", "owner")
 
     def __init__(
         self,
-        block: ExactBlock,
+        slab: MonotoneSlab,
         *,
         input_type: str,
         lane: int,
     ) -> None:
-        if tuple(block.columns) != self._FIELDS:
+        if tuple(slab.columns) != self._FIELDS:
             raise LearnerError("sealed sequential input has the wrong field contract")
-        self.block = block
+        if slab.schema.name != f"LearnerIndex.{input_type}":
+            raise LearnerError("sealed input is not the generated learner owner")
+        self.slab = slab
         self.input_type = input_type
         self.lane = lane
-        self.rows = block.rows
-        self.device = block.device
+        self.rows = slab.tail(lane)
+        self.device = slab.device
 
     @classmethod
     def seal(
         cls,
         family: MonotoneSlab,
+        destination: MonotoneSlab,
         *,
         input_type: str,
         lane: int = 0,
@@ -289,24 +318,59 @@ class SealedSequentialInputs:
         missing = set(cls._FIELDS).difference(by_name)
         if missing:
             raise LearnerError(f"family input lacks fields {sorted(missing)}")
-        schema = SoASchema(
-            name=f"SealedInput.{input_type}",
-            fields=tuple(by_name[name] for name in cls._FIELDS),
-            alignment=family.schema.alignment,
-            lifetime="align_and_seal_to_final_backward",
-        )
+        if (
+            destination.schema.name != f"LearnerIndex.{input_type}"
+            or tuple(destination.columns) != cls._FIELDS
+            or destination.n_replica != family.n_replica
+            or destination.device != family.device
+            or destination.failure_state is not family.failure_state
+        ):
+            raise LearnerError("generated learner-input owner is incompatible")
         rows = family.tail(lane)
-        block = ExactBlock(schema, rows, family.device)
-        for name in cls._FIELDS:
-            block.columns[name].copy_(family.columns[name][lane, :rows])
-        return cls(block, input_type=input_type, lane=lane)
+        if rows <= 0:
+            return cls(destination, input_type=input_type, lane=lane)
+        values = {
+            name: family.columns[name][:, :rows]
+            for name in cls._FIELDS
+        }
+        counts = torch.zeros(
+            family.n_replica, dtype=torch.int64, device=family.device
+        )
+        counts[lane] = rows
+        address = torch.full_like(counts, torch.iinfo(torch.int64).max)
+        address[lane] = 0
+        transaction = PublicationTransaction.begin_device(
+            (
+                DeviceDestinationRequest(
+                    destination,
+                    counts,
+                    values,
+                    input_type,
+                    address,
+                ),
+            ),
+            phase="sequential_input_seal",
+            active=torch.arange(
+                family.n_replica, device=family.device
+            ).eq(lane),
+        )
+        transaction.fill_all()
+        success = transaction.publish()
+        torch._assert_async(success[lane], "sequential input seal failed")
+        return cls(destination, input_type=input_type, lane=lane)
 
     @property
     def columns(self) -> Mapping[str, Tensor]:
-        return self.block.columns
+        return MappingProxyType(
+            {
+                name: value[self.lane, : self.rows]
+                for name, value in self.slab.columns.items()
+            }
+        )
 
     def release(self) -> None:
-        self.block.release()
+        # GeneratedOwners owns the slab lifetime.
+        return None
 
 
 class AlignedSequentialStore:
@@ -411,6 +475,8 @@ class SequentialBatchSampler:
         schedule: LearnerSchedule,
         *,
         generator: torch.Generator,
+        statistical_counts: Mapping[str, int] | None = None,
+        reproducibility: str = "strict",
     ) -> None:
         if not stores:
             raise ValueError("at least one aligned learner store is required")
@@ -423,18 +489,181 @@ class SequentialBatchSampler:
             raise LearnerError("one sampler cannot span devices or replica lanes")
         if generator.device != next(iter(devices)):
             raise LearnerError("learner generator must live on the learner CUDA device")
+        if statistical_counts is not None:
+            if set(statistical_counts) != set(stores):
+                raise LearnerError(
+                    "statistical allocation must cover every learner partition"
+                )
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in statistical_counts.values()
+            ):
+                raise LearnerError(
+                    "statistical allocation counts must be nonnegative integers"
+                )
+            if not any(statistical_counts.values()):
+                raise LearnerError("statistical allocation cannot be empty")
+        self.statistical_counts = (
+            None
+            if statistical_counts is None
+            else MappingProxyType(dict(statistical_counts))
+        )
+        if reproducibility not in ("strict", "seeded", "throughput"):
+            raise LearnerError("unknown learner reproducibility profile")
+        self.reproducibility = reproducibility
+
+    @classmethod
+    def from_costs(
+        cls,
+        stores: Mapping[str, AlignedSequentialStore],
+        schedule: LearnerSchedule,
+        *,
+        generator: torch.Generator,
+        mass: Tensor,
+        variance: Tensor,
+        seconds_per_draw: Tensor,
+        total_count: int,
+        reproducibility: str = "strict",
+    ) -> "SequentialBatchSampler":
+        names = tuple(stores)
+        if mass.numel() != len(names):
+            raise LearnerError(
+                "cost-aware allocation must match learner partitions"
+            )
+        counts = allocate_statistical_counts(
+            mass, variance, seconds_per_draw, total_count
+        )
+        return cls(
+            stores,
+            schedule,
+            generator=generator,
+            statistical_counts={
+                name: int(counts[index])
+                for index, name in enumerate(names)
+            },
+            reproducibility=reproducibility,
+        )
 
     @property
     def statistical_presentations(self) -> int:
+        if self.statistical_counts is not None:
+            count = sum(self.statistical_counts.values())
+            return (
+                count
+                if self.schedule.gradient_steps is None
+                else count * self.schedule.gradient_steps
+            )
         rows = sum(store.rows for store in self.stores.values())
         if self.schedule.gradient_steps is None:
             return rows * self.schedule.epochs
         return self.schedule.gradient_steps * self.schedule.batch_size
 
     def batches(self) -> Iterator[SequentialLearnerBatch]:
+        if self.statistical_counts is not None:
+            logical_steps = self.schedule.gradient_steps or 1
+            logical_rows = sum(self.statistical_counts.values())
+            if (
+                self.schedule.gradient_steps is not None
+                and logical_rows != self.schedule.batch_size
+            ):
+                raise LearnerError(
+                    "fixed-step statistical allocation must sum to batch_size"
+                )
+            standalone_step = 0
+            for logical_step in range(logical_steps):
+                for name, requested in self.statistical_counts.items():
+                    store = self.stores[name]
+                    if self.schedule.gradient_steps is not None:
+                        pieces: list[Tensor] = []
+                        remaining = requested
+                        while remaining:
+                            permutation = torch.randperm(
+                                store.rows,
+                                dtype=torch.int64,
+                                device=store.device,
+                                generator=self.generator,
+                            )
+                            take = min(store.rows, remaining)
+                            pieces.append(permutation[:take])
+                            remaining -= take
+                        gathered = store.gather(torch.cat(pieces))
+                        yield SequentialLearnerBatch(
+                            gathered.input_type,
+                            gathered.indices,
+                            gathered.fields,
+                            logical_step=logical_step,
+                            logical_rows=logical_rows,
+                        )
+                        continue
+                    emitted = 0
+                    while emitted < requested:
+                        permutation = torch.randperm(
+                            store.rows,
+                            dtype=torch.int64,
+                            device=store.device,
+                            generator=self.generator,
+                        )
+                        take = min(store.rows, requested - emitted)
+                        for begin in range(0, take, self.schedule.batch_size):
+                            end = min(begin + self.schedule.batch_size, take)
+                            gathered = store.gather(permutation[begin:end])
+                            yield SequentialLearnerBatch(
+                                gathered.input_type,
+                                gathered.indices,
+                                gathered.fields,
+                                logical_step=(
+                                    logical_step
+                                    if self.schedule.gradient_steps is not None
+                                    else standalone_step
+                                ),
+                                logical_rows=(
+                                    logical_rows
+                                    if self.schedule.gradient_steps is not None
+                                    else gathered.rows
+                                ),
+                            )
+                            if self.schedule.gradient_steps is None:
+                                standalone_step += 1
+                        emitted += take
+            return
         emitted = 0
         maximum = self.schedule.gradient_steps
-        names = tuple(self.stores)
+        names = (
+            tuple(
+                sorted(
+                    self.stores,
+                    key=lambda name: (-self.stores[name].rows, name),
+                )
+            )
+            if self.reproducibility == "throughput"
+            else tuple(self.stores)
+        )
+        if self.schedule.gradient_steps is not None:
+            for step in range(self.schedule.gradient_steps):
+                store = self.stores[names[step % len(names)]]
+                pieces: list[Tensor] = []
+                remaining = self.schedule.batch_size
+                while remaining:
+                    permutation = torch.randperm(
+                        store.rows,
+                        dtype=torch.int64,
+                        device=store.device,
+                        generator=self.generator,
+                    )
+                    take = min(store.rows, remaining)
+                    pieces.append(permutation[:take])
+                    remaining -= take
+                gathered = store.gather(torch.cat(pieces))
+                yield SequentialLearnerBatch(
+                    gathered.input_type,
+                    gathered.indices,
+                    gathered.fields,
+                    logical_step=step,
+                    logical_rows=gathered.rows,
+                )
+            return
         epoch = 0
         while maximum is None or emitted < maximum:
             epoch += 1
@@ -458,8 +687,15 @@ class SequentialBatchSampler:
                         return
                     end = min(begin + self.schedule.batch_size, store.rows)
                     made_progress = True
+                    gathered = store.gather(permutation[begin:end])
+                    yield SequentialLearnerBatch(
+                        gathered.input_type,
+                        gathered.indices,
+                        gathered.fields,
+                        logical_step=emitted,
+                        logical_rows=gathered.rows,
+                    )
                     emitted += 1
-                    yield store.gather(permutation[begin:end])
             if not made_progress:
                 return
             if maximum is None and epoch >= self.schedule.epochs:
@@ -511,6 +747,31 @@ def _scalar_private_row(value: Tensor, private: Tensor, owner: Tensor) -> Tensor
     return value.gather(1, combo[:, None]).squeeze(1).float()
 
 
+def _select_sampled_private(
+    value: Tensor, private: Tensor, owner: Tensor
+) -> Tensor:
+    """Gather one owner-combo row while preserving trailing head fields."""
+
+    if value.ndim < 2 or private.ndim != 2 or owner.shape != value.shape[:1]:
+        raise LearnerError("sampled output selection requires [B,H,...], [B,P], [B]")
+    owner64 = owner.to(torch.int64)
+    torch._assert_async(
+        ((owner64 >= 0) & (owner64 < private.shape[1])).all(),
+        "learner owner is outside the private profile",
+    )
+    combo = private.gather(1, owner64[:, None]).to(torch.int64)
+    if value.shape[1] == 1:
+        return value
+    torch._assert_async(
+        ((combo >= 0) & (combo < value.shape[1])).all(),
+        "sampled private combo is outside the model domain",
+    )
+    index = combo.reshape(
+        combo.shape[0], 1, *((1,) * (value.ndim - 2))
+    ).expand(combo.shape[0], 1, *value.shape[2:])
+    return value.gather(1, index)
+
+
 class LearnerOperation:
     """One authoritative forward/loss/immediate-backward operation."""
 
@@ -543,7 +804,9 @@ class LearnerOperation:
         *,
         iteration: int,
         reference_operation: ModelOperation | None = None,
+        reference_cache: ReferenceOutputCache | None = None,
         loss_scale: float = 1.0,
+        objective_weight: float = 1.0,
     ) -> LossResult:
         fields = batch.fields
         autocast_dtype = {
@@ -564,43 +827,84 @@ class LearnerOperation:
                 fields["sampled_private_state"],
                 fields["owner"],
             )
-            reference = (
-                None
-                if reference_operation is None
-                else reference_operation(
-                    batch.input_type,
-                    fields["model_input"],
+            evaluation = ModelEvaluation(
+                MappingProxyType(
+                    {
+                        name: _select_sampled_private(
+                            value,
+                            fields["sampled_private_state"],
+                            fields["owner"],
+                        )
+                        for name, value in evaluation.policy_raw.items()
+                    }
+                ),
+                _select_sampled_private(
+                    evaluation.value,
                     fields["sampled_private_state"],
                     fields["owner"],
-                ).policy_raw
+                ),
             )
+            if reference_cache is not None:
+                if reference_operation is not None:
+                    raise LearnerError(
+                        "reference cache and reference operation are mutually exclusive"
+                    )
+                reference = {
+                    name: _select_sampled_private(
+                        value,
+                        fields["sampled_private_state"],
+                        fields["owner"],
+                    )
+                    for name, value in reference_cache.gather(
+                        batch.indices
+                    ).items()
+                }
+            else:
+                reference = (
+                    None
+                    if reference_operation is None
+                    else {
+                        name: _select_sampled_private(
+                            value,
+                            fields["sampled_private_state"],
+                            fields["owner"],
+                        )
+                        for name, value in reference_operation(
+                            batch.input_type,
+                            fields["model_input"],
+                            fields["sampled_private_state"],
+                            fields["owner"],
+                        ).policy_raw.items()
+                    }
+                )
+        compact_private = torch.zeros_like(fields["sampled_private_state"])
         policy = self.policy_operation(
             batch.input_type,
             fields["model_input"],
             evaluation.policy_raw,
             fields["action"].to(torch.int32),
-            fields["sampled_private_state"],
+            compact_private,
             fields["owner"].to(torch.int64),
             reference,
         )
         current_log = _scalar_private_row(
             policy.selected_log_policy,
-            fields["sampled_private_state"],
+            compact_private,
             fields["owner"],
         )
         entropy = _scalar_private_row(
             policy.entropy,
-            fields["sampled_private_state"],
+            compact_private,
             fields["owner"],
         )
         reference_kl = _scalar_private_row(
             policy.reference_kl,
-            fields["sampled_private_state"],
+            compact_private,
             fields["owner"],
         )
         current_value = _scalar_private_row(
             evaluation.value,
-            fields["sampled_private_state"],
+            compact_private,
             fields["owner"],
         )
         old_log = fields["old_log_policy"].float().reshape(batch.rows, -1)[:, 0]
@@ -648,7 +952,13 @@ class LearnerOperation:
         )
         if self.precision != "fp16" and not torch.isfinite(total):
             raise LearnerError("learner loss is nonfinite")
-        (total * float(loss_scale)).backward()
+        if (
+            not math.isfinite(objective_weight)
+            or objective_weight <= 0
+            or objective_weight > 1
+        ):
+            raise LearnerError("physical objective weight must lie in (0,1]")
+        (total * float(loss_scale) * objective_weight).backward()
         return LossResult(
             total,
             policy_loss,

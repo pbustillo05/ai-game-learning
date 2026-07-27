@@ -13,6 +13,7 @@ from pbg.games.poker.bundle import build_bundle
 from pbg.games.poker.rules import CHECK_CALL, LIVE, RAISE_OFFSET, PokerConfig
 from pbg.games.poker.model.capacity import (
     max_player_nodes,
+    max_policy_partition_sequence_tokens,
     max_policy_sequence_tokens,
     max_public_history_tokens,
 )
@@ -32,6 +33,16 @@ def test_lossless_history_bound_covers_documented_player_nodes_and_separators(
     expected_nodes = math.ceil(stack * players + 3 * players - stack + 1)
     assert max_player_nodes(players, stack) == expected_nodes
     assert max_public_history_tokens(players, stack) == expected_nodes + 3
+
+
+def test_partition_attention_bounds_preserve_the_global_worst_case() -> None:
+    bounds = max_policy_partition_sequence_tokens(
+        n_players=2, stack_bb=32.0, rank_count=13, k_act=7
+    )
+    assert bounds == {"pre": 538, "post_2": 2557}
+    assert max(bounds.values()) == max_policy_sequence_tokens(
+        n_players=2, stack_bb=32.0, rank_count=13, k_act=7
+    )
 
 
 

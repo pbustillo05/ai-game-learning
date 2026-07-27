@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping
 
 import torch
 from torch import Tensor, nn
 
+from pbg.games.poker.model.capacity import (
+    max_policy_partition_sequence_tokens,
+)
 from pbg.games.poker.queued.hooks import (
     NLHEGeometry,
     PokerForwardInput,
     PokerLearnerPolicy,
     PokerStateMachine,
-    PokerTransitionTrace,
     SampledShowdownBinding,
     SequentialSampledPokerHooks,
 )
@@ -24,6 +27,7 @@ from pbg.queued.capacity import (
     GeneratedOwners,
     StoragePlan,
 )
+from pbg.queued.config import Phase5Config
 from pbg.queued.contracts import ModeSchema
 from pbg.queued.learner import (
     AlignedSequentialStore,
@@ -32,11 +36,18 @@ from pbg.queued.learner import (
     LossConfig,
     ModelEvaluation,
     ModelOperation,
+    ReferenceOutputCache,
+    ReferenceState,
     SealedSequentialInputs,
     SequentialBatchSampler,
 )
-from pbg.queued.optimization import DenseAdam
-from pbg.queued.persistence import RunState
+from pbg.queued.optimization import DenseAdam, LossScaler
+from pbg.queued.persistence import (
+    RunState,
+    load_checkpoint,
+    save_checkpoint,
+    trim_metrics_after_checkpoint,
+)
 from pbg.queued.rollout import (
     AsyncTopologyPublisher,
     CompletionFIFO,
@@ -53,14 +64,12 @@ from pbg.queued.storage import (
 )
 from pbg.queued.targets import LayeredTargetExecutor, TargetAlgebra
 from pbg.queued.topology import (
-    TargetKind,
-    Topology,
-    TopologyBindings,
     build_layer_plan,
 )
 from pbg.queued.training import (
     AttemptAddress,
     IterationResult,
+    PreemptionNotice,
     RecoverableOverflow,
     SequentialOverflowRecovery,
     SequentialSampledIteration,
@@ -77,217 +86,6 @@ class PokerIterationResult:
     player_nodes: int
     leaves: int
     target_layers: int
-
-
-def _i32(values: list[int]) -> Tensor:
-    return torch.tensor(values, dtype=torch.int32)
-
-
-class _TopologyRecorder:
-    """Attempt-local trace owner; discarded wholesale on a failed attempt."""
-
-    def __init__(
-        self,
-        input_names: tuple[str, ...],
-        *,
-        pack_cap: int,
-        topology_cap: int,
-        device: torch.device,
-    ) -> None:
-        self.input_index = {
-            name: index for index, name in enumerate(input_names)
-        }
-        self.parent: list[int] = []
-        self.owner: list[int] = []
-        self.familywork_row: list[int] = []
-        self.sigma_head_row: list[int] = []
-        self.action_begin: list[int] = []
-        self.label: list[int] = []
-        self.target_kind: list[int] = []
-        self.target_key: list[tuple[int, int] | None] = []
-        self.target_row: list[int] = []
-        self.input_type: list[int] = []
-        self.logical_to_node: dict[tuple[int, int], int] = {}
-        self.pending_parent: dict[tuple[int, int], int] = {}
-        self.leaves = 0
-        self._pack_cap = pack_cap
-        self._host_trace = torch.empty(
-            (topology_cap, 10), dtype=torch.int64, pin_memory=True
-        )
-        self._trace_rows = 0
-        self._device_feedback = torch.empty(
-            len(input_names) + 1, dtype=torch.int64, device=device
-        )
-        self._feedback = torch.empty(
-            len(input_names) + 1, dtype=torch.int64, pin_memory=True
-        )
-        self._feedback_event = torch.cuda.Event(blocking=False)
-        self._trace_events: list[torch.cuda.Event] = []
-        self._trace_stream = torch.cuda.Stream(device=device)
-        self._feedback_stream = torch.cuda.Stream(device=device)
-        self._device = device
-
-    def append(
-        self,
-        trace: PokerTransitionTrace,
-        *,
-        failed: Tensor,
-        ready: torch.cuda.Event,
-    ) -> tuple[bool, tuple[int, ...]]:
-        lane_count, rows = trace.terminal.shape
-        if lane_count != 1:
-            raise PokerIterationError("Phase 5 topology expects one ordinary lane")
-        if rows > self._pack_cap:
-            raise PokerIterationError("topology trace exceeds the family pack cap")
-        end = self._trace_rows + rows
-        if end > self._host_trace.shape[0]:
-            raise PokerIterationError("topology trace exceeds its admitted cap")
-        stream = torch.cuda.current_stream(self._device)
-        stream.wait_event(ready)
-        packed = torch.cat(
-            (
-                trace.logical_rng_key.to(torch.int64),
-                trace.next_logical_rng_key.to(torch.int64),
-                trace.next_input_type.to(torch.int64)[..., None],
-                trace.terminal.to(torch.int64)[..., None],
-                trace.owner.to(torch.int64)[..., None],
-                trace.action.to(torch.int64)[..., None],
-                trace.familywork_row.to(torch.int64)[..., None],
-                torch.full(
-                    (1, rows, 1),
-                    self.input_index[trace.input_type],
-                    dtype=torch.int64,
-                    device=self._device,
-                ),
-            ),
-            -1,
-        )[0]
-        staged = torch.cuda.Event(blocking=False)
-        staged.record(stream)
-        with torch.cuda.stream(self._trace_stream):
-            self._trace_stream.wait_event(staged)
-            self._host_trace[self._trace_rows : end].copy_(
-                packed, non_blocking=True
-            )
-            trace_ready = torch.cuda.Event(blocking=False)
-            trace_ready.record(self._trace_stream)
-            self._trace_events.append(trace_ready)
-        with torch.cuda.stream(self._feedback_stream):
-            self._feedback_stream.wait_event(staged)
-            self._device_feedback[0].copy_(failed[0].to(torch.int64))
-            live = ~packed[:, 5].bool()
-            for index in range(len(self.input_index)):
-                self._device_feedback[index + 1].copy_(
-                    packed[:, 4].eq(index).logical_and(live).sum()
-                )
-            self._feedback.copy_(
-                self._device_feedback, non_blocking=True
-            )
-            self._feedback_event.record(self._feedback_stream)
-        packed.record_stream(self._trace_stream)
-        packed.record_stream(self._feedback_stream)
-        while not self._feedback_event.query():
-            pass
-        if bool(self._feedback[0]):
-            return True, tuple(0 for _ in self.input_index)
-        counts = tuple(int(value) for value in self._feedback[1:])
-        self._trace_rows = end
-        return False, counts
-
-    def _accept_trace(self) -> None:
-        if self._trace_events:
-            with torch.cuda.stream(self._trace_stream):
-                for event in self._trace_events:
-                    self._trace_stream.wait_event(event)
-                all_ready = torch.cuda.Event(blocking=False)
-                all_ready.record(self._trace_stream)
-            all_ready.synchronize()
-            self._trace_events.clear()
-        feedback = self._host_trace[: self._trace_rows]
-        for row in range(self._trace_rows):
-            logical = tuple(
-                int(value) for value in feedback[row, 0:2].tolist()
-            )
-            if logical in self.logical_to_node:
-                raise PokerIterationError("a logical player node was processed twice")
-            node = len(self.parent)
-            parent = self.pending_parent.pop(logical, -1)
-            self.logical_to_node[logical] = node
-            self.parent.append(parent)
-            self.owner.append(int(feedback[row, 6]))
-            self.familywork_row.append(
-                int(feedback[row, 8])
-            )
-            self.sigma_head_row.append(
-                int(feedback[row, 8])
-            )
-            self.action_begin.append(
-                int(feedback[row, 8])
-            )
-            self.label.append(int(feedback[row, 7]))
-            self.input_type.append(int(feedback[row, 9]))
-            if bool(feedback[row, 5]):
-                self.target_kind.append(int(TargetKind.LEAF))
-                self.target_key.append(None)
-                self.target_row.append(self.leaves)
-                self.leaves += 1
-            else:
-                child = tuple(
-                    int(value)
-                    for value in feedback[row, 2:4].tolist()
-                )
-                if child in self.pending_parent:
-                    raise PokerIterationError(
-                        "two player nodes produced one logical child"
-                    )
-                self.pending_parent[child] = node
-                self.target_kind.append(int(TargetKind.TOPOLOGY))
-                self.target_key.append(child)
-                self.target_row.append(-1)
-
-    def seal(self, *, players: int) -> tuple[Topology, TopologyBindings]:
-        self._accept_trace()
-        if not self.parent or self.pending_parent:
-            raise PokerIterationError(
-                "rollout topology is empty or has unresolved player children"
-            )
-        for edge, key in enumerate(self.target_key):
-            if key is not None:
-                try:
-                    self.target_row[edge] = self.logical_to_node[key]
-                except KeyError as exc:
-                    raise PokerIterationError(
-                        "rollout topology child was never processed"
-                    ) from exc
-        nodes = len(self.parent)
-        topology = Topology(
-            parent=_i32(self.parent),
-            child_begin=torch.arange(nodes, dtype=torch.int32),
-            executed_degree=torch.ones(nodes, dtype=torch.int32),
-            nominal_degree=torch.ones(nodes, dtype=torch.int32),
-            target_degree=torch.ones(nodes, dtype=torch.int32),
-            owner=_i32(self.owner),
-            familywork_row=_i32(self.familywork_row),
-            sigma_head_row=_i32(self.sigma_head_row),
-            action_begin=_i32(self.action_begin),
-            label=_i32(self.label),
-            path_length=torch.ones(nodes, dtype=torch.int32),
-            target_kind=_i32(self.target_kind),
-            target_row=_i32(self.target_row),
-        )
-        bindings = TopologyBindings(
-            input_type=_i32(self.input_type),
-            output_type=torch.zeros(nodes, dtype=torch.int32),
-            sigma_target_row=_i32(self.sigma_head_row),
-            child_output_type=torch.zeros(nodes, dtype=torch.int32),
-        )
-        topology.validate(bindings, p_train=players)
-        self._device_feedback = torch.empty(
-            0, dtype=torch.int64, device=self._device
-        )
-        self._host_trace = torch.empty(0, dtype=torch.int64)
-        self._feedback = torch.empty(0, dtype=torch.int64)
-        return topology, bindings
 
 
 class SequentialSampledPokerIteration:
@@ -307,6 +105,11 @@ class SequentialSampledPokerIteration:
         generator: torch.Generator,
         seed: int,
         lambda_: float,
+        precision: str = "fp32",
+        utility: str = "raw_bb",
+        cache_reference_outputs: bool = False,
+        allocation_inputs: tuple[Tensor, Tensor, Tensor, int] | None = None,
+        reproducibility: str = "strict",
         run_state: RunState | None = None,
         reference_operation: ModelOperation | None = None,
     ) -> None:
@@ -330,6 +133,19 @@ class SequentialSampledPokerIteration:
         self.generator = generator
         self.seed = int(seed)
         self.lambda_ = float(lambda_)
+        if precision not in ("fp32", "fp16", "bf16"):
+            raise ValueError("poker iteration precision is invalid")
+        if utility not in ("raw_bb", "stack_normalized"):
+            raise ValueError("poker iteration utility is invalid")
+        self.precision = precision
+        self.utility = utility
+        if type(cache_reference_outputs) is not bool:
+            raise TypeError("cache_reference_outputs must be bool")
+        self.cache_reference_outputs = cache_reference_outputs
+        self.allocation_inputs = allocation_inputs
+        if reproducibility not in ("strict", "seeded", "throughput"):
+            raise ValueError("poker iteration reproducibility is invalid")
+        self.reproducibility = reproducibility
         self.run_state = run_state
         self.policy = PokerPolicyOperator()
 
@@ -368,6 +184,7 @@ class SequentialSampledPokerIteration:
             seed=self.seed,
             iteration=iteration,
             retry_epoch=retry_epoch,
+            logical_base=logical_base,
             device=self.owners.plan.device,
         )
         values = self._defaults(queue.family, roots)
@@ -444,7 +261,24 @@ class SequentialSampledPokerIteration:
     def _model(
         self, forward: PokerForwardInput, _lanes: Tensor
     ) -> Mapping[str, Tensor]:
-        with torch.no_grad():
+        if (
+            forward.input_type.startswith("post_")
+            and int(forward.input_type[5:]) != self.geometry.players
+        ):
+            raise PokerIterationError(
+                "Phase 5 cannot train folded postflop rows; "
+                "folded summaries land in Phase 6"
+            )
+        autocast_dtype = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[self.precision]
+        with torch.no_grad(), torch.autocast(
+            device_type="cuda",
+            dtype=autocast_dtype,
+            enabled=self.precision != "fp32",
+        ):
             evaluation = self.model_operation(
                 forward.input_type,
                 forward.model_input,
@@ -454,7 +288,13 @@ class SequentialSampledPokerIteration:
         if not isinstance(evaluation, ModelEvaluation):
             raise PokerIterationError("rollout model returned the wrong contract")
         return MappingProxyType(
-            {**dict(evaluation.policy_raw), "value": evaluation.value}
+            {
+                **{
+                    name: value.float()
+                    for name, value in evaluation.policy_raw.items()
+                },
+                "value": evaluation.value.float(),
+            }
         )
 
     def run(self, *, iteration: int) -> PokerIterationResult:
@@ -508,12 +348,6 @@ class SequentialSampledPokerIteration:
         scheduler = FamilyScheduler(
             input_names, owners.plan.manifest.family_pack_cap
         )
-        recorder = _TopologyRecorder(
-            input_names,
-            pack_cap=owners.plan.manifest.family_pack_cap,
-            topology_cap=owners.plan.manifest.topology_cap,
-            device=owners.plan.device,
-        )
         depths = {name: 0 for name in input_names}
         depths["pre"] = (
             owners.plan.manifest.root_count
@@ -545,14 +379,15 @@ class SequentialSampledPokerIteration:
                 self._model,
                 hooks,
             )
-            if hooks.last_trace is None:
-                raise PokerIterationError("poker transition omitted its trace")
-            failed, produced = recorder.append(
-                hooks.last_trace,
-                failed=commit.failed,
-                ready=commit.event,
+            if hooks.last_topology is None:
+                raise PokerIterationError(
+                    "poker transition omitted atomic topology"
+                )
+            failed, produced = topology_publisher.wait_deferred_feedback(
+                hooks.last_topology,
+                input_count=len(input_names),
             )
-            hooks.last_trace = None
+            hooks.last_topology = None
             if failed:
                 raise self._recoverable_overflow()
             depths[scheduled.input_type] -= scheduled.rows
@@ -567,8 +402,12 @@ class SequentialSampledPokerIteration:
                 raise PokerIterationError("poker rollout exceeded its geometry bound")
         if last_event is None:
             raise PokerIterationError("poker rollout produced no player nodes")
+        topology, bindings, leaf_count = (
+            topology_publisher.seal_deferred_unary(
+                input_count=len(input_names)
+            )
+        )
         topology_publisher.assert_drained()
-        topology, bindings = recorder.seal(players=self.geometry.players)
         plan = build_layer_plan(
             self.mode,
             owners.plan.partitions,
@@ -597,8 +436,9 @@ class SequentialSampledPokerIteration:
             owners.slab("LayerWork", "all"),
             n_replica=1,
             pack_cap=owners.plan.manifest.completion_pack_cap,
+            utility=self.utility,
         )
-        remaining_leaves = recorder.leaves
+        remaining_leaves = leaf_count
         while remaining_leaves:
             rows = min(
                 remaining_leaves,
@@ -621,7 +461,7 @@ class SequentialSampledPokerIteration:
             padding = PublicationTransaction.begin(
                 (
                     DestinationRequest(
-                        work, 0, missing, "all", recorder.leaves
+                        work, 0, missing, "all", leaf_count
                     ),
                 ),
                 phase="poker_target_arena_padding",
@@ -633,7 +473,9 @@ class SequentialSampledPokerIteration:
         owners.enter_phase(ExecutionPhase.ALIGN_AND_SEAL)
         sealed = {
             name: SealedSequentialInputs.seal(
-                owners.slab("FamilyWork", name), input_type=name
+                owners.slab("FamilyWork", name),
+                owners.slab("LearnerIndex", name),
+                input_type=name,
             )
             for name in input_names
         }
@@ -657,25 +499,153 @@ class SequentialSampledPokerIteration:
             for name in input_names
             if sealed[name].rows
         }
-        sampler = SequentialBatchSampler(
-            stores, self.schedule, generator=self.generator
+        allocation_inputs = self.allocation_inputs
+        if allocation_inputs is None and self.schedule.gradient_steps is not None:
+            names = tuple(stores)
+            preflop = getattr(self.model, "preflop", None)
+            model_config = getattr(preflop, "cfg", None)
+            if model_config is not None:
+                token_bounds = max_policy_partition_sequence_tokens(
+                    n_players=self.geometry.players,
+                    stack_bb=self.geometry.stack_bb,
+                    rank_count=self.geometry.rank_count,
+                    k_act=model_config.k_act,
+                )
+                allocation_inputs = (
+                    torch.tensor(
+                        [float(stores[name].rows) for name in names],
+                        dtype=torch.float64,
+                    ),
+                    torch.ones(len(names), dtype=torch.float64),
+                    torch.tensor(
+                        [
+                            float(token_bounds[name] * token_bounds[name])
+                            for name in names
+                        ],
+                        dtype=torch.float64,
+                    ),
+                    self.schedule.batch_size,
+                )
+        sampler = (
+            SequentialBatchSampler(
+                stores,
+                self.schedule,
+                generator=self.generator,
+                reproducibility=self.reproducibility,
+            )
+            if allocation_inputs is None
+            else SequentialBatchSampler.from_costs(
+                stores,
+                self.schedule,
+                generator=self.generator,
+                mass=allocation_inputs[0],
+                variance=allocation_inputs[1],
+                seconds_per_draw=allocation_inputs[2],
+                total_count=allocation_inputs[3],
+                reproducibility=self.reproducibility,
+            )
         )
+        reference_caches: dict[str, ReferenceOutputCache] | None = None
+        if self.cache_reference_outputs and self.reference_operation is not None:
+            admitted: dict[str, ReferenceOutputCache] = {}
+            resident = 0
+            budget = owners.plan.admission(
+                ExecutionPhase.LEARNER
+            ).bounded_workspace_bytes
+            for name, store in stores.items():
+                columns = store.sealed_inputs.columns
+                with torch.no_grad():
+                    evaluation = self.reference_operation(
+                        name,
+                        columns["model_input"],
+                        columns["sampled_private_state"],
+                        columns["owner"],
+                    )
+                batch_calls = max(
+                    1,
+                    (store.rows + self.schedule.batch_size - 1)
+                    // self.schedule.batch_size,
+                )
+                build_bytes = sum(
+                    value.numel() * value.element_size()
+                    for value in evaluation.policy_raw.values()
+                )
+                candidate = ReferenceOutputCache.admit(
+                    evaluation.policy_raw,
+                    byte_budget=budget,
+                    resident_bytes=resident,
+                    build_bytes=build_bytes,
+                    predicted_saved_seconds=float(max(0, batch_calls - 1)),
+                    predicted_build_seconds=0.5,
+                )
+                if candidate is None:
+                    for cache in admitted.values():
+                        cache.release()
+                    admitted = {}
+                    break
+                admitted[name] = candidate
+                resident += candidate.allocated_bytes
+            if admitted:
+                reference_caches = admitted
         learner = LearnerOperation(
             self.mode,
             self.loss,
             self.model_operation,
             PokerLearnerPolicy(self.geometry, self.policy),
+            precision=self.precision,
         )
+        global_cap = min(
+            owners.plan.manifest.learner_sigma_pack_cap,
+            owners.plan.manifest.learner_action_pack_cap,
+            owners.plan.manifest.hardware.training_max_tokens
+            // owners.plan.manifest.geometry.model_token_bound,
+            owners.plan.manifest.hardware.training_max_token_pairs
+            // owners.plan.manifest.geometry.model_token_pair_bound,
+        )
+        physical_caps: int | dict[str, int] = global_cap
+        preflop = getattr(self.model, "preflop", None)
+        model_config = getattr(preflop, "cfg", None)
+        if model_config is not None:
+            token_bounds = max_policy_partition_sequence_tokens(
+                n_players=self.geometry.players,
+                stack_bb=self.geometry.stack_bb,
+                rank_count=self.geometry.rank_count,
+                k_act=model_config.k_act,
+            )
+            declared = owners.plan.manifest.geometry
+            if (
+                max(token_bounds.values()) > declared.model_token_bound
+                or max(value * value for value in token_bounds.values())
+                > declared.model_token_pair_bound
+            ):
+                raise PokerIterationError(
+                    "partition model cost exceeds the immutable geometry bound"
+                )
+            physical_caps = {
+                name: min(
+                    owners.plan.manifest.learner_sigma_pack_cap,
+                    owners.plan.manifest.learner_action_pack_cap,
+                    owners.plan.manifest.hardware.training_max_tokens // tokens,
+                    owners.plan.manifest.hardware.training_max_token_pairs
+                    // (tokens * tokens),
+                )
+                for name, tokens in token_bounds.items()
+            }
         result = SequentialSampledIteration(
             model=self.model,
             learner=learner,
             optimizer=self.optimizer,
             run_state=self.run_state,
+            physical_batch_cap=physical_caps,
         ).optimize(
             sampler,
             iteration=iteration,
             reference_operation=self.reference_operation,
+            reference_caches=reference_caches,
         )
+        if reference_caches is not None:
+            for cache in reference_caches.values():
+                cache.release()
         if self.run_state is not None:
             self.run_state.logical_work["trajectories"] += (
                 self.run_state.root_count
@@ -688,8 +658,8 @@ class SequentialSampledPokerIteration:
         owners.close()
         return PokerIterationResult(
             result,
-            player_nodes=len(recorder.parent),
-            leaves=recorder.leaves,
+            player_nodes=topology.node_count,
+            leaves=leaf_count,
             target_layers=plan.layer_count,
         )
 
@@ -731,6 +701,11 @@ class RecoveringSequentialSampledPokerIteration:
         generator: torch.Generator,
         seed: int,
         lambda_: float,
+        precision: str = "fp32",
+        utility: str = "raw_bb",
+        cache_reference_outputs: bool = False,
+        allocation_inputs: tuple[Tensor, Tensor, Tensor, int] | None = None,
+        reproducibility: str = "strict",
         run_state: RunState,
         reference_operation: ModelOperation | None = None,
     ) -> None:
@@ -748,6 +723,11 @@ class RecoveringSequentialSampledPokerIteration:
             "generator": generator,
             "seed": seed,
             "lambda_": lambda_,
+            "precision": precision,
+            "utility": utility,
+            "cache_reference_outputs": cache_reference_outputs,
+            "allocation_inputs": allocation_inputs,
+            "reproducibility": reproducibility,
             "run_state": run_state,
             "reference_operation": reference_operation,
         }
@@ -793,7 +773,277 @@ class RecoveringSequentialSampledPokerIteration:
         return controller.run(attempt, discard)
 
 
+class Phase5TrainingSession:
+    """Public config-driven Phase 5 composition and strict resume boundary."""
+
+    def __init__(
+        self,
+        *,
+        config: Phase5Config,
+        plan: StoragePlan,
+        owner_factory: Callable[[], GeneratedOwners],
+        model: nn.Module,
+        reference_model: nn.Module,
+        model_operation: ModelOperation,
+        reference_operation: ModelOperation | None,
+        optimizer: DenseAdam,
+        generator: torch.Generator,
+        run_state: RunState,
+        reference_state: ReferenceState,
+        execution_config: Mapping[str, object] | None = None,
+        preemption: PreemptionNotice | None = None,
+        preemption_checkpoint: str | Path | None = None,
+        allocation_inputs: tuple[Tensor, Tensor, Tensor, int] | None = None,
+    ) -> None:
+        geometry = NLHEGeometry(
+            config.game.players,
+            config.game.stack_bb,
+            config.game.rank_count,
+        )
+        expected_mode = "self_play/sequential/sampled"
+        if plan.mode.key != expected_mode:
+            raise ValueError("Phase 5 session plan has the wrong mode")
+        if (
+            plan.manifest.geometry.players != geometry.players
+            or plan.manifest.geometry.stack_bb != geometry.stack_bb
+            or plan.manifest.geometry.rank_count != geometry.rank_count
+            or plan.manifest.root_count != config.root_count
+        ):
+            raise ValueError("Phase 5 public config differs from the storage plan")
+        if not config.root_count_minimum <= run_state.root_count <= config.root_count:
+            raise ValueError("run root_count is outside the public config")
+        if generator.device != plan.device:
+            raise ValueError("session RNG differs from the admitted CUDA device")
+        if optimizer.config != config.optimizer:
+            raise ValueError("session optimizer differs from the public config")
+        if optimizer.scaler.enabled != (config.precision.name == "fp16"):
+            raise ValueError("loss scaler enablement differs from precision")
+        if (
+            reference_state.interval_iterations
+            != config.reference.interval_iterations
+            or reference_state.interval_effective_hands
+            != config.reference.interval_effective_hands
+        ):
+            raise ValueError("reference cadence differs from the public config")
+        required_model_workspace = 4 * (
+            geometry.direct_model_input_width
+            + geometry.private_hands * (5 + 3 * config.model.m_raise)
+        )
+        if plan.layout.family_workspace_row_bytes < required_model_workspace:
+            raise ValueError(
+                "family model workspace is below the derived Phase 5 geometry"
+            )
+        if plan.layout.topology_packet_row_bytes < 11 * 8:
+            raise ValueError(
+                "topology packet workspace is below the atomic trace width"
+            )
+        self.config = config
+        self.geometry = geometry
+        self.plan = plan
+        self.owner_factory = owner_factory
+        self.model = model
+        self.reference_model = reference_model
+        self.model_operation = model_operation
+        self.reference_operation = reference_operation
+        self.optimizer = optimizer
+        self.generator = generator
+        self.run_state = run_state
+        self.reference_state = reference_state
+        self.execution_config = MappingProxyType(
+            {} if execution_config is None else dict(execution_config)
+        )
+        configurable = tuple(
+            configure
+            for configure in (
+                getattr(model, "configure_execution", None),
+                getattr(reference_model, "configure_execution", None),
+            )
+            if callable(configure)
+        )
+        if configurable:
+            hardware_profile = self.execution_config.get("hardware_profile")
+            if not isinstance(hardware_profile, Mapping):
+                raise ValueError(
+                    "queued poker model requires an execution hardware profile"
+                )
+            try:
+                for configure_execution in configurable:
+                    configure_execution(
+                        str(hardware_profile["attention_backend"]),
+                        int(hardware_profile["query_chunk_size"]),
+                    )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "execution hardware profile has no valid attention plan"
+                ) from exc
+        self.preemption = preemption
+        self.preemption_checkpoint = (
+            None
+            if preemption_checkpoint is None
+            else Path(preemption_checkpoint)
+        )
+        self.allocation_inputs = allocation_inputs
+
+    @classmethod
+    def fresh(
+        cls,
+        *,
+        config: Phase5Config,
+        plan: StoragePlan,
+        owner_factory: Callable[[], GeneratedOwners],
+        model: nn.Module,
+        reference_model: nn.Module,
+        model_operation: ModelOperation,
+        reference_operation: ModelOperation | None,
+        generator: torch.Generator,
+        run_id: str,
+        execution_config: Mapping[str, object] | None = None,
+        preemption: PreemptionNotice | None = None,
+        preemption_checkpoint: str | Path | None = None,
+        allocation_inputs: tuple[Tensor, Tensor, Tensor, int] | None = None,
+    ) -> "Phase5TrainingSession":
+        reference_model.load_state_dict(model.state_dict(), strict=True)
+        scaler = LossScaler(enabled=config.precision.name == "fp16")
+        return cls(
+            config=config,
+            plan=plan,
+            owner_factory=owner_factory,
+            model=model,
+            reference_model=reference_model,
+            model_operation=model_operation,
+            reference_operation=reference_operation,
+            optimizer=DenseAdam(model, config.optimizer, scaler=scaler),
+            generator=generator,
+            run_state=RunState(
+                run_id,
+                root_count=config.root_count,
+            ),
+            reference_state=ReferenceState(
+                interval_iterations=config.reference.interval_iterations,
+                interval_effective_hands=(
+                    config.reference.interval_effective_hands
+                ),
+            ),
+            execution_config=execution_config,
+            preemption=preemption,
+            preemption_checkpoint=preemption_checkpoint,
+            allocation_inputs=allocation_inputs,
+        )
+
+    @classmethod
+    def resume(
+        cls,
+        checkpoint: str | Path,
+        *,
+        config: Phase5Config,
+        plan: StoragePlan,
+        owner_factory: Callable[[], GeneratedOwners],
+        model: nn.Module,
+        reference_model: nn.Module,
+        model_operation: ModelOperation,
+        reference_operation: ModelOperation | None,
+        generator: torch.Generator,
+        external_metrics: tuple[Mapping[str, object], ...] = (),
+        preemption: PreemptionNotice | None = None,
+        preemption_checkpoint: str | Path | None = None,
+        allocation_inputs: tuple[Tensor, Tensor, Tensor, int] | None = None,
+    ) -> "Phase5TrainingSession":
+        optimizer = DenseAdam(
+            model,
+            config.optimizer,
+            scaler=LossScaler(enabled=config.precision.name == "fp16"),
+        )
+        scaler, reference_state, run_state, execution = load_checkpoint(
+            checkpoint,
+            model=model,
+            optimizer=optimizer,
+            reference_model=reference_model,
+            expected_scientific_config=config.scientific_mapping(),
+            generator=generator,
+        )
+        optimizer.scaler = scaler
+        if external_metrics:
+            run_state.metrics_prefix = trim_metrics_after_checkpoint(
+                external_metrics, run_state.iteration - 1
+            )
+        return cls(
+            config=config,
+            plan=plan,
+            owner_factory=owner_factory,
+            model=model,
+            reference_model=reference_model,
+            model_operation=model_operation,
+            reference_operation=reference_operation,
+            optimizer=optimizer,
+            generator=generator,
+            run_state=run_state,
+            reference_state=reference_state,
+            execution_config=execution,
+            preemption=preemption,
+            preemption_checkpoint=preemption_checkpoint,
+            allocation_inputs=allocation_inputs,
+        )
+
+    def checkpoint(self, path: str | Path) -> str:
+        return save_checkpoint(
+            path,
+            model=self.model,
+            optimizer=self.optimizer,
+            scaler=self.optimizer.scaler,
+            reference_model=self.reference_model,
+            reference_state=self.reference_state,
+            run_state=self.run_state,
+            scientific_config=self.config.scientific_mapping(),
+            execution_config=self.execution_config,
+            generator=self.generator,
+        )
+
+    def run(self, *, iteration: int | None = None) -> PokerIterationResult:
+        selected_iteration = (
+            self.run_state.iteration if iteration is None else int(iteration)
+        )
+        if selected_iteration != self.run_state.iteration:
+            raise ValueError("session may run only the next checkpointed iteration")
+        result = RecoveringSequentialSampledPokerIteration(
+            owner_factory=self.owner_factory,
+            plan=self.plan,
+            minimum_root_count=self.config.root_count_minimum,
+            geometry=self.geometry,
+            mode=self.plan.mode,
+            model=self.model,
+            model_operation=self.model_operation,
+            optimizer=self.optimizer,
+            loss=self.config.loss,
+            schedule=self.config.schedule,
+            generator=self.generator,
+            seed=self.config.seed,
+            lambda_=self.config.lambda_,
+            precision=self.config.precision.name,
+            utility=self.config.utility,
+            cache_reference_outputs=self.config.reference.cache_outputs,
+            allocation_inputs=self.allocation_inputs,
+            reproducibility=self.config.reproducibility,
+            run_state=self.run_state,
+            reference_operation=self.reference_operation,
+        ).run(iteration=selected_iteration)
+        if self.reference_state.observe(
+            iteration=self.run_state.iteration,
+            effective_hands=float(result.player_nodes),
+        ):
+            self.reference_model.load_state_dict(
+                self.model.state_dict(), strict=True
+            )
+        if self.preemption is not None and self.preemption.requested:
+            if self.preemption_checkpoint is None:
+                raise PokerIterationError(
+                    "preemption requested without a checkpoint destination"
+                )
+            self.checkpoint(self.preemption_checkpoint)
+        return result
+
+
 __all__ = [
+    "Phase5TrainingSession",
     "PokerIterationError",
     "PokerIterationResult",
     "RecoveringSequentialSampledPokerIteration",

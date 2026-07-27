@@ -44,3 +44,38 @@ def max_policy_sequence_tokens(
     flop_hands = math.comb(geometry.n_cards - 3, 2)
     postflop = n_players * flop_hands + scalar_count + 6 + history + k_act
     return max(preflop, postflop)
+
+
+def max_policy_partition_sequence_tokens(
+    *,
+    n_players: int,
+    stack_bb: float,
+    rank_count: int,
+    k_act: int,
+) -> dict[str, int]:
+    """Return conservative one-row bounds for each sampled input partition."""
+
+    geometry = DeckGeometry(rank_count)
+    history = max_public_history_tokens(n_players, stack_bb)
+    n_ticks = round(stack_bb / 0.5)
+    event_count = 3 + n_ticks
+    scalar_count = 3 * n_players + 13 + event_count + n_ticks
+    result = {
+        "pre": (
+            n_players * geometry.n_classes
+            + scalar_count
+            + 1
+            + history
+            + k_act
+        )
+    }
+    flop_hands = math.comb(geometry.n_cards - 3, 2)
+    for live_players in range(2, n_players + 1):
+        result[f"post_{live_players}"] = (
+            live_players * flop_hands
+            + scalar_count
+            + 6
+            + history
+            + k_act
+        )
+    return result

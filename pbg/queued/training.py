@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import signal
+from types import MappingProxyType
 import warnings
 from typing import Callable, Generic, Mapping, TypeVar
 
@@ -16,7 +17,9 @@ from torch import Tensor, nn
 from pbg.queued.learner import (
     LearnerOperation,
     LossResult,
+    ReferenceOutputCache,
     SequentialBatchSampler,
+    SequentialLearnerBatch,
 )
 from pbg.queued.optimization import DenseAdam, OptimizerStep
 from pbg.queued.persistence import RunState
@@ -194,11 +197,39 @@ class SequentialSampledIteration:
         learner: LearnerOperation,
         optimizer: DenseAdam,
         run_state: RunState | None = None,
+        physical_batch_cap: int | Mapping[str, int] | None = None,
     ) -> None:
         self.model = model
         self.learner = learner
         self.optimizer = optimizer
         self.run_state = run_state
+        if isinstance(physical_batch_cap, Mapping):
+            caps = dict(physical_batch_cap)
+            if not caps or any(
+                not isinstance(name, str)
+                or not name
+                or isinstance(cap, bool)
+                or not isinstance(cap, int)
+                or cap <= 0
+                for name, cap in caps.items()
+            ):
+                raise ValueError(
+                    "physical_batch_cap mapping must contain positive integer caps"
+                )
+            self.physical_batch_cap: int | Mapping[str, int] | None = (
+                MappingProxyType(caps)
+            )
+        else:
+            if (
+                physical_batch_cap is not None
+                and (
+                    isinstance(physical_batch_cap, bool)
+                    or not isinstance(physical_batch_cap, int)
+                    or physical_batch_cap <= 0
+                )
+            ):
+                raise ValueError("physical_batch_cap must be positive")
+            self.physical_batch_cap = physical_batch_cap
 
     def optimize(
         self,
@@ -206,22 +237,100 @@ class SequentialSampledIteration:
         *,
         iteration: int,
         reference_operation=None,
+        reference_caches: Mapping[str, ReferenceOutputCache] | None = None,
     ) -> IterationResult:
-        losses: list[dict[str, float]] = []
+        metric_names = (
+            "total",
+            "policy",
+            "value",
+            "entropy",
+            "reference_kl",
+            "approximate_kl",
+            "clip_fraction",
+        )
+        loss_tensors: list[dict[str, Tensor]] = []
         steps: list[OptimizerStep] = []
         presentations = 0
+        active_logical_step: int | None = None
+        weighted_metrics: dict[str, Tensor] = {}
+
+        def finish_logical_step() -> None:
+            if active_logical_step is None:
+                return
+            steps.append(self.optimizer.step())
+            loss_tensors.append(dict(weighted_metrics))
+
         for batch in sampler.batches():
-            self.optimizer.zero_grad()
-            result: LossResult = self.learner.forward_loss_backward(
-                batch,
-                iteration=iteration,
-                reference_operation=reference_operation,
-                loss_scale=self.optimizer.scaler.scale,
+            if batch.logical_step != active_logical_step:
+                finish_logical_step()
+                self.optimizer.zero_grad()
+                active_logical_step = batch.logical_step
+                weighted_metrics = {}
+            configured_cap = self.physical_batch_cap
+            if isinstance(configured_cap, Mapping):
+                if batch.input_type not in configured_cap:
+                    raise ValueError(
+                        "physical_batch_cap has no entry for "
+                        f"{batch.input_type!r}"
+                    )
+                configured_cap = configured_cap[batch.input_type]
+            cap = (
+                batch.rows
+                if configured_cap is None
+                else min(batch.rows, configured_cap)
             )
-            step = self.optimizer.step()
-            losses.append(result.detached_metrics())
-            steps.append(step)
+            for begin in range(0, batch.rows, cap):
+                end = min(begin + cap, batch.rows)
+                physical = SequentialLearnerBatch(
+                    batch.input_type,
+                    batch.indices[begin:end],
+                    MappingProxyType(
+                        {
+                            name: value[begin:end]
+                            for name, value in batch.fields.items()
+                        }
+                    ),
+                )
+                weight = physical.rows / batch.objective_rows
+                result: LossResult = self.learner.forward_loss_backward(
+                    physical,
+                    iteration=iteration,
+                    reference_operation=(
+                        reference_operation
+                        if reference_caches is None
+                        else None
+                    ),
+                    reference_cache=(
+                        None
+                        if reference_caches is None
+                        else reference_caches.get(batch.input_type)
+                    ),
+                    loss_scale=self.optimizer.scaler.scale,
+                    objective_weight=weight,
+                )
+                for name in metric_names:
+                    value = getattr(result, name).detach()
+                    weighted_metrics[name] = (
+                        weighted_metrics.get(name, 0.0) + weight * value
+                    )
             presentations += batch.rows
+        finish_logical_step()
+        if loss_tensors:
+            host_metrics = torch.stack(
+                tuple(
+                    torch.stack(tuple(values[name] for name in metric_names))
+                    for values in loss_tensors
+                )
+            ).to(device="cpu").tolist()
+            losses = tuple(
+                {
+                    name: float(row[index])
+                    for index, name in enumerate(metric_names)
+                }
+                for row in host_metrics
+            )
+        else:
+            losses = ()
         if self.run_state is not None:
             self.run_state.logical_work["minibatches"] += len(steps)
             self.run_state.logical_work["optimizer_steps"] += sum(
@@ -236,7 +345,7 @@ class SequentialSampledIteration:
                     "optimizer_steps": sum(int(step.applied) for step in steps),
                 }
             )
-        return IterationResult(tuple(losses), tuple(steps), presentations)
+        return IterationResult(losses, tuple(steps), presentations)
 
 
 class PreemptionNotice:

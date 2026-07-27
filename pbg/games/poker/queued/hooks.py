@@ -30,6 +30,7 @@ from pbg.queued.rollout import (
     CompletionBatch,
     CompletionPlan,
     DrawPurpose,
+    DeferredUnaryTopologyPublication,
     FamilyBatch,
     RolloutOwnerRegistry,
     SampleRequest,
@@ -116,7 +117,7 @@ class NLHEGeometry:
     def direct_model_input_width(self) -> int:
         return (
             8
-            + 9 * self.players
+            + 10 * self.players
             + self.players * self.private_hands
             + 10 * max_public_history_tokens(self.players, self.stack_bb)
         )
@@ -162,6 +163,7 @@ class PokerState:
     current_bet: Tensor
     last_full_raise: Tensor
     pending: Tensor
+    can_raise: Tensor
     terminal: Tensor
 
     @property
@@ -191,6 +193,7 @@ class PokerState:
             "current_bet": (self.current_bet, torch.float32, (batch,)),
             "last_full_raise": (self.last_full_raise, torch.float32, (batch,)),
             "pending": (self.pending, torch.bool, (batch, players)),
+            "can_raise": (self.can_raise, torch.bool, (batch, players)),
             "terminal": (self.terminal, torch.bool, (batch,)),
         }
         for name, (value, dtype, shape) in contracts.items():
@@ -262,6 +265,7 @@ class PokerStateMachine:
         seed: int,
         iteration: int,
         retry_epoch: int,
+        logical_base: int = 0,
         device: torch.device | str,
     ) -> PokerState:
         device = torch.device(device)
@@ -269,7 +273,10 @@ class PokerStateMachine:
             raise ValueError("queued poker roots require CUDA")
         if root_count <= 0:
             raise ValueError("root_count must be positive")
-        roots = torch.arange(root_count, dtype=torch.int64, device=device)
+        roots = (
+            torch.arange(root_count, dtype=torch.int64, device=device)
+            + int(logical_base)
+        )
         cards = torch.arange(
             self.geometry.first_card, 52, dtype=torch.int64, device=device
         )
@@ -331,6 +338,7 @@ class PokerStateMachine:
             current_bet=torch.ones(root_count, dtype=torch.float32, device=device),
             last_full_raise=torch.ones(root_count, dtype=torch.float32, device=device),
             pending=pending,
+            can_raise=pending.clone(),
             terminal=torch.zeros(root_count, dtype=torch.bool, device=device),
         )
         state.validate(self.geometry)
@@ -378,7 +386,12 @@ class PokerStateMachine:
             maximum[:, None] > state.current_bet[:, None]
         )
         multiple_actors = state.status.eq(LIVE).sum(-1).gt(1)
-        mask[:, RAISE_OFFSET:] = (full_raise | short_all_in) & multiple_actors[:, None]
+        can_raise = state.can_raise.gather(1, actor[:, None]).squeeze(1)
+        mask[:, RAISE_OFFSET:] = (
+            (full_raise | short_all_in)
+            & multiple_actors[:, None]
+            & can_raise[:, None]
+        )
         mask &= ~state.terminal[:, None]
         return PokerLegality(events.contiguous(), mask.contiguous())
 
@@ -443,6 +456,7 @@ class PokerStateMachine:
                 state.pending.float(),
                 (state.current_bet / scale)[:, None],
                 (state.last_full_raise / scale)[:, None],
+                state.can_raise.float(),
             ),
             1,
         )
@@ -474,7 +488,7 @@ class PokerStateMachine:
         tokens = max_public_history_tokens(
             players, self.geometry.stack_bb
         )
-        offset = 8 + 9 * players
+        offset = 8 + 10 * players
         reach = model_input[:, offset : offset + players * hands].float()
         offset += players * hands
         columns = []
@@ -592,7 +606,10 @@ class PokerStateMachine:
             active,
             {
                 "actor": torch.full_like(state.to_act, -1),
-                "street": state.street,
+                # The separator belongs to the street being entered, while
+                # every public arithmetic field is captured before the
+                # transition resets street commitments and the current bet.
+                "street": state.street + 1,
                 "action": torch.full_like(state.to_act, 3),
                 "amount": zeros,
                 "pot_before": state.committed.sum(1),
@@ -648,7 +665,8 @@ class PokerStateMachine:
         pending = take(players).gt(0.5)
         current_bet = take(1)[:, 0] * scale
         last_full_raise = take(1)[:, 0] * scale
-        if offset != 8 + 9 * players:
+        can_raise = take(players).gt(0.5)
+        if offset != 8 + 10 * players:
             raise QueuedPokerError("retained public input layout is not exact")
         state = PokerState(
             board,
@@ -663,6 +681,7 @@ class PokerStateMachine:
             current_bet,
             last_full_raise,
             pending,
+            can_raise,
             torch.zeros(model_input.shape[0], dtype=torch.bool, device=model_input.device),
         )
         state.validate(self.geometry)
@@ -683,6 +702,7 @@ class PokerStateMachine:
         committed_street = state.committed_street.clone()
         status = state.status.clone()
         pending = state.pending.clone()
+        can_raise = state.can_raise.clone()
         current_bet = state.current_bet.clone()
         last_full_raise = state.last_full_raise.clone()
         fold = action.eq(FOLD)
@@ -725,7 +745,18 @@ class PokerStateMachine:
         full_raise = raise_action & (raise_size >= last_full_raise)
         last_full_raise = torch.where(full_raise, raise_size, last_full_raise)
         active = status.eq(LIVE)
+        # A full raise reopens raising for every live player.  A short all-in
+        # does not reopen raising, but every live player still below the new
+        # current bet must act again to call or fold.
+        can_raise = torch.where(full_raise[:, None] & active, active, can_raise)
+        can_raise.scatter_(
+            1,
+            actor_index,
+            torch.zeros_like(actor_index, dtype=torch.bool),
+        )
         pending = torch.where(full_raise[:, None] & active, active, pending)
+        owes_call = active & committed_street.lt(current_bet[:, None])
+        pending |= owes_call
         pending.scatter_(
             1,
             actor_index,
@@ -750,6 +781,7 @@ class PokerStateMachine:
             current_bet,
             last_full_raise,
             pending,
+            can_raise,
             terminal,
         )
         result.validate(self.geometry)
@@ -811,6 +843,7 @@ class PokerStateMachine:
         has_betting_opponent = active.sum(-1).gt(1)
         next_pending = active & has_betting_opponent[:, None]
         pending = torch.where(needs[:, None], next_pending, state.pending)
+        can_raise = torch.where(needs[:, None], next_pending, state.can_raise)
         committed_street = torch.where(
             needs[:, None], torch.zeros_like(state.committed_street), state.committed_street
         )
@@ -829,6 +862,7 @@ class PokerStateMachine:
             torch.where(needs, zero, state.current_bet),
             torch.where(needs, torch.ones_like(zero), state.last_full_raise),
             pending,
+            can_raise,
             state.terminal
             | (
                 street.eq(3)
@@ -981,20 +1015,6 @@ class PokerForwardInput:
     owner: Tensor
 
 
-@dataclass(frozen=True)
-class PokerTransitionTrace:
-    """Ephemeral successful-transition data used to seal CPU topology."""
-
-    input_type: str
-    logical_rng_key: Tensor
-    next_logical_rng_key: Tensor
-    next_input_type: Tensor
-    terminal: Tensor
-    owner: Tensor
-    action: Tensor
-    familywork_row: Tensor
-
-
 class SequentialSampledPokerHooks:
     """NLHE implementation of the Phase 4 opaque rollout hook boundary.
 
@@ -1032,7 +1052,8 @@ class SequentialSampledPokerHooks:
             dtype=torch.int32,
             device=self.owners.device,
         )
-        self.last_trace: PokerTransitionTrace | None = None
+        self.last_topology: DeferredUnaryTopologyPublication | None = None
+        self._topology_sequence = 0
 
     def model_input(self, batch: FamilyBatch) -> PokerForwardInput:
         shape = (batch.lane_count * batch.rows,)
@@ -1165,6 +1186,9 @@ class SequentialSampledPokerHooks:
         ).reshape(-1)
         for generation in range(3):
             chance_active = self.machine.needs_chance(next_state)
+            history = self.machine.append_chance_history(
+                next_state, chance_active, history
+            )
             next_state = self.machine.deal_next_street_keyed(
                 next_state,
                 seed=self.seed,
@@ -1173,9 +1197,6 @@ class SequentialSampledPokerHooks:
                 path=path,
                 draw=generation,
                 retry_epoch=retry,
-            )
-            history = self.machine.append_chance_history(
-                next_state, chance_active, history
             )
         board = next_state.board_cards
         cards = self.machine.combo_cards(
@@ -1372,22 +1393,29 @@ class SequentialSampledPokerHooks:
             destination[lane, 2::3].copy_(route_destination)
             destination_ordinal[lane, 2::3].copy_(route_ordinal)
 
-        self.last_trace = PokerTransitionTrace(
-            batch.input_type,
-            logical.detach(),
-            next_logical.detach(),
-            next_family.detach(),
-            terminal.detach(),
-            batch.fields["owner"].detach(),
-            request.sample.values["action"].detach(),
-            batch.row.detach(),
+        topology = DeferredUnaryTopologyPublication(
+            lane=0,
+            sequence=self._topology_sequence,
+            input_type_index=self.input_index[batch.input_type],
+            logical_rng_key=logical[0],
+            next_logical_rng_key=next_logical[0],
+            next_input_type=next_family[0],
+            terminal=terminal[0],
+            owner=batch.fields["owner"][0],
+            action=request.sample.values["action"][0],
+            familywork_row=batch.row[0],
+            leaf_reservation_index=0,
+            leaf_target_ordinal=route_ordinal,
         )
+        self._topology_sequence += 1
+        self.last_topology = topology
         return CommitPlan(
             tuple(destinations),
             CommitCoverage(
                 valid, source_ordinal, destination, destination_ordinal
             ),
             published_queues=tuple(published_queues),
+            deferred_topology=(topology,),
         )
 
 
@@ -1436,6 +1464,7 @@ class SampledShowdownBinding:
         *,
         n_replica: int,
         pack_cap: int,
+        utility: str = "raw_bb",
     ) -> None:
         try:
             import poker_gpu_evaluator as poker
@@ -1453,6 +1482,11 @@ class SampledShowdownBinding:
         self.layer_work = layer_work
         self.n_replica = n_replica
         self.pack_cap = pack_cap
+        if utility not in ("raw_bb", "stack_normalized"):
+            raise ValueError("showdown utility must be raw_bb or stack_normalized")
+        self.utility_scale = (
+            1.0 if utility == "raw_bb" else 1.0 / geometry.stack_bb
+        )
 
     def leaf_to_layer_work(self, batch: CompletionBatch) -> CompletionPlan:
         fields = batch.fields
@@ -1470,7 +1504,9 @@ class SampledShowdownBinding:
             stratum_amount=fields["stratum_amount"].reshape(
                 -1, self.geometry.players
             ).contiguous(),
-        ).reshape(batch.lanes.numel(), batch.rows, self.geometry.players)
+        ).reshape(
+            batch.lanes.numel(), batch.rows, self.geometry.players
+        ).mul(self.utility_scale)
         values = torch.zeros(
             (
                 self.n_replica,
@@ -1537,7 +1573,6 @@ __all__ = [
     "PokerLearnerPolicy",
     "PokerState",
     "PokerStateMachine",
-    "PokerTransitionTrace",
     "QueuedPokerError",
     "SampledShowdownBinding",
     "SequentialSampledPokerHooks",

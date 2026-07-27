@@ -19,6 +19,7 @@ from pbg.games.poker.model.preflop import (
     PreflopMasks,
     PreflopNet,
 )
+from pbg.games.poker.model.primitives import MHA
 from pbg.games.poker.queued.hooks import (
     FOLDED,
     NLHEGeometry,
@@ -106,6 +107,17 @@ class QueuedPokerModel(nn.Module):
             torch.tensor(deck.combo_cards, dtype=torch.int64),
             persistent=False,
         )
+
+    def configure_execution(
+        self, attention_backend: str, query_chunk_size: int
+    ) -> None:
+        """Apply the admitted hardware execution profile to every attention."""
+
+        for module in self.modules():
+            if isinstance(module, MHA):
+                module.configure_execution(
+                    attention_backend, query_chunk_size
+                )
 
     @staticmethod
     def _call_direct(module: nn.Module, model_input: Tensor) -> ModelEvaluation:
@@ -316,6 +328,16 @@ class QueuedPokerModel(nn.Module):
             live = int(input_type[5:])
             if not 2 <= live <= self.geometry.players:
                 raise PokerModelError("postflop family has an invalid live-seat count")
+            if live != self.geometry.players:
+                raise PokerModelError(
+                    "Phase 5 postflop inference cannot omit folded summaries; "
+                    "use Phase 6"
+                )
+            state = self._state(model_input)
+            torch._assert_async(
+                (~state.status.eq(FOLDED).any(1)).all(),
+                "Phase 5 postflop inference cannot omit folded summaries; use Phase 6",
+            )
             result = (
                 self._call_postflop(input_type, model_input)
                 if isinstance(self.postflop, PostflopNet)
@@ -422,9 +444,12 @@ def build_model_from_config(
         )
 
     target = torch.device(device)
-    if target.type not in ("cuda", "mps"):
-        raise ValueError("queued poker model construction requires cuda or mps")
-    if target.type == "cuda" and target.index is None:
+    if target.type != "cuda":
+        raise ValueError(
+            "Phase 5 queued poker model construction requires CUDA; "
+            "a supported MPS inference composition lands at cutover"
+        )
+    if target.index is None:
         target = torch.device("cuda", torch.cuda.current_device())
     deck = DeckGeometry(geometry.rank_count)
     result = QueuedPokerModel(

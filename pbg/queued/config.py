@@ -107,7 +107,6 @@ class Phase5ModelConfig:
             self.m_raise,
             self.max_players,
             self.class_embedding_dim,
-            self.folder_beta_rank,
             self.folder_line_dim,
         )
         if any(
@@ -115,6 +114,12 @@ class Phase5ModelConfig:
             for value in integers
         ):
             raise ValueError("model dimensions must be positive integers")
+        if (
+            isinstance(self.folder_beta_rank, bool)
+            or not isinstance(self.folder_beta_rank, int)
+            or self.folder_beta_rank < 0
+        ):
+            raise ValueError("folder_beta_rank must be a nonnegative integer")
         if self.d_model % self.n_heads:
             raise ValueError("d_model must be divisible by n_heads")
         if not 2 <= self.max_players <= 6:
@@ -171,6 +176,7 @@ class Phase5Config:
     schedule: LearnerSchedule
     precision: Phase5Precision
     reference: ReferenceConfig
+    lambda_: float
     root_count: int
     root_count_minimum: int
     seed: int
@@ -194,6 +200,8 @@ class Phase5Config:
             )
         if self.utility not in ("raw_bb", "stack_normalized"):
             raise ValueError("utility must be raw_bb or stack_normalized")
+        if not math.isfinite(self.lambda_) or not 0 <= self.lambda_ <= 1:
+            raise ValueError("lambda_ must be finite in [0,1]")
         if self.model.max_players < self.game.players:
             raise ValueError("model max_players does not cover game players")
         if self.model.folder_beta_rank > 4 * self.game.rank_count:
@@ -211,6 +219,7 @@ class Phase5Config:
             "schedule",
             "precision",
             "reference",
+            "lambda",
             "root_count",
             "root_count_minimum",
             "seed",
@@ -247,6 +256,7 @@ class Phase5Config:
             "schedule",
             "precision",
             "reference",
+            "lambda",
             "root_count",
             "root_count_minimum",
             "seed",
@@ -270,6 +280,7 @@ class Phase5Config:
             reference=_closed(
                 ReferenceConfig, source["reference"], "root.reference"
             ),
+            lambda_=source["lambda"],
             root_count=source["root_count"],
             root_count_minimum=source["root_count_minimum"],
             seed=source["seed"],
@@ -297,6 +308,7 @@ class Phase5Config:
             "schedule": values(self.schedule),
             "precision": values(self.precision),
             "reference": values(self.reference),
+            "lambda": self.lambda_,
             "root_count": self.root_count,
             "root_count_minimum": self.root_count_minimum,
             "seed": self.seed,

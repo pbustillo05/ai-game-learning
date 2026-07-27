@@ -13,6 +13,7 @@ from typing import Mapping, Sequence
 import torch
 from torch import Tensor, nn
 
+from pbg.queued.config import Phase5Config
 from pbg.queued.learner import ReferenceState
 from pbg.queued.optimization import DenseAdam, LossScaler
 
@@ -76,6 +77,23 @@ def _atomic_torch_save(value: object, destination: Path) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _atomic_json_save(value: object, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, sort_keys=True, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, destination)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
 
 
 @dataclass
@@ -377,52 +395,119 @@ def convert_legacy_sequential_sampled(
         raise PersistenceError(
             "Phase 5 converter accepts only sequential sampled artifacts"
         )
-    scientific = {
-        "mode": {
-            "training_regime": "self_play",
-            "rollout_mode": "sequential",
-            "private_estimator": "sampled",
-        },
-        "game": dict(config["game"]),
-        "model": {
-            key: value
-            for key, value in config["model"].items()
-            if key not in ("k_act", "use_branching_heads", "max_history_tokens")
-        },
-        "loss": dict(config["loss"]),
-        "training": {
-            key: value
-            for key, value in config["training"].items()
-            if key not in ("out_dir",)
-        },
-        "root_count": int(
-            legacy["adaptive_work_state"]["current_roots_per_gpu"]
-        ),
-        "root_count_minimum": int(
-            legacy["adaptive_work_state"]["minimum_roots_per_gpu"]
-        ),
-    }
-    execution = {
-        "hardware_profile": dict(legacy["hardware_profile"]),
-        "checkpoint_cadence": config["training"].get("checkpoint_every"),
-    }
     training = config["training"]
+    legacy_loss = config["loss"]
+    model = dict(config["model"])
+    model["epsilon"] = model.pop("eps")
+    game = dict(config["game"])
+    game["players"] = game.pop("n_players")
     effective_hand_cadence = training.get("kl_ref_effective_hands_rollout")
     interval_cadence = (
         None
         if effective_hand_cadence is not None
         else int(training["kl_ref_interval"])
     )
+    optimizer_state = _convert_optimizer(legacy["optimizer"], training)
+    scientific = {
+        "mode": {
+            "training_regime": "self_play",
+            "rollout_mode": "sequential",
+            "private_estimator": "sampled",
+        },
+        "game": game,
+        "model": {
+            key: value
+            for key, value in model.items()
+            if key not in ("k_act", "use_branching_heads", "max_history_tokens")
+        },
+        "loss": {
+            "clip_epsilon": float(legacy_loss["clip_eps"]),
+            "value_clip_epsilon": float(legacy_loss["clip_eps_v"]),
+            "value_coefficient": float(legacy_loss["c_v"]),
+            "entropy_coefficient": float(legacy_loss["c_h"]),
+            "reference_kl_coefficient": float(legacy_loss["c_kl"]),
+            "value_loss": str(legacy_loss["value_loss"]),
+            "entropy_schedule": (
+                "constant"
+                if legacy_loss["entropy_schedule"] == "const"
+                else str(legacy_loss["entropy_schedule"])
+            ),
+            "entropy_decay_iterations": legacy_loss["entropy_decay_iters"],
+        },
+        "optimizer": dict(optimizer_state["config"]),
+        "schedule": {
+            "batch_size": int(training["minibatch_size"]),
+            "epochs": int(training.get("ppo_epochs") or 1),
+            "gradient_steps": (
+                None
+                if training.get("gd_steps_per_iter") is None
+                else int(training["gd_steps_per_iter"])
+            ),
+        },
+        "precision": {"name": "fp16" if bool(training["amp"]) else "fp32"},
+        "reference": {
+            "interval_iterations": interval_cadence,
+            "interval_effective_hands": (
+                None
+                if effective_hand_cadence is None
+                else float(effective_hand_cadence)
+            ),
+            "cache_outputs": True,
+        },
+        "lambda": float(legacy_loss["lam"]),
+        "root_count": int(
+            legacy["adaptive_work_state"]["current_roots_per_gpu"]
+        ),
+        "root_count_minimum": int(
+            legacy["adaptive_work_state"]["minimum_roots_per_gpu"]
+        ),
+        "seed": int(training["seed"]),
+        "reproducibility": str(training["reproducibility"]),
+        "utility": (
+            "stack_normalized"
+            if legacy_loss["utility_normalization"] == "stack"
+            else "raw_bb"
+        ),
+    }
+    # The converter itself must produce the strict public scientific schema,
+    # not merely a mapping sufficient to reconstruct model parameters.
+    scientific = Phase5Config.from_mapping(scientific).scientific_mapping()
+    execution = {
+        "hardware_profile": dict(legacy["hardware_profile"]),
+        "checkpoint_cadence": config["training"].get("checkpoint_every"),
+    }
     scaler = (
         _convert_scaler(legacy["scaler"])
         if bool(training["amp"])
         else LossScaler(enabled=False).state_dict()
     )
+    metrics_prefix: list[dict[str, object]] = []
+    metrics_path = source.parent / "metrics.jsonl"
+    if metrics_path.is_file():
+        with open(metrics_path, encoding="utf-8") as stream:
+            for line in stream:
+                item = json.loads(line)
+                item_iteration = int(item["iter"])
+                if item_iteration >= int(legacy["iteration"]):
+                    break
+                metrics_prefix.append(
+                    {
+                        "iteration": item_iteration,
+                        "statistical_presentations": int(
+                            item.get("statistical_rows", 0)
+                        ),
+                        "minibatches": int(item.get("minibatches", 0)),
+                        "optimizer_steps": int(
+                            item.get("optimizer_steps_applied_count", 0)
+                        ),
+                    }
+                )
     run_state = RunState(
         run_id=legacy["run_id"],
         iteration=int(legacy["iteration"]),
         root_count=int(legacy["adaptive_work_state"]["current_roots_per_gpu"]),
         logical_work=dict(legacy["logical_work"]),
+        metrics_prefix=metrics_prefix,
     )
     converted = {
         "checkpoint_schema": CHECKPOINT_SCHEMA,
@@ -430,7 +515,7 @@ def convert_legacy_sequential_sampled(
         "scientific_sha256": _canonical_hash(scientific),
         "execution_config": execution,
         "model": _clone_cpu(legacy["model"]),
-        "optimizer": _convert_optimizer(legacy["optimizer"], training),
+        "optimizer": optimizer_state,
         "scaler": scaler,
         "reference_model": _clone_cpu(legacy["reference_model"]),
         "reference_state": {
@@ -467,19 +552,27 @@ def convert_legacy_sequential_sampled(
         "destination": str(destination),
     }
     metadata = destination.with_suffix(destination.suffix + ".conversion.json")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{metadata.name}.", suffix=".tmp", dir=metadata.parent
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(result, stream, sort_keys=True, indent=2)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_name, metadata)
-    finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
+    _atomic_json_save(result, metadata)
+    external = {}
+    for name in ("run.json", "status.json", "metrics.jsonl"):
+        candidate = source.parent / name
+        if candidate.is_file():
+            external[name] = {
+                "sha256": sha256_file(candidate),
+                "bytes": candidate.stat().st_size,
+            }
+    if external:
+        artifact = {
+            "schema": "pbg-queued-run-artifacts-v1",
+            "checkpoint_iteration": int(legacy["iteration"]),
+            "checkpoint_run_id": str(legacy["run_id"]),
+            "source_files": external,
+            "converted_metrics_rows": len(metrics_prefix),
+        }
+        artifact_path = destination.with_suffix(
+            destination.suffix + ".run-artifacts.json"
+        )
+        _atomic_json_save(artifact, artifact_path)
     return result
 
 

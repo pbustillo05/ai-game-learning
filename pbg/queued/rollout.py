@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+import time
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol, Sequence
 
@@ -28,6 +29,7 @@ from pbg.queued.storage import (
     PublicationTransaction,
 )
 from pbg.queued.topology import (
+    TargetKind,
     Topology,
     TopologyBindings,
     TopologyError,
@@ -1165,6 +1167,80 @@ class ReplicaTopologyPacket:
     packet: TopologyPacket
 
 
+@dataclass(frozen=True)
+class DeferredUnaryTopologyPublication:
+    """Device-produced sequential unary trace committed with destinations."""
+
+    lane: int
+    sequence: int
+    input_type_index: int
+    logical_rng_key: Tensor
+    next_logical_rng_key: Tensor
+    next_input_type: Tensor
+    terminal: Tensor
+    owner: Tensor
+    action: Tensor
+    familywork_row: Tensor
+    leaf_reservation_index: int
+    leaf_target_ordinal: Tensor
+
+    def __post_init__(self) -> None:
+        if min(
+            self.lane,
+            self.sequence,
+            self.input_type_index,
+            self.leaf_reservation_index,
+        ) < 0:
+            raise TopologyError("deferred topology addresses must be nonnegative")
+        rows = self.terminal.numel()
+        device = self.terminal.device
+        if (
+            device.type != "cuda"
+            or self.terminal.dtype != torch.bool
+            or self.terminal.ndim != 1
+            or rows <= 0
+        ):
+            raise TopologyError(
+                "deferred topology terminal must be CUDA bool [rows]"
+            )
+        for name in (
+            "next_input_type",
+            "owner",
+            "action",
+            "familywork_row",
+            "leaf_target_ordinal",
+        ):
+            value = getattr(self, name)
+            if (
+                value.device != device
+                or value.ndim != 1
+                or value.numel() != rows
+            ):
+                raise TopologyError(
+                    f"deferred topology {name} must be CUDA [rows]"
+                )
+        for name in ("logical_rng_key", "next_logical_rng_key"):
+            value = getattr(self, name)
+            if (
+                value.device != device
+                or value.dtype != torch.int64
+                or value.shape != (rows, 2)
+            ):
+                raise TopologyError(
+                    f"deferred topology {name} must be CUDA int64 [rows,2]"
+                )
+
+
+@dataclass
+class _PendingDeferredUnary:
+    slot: int
+    publication: DeferredUnaryTopologyPublication
+    row_slice: slice
+    marker: Tensor
+    event: torch.cuda.Event
+    armed: bool = False
+
+
 @dataclass
 class _PendingTopologyBatch:
     slot: int
@@ -1213,6 +1289,17 @@ class AsyncTopologyPublisher:
             for _ in range(self.max_inflight_batches)
         )
         self._accept_stream = torch.cuda.Stream(device=owners.device)
+        self._deferred_buffer = torch.empty(
+            (owners.topology_cap, 11),
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+        self._deferred_pending: list[_PendingDeferredUnary] = []
+        self._deferred_staged: dict[
+            tuple[int, int], DeferredUnaryTopologyPublication
+        ] = {}
+        self._deferred_accepted: list[tuple[int, Tensor]] = []
+        self._deferred_reserved_rows = 0
 
     @staticmethod
     def _key(publication: TopologyPublication) -> tuple[int, int]:
@@ -1245,6 +1332,175 @@ class AsyncTopologyPublisher:
         self._reserved_packets += 1
         self._reserved_nodes += draft.declared_node_count
         self._reserved_edges += draft.declared_edge_count
+
+    def preflight_deferred(
+        self,
+        publication: DeferredUnaryTopologyPublication,
+        requests: Sequence[DeviceDestinationRequest],
+    ) -> None:
+        if publication.lane >= self.owners.n_replica:
+            raise TopologyError("deferred topology lane is outside replicas")
+        if publication.leaf_reservation_index >= len(requests):
+            raise TopologyError("deferred leaf reservation is outside commit plan")
+        if (
+            requests[
+                publication.leaf_reservation_index
+            ].slab.schema.name
+            != "Leaf"
+        ):
+            raise TopologyError("deferred leaf endpoint must bind to Leaf")
+        if publication.terminal.numel() > self.owners.topology_packet_cap:
+            raise TopologyError("deferred topology packet exceeds its cap")
+
+    def stage_deferred(
+        self, publication: DeferredUnaryTopologyPublication
+    ) -> None:
+        key = (publication.lane, publication.sequence)
+        if key in self._deferred_staged:
+            raise TopologyError("duplicate deferred topology sequence")
+        rows = publication.terminal.numel()
+        if self._deferred_reserved_rows + rows > self.owners.topology_cap:
+            raise TopologyError("deferred topology exceeds cumulative node cap")
+        self._deferred_staged[key] = publication
+        self._deferred_reserved_rows += rows
+
+    def prepare_deferred(
+        self,
+        publication: DeferredUnaryTopologyPublication,
+        transaction: object,
+        *,
+        stream: torch.cuda.Stream,
+    ) -> _PendingDeferredUnary:
+        if len(self._deferred_pending) >= self.max_inflight_batches:
+            raise TopologyError("deferred topology exceeds in-flight batch cap")
+        key = (publication.lane, publication.sequence)
+        if self._deferred_staged.get(key) is not publication:
+            raise TopologyError("deferred topology was not staged")
+        rows = publication.terminal.numel()
+        begin = sum(
+            item[1].shape[0] for item in self._deferred_accepted
+        ) + sum(
+            item.publication.terminal.numel()
+            for item in self._deferred_pending
+        )
+        end = begin + rows
+        if end > self._deferred_buffer.shape[0]:
+            raise TopologyError("deferred topology host buffer overflow")
+        leaf_begin = transaction.begins[
+            publication.leaf_reservation_index
+        ][publication.lane]
+        leaf_row = leaf_begin + publication.leaf_target_ordinal
+        packed = torch.cat(
+            (
+                publication.logical_rng_key,
+                publication.next_logical_rng_key,
+                publication.next_input_type.to(torch.int64)[:, None],
+                publication.terminal.to(torch.int64)[:, None],
+                publication.owner.to(torch.int64)[:, None],
+                publication.action.to(torch.int64)[:, None],
+                publication.familywork_row.to(torch.int64)[:, None],
+                torch.full(
+                    (rows, 1),
+                    publication.input_type_index,
+                    dtype=torch.int64,
+                    device=self.owners.device,
+                ),
+                leaf_row.to(torch.int64)[:, None],
+            ),
+            1,
+        )
+        self._deferred_buffer[begin:end].copy_(packed, non_blocking=True)
+        used = {item.slot for item in self._deferred_pending}
+        slot = next(
+            candidate
+            for candidate in range(self.max_inflight_batches)
+            if candidate not in used
+        )
+        pending = _PendingDeferredUnary(
+            slot,
+            publication,
+            slice(begin, end),
+            self._marker_buffers[slot],
+            torch.cuda.Event(blocking=False),
+        )
+        self._deferred_pending.append(pending)
+        packed.record_stream(stream)
+        return pending
+
+    @staticmethod
+    def finalize_deferred(
+        pending: _PendingDeferredUnary,
+        marker: Tensor,
+        *,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        pending.marker.copy_(marker, non_blocking=True)
+        pending.event.record(stream)
+        pending.armed = True
+
+    def _accept_deferred_ready(self) -> None:
+        waiting: list[_PendingDeferredUnary] = []
+        for item in self._deferred_pending:
+            if not item.armed or not item.event.query():
+                waiting.append(item)
+                continue
+            publication = item.publication
+            marker = int(item.marker[publication.lane])
+            key = (publication.lane, publication.sequence)
+            self._deferred_staged.pop(key, None)
+            if marker == publication.sequence:
+                self._deferred_accepted.append(
+                    (
+                        publication.sequence,
+                        self._deferred_buffer[item.row_slice],
+                    )
+                )
+        self._deferred_pending = waiting
+
+    def deferred_feedback(
+        self,
+        publication: DeferredUnaryTopologyPublication,
+        *,
+        input_count: int,
+    ) -> tuple[bool, tuple[int, ...]] | None:
+        """Poll scheduler feedback from the atomically committed packet."""
+
+        self._accept_deferred_ready()
+        accepted = next(
+            (
+                rows
+                for sequence, rows in self._deferred_accepted
+                if sequence == publication.sequence
+            ),
+            None,
+        )
+        if accepted is None:
+            if (publication.lane, publication.sequence) not in self._deferred_staged:
+                return True, tuple(0 for _ in range(input_count))
+            return None
+        terminal = accepted[:, 5].bool()
+        family = accepted[:, 4]
+        counts = tuple(
+            int(family.eq(index).logical_and(~terminal).sum())
+            for index in range(input_count)
+        )
+        return False, counts
+
+    def wait_deferred_feedback(
+        self,
+        publication: DeferredUnaryTopologyPublication,
+        *,
+        input_count: int,
+    ) -> tuple[bool, tuple[int, ...]]:
+        while True:
+            result = self.deferred_feedback(
+                publication, input_count=input_count
+            )
+            if result is not None:
+                return result
+            # This polls an asynchronous topology packet, never a device
+            # scalar, and does not synchronize a CUDA stream or event.
+            time.sleep(0)
 
     @staticmethod
     def _materialize(
@@ -1567,6 +1823,123 @@ class AsyncTopologyPublisher:
             if (lane, sequence) in self._drafts:
                 self.abort(lane, sequence)
 
+    def cancel_deferred(
+        self, publications: Sequence[DeferredUnaryTopologyPublication]
+    ) -> None:
+        keys = {(item.lane, item.sequence) for item in publications}
+        self._deferred_pending = [
+            item
+            for item in self._deferred_pending
+            if (item.publication.lane, item.publication.sequence) not in keys
+        ]
+        for key in keys:
+            publication = self._deferred_staged.pop(key, None)
+            if publication is not None:
+                self._deferred_reserved_rows -= publication.terminal.numel()
+
+    def seal_deferred_unary(
+        self, *, input_count: int
+    ) -> tuple[Topology, TopologyBindings, int]:
+        """Aggregate once, then link the committed unary logical trace."""
+
+        if self._deferred_pending:
+            with torch.cuda.stream(self._accept_stream):
+                for item in self._deferred_pending:
+                    self._accept_stream.wait_event(item.event)
+                ready = torch.cuda.Event(blocking=False)
+                ready.record(self._accept_stream)
+            ready.synchronize()
+            self._accept_deferred_ready()
+        if self._deferred_staged or self._deferred_pending:
+            raise TopologyError("deferred topology did not reach commit visibility")
+        ordered = [
+            rows
+            for _sequence, rows in sorted(
+                self._deferred_accepted, key=lambda item: item[0]
+            )
+        ]
+        if not ordered:
+            raise TopologyError("deferred topology is empty")
+        trace = torch.cat(ordered, 0)
+        logical_to_node: dict[tuple[int, int], int] = {}
+        pending_parent: dict[tuple[int, int], int] = {}
+        parent: list[int] = []
+        owner: list[int] = []
+        familywork_row: list[int] = []
+        label: list[int] = []
+        target_kind: list[int] = []
+        target_key: list[tuple[int, int] | None] = []
+        target_row: list[int] = []
+        input_type: list[int] = []
+        leaves = 0
+        for values in trace.tolist():
+            logical = (int(values[0]), int(values[1]))
+            if logical in logical_to_node:
+                raise TopologyError("a deferred logical node was processed twice")
+            node = len(parent)
+            parent.append(pending_parent.pop(logical, -1))
+            logical_to_node[logical] = node
+            owner.append(int(values[6]))
+            familywork_row.append(int(values[8]))
+            label.append(int(values[7]))
+            input_index = int(values[9])
+            if not 0 <= input_index < input_count:
+                raise TopologyError("deferred input type is outside preorder")
+            input_type.append(input_index)
+            if bool(values[5]):
+                target_kind.append(int(TargetKind.LEAF))
+                target_key.append(None)
+                target_row.append(int(values[10]))
+                leaves += 1
+            else:
+                child = (int(values[2]), int(values[3]))
+                if child in pending_parent:
+                    raise TopologyError(
+                        "two deferred nodes produced one logical child"
+                    )
+                pending_parent[child] = node
+                target_kind.append(int(TargetKind.TOPOLOGY))
+                target_key.append(child)
+                target_row.append(-1)
+        if pending_parent:
+            raise TopologyError("deferred topology has unresolved player children")
+        for edge, key in enumerate(target_key):
+            if key is not None:
+                try:
+                    target_row[edge] = logical_to_node[key]
+                except KeyError as exc:
+                    raise TopologyError(
+                        "deferred topology child was never processed"
+                    ) from exc
+
+        def i32(values: Sequence[int]) -> Tensor:
+            return torch.tensor(values, dtype=torch.int32)
+
+        nodes = len(parent)
+        topology = Topology(
+            parent=i32(parent),
+            child_begin=torch.arange(nodes, dtype=torch.int32),
+            executed_degree=torch.ones(nodes, dtype=torch.int32),
+            nominal_degree=torch.ones(nodes, dtype=torch.int32),
+            target_degree=torch.ones(nodes, dtype=torch.int32),
+            owner=i32(owner),
+            familywork_row=i32(familywork_row),
+            sigma_head_row=i32(familywork_row),
+            action_begin=i32(familywork_row),
+            label=i32(label),
+            path_length=torch.ones(nodes, dtype=torch.int32),
+            target_kind=i32(target_kind),
+            target_row=i32(target_row),
+        )
+        bindings = TopologyBindings(
+            input_type=i32(input_type),
+            output_type=torch.zeros(nodes, dtype=torch.int32),
+            sigma_target_row=i32(familywork_row),
+            child_output_type=torch.zeros(nodes, dtype=torch.int32),
+        )
+        topology.validate(bindings, p_train=self.p_train)
+        return topology, bindings, leaves
+
     @property
     def committed_packets(self) -> tuple[ReplicaTopologyPacket, ...]:
         return tuple(
@@ -1577,7 +1950,12 @@ class AsyncTopologyPublisher:
         )
 
     def assert_drained(self) -> None:
-        if self._drafts or self._pending:
+        if (
+            self._drafts
+            or self._pending
+            or self._deferred_staged
+            or self._deferred_pending
+        ):
             raise TopologyError("uncommitted topology packets remain staged")
 
 
@@ -1589,6 +1967,7 @@ class CommitPlan:
     coverage: CommitCoverage
     published_queues: tuple[SemanticFamilyFIFO, ...] = ()
     topology: tuple[TopologyPublication, ...] = ()
+    deferred_topology: tuple[DeferredUnaryTopologyPublication, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.destinations:
@@ -1600,6 +1979,16 @@ class CommitPlan:
         if len(set(lanes)) != len(lanes):
             raise ValueError(
                 "a family commit may stage only one topology packet per lane"
+            )
+        deferred_keys = tuple(
+            (item.lane, item.sequence) for item in self.deferred_topology
+        )
+        if len(set(deferred_keys)) != len(deferred_keys):
+            raise ValueError("a commit plan repeats a deferred topology sequence")
+        deferred_lanes = tuple(item.lane for item in self.deferred_topology)
+        if len(set(deferred_lanes)) != len(deferred_lanes):
+            raise ValueError(
+                "a family commit may stage only one deferred packet per lane"
             )
         queue_ids = tuple(id(queue) for queue in self.published_queues)
         if len(set(queue_ids)) != len(queue_ids):
@@ -1839,8 +2228,15 @@ class RolloutTransaction:
             if publication.lane not in scheduled.lanes:
                 raise RolloutError("topology publication lane was not scheduled")
             self.topology.preflight(publication, destinations)
+        for publication in plan.deferred_topology:
+            if publication.lane not in scheduled.lanes:
+                raise RolloutError(
+                    "deferred topology lane was not scheduled"
+                )
+            self.topology.preflight_deferred(publication, destinations)
         transaction = None
         pending_topology = None
+        pending_deferred: list[_PendingDeferredUnary] = []
         published = False
         source_head_before: Tensor | None = None
         queue_before: list[tuple[SemanticFamilyFIFO, Tensor, Tensor]] = []
@@ -1861,6 +2257,8 @@ class RolloutTransaction:
                     )
                 for publication in plan.topology:
                     self.topology.stage(publication)
+                for publication in plan.deferred_topology:
+                    self.topology.stage_deferred(publication)
                 transaction = PublicationTransaction.begin_device(
                     destinations,
                     phase="rollout_commit",
@@ -1877,6 +2275,14 @@ class RolloutTransaction:
                     marker,
                     stream=self.commit_stream,
                 )
+                pending_deferred = [
+                    self.topology.prepare_deferred(
+                        publication,
+                        transaction,
+                        stream=self.commit_stream,
+                    )
+                    for publication in plan.deferred_topology
+                ]
                 transaction.fill_all()
                 if failure_injector is not None:
                     failure_injector()
@@ -1932,6 +2338,21 @@ class RolloutTransaction:
                             marker_sequence,
                         )
                     )
+                for publication in plan.deferred_topology:
+                    lane_mask = torch.arange(
+                        self.n_replica,
+                        dtype=torch.int64,
+                        device=self.device,
+                    ).eq(publication.lane)
+                    marker_sequence.copy_(
+                        torch.where(
+                            lane_mask,
+                            torch.full_like(
+                                marker_sequence, publication.sequence
+                            ),
+                            marker_sequence,
+                        )
+                    )
                 success = transaction.publish(
                     commit_marker=marker,
                     sequence=marker_sequence,
@@ -1947,6 +2368,12 @@ class RolloutTransaction:
                     marker,
                     stream=self.commit_stream,
                 )
+                for pending in pending_deferred:
+                    self.topology.finalize_deferred(
+                        pending,
+                        marker,
+                        stream=self.commit_stream,
+                    )
                 commit_ready = torch.cuda.Event(blocking=False)
                 commit_ready.record(self.commit_stream)
         except BaseException:
@@ -1962,9 +2389,18 @@ class RolloutTransaction:
                         queue.ready_tail.copy_(ready)
                         queue.reserved_tail.copy_(reserved)
             self.topology.cancel(plan.topology)
+            self.topology.cancel_deferred(plan.deferred_topology)
             self._state = _MachineState.FAILED
             raise
-        sequence = 0 if not plan.topology else plan.topology[-1].draft.sequence
+        sequence = (
+            plan.deferred_topology[-1].sequence
+            if plan.deferred_topology
+            else (
+                0
+                if not plan.topology
+                else plan.topology[-1].draft.sequence
+            )
+        )
         self._state = _MachineState.COMMITTED
         return RolloutCommit(
             success=success,
@@ -2309,6 +2745,7 @@ __all__ = [
     "CompletionBatch",
     "CompletionFIFO",
     "CompletionPlan",
+    "DeferredUnaryTopologyPublication",
     "DeviceStableRoute",
     "DrawPurpose",
     "EndpointPatch",

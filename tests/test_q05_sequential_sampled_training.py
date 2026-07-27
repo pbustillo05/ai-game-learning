@@ -15,16 +15,19 @@ from pbg.games.poker.queued import (
     CHECK_CALL,
     FOLD,
     NLHEGeometry,
+    Phase5TrainingSession,
     PokerIterationError,
     PokerLegality,
     PokerPolicyOperator,
     PokerStateMachine,
     QueuedPokerModel,
-    RecoveringSequentialSampledPokerIteration,
     SampledShowdownBinding,
-    SequentialSampledPokerIteration,
     build_model_from_config,
     sampled_partitions,
+)
+from pbg.games.poker.queued.training import (
+    RecoveringSequentialSampledPokerIteration,
+    SequentialSampledPokerIteration,
 )
 from pbg.queued import (
     AlignedSequentialStore,
@@ -50,6 +53,7 @@ from pbg.queued import (
     PartitionRows,
     Phase5Config,
     PhysicalLayout,
+    PreemptionNotice,
     PublicationTransaction,
     ReferenceOutputCache,
     RecoverableOverflow,
@@ -57,6 +61,7 @@ from pbg.queued import (
     RunState,
     SealedSequentialInputs,
     SequentialBatchSampler,
+    SequentialLearnerBatch,
     SequentialOverflowRecovery,
     SequentialSampledIteration,
     SoAField,
@@ -73,6 +78,7 @@ from pbg.queued import (
 from pbg.queued.storage import DeviceFailure
 from pbg.queued.storage import MonotoneSlab
 from pbg.games.poker.cards import DeckGeometry
+from pbg.games.poker.model.capacity import max_policy_sequence_tokens
 
 
 CUDA = pytest.mark.skipif(
@@ -102,6 +108,85 @@ def test_nlhe_geometry_and_partition_boundary_matrix() -> None:
     for invalid in (7.5, 8.25, 128.5):
         with pytest.raises(ValueError):
             NLHEGeometry(2, invalid, 13)
+
+
+@CUDA
+def test_multiway_short_all_in_repends_callers_without_reopening_raise() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    machine = PokerStateMachine(NLHEGeometry(3, 8.0, 4))
+    state = machine.initial_roots(
+        1,
+        seed=71,
+        iteration=0,
+        retry_epoch=0,
+        device=device,
+    )
+    # Button/root 0 acts first, seat 1 is the small blind, and seat 2 is the
+    # big blind.  Seat 2's raise from 6 to 8 is all-in but smaller than the
+    # preceding full-raise increment of 5.
+    state = machine.step_player(
+        state, torch.tensor([13], dtype=torch.int32, device=device)
+    )
+    state = machine.step_player(
+        state, torch.tensor([CHECK_CALL], dtype=torch.int32, device=device)
+    )
+    state = machine.step_player(
+        state, torch.tensor([17], dtype=torch.int32, device=device)
+    )
+    torch.cuda.synchronize(device)
+    assert state.committed_street.tolist() == [[6.0, 6.0, 8.0]]
+    assert state.pending.tolist() == [[True, True, False]]
+    assert state.can_raise.tolist() == [[False, False, False]]
+    assert state.to_act.tolist() == [0]
+    assert not machine.needs_chance(state).item()
+    legality = machine.legality(state)
+    assert legality.mask[0, CHECK_CALL]
+    assert not legality.mask[0, 2:].any()
+
+
+@CUDA
+def test_retry_logical_base_owns_private_profile_and_button_identity() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    machine = PokerStateMachine(NLHEGeometry(3, 8.0, 4))
+    complete = machine.initial_roots(
+        5,
+        seed=91,
+        iteration=3,
+        retry_epoch=2,
+        device=device,
+    )
+    replacement = machine.initial_roots(
+        2,
+        seed=91,
+        iteration=3,
+        retry_epoch=2,
+        logical_base=3,
+        device=device,
+    )
+    torch.testing.assert_close(replacement.combo_ids, complete.combo_ids[3:])
+    torch.testing.assert_close(replacement.button, complete.button[3:])
+
+
+@CUDA
+def test_chance_separator_keeps_pretransition_public_arithmetic() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    machine = PokerStateMachine(NLHEGeometry(2, 8.0, 4))
+    state = machine.initial_roots(
+        1, seed=101, iteration=0, retry_epoch=0, device=device
+    )
+    history = machine.empty_history(1, device)
+    action = torch.tensor([CHECK_CALL], dtype=torch.int32, device=device)
+    history = machine.append_player_history(state, action, history)
+    state = machine.step_player(state, action)
+    history = machine.append_player_history(state, action, history)
+    state = machine.step_player(state, action)
+    active = machine.needs_chance(state)
+    history = machine.append_chance_history(state, active, history)
+    torch.cuda.synchronize(device)
+    assert history.action[0, :3].tolist() == [1, 1, 3]
+    assert history.street[0, :3].tolist() == [0, 0, 1]
+    assert history.current_bet[0, 2].item() == 1.0
+    assert history.pot_before[0, 2].item() == 2.0
 
 
 def _raw(
@@ -332,6 +417,17 @@ def test_sampled_leaf_matches_exact_evaluator_rows_and_binding() -> None:
     expected = binding.evaluator.evaluate_showdowns(**leaf)
     actual = plan.destinations[0].values["return_value"][0, :2, 0, :, 0]
     torch.testing.assert_close(actual, expected)
+    normalized = SampledShowdownBinding(
+        geometry,
+        work,
+        n_replica=1,
+        pack_cap=2,
+        utility="stack_normalized",
+    ).leaf_to_layer_work(batch)
+    normalized_value = normalized.destinations[0].values["return_value"][
+        0, :2, 0, :, 0
+    ]
+    torch.testing.assert_close(normalized_value, expected / geometry.stack_bb)
     realized = plan.coverage.validate(
         batch,
         plan.destinations,
@@ -391,11 +487,29 @@ def test_two_partition_model_routes_natural_domains_and_preserves_class_order() 
     assert model.combo_class.cpu().tolist() == list(
         DeckGeometry(geometry.rank_count).class_of_combo
     )
-    model_input = torch.randn(
-        3, geometry.direct_model_input_width, device=device
+    machine = PokerStateMachine(geometry)
+    state = machine.initial_roots(
+        3, seed=17, iteration=0, retry_epoch=0, device=device
     )
+    model_input = machine.direct_model_input(state)
     pre = model.forward_partition("pre", model_input)
-    post = model.forward_partition("post_2", model_input)
+    state = machine.step_player(
+        state,
+        torch.full((3,), CHECK_CALL, dtype=torch.int32, device=device),
+    )
+    state = machine.step_player(
+        state,
+        torch.full((3,), CHECK_CALL, dtype=torch.int32, device=device),
+    )
+    state = machine.deal_next_street(
+        state,
+        torch.arange(
+            geometry.deck_cards, dtype=torch.int64, device=device
+        )[None].expand(3, -1),
+    )
+    post = model.forward_partition(
+        "post_2", machine.direct_model_input(state)
+    )
     assert pre.value.shape == post.value.shape == (
         3,
         geometry.private_hands,
@@ -409,6 +523,40 @@ def test_two_partition_model_routes_natural_domains_and_preserves_class_order() 
     loss.backward()
     assert preflop.affine.weight.grad is not None
     assert postflop.affine.weight.grad is not None
+
+
+@CUDA
+def test_phase5_postflop_fails_before_silent_folded_summary_omission() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(3, 8.0, 4)
+    machine = PokerStateMachine(geometry)
+    state = machine.initial_roots(
+        1, seed=29, iteration=0, retry_epoch=0, device=device
+    )
+    status = state.status.clone()
+    status[:, 2] = 1
+    state = replace(
+        state,
+        street=torch.ones_like(state.street),
+        status=status,
+    )
+    model = QueuedPokerModel(
+        geometry,
+        _PartitionNetwork(
+            geometry.direct_model_input_width,
+            geometry.rank_count**2,
+            device,
+        ),
+        _PartitionNetwork(
+            geometry.direct_model_input_width,
+            geometry.private_hands,
+            device,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="folded summaries"):
+        model.forward_partition(
+            "post_2", machine.direct_model_input(state)
+        )
 
 
 def _phase5_manifest(device: torch.device) -> CapacityManifest:
@@ -478,7 +626,7 @@ def _phase5_layout(
         completion_workspace_row_bytes=64,
         learner_sigma_workspace_row_bytes=64,
         learner_action_workspace_row_bytes=64,
-        topology_packet_row_bytes=64,
+        topology_packet_row_bytes=88,
     )
 
 
@@ -681,6 +829,123 @@ def test_complete_poker_iteration_runs_roots_to_optimizer() -> None:
 
 
 @CUDA
+def test_public_config_composes_checkpoint_preemption_and_exact_resume(
+    tmp_path: Path,
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = next(
+        schema
+        for schema in MODE_SCHEMAS
+        if schema.key == "self_play/sequential/sampled"
+    )
+    config = Phase5Config.from_mapping(
+        {
+            "mode": {
+                "training_regime": "self_play",
+                "rollout_mode": "sequential",
+                "private_estimator": "sampled",
+            },
+            "game": {"players": 2, "stack_bb": 8.0, "rank_count": 4},
+            "model": {
+                "d_model": 4,
+                "n_heads": 1,
+                "n_layers_pre": 1,
+                "n_layers_post": 1,
+                "m_raise": 2,
+                "max_players": 2,
+                "class_embedding_dim": 2,
+                "ffn_hidden": 8,
+                "folder_beta_rank": 0,
+                "folder_line_dim": 2,
+            },
+            "loss": {"reference_kl_coefficient": 0.0},
+            "optimizer": {"name": "adamw", "grad_clip": 5.0},
+            "schedule": {"batch_size": 1},
+            "precision": {"name": "fp32"},
+            "reference": {
+                "interval_iterations": 1,
+                "interval_effective_hands": None,
+                "cache_outputs": True,
+            },
+            "lambda": 0.95,
+            "root_count": 1,
+            "root_count_minimum": 1,
+            "seed": 991,
+            "utility": "stack_normalized",
+        }
+    )
+    required_workspace = 4 * (
+        geometry.direct_model_input_width
+        + geometry.private_hands * (5 + 3 * config.model.m_raise)
+    )
+    layout = replace(
+        _phase5_layout(geometry),
+        family_workspace_row_bytes=required_workspace,
+    )
+    plan = build_storage_plan(
+        mode,
+        sampled_partitions(2),
+        _phase5_manifest(device),
+        layout,
+        device,
+    )
+    model = _EndToEndPokerModel(
+        device, geometry.private_hands, check_down=True
+    )
+    reference = _EndToEndPokerModel(
+        device, geometry.private_hands, check_down=True
+    )
+    notice = PreemptionNotice()
+    notice.requested_signal = 15
+    checkpoint = tmp_path / "preempted.pt"
+    session = Phase5TrainingSession.fresh(
+        config=config,
+        plan=plan,
+        owner_factory=lambda: GeneratedOwners(plan),
+        model=model,
+        reference_model=reference,
+        model_operation=model.evaluate,
+        reference_operation=reference.evaluate,
+        generator=torch.Generator(device=device).manual_seed(config.seed),
+        run_id="phase5-session",
+        execution_config={"capacity_sha": "test"},
+        preemption=notice,
+        preemption_checkpoint=checkpoint,
+    )
+    result = session.run()
+    assert result.player_nodes == 8
+    assert checkpoint.is_file()
+    assert session.reference_state.reference_iteration == 1
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(reference.state_dict()[name], value)
+
+    resumed_model = _EndToEndPokerModel(
+        device, geometry.private_hands, check_down=True
+    )
+    resumed_reference = _EndToEndPokerModel(
+        device, geometry.private_hands, check_down=True
+    )
+    resumed = Phase5TrainingSession.resume(
+        checkpoint,
+        config=config,
+        plan=plan,
+        owner_factory=lambda: GeneratedOwners(plan),
+        model=resumed_model,
+        reference_model=resumed_reference,
+        model_operation=resumed_model.evaluate,
+        reference_operation=resumed_reference.evaluate,
+        generator=torch.Generator(device=device),
+    )
+    assert resumed.run_state.iteration == 1
+    assert resumed.run_state.logical_work == session.run_state.logical_work
+    assert resumed.optimizer.step_count == session.optimizer.step_count
+    torch.testing.assert_close(
+        resumed.optimizer.exp_avg, session.optimizer.exp_avg
+    )
+
+
+@CUDA
 def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 13)
@@ -718,15 +983,37 @@ def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
         },
         device,
     )
+    model.configure_execution("sdpa", 64)
+    assert all(
+        attention.attention_backend == "sdpa"
+        and attention.query_chunk_size == 64
+        for attention in (
+            *model.preflop.attentions,
+            *model.postflop.attentions,
+        )
+    )
     with torch.no_grad():
         for network in (model.preflop, model.postflop):
             network.type_head.affine.weight.zero_()
             network.type_head.affine.bias.copy_(
                 torch.tensor([-30.0, 30.0, -60.0], device=device)
             )
+    token_bound = max_policy_sequence_tokens(
+        n_players=2,
+        stack_bb=8.0,
+        rank_count=13,
+        k_act=5,
+    )
     manifest = replace(
         _phase5_manifest(device),
-        geometry=GameGeometry(2, 8.0, 13, 64, 4096),
+        geometry=GameGeometry(
+            2, 8.0, 13, token_bound, token_bound * token_bound
+        ),
+        hardware=replace(
+            _phase5_manifest(device).hardware,
+            training_max_tokens=token_bound,
+            training_max_token_pairs=token_bound * token_bound,
+        ),
         topology_cap=16,
         topology_edge_cap=16,
         topology_packet_cap=16,
@@ -1009,6 +1296,7 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
     sealed_inputs = {
         partition: SealedSequentialInputs.seal(
             owners.slab("FamilyWork", partition),
+            owners.slab("LearnerIndex", partition),
             input_type=partition,
         )
         for partition in row_counts
@@ -1038,6 +1326,45 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
         )
         for partition in row_counts
     }
+    cost_sampler = SequentialBatchSampler.from_costs(
+        stores,
+        LearnerSchedule(batch_size=3),
+        generator=torch.Generator(device=device).manual_seed(884),
+        mass=torch.tensor([1.0, 2.0]),
+        variance=torch.tensor([4.0, 1.0]),
+        seconds_per_draw=torch.tensor([1.0, 4.0]),
+        total_count=7,
+    )
+    cost_batches = tuple(cost_sampler.batches())
+    assert cost_sampler.statistical_presentations == 7
+    assert sum(batch.rows for batch in cost_batches) == 7
+    assert all(0 < batch.rows <= 3 for batch in cost_batches)
+    mixed_sampler = SequentialBatchSampler.from_costs(
+        stores,
+        LearnerSchedule(batch_size=4, gradient_steps=2),
+        generator=torch.Generator(device=device).manual_seed(885),
+        mass=torch.tensor([3.0, 1.0]),
+        variance=torch.ones(2),
+        seconds_per_draw=torch.ones(2),
+        total_count=4,
+    )
+    mixed_model = _LearnerModel(device)
+    mixed_result = SequentialSampledIteration(
+        model=mixed_model,
+        learner=LearnerOperation(
+            mode,
+            LossConfig(reference_kl_coefficient=0.0),
+            mixed_model.evaluate,
+            _LearnerPolicy(),
+        ),
+        optimizer=DenseAdam(
+            mixed_model, OptimizerConfig(grad_clip=5.0)
+        ),
+        physical_batch_cap={"pre": 2, "post_2": 1},
+    ).optimize(mixed_sampler, iteration=0)
+    assert mixed_result.statistical_presentations == 8
+    assert len(mixed_result.optimizer_steps) == 2
+    assert all(step.applied for step in mixed_result.optimizer_steps)
     sampler = SequentialBatchSampler(
         stores,
         LearnerSchedule(batch_size=3, epochs=2),
@@ -1052,7 +1379,10 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
         _LearnerPolicy(),
     )
     result = SequentialSampledIteration(
-        model=model, learner=learner, optimizer=optimizer
+        model=model,
+        learner=learner,
+        optimizer=optimizer,
+        physical_batch_cap={"pre": 2, "post_2": 1},
     ).optimize(sampler, iteration=0)
     assert result.statistical_presentations == 16
     assert [step.applied for step in result.optimizer_steps] == [True] * 6
@@ -1230,6 +1560,92 @@ def test_cost_allocation_and_reference_cache_fallback_preserve_work() -> None:
     )
     assert admitted is not None
     torch.testing.assert_close(admitted.fields["log_policy"], fields["log_policy"])
+    admitted.release()
+    assert admitted.released
+
+
+@CUDA
+def test_admitted_and_uncached_reference_paths_have_identical_updates() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    mode = next(
+        schema
+        for schema in MODE_SCHEMAS
+        if schema.key == "self_play/sequential/sampled"
+    )
+    current_uncached = _LearnerModel(device)
+    current_cached = _LearnerModel(device)
+    current_cached.load_state_dict(current_uncached.state_dict())
+    reference = _LearnerModel(device)
+    rows = 3
+    fields = MappingProxyType(
+        {
+            "model_input": torch.randn(rows, 26, device=device),
+            "sampled_private_state": torch.tensor(
+                [[0, 1], [1, 2], [2, 3]],
+                dtype=torch.int32,
+                device=device,
+            ),
+            "owner": torch.tensor([0, 1, 0], dtype=torch.int32, device=device),
+            "action": torch.full(
+                (rows,), CHECK_CALL, dtype=torch.int32, device=device
+            ),
+            "old_log_policy": torch.full(
+                (rows, 1), -math.log(4), device=device
+            ),
+            "old_value": torch.zeros(rows, 1, device=device),
+            "value_target": torch.linspace(-0.5, 0.5, rows, device=device)[:, None],
+            "advantage_target": torch.linspace(
+                0.2, 0.8, rows, device=device
+            )[:, None],
+        }
+    )
+    batch = SequentialLearnerBatch(
+        "pre",
+        torch.arange(rows, dtype=torch.int64, device=device),
+        fields,
+    )
+    with torch.no_grad():
+        reference_fields = reference.evaluate(
+            "pre",
+            fields["model_input"],
+            fields["sampled_private_state"],
+            fields["owner"],
+        ).policy_raw
+    cache = ReferenceOutputCache.admit(
+        reference_fields,
+        byte_budget=1 << 20,
+        resident_bytes=0,
+        build_bytes=0,
+        predicted_saved_seconds=2.0,
+        predicted_build_seconds=1.0,
+    )
+    assert cache is not None
+    loss = LossConfig(reference_kl_coefficient=0.3)
+    uncached = LearnerOperation(
+        mode, loss, current_uncached.evaluate, _LearnerPolicy()
+    ).forward_loss_backward(
+        batch,
+        iteration=4,
+        reference_operation=reference.evaluate,
+    )
+    cached = LearnerOperation(
+        mode, loss, current_cached.evaluate, _LearnerPolicy()
+    ).forward_loss_backward(
+        batch,
+        iteration=4,
+        reference_cache=cache,
+    )
+    for name in uncached.__dataclass_fields__:
+        torch.testing.assert_close(
+            getattr(cached, name), getattr(uncached, name), atol=0, rtol=0
+        )
+    torch.testing.assert_close(
+        current_cached.affine.weight.grad,
+        current_uncached.affine.weight.grad,
+        atol=0,
+        rtol=0,
+    )
+    cache.release()
 
 
 @CUDA
@@ -1335,15 +1751,32 @@ def _legacy_checkpoint(version: str = "pbg-checkpoint-v8") -> dict[str, object]:
                 "folder_line_dim": 2,
                 "eps": 1.0e-8,
             },
-            "loss": {"name": "ppo"},
+            "loss": {
+                "name": "ppo",
+                "lam": 0.95,
+                "clip_eps": 0.2,
+                "clip_eps_v": 0.2,
+                "c_v": 0.5,
+                "c_h": 0.01,
+                "c_kl": 0.0,
+                "value_loss": "mse",
+                "entropy_schedule": "const",
+                "entropy_decay_iters": None,
+                "utility_normalization": "raw",
+            },
             "training": {
                 "mode": "normal",
                 "amp": True,
                 "optimizer": "adamw",
                 "adam_betas": (0.9, 0.999),
                 "grad_clip": 1.0,
+                "minibatch_size": 4,
+                "gd_steps_per_iter": 3,
+                "ppo_epochs": None,
                 "kl_ref_interval": 5,
                 "kl_ref_effective_hands_rollout": None,
+                "seed": 2,
+                "reproducibility": "strict",
                 "out_dir": "ignored",
             },
             "probe": None,
@@ -1410,6 +1843,11 @@ def test_offline_converter_records_hash_and_refuses_repeat(
     )
     assert metadata["mode"] == "self_play/sequential/sampled"
     converted = torch.load(destination, map_location="cpu", weights_only=False)
+    public = Phase5Config.from_mapping(converted["scientific_config"])
+    assert public.lambda_ == 0.95
+    assert public.optimizer.name == "adamw"
+    assert public.schedule.gradient_steps == 3
+    assert "training" not in converted["scientific_config"]
     assert converted["run_state"]["iteration"] == 2
     assert converted["optimizer"]["step"] == 3
     assert converted["reference_state"]["interval_iterations"] == 5
@@ -1496,6 +1934,7 @@ def test_strict_phase5_config_reports_dotted_unknown_path() -> None:
         "schedule": {"batch_size": 4},
         "precision": {},
         "reference": {},
+        "lambda": 0.95,
         "root_count": 8,
         "root_count_minimum": 2,
         "seed": 7,

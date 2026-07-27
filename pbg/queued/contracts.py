@@ -343,7 +343,14 @@ def _owners(
     if not sampled:
         action_target_fields.insert(0, "posterior")
 
-    learner_index_fields = ["target_degree"]
+    # Sequential sampled rows retain their learner inputs in the generated
+    # align-to-backward owner.  This is the admitted handoff that permits the
+    # rollout-hot FamilyWork slabs to die before optimization.
+    learner_index_fields = (
+        ["model_input", "sampled_private_state", "owner"]
+        if sampled and not branched
+        else ["target_degree"]
+    )
     if branched:
         learner_index_fields.extend(
             ("action_begin", "action_count", "log_sampling_weight")

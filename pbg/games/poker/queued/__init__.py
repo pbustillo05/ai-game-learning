@@ -6,7 +6,6 @@ from pbg.games.poker.queued.hooks import (
     PokerLearnerPolicy,
     PokerState,
     PokerStateMachine,
-    PokerTransitionTrace,
     QueuedPokerError,
     SampledShowdownBinding,
     SequentialSampledPokerHooks,
@@ -28,10 +27,9 @@ from pbg.games.poker.queued.model import (
     build_model_from_config,
 )
 from pbg.games.poker.queued.training import (
+    Phase5TrainingSession,
     PokerIterationError,
     PokerIterationResult,
-    RecoveringSequentialSampledPokerIteration,
-    SequentialSampledPokerIteration,
 )
 
 __all__ = [
@@ -40,10 +38,10 @@ __all__ = [
     "CHECK_CALL",
     "FOLD",
     "NLHEGeometry",
+    "Phase5TrainingSession",
     "PokerForwardInput",
     "PokerIterationError",
     "PokerIterationResult",
-    "RecoveringSequentialSampledPokerIteration",
     "PokerLearnerPolicy",
     "PokerLegality",
     "PokerModelError",
@@ -51,12 +49,10 @@ __all__ = [
     "PokerPolicyOperator",
     "PokerState",
     "PokerStateMachine",
-    "PokerTransitionTrace",
     "QueuedPokerModel",
     "QueuedPokerError",
     "SampledShowdownBinding",
     "SequentialSampledPokerHooks",
-    "SequentialSampledPokerIteration",
     "build_model_from_config",
     "sampled_partitions",
     "validate_phase5_mode",
