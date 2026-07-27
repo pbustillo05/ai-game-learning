@@ -15,12 +15,14 @@ from pbg.queued import (
     AsyncTopologyPublisher,
     BoundedChanceClosure,
     ChanceFrontier,
+    CommitCoverage,
     CommitPlan,
     CompletionFIFO,
+    CompletionPlan,
     ConversionSpec,
     DeviceDestinationRequest,
     DeviceFailureState,
-    DevicePublicationTransaction,
+    PublicationTransaction,
     DrawPurpose,
     EndpointPatch,
     FamilyQueueState,
@@ -31,6 +33,7 @@ from pbg.queued import (
     PartitionMap,
     RolloutMode,
     RolloutTransaction,
+    RolloutOwnerRegistry,
     SampleWorkspace,
     SemanticFamilyFIFO,
     SoAField,
@@ -149,11 +152,54 @@ def _slab(
     )
 
 
+def _registry(
+    slabs: tuple[MonotoneSlab, ...],
+    *,
+    family_pack_cap: int = 8,
+    chance_frontier_cap: int = 8,
+    completion_pack_cap: int = 8,
+    topology_packet_cap: int = 8,
+    topology_cap: int = 32,
+    topology_edge_cap: int = 32,
+) -> RolloutOwnerRegistry:
+    return RolloutOwnerRegistry.for_testing(
+        slabs,
+        family_pack_cap=family_pack_cap,
+        chance_frontier_cap=chance_frontier_cap,
+        completion_pack_cap=completion_pack_cap,
+        topology_packet_cap=topology_packet_cap,
+        topology_cap=topology_cap,
+        topology_edge_cap=topology_edge_cap,
+    )
+
+
+def _coverage(
+    counts: torch.Tensor,
+    rows: int,
+    *,
+    destination: int = 0,
+) -> CommitCoverage:
+    ordinal = torch.arange(rows, dtype=torch.int64, device=counts.device)
+    ordinal = ordinal.expand(counts.numel(), rows)
+    valid = ordinal < counts[:, None]
+    return CommitCoverage(
+        valid=valid,
+        source_ordinal=ordinal,
+        destination=torch.full_like(ordinal, destination),
+        destination_ordinal=ordinal,
+    )
+
+
 def _i32(values) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32)
 
 
-def _draft(sequence: int = 0) -> tuple[TopologyDraftPacket, EndpointPatch]:
+def _draft(
+    sequence: int = 0,
+    *,
+    device: torch.device | str = "cuda",
+    target_ordinal: int = 0,
+) -> tuple[TopologyDraftPacket, EndpointPatch]:
     topology = Topology(
         parent=_i32([-1]),
         child_begin=_i32([0]),
@@ -187,7 +233,11 @@ def _draft(sequence: int = 0) -> tuple[TopologyDraftPacket, EndpointPatch]:
         sequence=sequence,
         edge=_i32([0]),
         target_kind=_i32([1]),
-        target_row=_i32([0]),
+        reservation_index=_i32([0]),
+        preflight_target_row=_i32([0]),
+        target_ordinal=torch.tensor(
+            [target_ordinal], dtype=torch.int64, device=device
+        ),
         child_output_type=_i32([0]),
         commit_sequence=sequence,
     )
@@ -209,6 +259,7 @@ def test_scheduler_is_full_first_preorder_load_age_and_never_pads_lanes() -> Non
     assert selected.input_type == "post2"
     assert selected.rows == 4
     assert selected.lanes == (0, 2)
+    assert selected.lane_schemas == (fixed, kkt)
     assert not selected.forced_partial
 
     partial = scheduler.select(states[1:2] + states[3:4], allow_partial=True)
@@ -251,7 +302,7 @@ def test_device_counts_scans_reservations_and_publication_is_lane_atomic() -> No
         failures,
     )
     prior_counts = torch.tensor([0, 1, 0], dtype=torch.int64, device=device)
-    prior = DevicePublicationTransaction.begin(
+    prior = PublicationTransaction.begin_device(
         (_request(right, prior_counts, max_rows=1, base=3),),
         phase="prior_commit",
         active=torch.tensor([False, True, False], device=device),
@@ -260,7 +311,7 @@ def test_device_counts_scans_reservations_and_publication_is_lane_atomic() -> No
     prior.publish()
     left_counts = torch.tensor([2, 2, 1], dtype=torch.int64, device=device)
     right_counts = torch.tensor([2, 4, 1], dtype=torch.int64, device=device)
-    transaction = DevicePublicationTransaction.begin(
+    transaction = PublicationTransaction.begin_device(
         (
             _request(left, left_counts, max_rows=2, base=5),
             _request(right, right_counts, max_rows=4, base=7),
@@ -305,7 +356,7 @@ def test_device_counts_scans_reservations_and_publication_is_lane_atomic() -> No
         pack_failures,
     )
     invalid_count = torch.tensor([3], dtype=torch.int64, device=device)
-    invalid = DevicePublicationTransaction.begin(
+    invalid = PublicationTransaction.begin_device(
         (_request(packed, invalid_count, max_rows=2, logical=40),),
         phase="rollout_commit",
         active=torch.ones(1, dtype=torch.bool, device=device),
@@ -329,14 +380,14 @@ def test_device_counts_scans_reservations_and_publication_is_lane_atomic() -> No
         boundary_failures,
     )
     two = torch.tensor([2], dtype=torch.int64, device=device)
-    initial = DevicePublicationTransaction.begin(
+    initial = PublicationTransaction.begin_device(
         (_request(boundary, two, max_rows=2, base=3),),
         phase="initial",
         active=torch.ones(1, dtype=torch.bool, device=device),
     )
     initial.fill_all()
     initial.publish()
-    final = DevicePublicationTransaction.begin(
+    final = PublicationTransaction.begin_device(
         (_request(boundary, two, max_rows=4, base=9),),
         phase="final",
         active=torch.ones(1, dtype=torch.bool, device=device),
@@ -388,7 +439,7 @@ def test_device_publication_failure_injection_exposes_none_and_poisons() -> None
         failures,
     )
     counts = torch.tensor([2], dtype=torch.int64, device=device)
-    transaction = DevicePublicationTransaction.begin(
+    transaction = PublicationTransaction.begin_device(
         (_request(slab, counts, max_rows=2),),
         phase="rollout_commit",
         active=torch.ones(1, dtype=torch.bool, device=device),
@@ -426,7 +477,7 @@ def test_device_materialization_has_no_hidden_nonzero_or_scalar_sync() -> None:
         ),
         acc_events=True,
     ) as profile:
-        transaction = DevicePublicationTransaction.begin(
+        transaction = PublicationTransaction.begin_device(
             (_request(slab, counts, max_rows=4),),
             phase="rollout_commit",
             active=torch.ones(2, dtype=torch.bool, device=device),
@@ -468,6 +519,56 @@ torch.cuda.synchronize()
     )
     assert completed.returncode != 0
     assert "declared queue family" in completed.stderr
+
+
+@CUDA
+@pytest.mark.parametrize(
+    ("body", "message"),
+    (
+        (
+            """
+from types import MappingProxyType
+import torch
+from pbg.queued import CommitCoverage, DeviceDestinationRequest, DeviceFailureState, FamilyBatch, MonotoneSlab, SoAField, SoASchema
+device = torch.device("cuda")
+failure = DeviceFailureState(1, device)
+slab = MonotoneSlab(SoASchema("Leaf", (SoAField("x", torch.int32),), "test"), 2, 1, device, failure_state=failure)
+counts = torch.ones(1, dtype=torch.int64, device=device)
+request = DeviceDestinationRequest(slab, counts, {"x": torch.ones((1, 1), dtype=torch.int32, device=device)}, "pre", torch.zeros(1, dtype=torch.int64, device=device))
+batch = FamilyBatch("pre", torch.zeros(1, dtype=torch.int64, device=device), torch.arange(2, device=device)[None], MappingProxyType({}))
+coverage = CommitCoverage(torch.tensor([[True, False]], device=device), torch.tensor([[0, 1]], dtype=torch.int64, device=device), torch.zeros((1, 2), dtype=torch.int64, device=device), torch.tensor([[0, 0]], dtype=torch.int64, device=device))
+coverage.validate(batch, (request,), torch.ones(1, dtype=torch.bool, device=device))
+torch.cuda.synchronize()
+""",
+            "skipped a scheduled source row",
+        ),
+        (
+            """
+from types import MappingProxyType
+import torch
+from pbg.queued import BoundedChanceClosure, ChanceFrontier, DeviceFailureState, MonotoneSlab, RolloutOwnerRegistry, SoAField, SoASchema
+device = torch.device("cuda")
+failure = DeviceFailureState(1, device)
+slab = MonotoneSlab(SoASchema("Leaf", (SoAField("x", torch.int32),), "test"), 1, 1, device, failure_state=failure)
+owners = RolloutOwnerRegistry.for_testing((slab,), family_pack_cap=1, chance_frontier_cap=1, completion_pack_cap=1, topology_packet_cap=1, topology_cap=1, topology_edge_cap=1)
+frontier = ChanceFrontier(torch.ones((1,1), dtype=torch.bool, device=device), torch.zeros((1,1), dtype=torch.int64, device=device), torch.zeros((1,1), dtype=torch.int64, device=device), MappingProxyType({}))
+BoundedChanceClosure(seed=1, iteration=1, owners=owners, max_generations=1).run(frontier, lambda current, key, generation: key, lambda current, sampled, generation: current)
+torch.cuda.synchronize()
+""",
+            "exhausted its generation cap",
+        ),
+    ),
+)
+def test_terminal_device_contract_failures(body: str, message: str) -> None:
+    completed = subprocess.run(
+        (sys.executable, "-c", body),
+        cwd=str(Path(__file__).resolve().parents[1]),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert message in completed.stderr
 
 
 @CUDA
@@ -616,7 +717,7 @@ def test_one_model_sample_commit_path_serves_sequential_and_branched(
         dtype=torch.int64,
         device=device,
     )
-    roots = DevicePublicationTransaction.begin(
+    roots = PublicationTransaction.begin_device(
         (
             DeviceDestinationRequest(
                 family,
@@ -643,8 +744,9 @@ def test_one_model_sample_commit_path_serves_sequential_and_branched(
         states, allow_partial=True
     )
     assert scheduled is not None
-    publisher = AsyncTopologyPublisher(2)
-    draft, patch = _draft(0)
+    owners = _registry((family, metadata, leaf), family_pack_cap=2)
+    publisher = AsyncTopologyPublisher(owners, p_train=1)
+    draft, patch = _draft(0, device=device)
     seen: dict[str, object] = {}
 
     class Hooks:
@@ -680,6 +782,7 @@ def test_one_model_sample_commit_path_serves_sequential_and_branched(
                         ),
                     ),
                 ),
+                _coverage(counts, 2),
                 topology=(TopologyPublication(0, draft, patch),),
             )
 
@@ -692,7 +795,7 @@ def test_one_model_sample_commit_path_serves_sequential_and_branched(
         seed=123,
         iteration=4,
         topology=publisher,
-        retained_slabs=(family, leaf),
+        owners=owners,
     )
     result = engine.execute(fifo, scheduled, model, Hooks())
     torch.cuda.synchronize(device)
@@ -709,7 +812,10 @@ def test_one_model_sample_commit_path_serves_sequential_and_branched(
     assert publisher.committed_packets == ()
     committed = publisher.drain()
     assert len(committed) == 1
-    committed[0].topology.validate(committed[0].bindings, p_train=1)
+    assert committed[0].lane == 0
+    committed[0].packet.topology.validate(
+        committed[0].packet.bindings, p_train=1
+    )
 
     family.release()
     metadata.release()
@@ -731,7 +837,7 @@ def test_sample_cannot_publish_retained_storage() -> None:
     fifo = SemanticFamilyFIFO("pre", _partitions(), family, metadata)
     fifo.initialize()
     counts = torch.ones(1, dtype=torch.int64, device=device)
-    root = DevicePublicationTransaction.begin(
+    root = PublicationTransaction.begin_device(
         (_request(family, counts, max_rows=1),),
         phase="root_commit",
         active=torch.ones(1, dtype=torch.bool, device=device),
@@ -760,12 +866,13 @@ def test_sample_cannot_publish_retained_storage() -> None:
         def transition(self, request):
             raise AssertionError("transition must not run")
 
+    owners = _registry((family, metadata, leaf), family_pack_cap=1)
     engine = RolloutTransaction(
         schema,
         seed=1,
         iteration=1,
-        topology=AsyncTopologyPublisher(2),
-        retained_slabs=(family, leaf),
+        topology=AsyncTopologyPublisher(owners, p_train=1),
+        owners=owners,
     )
     with pytest.raises(Exception, match="sample wrote"):
         engine.execute(
@@ -782,66 +889,180 @@ def test_sample_cannot_publish_retained_storage() -> None:
     failures.release()
 
 
-def test_topology_descriptors_publish_only_with_complete_endpoint_patch() -> None:
-    too_small = AsyncTopologyPublisher(1)
-    oversized, _ = _draft(0)
-    with pytest.raises(TopologyError, match="packet cap"):
-        too_small.stage(oversized)
-
-    publisher = AsyncTopologyPublisher(2)
-    draft, patch = _draft(0)
-    publisher.stage(draft)
-    bad = EndpointPatch(
-        sequence=0,
-        edge=_i32([]),
-        target_kind=_i32([]),
-        target_row=_i32([]),
-        child_output_type=_i32([]),
-        commit_sequence=0,
+@CUDA
+def test_post_publish_exception_rolls_back_destination_and_source_visibility() -> None:
+    device = torch.device("cuda", 0)
+    failures = DeviceFailureState(1, device)
+    family = _slab(_family_schema(), 2, failures)
+    metadata = _slab(_metadata_schema(), 1, failures)
+    leaf = _slab(
+        _schema("Leaf", (SoAField("result", torch.int32),)),
+        2,
+        failures,
     )
-    with pytest.raises(TopologyError, match="cover unresolved"):
-        publisher.commit(bad)
+    fifo = SemanticFamilyFIFO("pre", _partitions(), family, metadata)
+    fifo.initialize()
+    counts = torch.ones(1, dtype=torch.int64, device=device)
+    root = PublicationTransaction.begin_device(
+        (_request(family, counts, max_rows=1),),
+        phase="root",
+        active=torch.ones(1, dtype=torch.bool, device=device),
+    )
+    root.fill_all()
+    root.publish()
+    fifo.publish_family_tail(torch.ones(1, dtype=torch.bool, device=device))
+    schema = mode_schema("self_play", "sequential", "sampled")
+    scheduled = FamilyScheduler(("pre",), 1).select(
+        (FamilyQueueState(0, "pre", 0, 0, 1, 1, 0, schema),),
+        allow_partial=True,
+    )
+    assert scheduled is not None
+    owners = _registry(
+        (family, metadata, leaf),
+        family_pack_cap=1,
+        completion_pack_cap=1,
+    )
+    publisher = AsyncTopologyPublisher(owners, p_train=1)
 
-    publisher = AsyncTopologyPublisher(2)
-    publisher.stage(draft)
-    packet = publisher.commit(patch)
-    packet.topology.validate(packet.bindings, p_train=1)
-    assert packet.topology.target_row.tolist() == [0]
-    assert len(publisher.committed_packets) == 1
-    publisher.assert_drained()
+    class Hooks:
+        def model_input(self, batch):
+            return batch.fields["model_input"]
 
-    second, _ = _draft(1)
-    publisher.stage(second)
-    with pytest.raises(TopologyError, match="uncommitted"):
-        publisher.assert_drained()
-    publisher.abort(1)
+        def sample(self, request):
+            return SampleWorkspace(
+                MappingProxyType({"label": request.rng_key}),
+                torch.ones(1, dtype=torch.int64, device=device),
+            )
+
+        def transition(self, request):
+            destination = _request(leaf, counts, max_rows=1)
+            return CommitPlan((destination,), _coverage(counts, 1))
+
+    engine = RolloutTransaction(
+        schema,
+        seed=1,
+        iteration=0,
+        topology=publisher,
+        owners=owners,
+    )
+    with pytest.raises(RuntimeError, match="after publish"):
+        engine.execute(
+            fifo,
+            scheduled,
+            lambda value, lanes: {"policy": value.sum(-1)},
+            Hooks(),
+            post_publish_failure_injector=lambda: (_ for _ in ()).throw(
+                RuntimeError("after publish")
+            ),
+        )
+    torch.cuda.synchronize(device)
+    assert leaf.tail(0) == leaf.reserved_tail(0) == 0
+    assert fifo.head.tolist() == [0]
     publisher.assert_drained()
+    family.release()
+    metadata.release()
+    leaf.release()
+    failures.release()
 
 
 @CUDA
-def test_topology_acceptance_waits_for_device_commit_marker_and_drops_failure() -> None:
+def test_topology_endpoints_bind_divergent_reservations_and_keep_replica_identity() -> None:
     device = torch.device("cuda", 0)
-    publisher = AsyncTopologyPublisher(2)
-    draft0, patch0 = _draft(0)
-    publisher.stage(draft0)
-    marker0 = torch.tensor([0], dtype=torch.int64, device=device)
-    publisher.defer(TopologyPublication(0, draft0, patch0), marker0)
-    assert publisher.committed_packets == ()
+    failures = DeviceFailureState(2, device)
+    leaf = _slab(
+        _schema("Leaf", (SoAField("terminal", torch.int32),)),
+        4,
+        failures,
+    )
+    owners = _registry((leaf,))
+    publisher = AsyncTopologyPublisher(owners, p_train=1)
+    one = torch.ones(2, dtype=torch.int64, device=device)
+    prior = PublicationTransaction.begin_device(
+        (_request(leaf, one, max_rows=1),),
+        phase="prior",
+        active=torch.tensor([False, True], device=device),
+    )
+    prior.fill_all()
+    prior.publish()
+    request = _request(leaf, one, max_rows=1, base=7)
+    transaction = PublicationTransaction.begin_device(
+        (request,),
+        phase="rollout",
+        active=torch.ones(2, dtype=torch.bool, device=device),
+    )
+    publications = tuple(
+        TopologyPublication(
+            lane,
+            *_draft(0, device=device),
+        )
+        for lane in (0, 1)
+    )
+    for publication in publications:
+        publisher.preflight(publication, (request,))
+        publisher.stage(publication)
+    resolved = tuple(
+        publisher.resolve_rows(publication, transaction)
+        for publication in publications
+    )
+    marker = torch.full((2,), -1, dtype=torch.int64, device=device)
+    stream = torch.cuda.current_stream(device)
+    pending = publisher.prepare_defer(
+        publications, resolved, marker, stream=stream
+    )
+    transaction.fill_all()
+    transaction.publish(
+        commit_marker=marker,
+        sequence=torch.zeros_like(marker),
+    )
+    publisher.finalize_defer(pending, marker, stream=stream)
     accepted = publisher.drain()
-    assert len(accepted) == 1
-    accepted[0].topology.validate(accepted[0].bindings, p_train=1)
-
-    draft1, patch1 = _draft(1)
-    publisher.stage(draft1)
-    marker1 = torch.tensor([-1], dtype=torch.int64, device=device)
-    publisher.defer(TopologyPublication(0, draft1, patch1), marker1)
-    assert publisher.drain() == ()
+    assert tuple(item.lane for item in accepted) == (0, 1)
+    assert tuple(
+        item.packet.topology.target_row.item() for item in accepted
+    ) == (0, 1)
+    assert tuple(item.packet.sequence for item in accepted) == (0, 0)
     publisher.assert_drained()
+    leaf.release()
+    failures.release()
+
+
+@CUDA
+def test_topology_staging_enforces_cumulative_manifest_caps() -> None:
+    device = torch.device("cuda", 0)
+    failures = DeviceFailureState(2, device)
+    leaf = _slab(
+        _schema("Leaf", (SoAField("terminal", torch.int32),)),
+        2,
+        failures,
+    )
+    owners = _registry(
+        (leaf,),
+        topology_packet_cap=2,
+        topology_cap=1,
+        topology_edge_cap=1,
+    )
+    publisher = AsyncTopologyPublisher(owners, p_train=1)
+    first = TopologyPublication(0, *_draft(0, device=device))
+    second = TopologyPublication(1, *_draft(0, device=device))
+    publisher.stage(first)
+    with pytest.raises(TopologyError, match="cumulative node cap"):
+        publisher.stage(second)
+    publisher.abort(0, 0)
+    publisher.assert_drained()
+    leaf.release()
+    failures.release()
 
 
 @CUDA
 def test_bounded_chance_closure_uses_fixed_launches_and_inactive_draws_nothing() -> None:
     device = torch.device("cuda", 0)
+    failures = DeviceFailureState(2, device)
+    owner = _slab(
+        _schema("Leaf", (SoAField("terminal", torch.int32),)),
+        4,
+        failures,
+    )
+    owners = _registry((owner,), chance_frontier_cap=4)
     active = torch.tensor(
         [[True, True, False, False], [True, False, False, False]],
         dtype=torch.bool,
@@ -890,7 +1111,7 @@ def test_bounded_chance_closure_uses_fixed_launches_and_inactive_draws_nothing()
     result = BoundedChanceClosure(
         seed=17,
         iteration=3,
-        capacity=4,
+        owners=owners,
         max_generations=4,
     ).run(frontier, sample, commit)
     torch.cuda.synchronize(device)
@@ -906,6 +1127,8 @@ def test_bounded_chance_closure_uses_fixed_launches_and_inactive_draws_nothing()
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
     assert not {"item", "cpu", "tolist", "numpy"}.intersection(calls_in_source)
+    owner.release()
+    failures.release()
 
 
 @CUDA
@@ -923,42 +1146,70 @@ def test_completion_fifo_consumes_exact_stable_prefix_and_isolates_failure() -> 
         failures,
     )
     leaf_counts = torch.tensor([2, 2], dtype=torch.int64, device=device)
-    leaves = DevicePublicationTransaction.begin(
+    leaves = PublicationTransaction.begin_device(
         (_request(leaf, leaf_counts, max_rows=2, base=9),),
         phase="leaf_commit",
         active=torch.ones(2, dtype=torch.bool, device=device),
     )
     leaves.fill_all()
     leaves.publish()
-    fifo = CompletionFIFO(leaf, 2)
+    prior_counts = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    prior = PublicationTransaction.begin_device(
+        (_request(work, prior_counts, max_rows=1, base=4),),
+        phase="prior_layer_work",
+        active=torch.tensor([False, True], device=device),
+    )
+    prior.fill_all()
+    prior.publish()
+    owners = _registry(
+        (leaf, work), completion_pack_cap=2, family_pack_cap=2
+    )
+    fifo = CompletionFIFO(
+        leaf,
+        owners,
+        head=torch.zeros(2, dtype=torch.int64, device=device),
+        observed_epoch=torch.zeros(2, dtype=torch.int64, device=device),
+    )
 
     def complete(batch):
         values = {
             "return_value": batch.fields["terminal"].to(torch.float32)
         }
-        return (
-            DeviceDestinationRequest(
-                work,
-                torch.tensor([2, 3], dtype=torch.int64, device=device),
-                values=values,
-                input_type="all",
-                logical_address=torch.tensor(
-                    [30, 31], dtype=torch.int64, device=device
+        counts = torch.tensor([2, 3], dtype=torch.int64, device=device)
+        return CompletionPlan(
+            (
+                DeviceDestinationRequest(
+                    work,
+                    counts,
+                    values=values,
+                    input_type="all",
+                    logical_address=torch.tensor(
+                        [30, 31], dtype=torch.int64, device=device
+                    ),
                 ),
             ),
+            _coverage(counts, 2),
         )
 
-    success = fifo.complete((0, 1), 2, complete)
+    ready = torch.cuda.Event(blocking=False)
+    ready.record()
+    success = fifo.complete((0, 1), 2, complete, wait_for=ready)
     torch.cuda.synchronize(device)
     assert success.tolist() == [True, False]
     assert fifo.head.tolist() == [2, 0]
     assert work.tail(0) == 2
-    assert work.tail(1) == 0
+    assert work.tail(1) == 1
     failure = failures.snapshot(1)
     assert failure is not None and failure.phase == "completion"
     leaf.reset_failed_lane(1)
     work.reset_failed_lane(1)
     failures.clear_lane(1)
+    fifo._observe_retry_epoch()
+    assert fifo.observed_epoch.tolist() == [0, 1]
+    assert fifo.head.tolist() == [2, 0]
+    fifo.release()
+    with pytest.raises(Exception, match="released"):
+        _ = fifo.ready_tail
     leaf.release()
     work.release()
     failures.release()
@@ -966,9 +1217,8 @@ def test_completion_fifo_consumes_exact_stable_prefix_and_isolates_failure() -> 
 
 def test_rollout_hot_paths_do_not_read_cuda_scalars_on_host() -> None:
     hot = (
-        DevicePublicationTransaction.__init__,
-        DevicePublicationTransaction.fill,
-        DevicePublicationTransaction.publish,
+        PublicationTransaction.begin_device,
+        CommitCoverage.validate,
         SemanticFamilyFIFO.publish_family_tail,
         SemanticFamilyFIFO.stable_prefix,
         SemanticFamilyFIFO.consume,

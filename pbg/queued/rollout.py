@@ -23,9 +23,8 @@ from pbg.queued.contracts import (
 )
 from pbg.queued.storage import (
     DeviceDestinationRequest,
-    DevicePublicationTransaction,
     MonotoneSlab,
-    StorageError,
+    PublicationTransaction,
 )
 from pbg.queued.topology import (
     Topology,
@@ -54,6 +53,15 @@ class DrawPurpose(IntEnum):
 
 LOGICAL_RNG_VERSION = "counter_hash_v3"
 _MASK63 = (1 << 63) - 1
+_OWNER_REGISTRY_TOKEN = object()
+
+
+def _int64_like(reference: Tensor, value: Tensor | int) -> Tensor:
+    """Materialize scalar counters without a host-to-device scalar copy."""
+
+    if isinstance(value, Tensor):
+        return value.to(dtype=torch.int64, device=reference.device)
+    return torch.full_like(reference, int(value), dtype=torch.int64)
 
 
 def _mix63(value: Tensor) -> Tensor:
@@ -103,15 +111,9 @@ def logical_rng_keys(
     root_address, path = torch.broadcast_tensors(
         root_address.to(torch.int64), path.to(torch.int64)
     )
-    draw_tensor = torch.as_tensor(
-        draw, dtype=torch.int64, device=root_address.device
-    )
-    lane_tensor = torch.as_tensor(
-        lane, dtype=torch.int64, device=root_address.device
-    )
-    epoch_tensor = torch.as_tensor(
-        retry_epoch, dtype=torch.int64, device=root_address.device
-    )
+    draw_tensor = _int64_like(root_address, draw)
+    lane_tensor = _int64_like(root_address, lane)
+    epoch_tensor = _int64_like(root_address, retry_epoch)
     root_address, path, draw_tensor, lane_tensor, epoch_tensor = (
         torch.broadcast_tensors(
             root_address,
@@ -151,9 +153,7 @@ def logical_rng_keys(
 def child_path_keys(parent_path: Tensor, child_ordinal: Tensor | int) -> Tensor:
     """Extend a logical path by its positive one-based child ordinal."""
 
-    ordinal = torch.as_tensor(
-        child_ordinal, dtype=torch.int64, device=parent_path.device
-    )
+    ordinal = _int64_like(parent_path, child_ordinal)
     parent_path, ordinal = torch.broadcast_tensors(
         parent_path.to(torch.int64), ordinal
     )
@@ -345,6 +345,7 @@ class ScheduledFamily:
 
     input_type: str
     lanes: tuple[int, ...]
+    lane_schemas: tuple[ModeSchema, ...]
     rows: int
     forced_partial: bool
 
@@ -353,6 +354,7 @@ class ScheduledFamily:
             not self.input_type
             or not self.lanes
             or len(set(self.lanes)) != len(self.lanes)
+            or len(self.lane_schemas) != len(self.lanes)
             or self.rows <= 0
         ):
             raise ValueError("invalid scheduled family cohort")
@@ -440,9 +442,11 @@ class FamilyScheduler:
         )
         validate_replica_group(tuple(state.schema for state in same_family))
         lanes = tuple(sorted(state.lane for state in same_family))
+        schema_by_lane = {state.lane: state.schema for state in same_family}
         return ScheduledFamily(
             input_type=first.input_type,
             lanes=lanes,
+            lane_schemas=tuple(schema_by_lane[lane] for lane in lanes),
             rows=rows,
             forced_partial=forced_partial,
         )
@@ -532,7 +536,7 @@ class SemanticFamilyFIFO:
         counts = torch.ones(
             self.n_replica, dtype=torch.int64, device=self.device
         )
-        transaction = DevicePublicationTransaction.begin(
+        transaction = PublicationTransaction.begin_device(
             (
                 DeviceDestinationRequest(
                     slab=self.metadata,
@@ -660,7 +664,7 @@ class SampleWorkspace:
 
 @dataclass(frozen=True)
 class SampleRequest:
-    schema: ModeSchema
+    lane_schemas: tuple[ModeSchema, ...]
     batch: FamilyBatch
     model: ModelWorkspace
     rng_key: Tensor
@@ -668,10 +672,300 @@ class SampleRequest:
 
 @dataclass(frozen=True)
 class TransitionRequest:
-    schema: ModeSchema
+    lane_schemas: tuple[ModeSchema, ...]
     batch: FamilyBatch
     model: ModelWorkspace
     sample: SampleWorkspace
+
+
+@dataclass(frozen=True)
+class CommitCoverage:
+    """Fixed-shape proof connecting sources to every committed row.
+
+    Every valid descriptor names one scheduled source ordinal and one
+    destination request/ordinal. A source may have several descendants, but
+    every scheduled source must occur and every realized destination row must
+    occur exactly once.
+    """
+
+    valid: Tensor
+    source_ordinal: Tensor
+    destination: Tensor
+    destination_ordinal: Tensor
+
+    def validate(
+        self,
+        batch: FamilyBatch,
+        requests: Sequence[DeviceDestinationRequest],
+        active: Tensor,
+    ) -> tuple[Tensor, ...]:
+        shape = self.valid.shape
+        if (
+            self.valid.device != batch.lanes.device
+            or self.valid.dtype != torch.bool
+            or self.valid.ndim != 2
+            or shape[0] != active.numel()
+        ):
+            raise RolloutError(
+                "commit coverage valid must be CUDA bool [n_replica, extent]"
+            )
+        for name in (
+            "source_ordinal",
+            "destination",
+            "destination_ordinal",
+        ):
+            value = getattr(self, name)
+            if (
+                value.shape != shape
+                or value.device != self.valid.device
+                or value.dtype != torch.int64
+            ):
+                raise RolloutError(
+                    f"commit coverage {name} must be CUDA int64 {shape}"
+                )
+        lane_active = torch.zeros_like(active)
+        lane_active[batch.lanes] = True
+        torch._assert_async(
+            (~self.valid | lane_active[:, None]).all(),
+            "commit coverage contains an inactive lane",
+        )
+        source_in_range = (
+            (self.source_ordinal >= 0)
+            & (self.source_ordinal < batch.rows)
+        )
+        torch._assert_async(
+            (~self.valid | source_in_range).all(),
+            "commit coverage source ordinal is outside the scheduled prefix",
+        )
+        source_hit = torch.zeros(
+            (active.numel(), batch.rows),
+            dtype=torch.int64,
+            device=self.valid.device,
+        )
+        source_hit.scatter_add_(
+            1,
+            self.source_ordinal.clamp(0, batch.rows - 1),
+            (self.valid & source_in_range).to(torch.int64),
+        )
+        torch._assert_async(
+            (
+                torch.where(
+                    lane_active[:, None],
+                    source_hit > 0,
+                    source_hit == 0,
+                )
+            ).all(),
+            "commit coverage skipped a scheduled source row",
+        )
+        destination_declared = torch.zeros_like(self.valid)
+        realized_counts: list[Tensor] = []
+        for index, request in enumerate(requests):
+            selected = self.valid & self.destination.eq(index)
+            realized = selected.sum(1, dtype=torch.int64)
+            realized_counts.append(realized)
+            in_range = (
+                (self.destination_ordinal >= 0)
+                & (self.destination_ordinal < request.max_rows)
+            )
+            torch._assert_async(
+                (~selected | in_range).all(),
+                "commit coverage destination ordinal is outside its pack",
+            )
+            hit = torch.zeros(
+                (active.numel(), request.max_rows),
+                dtype=torch.int64,
+                device=self.valid.device,
+            )
+            hit.scatter_add_(
+                1,
+                self.destination_ordinal.clamp(0, request.max_rows - 1),
+                (selected & in_range).to(torch.int64),
+            )
+            ordinal = torch.arange(
+                request.max_rows,
+                dtype=torch.int64,
+                device=self.valid.device,
+            )
+            expected = (
+                active[:, None] & (ordinal[None, :] < realized[:, None])
+            )
+            torch._assert_async(
+                torch.where(expected, hit == 1, hit == 0).all(),
+                "commit coverage must name every destination row exactly once",
+            )
+            source_at_destination = torch.zeros_like(hit)
+            source_at_destination.scatter_add_(
+                1,
+                self.destination_ordinal.clamp(0, request.max_rows - 1),
+                torch.where(
+                    selected & in_range,
+                    self.source_ordinal + 1,
+                    torch.zeros_like(self.source_ordinal),
+                ),
+            )
+            if request.max_rows > 1:
+                adjacent = source_at_destination[:, 1:] >= (
+                    source_at_destination[:, :-1]
+                )
+                valid_adjacent = (
+                    ordinal[None, 1:] < realized[:, None]
+                )
+                torch._assert_async(
+                    (~valid_adjacent | adjacent).all(),
+                    "commit coverage reordered a destination FIFO",
+                )
+            destination_declared |= selected
+        torch._assert_async(
+            (~self.valid | destination_declared).all(),
+            "commit coverage names an undeclared destination",
+        )
+        stacked = torch.stack(realized_counts, dim=1)
+        device_exclusive_scan(stacked)
+        return tuple(realized_counts)
+
+
+class RolloutOwnerRegistry:
+    """Closed retained-owner set and immutable manifest bounds for rollout."""
+
+    def __init__(
+        self,
+        slabs: Sequence[MonotoneSlab],
+        *,
+        family_pack_cap: int,
+        chance_frontier_cap: int,
+        completion_pack_cap: int,
+        topology_packet_cap: int,
+        topology_cap: int,
+        topology_edge_cap: int,
+        _token: object | None = None,
+    ) -> None:
+        if _token is not _OWNER_REGISTRY_TOKEN:
+            raise ValueError(
+                "use from_generated; only synthetic tests may use for_testing"
+            )
+        self.slabs = tuple(slabs)
+        if not self.slabs or len({id(slab) for slab in self.slabs}) != len(
+            self.slabs
+        ):
+            raise ValueError("rollout owner registry must be unique and nonempty")
+        self.device = self.slabs[0].device
+        self.n_replica = self.slabs[0].n_replica
+        self.failure_state = self.slabs[0].failure_state
+        if any(
+            slab.device != self.device
+            or slab.n_replica != self.n_replica
+            or slab.failure_state is not self.failure_state
+            for slab in self.slabs
+        ):
+            raise ValueError("rollout owners disagree on device/replica/failure")
+        bounds = (
+            family_pack_cap,
+            chance_frontier_cap,
+            completion_pack_cap,
+            topology_packet_cap,
+            topology_cap,
+            topology_edge_cap,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in bounds
+        ):
+            raise ValueError("rollout registry bounds must be positive integers")
+        (
+            self.family_pack_cap,
+            self.chance_frontier_cap,
+            self.completion_pack_cap,
+            self.topology_packet_cap,
+            self.topology_cap,
+            self.topology_edge_cap,
+        ) = bounds
+        self._ids = frozenset(id(slab) for slab in self.slabs)
+
+    @classmethod
+    def from_generated(cls, owners: object) -> "RolloutOwnerRegistry":
+        """Bind to the complete live set and its immutable CapacityManifest."""
+
+        plan = getattr(owners, "plan")
+        manifest = plan.manifest
+        return cls(
+            getattr(owners, "live_slabs"),
+            family_pack_cap=manifest.family_pack_cap,
+            chance_frontier_cap=manifest.chance_frontier_cap,
+            completion_pack_cap=manifest.completion_pack_cap,
+            topology_packet_cap=manifest.topology_packet_cap,
+            topology_cap=manifest.topology_cap,
+            topology_edge_cap=manifest.topology_edge_cap,
+            _token=_OWNER_REGISTRY_TOKEN,
+        )
+
+    @classmethod
+    def for_testing(
+        cls,
+        slabs: Sequence[MonotoneSlab],
+        *,
+        family_pack_cap: int,
+        chance_frontier_cap: int,
+        completion_pack_cap: int,
+        topology_packet_cap: int,
+        topology_cap: int,
+        topology_edge_cap: int,
+    ) -> "RolloutOwnerRegistry":
+        """Create an explicitly closed synthetic owner set for contract tests."""
+
+        return cls(
+            slabs,
+            family_pack_cap=family_pack_cap,
+            chance_frontier_cap=chance_frontier_cap,
+            completion_pack_cap=completion_pack_cap,
+            topology_packet_cap=topology_packet_cap,
+            topology_cap=topology_cap,
+            topology_edge_cap=topology_edge_cap,
+            _token=_OWNER_REGISTRY_TOKEN,
+        )
+
+    def require(self, slab: MonotoneSlab) -> None:
+        if id(slab) not in self._ids:
+            raise RolloutError(
+                f"{slab.schema.name} is outside the generated rollout owner set"
+            )
+
+    def retry_epoch(self) -> Tensor:
+        epochs = torch.stack(
+            tuple(
+                slab._state[:, MonotoneSlab._EPOCH] for slab in self.slabs
+            )
+        )
+        torch._assert_async(
+            (epochs == epochs[:1]).all(),
+            "rollout owner retry epochs diverged",
+        )
+        return epochs[0]
+
+    def guard(self) -> tuple[tuple[int, tuple[tuple[str, int], ...]], ...]:
+        return tuple(
+            (
+                slab._state._version,
+                tuple(
+                    (name, value._version)
+                    for name, value in slab.columns.items()
+                ),
+            )
+            for slab in self.slabs
+        )
+
+    def assert_unchanged(
+        self,
+        before: tuple[tuple[int, tuple[tuple[str, int], ...]], ...],
+        phase: str,
+    ) -> None:
+        for slab, (state_version, column_versions) in zip(self.slabs, before):
+            if slab._state._version != state_version or tuple(
+                (name, value._version)
+                for name, value in slab.columns.items()
+            ) != column_versions:
+                raise RolloutError(
+                    f"{phase} wrote or published retained owner {slab.label}"
+                )
 
 
 @dataclass(frozen=True)
@@ -702,12 +996,14 @@ class TopologyDraftPacket:
 
 @dataclass(frozen=True)
 class EndpointPatch:
-    """Commit-time endpoint rows for one sampled topology packet."""
+    """Endpoint ordinals resolved against the actual device reservation."""
 
     sequence: int
     edge: Tensor
     target_kind: Tensor
-    target_row: Tensor
+    reservation_index: Tensor
+    preflight_target_row: Tensor
+    target_ordinal: Tensor
     child_output_type: Tensor
     commit_sequence: int
 
@@ -716,7 +1012,8 @@ class EndpointPatch:
         for name in (
             "edge",
             "target_kind",
-            "target_row",
+            "reservation_index",
+            "preflight_target_row",
             "child_output_type",
         ):
             value = getattr(self, name)
@@ -729,6 +1026,16 @@ class EndpointPatch:
                 raise TopologyError(
                     f"endpoint patch {name} must be contiguous CPU int32 [{count}]"
                 )
+        if (
+            self.target_ordinal.device.type != "cuda"
+            or self.target_ordinal.dtype != torch.int64
+            or self.target_ordinal.shape != (count,)
+            or not self.target_ordinal.is_contiguous()
+        ):
+            raise TopologyError(
+                "endpoint target_ordinal must be contiguous CUDA int64 "
+                f"[{count}]"
+            )
         if self.sequence < 0 or self.commit_sequence != self.sequence:
             raise TopologyError("endpoint patch lacks its commit marker")
 
@@ -749,46 +1056,103 @@ class TopologyPublication:
 
 
 @dataclass(frozen=True)
-class _PendingTopologyPublication:
-    publication: TopologyPublication
+class ReplicaTopologyPacket:
+    """A committed packet whose replica identity is never discarded."""
+
+    lane: int
+    packet: TopologyPacket
+
+
+@dataclass
+class _PendingTopologyBatch:
+    slot: int
+    publications: tuple[TopologyPublication, ...]
+    rows: Tensor
+    row_slices: tuple[slice, ...]
     marker: Tensor
     event: torch.cuda.Event
+    armed: bool = False
 
 
 class AsyncTopologyPublisher:
     """Accept topology descriptors only after endpoint commit visibility."""
 
     def __init__(
-        self, topology_packet_cap: int, *, max_inflight_packets: int = 2
+        self,
+        owners: RolloutOwnerRegistry,
+        *,
+        p_train: int,
+        max_inflight_batches: int = 2,
     ) -> None:
-        if topology_packet_cap <= 0 or max_inflight_packets <= 0:
+        if p_train <= 0 or max_inflight_batches <= 0:
             raise ValueError("topology publication bounds must be positive")
-        self.topology_packet_cap = int(topology_packet_cap)
-        self.max_inflight_packets = int(max_inflight_packets)
-        self._drafts: dict[int, TopologyDraftPacket] = {}
-        self._packets: list[TopologyPacket] = []
-        self._pending: list[_PendingTopologyPublication] = []
+        self.owners = owners
+        self.p_train = int(p_train)
+        self.max_inflight_batches = int(max_inflight_batches)
+        self._drafts: dict[tuple[int, int], TopologyDraftPacket] = {}
+        self._packets: list[ReplicaTopologyPacket] = []
+        self._pending: list[_PendingTopologyBatch] = []
+        self._reserved_packets = 0
+        self._reserved_nodes = 0
+        self._reserved_edges = 0
+        self._row_buffers = tuple(
+            torch.empty(
+                owners.topology_edge_cap,
+                dtype=torch.int64,
+                pin_memory=True,
+            )
+            for _ in range(self.max_inflight_batches)
+        )
+        self._marker_buffers = tuple(
+            torch.empty(
+                owners.n_replica,
+                dtype=torch.int64,
+                pin_memory=True,
+            )
+            for _ in range(self.max_inflight_batches)
+        )
 
-    def stage(self, draft: TopologyDraftPacket) -> None:
-        if draft.sequence in self._drafts or any(
-            packet.sequence == draft.sequence for packet in self._packets
+    @staticmethod
+    def _key(publication: TopologyPublication) -> tuple[int, int]:
+        return publication.lane, publication.draft.sequence
+
+    def stage(self, publication: TopologyPublication) -> None:
+        key = self._key(publication)
+        draft = publication.draft
+        if key in self._drafts or any(
+            item.lane == key[0] and item.packet.sequence == key[1]
+            for item in self._packets
         ):
             raise TopologyError("duplicate topology transaction sequence")
         if (
             draft.topology.node_count + draft.topology.edge_count
-            > self.topology_packet_cap
+            > self.owners.topology_packet_cap
         ):
             raise TopologyError("topology draft exceeds its fixed packet cap")
-        inflight = set(self._drafts).union(
-            item.publication.draft.sequence for item in self._pending
-        )
-        if len(inflight) >= self.max_inflight_packets:
-            raise TopologyError("topology publication exceeds its in-flight cap")
-        self._drafts[draft.sequence] = draft
+        if draft.topology.node_count <= 0:
+            raise TopologyError("topology packets must retain at least one node")
+        if (
+            self._reserved_nodes + draft.topology.node_count
+            > self.owners.topology_cap
+        ):
+            raise TopologyError("topology publication exceeds cumulative node cap")
+        if (
+            self._reserved_edges + draft.topology.edge_count
+            > self.owners.topology_edge_cap
+        ):
+            raise TopologyError("topology publication exceeds cumulative edge cap")
+        self._drafts[key] = draft
+        self._reserved_packets += 1
+        self._reserved_nodes += draft.topology.node_count
+        self._reserved_edges += draft.topology.edge_count
 
     @staticmethod
     def _materialize(
-        draft: TopologyDraftPacket, patch: EndpointPatch
+        draft: TopologyDraftPacket,
+        patch: EndpointPatch,
+        target_row: Tensor,
+        *,
+        p_train: int,
     ) -> TopologyPacket:
         expected = draft.unresolved_edges
         actual = tuple(int(value) for value in patch.edge.tolist())
@@ -796,6 +1160,12 @@ class AsyncTopologyPublisher:
             raise TopologyError(
                 "endpoint patch must cover unresolved edges in stable order"
             )
+        if (
+            target_row.device.type != "cpu"
+            or target_row.dtype != torch.int64
+            or target_row.shape != patch.edge.shape
+        ):
+            raise TopologyError("resolved endpoint rows must be CPU int64")
         topology_columns = {
             name: getattr(draft.topology, name).clone()
             for name in (
@@ -823,7 +1193,7 @@ class AsyncTopologyPublisher:
         if actual:
             edge = patch.edge.to(torch.int64)
             topology_columns["target_kind"][edge] = patch.target_kind
-            topology_columns["target_row"][edge] = patch.target_row
+            topology_columns["target_row"][edge] = target_row.to(torch.int32)
             binding_columns["child_output_type"][
                 edge
             ] = patch.child_output_type
@@ -837,80 +1207,223 @@ class AsyncTopologyPublisher:
             topology=topology,
             bindings=bindings,
         )
+        packet.topology.validate(packet.bindings, p_train=p_train)
         return packet
 
     def preflight(
-        self, draft: TopologyDraftPacket, patch: EndpointPatch
-    ) -> None:
-        """Prove endpoint closure before any retained destination reserves."""
-
-        if draft.sequence != patch.sequence:
-            raise TopologyError("topology draft and patch sequences differ")
-        self._materialize(draft, patch)
-
-    def commit(self, patch: EndpointPatch) -> TopologyPacket:
-        try:
-            draft = self._drafts[patch.sequence]
-        except KeyError as exc:
-            raise TopologyError("endpoint patch has no staged packet") from exc
-        packet = self._materialize(draft, patch)
-        del self._drafts[patch.sequence]
-        self._packets.append(packet)
-        return packet
-
-    def defer(
         self,
         publication: TopologyPublication,
+        requests: Sequence[DeviceDestinationRequest],
+    ) -> None:
+        """Validate the static endpoint descriptor before reservations."""
+
+        draft = publication.draft
+        patch = publication.patch
+        if draft.sequence != patch.sequence:
+            raise TopologyError("topology draft and patch sequences differ")
+        expected = draft.unresolved_edges
+        actual = tuple(int(value) for value in patch.edge.tolist())
+        if actual != expected:
+            raise TopologyError(
+                "endpoint patch must cover unresolved edges in stable order"
+            )
+        kinds = tuple(int(value) for value in patch.target_kind.tolist())
+        reservations = tuple(
+            int(value) for value in patch.reservation_index.tolist()
+        )
+        for kind, reservation in zip(kinds, reservations):
+            if kind == 0:
+                if reservation != -1:
+                    raise TopologyError(
+                        "topology endpoint cannot name a destination reservation"
+                    )
+            elif kind == 1:
+                if not 0 <= reservation < len(requests):
+                    raise TopologyError(
+                        "leaf endpoint reservation is outside the commit plan"
+                    )
+                if requests[reservation].slab.schema.name != "Leaf":
+                    raise TopologyError(
+                        "leaf endpoint must bind to a Leaf reservation"
+                    )
+            else:
+                raise TopologyError("unknown topology endpoint kind")
+        torch._assert_async(
+            (patch.target_ordinal >= 0).all(),
+            "endpoint ordinal must be nonnegative",
+        )
+        self._materialize(
+            draft,
+            patch,
+            patch.preflight_target_row.to(torch.int64),
+            p_train=self.p_train,
+        )
+
+    def resolve_rows(
+        self,
+        publication: TopologyPublication,
+        transaction: object,
+    ) -> Tensor:
+        """Resolve endpoint rows from the actual reservation beginnings."""
+
+        patch = publication.patch
+        rows = patch.target_ordinal
+        for index, begin in enumerate(transaction.begins):
+            selected_cpu = patch.reservation_index.eq(index)
+            if bool(selected_cpu.any()):
+                selected = selected_cpu.to(
+                    device=rows.device, dtype=torch.bool, non_blocking=True
+                )
+                lane_begin = begin[publication.lane]
+                rows = torch.where(
+                    selected,
+                    lane_begin + patch.target_ordinal,
+                    rows,
+                )
+                request = transaction.requests[index]
+                torch._assert_async(
+                    (
+                        ~selected
+                        | (
+                            patch.target_ordinal
+                            < request.counts[publication.lane]
+                        )
+                    ).all(),
+                    "endpoint ordinal exceeds its realized reservation",
+                )
+        return rows
+
+    def prepare_defer(
+        self,
+        publications: Sequence[TopologyPublication],
+        resolved_rows: Sequence[Tensor],
         marker: Tensor,
         *,
-        stream: torch.cuda.Stream | None = None,
+        stream: torch.cuda.Stream,
+    ) -> _PendingTopologyBatch | None:
+        if not publications:
+            return None
+        if len(publications) != len(resolved_rows):
+            raise TopologyError("topology publications and resolved rows differ")
+        if len(self._pending) >= self.max_inflight_batches:
+            raise TopologyError("topology publication exceeds in-flight batch cap")
+        total = sum(int(value.numel()) for value in resolved_rows)
+        if total > self.owners.topology_edge_cap:
+            raise TopologyError("endpoint transfer exceeds topology edge cap")
+        used = {pending.slot for pending in self._pending}
+        slot = next(
+            (
+                candidate
+                for candidate in range(self.max_inflight_batches)
+                if candidate not in used
+            ),
+            None,
+        )
+        if slot is None:
+            raise TopologyError("no bounded topology transfer slot is free")
+        cpu_rows = self._row_buffers[slot][:total]
+        slices: list[slice] = []
+        offset = 0
+        for value in resolved_rows:
+            stop = offset + value.numel()
+            cpu_rows[offset:stop].copy_(value, non_blocking=True)
+            slices.append(slice(offset, stop))
+            offset = stop
+        cpu_marker = self._marker_buffers[slot]
+        pending = _PendingTopologyBatch(
+            slot,
+            tuple(publications),
+            cpu_rows,
+            tuple(slices),
+            cpu_marker,
+            torch.cuda.Event(blocking=False),
+        )
+        self._pending.append(pending)
+        return pending
+
+    @staticmethod
+    def finalize_defer(
+        pending: _PendingTopologyBatch | None,
+        marker: Tensor,
+        *,
+        stream: torch.cuda.Stream,
     ) -> None:
-        """Queue CPU acceptance behind the CUDA transaction commit event."""
+        if pending is None:
+            return
+        pending.marker.copy_(marker, non_blocking=True)
+        pending.event.record(stream)
+        pending.armed = True
 
-        if (
-            marker.device.type != "cuda"
-            or marker.dtype != torch.int64
-            or marker.ndim != 1
-            or publication.lane >= marker.numel()
-        ):
-            raise TopologyError(
-                "topology commit marker must be CUDA int64 [n_replica]"
-            )
-        if publication.draft.sequence not in self._drafts:
-            raise TopologyError("deferred topology draft was not staged")
-        event = torch.cuda.Event(blocking=False)
-        event.record(
-            torch.cuda.current_stream(marker.device)
-            if stream is None
-            else stream
+    def _commit(
+        self,
+        publication: TopologyPublication,
+        target_row: Tensor,
+    ) -> ReplicaTopologyPacket:
+        key = self._key(publication)
+        try:
+            draft = self._drafts[key]
+        except KeyError as exc:
+            raise TopologyError("endpoint patch has no staged packet") from exc
+        packet = self._materialize(
+            draft,
+            publication.patch,
+            target_row,
+            p_train=self.p_train,
         )
-        self._pending.append(
-            _PendingTopologyPublication(publication, marker, event)
-        )
+        del self._drafts[key]
+        retained = ReplicaTopologyPacket(publication.lane, packet)
+        self._packets.append(retained)
+        return retained
 
-    def drain(self) -> tuple[TopologyPacket, ...]:
-        """Wait once per transfer and accept only visible commit markers."""
+    def drain(self) -> tuple[ReplicaTopologyPacket, ...]:
+        """Wait once per commit batch; never read a CUDA scalar per packet."""
 
-        accepted: list[TopologyPacket] = []
+        accepted: list[ReplicaTopologyPacket] = []
         pending, self._pending = self._pending, []
         for item in pending:
+            if not item.armed:
+                raise TopologyError("topology transfer was never commit-armed")
             item.event.synchronize()
-            publication = item.publication
-            marker = int(item.marker[publication.lane].item())
-            if marker == publication.draft.sequence:
-                accepted.append(self.commit(publication.patch))
-            else:
-                self.abort(publication.draft.sequence)
+            for publication, row_slice in zip(
+                item.publications, item.row_slices
+            ):
+                marker = int(item.marker[publication.lane])
+                if marker == publication.draft.sequence:
+                    accepted.append(
+                        self._commit(publication, item.rows[row_slice])
+                    )
+                else:
+                    self.abort(publication.lane, publication.draft.sequence)
         return tuple(accepted)
 
-    def abort(self, sequence: int) -> None:
-        if sequence not in self._drafts:
+    def abort(self, lane: int, sequence: int) -> None:
+        key = (lane, sequence)
+        if key not in self._drafts:
             raise TopologyError("cannot abort an unknown topology sequence")
-        del self._drafts[sequence]
+        draft = self._drafts.pop(key)
+        self._reserved_packets -= 1
+        self._reserved_nodes -= draft.topology.node_count
+        self._reserved_edges -= draft.topology.edge_count
+
+    def cancel(self, publications: Sequence[TopologyPublication]) -> None:
+        keys = {self._key(item) for item in publications}
+        self._pending = [
+            pending
+            for pending in self._pending
+            if not any(self._key(item) in keys for item in pending.publications)
+        ]
+        for lane, sequence in keys:
+            if (lane, sequence) in self._drafts:
+                self.abort(lane, sequence)
 
     @property
-    def committed_packets(self) -> tuple[TopologyPacket, ...]:
-        return tuple(sorted(self._packets, key=lambda packet: packet.sequence))
+    def committed_packets(self) -> tuple[ReplicaTopologyPacket, ...]:
+        return tuple(
+            sorted(
+                self._packets,
+                key=lambda item: (item.packet.sequence, item.lane),
+            )
+        )
 
     def assert_drained(self) -> None:
         if self._drafts or self._pending:
@@ -922,14 +1435,15 @@ class CommitPlan:
     """Every retained destination and structural effect of one transition."""
 
     destinations: tuple[DeviceDestinationRequest, ...]
+    coverage: CommitCoverage
     published_queues: tuple[SemanticFamilyFIFO, ...] = ()
     topology: tuple[TopologyPublication, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.destinations:
             raise ValueError("a commit plan requires retained destinations")
-        sequences = tuple(item.draft.sequence for item in self.topology)
-        if len(set(sequences)) != len(sequences):
+        keys = tuple((item.lane, item.draft.sequence) for item in self.topology)
+        if len(set(keys)) != len(keys):
             raise ValueError("a commit plan repeats a topology sequence")
         lanes = tuple(item.lane for item in self.topology)
         if len(set(lanes)) != len(lanes):
@@ -970,29 +1484,30 @@ class RolloutTransaction:
 
     def __init__(
         self,
-        schema: ModeSchema,
+        schemas: ModeSchema | Sequence[ModeSchema],
         *,
         seed: int,
         iteration: int,
         topology: AsyncTopologyPublisher,
-        retained_slabs: Sequence[MonotoneSlab],
+        owners: RolloutOwnerRegistry,
         model_stream: torch.cuda.Stream | None = None,
         commit_stream: torch.cuda.Stream | None = None,
     ) -> None:
-        self.schema = schema
         self.seed = int(seed)
         self.iteration = int(iteration)
         self.topology = topology
-        self.retained_slabs = tuple(retained_slabs)
-        if not self.retained_slabs:
-            raise ValueError("rollout transaction needs its retained owner set")
-        self.device = self.retained_slabs[0].device
-        self.n_replica = self.retained_slabs[0].n_replica
-        if any(
-            slab.device != self.device or slab.n_replica != self.n_replica
-            for slab in self.retained_slabs
-        ):
-            raise ValueError("retained rollout owners disagree on device/replicas")
+        self.owners = owners
+        if topology.owners is not owners:
+            raise ValueError("rollout and topology must share one owner registry")
+        self.device = owners.device
+        self.n_replica = owners.n_replica
+        self.lane_schemas = (
+            (schemas,) * self.n_replica
+            if isinstance(schemas, ModeSchema)
+            else tuple(schemas)
+        )
+        if len(self.lane_schemas) != self.n_replica:
+            raise ValueError("rollout needs one semantic schema per replica lane")
         self.model_stream = (
             torch.cuda.Stream(device=self.device)
             if model_stream is None
@@ -1015,27 +1530,29 @@ class RolloutTransaction:
         hooks: RolloutHooks,
         *,
         purpose: DrawPurpose = DrawPurpose.ACTION,
-        retry_epoch: Tensor | int = 0,
         sampler_attempt_count: Tensor | None = None,
         failure_injector: Callable[[], None] | None = None,
+        post_publish_failure_injector: Callable[[], None] | None = None,
     ) -> RolloutCommit:
         if self._state not in (_MachineState.READY, _MachineState.COMMITTED):
             raise RolloutError(
                 f"rollout transaction cannot start from {self._state.value}"
             )
         self._state = _MachineState.READY
+        if scheduled.rows > self.owners.family_pack_cap:
+            raise RolloutError("scheduled prefix exceeds manifest family_pack_cap")
+        expected_schemas = tuple(
+            self.lane_schemas[lane] for lane in scheduled.lanes
+        )
+        if scheduled.lane_schemas != expected_schemas:
+            raise RolloutError(
+                "scheduled cohort lost its lane-local semantic mode identity"
+            )
+        self.owners.require(source.family)
+        self.owners.require(source.metadata)
         with torch.cuda.stream(self.model_stream):
             batch = source.stable_prefix(scheduled)
-            before = tuple(
-                (
-                    slab._state._version,
-                    tuple(
-                        (name, value._version)
-                        for name, value in slab.columns.items()
-                    ),
-                )
-                for slab in self.retained_slabs
-            )
+            before = self.owners.guard()
             model_input = hooks.model_input(batch)
             model_workspace = ModelWorkspace(
                 MappingProxyType(dict(model(model_input, batch.lanes)))
@@ -1056,11 +1573,16 @@ class RolloutTransaction:
                 draw=0,
                 purpose=purpose,
                 lane=lane,
-                retry_epoch=retry_epoch,
+                retry_epoch=self.owners.retry_epoch()[batch.lanes, None],
                 active=active,
             )
             sampled = hooks.sample(
-                SampleRequest(self.schema, batch, model_workspace, rng_key)
+                SampleRequest(
+                    scheduled.lane_schemas,
+                    batch,
+                    model_workspace,
+                    rng_key,
+                )
             )
             if (
                 sampled.draw_count.shape != (batch.lane_count,)
@@ -1074,31 +1596,56 @@ class RolloutTransaction:
                 self.n_replica, dtype=torch.int64, device=self.device
             )
             full_draw_count[batch.lanes] = sampled.draw_count
-            for slab, (state_version, column_versions) in zip(
-                self.retained_slabs, before
-            ):
-                current_columns = tuple(
-                    (name, value._version)
-                    for name, value in slab.columns.items()
-                )
-                if (
-                    slab._state._version != state_version
-                    or current_columns != column_versions
-                ):
-                    self._state = _MachineState.FAILED
-                    raise RolloutError(
-                        "sample wrote or published a retained destination"
-                    )
+            self.owners.assert_unchanged(before, "sample")
             self._state = _MachineState.SAMPLED
             plan = hooks.transition(
                 TransitionRequest(
-                    self.schema, batch, model_workspace, sampled
+                    scheduled.lane_schemas,
+                    batch,
+                    model_workspace,
+                    sampled,
                 )
             )
+            self.owners.assert_unchanged(before, "transition")
             active_lanes = torch.zeros(
                 self.n_replica, dtype=torch.bool, device=self.device
             )
             active_lanes[batch.lanes] = True
+            for request in plan.destinations:
+                self.owners.require(request.slab)
+                if request.input_type != scheduled.input_type:
+                    raise RolloutError(
+                        "destination input type differs from scheduled family"
+                    )
+            for queue in plan.published_queues:
+                self.owners.require(queue.family)
+                self.owners.require(queue.metadata)
+                if queue.input_type != scheduled.input_type:
+                    raise RolloutError(
+                        "published queue differs from scheduled family"
+                    )
+                if not any(
+                    request.slab is queue.family
+                    for request in plan.destinations
+                ):
+                    raise RolloutError(
+                        "published queue lacks a family destination"
+                    )
+            realized_counts = plan.coverage.validate(
+                batch, plan.destinations, active_lanes
+            )
+            destinations = tuple(
+                DeviceDestinationRequest(
+                    slab=request.slab,
+                    counts=count,
+                    values=request.values,
+                    input_type=request.input_type,
+                    logical_address=request.logical_address,
+                )
+                for request, count in zip(
+                    plan.destinations, realized_counts
+                )
+            )
             marker = torch.full(
                 (self.n_replica,),
                 -1,
@@ -1110,52 +1657,120 @@ class RolloutTransaction:
         for publication in plan.topology:
             if publication.lane >= self.n_replica:
                 raise RolloutError("topology publication lane is outside replicas")
-            self.topology.preflight(publication.draft, publication.patch)
-        staged: list[int] = []
-        transaction: DevicePublicationTransaction | None = None
+            if publication.lane not in scheduled.lanes:
+                raise RolloutError("topology publication lane was not scheduled")
+            self.topology.preflight(publication, destinations)
+        transaction = None
+        pending_topology = None
+        published = False
+        source_head_before: Tensor | None = None
+        queue_before: list[tuple[SemanticFamilyFIFO, Tensor, Tensor]] = []
         try:
             with torch.cuda.stream(self.commit_stream):
                 self.commit_stream.wait_event(sample_ready)
-                transaction = DevicePublicationTransaction.begin(
-                    plan.destinations,
+                for publication in plan.topology:
+                    self.topology.stage(publication)
+                transaction = PublicationTransaction.begin_device(
+                    destinations,
                     phase="rollout_commit",
                     active=active_lanes,
                     sampler_attempt_count=sampler_attempt_count,
                 )
-                for publication in plan.topology:
-                    self.topology.stage(publication.draft)
-                    staged.append(publication.draft.sequence)
-                transaction.fill_all()
-                success = transaction.publish(
-                    commit_marker=marker,
-                    sequence=0,
-                    failure_injector=failure_injector,
+                resolved_rows = tuple(
+                    self.topology.resolve_rows(publication, transaction)
+                    for publication in plan.topology
                 )
+                pending_topology = self.topology.prepare_defer(
+                    plan.topology,
+                    resolved_rows,
+                    marker,
+                    stream=self.commit_stream,
+                )
+                transaction.fill_all()
+                if failure_injector is not None:
+                    failure_injector()
+                success = transaction.success
+                source_head_before = source.head.clone()
                 for queue in plan.published_queues:
-                    queue.publish_family_tail(success)
-                source.consume(batch.lanes, scheduled.rows, success)
-                for publication in plan.topology:
-                    marker[publication.lane].copy_(
-                        torch.where(
-                            success[publication.lane],
-                            torch.as_tensor(
-                                publication.draft.sequence,
-                                dtype=torch.int64,
-                                device=self.device,
-                            ),
-                            marker[publication.lane],
+                    queue_before.append(
+                        (
+                            queue,
+                            queue.ready_tail.clone(),
+                            queue.reserved_tail.clone(),
                         )
                     )
-                    self.topology.defer(
-                        publication, marker, stream=self.commit_stream
+                    request_index = next(
+                        index
+                        for index, request in enumerate(destinations)
+                        if request.slab is queue.family
                     )
+                    end = transaction.ends[request_index].to(torch.int32)
+                    queue.ready_tail.copy_(
+                        torch.where(success, end, queue.ready_tail)
+                    )
+                    queue.reserved_tail.copy_(
+                        torch.where(success, end, queue.reserved_tail)
+                    )
+                selected = success[batch.lanes]
+                old_source_head = source.head[batch.lanes]
+                new_source_head = old_source_head + scheduled.rows
+                torch._assert_async(
+                    (
+                        ~selected
+                        | (new_source_head <= source.ready_tail[batch.lanes])
+                    ).all(),
+                    "queue consumption exceeds its stable prefix",
+                )
+                source.head[batch.lanes] = torch.where(
+                    selected, new_source_head, old_source_head
+                )
+                marker_sequence = torch.full_like(marker, -1)
+                for publication in plan.topology:
+                    lane_mask = torch.arange(
+                        self.n_replica,
+                        dtype=torch.int64,
+                        device=self.device,
+                    ).eq(publication.lane)
+                    marker_sequence.copy_(
+                        torch.where(
+                            lane_mask,
+                            torch.full_like(
+                                marker_sequence,
+                                publication.draft.sequence,
+                            ),
+                            marker_sequence,
+                        )
+                    )
+                success = transaction.publish(
+                    commit_marker=marker,
+                    sequence=marker_sequence,
+                )
+                published = True
+                if post_publish_failure_injector is not None:
+                    post_publish_failure_injector()
+                source._record_ready(self.commit_stream)
+                for queue in plan.published_queues:
+                    queue._record_ready(self.commit_stream)
+                self.topology.finalize_defer(
+                    pending_topology,
+                    marker,
+                    stream=self.commit_stream,
+                )
                 commit_ready = torch.cuda.Event(blocking=False)
                 commit_ready.record(self.commit_stream)
         except BaseException:
             if transaction is not None:
-                transaction.abort()
-            for sequence in staged:
-                self.topology.abort(sequence)
+                with torch.cuda.stream(self.commit_stream):
+                    if published:
+                        transaction.rollback_published()
+                    else:
+                        transaction.abort()
+                    if source_head_before is not None:
+                        source.head.copy_(source_head_before)
+                    for queue, ready, reserved in queue_before:
+                        queue.ready_tail.copy_(ready)
+                        queue.reserved_tail.copy_(reserved)
+            self.topology.cancel(plan.topology)
             self._state = _MachineState.FAILED
             raise
         sequence = 0 if not plan.topology else plan.topology[-1].draft.sequence
@@ -1238,14 +1853,20 @@ class BoundedChanceClosure:
         *,
         seed: int,
         iteration: int,
-        capacity: int,
+        owners: RolloutOwnerRegistry,
         max_generations: int,
     ) -> None:
-        if capacity <= 0 or max_generations <= 0:
-            raise ValueError("chance closure bounds must be positive")
+        if (
+            max_generations <= 0
+            or max_generations > owners.chance_frontier_cap
+        ):
+            raise ValueError(
+                "chance generations must fit the manifest frontier bound"
+            )
         self.seed = int(seed)
         self.iteration = int(iteration)
-        self.capacity = int(capacity)
+        self.owners = owners
+        self.capacity = owners.chance_frontier_cap
         self.max_generations = int(max_generations)
 
     def run(
@@ -1255,12 +1876,15 @@ class BoundedChanceClosure:
         commit: ChanceCommitter,
     ) -> ChanceClosureResult:
         frontier.validate(self.capacity)
+        if frontier.active.shape[0] != self.owners.n_replica:
+            raise RolloutError("chance frontier replica axis differs from owners")
         draws: list[Tensor] = []
         lanes = torch.arange(
             frontier.active.shape[0],
             dtype=torch.int64,
             device=frontier.active.device,
         )[:, None]
+        retry_epoch = self.owners.retry_epoch()[:, None]
         for generation in range(self.max_generations):
             key = logical_rng_keys(
                 seed=self.seed,
@@ -1270,12 +1894,20 @@ class BoundedChanceClosure:
                 draw=generation,
                 purpose=DrawPurpose.CHANCE,
                 lane=lanes,
+                retry_epoch=retry_epoch,
                 active=frontier.active,
             )
+            before = self.owners.guard()
             sampled = sample(frontier, key, generation)
+            self.owners.assert_unchanged(before, "chance sample")
             draws.append(frontier.active.sum(dtype=torch.int64))
             frontier = commit(frontier, sampled, generation)
+            self.owners.assert_unchanged(before, "chance transition")
             frontier.validate(self.capacity)
+        torch._assert_async(
+            (~frontier.active).all(),
+            "bounded chance closure exhausted its generation cap",
+        )
         return ChanceClosureResult(
             frontier=frontier,
             generation_draws=torch.stack(draws),
@@ -1288,31 +1920,78 @@ class CompletionBatch:
     row: Tensor
     fields: Mapping[str, Tensor]
 
+    @property
+    def rows(self) -> int:
+        return int(self.row.shape[1])
+
 
 class CompletionHook(Protocol):
     def __call__(
         self, batch: CompletionBatch
-    ) -> tuple[DeviceDestinationRequest, ...]: ...
+    ) -> "CompletionPlan": ...
+
+
+@dataclass(frozen=True)
+class CompletionPlan:
+    destinations: tuple[DeviceDestinationRequest, ...]
+    coverage: CommitCoverage
+
+    def __post_init__(self) -> None:
+        if not self.destinations:
+            raise ValueError("completion needs retained destinations")
 
 
 class CompletionFIFO:
     """Stable, bounded ``Leaf`` prefixes feeding the completion hook."""
 
-    def __init__(self, leaf: MonotoneSlab, completion_pack_cap: int) -> None:
-        if leaf.schema.name != "Leaf" or completion_pack_cap <= 0:
-            raise ValueError("completion FIFO requires Leaf and a positive pack")
-        if completion_pack_cap > leaf.capacity:
+    def __init__(
+        self,
+        leaf: MonotoneSlab,
+        owners: RolloutOwnerRegistry,
+        *,
+        head: Tensor,
+        observed_epoch: Tensor,
+    ) -> None:
+        if leaf.schema.name != "Leaf":
+            raise ValueError("completion FIFO requires Leaf")
+        owners.require(leaf)
+        if owners.completion_pack_cap > leaf.capacity:
             raise ValueError("completion pack exceeds Leaf capacity")
+        for name, value in (
+            ("head", head),
+            ("observed_epoch", observed_epoch),
+        ):
+            if (
+                value.shape != (owners.n_replica,)
+                or value.dtype != torch.int64
+                or value.device != owners.device
+            ):
+                raise ValueError(
+                    f"completion {name} must be owner workspace int64 [n_replica]"
+                )
         self.leaf = leaf
+        self.owners = owners
         self.device = leaf.device
         self.n_replica = leaf.n_replica
-        self.completion_pack_cap = int(completion_pack_cap)
-        self.head = torch.zeros(
-            self.n_replica, dtype=torch.int64, device=self.device
-        )
+        self.completion_pack_cap = owners.completion_pack_cap
+        self.head = head
+        self.observed_epoch = observed_epoch
+        self._released = False
+
+    def _check_live(self) -> None:
+        if self._released:
+            raise RolloutError("completion FIFO workspace has been released")
+
+    def _observe_retry_epoch(self) -> None:
+        self._check_live()
+        epoch = self.owners.retry_epoch()
+        changed = self.observed_epoch != epoch
+        self.head.copy_(torch.where(changed, torch.zeros_like(self.head), self.head))
+        self.observed_epoch.copy_(epoch)
 
     @property
     def ready_tail(self) -> Tensor:
+        self._check_live()
         return self.leaf._state[:, MonotoneSlab._PUBLISHED]
 
     @property
@@ -1322,6 +2001,7 @@ class CompletionFIFO:
     def stable_prefix(
         self, lanes: Sequence[int], rows: int
     ) -> CompletionBatch:
+        self._observe_retry_epoch()
         if rows <= 0 or rows > self.completion_pack_cap:
             raise ValueError("completion rows are outside its pack bound")
         lane_values = tuple(int(lane) for lane in lanes)
@@ -1349,36 +2029,68 @@ class CompletionFIFO:
         hook: CompletionHook,
         *,
         sampler_attempt_count: Tensor | None = None,
-        wait_for: torch.cuda.Event | None = None,
+        wait_for: torch.cuda.Event,
+        failure_injector: Callable[[], None] | None = None,
     ) -> Tensor:
-        if wait_for is not None:
-            torch.cuda.current_stream(self.device).wait_event(wait_for)
+        torch.cuda.current_stream(self.device).wait_event(wait_for)
         batch = self.stable_prefix(lanes, rows)
-        requests = hook(batch)
+        before = self.owners.guard()
+        workspace_versions = (self.head._version, self.observed_epoch._version)
+        plan = hook(batch)
+        self.owners.assert_unchanged(before, "completion hook")
+        if workspace_versions != (
+            self.head._version,
+            self.observed_epoch._version,
+        ):
+            raise RolloutError("completion hook mutated FIFO workspace")
         active = torch.zeros(
             self.n_replica, dtype=torch.bool, device=self.device
         )
         active[batch.lanes] = True
-        transaction = DevicePublicationTransaction.begin(
-            requests,
+        for request in plan.destinations:
+            self.owners.require(request.slab)
+        realized_counts = plan.coverage.validate(
+            batch, plan.destinations, active
+        )
+        destinations = tuple(
+            DeviceDestinationRequest(
+                slab=request.slab,
+                counts=count,
+                values=request.values,
+                input_type=request.input_type,
+                logical_address=request.logical_address,
+            )
+            for request, count in zip(plan.destinations, realized_counts)
+        )
+        transaction = PublicationTransaction.begin_device(
+            destinations,
             phase="completion",
             active=active,
             sampler_attempt_count=sampler_attempt_count,
         )
-        transaction.fill_all()
-        success = transaction.publish()
-        old = self.head[batch.lanes]
-        self.head[batch.lanes] = torch.where(
-            success[batch.lanes], old + rows, old
-        )
+        try:
+            transaction.fill_all()
+            if failure_injector is not None:
+                failure_injector()
+            success = transaction.publish()
+            old = self.head[batch.lanes]
+            self.head[batch.lanes] = torch.where(
+                success[batch.lanes], old + rows, old
+            )
+        except BaseException:
+            transaction.abort()
+            raise
         return success
 
-    def reset_failed_lane(self, lane: int) -> None:
-        """Reset completion consumption after the owner attempt is discarded."""
+    def release(self) -> None:
+        """Drop the bounded completion-workspace views exactly once."""
 
-        if lane < 0 or lane >= self.n_replica:
-            raise ValueError("completion retry lane is outside replicas")
-        self.head[lane].zero_()
+        self._check_live()
+        self.head = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.observed_epoch = torch.empty(
+            0, dtype=torch.int64, device=self.device
+        )
+        self._released = True
 
 
 __all__ = [
@@ -1386,9 +2098,11 @@ __all__ = [
     "BoundedChanceClosure",
     "ChanceClosureResult",
     "ChanceFrontier",
+    "CommitCoverage",
     "CommitPlan",
     "CompletionBatch",
     "CompletionFIFO",
+    "CompletionPlan",
     "DeviceStableRoute",
     "DrawPurpose",
     "EndpointPatch",
@@ -1400,6 +2114,7 @@ __all__ = [
     "RolloutCommit",
     "RolloutError",
     "RolloutHooks",
+    "RolloutOwnerRegistry",
     "RolloutTransaction",
     "SampleRequest",
     "SampleWorkspace",
@@ -1407,6 +2122,7 @@ __all__ = [
     "SemanticFamilyFIFO",
     "TopologyDraftPacket",
     "TopologyPublication",
+    "ReplicaTopologyPacket",
     "TransitionRequest",
     "child_path_keys",
     "device_exclusive_scan",

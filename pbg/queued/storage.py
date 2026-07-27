@@ -890,6 +890,24 @@ class PublicationTransaction:
             raise
         return cls(tuple(reservations))
 
+    @classmethod
+    def begin_device(
+        cls,
+        requests: Sequence["DeviceDestinationRequest"],
+        *,
+        phase: str,
+        active: Tensor,
+        sampler_attempt_count: Tensor | None = None,
+    ) -> "_DevicePublicationTransaction":
+        """Begin the sole device-counted form of a publication transaction."""
+
+        return _DevicePublicationTransaction(
+            tuple(requests),
+            phase=phase,
+            active=active,
+            sampler_attempt_count=sampler_attempt_count,
+        )
+
     def fill(self, index: int, values: Mapping[str, Tensor]) -> None:
         if self._closed:
             raise TransactionError("transaction is closed")
@@ -969,7 +987,7 @@ class DeviceDestinationRequest:
         return int(first.shape[1])
 
 
-class DevicePublicationTransaction:
+class _DevicePublicationTransaction:
     """Device-counted multi-destination publication with lane isolation.
 
     Counts, scans, capacity decisions, reservations, and publication remain
@@ -1061,13 +1079,25 @@ class DevicePublicationTransaction:
         phase: str,
         active: Tensor,
         sampler_attempt_count: Tensor | None = None,
-    ) -> "DevicePublicationTransaction":
+    ) -> "_DevicePublicationTransaction":
         return cls(
             tuple(requests),
             phase=phase,
             active=active,
             sampler_attempt_count=sampler_attempt_count,
         )
+
+    @property
+    def begins(self) -> tuple[Tensor, ...]:
+        """Device-resident reservation beginnings, one per request."""
+
+        return self._begins
+
+    @property
+    def ends(self) -> tuple[Tensor, ...]:
+        """Device-resident realized reservation ends, one per request."""
+
+        return self._ends
 
     def _validate_requests(self) -> None:
         identities: set[int] = set()
@@ -1182,11 +1212,44 @@ class DevicePublicationTransaction:
         phase_id = self.failure_state._id(
             self.failure_state._phase_ids, self.phase
         )
-        code_id = self.failure_state._id(
-            self.failure_state._code_ids, "capacity_overflow"
-        )
         records = self.failure_state._records
         current_address = records[:, DeviceFailureState._ADDRESS]
+        code_ids: list[Tensor] = []
+        for request, begin in zip(self.requests, self._begins):
+            count_invalid = (request.counts < 0) | (
+                request.counts > request.max_rows
+            )
+            address_invalid = request.logical_address < 0
+            capacity_invalid = request.counts > request.slab.capacity - begin
+            order_invalid = (
+                request.slab._state[:, MonotoneSlab._OPEN_BEGIN] != -1
+            ) | (request.slab._state[:, MonotoneSlab._POISONED] != 0)
+            code = torch.full_like(
+                current_address,
+                self.failure_state._id(
+                    self.failure_state._code_ids, "capacity_overflow"
+                ),
+            )
+            for selected_failure, name in (
+                (capacity_invalid, "capacity_overflow"),
+                (count_invalid, "invalid_extent"),
+                (address_invalid, "invalid_logical_address"),
+                (order_invalid, "reservation_order"),
+            ):
+                code = torch.where(
+                    selected_failure,
+                    torch.full_like(
+                        code,
+                        self.failure_state._id(
+                            self.failure_state._code_ids, name
+                        ),
+                    ),
+                    code,
+                )
+            code_ids.append(code)
+        chosen_code = torch.stack(code_ids).gather(
+            0, selected.unsqueeze(0)
+        ).squeeze(0)
         input_ids = torch.stack(
             tuple(
                 torch.full_like(
@@ -1216,7 +1279,7 @@ class DevicePublicationTransaction:
             ),
             (
                 DeviceFailureState._CODE,
-                torch.full_like(current_address, code_id),
+                chosen_code,
             ),
             (DeviceFailureState._INPUT, chosen_input),
             (DeviceFailureState._ADDRESS, chosen_address),
@@ -1424,6 +1487,47 @@ class DevicePublicationTransaction:
             )
         self._closed = True
 
+    def rollback_published(self) -> None:
+        """Roll back a just-published transaction before visibility escapes.
+
+        This is reserved for the generic commit coordinator's exception path.
+        It restores every successful lane to its pre-reservation tail and
+        poisons that lane so it must pass through the ordinary retry reset.
+        """
+
+        if not self._closed:
+            self.abort()
+            return
+        for request, begin in zip(self.requests, self._begins):
+            slab = request.slab
+            positive = self.success & (request.counts > 0)
+            state = slab._state
+            for column in (
+                MonotoneSlab._PUBLISHED,
+                MonotoneSlab._RESERVED,
+            ):
+                state[:, column].copy_(
+                    torch.where(positive, begin, state[:, column])
+                )
+            for column in (
+                MonotoneSlab._OPEN_BEGIN,
+                MonotoneSlab._OPEN_END,
+            ):
+                state[:, column].copy_(
+                    torch.where(
+                        positive,
+                        torch.full_like(begin, -1),
+                        state[:, column],
+                    )
+                )
+            state[:, MonotoneSlab._POISONED].copy_(
+                torch.where(
+                    positive,
+                    torch.ones_like(begin),
+                    state[:, MonotoneSlab._POISONED],
+                )
+            )
+
 
 class ExactBlock:
     """One explicitly released CUDA block with an immutable realized extent."""
@@ -1481,7 +1585,6 @@ __all__ = [
     "DeviceDestinationRequest",
     "DeviceFailure",
     "DeviceFailureState",
-    "DevicePublicationTransaction",
     "ExactBlock",
     "FieldExtent",
     "MonotoneSlab",

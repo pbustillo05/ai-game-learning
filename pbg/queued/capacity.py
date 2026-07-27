@@ -868,6 +868,15 @@ class GeneratedOwners:
         return frozenset(self._live)
 
     @property
+    def live_slabs(self) -> tuple[MonotoneSlab, ...]:
+        """All sanctioned live retained owners in stable allocation order."""
+
+        return tuple(
+            self._live[key]
+            for key in sorted(self._live, key=lambda item: item.label)
+        )
+
+    @property
     def released_keys(self) -> frozenset[OwnerKey]:
         return frozenset(self._released)
 
