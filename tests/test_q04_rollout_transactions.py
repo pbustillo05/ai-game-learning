@@ -439,7 +439,11 @@ def test_device_materialization_has_no_hidden_nonzero_or_scalar_sync() -> None:
     assert "aten::_local_scalar_dense" not in keys
     names = tuple(event.name.lower() for event in profile.events())
     assert not any(
-        "memcpy dtoh" in name or "device to host" in name for name in names
+        "memcpy dtoh" in name
+        or "device to host" in name
+        or "memcpy htod" in name
+        or "host to device" in name
+        for name in names
     )
     slab.release()
     failures.release()

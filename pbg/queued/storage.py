@@ -1185,19 +1185,22 @@ class DevicePublicationTransaction:
         code_id = self.failure_state._id(
             self.failure_state._code_ids, "capacity_overflow"
         )
-        input_ids = torch.tensor(
+        records = self.failure_state._records
+        current_address = records[:, DeviceFailureState._ADDRESS]
+        input_ids = torch.stack(
             tuple(
-                self.failure_state._id(
-                    self.failure_state._input_ids, request.input_type
+                torch.full_like(
+                    current_address,
+                    self.failure_state._id(
+                        self.failure_state._input_ids, request.input_type
+                    ),
                 )
                 for request in self.requests
             ),
-            dtype=torch.int64,
-            device=self.device,
         )
-        chosen_input = input_ids[selected]
-        records = self.failure_state._records
-        current_address = records[:, DeviceFailureState._ADDRESS]
+        chosen_input = input_ids.gather(
+            0, selected.unsqueeze(0)
+        ).squeeze(0)
         replace = self.failed & (chosen_address < current_address)
         records[:, DeviceFailureState._STATUS].copy_(
             torch.where(
