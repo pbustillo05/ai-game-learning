@@ -1,16 +1,13 @@
 # Poker Player Model
 
 > **Poker-math boundary.** Hand/card-indexed features in this document are
-> model inputs, not permission to compute poker-private combinatorics locally.
-> Collision-conditioned posteriors, partition/folded-card summaries,
-> completion, sampling, and showdown winners are produced by
-> `poker-gpu-evaluator` under `archive/POKER_GPU_EVALUATOR_IO.md`. This repository only
-> learns transformations of supplied fields, applies the fixed card/class
-> representation incidence operator inside neural layers, and navigates the
-> public tree. Any later wording that says the model computes folded-card
-> kernels, partition corrections, collision-conditioned laws, or private
-> assignments is descriptive of desired input semantics and is superseded by
-> this boundary; those private-law fields must arrive from the sibling facade.
+> model inputs, not model outputs. In the queued rewrite,
+> `ai-game-learning` owns collision-conditioned profile sampling,
+> partition/folded-card summaries, logical RNG, and public-tree navigation.
+> `poker-gpu-evaluator` contract v2 owns showdown evaluation and the
+> `Leaf -> LayerWork` Monte Carlo completion operations involving
+> `hand_rank`. The model consumes locally constructed folded features and does
+> not learn or reconstruct the underlying private combinatorics.
 
 The deployed object is one weight-only policy object with two networks:
 
@@ -113,8 +110,8 @@ $q\in\mathcal P_{\mathrm{live}}(\sigma)$ and hands $h\in\mathcal H_R$.
 Normalized ranges mask board-impossible hands and normalize over each player's
 available hands; raw ranges remain row features.
 
-**Postflop folded statistics** $\mathcal F_\sigma$, supplied by the evaluator
-partition-summary facade using the semantics in
+**Postflop folded statistics** $\mathcal F_\sigma$, constructed by the
+poker-owned queued hook using the semantics in
 `docs/theory/folder_impact.md` and refreshed
 by the caller only on street or fold events:
 

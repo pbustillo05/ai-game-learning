@@ -35,7 +35,7 @@ as its sole active game.
 - `pbg/core/`: legacy implementation of generic rollout, branching, value, loss, and training code.
 - `pbg/games/poker/`: NLHE-specific implementation.
 - `tests/`: behavior and contract tests.
-- `/home/pablob/poker-gpu-evaluator/docs/api.md` (read-only rights, you are not authorized to modify that file): binding interface to the sibling poker evaluator. We **have** to use that sibling repo for posterior sampling and Monte Carlo equity/posterior simulations.
+- `/home/pablob/poker-gpu-evaluator/docs/api.md` (read-only rights, you are not authorized to modify that file): contract-v2 binding interface to the sibling poker evaluator. The sibling owns showdown evaluation and the `Leaf -> LayerWork` completion operations involving `hand_rank`. The queued rewrite owns posterior/profile sampling and folded-summary construction in this repository; do not route those operations through an implicit compatibility facade.
 - In Markdown, write math with `$...$` and `$$...$$` rather than `\(...\)` or `\[...\]` so it renders in VS Code.
 
 ## Actual Games

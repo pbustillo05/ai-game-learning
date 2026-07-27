@@ -1,11 +1,11 @@
 # Card Removal from Folded Ranges: Theory
 
-> **Ownership note.** This is mathematical background for
-> `poker-gpu-evaluator`, not an implementation specification for this
-> repository. `ai-game-learning` may consume versioned partition/folded-card
-> summaries from the sibling facade, but must not implement the partition,
-> removal-set, collision, or Monte Carlo machinery described below. Binding
-> implementation ownership is defined by `archive/POKER_GPU_EVALUATOR_IO.md`.
+> **Ownership note.** This mathematics specifies the folded-summary operation
+> owned by the poker hooks in `ai-game-learning`'s queued rewrite. The local
+> implementation owns partition, removal-set, collision, and folded-summary
+> construction. `poker-gpu-evaluator` contract v2 remains the authority for
+> showdown evaluation and `Leaf -> LayerWork` Monte Carlo completion involving
+> `hand_rank`; it is not a folded-summary compatibility facade.
 
 **Scope.** This document is self-contained mathematics. It (1) states the problem
 of how folded players' ranges bias the joint distribution of live hands and
@@ -19,10 +19,9 @@ corrected compressed per-folder summaries, and (6) defines the computation
 budget, the Monte Carlo validation oracle, and teacher targets for learned
 components.
 
-The companion `blocker_model.md` in the sibling evaluator repository specifies
-the network that consumes the objects defined here. It is intentionally not a
-local file: this document contains no architecture, and the sibling model
-document contains no derivations.
+`docs/theory/MHA_model.md` specifies the network that consumes the objects
+defined here. This document owns the derivations and folded-summary semantics;
+the model document owns their architectural consumption.
 
 ---
 

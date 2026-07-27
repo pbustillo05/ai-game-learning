@@ -1043,6 +1043,38 @@ Then $|\mathfrak S_K|\to\infty$ and
     In particular, the sibling average used as the leave-one-out baseline for $\widehat{A}^\lambda$ would no longer be independent of the target branch after conditioning on the target action label.
 \end{warning}
 
+\paragraph{Queued execution laws that supersede the independent-tree estimator.}
+The queued rewrite also exposes two explicitly different branching laws. They
+must retain distinct mode identity and must not inherit claims that require
+\autoref{lem:branched-branch-independence}.
+
+In sampled-private branching only (a branched rollout with the
+\texttt{sampled} private estimator), each logical root first draws one joint
+private profile. Every action and chance draw in that root's complete rollout
+tree is conditioned on that stored profile. Siblings are therefore
+intentionally correlated. This mode is a deliberate negative-control
+experiment intended to demonstrate that the estimator is a bad idea. It is a
+biased estimator: it does not satisfy
+\autoref{lem:branched-branch-independence}, does not use that lemma to justify a
+leave-one-out baseline, and must never be reported as the independent-tree law
+of \cref{alg:sample-tree}.
+
+In branched Rao--Blackwell execution, a node with $N(\mathsf s)\geq1$ assigns
+its inherited posterior profile to logical child zero and draws exactly
+$N(\mathsf s)-1$ fresh posterior profiles for the remaining children. Each
+public action or chance label is then drawn conditional on its child's
+profile, and that profile is propagated to the child. The inherited profile
+has the node posterior law by construction; the fresh profiles are
+independent draws from the same law. This child-zero reuse is the authoritative
+queued sampling law and avoids one rejection sample per expansion.
+
+A run may contain any positive number of logical roots. Root $r$ owns a local
+distinguished root $(r,\varnothing)$, intrinsic root fields, and an independent
+logical RNG address. Root batching is an execution dimension, not a branching
+degree or a new estimator mode. At $\beta\equiv1$, every root has
+$N=\widetilde N=N^{\tt tgt}=1$ at every node and is exactly one sequential
+trajectory.
+
 \paragraph{Primitive Functions.}
 Back to a synchronous rollout training, we fix weights $\theta_0,\ldots, \theta_k$.
 We let $\mathfrak{S}$, $\ell$, $P$, $\mathsf{S}$, $\Sigma$, $\mathsf{A}$, $A$, $\mathsf{T}$, $\Tau^{\mathsf{pre-c}}$ and $X$ be as above for $\pi = \pi^{\theta_k}$.
