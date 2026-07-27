@@ -630,6 +630,8 @@ class LayerPlan:
             raise TopologyError("LayerPlan conversion vocabulary is invalid")
         child_lane = [-1] * self.edge_count
         child_owner = [-1] * self.edge_count
+        sigma_destinations: set[tuple[int, int, int]] = set()
+        action_destinations: set[tuple[int, int, int]] = set()
         for first, stop in zip(layer_ptr, layer_ptr[1:]):
             destinations: set[tuple[int, int, int]] = set()
             for row in range(first, stop):
@@ -659,7 +661,7 @@ class LayerPlan:
                 begin < 0
                 or begin + count > self.edge_count
                 or not 1 <= target_count <= count <= manifest.beta_max
-                or nominal < 1
+                or not 1 <= nominal <= manifest.beta_max
                 or (
                     not self.branched
                     and (count != 1 or target_count != 1 or nominal != 1)
@@ -697,6 +699,14 @@ class LayerPlan:
                 raise TopologyError(
                     "LayerPlan sigma target exceeds its realized reservation"
                 )
+            sigma_key = (
+                lane,
+                input_type,
+                int(self.sigma_target_row[row]),
+            )
+            if sigma_key in sigma_destinations:
+                raise TopologyError("LayerPlan sigma targets are not unique")
+            sigma_destinations.add(sigma_key)
             action_type = output if self.branched else input_type
             action_name = (
                 self.output_names[action_type]
@@ -710,6 +720,11 @@ class LayerPlan:
                 raise TopologyError(
                     "LayerPlan action target exceeds its realized reservation"
                 )
+            for action_row in range(int(self.action_begin[row]), action_stop):
+                action_key = (lane, action_type, action_row)
+                if action_key in action_destinations:
+                    raise TopologyError("LayerPlan action targets overlap")
+                action_destinations.add(action_key)
         if any(lane < 0 for lane in child_lane):
             raise TopologyError("LayerPlan child spans do not cover every edge")
         for edge in range(self.edge_count):
@@ -757,6 +772,7 @@ class LayerPlan:
         ):
             raise TopologyError("LayerPlan target-edge summary is inconsistent")
         movement_destinations: set[tuple[int, int, int]] = set()
+        movement_sources: list[set[int]] = [set() for _ in range(n_replica)]
         group_counts: dict[tuple[int, int], int] = {}
         for movement in range(self.movement_count):
             lane = int(self.movement_replica[movement])
@@ -774,6 +790,9 @@ class LayerPlan:
             if key in movement_destinations:
                 raise TopologyError("LayerPlan movement destinations overlap")
             movement_destinations.add(key)
+            if source in movement_sources[lane]:
+                raise TopologyError("LayerPlan leaf sources are not unique")
+            movement_sources[lane].add(source)
             group = (lane, output)
             expected_destination = group_counts.get(group, 0)
             if destination != expected_destination:
@@ -786,6 +805,11 @@ class LayerPlan:
             raise TopologyError("LayerPlan movement scratch summary is inconsistent")
         if self.movement_index_bytes > manifest.movement_scratch_bytes:
             raise TopologyError("LayerPlan movement indices exceed admitted scratch")
+        for lane, sources in enumerate(movement_sources):
+            if sources != set(range(self.leaf_rows[lane])):
+                raise TopologyError(
+                    "LayerPlan leaf movement is not an exact permutation"
+                )
         for lane in range(n_replica):
             for input_type, name in enumerate(self.input_names):
                 if self.sigma_rows[lane][input_type] > trained_caps[name]:
@@ -922,6 +946,7 @@ def build_layer_plan(
     # shorter branches in their producing arena without physical carries.
     current: dict[tuple[int, int, int, int], int] = {}
     movement: list[tuple[int, int, int, int]] = []
+    leaf_source_rows: list[set[int]] = [set() for _ in compacted]
     arena_max = [[0] * output_count for _ in compacted]
     next_slot = [
         [[0, 0] for _ in range(output_count)] for _ in compacted
@@ -938,6 +963,9 @@ def build_layer_plan(
             if not 0 <= output < output_count:
                 raise TopologyError("leaf output type is outside the contract")
             leaf = int(topology.target_row[edge])
+            if leaf in leaf_source_rows[lane]:
+                raise TopologyError("a leaf row is referenced more than once")
+            leaf_source_rows[lane].add(leaf)
             key = (lane, int(TargetKind.LEAF), leaf, output)
             if key in current:
                 raise TopologyError("a leaf endpoint is referenced more than once")
@@ -947,6 +975,8 @@ def build_layer_plan(
             movement.append((lane, leaf, row, output))
         for output in range(output_count):
             arena_max[lane][output] = next_slot[lane][output][0]
+        if leaf_source_rows[lane] != set(range(len(leaf_source_rows[lane]))):
+            raise TopologyError("leaf rows must form one dense exact permutation")
 
     node_records: list[tuple[int, ...]] = []
     child_records: list[tuple[int, int, int, float]] = []
@@ -1096,11 +1126,18 @@ def build_layer_plan(
         )
         if owner < 0:
             continue
-        sigma_seen.setdefault((lane, input_type), set()).add(sigma)
+        sigma_key = (lane, input_type)
+        sigma_partition_rows = sigma_seen.setdefault(sigma_key, set())
+        if sigma in sigma_partition_rows:
+            raise TopologyError("sigma target rows must be unique")
+        sigma_partition_rows.add(sigma)
         action_partition = output if mode.rollout_mode.is_branched else input_type
-        action_seen.setdefault((lane, action_partition), set()).update(
-            range(action, action + target_degree)
-        )
+        action_key = (lane, action_partition)
+        action_partition_rows = action_seen.setdefault(action_key, set())
+        action_span = set(range(action, action + target_degree))
+        if action_partition_rows & action_span:
+            raise TopologyError("action target spans must not overlap")
+        action_partition_rows.update(action_span)
     rb_first_source_components = 0
     rb_owner_source_components = 0
     rb_written_components = 0

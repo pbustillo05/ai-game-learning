@@ -531,6 +531,63 @@ def test_topology_rejects_overlapping_or_orphan_child_spans() -> None:
         orphaned.validate(orphan_bindings, p_train=2)
 
 
+def test_layer_plan_rejects_duplicate_sigma_and_action_destinations() -> None:
+    mode = mode_schema("self_play", "branched.fixed", "sampled")
+    topology = Topology(
+        parent=_i32([-1, -1]),
+        child_begin=_i32([0, 1]),
+        executed_degree=_i32([1, 1]),
+        nominal_degree=_i32([1, 1]),
+        target_degree=_i32([1, 1]),
+        owner=_i32([0, 0]),
+        familywork_row=_i32([0, 1]),
+        sigma_head_row=_i32([0, 1]),
+        action_begin=_i32([0, 1]),
+        label=_i32([1, 2]),
+        path_length=_i32([1, 1]),
+        target_kind=_i32([int(TargetKind.LEAF), int(TargetKind.LEAF)]),
+        target_row=_i32([0, 1]),
+    )
+    duplicate_sigma = TopologyBindings(
+        input_type=_i32([0, 0]),
+        output_type=_i32([0, 0]),
+        sigma_target_row=_i32([0, 0]),
+        child_output_type=_i32([0, 0]),
+    )
+    with pytest.raises(TopologyError, match="sigma target rows must be unique"):
+        build_layer_plan(
+            mode,
+            _partitions(mode.private_estimator),
+            (topology,),
+            (duplicate_sigma,),
+            p_train=2,
+        )
+    unique_sigma = replace(
+        duplicate_sigma, sigma_target_row=_i32([0, 1])
+    )
+    with pytest.raises(TopologyError, match="action target spans"):
+        build_layer_plan(
+            mode,
+            _partitions(mode.private_estimator),
+            (replace(topology, action_begin=_i32([0, 0])),),
+            (unique_sigma,),
+            p_train=2,
+        )
+
+
+def test_layer_plan_rejects_nonpermutation_leaf_rows() -> None:
+    mode = mode_schema("self_play", "sequential", "sampled")
+    topology, bindings = _topology(mode)
+    with pytest.raises(TopologyError, match="dense exact permutation"):
+        build_layer_plan(
+            mode,
+            _partitions(mode.private_estimator),
+            (replace(topology, target_row=_i32([1])),),
+            (bindings,),
+            p_train=2,
+        )
+
+
 def test_sequential_rejects_nonunit_nominal_degree() -> None:
     mode = mode_schema("self_play", "sequential", "sampled")
     topology, bindings = _topology(mode)
@@ -670,6 +727,23 @@ def test_configured_maximum_sequential_depth_is_admitted() -> None:
         manifest=_manifest(mode, device),
     )
     assert plan.layer_count == nodes
+
+
+@CUDA
+def test_branched_nominal_degree_cannot_exceed_beta_max() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    mode = mode_schema("self_play", "branched.fixed", "sampled")
+    topology, bindings = _topology(mode)
+    topology = replace(topology, nominal_degree=_i32([4]))
+    with pytest.raises(TopologyError, match="child span"):
+        build_layer_plan(
+            mode,
+            _partitions(mode.private_estimator),
+            (topology,),
+            (bindings,),
+            p_train=2,
+            manifest=_manifest(mode, device),
+        )
 
 
 @CUDA
