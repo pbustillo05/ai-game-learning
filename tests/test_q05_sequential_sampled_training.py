@@ -15,6 +15,7 @@ from pbg.games.poker.queued import (
     CHECK_CALL,
     FOLD,
     NLHEGeometry,
+    PokerIterationError,
     PokerLegality,
     PokerPolicyOperator,
     PokerStateMachine,
@@ -457,16 +458,22 @@ def _phase5_manifest(device: torch.device) -> CapacityManifest:
     )
 
 
-def _phase5_layout() -> PhysicalLayout:
+def _phase5_layout(
+    geometry: NLHEGeometry | None = None,
+) -> PhysicalLayout:
+    geometry = (
+        NLHEGeometry(2, 8.0, 4) if geometry is None else geometry
+    )
+    input_width = geometry.direct_model_input_width
     return PhysicalLayout(
         model_input_shapes=(
-            NamedShape("pre", (26,)),
-            NamedShape("post_2", (26,)),
+            NamedShape("pre", (input_width,)),
+            NamedShape("post_2", (input_width,)),
         ),
         player_count=2,
         stratum_count=2,
         evaluator_private_width=4,
-        family_workspace_row_bytes=64,
+        family_workspace_row_bytes=4 * input_width + 64,
         chance_frontier_row_bytes=32,
         completion_workspace_row_bytes=64,
         learner_sigma_workspace_row_bytes=64,
@@ -501,7 +508,9 @@ class _LearnerModel(nn.Module):
         _owner: torch.Tensor,
     ) -> ModelEvaluation:
         batch = model_input.shape[0]
-        fields = self.affine(model_input.float()).reshape(batch, self.hands, 11)
+        fields = self.affine(
+            model_input[:, :26].float()
+        ).reshape(batch, self.hands, 11)
         return ModelEvaluation(
             MappingProxyType(
                 {
@@ -574,14 +583,14 @@ class _EndToEndPokerModel(nn.Module):
     ) -> ModelEvaluation:
         self.seen_input_types.append(input_type)
         batch = model_input.shape[0]
-        public = self.public(model_input.float())
+        public = self.public(model_input[:, :26].float())
         type_logits = self.type_logits[None].expand(batch, -1, -1)
         if self.check_down:
             actor = model_input[:, 6:8].argmax(-1)
             committed_street = model_input[:, 14:16].gather(
                 1, actor[:, None]
             ).squeeze(1)
-            facing = model_input[:, -2].float() > committed_street + 1.0e-6
+            facing = model_input[:, 24].float() > committed_street + 1.0e-6
             forced = torch.stack(
                 (
                     torch.where(
@@ -669,6 +678,87 @@ def test_complete_poker_iteration_runs_roots_to_optimizer() -> None:
     assert run_state.iteration == 1
     assert run_state.logical_work["trajectories"] == 1
     assert set(model.seen_input_types) == {"pre", "post_2"}
+
+
+@CUDA
+def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 13)
+    mode = next(
+        schema
+        for schema in MODE_SCHEMAS
+        if schema.key == "self_play/sequential/sampled"
+    )
+    model = build_model_from_config(
+        {
+            "mode": {
+                "training_regime": "self_play",
+                "rollout_mode": "sequential",
+                "private_estimator": "sampled",
+            },
+            "game": {
+                "players": 2,
+                "stack_bb": 8.0,
+                "rank_count": 13,
+            },
+            "model": {
+                "d_model": 4,
+                "n_heads": 1,
+                "n_layers_pre": 1,
+                "n_layers_post": 1,
+                "m_raise": 2,
+                "s_min": 0.02,
+                "max_players": 2,
+                "class_embedding_dim": 2,
+                "ffn_hidden": 8,
+                "folder_beta_rank": 0,
+                "folder_line_dim": 2,
+                "eps": 1.0e-8,
+            },
+        },
+        device,
+    )
+    with torch.no_grad():
+        for network in (model.preflop, model.postflop):
+            network.type_head.affine.weight.zero_()
+            network.type_head.affine.bias.copy_(
+                torch.tensor([-30.0, 30.0, -60.0], device=device)
+            )
+    manifest = replace(
+        _phase5_manifest(device),
+        geometry=GameGeometry(2, 8.0, 13, 64, 4096),
+        topology_cap=16,
+        topology_edge_cap=16,
+        topology_packet_cap=16,
+        target_arena_cap=32,
+    )
+    owners = GeneratedOwners(
+        build_storage_plan(
+            mode,
+            sampled_partitions(2),
+            manifest,
+            _phase5_layout(geometry),
+            device,
+        )
+    )
+    result = SequentialSampledPokerIteration(
+        geometry=geometry,
+        owners=owners,
+        mode=mode,
+        model=model,
+        model_operation=model.learner_operation,
+        optimizer=DenseAdam(model, OptimizerConfig()),
+        loss=LossConfig(),
+        schedule=LearnerSchedule(batch_size=1),
+        generator=torch.Generator(device=device).manual_seed(43),
+        seed=43,
+        lambda_=0.95,
+        run_state=RunState("phase5-real-model", root_count=1),
+    ).run(iteration=0)
+    assert result.player_nodes == 8
+    assert result.leaves == 1
+    assert result.target_layers == 8
+    assert result.learner.statistical_presentations == 8
 
 
 @CUDA
@@ -763,6 +853,7 @@ def test_end_to_end_overflow_rebuilds_and_retries_at_lower_roots() -> None:
     with pytest.warns(RuntimeWarning, match="RECOVERED_SEQUENTIAL_OVERFLOW"):
         result = RecoveringSequentialSampledPokerIteration(
             owner_factory=lambda: GeneratedOwners(plan),
+            plan=plan,
             minimum_root_count=1,
             geometry=geometry,
             mode=mode,
@@ -789,6 +880,68 @@ def test_end_to_end_overflow_rebuilds_and_retries_at_lower_roots() -> None:
     assert record["old_root_count"] == 2
     assert record["new_root_count"] == 1
     assert record["replacement_address"] == "1:2"
+
+
+@CUDA
+def test_end_to_end_overflow_rejects_retry_capacity_drift() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = next(
+        schema
+        for schema in MODE_SCHEMAS
+        if schema.key == "self_play/sequential/sampled"
+    )
+    manifest = replace(
+        _phase5_manifest(device),
+        root_count=2,
+        player_node_cap=(
+            PartitionRows("pre", 2),
+            PartitionRows("post_2", 78),
+        ),
+    )
+    plan = build_storage_plan(
+        mode,
+        sampled_partitions(2),
+        manifest,
+        _phase5_layout(),
+        device,
+    )
+    drifted = build_storage_plan(
+        mode,
+        sampled_partitions(2),
+        replace(
+            manifest,
+            player_node_cap=(
+                PartitionRows("pre", 40),
+                PartitionRows("post_2", 40),
+            ),
+        ),
+        _phase5_layout(),
+        device,
+    )
+    attempts = iter((plan, drifted))
+    model = _EndToEndPokerModel(
+        device, geometry.private_hands, check_down=True
+    )
+    run_state = RunState("phase5-cap-drift", root_count=2)
+    with pytest.warns(RuntimeWarning, match="RECOVERED_SEQUENTIAL_OVERFLOW"):
+        with pytest.raises(PokerIterationError, match="immutable storage plan"):
+            RecoveringSequentialSampledPokerIteration(
+                owner_factory=lambda: GeneratedOwners(next(attempts)),
+                plan=plan,
+                minimum_root_count=1,
+                geometry=geometry,
+                mode=mode,
+                model=model,
+                model_operation=model.evaluate,
+                optimizer=DenseAdam(model, OptimizerConfig()),
+                loss=LossConfig(),
+                schedule=LearnerSchedule(batch_size=1),
+                generator=torch.Generator(device=device).manual_seed(31),
+                seed=31,
+                lambda_=0.95,
+                run_state=run_state,
+            ).run(iteration=0)
 
 
 @CUDA
@@ -1299,6 +1452,32 @@ def test_converted_checkpoint_reconstructs_derived_model_exactly(
     assert resumed.preflop.cfg.k_act == 5
     assert resumed.preflop.cfg.use_branching_heads is False
     assert resumed.preflop.cfg.max_history_tokens == 18
+    machine = PokerStateMachine(resumed.geometry)
+    state = machine.initial_roots(
+        1, seed=41, iteration=0, retry_epoch=0, device="cuda"
+    )
+    direct = machine.direct_model_input(state)
+    pre = resumed.forward_partition("pre", direct)
+    assert pre.value.shape == (1, resumed.geometry.private_hands)
+    for _ in range(2):
+        state = machine.step_player(
+            state,
+            torch.full(
+                (1,), CHECK_CALL, dtype=torch.int32, device="cuda"
+            ),
+        )
+    state = machine.deal_next_street(
+        state,
+        torch.arange(
+            resumed.geometry.deck_cards,
+            dtype=torch.int64,
+            device="cuda",
+        )[None],
+    )
+    post = resumed.forward_partition(
+        "post_2", machine.direct_model_input(state)
+    )
+    assert post.value.shape == (1, resumed.geometry.private_hands)
     for name, expected in source_model.state_dict().items():
         torch.testing.assert_close(resumed.state_dict()[name].cpu(), expected.cpu())
 

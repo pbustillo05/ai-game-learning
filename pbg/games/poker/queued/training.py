@@ -19,7 +19,11 @@ from pbg.games.poker.queued.hooks import (
     SequentialSampledPokerHooks,
 )
 from pbg.games.poker.queued.policy import PokerPolicyOperator
-from pbg.queued.capacity import ExecutionPhase, GeneratedOwners
+from pbg.queued.capacity import (
+    ExecutionPhase,
+    GeneratedOwners,
+    StoragePlan,
+)
 from pbg.queued.contracts import ModeSchema
 from pbg.queued.learner import (
     AlignedSequentialStore,
@@ -715,6 +719,7 @@ class RecoveringSequentialSampledPokerIteration:
         self,
         *,
         owner_factory: Callable[[], GeneratedOwners],
+        plan: StoragePlan,
         minimum_root_count: int,
         geometry: NLHEGeometry,
         mode: ModeSchema,
@@ -730,6 +735,7 @@ class RecoveringSequentialSampledPokerIteration:
         reference_operation: ModelOperation | None = None,
     ) -> None:
         self.owner_factory = owner_factory
+        self.plan = plan
         self.minimum_root_count = int(minimum_root_count)
         self.arguments = {
             "geometry": geometry,
@@ -769,6 +775,11 @@ class RecoveringSequentialSampledPokerIteration:
                     "overflow controller and run state addresses diverged"
                 )
             owners = self.owner_factory()
+            if owners.plan != self.plan:
+                owners.failure_state.release()
+                raise PokerIterationError(
+                    "overflow retry changed the immutable storage plan"
+                )
             active[:] = [owners]
             return SequentialSampledPokerIteration(
                 owners=owners, **self.arguments

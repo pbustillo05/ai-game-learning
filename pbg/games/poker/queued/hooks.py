@@ -41,6 +41,7 @@ from pbg.queued.rollout import (
     stable_route,
 )
 from pbg.queued.storage import DeviceDestinationRequest, MonotoneSlab
+from pbg.games.poker.model.capacity import max_public_history_tokens
 from pbg.games.poker.queued.policy import (
     CHECK_CALL,
     FOLD,
@@ -113,7 +114,12 @@ class NLHEGeometry:
 
     @property
     def direct_model_input_width(self) -> int:
-        return 8 + 9 * self.players
+        return (
+            8
+            + 9 * self.players
+            + self.players * self.private_hands
+            + 10 * max_public_history_tokens(self.players, self.stack_bb)
+        )
 
     def combo_id(self, first: Tensor, second: Tensor) -> Tensor:
         low = torch.minimum(first, second).to(torch.int64) - self.first_card
@@ -218,6 +224,20 @@ class PokerState:
             ).all(),
             "public chip accounting is not conserved",
         )
+
+
+@dataclass(frozen=True)
+class PokerHistory:
+    actor: Tensor
+    street: Tensor
+    action: Tensor
+    amount: Tensor
+    pot_before: Tensor
+    call_amount: Tensor
+    current_bet: Tensor
+    min_raise_to: Tensor
+    max_raise_to: Tensor
+    mask: Tensor
 
 
 def _next_seat(mask: Tensor, after: Tensor) -> Tensor:
@@ -362,8 +382,36 @@ class PokerStateMachine:
         mask &= ~state.terminal[:, None]
         return PokerLegality(events.contiguous(), mask.contiguous())
 
-    def direct_model_input(self, state: PokerState) -> Tensor:
-        """Return the retained fixed-width public tensor without a DTO adapter."""
+    def empty_history(self, rows: int, device: torch.device) -> PokerHistory:
+        tokens = max_public_history_tokens(
+            self.geometry.players, self.geometry.stack_bb
+        )
+        integer = torch.full(
+            (rows, tokens), -1, dtype=torch.int64, device=device
+        )
+        numeric = torch.zeros(
+            (rows, tokens), dtype=torch.float32, device=device
+        )
+        return PokerHistory(
+            integer.clone(),
+            integer.clone(),
+            integer.clone(),
+            numeric.clone(),
+            numeric.clone(),
+            numeric.clone(),
+            numeric.clone(),
+            numeric.clone(),
+            numeric.clone(),
+            torch.zeros_like(numeric, dtype=torch.bool),
+        )
+
+    def direct_model_input(
+        self,
+        state: PokerState,
+        log_reach: Tensor | None = None,
+        history: PokerHistory | None = None,
+    ) -> Tensor:
+        """Return the retained public, reach, and history model tensor."""
 
         state.validate(self.geometry)
         scale = float(self.geometry.stack_bb)
@@ -382,7 +430,7 @@ class PokerStateMachine:
         status = torch.nn.functional.one_hot(
             state.status.to(torch.int64), 3
         ).float().flatten(1)
-        return torch.cat(
+        public = torch.cat(
             (
                 state.street[:, None].float() / 3.0,
                 board,
@@ -397,7 +445,163 @@ class PokerStateMachine:
                 (state.last_full_raise / scale)[:, None],
             ),
             1,
+        )
+        if log_reach is None:
+            log_reach = torch.zeros(
+                (
+                    state.rows,
+                    self.geometry.players,
+                    self.geometry.private_hands,
+                ),
+                dtype=torch.float32,
+                device=state.device,
+            )
+        if history is None:
+            history = self.empty_history(state.rows, state.device)
+        history_values = tuple(
+            getattr(history, name).float()
+            for name in history.__dataclass_fields__
+        )
+        return torch.cat(
+            (public, log_reach.flatten(1), *history_values), 1
         ).contiguous()
+
+    def model_context(
+        self, model_input: Tensor
+    ) -> tuple[Tensor, PokerHistory]:
+        players = self.geometry.players
+        hands = self.geometry.private_hands
+        tokens = max_public_history_tokens(
+            players, self.geometry.stack_bb
+        )
+        offset = 8 + 9 * players
+        reach = model_input[:, offset : offset + players * hands].float()
+        offset += players * hands
+        columns = []
+        for _ in range(10):
+            columns.append(model_input[:, offset : offset + tokens])
+            offset += tokens
+        if offset != model_input.shape[1]:
+            raise QueuedPokerError("retained model context layout is not exact")
+        return reach.reshape(-1, players, hands), PokerHistory(
+            columns[0].round().to(torch.int64),
+            columns[1].round().to(torch.int64),
+            columns[2].round().to(torch.int64),
+            columns[3].float(),
+            columns[4].float(),
+            columns[5].float(),
+            columns[6].float(),
+            columns[7].float(),
+            columns[8].float(),
+            columns[9].gt(0.5),
+        )
+
+    @staticmethod
+    def _append_history(
+        history: PokerHistory,
+        active: Tensor,
+        values: Mapping[str, Tensor],
+    ) -> PokerHistory:
+        length = history.mask.sum(1, dtype=torch.int64)
+        torch._assert_async(
+            (~active | length.lt(history.mask.shape[1])).all(),
+            "poker public history capacity exceeded",
+        )
+        position = torch.arange(
+            history.mask.shape[1], device=history.mask.device
+        )[None].eq(length[:, None])
+        selected = active[:, None] & position
+        result = {}
+        for name in history.__dataclass_fields__:
+            current = getattr(history, name)
+            if name == "mask":
+                result[name] = current | selected
+            else:
+                value = values[name].to(current.dtype)[:, None]
+                result[name] = torch.where(selected, value, current)
+        return PokerHistory(**result)
+
+    def append_player_history(
+        self, state: PokerState, action: Tensor, history: PokerHistory
+    ) -> PokerHistory:
+        legality = self.legality(state)
+        raise_mask = legality.mask[:, RAISE_OFFSET:]
+        targets = (
+            torch.arange(
+                1,
+                self.geometry.stack_ticks + 1,
+                dtype=torch.float32,
+                device=state.device,
+            )
+            * 0.5
+        )
+        lower = targets[None].masked_fill(
+            ~raise_mask, torch.inf
+        ).min(1).values
+        upper = targets[None].masked_fill(
+            ~raise_mask, -torch.inf
+        ).max(1).values
+        has_raise = raise_mask.any(1)
+        lower = torch.where(has_raise, lower, torch.zeros_like(lower))
+        upper = torch.where(has_raise, upper, torch.zeros_like(upper))
+        actor = state.to_act.to(torch.int64)
+        actor_stack = state.stacks.gather(1, actor[:, None]).squeeze(1)
+        actor_committed = state.committed_street.gather(
+            1, actor[:, None]
+        ).squeeze(1)
+        call = (state.current_bet - actor_committed).clamp_min(0.0)
+        paid_call = torch.minimum(call, actor_stack)
+        raise_to = (action.float() - RAISE_OFFSET + 1.0) * 0.5
+        raised = action.ge(RAISE_OFFSET)
+        called = action.eq(CHECK_CALL)
+        amount = torch.where(
+            raised,
+            raise_to,
+            torch.where(called, paid_call, torch.zeros_like(call)),
+        )
+        action_type = torch.where(
+            raised,
+            torch.full_like(action, 2),
+            torch.where(called, torch.ones_like(action), torch.zeros_like(action)),
+        )
+        return self._append_history(
+            history,
+            ~state.terminal,
+            {
+                "actor": actor,
+                "street": state.street,
+                "action": action_type,
+                "amount": amount,
+                "pot_before": state.committed.sum(1),
+                "call_amount": call,
+                "current_bet": state.current_bet,
+                "min_raise_to": lower,
+                "max_raise_to": upper,
+            },
+        )
+
+    def append_chance_history(
+        self,
+        state: PokerState,
+        active: Tensor,
+        history: PokerHistory,
+    ) -> PokerHistory:
+        zeros = torch.zeros_like(state.current_bet)
+        return self._append_history(
+            history,
+            active,
+            {
+                "actor": torch.full_like(state.to_act, -1),
+                "street": state.street,
+                "action": torch.full_like(state.to_act, 3),
+                "amount": zeros,
+                "pot_before": state.committed.sum(1),
+                "call_amount": zeros,
+                "current_bet": state.current_bet,
+                "min_raise_to": zeros,
+                "max_raise_to": zeros,
+            },
+        )
 
     def state_from_model_input(
         self, model_input: Tensor, combo_ids: Tensor
@@ -444,8 +648,8 @@ class PokerStateMachine:
         pending = take(players).gt(0.5)
         current_bet = take(1)[:, 0] * scale
         last_full_raise = take(1)[:, 0] * scale
-        if offset != model_input.shape[1]:
-            raise QueuedPokerError("retained model input layout is not exact")
+        if offset != 8 + 9 * players:
+            raise QueuedPokerError("retained public input layout is not exact")
         state = PokerState(
             board,
             combo_ids,
@@ -927,7 +1131,31 @@ class SequentialSampledPokerHooks:
             -1, self.geometry.players
         )
         state = self.machine.state_from_model_input(flat_input, flat_private)
+        log_reach, history = self.machine.model_context(flat_input)
         action = request.sample.values["action"].reshape(-1)
+        raw = MappingProxyType(
+            {
+                name: value
+                for name, value in request.model.values.items()
+                if name != "value"
+            }
+        )
+        selected_log = self.policy.selected_log_pi(
+            raw, self.machine.legality(state), action
+        ).detach().float()
+        actor = state.to_act.to(torch.int64)
+        actor_reach = log_reach.gather(
+            1,
+            actor[:, None, None].expand(-1, 1, self.geometry.private_hands),
+        ).squeeze(1)
+        log_reach = log_reach.scatter(
+            1,
+            actor[:, None, None].expand(-1, 1, self.geometry.private_hands),
+            (actor_reach + selected_log)[:, None],
+        )
+        history = self.machine.append_player_history(
+            state, action, history
+        )
         next_state = self.machine.step_player(state, action)
         logical = batch.fields["logical_rng_key"]
         root = logical[..., 0].reshape(-1)
@@ -936,6 +1164,7 @@ class SequentialSampledPokerHooks:
             lane_count, rows
         ).reshape(-1)
         for generation in range(3):
+            chance_active = self.machine.needs_chance(next_state)
             next_state = self.machine.deal_next_street_keyed(
                 next_state,
                 seed=self.seed,
@@ -945,6 +1174,24 @@ class SequentialSampledPokerHooks:
                 draw=generation,
                 retry_epoch=retry,
             )
+            history = self.machine.append_chance_history(
+                next_state, chance_active, history
+            )
+        board = next_state.board_cards
+        cards = self.machine.combo_cards(
+            torch.arange(
+                self.geometry.private_hands,
+                dtype=torch.int32,
+                device=state.device,
+            )
+        )
+        conflict = (
+            board.ne(PAD_CARD)[..., None, None]
+            & board.long()[..., None, None].eq(cards[None, :, :])
+        ).any(1).any(-1)
+        log_reach = log_reach.masked_fill(
+            conflict[:, None, :], -torch.inf
+        )
         terminal = next_state.terminal.reshape(lane_count, rows)
         next_family = self.machine.input_type(next_state).reshape(
             lane_count, rows
@@ -1048,7 +1295,9 @@ class SequentialSampledPokerHooks:
         )
 
         next_path = child_path_keys(path, 1).reshape(lane_count, rows)
-        next_input = self.machine.direct_model_input(next_state).reshape(
+        next_input = self.machine.direct_model_input(
+            next_state, log_reach, history
+        ).reshape(
             lane_count, rows, -1
         )
         next_private = next_state.combo_ids.reshape(
@@ -1284,6 +1533,7 @@ __all__ = [
     "NLHEGeometry",
     "PAD_CARD",
     "PokerForwardInput",
+    "PokerHistory",
     "PokerLearnerPolicy",
     "PokerState",
     "PokerStateMachine",

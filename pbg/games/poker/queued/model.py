@@ -10,9 +10,23 @@ from torch import Tensor, nn
 from pbg.queued.learner import ModelEvaluation
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.model.capacity import max_public_history_tokens
-from pbg.games.poker.model.postflop import PostflopNet
-from pbg.games.poker.model.preflop import PokerModelConfig, PreflopNet
-from pbg.games.poker.queued.hooks import NLHEGeometry
+from pbg.games.poker.model.postflop import PostflopMasks, PostflopNet
+from pbg.games.poker.model.preflop import (
+    PackedPublicHistory,
+    PokerModelConfig,
+    PokerPublicBatch,
+    PolicyOutput,
+    PreflopMasks,
+    PreflopNet,
+)
+from pbg.games.poker.queued.hooks import (
+    FOLDED,
+    NLHEGeometry,
+    PAD_CARD,
+    PokerHistory,
+    PokerState,
+    PokerStateMachine,
+)
 
 
 class PokerModelError(RuntimeError):
@@ -86,13 +100,190 @@ class QueuedPokerModel(nn.Module):
         self.preflop = preflop
         self.postflop = postflop
         self.register_buffer("combo_class", _combo_class(geometry), persistent=True)
+        deck = DeckGeometry(geometry.rank_count)
+        self.register_buffer(
+            "combo_cards",
+            torch.tensor(deck.combo_cards, dtype=torch.int64),
+            persistent=False,
+        )
 
     @staticmethod
-    def _call(module: nn.Module, model_input: Tensor) -> ModelEvaluation:
+    def _call_direct(module: nn.Module, model_input: Tensor) -> ModelEvaluation:
         result = module(model_input)
         if not isinstance(result, ModelEvaluation):
             raise PokerModelError("partition network must return ModelEvaluation")
         return result
+
+    @staticmethod
+    def _evaluation(result: PolicyOutput) -> ModelEvaluation:
+        return ModelEvaluation(MappingProxyType(dict(result.raw)), result.v)
+
+    def _state(self, model_input: Tensor) -> PokerState:
+        combo_ids = torch.zeros(
+            (model_input.shape[0], self.geometry.players),
+            dtype=torch.int32,
+            device=model_input.device,
+        )
+        return PokerStateMachine(self.geometry).state_from_model_input(
+            model_input, combo_ids
+        )
+
+    def _public(
+        self, state: PokerState, history: PokerHistory
+    ) -> tuple[PokerPublicBatch, Tensor]:
+        machine = PokerStateMachine(self.geometry)
+        legality = machine.legality(state)
+        raise_mask = legality.mask[:, 2:]
+        raise_ticks = (
+            torch.arange(
+                1,
+                self.geometry.stack_ticks + 1,
+                dtype=torch.float32,
+                device=state.device,
+            )[None]
+            * 0.5
+        ).expand(state.rows, -1)
+        lower = raise_ticks.masked_fill(~raise_mask, torch.inf).min(1).values
+        upper = raise_ticks.masked_fill(~raise_mask, -torch.inf).max(1).values
+        has_raise = raise_mask.any(1)
+        lower = torch.where(has_raise, lower, torch.zeros_like(lower))
+        upper = torch.where(has_raise, upper, torch.zeros_like(upper))
+        actor = state.to_act.to(torch.int64)
+        actor_committed = state.committed_street.gather(
+            1, actor[:, None]
+        ).squeeze(1)
+        legality_summary = torch.stack(
+            (
+                legality.mask[:, 0].float(),
+                legality.mask[:, 1].float(),
+                raise_mask.float().mean(1),
+            ),
+            1,
+        )
+        public = PokerPublicBatch(
+            street=state.street.to(torch.int64),
+            board=torch.where(
+                state.board_cards.eq(PAD_CARD),
+                torch.full_like(state.board_cards, -1, dtype=torch.int64),
+                state.board_cards.to(torch.int64),
+            ),
+            pot=state.committed.sum(1),
+            stacks=state.stacks,
+            committed=state.committed,
+            to_act=actor,
+            legality_summary=legality_summary,
+            n_ticks=torch.full(
+                (state.rows,),
+                self.geometry.stack_ticks,
+                dtype=torch.int64,
+                device=state.device,
+            ),
+            raise_grid_bounds=torch.stack((lower, upper), 1),
+            status=state.status.to(torch.int64),
+            seat_mask=torch.ones_like(state.status, dtype=torch.bool),
+            button=state.button.to(torch.int64),
+            committed_street=state.committed_street,
+            call_amount=(
+                state.current_bet - actor_committed
+            ).clamp_min(0.0),
+            current_bet=state.current_bet,
+            min_raise_to=lower,
+            max_raise_to=upper,
+            last_full_raise=state.last_full_raise,
+            legal_action_mask=legality.mask,
+            raise_ticks=raise_ticks,
+            history=PackedPublicHistory(
+                **{
+                    name: getattr(history, name)
+                    for name in history.__dataclass_fields__
+                }
+            ),
+        )
+        board = public.board
+        compatible = ~(
+            self.combo_cards[None, :, :, None].eq(
+                board[:, None, None, :]
+            )
+            & board[:, None, None, :].ge(0)
+        ).any(3).any(2)
+        return public, compatible
+
+    def _call_preflop(
+        self, model_input: Tensor
+    ) -> ModelEvaluation:
+        state = self._state(model_input)
+        log_reach, history = PokerStateMachine(
+            self.geometry
+        ).model_context(model_input)
+        public, _compatible = self._public(state, history)
+        finite = torch.isfinite(log_reach)
+        gauge = log_reach.masked_fill(
+            ~finite, -torch.inf
+        ).max(2, keepdim=True).values
+        weights = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
+        class_ranges = torch.zeros(
+            (
+                state.rows,
+                self.geometry.players,
+                self.geometry.rank_count**2,
+            ),
+            dtype=torch.float32,
+            device=state.device,
+        )
+        classes = self.combo_class[None, None, :].expand_as(weights)
+        class_ranges.scatter_add_(2, classes, weights)
+        return self._evaluation(
+            self.preflop(
+                public,
+                class_ranges,
+                public.to_act,
+                PreflopMasks(
+                    seat_mask=public.seat_mask,
+                    status=public.status,
+                ),
+            )
+        )
+
+    def _call_postflop(
+        self, input_type: str, model_input: Tensor
+    ) -> ModelEvaluation:
+        state = self._state(model_input)
+        log_reach, history = PokerStateMachine(
+            self.geometry
+        ).model_context(model_input)
+        public, compatible = self._public(state, history)
+        live = int(input_type[5:])
+        seats = torch.arange(
+            self.geometry.players, device=state.device
+        )[None].expand(state.rows, -1)
+        ordered = torch.where(
+            state.status.ne(FOLDED), seats, self.geometry.players
+        ).sort(1).values
+        live_ids = ordered[:, :live]
+        torch._assert_async(
+            live_ids.lt(self.geometry.players).all(),
+            "postflop family disagrees with live-seat state",
+        )
+        finite = torch.isfinite(log_reach)
+        gauge = log_reach.masked_fill(
+            ~finite, -torch.inf
+        ).max(2, keepdim=True).values
+        ranges = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
+        return self._evaluation(
+            self.postflop(
+                public,
+                ranges,
+                public.to_act,
+                PostflopMasks(
+                    compatibility=compatible,
+                    seat_mask=public.seat_mask,
+                    combo_mask=ranges.bool(),
+                    status=public.status,
+                    evaluator_summary=None,
+                    live_seat_ids=live_ids,
+                ),
+            )
+        )
 
     def forward_partition(
         self, input_type: str, model_input: Tensor
@@ -105,7 +296,11 @@ class QueuedPokerModel(nn.Module):
             raise PokerModelError("queued poker model input must be CUDA [B,F]")
         batch = model_input.shape[0]
         if input_type == "pre":
-            compact = self._call(self.preflop, model_input)
+            compact = (
+                self._call_preflop(model_input)
+                if isinstance(self.preflop, PreflopNet)
+                else self._call_direct(self.preflop, model_input)
+            )
             _validate_output(
                 compact,
                 batch=batch,
@@ -121,7 +316,11 @@ class QueuedPokerModel(nn.Module):
             live = int(input_type[5:])
             if not 2 <= live <= self.geometry.players:
                 raise PokerModelError("postflop family has an invalid live-seat count")
-            result = self._call(self.postflop, model_input)
+            result = (
+                self._call_postflop(input_type, model_input)
+                if isinstance(self.postflop, PostflopNet)
+                else self._call_direct(self.postflop, model_input)
+            )
         else:
             raise PokerModelError(f"unknown poker input partition {input_type!r}")
         _validate_output(
