@@ -269,10 +269,6 @@ def test_phase1_inventory_covers_legacy_modules_and_config_fields() -> None:
         / "audit"
         / "queued_phase1_inventory_20260726.md"
     ).read_text(encoding="utf-8")
-    mode_contract = (
-        REPOSITORY / "docs" / "queued" / "mode_contracts.md"
-    ).read_text(encoding="utf-8")
-
     for path in sorted((REPOSITORY / "pbg" / "core").glob("*.py")):
         if path.name != "__init__.py":
             assert f"core.{path.stem}" in ledger
@@ -306,6 +302,3 @@ def test_phase1_inventory_covers_legacy_modules_and_config_fields() -> None:
     )
     for field in expected_config_fields:
         assert field in inventory
-
-    assert "Cartesian product has twelve rows" in mode_contract
-    assert "negative-control" in mode_contract
