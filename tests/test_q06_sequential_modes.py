@@ -225,7 +225,22 @@ def test_native_postflop_model_consumes_signed_folded_summary() -> None:
     model_input[:, geometry.base_model_input_width :] = (
         pack_folded_statistics(geometry, summary)
     )
-    evaluation = model.forward_sequential_partition("post_2", model_input)
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        acc_events=True,
+    ) as profile:
+        evaluation = model.forward_sequential_partition(
+            "post_2", model_input
+        )
+    scalar_events = {
+        event.key
+        for event in profile.key_averages()
+        if event.key in {"aten::_local_scalar_dense", "aten::is_nonzero"}
+    }
+    assert not scalar_events
     assert evaluation.value.shape == (1, geometry.private_hands)
     assert torch.isfinite(evaluation.value).all()
     evaluation.value.mean().backward()
@@ -427,7 +442,7 @@ def test_max_geometry_workspace_bounds_are_explicit() -> None:
     geometry = NLHEGeometry(6, 128.0, 13)
     assert geometry.private_hands == 1326
     assert geometry.folded_summary_width == 4402
-    assert folded_statistics_workspace_row_bytes(geometry) == 296_976
+    assert folded_statistics_workspace_row_bytes(geometry) == 3_691_536
     assert rb_conversion_workspace_row_bytes(1326, 169) == 17_264
 
 
@@ -461,6 +476,50 @@ def test_full_deck_h_to_k_conversion_is_deterministic_and_bounded() -> None:
     assert (
         torch.cuda.max_memory_allocated(device) - baseline
         < 10_000_000
+    )
+
+
+@CUDA
+def test_full_deck_folded_statistics_stays_within_admitted_workspace() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(6, 128.0, 13)
+    machine = PokerStateMachine(geometry)
+    batch = 8
+    state = machine.initial_roots(
+        batch, seed=59, iteration=0, retry_epoch=0, device=device
+    )
+    status = state.status.clone()
+    status[:, 3:] = FOLDED
+    ranges = torch.rand(
+        (batch, geometry.players, geometry.private_hands),
+        dtype=torch.float32,
+        device=device,
+    )
+    combo_cards = machine.combo_cards(
+        torch.arange(
+            geometry.private_hands, dtype=torch.int32, device=device
+        )
+    )
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    summary = folded_statistics(
+        geometry,
+        board_cards=state.board_cards,
+        range_weights=ranges,
+        status=status,
+        combo_cards=combo_cards,
+        beta_rank=16,
+        line_dim=0,
+        tight_mask=status.eq(FOLDED),
+    )
+    torch.cuda.synchronize()
+    incremental_peak = (
+        torch.cuda.max_memory_allocated(device) - baseline
+    )
+    assert torch.isfinite(summary["hand_log_ratio"]).all()
+    assert incremental_peak <= (
+        batch * folded_statistics_workspace_row_bytes(geometry)
     )
 
 

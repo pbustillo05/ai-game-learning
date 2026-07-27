@@ -38,6 +38,9 @@ def folded_statistics_workspace_row_bytes(geometry: NLHEGeometry) -> int:
             + 8
         )
         + 2 * queries
+        # Triple-cluster evaluation holds the survives/edge/matrix-term
+        # hand-domain operands concurrently for one query chunk.
+        + 10 * chunk * hands
         + hands
         + 3 * cards * cards
     )
