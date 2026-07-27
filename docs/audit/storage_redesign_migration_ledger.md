@@ -27,6 +27,16 @@ headless structural rows, and atomic target publication. Physical carries and
 total-minus-child are deleted. Legacy topology and target definitions remain
 open until their callers and owners are deleted at cutover.
 
+Phase 4 replacement evidence passed against candidate
+`de6b429ce5c174df1af21e5709bfd9d51e007429`: semantic FIFOs, stable
+compatible-cohort scheduling, lane-local mode identity, authoritative logical
+RNG, descriptor-derived device routing and exact coverage, one rollback-safe
+`model -> sample -> commit` transaction, declared cross-family fan-out,
+reservation-bound asynchronous topology, bounded chance closure, and strict
+`Leaf -> LayerWork` completion. Legacy rollout, queue, RNG, and completion
+definitions remain open until their consumer phases land and cutover deletes
+their old callers.
+
 Disposition meanings:
 
 - `move`: representation-independent behavior relocates once to its final
@@ -183,3 +193,17 @@ topology owner, one plan, one target executor, closed completion and conversion
 contracts, and no parallel path or forbidden import. See
 `queued_phase3_report_20260726.md` and
 `../queued/topology_and_targets.md`.
+
+Phase 4 candidate `de6b429ce5c174df1af21e5709bfd9d51e007429`
+passed 20 focused CUDA tests, 91 cumulative queued tests, 13 targeted
+ownership/integration gates, adversarial topology ordering probes, and the
+legacy context selection on explicitly selected GPU 0. Profiler traces for
+1/2/4/8 packs contained no D2H/H2D copies, nonzero compaction, host scalar
+reads, or stream synchronization in the measured hot path. Evidence covers
+stable exact routing, inactive RNG, collision/overflow, cross-family branched
+fan-out, atomic rollback and real generated-owner retry, replica-local
+reservation-bound topology, chance exhaustion, and exact matching
+`LayerWork` completion. The final independent read-only audit found no
+remaining critical or high-severity executable issue. See
+`queued_phase4_report_20260727.md` and
+`../queued/rollout_transactions.md`.
