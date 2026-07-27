@@ -1692,7 +1692,12 @@ class SequentialPokerHooks:
             batch.lanes,
             fold.reshape(lane_count, rows).sum(1, dtype=torch.int64),
         )
-        fold_base = folded_slab.tail(0)
+        fold_base = (
+            folded_slab.reserved_tails_device()
+            .index_select(0, batch.lanes)[:, None]
+            .expand(lane_count, rows)
+            .reshape(-1)
+        )
         fold_ordinal = fold.cumsum(0, dtype=torch.int64) - 1
         encoded_reference = (
             fold_base + fold_ordinal

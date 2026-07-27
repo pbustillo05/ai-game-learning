@@ -572,6 +572,12 @@ class MonotoneSlab:
     def reserved_tail(self, lane: int) -> int:
         return self._lane_state(lane)[self._RESERVED]
 
+    def reserved_tails_device(self) -> Tensor:
+        """Return current reservation beginnings without a host synchronization."""
+
+        self._check_live()
+        return self._state[:, self._RESERVED].clone()
+
     def high_water(self, lane: int, *, lifetime: bool = False) -> int:
         index = self._LIFETIME_HIGH_WATER if lifetime else self._ATTEMPT_HIGH_WATER
         return self._lane_state(lane)[index]
