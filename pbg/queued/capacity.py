@@ -434,7 +434,12 @@ def _field(
         return SoAField(field_name, torch.int32, (players,), alignment, integer_fill)
     if field_name == "folded_range_row":
         return SoAField(field_name, torch.int32, (players,), alignment, integer_fill)
-    if field_name in ("reservation_state", "publication_state", "role_selector"):
+    if field_name in (
+        "reservation_state",
+        "publication_state",
+        "role_selector",
+        "probe_cutoff",
+    ):
         return SoAField(field_name, torch.uint8, (), alignment)
     if field_name == "model_input":
         if partition is None or partition.name not in layout.input_shapes:
@@ -489,6 +494,8 @@ def _field(
         if partition is None:
             raise CapacityError("folded range requires a partition")
         return SoAField(field_name, torch.float32, (partition.width,), alignment)
+    if field_name == "log_mass":
+        return SoAField(field_name, torch.float32, (), alignment)
     if field_name in (
         "old_value",
         "old_log_policy",

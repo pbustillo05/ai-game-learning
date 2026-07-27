@@ -15,6 +15,35 @@ class FoldedStatisticsError(ValueError):
     pass
 
 
+_REMOVAL_QUERY_CHUNK = 64
+
+
+def folded_statistics_workspace_row_bytes(geometry: NLHEGeometry) -> int:
+    """Conservative per-row bound for the finite-difference CUDA kernel."""
+
+    if geometry.players == 2:
+        return 0
+    cards = geometry.deck_cards
+    players = geometry.players
+    hands = geometry.private_hands
+    queries = 1 + cards + cards * (cards - 1) // 2
+    chunk = min(queries, _REMOVAL_QUERY_CHUNK)
+    fp32_values = (
+        players * cards * cards
+        + chunk
+        * (
+            2 * players * cards
+            + players * players
+            + 8 * players
+            + 8
+        )
+        + 2 * queries
+        + hands
+        + 3 * cards * cards
+    )
+    return 4 * fp32_values
+
+
 def _removal_queries(cards: int, device: torch.device) -> tuple[Tensor, Tensor, Tensor]:
     pair = torch.triu_indices(cards, cards, offset=1, device=device)
     rows = 1 + cards + pair.shape[1]
@@ -51,11 +80,12 @@ def _phi_queries(
     removal: Tensor,
     combo_local: Tensor,
     base_cards: Tensor,
+    tight_mask: Tensor,
 ) -> tuple[Tensor, Tensor]:
     """Evaluate the §3.4 estimator on every zero/one/two-card removal."""
 
     batch, folders, _ = probability.shape
-    queries, cards = removal.shape
+    queries = removal.shape[0]
     remove = removal.float()
     allowed = ~removal
     removed_count = remove.sum(-1)
@@ -135,14 +165,12 @@ def _phi_queries(
                 torch.zeros_like(phi),
             )
 
-    # Treat every observed folder as tight. This is the conservative exact
-    # §3.4 path when line metadata does not authorize dropping a loose wing.
     triple = torch.zeros(
         (batch, queries), dtype=torch.float32, device=probability.device
     )
     for first in range(folders):
         for second in range(first + 1, folders):
-            wings = folder_mask[:, first] & folder_mask[:, second]
+            wings = tight_mask[:, first] & tight_mask[:, second]
             left = delta[:, :, first]
             right = delta[:, :, second]
             for hub in range(folders):
@@ -182,6 +210,7 @@ def _folded_statistics_fp32(
     beta_rank: int,
     line_dim: int,
     line_metadata: Tensor | None = None,
+    tight_mask: Tensor | None = None,
 ) -> Mapping[str, Tensor]:
     r"""Compute $\Lambda_B$ and signed $\beta_B$ factors from exact combos."""
 
@@ -208,6 +237,18 @@ def _folded_statistics_fp32(
     ):
         raise FoldedStatisticsError("folded statistic inputs violate poker geometry")
     folder_mask = status.eq(FOLDED)
+    if tight_mask is None:
+        tight_mask = folder_mask
+    if (
+        tight_mask.shape != folder_mask.shape
+        or tight_mask.dtype != torch.bool
+        or tight_mask.device != range_weights.device
+    ):
+        raise FoldedStatisticsError("tight-folder mask violates folded seats")
+    torch._assert_async(
+        (~tight_mask | folder_mask).all(),
+        "tight-folder mask includes a live seat",
+    )
     finite = torch.isfinite(range_weights)
     raw = range_weights.masked_fill(~finite, 0.0).clamp_min(0.0)
     raw = raw * folder_mask[..., None]
@@ -225,14 +266,22 @@ def _folded_statistics_fp32(
     matrix = _range_matrix(probability, combo_local, cards)
     removal, pair, pair_ordinal = _removal_queries(cards, raw.device)
     base_cards = cards - board_valid.sum(-1, dtype=torch.float32)
-    phi, triple = _phi_queries(
-        probability,
-        matrix,
-        folder_mask,
-        removal,
-        combo_local,
-        base_cards,
-    )
+    phi_parts = []
+    triple_parts = []
+    for begin in range(0, removal.shape[0], _REMOVAL_QUERY_CHUNK):
+        phi_part, triple_part = _phi_queries(
+            probability,
+            matrix,
+            folder_mask,
+            removal[begin : begin + _REMOVAL_QUERY_CHUNK],
+            combo_local,
+            base_cards,
+            tight_mask,
+        )
+        phi_parts.append(phi_part)
+        triple_parts.append(triple_part)
+    phi = torch.cat(phi_parts, 1)
+    triple = torch.cat(triple_parts, 1)
     phi_zero = phi[:, :1]
     alpha = phi[:, 1 : 1 + cards] - phi_zero
     beta = torch.zeros(
@@ -324,6 +373,7 @@ def folded_statistics(
     beta_rank: int,
     line_dim: int,
     line_metadata: Tensor | None = None,
+    tight_mask: Tensor | None = None,
 ) -> Mapping[str, Tensor]:
     """Run the authoritative finite differences outside mixed precision."""
 
@@ -337,7 +387,119 @@ def folded_statistics(
             beta_rank=beta_rank,
             line_dim=line_dim,
             line_metadata=line_metadata,
+            tight_mask=tight_mask,
         )
 
 
-__all__ = ["FoldedStatisticsError", "folded_statistics"]
+def pack_folded_statistics(
+    geometry: NLHEGeometry, summary: Mapping[str, Tensor]
+) -> Tensor:
+    """Pack model-consumed statistics into the retained family row."""
+
+    batch = summary["hand_log_ratio"].shape[0]
+    value = torch.cat(
+        (
+            summary["hand_log_ratio"],
+            summary["beta_eigenvalue"],
+            summary["beta_eigenvector"].flatten(1),
+            summary["folder_log_mass"],
+            summary["folder_card_mass"].flatten(1),
+            summary["tight_cluster_scalar"][:, None],
+            torch.ones(
+                (batch, 1),
+                dtype=summary["hand_log_ratio"].dtype,
+                device=summary["hand_log_ratio"].device,
+            ),
+        ),
+        1,
+    ).contiguous()
+    if value.shape != (batch, geometry.folded_summary_width):
+        raise FoldedStatisticsError("packed folded summary has the wrong width")
+    return value
+
+
+def unpack_folded_statistics(
+    geometry: NLHEGeometry,
+    packed: Tensor,
+    *,
+    beta_rank: int,
+    line_metadata: Tensor,
+    status: Tensor,
+) -> Mapping[str, Tensor]:
+    """Recover the model view without folded-range access or recomputation."""
+
+    batch = packed.shape[0]
+    cards = geometry.deck_cards
+    hands = geometry.private_hands
+    players = geometry.players
+    if geometry.folded_summary_width == 0:
+        folder_mask = status.eq(FOLDED)
+        return MappingProxyType(
+            {
+                "hand_log_ratio": packed.new_zeros((batch, hands)),
+                "beta_eigenvalue": packed.new_zeros((batch, beta_rank)),
+                "beta_eigenvector": packed.new_zeros(
+                    (batch, cards, beta_rank)
+                ),
+                "folder_log_mass": packed.new_zeros((batch, players)),
+                "folder_card_mass": packed.new_zeros(
+                    (batch, players, cards)
+                ),
+                "folder_line_meta": line_metadata * folder_mask[..., None],
+                "folder_mask": folder_mask,
+                "folder_output_valid": folder_mask,
+                "folder_seat": torch.arange(
+                    players, dtype=torch.int64, device=packed.device
+                )[None].expand(batch, -1),
+                "tight_cluster_scalar": packed.new_zeros((batch,)),
+            }
+        )
+    if packed.shape != (batch, geometry.folded_summary_width):
+        raise FoldedStatisticsError("retained folded summary has the wrong width")
+    offset = 0
+
+    def take(width: int) -> Tensor:
+        nonlocal offset
+        result = packed[:, offset : offset + width]
+        offset += width
+        return result
+
+    hand_log_ratio = take(hands)
+    eigenvalue = take(cards)[:, :beta_rank]
+    eigenvector = take(cards * cards).reshape(batch, cards, cards)[
+        :, :, :beta_rank
+    ]
+    folder_log_mass = take(players)
+    folder_card_mass = take(players * cards).reshape(batch, players, cards)
+    tight_cluster_scalar = take(1)[:, 0]
+    summary_valid = take(1)[:, 0].gt(0.5)
+    folder_mask = status.eq(FOLDED)
+    torch._assert_async(
+        (~folder_mask.any(-1) | summary_valid).all(),
+        "postflop folded seats require a sealed folded summary",
+    )
+    return MappingProxyType(
+        {
+            "hand_log_ratio": hand_log_ratio,
+            "beta_eigenvalue": eigenvalue,
+            "beta_eigenvector": eigenvector,
+            "folder_log_mass": folder_log_mass,
+            "folder_card_mass": folder_card_mass,
+            "folder_line_meta": line_metadata * folder_mask[..., None],
+            "folder_mask": folder_mask,
+            "folder_output_valid": folder_mask,
+            "folder_seat": torch.arange(
+                players, dtype=torch.int64, device=packed.device
+            )[None].expand(batch, -1),
+            "tight_cluster_scalar": tight_cluster_scalar,
+        }
+    )
+
+
+__all__ = [
+    "FoldedStatisticsError",
+    "folded_statistics",
+    "folded_statistics_workspace_row_bytes",
+    "pack_folded_statistics",
+    "unpack_folded_statistics",
+]

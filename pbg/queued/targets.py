@@ -38,6 +38,16 @@ class TargetError(RuntimeError):
     """Layered target planning or execution failed."""
 
 
+def rb_conversion_workspace_row_bytes(
+    source_width: int, destination_width: int
+) -> int:
+    """Bound FP32 posterior/moment conversion without a K-by-H product."""
+
+    if source_width <= 0 or destination_width <= 0:
+        raise ValueError("RB conversion widths must be positive")
+    return 4 * (3 * source_width + 2 * destination_width)
+
+
 def _lambda(value: float) -> float:
     result = float(value)
     if not torch.isfinite(torch.tensor(result)) or not 0.0 <= result <= 1.0:
@@ -146,8 +156,9 @@ class _DeviceAlgebra:
             raise TargetError(
                 f"unsupported output conversion {source} -> {destination}"
             ) from exc
-        # [..., source] -> [..., destination], summing source order exactly.
-        return (value.unsqueeze(-2) * mask).sum(dim=-1)
+        # GEMM avoids materializing the prohibited [..., destination, source]
+        # product while preserving the fixed source-order reduction.
+        return torch.matmul(value, mask.t())
 
 
 @dataclass(frozen=True)

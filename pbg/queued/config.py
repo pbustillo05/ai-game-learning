@@ -401,11 +401,16 @@ class SequentialModeConfig:
                         "root.probe: shared-response probe requires sequential RB"
                     )
                 probe = dict(_mapping(source["probe"], "root.probe"))
-                if set(probe) != {"target_sha256"} or (
+                if set(probe) != {
+                    "target_sha256",
+                    "initial_model_sha256",
+                } or (
                     probe["target_sha256"] != frozen["sha256"]
+                    or not isinstance(probe["initial_model_sha256"], str)
+                    or len(probe["initial_model_sha256"]) != 64
                 ):
                     raise ValueError(
-                        "root.probe.target_sha256: must identify the frozen profile"
+                        "root.probe: target and initial model identities are required"
                     )
                 applicable["probe"] = probe
         elif any(

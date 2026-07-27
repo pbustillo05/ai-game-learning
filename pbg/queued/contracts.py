@@ -329,7 +329,7 @@ def _owners(
     else:
         leaf_fields.extend(("range_weights", "seed"))
     if response:
-        leaf_fields.append("selected_player")
+        leaf_fields.extend(("selected_player", "probe_cutoff"))
 
     layer_fields = ["return_value"] if sampled else ["mass", "moment"]
     if branched:
@@ -406,7 +406,7 @@ def _owners(
         _owner(
             "FoldedRanges",
             "folded",
-            ("range",),
+            ("range", "log_mass"),
             "fold_event_to_align_and_seal",
         ),
         _owner(

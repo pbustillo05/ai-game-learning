@@ -8,7 +8,11 @@ import pytest
 import torch
 from torch import nn
 
-from pbg.games.poker.queued.folded import folded_statistics
+from pbg.games.poker.queued.folded import (
+    folded_statistics,
+    folded_statistics_workspace_row_bytes,
+    pack_folded_statistics,
+)
 from pbg.games.poker.queued.hooks import (
     FOLD,
     FOLDED,
@@ -22,17 +26,26 @@ from pbg.games.poker.queued.hooks import (
 )
 from pbg.games.poker.queued.model import (
     QueuedPokerModel,
+    _combo_class,
     _fold_line_metadata,
     build_model_from_config,
 )
 from pbg.games.poker.queued.training import SequentialPokerIteration
 from pbg.games.poker.queued.training import SequentialSharedResponseProbe
 from pbg.games.poker.queued.response import (
+    SequentialSharedResponseEvaluator,
     balanced_evaluation_probe_seats,
     paired_probe_statistics,
     training_probe_seats,
 )
-from pbg.queued.capacity import GeneratedOwners, build_storage_plan
+from pbg.queued.capacity import (
+    GameGeometry,
+    GeneratedOwners,
+    NamedShape,
+    PartitionRows,
+    PhysicalLayout,
+    build_storage_plan,
+)
 from pbg.queued.config import SequentialModeConfig
 from pbg.queued.contracts import mode_schema
 from pbg.queued.learner import (
@@ -42,6 +55,11 @@ from pbg.queued.learner import (
     ModelEvaluation,
     PolicyEvaluation,
     SequentialLearnerBatch,
+)
+from pbg.queued.targets import (
+    ConversionMap,
+    TargetAlgebra,
+    rb_conversion_workspace_row_bytes,
 )
 from pbg.queued.optimization import DenseAdam, OptimizerConfig
 from pbg.queued.persistence import convert_legacy_sequential
@@ -188,6 +206,25 @@ def test_native_postflop_model_consumes_signed_folded_summary() -> None:
     assert line[0, 2, 0] == 0.0
     assert line[0, 2, 1] > 0.0
     model_input = machine.direct_model_input(state, log_reach, history)
+    summary = folded_statistics(
+        geometry,
+        board_cards=state.board_cards,
+        range_weights=log_reach.exp(),
+        status=state.status,
+        combo_cards=machine.combo_cards(
+            torch.arange(
+                geometry.private_hands,
+                dtype=torch.int32,
+                device=device,
+            )
+        ),
+        beta_rank=geometry.deck_cards,
+        line_dim=0,
+        tight_mask=torch.zeros_like(state.status, dtype=torch.bool),
+    )
+    model_input[:, geometry.base_model_input_width :] = (
+        pack_folded_statistics(geometry, summary)
+    )
     evaluation = model.forward_sequential_partition("post_2", model_input)
     assert evaluation.value.shape == (1, geometry.private_hands)
     assert torch.isfinite(evaluation.value).all()
@@ -200,9 +237,15 @@ def test_native_postflop_model_consumes_signed_folded_summary() -> None:
 
 def test_probe_is_the_ordinary_best_response_rb_schema() -> None:
     value = _config("best_response", "rao_blackwell")
-    value["probe"] = {"target_sha256": "a" * 64}
+    value["probe"] = {
+        "target_sha256": "a" * 64,
+        "initial_model_sha256": "c" * 64,
+    }
     config = SequentialModeConfig.from_mapping(value)
-    assert config.applicable["probe"] == {"target_sha256": "a" * 64}
+    assert config.applicable["probe"] == {
+        "target_sha256": "a" * 64,
+        "initial_model_sha256": "c" * 64,
+    }
     assert mode_schema(
         **{
             "training_regime": config.mode["training_regime"],
@@ -221,6 +264,32 @@ def test_probe_is_the_ordinary_best_response_rb_schema() -> None:
     )
     assert summary.per_seat_gain == (1.0, 4.0, 7.0)
     assert summary.approximate_nashconv_lower_bound == 12.0
+    assert summary.confidence_level == 0.95
+    assert summary.confidence_interval[0] < summary.mean_gain
+    assert summary.confidence_interval[1] > summary.mean_gain
+
+    observed: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def rollout(ids: torch.Tensor, selected: torch.Tensor) -> torch.Tensor:
+        observed.append((ids.clone(), selected.clone()))
+        return ids.float()
+
+    report = SequentialSharedResponseEvaluator(
+        3, "a" * 64, "c" * 64
+    ).evaluate(
+        torch.arange(9, dtype=torch.int64),
+        rollout,
+        lambda ids, selected: rollout(ids, selected) - 1.0,
+    )
+    assert report.semantics == "shared_seat_approximate_response_v1"
+    assert report.target_sha256 == "a" * 64
+    assert report.initial_model_sha256 == "c" * 64
+    assert report.statistics.mean_gain == 1.0
+    assert len(observed) == 2
+    assert all(
+        torch.equal(left, right)
+        for left, right in zip(observed[0], observed[1])
+    )
 
 
 def test_sequential_config_rejects_inapplicable_mode_fields() -> None:
@@ -233,7 +302,10 @@ def test_sequential_config_rejects_inapplicable_mode_fields() -> None:
     with pytest.raises(ValueError, match="best_response"):
         SequentialModeConfig.from_mapping(self_play)
     sampled_response = _config("best_response", "sampled")
-    sampled_response["probe"] = {"target_sha256": "a" * 64}
+    sampled_response["probe"] = {
+        "target_sha256": "a" * 64,
+        "initial_model_sha256": "c" * 64,
+    }
     with pytest.raises(ValueError, match="requires sequential RB"):
         SequentialModeConfig.from_mapping(sampled_response)
 
@@ -256,6 +328,14 @@ def test_offline_converter_covers_sequential_rb_and_probe(
             "target_sha256": "b" * 64,
             "initialization": "target",
         }
+        legacy["probe_target"] = {
+            "semantics": "shared_seat_approximate_response_v1",
+            "sha256": "b" * 64,
+        }
+        legacy["initialization"] = {
+            "kind": "target",
+            "initial_model_sha256": "c" * 64,
+        }
     source = tmp_path / "legacy.pt"
     destination = tmp_path / "queued.pt"
     torch.save(legacy, source)
@@ -275,6 +355,11 @@ def test_offline_converter_covers_sequential_rb_and_probe(
         "strata": "default",
     }
     assert ("probe" in config.applicable) is probe
+    if probe:
+        assert config.applicable["probe"] == {
+            "target_sha256": "b" * 64,
+            "initial_model_sha256": "c" * 64,
+        }
     with pytest.raises(Exception, match="already exists"):
         convert_legacy_sequential(source, destination)
 
@@ -286,6 +371,38 @@ def test_offline_converter_rejects_wrong_requested_rb_mode(tmp_path: Path) -> No
     source = tmp_path / "legacy.pt"
     torch.save(legacy, source)
     with pytest.raises(Exception, match="differs"):
+        convert_legacy_sequential(
+            source,
+            tmp_path / "queued.pt",
+            expected_training_regime="best_response",
+            expected_estimator="rao_blackwell",
+        )
+
+
+def test_probe_converter_rejects_disagreeing_duplicate_identity(
+    tmp_path: Path,
+) -> None:
+    legacy = _legacy_checkpoint()
+    legacy["config"]["training"]["mode"] = "rao_blackwell"
+    legacy["config"]["completion"] = {
+        "n_samples": 8,
+        "strata": "default",
+    }
+    legacy["config"]["probe"] = {
+        "target_sha256": "a" * 64,
+        "initialization": "random",
+    }
+    legacy["probe_target"] = {
+        "semantics": "shared_seat_approximate_response_v1",
+        "sha256": "b" * 64,
+    }
+    legacy["initialization"] = {
+        "kind": "scratch",
+        "initial_model_sha256": "c" * 64,
+    }
+    source = tmp_path / "legacy.pt"
+    torch.save(legacy, source)
+    with pytest.raises(Exception, match="content hash"):
         convert_legacy_sequential(
             source,
             tmp_path / "queued.pt",
@@ -306,7 +423,48 @@ def test_rb_partitions_are_k_wide_preflop_and_h_wide_postflop() -> None:
     assert partitions.output_for("post_3").name == "post"
 
 
-def test_multiway_preflop_and_folded_postflop_refresh_hot_references() -> None:
+def test_max_geometry_workspace_bounds_are_explicit() -> None:
+    geometry = NLHEGeometry(6, 128.0, 13)
+    assert geometry.private_hands == 1326
+    assert geometry.folded_summary_width == 4402
+    assert folded_statistics_workspace_row_bytes(geometry) == 296_976
+    assert rb_conversion_workspace_row_bytes(1326, 169) == 17_264
+
+
+@CUDA
+def test_full_deck_h_to_k_conversion_is_deterministic_and_bounded() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(6, 128.0, 13)
+    classes = _combo_class(geometry)
+    algebra = TargetAlgebra(
+        rb_partitions(geometry),
+        (
+            ConversionMap(
+                "post",
+                "pre",
+                tuple(int(value) for value in classes.tolist()),
+            ),
+        ),
+    ).device(device)
+    value = torch.arange(
+        8 * geometry.private_hands,
+        dtype=torch.float32,
+        device=device,
+    ).reshape(8, geometry.private_hands)
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    first = algebra.convert(value, 1, 0)
+    second = algebra.convert(value, 1, 0)
+    torch.cuda.synchronize()
+    assert torch.equal(first, second)
+    assert (
+        torch.cuda.max_memory_allocated(device) - baseline
+        < 10_000_000
+    )
+
+
+def test_every_model_forward_uses_the_sealed_family_input() -> None:
     hooks = object.__new__(SequentialPokerHooks)
     hooks.geometry = NLHEGeometry(3, 8.0, 4)
     width = hooks.geometry.direct_model_input_width
@@ -316,8 +474,8 @@ def test_multiway_preflop_and_folded_postflop_refresh_hot_references() -> None:
     pre = SimpleNamespace(input_type="pre", fields={"model_input": raw})
     post_two = SimpleNamespace(input_type="post_2", fields={"model_input": raw})
     post_three = SimpleNamespace(input_type="post_3", fields={"model_input": raw})
-    assert hooks._forward_model_input(pre) is refreshed
-    assert hooks._forward_model_input(post_two) is refreshed
+    assert torch.equal(hooks._forward_model_input(pre), raw.reshape(1, width))
+    assert torch.equal(hooks._forward_model_input(post_two), raw.reshape(1, width))
     assert torch.equal(hooks._forward_model_input(post_three), raw.reshape(1, width))
 
 
@@ -518,6 +676,48 @@ def test_folded_exact_combo_content_and_two_folder_oracle() -> None:
 
 
 @CUDA
+def test_evaluator_selected_completion_matches_the_selected_dense_slice() -> None:
+    import poker_gpu_evaluator as poker
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(3, 8.0, 4)
+    machine = PokerStateMachine(geometry)
+    state = machine.initial_roots(
+        1, seed=43, iteration=0, retry_epoch=0, device=device
+    )
+    leaf = machine.rb_leaf(
+        state,
+        torch.zeros(
+            (1, geometry.players, geometry.private_hands),
+            dtype=torch.float32,
+            device=device,
+        ),
+        seed=torch.tensor([71], dtype=torch.int64, device=device),
+    )
+    common = {
+        "board_cards": leaf["board_cards"],
+        "range_weights": leaf["range_weights"],
+        "stratum_level": leaf["stratum_level"],
+        "payoff_baseline": leaf["payoff_baseline"],
+        "stratum_amount": leaf["stratum_amount"],
+        "n_samples": 4,
+        "seed": leaf["seed"],
+    }
+    evaluator = poker.bind(rank_count=geometry.rank_count)
+    dense = evaluator.complete(**common)
+    selected = torch.tensor([1], dtype=torch.int32, device=device)
+    compact = evaluator.complete_selected(
+        **common, selected_player=selected
+    )
+    torch.testing.assert_close(
+        compact.p_hat, dense.p_hat[:, 1], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        compact.v_hat, dense.v_hat[:, 1], rtol=0, atol=0
+    )
+
+
+@CUDA
 def test_three_loose_folder_estimator_calibrates_to_exact_enumeration() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(4, 8.0, 4)
@@ -627,7 +827,14 @@ def test_folded_owner_refreshes_model_input_and_releases_at_seal() -> None:
         1, geometry.rank_count**2 + 1, dtype=torch.float32, device=device
     )
     class_range /= class_range.sum()
-    _publish_rows(folded, 1, {"range": class_range[None]})
+    _publish_rows(
+        folded,
+        1,
+        {
+            "range": class_range[None],
+            "log_mass": torch.zeros((1,), device=device),
+        },
+    )
     machine = PokerStateMachine(geometry)
     state = machine.initial_roots(
         1, seed=5, iteration=0, retry_epoch=0, device=device
@@ -886,14 +1093,110 @@ def test_all_four_sequential_modes_complete_an_optimizer_step(
         seed=17,
         lambda_=0.95,
         completion_samples=4 if rb else 0,
+        probe_cutoff=regime == "best_response" and rb,
     )
     if regime == "best_response" and rb:
         probe = SequentialSharedResponseProbe(
-            iteration_runner, target_sha256="a" * 64
+            iteration_runner,
+            target_sha256="a" * 64,
+            initial_model_sha256="c" * 64,
         )
         assert probe.mode is mode
         result = probe.run(iteration=0)
     else:
         result = iteration_runner.run(iteration=0)
+    assert result.learner.optimizer_steps
+    assert all(step.applied for step in result.learner.optimizer_steps)
+
+
+@CUDA
+@pytest.mark.parametrize("estimator", ("sampled", "rao_blackwell"))
+def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
+    estimator: str,
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(3, 8.0, 4)
+    mode = mode_schema("best_response", "sequential", estimator)
+    partitions = (
+        rb_partitions(geometry)
+        if estimator == "rao_blackwell"
+        else sampled_partitions(3, geometry)
+    )
+    inputs = tuple(item.name for item in partitions.inputs)
+    base_manifest = _phase5_manifest(device)
+    manifest = replace(
+        base_manifest,
+        geometry=GameGeometry(3, 8.0, 4, 64, 4096),
+        player_node_cap=tuple(PartitionRows(name, 40) for name in inputs),
+        trained_player_cap=tuple(PartitionRows(name, 40) for name in inputs),
+        action_cap=tuple(PartitionRows(name, 40) for name in inputs),
+        leaf_cap=32,
+        topology_cap=64,
+        topology_edge_cap=64,
+        target_arena_cap=128,
+    )
+    width = geometry.direct_model_input_width
+    layout = PhysicalLayout(
+        model_input_shapes=tuple(
+            NamedShape(name, (width,)) for name in inputs
+        ),
+        player_count=3,
+        stratum_count=3,
+        evaluator_private_width=geometry.private_hands,
+        family_workspace_row_bytes=folded_statistics_workspace_row_bytes(
+            geometry
+        ),
+        chance_frontier_row_bytes=32,
+        completion_workspace_row_bytes=4096,
+        learner_sigma_workspace_row_bytes=4096,
+        learner_action_workspace_row_bytes=4096,
+        topology_packet_row_bytes=88,
+    )
+    owners = GeneratedOwners(
+        build_storage_plan(mode, partitions, manifest, layout, device)
+    )
+
+    def make_model() -> QueuedPokerModel:
+        result = QueuedPokerModel(
+            geometry,
+            _FinitePartitionNetwork(
+                width, geometry.rank_count**2, device
+            ),
+            _FinitePartitionNetwork(
+                width, geometry.private_hands, device
+            ),
+        ).to(device)
+        with torch.no_grad():
+            for partition in (result.preflop, result.postflop):
+                partition.affine.weight.zero_()
+                partition.affine.bias.zero_()
+        return result
+
+    model = make_model()
+    frozen = make_model()
+    generator = torch.Generator(device=device).manual_seed(911)
+    runner = SequentialPokerIteration(
+        geometry=geometry,
+        owners=owners,
+        mode=mode,
+        model=model,
+        model_operation=(
+            model.rb_learner_operation
+            if estimator == "rao_blackwell"
+            else model.learner_operation
+        ),
+        rollout_operation=model.sequential_rollout_operation,
+        frozen_operation=frozen.sequential_rollout_operation,
+        optimizer=DenseAdam(
+            model, OptimizerConfig(name="adamw", learning_rate=1.0e-3)
+        ),
+        loss=LossConfig(),
+        schedule=LearnerSchedule(batch_size=1),
+        generator=generator,
+        seed=23,
+        lambda_=0.95,
+        completion_samples=4 if estimator == "rao_blackwell" else 0,
+    )
+    result = runner.run(iteration=0)
     assert result.learner.optimizer_steps
     assert all(step.applied for step in result.learner.optimizer_steps)

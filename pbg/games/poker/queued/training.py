@@ -26,6 +26,7 @@ from pbg.games.poker.queued.hooks import (
 from pbg.games.poker.queued.policy import PokerPolicyOperator
 from pbg.games.poker.queued.response import (
     PairedProbeStatistics,
+    SequentialSharedResponseEvaluator,
     paired_probe_statistics,
 )
 from pbg.queued.capacity import (
@@ -126,6 +127,7 @@ class SequentialPokerIteration:
         reference_operation: ModelOperation | None = None,
         frozen_operation: ModelOperation | None = None,
         completion_samples: int = 0,
+        probe_cutoff: bool = False,
     ) -> None:
         if owners.plan.mode != mode:
             raise ValueError("poker iteration mode differs from generated owners")
@@ -137,6 +139,48 @@ class SequentialPokerIteration:
             raise ValueError("poker learner RNG must use the selected CUDA device")
         if mode.rollout_mode is not RolloutMode.SEQUENTIAL:
             raise ValueError("sequential poker iteration requires sequential mode")
+        expected_width = geometry.direct_model_input_width
+        if any(
+            owners.plan.layout.input_shapes[partition.name]
+            != (expected_width,)
+            for partition in owners.plan.partitions.inputs
+        ):
+            raise ValueError(
+                "family model-input layout omits retained folded statistics"
+            )
+        if geometry.players > 2:
+            from pbg.games.poker.queued.folded import (
+                folded_statistics_workspace_row_bytes,
+            )
+
+            required_folded_workspace = (
+                folded_statistics_workspace_row_bytes(geometry)
+            )
+            if (
+                owners.plan.layout.family_workspace_row_bytes
+                < required_folded_workspace
+            ):
+                raise ValueError(
+                    "family workspace is below the folded-statistics bound"
+                )
+        if mode.private_estimator is PrivateEstimator.RAO_BLACKWELL:
+            from pbg.queued.targets import (
+                rb_conversion_workspace_row_bytes,
+            )
+
+            required_conversion_workspace = (
+                rb_conversion_workspace_row_bytes(
+                    geometry.private_hands,
+                    geometry.rank_count**2,
+                )
+            )
+            if (
+                owners.plan.layout.completion_workspace_row_bytes
+                < required_conversion_workspace
+            ):
+                raise ValueError(
+                    "completion workspace is below the H-to-K conversion bound"
+                )
         if (
             mode.training_regime is TrainingRegime.BEST_RESPONSE
             and frozen_operation is None
@@ -158,6 +202,14 @@ class SequentialPokerIteration:
         self.reference_operation = reference_operation
         self.frozen_operation = frozen_operation
         self.completion_samples = int(completion_samples)
+        if type(probe_cutoff) is not bool:
+            raise TypeError("probe_cutoff must be bool")
+        if probe_cutoff and (
+            mode.training_regime is not TrainingRegime.BEST_RESPONSE
+            or mode.private_estimator is not PrivateEstimator.RAO_BLACKWELL
+        ):
+            raise ValueError("probe cutoff requires sequential BR/RB")
+        self.probe_cutoff = probe_cutoff
         self.optimizer = optimizer
         self.loss = loss
         self.schedule = schedule
@@ -434,6 +486,7 @@ class SequentialPokerIteration:
             iteration=iteration,
             mode=self.mode,
             policy=self.policy,
+            probe_cutoff=self.probe_cutoff,
         )
         topology_publisher = AsyncTopologyPublisher(
             registry,
@@ -828,6 +881,7 @@ class SequentialSharedResponseProbe:
 
     iteration: SequentialPokerIteration
     target_sha256: str
+    initial_model_sha256: str
 
     def __post_init__(self) -> None:
         mode = self.iteration.mode
@@ -837,6 +891,10 @@ class SequentialSharedResponseProbe:
             or mode.private_estimator is not PrivateEstimator.RAO_BLACKWELL
         ):
             raise ValueError("shared-response probe requires sequential BR/RB")
+        if not self.iteration.probe_cutoff:
+            raise ValueError(
+                "shared-response probe requires selected-seat fold cutoff"
+            )
         if (
             len(self.target_sha256) != 64
             or any(
@@ -845,6 +903,16 @@ class SequentialSharedResponseProbe:
             )
         ):
             raise ValueError("probe target_sha256 must be lowercase SHA-256")
+        if (
+            len(self.initial_model_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.initial_model_sha256
+            )
+        ):
+            raise ValueError(
+                "probe initial_model_sha256 must be lowercase SHA-256"
+            )
 
     @property
     def mode(self) -> ModeSchema:
@@ -858,6 +926,13 @@ class SequentialSharedResponseProbe:
     ) -> PairedProbeStatistics:
         return paired_probe_statistics(
             differences, seats, self.iteration.geometry.players
+        )
+
+    def evaluator(self) -> SequentialSharedResponseEvaluator:
+        return SequentialSharedResponseEvaluator(
+            self.iteration.geometry.players,
+            self.target_sha256,
+            self.initial_model_sha256,
         )
 
 

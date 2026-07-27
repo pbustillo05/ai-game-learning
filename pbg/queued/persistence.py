@@ -396,6 +396,10 @@ def convert_legacy_sequential(
         regime, estimator = "self_play", "sampled"
     elif legacy_mode == "rao_blackwell" and completion_samples is not None:
         probe = config.get("probe")
+        if (probe is None) != (legacy["probe_target"] is None):
+            raise PersistenceError(
+                "probe target metadata disagrees with legacy configuration"
+            )
         regime, estimator = (
             ("best_response", "rao_blackwell")
             if probe is not None
@@ -499,14 +503,58 @@ def convert_legacy_sequential(
         }
     if regime == "best_response":
         probe = config["probe"]
-        target_hash = probe.get("target_sha256") or probe.get("checkpoint_sha256")
-        if not isinstance(target_hash, str) or len(target_hash) != 64:
-            raise PersistenceError("probe target must have a content hash")
-        scientific["frozen_profile"] = {"sha256": target_hash}
-        scientific["response_initialization"] = str(
-            probe.get("initialization", "random")
+        configured_target = (
+            probe.get("target_sha256") or probe.get("checkpoint_sha256")
         )
-        scientific["probe"] = {"target_sha256": target_hash}
+        target_metadata = legacy["probe_target"]
+        metadata_target = (
+            target_metadata.get("sha256")
+            if isinstance(target_metadata, Mapping)
+            else target_metadata
+        )
+        candidates = tuple(
+            value
+            for value in (configured_target, metadata_target)
+            if value is not None
+        )
+        if (
+            not candidates
+            or any(not isinstance(value, str) or len(value) != 64 for value in candidates)
+            or len(set(candidates)) != 1
+        ):
+            raise PersistenceError("probe target must have a content hash")
+        target_hash = candidates[0]
+        if isinstance(target_metadata, Mapping) and target_metadata.get(
+            "semantics", "shared_seat_approximate_response_v1"
+        ) != "shared_seat_approximate_response_v1":
+            raise PersistenceError("probe target uses unknown response semantics")
+        initialization_metadata = legacy["initialization"]
+        initial_hash = (
+            initialization_metadata.get("initial_model_sha256")
+            if isinstance(initialization_metadata, Mapping)
+            else None
+        )
+        if not isinstance(initial_hash, str) or len(initial_hash) != 64:
+            raise PersistenceError(
+                "probe initialization must preserve initial_model_sha256"
+            )
+        initialization = str(probe.get("initialization", "random"))
+        metadata_kind = (
+            initialization_metadata.get("kind")
+            if isinstance(initialization_metadata, Mapping)
+            else None
+        )
+        expected_kind = "scratch" if initialization == "random" else "target"
+        if metadata_kind not in (None, expected_kind):
+            raise PersistenceError(
+                "probe initialization metadata disagrees with configuration"
+            )
+        scientific["frozen_profile"] = {"sha256": target_hash}
+        scientific["response_initialization"] = initialization
+        scientific["probe"] = {
+            "target_sha256": target_hash,
+            "initial_model_sha256": initial_hash,
+        }
     scientific = SequentialModeConfig.from_mapping(scientific).scientific_mapping()
     execution = {
         "hardware_profile": dict(legacy["hardware_profile"]),
