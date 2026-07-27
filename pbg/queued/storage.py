@@ -948,6 +948,448 @@ class PublicationTransaction:
         self._closed = True
 
 
+@dataclass(frozen=True)
+class DeviceDestinationRequest:
+    """One fixed-shape destination whose realized extents stay on CUDA.
+
+    ``values`` has shape ``[n_replica, max_rows, *field.shape]`` for every
+    field.  Only the stable prefix selected by ``counts`` is materialized.
+    A zero count is valid and leaves that lane's destination unchanged.
+    """
+
+    slab: MonotoneSlab
+    counts: Tensor
+    values: Mapping[str, Tensor]
+    input_type: str
+    logical_address: Tensor
+
+    @property
+    def max_rows(self) -> int:
+        first = next(iter(self.values.values()))
+        return int(first.shape[1])
+
+
+class DevicePublicationTransaction:
+    """Device-counted multi-destination publication with lane isolation.
+
+    Counts, scans, capacity decisions, reservations, and publication remain
+    on the destination CUDA stream.  The host supplies only fixed schemas and
+    launch bounds.  Failed lanes publish no destination; successful lanes in
+    the same replica group commit normally.
+    """
+
+    def __init__(
+        self,
+        requests: tuple[DeviceDestinationRequest, ...],
+        *,
+        phase: str,
+        active: Tensor,
+        sampler_attempt_count: Tensor | None = None,
+    ) -> None:
+        if not requests:
+            raise ValueError("a device publication requires destinations")
+        if not phase:
+            raise ValueError("device publication phase must be nonempty")
+        first = requests[0].slab
+        self.requests = requests
+        self.phase = phase
+        self.device = first.device
+        self.n_replica = first.n_replica
+        self.failure_state = first.failure_state
+        if (
+            active.shape != (self.n_replica,)
+            or active.dtype != torch.bool
+            or active.device != self.device
+        ):
+            raise ValueError("active lanes must be CUDA bool [n_replica]")
+        self.active = active
+        if sampler_attempt_count is None:
+            sampler_attempt_count = torch.zeros(
+                self.n_replica, dtype=torch.int64, device=self.device
+            )
+        if (
+            sampler_attempt_count.shape != (self.n_replica,)
+            or sampler_attempt_count.dtype != torch.int64
+            or sampler_attempt_count.device != self.device
+        ):
+            raise ValueError(
+                "sampler attempt counts must be CUDA int64 [n_replica]"
+            )
+        self.sampler_attempt_count = sampler_attempt_count
+        self._validate_requests()
+        self._begins = tuple(
+            request.slab._state[:, MonotoneSlab._RESERVED].clone()
+            for request in requests
+        )
+        self._fits = tuple(
+            (
+                (request.counts >= 0)
+                & (request.counts <= request.max_rows)
+                & (request.logical_address >= 0)
+                & (
+                    request.counts
+                    <= request.slab.capacity - begin
+                )
+                & (
+                    request.slab._state[:, MonotoneSlab._OPEN_BEGIN]
+                    == -1
+                )
+                & (
+                    request.slab._state[:, MonotoneSlab._POISONED]
+                    == 0
+                )
+            )
+            for request, begin in zip(requests, self._begins)
+        )
+        fits = torch.stack(self._fits).all(0)
+        self.success = self.active & fits
+        self.failed = self.active & ~fits
+        self._ends = tuple(
+            begin + request.counts.clamp(0, request.max_rows)
+            for request, begin in zip(requests, self._begins)
+        )
+        self._record_failures()
+        self._reserve_successful_lanes()
+        self._filled = [False] * len(requests)
+        self._closed = False
+
+    @classmethod
+    def begin(
+        cls,
+        requests: Sequence[DeviceDestinationRequest],
+        *,
+        phase: str,
+        active: Tensor,
+        sampler_attempt_count: Tensor | None = None,
+    ) -> "DevicePublicationTransaction":
+        return cls(
+            tuple(requests),
+            phase=phase,
+            active=active,
+            sampler_attempt_count=sampler_attempt_count,
+        )
+
+    def _validate_requests(self) -> None:
+        identities: set[int] = set()
+        for request in self.requests:
+            slab = request.slab
+            if id(slab) in identities:
+                raise ValueError(
+                    "a device transaction may publish each slab only once"
+                )
+            identities.add(id(slab))
+            if (
+                slab.device != self.device
+                or slab.n_replica != self.n_replica
+                or slab.failure_state is not self.failure_state
+            ):
+                raise ValueError(
+                    "device destinations must share device, replica axis, "
+                    "and failure state"
+                )
+            if not request.input_type:
+                raise ValueError("destination input type must be nonempty")
+            if (
+                request.counts.shape != (self.n_replica,)
+                or request.counts.dtype != torch.int64
+                or request.counts.device != self.device
+            ):
+                raise ValueError(
+                    "destination counts must be CUDA int64 [n_replica]"
+                )
+            if (
+                request.logical_address.shape != (self.n_replica,)
+                or request.logical_address.dtype != torch.int64
+                or request.logical_address.device != self.device
+            ):
+                raise ValueError(
+                    "logical addresses must be CUDA int64 [n_replica]"
+                )
+            expected_names = tuple(field.name for field in slab.schema.fields)
+            if tuple(request.values) != expected_names:
+                raise StorageError(
+                    f"{slab.label} device fields must exactly match "
+                    f"{expected_names}"
+                )
+            max_rows: int | None = None
+            for field in slab.schema.fields:
+                value = request.values[field.name]
+                if value.ndim < 2:
+                    raise StorageError(
+                        f"{slab.label}.{field.name} needs replica and row axes"
+                    )
+                if max_rows is None:
+                    max_rows = int(value.shape[1])
+                expected = (
+                    self.n_replica,
+                    max_rows,
+                    *field.shape,
+                )
+                if (
+                    tuple(value.shape) != expected
+                    or value.dtype != field.dtype
+                    or value.device != self.device
+                ):
+                    raise StorageError(
+                        f"{slab.label}.{field.name} device fill must be "
+                        f"{expected} {field.dtype} on {self.device}"
+                    )
+            if max_rows is None or max_rows <= 0:
+                raise ValueError("device destinations need a positive pack bound")
+            if max_rows > slab.capacity:
+                raise ValueError(
+                    f"{slab.label} device pack exceeds destination capacity"
+                )
+
+    def _record_failures(self) -> None:
+        if len(self.requests) == 1:
+            selected = torch.zeros(
+                self.n_replica, dtype=torch.int64, device=self.device
+            )
+        else:
+            addresses = torch.stack(
+                tuple(request.logical_address for request in self.requests)
+            )
+            failing = ~torch.stack(self._fits)
+            maximum = torch.iinfo(torch.int64).max
+            selected = torch.where(
+                failing,
+                addresses,
+                torch.full_like(addresses, maximum),
+            ).argmin(0)
+        request_counts = torch.stack(
+            tuple(request.counts.clamp_min(0) for request in self.requests)
+        )
+        available = torch.stack(
+            tuple(
+                torch.minimum(
+                    request.slab.capacity - begin,
+                    torch.full_like(begin, request.max_rows),
+                )
+                for request, begin in zip(self.requests, self._begins)
+            )
+        )
+        addresses = torch.stack(
+            tuple(
+                request.logical_address.clamp_min(0)
+                for request in self.requests
+            )
+        )
+        gather = selected.unsqueeze(0)
+        chosen_count = request_counts.gather(0, gather).squeeze(0)
+        chosen_available = available.gather(0, gather).squeeze(0)
+        chosen_address = addresses.gather(0, gather).squeeze(0)
+        phase_id = self.failure_state._id(
+            self.failure_state._phase_ids, self.phase
+        )
+        code_id = self.failure_state._id(
+            self.failure_state._code_ids, "capacity_overflow"
+        )
+        input_ids = torch.tensor(
+            tuple(
+                self.failure_state._id(
+                    self.failure_state._input_ids, request.input_type
+                )
+                for request in self.requests
+            ),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        chosen_input = input_ids[selected]
+        records = self.failure_state._records
+        current_address = records[:, DeviceFailureState._ADDRESS]
+        replace = self.failed & (chosen_address < current_address)
+        records[:, DeviceFailureState._STATUS].copy_(
+            torch.where(
+                replace,
+                torch.ones_like(current_address),
+                records[:, DeviceFailureState._STATUS],
+            )
+        )
+        for column, value in (
+            (
+                DeviceFailureState._PHASE,
+                torch.full_like(current_address, phase_id),
+            ),
+            (
+                DeviceFailureState._CODE,
+                torch.full_like(current_address, code_id),
+            ),
+            (DeviceFailureState._INPUT, chosen_input),
+            (DeviceFailureState._ADDRESS, chosen_address),
+            (DeviceFailureState._REQUESTED, chosen_count),
+            (DeviceFailureState._AVAILABLE, chosen_available),
+            (DeviceFailureState._ATTEMPTS, self.sampler_attempt_count),
+        ):
+            records[:, column].copy_(
+                torch.where(replace, value, records[:, column])
+            )
+
+    def _reserve_successful_lanes(self) -> None:
+        for request, begin, end in zip(
+            self.requests, self._begins, self._ends
+        ):
+            slab = request.slab
+            state = slab._state
+            positive = self.success & (request.counts > 0)
+            state[:, MonotoneSlab._RESERVED].copy_(
+                torch.where(positive, end, state[:, MonotoneSlab._RESERVED])
+            )
+            state[:, MonotoneSlab._ATTEMPT_HIGH_WATER].copy_(
+                torch.where(
+                    positive,
+                    torch.maximum(
+                        state[:, MonotoneSlab._ATTEMPT_HIGH_WATER], end
+                    ),
+                    state[:, MonotoneSlab._ATTEMPT_HIGH_WATER],
+                )
+            )
+            state[:, MonotoneSlab._LIFETIME_HIGH_WATER].copy_(
+                torch.where(
+                    positive,
+                    torch.maximum(
+                        state[:, MonotoneSlab._LIFETIME_HIGH_WATER], end
+                    ),
+                    state[:, MonotoneSlab._LIFETIME_HIGH_WATER],
+                )
+            )
+            state[:, MonotoneSlab._OPEN_BEGIN].copy_(
+                torch.where(
+                    positive,
+                    begin,
+                    state[:, MonotoneSlab._OPEN_BEGIN],
+                )
+            )
+            state[:, MonotoneSlab._OPEN_END].copy_(
+                torch.where(
+                    positive,
+                    end,
+                    state[:, MonotoneSlab._OPEN_END],
+                )
+            )
+
+    def fill(self, index: int) -> None:
+        if self._closed:
+            raise TransactionError("device transaction is closed")
+        if not 0 <= index < len(self.requests):
+            raise IndexError("device destination index is outside transaction")
+        request = self.requests[index]
+        begin = self._begins[index]
+        max_rows = request.max_rows
+        ordinal = torch.arange(
+            max_rows, dtype=torch.int64, device=self.device
+        )
+        rows = begin[:, None] + ordinal[None, :]
+        valid = (
+            self.success[:, None]
+            & (ordinal[None, :] < request.counts[:, None])
+        )
+        safe_rows = rows.clamp(0, request.slab.capacity - 1)
+        lanes = torch.arange(
+            self.n_replica, dtype=torch.int64, device=self.device
+        )[:, None].expand_as(safe_rows)
+        for field in request.slab.schema.fields:
+            destination = request.slab._columns[field.name]
+            source = request.values[field.name]
+            destination[lanes[valid], safe_rows[valid]] = source[valid]
+        self._filled[index] = True
+
+    def fill_all(self) -> None:
+        for index in range(len(self.requests)):
+            self.fill(index)
+
+    def publish(
+        self,
+        *,
+        commit_marker: Tensor | None = None,
+        sequence: int | Tensor | None = None,
+        failure_injector: Callable[[], None] | None = None,
+    ) -> Tensor:
+        if self._closed:
+            raise TransactionError("device transaction is closed")
+        if not all(self._filled):
+            raise TransactionError("every device destination must be filled")
+        if commit_marker is not None:
+            if (
+                commit_marker.shape != (self.n_replica,)
+                or commit_marker.dtype != torch.int64
+                or commit_marker.device != self.device
+                or sequence is None
+            ):
+                raise ValueError(
+                    "commit marker must be CUDA int64 [n_replica] with sequence"
+                )
+        try:
+            if failure_injector is not None:
+                failure_injector()
+        except BaseException:
+            self.abort()
+            raise
+        for request, end in zip(self.requests, self._ends):
+            slab = request.slab
+            positive = self.success & (request.counts > 0)
+            state = slab._state
+            state[:, MonotoneSlab._PUBLISHED].copy_(
+                torch.where(positive, end, state[:, MonotoneSlab._PUBLISHED])
+            )
+            state[:, MonotoneSlab._OPEN_BEGIN].copy_(
+                torch.where(
+                    positive,
+                    torch.full_like(end, -1),
+                    state[:, MonotoneSlab._OPEN_BEGIN],
+                )
+            )
+            state[:, MonotoneSlab._OPEN_END].copy_(
+                torch.where(
+                    positive,
+                    torch.full_like(end, -1),
+                    state[:, MonotoneSlab._OPEN_END],
+                )
+            )
+        if commit_marker is not None:
+            marker = torch.as_tensor(
+                sequence, dtype=torch.int64, device=self.device
+            ).expand_as(commit_marker)
+            commit_marker.copy_(
+                torch.where(self.success, marker, commit_marker)
+            )
+        self._closed = True
+        return self.success
+
+    def abort(self) -> None:
+        if self._closed:
+            return
+        for request, begin in zip(self.requests, self._begins):
+            slab = request.slab
+            positive = self.success & (request.counts > 0)
+            state = slab._state
+            state[:, MonotoneSlab._RESERVED].copy_(
+                torch.where(positive, begin, state[:, MonotoneSlab._RESERVED])
+            )
+            state[:, MonotoneSlab._OPEN_BEGIN].copy_(
+                torch.where(
+                    positive,
+                    torch.full_like(begin, -1),
+                    state[:, MonotoneSlab._OPEN_BEGIN],
+                )
+            )
+            state[:, MonotoneSlab._OPEN_END].copy_(
+                torch.where(
+                    positive,
+                    torch.full_like(begin, -1),
+                    state[:, MonotoneSlab._OPEN_END],
+                )
+            )
+            state[:, MonotoneSlab._POISONED].copy_(
+                torch.where(
+                    positive,
+                    torch.ones_like(begin),
+                    state[:, MonotoneSlab._POISONED],
+                )
+            )
+        self._closed = True
+
+
 class ExactBlock:
     """One explicitly released CUDA block with an immutable realized extent."""
 
@@ -1001,8 +1443,10 @@ class ExactBlock:
 
 __all__ = [
     "DestinationRequest",
+    "DeviceDestinationRequest",
     "DeviceFailure",
     "DeviceFailureState",
+    "DevicePublicationTransaction",
     "ExactBlock",
     "FieldExtent",
     "MonotoneSlab",
