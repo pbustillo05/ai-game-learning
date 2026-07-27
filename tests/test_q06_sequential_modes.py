@@ -14,6 +14,7 @@ from pbg.games.poker.queued.hooks import (
     NLHEGeometry,
     PokerForwardInput,
     PokerStateMachine,
+    SequentialPokerHooks,
     rb_partitions,
     sampled_partitions,
 )
@@ -219,6 +220,21 @@ def test_rb_partitions_are_k_wide_preflop_and_h_wide_postflop() -> None:
     assert partitions.output_for("post_3").name == "post"
 
 
+def test_multiway_preflop_and_folded_postflop_refresh_hot_references() -> None:
+    hooks = object.__new__(SequentialPokerHooks)
+    hooks.geometry = NLHEGeometry(3, 8.0, 4)
+    width = hooks.geometry.direct_model_input_width
+    raw = torch.zeros((1, 1, width))
+    refreshed = torch.ones((1, width))
+    hooks._resolved_model_input = lambda _batch: refreshed
+    pre = SimpleNamespace(input_type="pre", fields={"model_input": raw})
+    post_two = SimpleNamespace(input_type="post_2", fields={"model_input": raw})
+    post_three = SimpleNamespace(input_type="post_3", fields={"model_input": raw})
+    assert hooks._forward_model_input(pre) is refreshed
+    assert hooks._forward_model_input(post_two) is refreshed
+    assert torch.equal(hooks._forward_model_input(post_three), raw.reshape(1, width))
+
+
 @CUDA
 def test_repository_folded_statistics_are_deterministic_fp32() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
@@ -285,8 +301,6 @@ def test_folded_owner_refreshes_model_input_and_releases_at_seal() -> None:
         )
         for name in ("pre", "post_2")
     }
-    from pbg.games.poker.queued.hooks import SequentialPokerHooks
-
     hooks = SequentialPokerHooks(
         geometry, registry, queues, seed=3, iteration=0, mode=mode
     )

@@ -1248,7 +1248,9 @@ class SequentialPokerHooks:
             if batch.input_type == "pre"
             else int(batch.input_type[5:])
         )
-        if self.geometry.players == 2 or live == self.geometry.players:
+        if self.geometry.players == 2 or (
+            batch.input_type != "pre" and live == self.geometry.players
+        ):
             return batch.fields["model_input"].reshape(
                 -1, self.geometry.direct_model_input_width
             )
