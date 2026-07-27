@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from types import MappingProxyType
+from typing import Mapping
 import torch
 from torch import Tensor, nn
 
 from pbg.queued.learner import ModelEvaluation
+from pbg.games.poker.cards import DeckGeometry
+from pbg.games.poker.model.capacity import max_public_history_tokens
+from pbg.games.poker.model.postflop import PostflopNet
+from pbg.games.poker.model.preflop import PokerModelConfig, PreflopNet
 from pbg.games.poker.queued.hooks import NLHEGeometry
 
 
@@ -138,4 +143,100 @@ class QueuedPokerModel(nn.Module):
         return operation
 
 
-__all__ = ["PokerModelError", "QueuedPokerModel"]
+def build_model_from_config(
+    scientific: Mapping[str, object],
+    device: torch.device | str,
+) -> QueuedPokerModel:
+    """Reconstruct the selected queued architecture from scientific state.
+
+    The offline converter intentionally removes architecture values that are
+    functions of other scientific values.  This factory is the sole inverse:
+    it derives the action width, sequential head selection, and lossless
+    history capacity before constructing the exact parameter owners.
+    """
+
+    mode = scientific.get("mode")
+    expected_mode = {
+        "training_regime": "self_play",
+        "rollout_mode": "sequential",
+        "private_estimator": "sampled",
+    }
+    if not isinstance(mode, Mapping) or dict(mode) != expected_mode:
+        raise ValueError(
+            "scientific.mode must select self_play/sequential/sampled"
+        )
+    game = scientific.get("game")
+    model = scientific.get("model")
+    if not isinstance(game, Mapping) or not isinstance(model, Mapping):
+        raise ValueError(
+            "scientific configuration must contain game and model objects"
+        )
+    game_values = dict(game)
+    if "players" in game_values:
+        players = game_values["players"]
+        if "n_players" in game_values:
+            raise ValueError("scientific.game contains duplicate player counts")
+    else:
+        players = game_values.get("n_players")
+    try:
+        geometry = NLHEGeometry(
+            players=int(players),
+            stack_bb=float(game_values["stack_bb"]),
+            rank_count=int(game_values["rank_count"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("scientific.game is not a valid NLHE geometry") from exc
+
+    model_values = dict(model)
+    if "epsilon" in model_values:
+        if "eps" in model_values:
+            raise ValueError("scientific.model contains duplicate epsilon values")
+        model_values["eps"] = model_values.pop("epsilon")
+    derived_action_width = 3 + int(model_values.get("m_raise", 4))
+    if "k_act" in model_values and model_values["k_act"] != derived_action_width:
+        raise ValueError("scientific.model.k_act disagrees with m_raise")
+    model_values["k_act"] = derived_action_width
+    if (
+        "use_branching_heads" in model_values
+        and model_values["use_branching_heads"] is not False
+    ):
+        raise ValueError(
+            "scientific.model.use_branching_heads is invalid for sequential mode"
+        )
+    model_values["use_branching_heads"] = False
+    required_history = max_public_history_tokens(
+        geometry.players, geometry.stack_bb
+    )
+    if (
+        "max_history_tokens" in model_values
+        and int(model_values["max_history_tokens"]) != required_history
+    ):
+        raise ValueError(
+            "scientific.model.max_history_tokens is not the derived exact bound"
+        )
+    model_values["max_history_tokens"] = required_history
+    model_config = PokerModelConfig.from_dict(model_values)
+    if model_config.max_players < geometry.players:
+        raise ValueError("scientific.model.max_players does not cover all seats")
+    if model_config.folder_beta_rank > geometry.deck_cards:
+        raise ValueError(
+            "scientific.model.folder_beta_rank exceeds the compact deck"
+        )
+
+    target = torch.device(device)
+    if target.type not in ("cuda", "mps"):
+        raise ValueError("queued poker model construction requires cuda or mps")
+    if target.type == "cuda" and target.index is None:
+        target = torch.device("cuda", torch.cuda.current_device())
+    deck = DeckGeometry(geometry.rank_count)
+    result = QueuedPokerModel(
+        geometry,
+        PreflopNet(model_config, deck),
+        PostflopNet(model_config, deck),
+    ).to(target)
+    if any(parameter.device != target for parameter in result.parameters()):
+        raise PokerModelError("queued poker model construction changed device")
+    return result
+
+
+__all__ = ["PokerModelError", "QueuedPokerModel", "build_model_from_config"]

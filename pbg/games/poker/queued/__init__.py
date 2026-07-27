@@ -18,7 +18,11 @@ from pbg.games.poker.queued.policy import (
     PokerPolicyError,
     PokerPolicyOperator,
 )
-from pbg.games.poker.queued.model import PokerModelError, QueuedPokerModel
+from pbg.games.poker.queued.model import (
+    PokerModelError,
+    QueuedPokerModel,
+    build_model_from_config,
+)
 
 __all__ = [
     "ActorSample",
@@ -35,6 +39,7 @@ __all__ = [
     "QueuedPokerModel",
     "QueuedPokerError",
     "SampledShowdownBinding",
+    "build_model_from_config",
     "sampled_partitions",
     "validate_phase5_mode",
 ]

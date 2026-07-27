@@ -407,6 +407,12 @@ def convert_legacy_sequential_sampled(
         "checkpoint_cadence": config["training"].get("checkpoint_every"),
     }
     training = config["training"]
+    effective_hand_cadence = training.get("kl_ref_effective_hands_rollout")
+    interval_cadence = (
+        None
+        if effective_hand_cadence is not None
+        else int(training["kl_ref_interval"])
+    )
     scaler = (
         _convert_scaler(legacy["scaler"])
         if bool(training["amp"])
@@ -432,8 +438,12 @@ def convert_legacy_sequential_sampled(
             "effective_hands_rollout": float(
                 legacy["reference_effective_hands_rollout"]
             ),
-            "interval_iterations": int(training["kl_ref_interval"]),
-            "interval_effective_hands": None,
+            "interval_iterations": interval_cadence,
+            "interval_effective_hands": (
+                None
+                if effective_hand_cadence is None
+                else float(effective_hand_cadence)
+            ),
         },
         "run_state": run_state.state_dict(),
         "explicit_rng": legacy["torch_generator"].clone(),

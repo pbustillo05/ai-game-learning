@@ -19,6 +19,7 @@ from pbg.games.poker.queued import (
     PokerStateMachine,
     QueuedPokerModel,
     SampledShowdownBinding,
+    build_model_from_config,
     sampled_partitions,
 )
 from pbg.queued import (
@@ -904,9 +905,20 @@ def _legacy_checkpoint(version: str = "pbg-checkpoint-v8") -> dict[str, object]:
             "completion": {"n_samples": None},
             "model": {
                 "d_model": 4,
+                "n_heads": 1,
+                "n_layers_pre": 1,
+                "n_layers_post": 1,
+                "m_raise": 2,
                 "k_act": 5,
+                "s_min": 0.02,
+                "max_players": 2,
+                "class_embedding_dim": 2,
+                "ffn_hidden": 8,
                 "use_branching_heads": False,
                 "max_history_tokens": 20,
+                "folder_beta_rank": 0,
+                "folder_line_dim": 2,
+                "eps": 1.0e-8,
             },
             "loss": {"name": "ppo"},
             "training": {
@@ -916,6 +928,7 @@ def _legacy_checkpoint(version: str = "pbg-checkpoint-v8") -> dict[str, object]:
                 "adam_betas": (0.9, 0.999),
                 "grad_clip": 1.0,
                 "kl_ref_interval": 5,
+                "kl_ref_effective_hands_rollout": None,
                 "out_dir": "ignored",
             },
             "probe": None,
@@ -984,8 +997,48 @@ def test_offline_converter_records_hash_and_refuses_repeat(
     converted = torch.load(destination, map_location="cpu", weights_only=False)
     assert converted["run_state"]["iteration"] == 2
     assert converted["optimizer"]["step"] == 3
+    assert converted["reference_state"]["interval_iterations"] == 5
+    assert converted["reference_state"]["interval_effective_hands"] is None
     with pytest.raises(Exception, match="already exists"):
         convert_legacy_sequential_sampled(source, destination)
+
+
+@CUDA
+def test_converted_checkpoint_reconstructs_derived_model_exactly(
+    tmp_path: Path,
+) -> None:
+    legacy = _legacy_checkpoint()
+    source_scientific = {
+        "mode": {
+            "training_regime": "self_play",
+            "rollout_mode": "sequential",
+            "private_estimator": "sampled",
+        },
+        "game": legacy["config"]["game"],
+        "model": {
+            key: value
+            for key, value in legacy["config"]["model"].items()
+            if key not in ("k_act", "use_branching_heads", "max_history_tokens")
+        },
+    }
+    source_model = build_model_from_config(source_scientific, "cuda")
+    legacy["model"] = source_model.state_dict()
+    legacy["reference_model"] = {
+        name: value.clone() for name, value in source_model.state_dict().items()
+    }
+    source = tmp_path / "legacy.pt"
+    destination = tmp_path / "queued.pt"
+    torch.save(legacy, source)
+    convert_legacy_sequential_sampled(source, destination)
+    converted = torch.load(destination, map_location="cpu", weights_only=False)
+
+    resumed = build_model_from_config(converted["scientific_config"], "cuda")
+    resumed.load_state_dict(converted["model"], strict=True)
+    assert resumed.preflop.cfg.k_act == 5
+    assert resumed.preflop.cfg.use_branching_heads is False
+    assert resumed.preflop.cfg.max_history_tokens == 18
+    for name, expected in source_model.state_dict().items():
+        torch.testing.assert_close(resumed.state_dict()[name].cpu(), expected.cpu())
 
 
 def test_strict_phase5_config_reports_dotted_unknown_path() -> None:
