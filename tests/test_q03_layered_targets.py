@@ -593,18 +593,20 @@ def test_layer_plan_rejects_inflated_or_gapped_target_extents() -> None:
         replace(plan, sigma_rows=((2, 0),)).assert_admitted(manifest)
     with pytest.raises(TopologyError, match="action targets.*exact extent"):
         replace(plan, action_rows=((2, 0),)).assert_admitted(manifest)
-    with pytest.raises(TopologyError, match="sigma targets.*exact extent"):
+    with pytest.raises(TopologyError, match="share one identity"):
         replace(
             plan,
             sigma_target_row=_i32([1]),
             sigma_rows=((2, 0),),
         ).assert_admitted(manifest)
-    with pytest.raises(TopologyError, match="action targets.*exact extent"):
+    with pytest.raises(TopologyError, match="share one identity"):
         replace(
             plan,
             action_begin=_i32([1]),
             action_rows=((2, 0),),
         ).assert_admitted(manifest)
+
+
 def test_layer_plan_rejects_nonpermutation_leaf_rows() -> None:
     mode = mode_schema("self_play", "sequential", "sampled")
     topology, bindings = _topology(mode)
@@ -629,6 +631,67 @@ def test_sequential_rejects_nonunit_nominal_degree() -> None:
             (bindings,),
             p_train=2,
         )
+
+
+def test_sequential_rejects_permuted_aligned_target_rows() -> None:
+    mode = mode_schema("self_play", "sequential", "sampled")
+    topology = Topology(
+        parent=_i32([-1, -1]),
+        child_begin=_i32([0, 1]),
+        executed_degree=_i32([1, 1]),
+        nominal_degree=_i32([1, 1]),
+        target_degree=_i32([1, 1]),
+        owner=_i32([0, 0]),
+        familywork_row=_i32([0, 1]),
+        sigma_head_row=_i32([0, 1]),
+        action_begin=_i32([1, 0]),
+        label=_i32([1, 2]),
+        path_length=_i32([1, 1]),
+        target_kind=_i32([int(TargetKind.LEAF), int(TargetKind.LEAF)]),
+        target_row=_i32([0, 1]),
+    )
+    bindings = TopologyBindings(
+        input_type=_i32([0, 0]),
+        output_type=_i32([0, 0]),
+        sigma_target_row=_i32([0, 1]),
+        child_output_type=_i32([0, 0]),
+    )
+    with pytest.raises(TopologyError, match="share one identity"):
+        build_layer_plan(
+            mode,
+            _partitions(mode.private_estimator),
+            (topology,),
+            (bindings,),
+            p_train=2,
+        )
+
+
+@CUDA
+def test_sequential_mutated_plan_rejects_permuted_row_identity() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    mode = mode_schema("self_play", "sequential", "sampled")
+    topology, bindings = _topology(mode)
+    manifest = _manifest(mode, device)
+    plan = build_layer_plan(
+        mode,
+        _partitions(mode.private_estimator),
+        (topology,),
+        (bindings,),
+        p_train=2,
+        manifest=manifest,
+    )
+    with pytest.raises(TopologyError, match="share one identity"):
+        replace(
+            plan,
+            sigma_head_row=_i32([1]),
+            sigma_target_row=_i32([0]),
+        ).assert_admitted(manifest)
+    with pytest.raises(TopologyError, match="share one identity"):
+        replace(
+            plan,
+            action_begin=_i32([1]),
+            action_rows=((2, 0),),
+        ).assert_admitted(manifest)
 
 
 def test_sampled_completion_rejects_cpu_state() -> None:
@@ -786,7 +849,7 @@ def test_signed_sampled_return_is_valid() -> None:
     plan = build_layer_plan(
         mode, partitions, (topology,), (bindings,), p_train=2, manifest=manifest
     )
-    with pytest.raises(TopologyError, match="action target span"):
+    with pytest.raises(TopologyError, match="share one identity"):
         replace(plan, action_begin=_i32([16])).assert_admitted(manifest)
     owners = GeneratedOwners(
         build_storage_plan(mode, partitions, manifest, _layout(), device)
@@ -1277,7 +1340,7 @@ def test_internal_layer_post_to_pre_conversion_is_deterministic() -> None:
 
 
 @CUDA
-def test_executor_rejects_unpublished_heads_and_schema_mismatch_prelaunch() -> None:
+def test_executor_rejects_mutated_heads_and_schema_mismatch_prelaunch() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     mode = mode_schema("self_play", "sequential", "sampled")
     topology, bindings = _topology(mode)
@@ -1301,7 +1364,7 @@ def test_executor_rejects_unpublished_heads_and_schema_mismatch_prelaunch() -> N
         1,
     )
     unpublished = replace(plan, sigma_head_row=_i32([3]))
-    with pytest.raises(TargetError, match="unpublished sigma head"):
+    with pytest.raises(TopologyError, match="share one identity"):
         LayeredTargetExecutor(
             mode, _algebra(mode.private_estimator), lambda_=0.5
         ).execute(owners, unpublished)

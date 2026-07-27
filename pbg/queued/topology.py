@@ -699,6 +699,18 @@ class LayerPlan:
                 raise TopologyError(
                     "LayerPlan sigma target exceeds its realized reservation"
                 )
+            if (
+                not self.branched
+                and (
+                    int(self.sigma_head_row[row])
+                    != int(self.sigma_target_row[row])
+                    or int(self.action_begin[row])
+                    != int(self.sigma_target_row[row])
+                )
+            ):
+                raise TopologyError(
+                    "sequential head and target rows must share one identity"
+                )
             sigma_key = (
                 lane,
                 input_type,
@@ -945,6 +957,20 @@ def build_layer_plan(
                 if not 0 <= family_row < player_caps[name]:
                     raise TopologyError(
                         "topology family-work address is out of bounds"
+                    )
+        if mode.rollout_mode is RolloutMode.SEQUENTIAL:
+            for node in range(topology.node_count):
+                if int(topology.owner[node]) < 0:
+                    continue
+                aligned = (
+                    int(topology.familywork_row[node]),
+                    int(topology.sigma_head_row[node]),
+                    int(binding.sigma_target_row[node]),
+                    int(topology.action_begin[node]),
+                )
+                if len(set(aligned)) != 1:
+                    raise TopologyError(
+                        "sequential learner rows must share one identity"
                     )
         for node in range(topology.node_count):
             destination = int(binding.output_type[node])
