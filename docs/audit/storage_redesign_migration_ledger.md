@@ -10,6 +10,14 @@ opaque hooks, old-module/root/config/persistence/artifact inventories, and
 static firewall gates. All replacement and deletion rows for later phases
 remain open.
 
+Phase 2 replacement evidence passed against candidate
+`5bd7d0ebb900ec4dddc6a951646d6e1e62622a3b`: immutable aligned schemas,
+fixed monotone slabs, exact blocks, lane-local failure/retry, atomic
+multi-destination publication, generated owners, immutable capacity admission,
+exact byte reports, and last-consumer release. The corresponding old-definition
+rows remain open until their legacy callers and definitions are deleted at
+cutover; isolated replacement does not weaken that closure rule.
+
 Disposition meanings:
 
 - `move`: representation-independent behavior relocates once to its final
@@ -139,3 +147,14 @@ Rows close only with exact candidate SHA, CUDA commands/results, failure
 injection, determinism, memory/high-water accounting, matched-work timing, old
 definition/caller deletion, and audit result. Phase 1 opens the rows and proves
 the closed schema/firewall; it does not prematurely close later behavior.
+
+Phase 2 candidate `5bd7d0ebb900ec4dddc6a951646d6e1e62622a3b`
+passed 25 queued cumulative CUDA tests and 66 legacy storage/memory regression
+tests on explicitly selected GPU 0. Evidence covers all twelve generated owner
+sets, exact analytical/allocated/observed bytes, allocation and publication
+failure injection, minimum-address determinism, whole-lane retry isolation,
+immutable-manifest rejection, and release exactly at every last consumer. The
+read-only audit found no parallel queued allocator, capacity authority, failure
+owner, compatibility path, forbidden import, paging, recycling, growth, or
+wraparound. See `queued_phase2_report_20260726.md` and
+`../queued/storage_and_lifetimes.md`.
