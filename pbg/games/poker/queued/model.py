@@ -22,6 +22,7 @@ from pbg.games.poker.model.preflop import (
 )
 from pbg.games.poker.model.primitives import MHA
 from pbg.games.poker.queued.hooks import (
+    FOLD,
     FOLDED,
     NLHEGeometry,
     PAD_CARD,
@@ -34,6 +35,55 @@ from pbg.games.poker.queued.folded import folded_statistics
 
 class PokerModelError(RuntimeError):
     """A partition model violated the queued model operation."""
+
+
+def _fold_line_metadata(
+    history: PokerHistory,
+    status: Tensor,
+    *,
+    line_dim: int,
+    stack_bb: float,
+) -> Tensor:
+    """Encode each folded seat's retained action line at its fold event."""
+
+    batch, tokens = history.mask.shape
+    players = status.shape[1]
+    result = torch.zeros(
+        (batch, players, line_dim),
+        dtype=torch.float32,
+        device=status.device,
+    )
+    position = torch.arange(tokens, device=status.device)[None]
+    for seat in range(players):
+        folder = status[:, seat].eq(FOLDED)
+        owned = history.mask & history.actor.eq(seat)
+        fold = owned & history.action.eq(FOLD)
+        torch._assert_async(
+            (~folder | fold.any(-1)).all(),
+            "folded seat has no retained fold-line event",
+        )
+        last = torch.where(
+            fold, position, torch.full_like(position, -1)
+        ).max(-1).values
+        gather = last.clamp_min(0)[:, None]
+        through_fold = owned & position.le(last[:, None])
+        call = through_fold & history.action.eq(1)
+        raise_ = through_fold & history.action.eq(2)
+        fields = (
+            history.street.gather(1, gather).squeeze(1).float() / 3.0,
+            through_fold.sum(-1, dtype=torch.float32) / max(tokens, 1),
+            (history.amount * through_fold).sum(-1) / float(stack_bb),
+            call.sum(-1, dtype=torch.float32),
+            raise_.sum(-1, dtype=torch.float32),
+            history.amount.gather(1, gather).squeeze(1) / float(stack_bb),
+            history.pot_before.gather(1, gather).squeeze(1) / float(stack_bb),
+            history.call_amount.gather(1, gather).squeeze(1) / float(stack_bb),
+        )
+        for column, value in enumerate(fields[:line_dim]):
+            result[:, seat, column] = torch.where(
+                folder, value, torch.zeros_like(value)
+            )
+    return result
 
 
 def _combo_class(geometry: NLHEGeometry) -> Tensor:
@@ -283,14 +333,22 @@ class QueuedPokerModel(nn.Module):
             ~finite, -torch.inf
         ).max(2, keepdim=True).values
         ranges = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
+        folded_ranges = torch.exp(log_reach).masked_fill(~finite, 0.0)
+        line_dim = getattr(self.postflop.cfg, "folder_line_dim", 0)
         summary = folded_statistics(
             self.geometry,
             board_cards=state.board_cards,
-            range_weights=ranges.float(),
+            range_weights=folded_ranges.float(),
             status=state.status,
             combo_cards=self.combo_cards,
             beta_rank=getattr(self.postflop.cfg, "folder_beta_rank", 0),
-            line_dim=getattr(self.postflop.cfg, "folder_line_dim", 0),
+            line_dim=line_dim,
+            line_metadata=_fold_line_metadata(
+                history,
+                state.status,
+                line_dim=line_dim,
+                stack_bb=self.geometry.stack_bb,
+            ),
         )
         return self._evaluation(
             self.postflop(

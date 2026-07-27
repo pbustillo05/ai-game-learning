@@ -10,6 +10,7 @@ from torch import nn
 
 from pbg.games.poker.queued.folded import folded_statistics
 from pbg.games.poker.queued.hooks import (
+    FOLD,
     FOLDED,
     NLHEGeometry,
     PAD_CARD,
@@ -21,6 +22,7 @@ from pbg.games.poker.queued.hooks import (
 )
 from pbg.games.poker.queued.model import (
     QueuedPokerModel,
+    _fold_line_metadata,
     build_model_from_config,
 )
 from pbg.games.poker.queued.training import SequentialPokerIteration
@@ -172,7 +174,20 @@ def test_native_postflop_model_consumes_signed_folded_summary() -> None:
     log_reach[:, 2] = torch.linspace(
         -2.0, 0.0, geometry.private_hands, device=device
     )
-    model_input = machine.direct_model_input(state, log_reach)
+    history = machine.empty_history(1, device)
+    history.actor[:, 0] = 2
+    history.street[:, 0] = 0
+    history.action[:, 0] = FOLD
+    history.mask[:, 0] = True
+    line = _fold_line_metadata(
+        history,
+        state.status,
+        line_dim=4,
+        stack_bb=geometry.stack_bb,
+    )
+    assert line[0, 2, 0] == 0.0
+    assert line[0, 2, 1] > 0.0
+    model_input = machine.direct_model_input(state, log_reach, history)
     evaluation = model.forward_sequential_partition("post_2", model_input)
     assert evaluation.value.shape == (1, geometry.private_hands)
     assert torch.isfinite(evaluation.value).all()
@@ -333,6 +348,14 @@ def test_repository_folded_statistics_are_deterministic_fp32() -> None:
         combo_cards=combo_cards,
         beta_rank=4,
         line_dim=3,
+        line_metadata=torch.tensor(
+            [
+                [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 2.0, 3.0]],
+                [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 2.0, 3.0]],
+            ],
+            dtype=torch.float32,
+            device=device,
+        ),
     )
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         first = folded_statistics(geometry, **arguments)
@@ -345,6 +368,10 @@ def test_repository_folded_statistics_are_deterministic_fp32() -> None:
     assert not first["folder_mask"][:, :2].any()
     assert torch.count_nonzero(first["beta_eigenvalue"]) > 0
     assert torch.count_nonzero(first["folder_line_meta"]) > 0
+    torch.testing.assert_close(
+        first["folder_log_mass"][:, 2],
+        weights[:, 2].sum(-1).log(),
+    )
 
 
 @CUDA
@@ -380,7 +407,7 @@ def test_folded_lambda_and_signed_beta_match_one_folder_finite_differences() -> 
         status=status,
         combo_cards=combo,
         beta_rank=geometry.deck_cards,
-        line_dim=4,
+        line_dim=0,
     )
     local = (combo - geometry.first_card).long()
     marginal = torch.zeros(
@@ -463,7 +490,7 @@ def test_folded_exact_combo_content_and_two_folder_oracle() -> None:
         status=status,
         combo_cards=combo,
         beta_rank=geometry.deck_cards,
-        line_dim=4,
+        line_dim=0,
     )
     p = torch.stack((first / first.sum(), second / second.sum()))
     disjoint = (
@@ -527,7 +554,7 @@ def test_three_loose_folder_estimator_calibrates_to_exact_enumeration() -> None:
         status=status,
         combo_cards=combo,
         beta_rank=geometry.deck_cards,
-        line_dim=4,
+        line_dim=0,
     )
     disjoint = (
         local[:, None, :, None]

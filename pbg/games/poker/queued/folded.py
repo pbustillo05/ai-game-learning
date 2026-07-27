@@ -181,6 +181,7 @@ def _folded_statistics_fp32(
     combo_cards: Tensor,
     beta_rank: int,
     line_dim: int,
+    line_metadata: Tensor | None = None,
 ) -> Mapping[str, Tensor]:
     r"""Compute $\Lambda_B$ and signed $\beta_B$ factors from exact combos."""
 
@@ -195,6 +196,15 @@ def _folded_statistics_fp32(
         or combo_cards.shape != (hands, 2)
         or not 0 <= beta_rank <= cards
         or line_dim < 0
+        or (line_dim > 0 and line_metadata is None)
+        or (
+            line_metadata is not None
+            and (
+                line_metadata.shape != (batch, players, line_dim)
+                or line_metadata.dtype != torch.float32
+                or line_metadata.device != range_weights.device
+            )
+        )
     ):
         raise FoldedStatisticsError("folded statistic inputs violate poker geometry")
     folder_mask = status.eq(FOLDED)
@@ -277,19 +287,11 @@ def _folded_statistics_fp32(
     card_incidence = raw.new_zeros((hands, cards))
     card_incidence.scatter_(1, combo_local, 1.0)
     card_mass = torch.einsum("bph,hc->bpc", raw, card_incidence)
-    line_meta = raw.new_zeros((batch, players, line_dim))
-    normalized = probability.square().sum(-1)
-    tilt = matrix.sum(-1) - (
-        2.0 / base_cards[:, None, None]
+    line_meta = (
+        raw.new_zeros((batch, players, line_dim))
+        if line_metadata is None
+        else line_metadata * folder_mask[..., None]
     )
-    line_fields = (
-        torch.log(mass.clamp_min(torch.finfo(torch.float32).tiny)),
-        normalized.reciprocal().masked_fill(~folder_mask, 0.0),
-        torch.linalg.vector_norm(tilt, dim=-1),
-        board_valid.sum(-1, dtype=torch.float32)[:, None].expand(-1, players),
-    )
-    for column, value in enumerate(line_fields[:line_dim]):
-        line_meta[:, :, column] = value * folder_mask
     return MappingProxyType(
         {
             "hand_log_ratio": hand_log_ratio.contiguous(),
@@ -321,6 +323,7 @@ def folded_statistics(
     combo_cards: Tensor,
     beta_rank: int,
     line_dim: int,
+    line_metadata: Tensor | None = None,
 ) -> Mapping[str, Tensor]:
     """Run the authoritative finite differences outside mixed precision."""
 
@@ -333,6 +336,7 @@ def folded_statistics(
             combo_cards=combo_cards,
             beta_rank=beta_rank,
             line_dim=line_dim,
+            line_metadata=line_metadata,
         )
 
 
