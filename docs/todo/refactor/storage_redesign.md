@@ -1,6 +1,7 @@
 # Queued training rewrite, in iteration order
 
-Status: implementation proposal; not yet an authoritative production contract.
+Status: approved queued-rewrite contract; prerequisite closure recorded
+2026-07-26.
 
 ## 1. Fundamentals
 

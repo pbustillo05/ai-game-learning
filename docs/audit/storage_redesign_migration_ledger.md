@@ -3,6 +3,13 @@
 Status: opened in Phase 1. A row closes only when the old definition and all
 callers, tests, configuration, and stale documentation are deleted.
 
+Phase 1 contract/inventory rows closed against candidate
+`7e371b8daf9f978ad2e479edfda6ae87fdaadb6b`: twelve-mode vocabulary,
+partitions/conversions, owner fields, replica rules, capacity vocabulary,
+opaque hooks, old-module/root/config/persistence/artifact inventories, and
+static firewall gates. All replacement and deletion rows for later phases
+remain open.
+
 Disposition meanings:
 
 - `move`: representation-independent behavior relocates once to its final

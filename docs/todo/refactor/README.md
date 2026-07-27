@@ -1,6 +1,9 @@
 # Queued-training refactor proposals
 
-This folder designs the replacement before production code changes. Its
+This folder defines the approved replacement. Prerequisite authority closure
+is recorded in
+[`queued_refactor_prerequisite_closure_20260726.md`](../../audit/queued_refactor_prerequisite_closure_20260726.md).
+Its
 external authorities are [`core_math.tex`](../../theory/core_math.tex),
 [`MHA_model.md`](../../theory/MHA_model.md), and
 [`folder_impact.md`](../../theory/folder_impact.md).
@@ -49,9 +52,7 @@ Experiments select one implementation; production deletes every alternative.
 - Duplicate-node computation reuse. Duplicate sampled children always keep distinct logical identities and topology
   edges.
 
-The workflow is: finish and approve the design here; reconcile it with the
-three external authorities and approve the required repository ownership and
-evaluator contract; freeze capacities and matched-work CUDA gates; then
-implement, test, benchmark, select hardware tables, and delete superseded
-production paths. `docs/theory/pseudocode/` is historical design evidence, not
-an authority or implementation gate for this rewrite.
+The design, repository ownership, evaluator boundary, capacity vocabulary, and
+matched-work CUDA gates are approved. Implementation follows the phased
+protocol in `implementation_plan.md`. `docs/theory/pseudocode/` is historical
+design evidence, not an authority or implementation gate for this rewrite.

@@ -1,10 +1,10 @@
 # Queued-core rewrite and repository cleanup
 
-Status: conditional implementation plan derived from
-[`storage_redesign.md`](storage_redesign.md). It becomes executable only after
-the authority and external-interface gates in Section 5 close. This plan
-cannot approve changes to the three external authorities or the evaluator
-ownership boundary.
+Status: executable implementation plan derived from
+[`storage_redesign.md`](storage_redesign.md). The authority and
+external-interface gates in Section 5 closed in
+[`queued_refactor_prerequisite_closure_20260726.md`](../../audit/queued_refactor_prerequisite_closure_20260726.md).
+External-authority changes remain separately approved changes.
 
 ## 1. Goal
 
