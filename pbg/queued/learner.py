@@ -220,6 +220,7 @@ class PolicyEvaluation:
 class ModelOperation(Protocol):
     def __call__(
         self,
+        input_type: str,
         model_input: Tensor,
         sampled_private_state: Tensor,
         owner: Tensor,
@@ -229,6 +230,8 @@ class ModelOperation(Protocol):
 class PolicyOperation(Protocol):
     def __call__(
         self,
+        input_type: str,
+        model_input: Tensor,
         raw: Mapping[str, Tensor],
         action: Tensor,
         sampled_private_state: Tensor,
@@ -556,6 +559,7 @@ class LearnerOperation:
             enabled=self.precision != "fp32",
         ):
             evaluation = self.model_operation(
+                batch.input_type,
                 fields["model_input"],
                 fields["sampled_private_state"],
                 fields["owner"],
@@ -564,12 +568,15 @@ class LearnerOperation:
                 None
                 if reference_operation is None
                 else reference_operation(
+                    batch.input_type,
                     fields["model_input"],
                     fields["sampled_private_state"],
                     fields["owner"],
                 ).policy_raw
             )
         policy = self.policy_operation(
+            batch.input_type,
+            fields["model_input"],
             evaluation.policy_raw,
             fields["action"].to(torch.int32),
             fields["sampled_private_state"],

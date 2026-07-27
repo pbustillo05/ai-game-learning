@@ -132,15 +132,14 @@ class QueuedPokerModel(nn.Module):
         )
         return result
 
-    def learner_operation(self, input_type: str):
-        def operation(
-            model_input: Tensor,
-            _sampled_private_state: Tensor,
-            _owner: Tensor,
-        ) -> ModelEvaluation:
-            return self.forward_partition(input_type, model_input)
-
-        return operation
+    def learner_operation(
+        self,
+        input_type: str,
+        model_input: Tensor,
+        _sampled_private_state: Tensor,
+        _owner: Tensor,
+    ) -> ModelEvaluation:
+        return self.forward_partition(input_type, model_input)
 
 
 def build_model_from_config(

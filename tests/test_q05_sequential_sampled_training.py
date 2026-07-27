@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -19,6 +20,7 @@ from pbg.games.poker.queued import (
     PokerStateMachine,
     QueuedPokerModel,
     SampledShowdownBinding,
+    SequentialSampledPokerIteration,
     build_model_from_config,
     sampled_partitions,
 )
@@ -491,7 +493,11 @@ class _LearnerModel(nn.Module):
         self.affine = nn.Linear(26, hands * 11, device=device)
 
     def evaluate(
-        self, model_input: torch.Tensor, _private: torch.Tensor, _owner: torch.Tensor
+        self,
+        _input_type: str,
+        model_input: torch.Tensor,
+        _private: torch.Tensor,
+        _owner: torch.Tensor,
     ) -> ModelEvaluation:
         batch = model_input.shape[0]
         fields = self.affine(model_input.float()).reshape(batch, self.hands, 11)
@@ -514,7 +520,14 @@ class _LearnerPolicy:
         self.operator = PokerPolicyOperator()
 
     def __call__(
-        self, raw, action, private, owner, reference_raw
+        self,
+        _input_type,
+        _model_input,
+        raw,
+        action,
+        private,
+        owner,
+        reference_raw,
     ):
         batch = action.shape[0]
         device = action.device
@@ -527,6 +540,195 @@ class _LearnerPolicy:
         return self.operator.learner(
             raw, legality, action, private, owner, reference_raw
         )
+
+
+class _EndToEndPokerModel(nn.Module):
+    def __init__(
+        self, device: torch.device, hands: int, *, check_down: bool
+    ) -> None:
+        super().__init__()
+        self.hands = hands
+        self.check_down = check_down
+        self.seen_input_types: list[str] = []
+        self.public = nn.Linear(26, 1, device=device)
+        self.type_logits = nn.Parameter(
+            torch.tensor([24.0, -24.0, -24.0], device=device).expand(
+                hands, -1
+            ).clone()
+        )
+        self.omega = nn.Parameter(torch.zeros(hands, 2, device=device))
+        self.mu = nn.Parameter(torch.zeros(hands, 2, device=device))
+        self.scale = nn.Parameter(torch.zeros(hands, 2, device=device))
+        self.iota = nn.Parameter(
+            torch.full((hands,), -4.0, device=device)
+        )
+        self.value = nn.Parameter(torch.zeros(hands, device=device))
+
+    def evaluate(
+        self,
+        input_type: str,
+        model_input: torch.Tensor,
+        _private: torch.Tensor,
+        _owner: torch.Tensor,
+    ) -> ModelEvaluation:
+        self.seen_input_types.append(input_type)
+        batch = model_input.shape[0]
+        public = self.public(model_input.float())
+        type_logits = self.type_logits[None].expand(batch, -1, -1)
+        if self.check_down:
+            actor = model_input[:, 6:8].argmax(-1)
+            committed_street = model_input[:, 14:16].gather(
+                1, actor[:, None]
+            ).squeeze(1)
+            facing = model_input[:, -2].float() > committed_street + 1.0e-6
+            forced = torch.stack(
+                (
+                    torch.where(
+                        facing,
+                        torch.full_like(facing, -30.0, dtype=torch.float32),
+                        torch.full_like(facing, 30.0, dtype=torch.float32),
+                    ),
+                    torch.where(
+                        facing,
+                        torch.full_like(facing, 30.0, dtype=torch.float32),
+                        torch.full_like(facing, -30.0, dtype=torch.float32),
+                    ),
+                    torch.full_like(facing, -30.0, dtype=torch.float32),
+                ),
+                -1,
+            )
+            type_logits = (
+                forced[:, None].expand(-1, self.hands, -1)
+                + 0.001 * type_logits
+            )
+        return ModelEvaluation(
+            MappingProxyType(
+                {
+                    "type_logits": type_logits + public[:, None] * 0.01,
+                    "omega": torch.softmax(self.omega, -1)[None].expand(
+                        batch, -1, -1
+                    ),
+                    "mu": torch.sigmoid(self.mu)[None].expand(batch, -1, -1),
+                    "s": (
+                        torch.nn.functional.softplus(self.scale) + 0.02
+                    )[None].expand(batch, -1, -1),
+                    "iota": torch.sigmoid(self.iota)[None].expand(batch, -1),
+                }
+            ),
+            self.value[None].expand(batch, -1) + public,
+        )
+
+
+@CUDA
+def test_complete_poker_iteration_runs_roots_to_optimizer() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = next(
+        schema
+        for schema in MODE_SCHEMAS
+        if schema.key == "self_play/sequential/sampled"
+    )
+    owners = GeneratedOwners(
+        build_storage_plan(
+            mode,
+            sampled_partitions(geometry.players),
+            _phase5_manifest(device),
+            _phase5_layout(),
+            device,
+        )
+    )
+    model = _EndToEndPokerModel(
+        device, geometry.private_hands, check_down=True
+    )
+    optimizer = DenseAdam(
+        model, OptimizerConfig(name="adamw", grad_clip=5.0)
+    )
+    run_state = RunState("phase5-e2e", root_count=1)
+    result = SequentialSampledPokerIteration(
+        geometry=geometry,
+        owners=owners,
+        mode=mode,
+        model=model,
+        model_operation=model.evaluate,
+        optimizer=optimizer,
+        loss=LossConfig(reference_kl_coefficient=0.0),
+        schedule=LearnerSchedule(batch_size=1),
+        generator=torch.Generator(device=device).manual_seed(991),
+        seed=991,
+        lambda_=0.95,
+        run_state=run_state,
+    ).run(iteration=0)
+    assert result.player_nodes == 8
+    assert result.leaves == 1
+    assert result.target_layers == 8
+    assert result.learner.statistical_presentations == 8
+    assert len(result.learner.optimizer_steps) == 8
+    assert all(step.applied for step in result.learner.optimizer_steps)
+    assert optimizer.step_count == 8
+    assert run_state.iteration == 1
+    assert run_state.logical_work["trajectories"] == 1
+    assert set(model.seen_input_types) == {"pre", "post_2"}
+
+
+@CUDA
+def test_end_to_end_overflow_exposes_no_failed_attempt_rows() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = next(
+        schema
+        for schema in MODE_SCHEMAS
+        if schema.key == "self_play/sequential/sampled"
+    )
+    manifest = replace(
+        _phase5_manifest(device),
+        player_node_cap=(
+            PartitionRows("pre", 1),
+            PartitionRows("post_2", 79),
+        ),
+    )
+    owners = GeneratedOwners(
+        build_storage_plan(
+            mode,
+            sampled_partitions(2),
+            manifest,
+            _phase5_layout(),
+            device,
+        )
+    )
+    model = _EndToEndPokerModel(
+        device, geometry.private_hands, check_down=True
+    )
+    run_state = RunState("phase5-overflow", root_count=1)
+    with pytest.raises(RecoverableOverflow) as raised:
+        SequentialSampledPokerIteration(
+            geometry=geometry,
+            owners=owners,
+            mode=mode,
+            model=model,
+            model_operation=model.evaluate,
+            optimizer=DenseAdam(model, OptimizerConfig()),
+            loss=LossConfig(),
+            schedule=LearnerSchedule(batch_size=1),
+            generator=torch.Generator(device=device).manual_seed(19),
+            seed=19,
+            lambda_=0.95,
+            run_state=run_state,
+        ).run(iteration=0)
+    assert raised.value.failure.failure_code == "capacity_overflow"
+    owners.abort_failed_lane(0)
+    assert all(slab.tail(0) == 0 and slab.epoch(0) == 1 for slab in owners.live_slabs)
+    owners.release_after(ExecutionPhase.ROLLOUT)
+    for phase in (
+        ExecutionPhase.QUEUE_DRAIN,
+        ExecutionPhase.COMPLETION,
+        ExecutionPhase.ALIGN_AND_SEAL,
+        ExecutionPhase.TARGETS,
+        ExecutionPhase.LEARNER,
+        ExecutionPhase.FINAL_BACKWARD,
+    ):
+        owners.enter_phase(phase)
+        owners.release_after(phase)
+    owners.close()
 
 
 @CUDA
