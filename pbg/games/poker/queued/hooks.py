@@ -673,12 +673,50 @@ class PokerStateMachine:
             baseline,
         )
         amount[early] = 0
+        level = torch.where(
+            early[:, None], torch.full_like(level, -1), level
+        )
         combo = torch.where(
             early[:, None], torch.full_like(state.combo_ids, -1), state.combo_ids
         )
+        board = state.board_cards.clone()
+        if board.shape[0]:
+            private_cards = self.combo_cards(state.combo_ids).flatten(1)
+            used = torch.zeros(
+                (state.rows, self.geometry.deck_cards),
+                dtype=torch.bool,
+                device=state.device,
+            )
+            used.scatter_(
+                1, private_cards - self.geometry.first_card, True
+            )
+            board_valid = board.ne(PAD_CARD)
+            used.scatter_(
+                1,
+                (board.long() - self.geometry.first_card).clamp(
+                    0, self.geometry.deck_cards - 1
+                ),
+                board_valid,
+            )
+            unused_order = torch.argsort(used.to(torch.uint8), dim=1, stable=True)
+            cards = torch.arange(
+                self.geometry.first_card,
+                52,
+                dtype=torch.int64,
+                device=state.device,
+            )
+            unused_cards = cards[unused_order]
+            missing = board.eq(PAD_CARD)
+            missing_ordinal = missing.cumsum(1).sub(1).clamp_min(0)
+            completion = unused_cards.gather(1, missing_ordinal)
+            board = torch.where(
+                early[:, None] & missing,
+                completion.to(torch.uint8),
+                board,
+            )
         return MappingProxyType(
             {
-                "board_cards": state.board_cards,
+                "board_cards": board,
                 "combo_ids": combo,
                 "stratum_level": level,
                 "payoff_baseline": baseline,

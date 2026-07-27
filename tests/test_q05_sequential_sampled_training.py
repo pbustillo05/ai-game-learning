@@ -264,6 +264,14 @@ def test_root_profiles_are_collision_free_and_public_transition_is_conservative(
             atol=1.0e-5,
             rtol=0,
         )
+        import poker_gpu_evaluator as poker
+
+        evaluator_payoff = poker.bind(
+            rank_count=geometry.rank_count
+        ).evaluate_showdowns(**leaf)
+        torch.testing.assert_close(
+            evaluator_payoff, leaf["payoff_baseline"], atol=0, rtol=0
+        )
 
 
 @CUDA
