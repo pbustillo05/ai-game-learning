@@ -1498,6 +1498,76 @@ class _DevicePublicationTransaction:
         if not self._closed:
             self.abort()
             return
+        addresses = torch.stack(
+            tuple(
+                torch.where(
+                    request.counts > 0,
+                    request.logical_address,
+                    torch.full_like(
+                        request.logical_address, torch.iinfo(torch.int64).max
+                    ),
+                )
+                for request in self.requests
+            )
+        )
+        selected = addresses.argmin(0)
+        gather = selected.unsqueeze(0)
+        chosen_address = addresses.gather(0, gather).squeeze(0)
+        counts = torch.stack(
+            tuple(request.counts for request in self.requests)
+        )
+        chosen_count = counts.gather(0, gather).squeeze(0)
+        available = torch.stack(
+            tuple(
+                request.slab.capacity - begin
+                for request, begin in zip(self.requests, self._begins)
+            )
+        )
+        chosen_available = available.gather(0, gather).squeeze(0)
+        records = self.failure_state._records
+        phase_id = self.failure_state._id(
+            self.failure_state._phase_ids, self.phase
+        )
+        code_id = self.failure_state._id(
+            self.failure_state._code_ids, "transaction_rollback"
+        )
+        input_ids = torch.stack(
+            tuple(
+                torch.full(
+                    (self.n_replica,),
+                    self.failure_state._id(
+                        self.failure_state._input_ids, request.input_type
+                    ),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                for request in self.requests
+            )
+        )
+        chosen_input = input_ids.gather(0, gather).squeeze(0)
+        replace = self.success
+        for column, value in (
+            (
+                DeviceFailureState._STATUS,
+                torch.ones_like(chosen_address),
+            ),
+            (
+                DeviceFailureState._PHASE,
+                torch.full_like(chosen_address, phase_id),
+            ),
+            (
+                DeviceFailureState._CODE,
+                torch.full_like(chosen_address, code_id),
+            ),
+            (DeviceFailureState._INPUT, chosen_input),
+            (DeviceFailureState._ADDRESS, chosen_address),
+            (DeviceFailureState._REQUESTED, chosen_count),
+            (DeviceFailureState._AVAILABLE, chosen_available),
+            (DeviceFailureState._ATTEMPTS, self.sampler_attempt_count),
+        ):
+            records[:, column].copy_(
+                torch.where(replace, value, records[:, column])
+            )
         for request, begin in zip(self.requests, self._begins):
             slab = request.slab
             positive = self.success & (request.counts > 0)

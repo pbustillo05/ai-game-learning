@@ -14,6 +14,7 @@ from pbg.queued import (
     CapacityManifest,
     ConversionSpec,
     DestinationRequest,
+    DeviceDestinationRequest,
     DeviceFailure,
     DeviceFailureState,
     ExactBlock,
@@ -186,6 +187,57 @@ def _small_schema(name: str) -> SoASchema:
         ),
         lifetime="test_commit_to_test_consumer",
     )
+
+
+@CUDA
+def test_generated_owners_reset_every_live_slab_after_device_rollback() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    mode = MODE_SCHEMAS[0]
+    plan = build_storage_plan(
+        mode,
+        _partitions(mode.private_estimator),
+        _manifest(mode, device=device),
+        _layout(),
+        device,
+    )
+    owners = GeneratedOwners(plan)
+    owners.enter_phase(ExecutionPhase.ROLLOUT)
+    leaf = owners.slab("Leaf")
+    counts = torch.tensor([1, 0], dtype=torch.int64, device=device)
+    values = {
+        field.name: torch.full(
+            (2, 1, *field.shape),
+            field.fill,
+            dtype=field.dtype,
+            device=device,
+        )
+        for field in leaf.schema.fields
+    }
+    transaction = PublicationTransaction.begin_device(
+        (
+            DeviceDestinationRequest(
+                leaf,
+                counts,
+                values,
+                "pre",
+                torch.tensor([7, 8], dtype=torch.int64, device=device),
+            ),
+        ),
+        phase="rollout_commit",
+        active=torch.tensor([True, False], device=device),
+    )
+    transaction.fill_all()
+    transaction.publish()
+    transaction.rollback_published()
+    failure = owners.failure_state.snapshot(0)
+    assert failure is not None
+    assert failure.failure_code == "transaction_rollback"
+    owners.abort_failed_lane(0)
+    assert all(slab.epoch(0) == 1 for slab in owners.live_slabs)
+    assert all(slab.epoch(1) == 0 for slab in owners.live_slabs)
+    for slab in owners.live_slabs:
+        slab.release()
+    owners.failure_state.release()
 
 
 def test_schema_and_capacity_records_are_deeply_immutable() -> None:

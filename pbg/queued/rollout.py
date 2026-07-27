@@ -16,6 +16,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 import torch
 from torch import Tensor
 
+from pbg.queued.capacity import ExecutionPhase
 from pbg.queued.contracts import (
     ModeSchema,
     PartitionContract,
@@ -698,6 +699,9 @@ class CommitCoverage:
         batch: FamilyBatch,
         requests: Sequence[DeviceDestinationRequest],
         active: Tensor,
+        *,
+        descriptor_cap: int,
+        workspace_byte_cap: int,
     ) -> tuple[Tensor, ...]:
         shape = self.valid.shape
         if (
@@ -708,6 +712,22 @@ class CommitCoverage:
         ):
             raise RolloutError(
                 "commit coverage valid must be CUDA bool [n_replica, extent]"
+            )
+        if shape[1] > descriptor_cap:
+            raise RolloutError(
+                "commit coverage exceeds its generated descriptor bound"
+            )
+        temporary_bytes = (
+            active.numel() * batch.rows * 8
+            + sum(
+                active.numel() * request.max_rows * 16
+                for request in requests
+            )
+            + active.numel() * len(requests) * 8
+        )
+        if temporary_bytes > workspace_byte_cap:
+            raise RolloutError(
+                "commit coverage exceeds admitted rollout workspace bytes"
             )
         for name in (
             "source_ordinal",
@@ -837,6 +857,9 @@ class RolloutOwnerRegistry:
         topology_packet_cap: int,
         topology_cap: int,
         topology_edge_cap: int,
+        chance_generation_cap: int,
+        descriptor_cap: int,
+        workspace_byte_cap: int,
         _token: object | None = None,
     ) -> None:
         if _token is not _OWNER_REGISTRY_TOKEN:
@@ -865,6 +888,9 @@ class RolloutOwnerRegistry:
             topology_packet_cap,
             topology_cap,
             topology_edge_cap,
+            chance_generation_cap,
+            descriptor_cap,
+            workspace_byte_cap,
         )
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
@@ -878,6 +904,9 @@ class RolloutOwnerRegistry:
             self.topology_packet_cap,
             self.topology_cap,
             self.topology_edge_cap,
+            self.chance_generation_cap,
+            self.descriptor_cap,
+            self.workspace_byte_cap,
         ) = bounds
         self._ids = frozenset(id(slab) for slab in self.slabs)
 
@@ -887,14 +916,20 @@ class RolloutOwnerRegistry:
 
         plan = getattr(owners, "plan")
         manifest = plan.manifest
+        slabs = getattr(owners, "live_slabs")
         return cls(
-            getattr(owners, "live_slabs"),
+            slabs,
             family_pack_cap=manifest.family_pack_cap,
             chance_frontier_cap=manifest.chance_frontier_cap,
             completion_pack_cap=manifest.completion_pack_cap,
             topology_packet_cap=manifest.topology_packet_cap,
             topology_cap=manifest.topology_cap,
             topology_edge_cap=manifest.topology_edge_cap,
+            chance_generation_cap=manifest.geometry.player_node_bound,
+            descriptor_cap=sum(slab.capacity for slab in slabs),
+            workspace_byte_cap=plan.admission(
+                ExecutionPhase.ROLLOUT
+            ).bounded_workspace_bytes,
             _token=_OWNER_REGISTRY_TOKEN,
         )
 
@@ -909,9 +944,12 @@ class RolloutOwnerRegistry:
         topology_packet_cap: int,
         topology_cap: int,
         topology_edge_cap: int,
+        chance_generation_cap: int | None = None,
     ) -> "RolloutOwnerRegistry":
         """Create an explicitly closed synthetic owner set for contract tests."""
 
+        replica = slabs[0].n_replica if slabs else 1
+        descriptor_cap = sum(slab.capacity for slab in slabs)
         return cls(
             slabs,
             family_pack_cap=family_pack_cap,
@@ -920,6 +958,15 @@ class RolloutOwnerRegistry:
             topology_packet_cap=topology_packet_cap,
             topology_cap=topology_cap,
             topology_edge_cap=topology_edge_cap,
+            chance_generation_cap=(
+                family_pack_cap
+                if chance_generation_cap is None
+                else chance_generation_cap
+            ),
+            descriptor_cap=descriptor_cap,
+            workspace_byte_cap=max(
+                1, replica * descriptor_cap * 64
+            ),
             _token=_OWNER_REGISTRY_TOKEN,
         )
 
@@ -941,8 +988,13 @@ class RolloutOwnerRegistry:
         )
         return epochs[0]
 
-    def guard(self) -> tuple[tuple[int, tuple[tuple[str, int], ...]], ...]:
-        return tuple(
+    def guard(
+        self,
+    ) -> tuple[
+        int,
+        tuple[tuple[int, tuple[tuple[str, int], ...]], ...],
+    ]:
+        return self.failure_state._records._version, tuple(
             (
                 slab._state._version,
                 tuple(
@@ -955,10 +1007,18 @@ class RolloutOwnerRegistry:
 
     def assert_unchanged(
         self,
-        before: tuple[tuple[int, tuple[tuple[str, int], ...]], ...],
+        before: tuple[
+            int,
+            tuple[tuple[int, tuple[tuple[str, int], ...]], ...],
+        ],
         phase: str,
     ) -> None:
-        for slab, (state_version, column_versions) in zip(self.slabs, before):
+        failure_version, slab_versions = before
+        if self.failure_state._records._version != failure_version:
+            raise RolloutError(f"{phase} mutated device failure records")
+        for slab, (state_version, column_versions) in zip(
+            self.slabs, slab_versions
+        ):
             if slab._state._version != state_version or tuple(
                 (name, value._version)
                 for name, value in slab.columns.items()
@@ -978,20 +1038,31 @@ class TopologyDraftPacket:
     topology: Topology
     bindings: TopologyBindings
     unresolved_edges: tuple[int, ...]
+    declared_node_count: int
+    declared_edge_count: int
+    ready_event: torch.cuda.Event
+    device_valid: Tensor
 
     def __post_init__(self) -> None:
         if min(self.sequence, self.node_begin, self.edge_begin) < 0:
             raise TopologyError("draft packet addresses must be nonnegative")
+        if self.declared_node_count <= 0 or self.declared_edge_count < 0:
+            raise TopologyError("draft packet declared extents are invalid")
         if len(set(self.unresolved_edges)) != len(self.unresolved_edges):
             raise TopologyError("draft packet repeats an unresolved endpoint")
         if any(
-            edge < 0 or edge >= self.topology.edge_count
+            edge < 0 or edge >= self.declared_edge_count
             for edge in self.unresolved_edges
         ):
             raise TopologyError("draft endpoint is outside its edge table")
-        self.bindings.validate(
-            self.topology.node_count, self.topology.edge_count
-        )
+        if (
+            self.device_valid.device.type != "cuda"
+            or self.device_valid.dtype != torch.bool
+            or self.device_valid.numel() != 1
+        ):
+            raise TopologyError(
+                "draft device validation marker must be CUDA bool scalar"
+            )
 
 
 @dataclass(frozen=True)
@@ -1082,13 +1153,12 @@ class AsyncTopologyPublisher:
         owners: RolloutOwnerRegistry,
         *,
         p_train: int,
-        max_inflight_batches: int = 2,
     ) -> None:
-        if p_train <= 0 or max_inflight_batches <= 0:
+        if p_train <= 0:
             raise ValueError("topology publication bounds must be positive")
         self.owners = owners
         self.p_train = int(p_train)
-        self.max_inflight_batches = int(max_inflight_batches)
+        self.max_inflight_batches = 2
         self._drafts: dict[tuple[int, int], TopologyDraftPacket] = {}
         self._packets: list[ReplicaTopologyPacket] = []
         self._pending: list[_PendingTopologyBatch] = []
@@ -1111,6 +1181,7 @@ class AsyncTopologyPublisher:
             )
             for _ in range(self.max_inflight_batches)
         )
+        self._accept_stream = torch.cuda.Stream(device=owners.device)
 
     @staticmethod
     def _key(publication: TopologyPublication) -> tuple[int, int]:
@@ -1125,26 +1196,24 @@ class AsyncTopologyPublisher:
         ):
             raise TopologyError("duplicate topology transaction sequence")
         if (
-            draft.topology.node_count + draft.topology.edge_count
+            draft.declared_node_count + draft.declared_edge_count
             > self.owners.topology_packet_cap
         ):
             raise TopologyError("topology draft exceeds its fixed packet cap")
-        if draft.topology.node_count <= 0:
-            raise TopologyError("topology packets must retain at least one node")
         if (
-            self._reserved_nodes + draft.topology.node_count
+            self._reserved_nodes + draft.declared_node_count
             > self.owners.topology_cap
         ):
             raise TopologyError("topology publication exceeds cumulative node cap")
         if (
-            self._reserved_edges + draft.topology.edge_count
+            self._reserved_edges + draft.declared_edge_count
             > self.owners.topology_edge_cap
         ):
             raise TopologyError("topology publication exceeds cumulative edge cap")
         self._drafts[key] = draft
         self._reserved_packets += 1
-        self._reserved_nodes += draft.topology.node_count
-        self._reserved_edges += draft.topology.edge_count
+        self._reserved_nodes += draft.declared_node_count
+        self._reserved_edges += draft.declared_edge_count
 
     @staticmethod
     def _materialize(
@@ -1154,6 +1223,41 @@ class AsyncTopologyPublisher:
         *,
         p_train: int,
     ) -> TopologyPacket:
+        if (
+            draft.topology.node_count != draft.declared_node_count
+            or draft.topology.edge_count != draft.declared_edge_count
+        ):
+            raise TopologyError("ready topology differs from declared extents")
+        draft_tensors = tuple(
+            getattr(draft.topology, name)
+            for name in (
+                "parent",
+                "child_begin",
+                "executed_degree",
+                "nominal_degree",
+                "target_degree",
+                "owner",
+                "familywork_row",
+                "sigma_head_row",
+                "action_begin",
+                "label",
+                "path_length",
+                "target_kind",
+                "target_row",
+            )
+        ) + (
+            draft.bindings.input_type,
+            draft.bindings.output_type,
+            draft.bindings.sigma_target_row,
+            draft.bindings.child_output_type,
+        )
+        if not all(value.is_pinned() for value in draft_tensors):
+            raise TopologyError(
+                "asynchronous topology draft must use pinned CPU columns"
+            )
+        draft.bindings.validate(
+            draft.declared_node_count, draft.declared_edge_count
+        )
         expected = draft.unresolved_edges
         actual = tuple(int(value) for value in patch.edge.tolist())
         if actual != expected:
@@ -1252,11 +1356,9 @@ class AsyncTopologyPublisher:
             (patch.target_ordinal >= 0).all(),
             "endpoint ordinal must be nonnegative",
         )
-        self._materialize(
-            draft,
-            patch,
-            patch.preflight_target_row.to(torch.int64),
-            p_train=self.p_train,
+        torch._assert_async(
+            draft.device_valid.all(),
+            "device topology validation failed before commit",
         )
 
     def resolve_rows(
@@ -1375,15 +1477,39 @@ class AsyncTopologyPublisher:
         self._packets.append(retained)
         return retained
 
-    def drain(self) -> tuple[ReplicaTopologyPacket, ...]:
-        """Wait once per commit batch; never read a CUDA scalar per packet."""
+    def drain(self, *, block: bool = False) -> tuple[ReplicaTopologyPacket, ...]:
+        """Poll without blocking, or synchronize once at the sealing boundary."""
 
         accepted: list[ReplicaTopologyPacket] = []
-        pending, self._pending = self._pending, []
-        for item in pending:
+        if block and self._pending:
+            with torch.cuda.stream(self._accept_stream):
+                for item in self._pending:
+                    self._accept_stream.wait_event(item.event)
+                    for publication in item.publications:
+                        self._accept_stream.wait_event(
+                            publication.draft.ready_event
+                        )
+                all_ready = torch.cuda.Event(blocking=False)
+                all_ready.record(self._accept_stream)
+            all_ready.synchronize()
+            ready = self._pending
+            self._pending = []
+        else:
+            ready = []
+            waiting = []
+            for item in self._pending:
+                draft_ready = all(
+                    publication.draft.ready_event.query()
+                    for publication in item.publications
+                )
+                if item.armed and item.event.query() and draft_ready:
+                    ready.append(item)
+                else:
+                    waiting.append(item)
+            self._pending = waiting
+        for item in ready:
             if not item.armed:
                 raise TopologyError("topology transfer was never commit-armed")
-            item.event.synchronize()
             for publication, row_slice in zip(
                 item.publications, item.row_slices
             ):
@@ -1402,8 +1528,8 @@ class AsyncTopologyPublisher:
             raise TopologyError("cannot abort an unknown topology sequence")
         draft = self._drafts.pop(key)
         self._reserved_packets -= 1
-        self._reserved_nodes -= draft.topology.node_count
-        self._reserved_edges -= draft.topology.edge_count
+        self._reserved_nodes -= draft.declared_node_count
+        self._reserved_edges -= draft.declared_edge_count
 
     def cancel(self, publications: Sequence[TopologyPublication]) -> None:
         keys = {self._key(item) for item in publications}
@@ -1450,6 +1576,9 @@ class CommitPlan:
             raise ValueError(
                 "a family commit may stage only one topology packet per lane"
             )
+        queue_ids = tuple(id(queue) for queue in self.published_queues)
+        if len(set(queue_ids)) != len(queue_ids):
+            raise ValueError("a commit plan repeats a published queue")
 
 
 class RolloutHooks(Protocol):
@@ -1611,28 +1740,53 @@ class RolloutTransaction:
                 self.n_replica, dtype=torch.bool, device=self.device
             )
             active_lanes[batch.lanes] = True
+            declared_inputs = frozenset(
+                item.name for item in source.partitions.inputs
+            )
             for request in plan.destinations:
                 self.owners.require(request.slab)
-                if request.input_type != scheduled.input_type:
+                if request.input_type not in declared_inputs:
                     raise RolloutError(
-                        "destination input type differs from scheduled family"
+                        "destination names an undeclared input family"
                     )
             for queue in plan.published_queues:
                 self.owners.require(queue.family)
                 self.owners.require(queue.metadata)
-                if queue.input_type != scheduled.input_type:
-                    raise RolloutError(
-                        "published queue differs from scheduled family"
-                    )
-                if not any(
-                    request.slab is queue.family
-                    for request in plan.destinations
+                if (
+                    queue.input_type not in declared_inputs
+                    or queue.partitions != source.partitions
                 ):
                     raise RolloutError(
-                        "published queue lacks a family destination"
+                        "published queue is outside the source partition contract"
                     )
+                matching = tuple(
+                    request
+                    for request in plan.destinations
+                    if request.slab is queue.family
+                )
+                if len(matching) != 1 or (
+                    matching[0].input_type != queue.input_type
+                ):
+                    raise RolloutError(
+                        "published queue lacks its declared family destination"
+                    )
+            published_family_ids = frozenset(
+                id(queue.family) for queue in plan.published_queues
+            )
+            if any(
+                request.slab.schema.name.startswith("FamilyWork.")
+                and id(request.slab) not in published_family_ids
+                for request in plan.destinations
+            ):
+                raise RolloutError(
+                    "FamilyWork destination lacks queue publication"
+                )
             realized_counts = plan.coverage.validate(
-                batch, plan.destinations, active_lanes
+                batch,
+                plan.destinations,
+                active_lanes,
+                descriptor_cap=self.owners.descriptor_cap,
+                workspace_byte_cap=self.owners.workspace_byte_cap,
             )
             destinations = tuple(
                 DeviceDestinationRequest(
@@ -1858,10 +2012,10 @@ class BoundedChanceClosure:
     ) -> None:
         if (
             max_generations <= 0
-            or max_generations > owners.chance_frontier_cap
+            or max_generations > owners.chance_generation_cap
         ):
             raise ValueError(
-                "chance generations must fit the manifest frontier bound"
+                "chance generations must fit the geometry-derived bound"
             )
         self.seed = int(seed)
         self.iteration = int(iteration)
@@ -1969,6 +2123,10 @@ class CompletionFIFO:
                 raise ValueError(
                     f"completion {name} must be owner workspace int64 [n_replica]"
                 )
+        if 2 * owners.n_replica * 8 > owners.workspace_byte_cap:
+            raise ValueError(
+                "completion cursor exceeds admitted workspace bytes"
+            )
         self.leaf = leaf
         self.owners = owners
         self.device = leaf.device
@@ -2049,8 +2207,16 @@ class CompletionFIFO:
         active[batch.lanes] = True
         for request in plan.destinations:
             self.owners.require(request.slab)
+            if request.slab.schema.name != f"LayerWork.{request.input_type}":
+                raise RolloutError(
+                    "completion destinations must be matching LayerWork partitions"
+                )
         realized_counts = plan.coverage.validate(
-            batch, plan.destinations, active
+            batch,
+            plan.destinations,
+            active,
+            descriptor_cap=self.owners.descriptor_cap,
+            workspace_byte_cap=self.owners.workspace_byte_cap,
         )
         destinations = tuple(
             DeviceDestinationRequest(
