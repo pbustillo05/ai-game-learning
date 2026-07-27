@@ -257,6 +257,8 @@ def stable_route(
     family_id: Tensor,
     active: Tensor,
     family_values: Sequence[int],
+    *,
+    declared_values: Tensor | None = None,
 ) -> DeviceStableRoute:
     """Route every active row once while preserving source order per family."""
 
@@ -275,9 +277,20 @@ def stable_route(
         raise ValueError(
             "routing requires CUDA integer family ids and bool active [R,B]"
         )
-    declared = torch.tensor(
-        values, dtype=family_id.dtype, device=family_id.device
-    )
+    if declared_values is None:
+        declared = torch.tensor(
+            values, dtype=family_id.dtype, device=family_id.device
+        )
+    else:
+        declared = declared_values
+        if (
+            declared.device != family_id.device
+            or declared.dtype != family_id.dtype
+            or declared.shape != (len(values),)
+        ):
+            raise ValueError(
+                "preallocated routing families disagree with the route contract"
+            )
     membership = family_id[..., None] == declared[None, None, :]
     declared_rows = ~active | membership.sum(-1, dtype=torch.int64).eq(1)
     torch._assert_async(
@@ -499,6 +512,9 @@ class SemanticFamilyFIFO:
         self.metadata = metadata
         self.device = family.device
         self.n_replica = family.n_replica
+        self._all_lanes = torch.arange(
+            self.n_replica, dtype=torch.int64, device=self.device
+        )
         self._ready_event = torch.cuda.Event(blocking=False)
         self._has_ready_event = False
 
@@ -607,8 +623,12 @@ class SemanticFamilyFIFO:
         if scheduled.input_type != self.input_type:
             raise RolloutError("scheduled family does not match this FIFO")
         self.wait_ready()
-        lanes = torch.tensor(
-            scheduled.lanes, dtype=torch.int64, device=self.device
+        lanes = (
+            self._all_lanes
+            if scheduled.lanes == tuple(range(self.n_replica))
+            else torch.tensor(
+                scheduled.lanes, dtype=torch.int64, device=self.device
+            )
         )
         width = scheduled.rows
         torch._assert_async(
@@ -745,7 +765,7 @@ class CommitCoverage:
                     f"commit coverage {name} must be CUDA int64 {shape}"
                 )
         lane_active = torch.zeros_like(active)
-        lane_active[batch.lanes] = True
+        lane_active.index_fill_(0, batch.lanes, True)
         torch._assert_async(
             (~self.valid | lane_active[:, None]).all(),
             "commit coverage contains an inactive lane",
@@ -1744,7 +1764,7 @@ class RolloutTransaction:
             active_lanes = torch.zeros(
                 self.n_replica, dtype=torch.bool, device=self.device
             )
-            active_lanes[batch.lanes] = True
+            active_lanes.index_fill_(0, batch.lanes, True)
             declared_inputs = frozenset(
                 item.name for item in source.partitions.inputs
             )

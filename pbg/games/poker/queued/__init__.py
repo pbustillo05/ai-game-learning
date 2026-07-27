@@ -30,6 +30,7 @@ from pbg.games.poker.queued.model import (
 from pbg.games.poker.queued.training import (
     PokerIterationError,
     PokerIterationResult,
+    RecoveringSequentialSampledPokerIteration,
     SequentialSampledPokerIteration,
 )
 
@@ -42,6 +43,7 @@ __all__ = [
     "PokerForwardInput",
     "PokerIterationError",
     "PokerIterationResult",
+    "RecoveringSequentialSampledPokerIteration",
     "PokerLearnerPolicy",
     "PokerLegality",
     "PokerModelError",

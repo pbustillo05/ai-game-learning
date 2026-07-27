@@ -339,7 +339,7 @@ class PokerStateMachine:
         actor_street = state.committed_street[row, actor]
         call = (state.current_bet - actor_street).clamp_min(0.0)
         mask[:, FOLD] = call > 0
-        mask[:, CHECK_CALL] = True
+        mask[:, CHECK_CALL].fill_(True)
         target = (
             torch.arange(
                 1,
@@ -473,7 +473,6 @@ class PokerStateMachine:
             (matches & legality.mask).sum(-1).eq(1).all(),
             "player transition received an illegal action",
         )
-        row = torch.arange(state.rows, device=state.device)
         actor = state.to_act.to(torch.int64)
         stacks = state.stacks.clone()
         committed = state.committed.clone()
@@ -485,20 +484,37 @@ class PokerStateMachine:
         fold = action.eq(FOLD)
         call_action = action.eq(CHECK_CALL)
         raise_action = action.ge(RAISE_OFFSET)
-        status[row[fold], actor[fold]] = FOLDED
-        pending[row, actor] = False
-        call = (current_bet - committed_street[row, actor]).clamp_min(0.0)
-        paid_call = torch.minimum(call, stacks[row, actor])
+        actor_index = actor[:, None]
+        actor_status = status.gather(1, actor_index).squeeze(1)
+        actor_status = torch.where(
+            fold, torch.full_like(actor_status, FOLDED), actor_status
+        )
+        status.scatter_(1, actor_index, actor_status[:, None])
+        pending.scatter_(
+            1,
+            actor_index,
+            torch.zeros_like(actor_index, dtype=torch.bool),
+        )
+        actor_committed = committed_street.gather(
+            1, actor_index
+        ).squeeze(1)
+        actor_stack = stacks.gather(1, actor_index).squeeze(1)
+        call = (current_bet - actor_committed).clamp_min(0.0)
+        paid_call = torch.minimum(call, actor_stack)
         paid = torch.where(call_action, paid_call, torch.zeros_like(paid_call))
         raise_to = (action.float() - RAISE_OFFSET + 1.0) * 0.5
-        paid_raise = (raise_to - committed_street[row, actor]).clamp_min(0.0)
+        paid_raise = (raise_to - actor_committed).clamp_min(0.0)
         paid = torch.where(raise_action, paid_raise, paid)
         paid = torch.where(fold, torch.zeros_like(paid), paid)
-        stacks[row, actor] -= paid
-        committed[row, actor] += paid
-        committed_street[row, actor] += paid
-        all_in = stacks[row, actor].eq(0) & ~fold
-        status[row[all_in], actor[all_in]] = ALL_IN
+        next_actor_stack = actor_stack - paid
+        stacks.scatter_(1, actor_index, next_actor_stack[:, None])
+        committed.scatter_add_(1, actor_index, paid[:, None])
+        committed_street.scatter_add_(1, actor_index, paid[:, None])
+        all_in = next_actor_stack.eq(0) & ~fold
+        actor_status = torch.where(
+            all_in, torch.full_like(actor_status, ALL_IN), actor_status
+        )
+        status.scatter_(1, actor_index, actor_status[:, None])
         old_bet = current_bet.clone()
         current_bet = torch.where(raise_action, raise_to, current_bet)
         raise_size = raise_to - old_bet
@@ -506,7 +522,11 @@ class PokerStateMachine:
         last_full_raise = torch.where(full_raise, raise_size, last_full_raise)
         active = status.eq(LIVE)
         pending = torch.where(full_raise[:, None] & active, active, pending)
-        pending[row, actor] = False
+        pending.scatter_(
+            1,
+            actor_index,
+            torch.zeros_like(actor_index, dtype=torch.bool),
+        )
         contenders = status.ne(FOLDED)
         terminal = contenders.sum(-1).le(1)
         outstanding = pending & active
@@ -573,9 +593,15 @@ class PokerStateMachine:
         flop = state.street.eq(0) & needs
         turn = state.street.eq(1) & needs
         river = state.street.eq(2) & needs
-        board[flop, :3] = dealt[flop, :3].to(torch.uint8)
-        board[turn, 3] = dealt[turn, 0].to(torch.uint8)
-        board[river, 4] = dealt[river, 0].to(torch.uint8)
+        board[:, :3] = torch.where(
+            flop[:, None], dealt[:, :3].to(torch.uint8), board[:, :3]
+        )
+        board[:, 3] = torch.where(
+            turn, dealt[:, 0].to(torch.uint8), board[:, 3]
+        )
+        board[:, 4] = torch.where(
+            river, dealt[:, 0].to(torch.uint8), board[:, 4]
+        )
         street = state.street + needs.to(torch.int32)
         active = state.status.eq(LIVE)
         has_betting_opponent = active.sum(-1).gt(1)
@@ -691,7 +717,7 @@ class PokerStateMachine:
             baseline + winner * amount[:, :1],
             baseline,
         )
-        amount[early] = 0
+        amount = torch.where(early[:, None], torch.zeros_like(amount), amount)
         level = torch.where(
             early[:, None], torch.full_like(level, -1), level
         )
@@ -758,6 +784,7 @@ class PokerTransitionTrace:
     input_type: str
     logical_rng_key: Tensor
     next_logical_rng_key: Tensor
+    next_input_type: Tensor
     terminal: Tensor
     owner: Tensor
     action: Tensor
@@ -795,6 +822,12 @@ class SequentialSampledPokerHooks:
         self.iteration = int(iteration)
         self.policy = PokerPolicyOperator() if policy is None else policy
         self.input_index = {name: index for index, name in enumerate(expected)}
+        self._route_family_values = (-1, *range(len(self.queues)))
+        self._route_families = torch.tensor(
+            self._route_family_values,
+            dtype=torch.int32,
+            device=self.owners.device,
+        )
         self.last_trace: PokerTransitionTrace | None = None
 
     def model_input(self, batch: FamilyBatch) -> PokerForwardInput:
@@ -882,7 +915,7 @@ class SequentialSampledPokerHooks:
             for _ in value.shape[2:]:
                 index = index.unsqueeze(-1)
             index = index.expand((value.shape[0], source_row.shape[1], *value.shape[2:]))
-            destination[name][lanes] = value.gather(1, index)
+            destination[name].index_copy_(0, lanes, value.gather(1, index))
 
     def transition(self, request: TransitionRequest) -> CommitPlan:
         batch = request.batch
@@ -924,21 +957,22 @@ class SequentialSampledPokerHooks:
         route = stable_route(
             route_family,
             torch.ones_like(route_family, dtype=torch.bool),
-            (-1, *range(len(self.queues))),
+            self._route_family_values,
+            declared_values=self._route_families,
         )
 
         n_replica = self.owners.n_replica
         full_counts = torch.zeros(
             (n_replica,), dtype=torch.int64, device=state.device
         )
-        full_counts[batch.lanes] = rows
+        full_counts.index_fill_(0, batch.lanes, rows)
         address = torch.full(
             (n_replica,),
             torch.iinfo(torch.int64).max,
             dtype=torch.int64,
             device=state.device,
         )
-        address[batch.lanes] = logical[..., 0].amin(1)
+        address.index_copy_(0, batch.lanes, logical[..., 0].amin(1))
         destinations: list[DeviceDestinationRequest] = []
 
         leaf = next(
@@ -959,7 +993,7 @@ class SequentialSampledPokerHooks:
             leaf_values, reshaped_leaf, route.source_row[:, 0], batch.lanes
         )
         leaf_counts = torch.zeros_like(full_counts)
-        leaf_counts[batch.lanes] = route.counts[:, 0]
+        leaf_counts.index_copy_(0, batch.lanes, route.counts[:, 0])
         destinations.append(
             DeviceDestinationRequest(
                 leaf, leaf_counts, leaf_values, batch.input_type, address
@@ -980,7 +1014,9 @@ class SequentialSampledPokerHooks:
         selected_value = value[flat_row, actor_hand].reshape(
             lane_count, rows, 1
         )
-        sigma_values["old_value"][batch.lanes] = selected_value
+        sigma_values["old_value"].index_copy_(
+            0, batch.lanes, selected_value
+        )
         destinations.append(
             DeviceDestinationRequest(
                 sigma, full_counts, sigma_values, batch.input_type, address
@@ -993,10 +1029,14 @@ class SequentialSampledPokerHooks:
             if slab.schema.name == f"ActionHead.{batch.input_type}"
         )
         action_values = self._defaults(action_head, rows)
-        action_values["action"][batch.lanes] = request.sample.values["action"]
-        action_values["old_log_policy"][batch.lanes] = request.sample.values[
-            "selected_log_policy"
-        ][..., None]
+        action_values["action"].index_copy_(
+            0, batch.lanes, request.sample.values["action"]
+        )
+        action_values["old_log_policy"].index_copy_(
+            0,
+            batch.lanes,
+            request.sample.values["selected_log_policy"][..., None],
+        )
         destinations.append(
             DeviceDestinationRequest(
                 action_head,
@@ -1035,7 +1075,9 @@ class SequentialSampledPokerHooks:
                 batch.lanes,
             )
             counts = torch.zeros_like(full_counts)
-            counts[batch.lanes] = route.counts[:, family_index + 1]
+            counts.index_copy_(
+                0, batch.lanes, route.counts[:, family_index + 1]
+            )
             destinations.append(
                 DeviceDestinationRequest(
                     queue.family, counts, values, name, address
@@ -1054,14 +1096,14 @@ class SequentialSampledPokerHooks:
         destination_ordinal = torch.zeros_like(source_ordinal)
         ordinal = torch.arange(rows, dtype=torch.int64, device=state.device)
         for local_lane, lane in ((0, 0),):
-            valid[lane] = True
-            source_ordinal[lane, 0::3] = ordinal
-            source_ordinal[lane, 1::3] = ordinal
-            source_ordinal[lane, 2::3] = ordinal
-            destination[lane, 0::3] = 1
-            destination[lane, 1::3] = 2
-            destination_ordinal[lane, 0::3] = ordinal
-            destination_ordinal[lane, 1::3] = ordinal
+            valid[lane].fill_(True)
+            source_ordinal[lane, 0::3].copy_(ordinal)
+            source_ordinal[lane, 1::3].copy_(ordinal)
+            source_ordinal[lane, 2::3].copy_(ordinal)
+            destination[lane, 0::3].fill_(1)
+            destination[lane, 1::3].fill_(2)
+            destination_ordinal[lane, 0::3].copy_(ordinal)
+            destination_ordinal[lane, 1::3].copy_(ordinal)
             selected_family = route_family[local_lane]
             route_ordinal = torch.zeros_like(ordinal)
             route_destination = torch.zeros_like(ordinal)
@@ -1078,13 +1120,14 @@ class SequentialSampledPokerHooks:
                     torch.full_like(route_destination, request_index),
                     route_destination,
                 )
-            destination[lane, 2::3] = route_destination
-            destination_ordinal[lane, 2::3] = route_ordinal
+            destination[lane, 2::3].copy_(route_destination)
+            destination_ordinal[lane, 2::3].copy_(route_ordinal)
 
         self.last_trace = PokerTransitionTrace(
             batch.input_type,
             logical.detach(),
             next_logical.detach(),
+            next_family.detach(),
             terminal.detach(),
             batch.fields["owner"].detach(),
             request.sample.values["action"].detach(),

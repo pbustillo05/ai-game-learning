@@ -19,6 +19,7 @@ from pbg.games.poker.queued import (
     PokerPolicyOperator,
     PokerStateMachine,
     QueuedPokerModel,
+    RecoveringSequentialSampledPokerIteration,
     SampledShowdownBinding,
     SequentialSampledPokerIteration,
     build_model_from_config,
@@ -729,6 +730,65 @@ def test_end_to_end_overflow_exposes_no_failed_attempt_rows() -> None:
         owners.enter_phase(phase)
         owners.release_after(phase)
     owners.close()
+
+
+@CUDA
+def test_end_to_end_overflow_rebuilds_and_retries_at_lower_roots() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = next(
+        schema
+        for schema in MODE_SCHEMAS
+        if schema.key == "self_play/sequential/sampled"
+    )
+    manifest = replace(
+        _phase5_manifest(device),
+        root_count=2,
+        player_node_cap=(
+            PartitionRows("pre", 2),
+            PartitionRows("post_2", 78),
+        ),
+    )
+    plan = build_storage_plan(
+        mode,
+        sampled_partitions(2),
+        manifest,
+        _phase5_layout(),
+        device,
+    )
+    model = _EndToEndPokerModel(
+        device, geometry.private_hands, check_down=True
+    )
+    run_state = RunState("phase5-retry", root_count=2)
+    with pytest.warns(RuntimeWarning, match="RECOVERED_SEQUENTIAL_OVERFLOW"):
+        result = RecoveringSequentialSampledPokerIteration(
+            owner_factory=lambda: GeneratedOwners(plan),
+            minimum_root_count=1,
+            geometry=geometry,
+            mode=mode,
+            model=model,
+            model_operation=model.evaluate,
+            optimizer=DenseAdam(model, OptimizerConfig()),
+            loss=LossConfig(),
+            schedule=LearnerSchedule(batch_size=1),
+            generator=torch.Generator(device=device).manual_seed(29),
+            seed=29,
+            lambda_=0.95,
+            run_state=run_state,
+        ).run(iteration=0)
+    assert result.player_nodes == 8
+    assert result.leaves == 1
+    assert run_state.root_count == 1
+    assert run_state.retry_epoch == 1
+    assert run_state.attempt_logical_base == 2
+    assert run_state.recovered_overflow
+    assert len(run_state.overflow_recoveries) == 1
+    record = run_state.overflow_recoveries[0]
+    assert record["capacity"] == 2
+    assert record["observed_demand"] == 4
+    assert record["old_root_count"] == 2
+    assert record["new_root_count"] == 1
+    assert record["replacement_address"] == "1:2"
 
 
 @CUDA

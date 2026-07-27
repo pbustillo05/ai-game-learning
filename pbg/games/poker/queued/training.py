@@ -55,8 +55,10 @@ from pbg.queued.topology import (
     build_layer_plan,
 )
 from pbg.queued.training import (
+    AttemptAddress,
     IterationResult,
     RecoverableOverflow,
+    SequentialOverflowRecovery,
     SequentialSampledIteration,
 )
 
@@ -80,7 +82,14 @@ def _i32(values: list[int]) -> Tensor:
 class _TopologyRecorder:
     """Attempt-local trace owner; discarded wholesale on a failed attempt."""
 
-    def __init__(self, input_names: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        input_names: tuple[str, ...],
+        *,
+        pack_cap: int,
+        topology_cap: int,
+        device: torch.device,
+    ) -> None:
         self.input_index = {
             name: index for index, name in enumerate(input_names)
         }
@@ -97,22 +106,103 @@ class _TopologyRecorder:
         self.logical_to_node: dict[tuple[int, int], int] = {}
         self.pending_parent: dict[tuple[int, int], int] = {}
         self.leaves = 0
+        self._pack_cap = pack_cap
+        self._host_trace = torch.empty(
+            (topology_cap, 10), dtype=torch.int64, pin_memory=True
+        )
+        self._trace_rows = 0
+        self._device_feedback = torch.empty(
+            len(input_names) + 1, dtype=torch.int64, device=device
+        )
+        self._feedback = torch.empty(
+            len(input_names) + 1, dtype=torch.int64, pin_memory=True
+        )
+        self._feedback_event = torch.cuda.Event(blocking=False)
+        self._trace_events: list[torch.cuda.Event] = []
+        self._trace_stream = torch.cuda.Stream(device=device)
+        self._feedback_stream = torch.cuda.Stream(device=device)
+        self._device = device
 
-    def append(self, trace: PokerTransitionTrace) -> None:
-        tensors = {
-            "logical": trace.logical_rng_key.to("cpu"),
-            "next_logical": trace.next_logical_rng_key.to("cpu"),
-            "terminal": trace.terminal.to("cpu"),
-            "owner": trace.owner.to("cpu"),
-            "action": trace.action.to("cpu"),
-            "familywork_row": trace.familywork_row.to("cpu"),
-        }
-        lane_count, rows = tensors["terminal"].shape
+    def append(
+        self,
+        trace: PokerTransitionTrace,
+        *,
+        failed: Tensor,
+        ready: torch.cuda.Event,
+    ) -> tuple[bool, tuple[int, ...]]:
+        lane_count, rows = trace.terminal.shape
         if lane_count != 1:
             raise PokerIterationError("Phase 5 topology expects one ordinary lane")
-        for row in range(rows):
+        if rows > self._pack_cap:
+            raise PokerIterationError("topology trace exceeds the family pack cap")
+        end = self._trace_rows + rows
+        if end > self._host_trace.shape[0]:
+            raise PokerIterationError("topology trace exceeds its admitted cap")
+        stream = torch.cuda.current_stream(self._device)
+        stream.wait_event(ready)
+        packed = torch.cat(
+            (
+                trace.logical_rng_key.to(torch.int64),
+                trace.next_logical_rng_key.to(torch.int64),
+                trace.next_input_type.to(torch.int64)[..., None],
+                trace.terminal.to(torch.int64)[..., None],
+                trace.owner.to(torch.int64)[..., None],
+                trace.action.to(torch.int64)[..., None],
+                trace.familywork_row.to(torch.int64)[..., None],
+                torch.full(
+                    (1, rows, 1),
+                    self.input_index[trace.input_type],
+                    dtype=torch.int64,
+                    device=self._device,
+                ),
+            ),
+            -1,
+        )[0]
+        staged = torch.cuda.Event(blocking=False)
+        staged.record(stream)
+        with torch.cuda.stream(self._trace_stream):
+            self._trace_stream.wait_event(staged)
+            self._host_trace[self._trace_rows : end].copy_(
+                packed, non_blocking=True
+            )
+            trace_ready = torch.cuda.Event(blocking=False)
+            trace_ready.record(self._trace_stream)
+            self._trace_events.append(trace_ready)
+        with torch.cuda.stream(self._feedback_stream):
+            self._feedback_stream.wait_event(staged)
+            self._device_feedback[0].copy_(failed[0].to(torch.int64))
+            live = ~packed[:, 5].bool()
+            for index in range(len(self.input_index)):
+                self._device_feedback[index + 1].copy_(
+                    packed[:, 4].eq(index).logical_and(live).sum()
+                )
+            self._feedback.copy_(
+                self._device_feedback, non_blocking=True
+            )
+            self._feedback_event.record(self._feedback_stream)
+        packed.record_stream(self._trace_stream)
+        packed.record_stream(self._feedback_stream)
+        while not self._feedback_event.query():
+            pass
+        if bool(self._feedback[0]):
+            return True, tuple(0 for _ in self.input_index)
+        counts = tuple(int(value) for value in self._feedback[1:])
+        self._trace_rows = end
+        return False, counts
+
+    def _accept_trace(self) -> None:
+        if self._trace_events:
+            with torch.cuda.stream(self._trace_stream):
+                for event in self._trace_events:
+                    self._trace_stream.wait_event(event)
+                all_ready = torch.cuda.Event(blocking=False)
+                all_ready.record(self._trace_stream)
+            all_ready.synchronize()
+            self._trace_events.clear()
+        feedback = self._host_trace[: self._trace_rows]
+        for row in range(self._trace_rows):
             logical = tuple(
-                int(value) for value in tensors["logical"][0, row].tolist()
+                int(value) for value in feedback[row, 0:2].tolist()
             )
             if logical in self.logical_to_node:
                 raise PokerIterationError("a logical player node was processed twice")
@@ -120,19 +210,19 @@ class _TopologyRecorder:
             parent = self.pending_parent.pop(logical, -1)
             self.logical_to_node[logical] = node
             self.parent.append(parent)
-            self.owner.append(int(tensors["owner"][0, row]))
+            self.owner.append(int(feedback[row, 6]))
             self.familywork_row.append(
-                int(tensors["familywork_row"][0, row])
+                int(feedback[row, 8])
             )
             self.sigma_head_row.append(
-                int(tensors["familywork_row"][0, row])
+                int(feedback[row, 8])
             )
             self.action_begin.append(
-                int(tensors["familywork_row"][0, row])
+                int(feedback[row, 8])
             )
-            self.label.append(int(tensors["action"][0, row]))
-            self.input_type.append(self.input_index[trace.input_type])
-            if bool(tensors["terminal"][0, row]):
+            self.label.append(int(feedback[row, 7]))
+            self.input_type.append(int(feedback[row, 9]))
+            if bool(feedback[row, 5]):
                 self.target_kind.append(int(TargetKind.LEAF))
                 self.target_key.append(None)
                 self.target_row.append(self.leaves)
@@ -140,7 +230,7 @@ class _TopologyRecorder:
             else:
                 child = tuple(
                     int(value)
-                    for value in tensors["next_logical"][0, row].tolist()
+                    for value in feedback[row, 2:4].tolist()
                 )
                 if child in self.pending_parent:
                     raise PokerIterationError(
@@ -152,6 +242,7 @@ class _TopologyRecorder:
                 self.target_row.append(-1)
 
     def seal(self, *, players: int) -> tuple[Topology, TopologyBindings]:
+        self._accept_trace()
         if not self.parent or self.pending_parent:
             raise PokerIterationError(
                 "rollout topology is empty or has unresolved player children"
@@ -187,6 +278,11 @@ class _TopologyRecorder:
             child_output_type=torch.zeros(nodes, dtype=torch.int32),
         )
         topology.validate(bindings, p_train=players)
+        self._device_feedback = torch.empty(
+            0, dtype=torch.int64, device=self._device
+        )
+        self._host_trace = torch.empty(0, dtype=torch.int64)
+        self._feedback = torch.empty(0, dtype=torch.int64)
         return topology, bindings
 
 
@@ -299,9 +395,46 @@ class SequentialSampledPokerIteration:
         )
         transaction.fill_all()
         success = transaction.publish()
-        torch._assert_async(success.all(), "poker root publication failed")
+        if not bool(success.all()):
+            raise self._recoverable_overflow()
         queue.publish_family_tail(
             torch.ones(1, dtype=torch.bool, device=state.device)
+        )
+
+    def _recoverable_overflow(self) -> RecoverableOverflow:
+        failure = self.owners.failure_state.snapshot(0)
+        if failure is None or failure.failure_code != "capacity_overflow":
+            raise PokerIterationError(
+                "rollout failed without a recoverable capacity record"
+            )
+        candidates = [
+            slab
+            for slab in self.owners.live_slabs
+            if slab.capacity - slab.tail(0) == failure.available_extent
+            and slab.schema.name.split(".", 1)[0]
+            in {"FamilyWork", "SigmaHead", "ActionHead", "Leaf"}
+            and (
+                slab.schema.name == "Leaf"
+                or slab.schema.name.endswith(f".{failure.input_type}")
+            )
+        ]
+        if not candidates:
+            candidates = [
+                slab
+                for slab in self.owners.live_slabs
+                if slab.capacity - slab.tail(0) == failure.available_extent
+            ]
+        if candidates:
+            slab = min(candidates, key=lambda value: value.capacity)
+            capacity = slab.capacity
+            observed = slab.tail(0) + failure.requested_extent
+        else:
+            capacity = failure.available_extent
+            observed = failure.requested_extent
+        return RecoverableOverflow(
+            failure,
+            capacity=capacity,
+            observed_demand=observed,
         )
 
     def _model(
@@ -371,7 +504,18 @@ class SequentialSampledPokerIteration:
         scheduler = FamilyScheduler(
             input_names, owners.plan.manifest.family_pack_cap
         )
-        recorder = _TopologyRecorder(input_names)
+        recorder = _TopologyRecorder(
+            input_names,
+            pack_cap=owners.plan.manifest.family_pack_cap,
+            topology_cap=owners.plan.manifest.topology_cap,
+            device=owners.plan.device,
+        )
+        depths = {name: 0 for name in input_names}
+        depths["pre"] = (
+            owners.plan.manifest.root_count
+            if self.run_state is None
+            else self.run_state.root_count
+        )
         logical_time = 0
         last_event: torch.cuda.Event | None = None
         while True:
@@ -380,8 +524,8 @@ class SequentialSampledPokerIteration:
                     0,
                     name,
                     index,
-                    int(queue.head[0]),
-                    int(queue.ready_tail[0]),
+                    0,
+                    depths[name],
                     logical_time,
                     0,
                     self.mode,
@@ -397,32 +541,19 @@ class SequentialSampledPokerIteration:
                 self._model,
                 hooks,
             )
-            commit.event.synchronize()
-            if bool(commit.failed.any()):
-                failure = owners.failure_state.snapshot(0)
-                if failure is None or failure.failure_code != "capacity_overflow":
-                    raise PokerIterationError(
-                        "rollout failed without a recoverable capacity record"
-                    )
-                matching_capacities = [
-                    slab.capacity
-                    for slab in owners.live_slabs
-                    if slab.capacity - slab.tail(0) == failure.available_extent
-                ]
-                capacity = (
-                    min(matching_capacities)
-                    if matching_capacities
-                    else failure.available_extent
-                )
-                raise RecoverableOverflow(
-                    failure,
-                    capacity=capacity,
-                    observed_demand=failure.requested_extent,
-                )
             if hooks.last_trace is None:
                 raise PokerIterationError("poker transition omitted its trace")
-            recorder.append(hooks.last_trace)
+            failed, produced = recorder.append(
+                hooks.last_trace,
+                failed=commit.failed,
+                ready=commit.event,
+            )
             hooks.last_trace = None
+            if failed:
+                raise self._recoverable_overflow()
+            depths[scheduled.input_type] -= scheduled.rows
+            for name, count in zip(input_names, produced, strict=True):
+                depths[name] += count
             last_event = commit.event
             logical_time += 1
             if logical_time > (
@@ -443,6 +574,7 @@ class SequentialSampledPokerIteration:
             manifest=owners.plan.manifest,
         )
         owners.release_after(ExecutionPhase.ROLLOUT)
+        del hooks, transaction, topology_publisher, registry, queues
 
         owners.enter_phase(ExecutionPhase.QUEUE_DRAIN)
         owners.release_after(ExecutionPhase.QUEUE_DRAIN)
@@ -462,9 +594,10 @@ class SequentialSampledPokerIteration:
             n_replica=1,
             pack_cap=owners.plan.manifest.completion_pack_cap,
         )
-        while int(completion.depth[0]):
+        remaining_leaves = recorder.leaves
+        while remaining_leaves:
             rows = min(
-                int(completion.depth[0]),
+                remaining_leaves,
                 owners.plan.manifest.completion_pack_cap,
             )
             success = completion.complete(
@@ -474,6 +607,7 @@ class SequentialSampledPokerIteration:
                 wait_for=last_event,
             )
             torch._assert_async(success.all(), "poker completion failed")
+            remaining_leaves -= rows
         completion.release()
         work = owners.slab("LayerWork", "all")
         missing = plan.arena_rows[0][0] - work.tail(0)
@@ -556,8 +690,101 @@ class SequentialSampledPokerIteration:
         )
 
 
+def _discard_rollout_attempt(owners: GeneratedOwners) -> None:
+    """Reset and close an unpublished failed attempt before replacement."""
+
+    owners.abort_failed_lane(0)
+    owners.release_after(ExecutionPhase.ROLLOUT)
+    for phase in (
+        ExecutionPhase.QUEUE_DRAIN,
+        ExecutionPhase.COMPLETION,
+        ExecutionPhase.ALIGN_AND_SEAL,
+        ExecutionPhase.TARGETS,
+        ExecutionPhase.LEARNER,
+        ExecutionPhase.FINAL_BACKWARD,
+    ):
+        owners.enter_phase(phase)
+        owners.release_after(phase)
+    owners.close()
+
+
+class RecoveringSequentialSampledPokerIteration:
+    """Own attempt allocation and automatic lower-root disjoint retries."""
+
+    def __init__(
+        self,
+        *,
+        owner_factory: Callable[[], GeneratedOwners],
+        minimum_root_count: int,
+        geometry: NLHEGeometry,
+        mode: ModeSchema,
+        model: nn.Module,
+        model_operation: ModelOperation,
+        optimizer: DenseAdam,
+        loss: LossConfig,
+        schedule: LearnerSchedule,
+        generator: torch.Generator,
+        seed: int,
+        lambda_: float,
+        run_state: RunState,
+        reference_operation: ModelOperation | None = None,
+    ) -> None:
+        self.owner_factory = owner_factory
+        self.minimum_root_count = int(minimum_root_count)
+        self.arguments = {
+            "geometry": geometry,
+            "mode": mode,
+            "model": model,
+            "model_operation": model_operation,
+            "optimizer": optimizer,
+            "loss": loss,
+            "schedule": schedule,
+            "generator": generator,
+            "seed": seed,
+            "lambda_": lambda_,
+            "run_state": run_state,
+            "reference_operation": reference_operation,
+        }
+        self.run_state = run_state
+
+    def run(self, *, iteration: int) -> PokerIterationResult:
+        active: list[GeneratedOwners] = []
+        controller = SequentialOverflowRecovery[PokerIterationResult](
+            iteration=iteration,
+            replica=0,
+            root_count=self.run_state.root_count,
+            minimum_root_count=self.minimum_root_count,
+            run_state=self.run_state,
+        )
+
+        def attempt(
+            root_count: int, address: AttemptAddress
+        ) -> PokerIterationResult:
+            if (
+                self.run_state.root_count != root_count
+                or self.run_state.retry_epoch != address.retry_epoch
+                or self.run_state.attempt_logical_base != address.logical_base
+            ):
+                raise PokerIterationError(
+                    "overflow controller and run state addresses diverged"
+                )
+            owners = self.owner_factory()
+            active[:] = [owners]
+            return SequentialSampledPokerIteration(
+                owners=owners, **self.arguments
+            ).run(iteration=iteration)
+
+        def discard(_failure: RecoverableOverflow) -> None:
+            if len(active) != 1:
+                raise PokerIterationError("failed attempt owner is unavailable")
+            _discard_rollout_attempt(active.pop())
+
+        return controller.run(attempt, discard)
+
+
 __all__ = [
     "PokerIterationError",
     "PokerIterationResult",
+    "RecoveringSequentialSampledPokerIteration",
     "SequentialSampledPokerIteration",
 ]
