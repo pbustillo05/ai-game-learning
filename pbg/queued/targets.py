@@ -35,6 +35,7 @@ from pbg.queued.topology import LayerPlan
 
 
 RB_GEMM_LIBRARY_WORKSPACE_BYTES = 8 << 20
+CUDA_LIBRARY_ALLOCATION_ALIGNMENT = 64 << 10
 
 
 class TargetError(RuntimeError):
@@ -66,9 +67,14 @@ def rb_conversion_library_workspace_bytes(
 ) -> int:
     """Resident reduction mask plus the versioned cuBLAS workspace bound."""
 
-    return (
+    raw = (
         rb_conversion_mask_bytes(source_width, destination_width)
         + RB_GEMM_LIBRARY_WORKSPACE_BYTES
+    )
+    return (
+        (raw + CUDA_LIBRARY_ALLOCATION_ALIGNMENT - 1)
+        // CUDA_LIBRARY_ALLOCATION_ALIGNMENT
+        * CUDA_LIBRARY_ALLOCATION_ALIGNMENT
     )
 
 

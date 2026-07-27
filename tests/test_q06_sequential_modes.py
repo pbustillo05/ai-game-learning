@@ -473,7 +473,7 @@ def test_max_geometry_workspace_bounds_are_explicit() -> None:
     assert rb_conversion_mask_bytes(1326, 169) == 896_376
     assert (
         rb_conversion_library_workspace_bytes(1326, 169)
-        == 9_284_984
+        == 9_306_112
     )
 
 
