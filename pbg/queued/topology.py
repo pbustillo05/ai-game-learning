@@ -142,6 +142,7 @@ class Topology:
         path_length = self.path_length.tolist()
 
         incoming = [0] * n
+        edge_owner = [-1] * e
         for node in range(n):
             if parent[node] < -1 or parent[node] >= n or parent[node] == node:
                 raise TopologyError("parent address is outside the structural forest")
@@ -182,6 +183,9 @@ class Topology:
                 raise TopologyError("headless ordinary unary row was not compressed")
 
             for edge in range(begin[node], begin[node] + degree[node]):
+                if edge_owner[edge] != -1:
+                    raise TopologyError("topology child spans overlap")
+                edge_owner[edge] = node
                 if path_length[edge] < 1:
                     raise TopologyError("compressed path length must be positive")
                 kind = target_kind[edge]
@@ -201,6 +205,8 @@ class Topology:
                     raise TopologyError("unknown topology target kind")
                 if child_output[edge] < 0:
                     raise TopologyError("every child endpoint needs an output domain")
+        if any(owner < 0 for owner in edge_owner):
+            raise TopologyError("topology child spans leave orphan edges")
 
         for node, count in enumerate(incoming):
             if parent[node] == -1:
@@ -445,7 +451,6 @@ class LayerPlan:
     """Exact CPU movement and reverse-layer execution plan."""
 
     layer_ptr: Tensor
-    carry_ptr: Tensor
     replica: Tensor
     child_begin: Tensor
     child_count: Tensor
@@ -462,10 +467,6 @@ class LayerPlan:
     child_source_output_type: Tensor
     child_path_length: Tensor
     child_cost_multiplier: Tensor
-    carry_replica: Tensor
-    carry_source_work_row: Tensor
-    carry_destination_work_row: Tensor
-    carry_output_type: Tensor
     movement_replica: Tensor
     movement_source_leaf_row: Tensor
     movement_destination_work_row: Tensor
@@ -473,6 +474,7 @@ class LayerPlan:
     arena_rows: tuple[tuple[int, ...], ...]
     sigma_rows: tuple[tuple[int, ...], ...]
     action_rows: tuple[tuple[int, ...], ...]
+    leaf_rows: tuple[int, ...]
     input_names: tuple[str, ...]
     output_names: tuple[str, ...]
     output_widths: tuple[int, ...]
@@ -480,6 +482,8 @@ class LayerPlan:
     rb_first_source_components: int
     rb_owner_source_components: int
     rb_written_components: int
+    target_edge_count: int
+    movement_index_bytes: int
     branched: bool
 
     @property
@@ -495,23 +499,13 @@ class LayerPlan:
         return int(self.child_source_work_row.numel())
 
     @property
-    def carry_count(self) -> int:
-        return int(self.carry_replica.numel())
-
-    @property
     def movement_count(self) -> int:
         return int(self.movement_replica.numel())
-
-    @property
-    def carry_bytes(self) -> int:
-        # Last-consumer slot planning leaves the legacy carry schema empty.
-        return self.carry_count * 4 * 4
 
     @property
     def nbytes(self) -> int:
         tensors = (
             self.layer_ptr,
-            self.carry_ptr,
             self.replica,
             self.child_begin,
             self.child_count,
@@ -528,10 +522,6 @@ class LayerPlan:
             self.child_source_output_type,
             self.child_path_length,
             self.child_cost_multiplier,
-            self.carry_replica,
-            self.carry_source_work_row,
-            self.carry_destination_work_row,
-            self.carry_output_type,
             self.movement_replica,
             self.movement_source_leaf_row,
             self.movement_destination_work_row,
@@ -580,19 +570,6 @@ class LayerPlan:
             or any(left > right for left, right in zip(layer_ptr, layer_ptr[1:]))
         ):
             raise TopologyError("LayerPlan layer pointers are invalid")
-        carry_fields = (
-            self.carry_replica,
-            self.carry_source_work_row,
-            self.carry_destination_work_row,
-            self.carry_output_type,
-        )
-        if self.carry_count or any(value.numel() for value in carry_fields):
-            raise TopologyError("physical carry rows are not supported")
-        _cpu_vector(
-            "carry_ptr", self.carry_ptr, self.layer_count + 1, torch.int32
-        )
-        if bool((self.carry_ptr != 0).any()):
-            raise TopologyError("last-consumer plans require empty carry pointers")
         movement_fields = (
             "movement_replica",
             "movement_source_leaf_row",
@@ -629,6 +606,10 @@ class LayerPlan:
             raise TopologyError("LayerPlan arena replica axis is invalid")
         if len(self.sigma_rows) != n_replica or len(self.action_rows) != n_replica:
             raise TopologyError("LayerPlan target replica axis is invalid")
+        if len(self.leaf_rows) != n_replica:
+            raise TopologyError("LayerPlan leaf replica axis is invalid")
+        if any(not 0 <= rows <= manifest.leaf_cap for rows in self.leaf_rows):
+            raise TopologyError("LayerPlan leaf extent is out of bounds")
         if any(len(rows) != output_count for rows in self.arena_rows):
             raise TopologyError("LayerPlan arena partition axis is invalid")
         if any(len(rows) != input_count for rows in self.sigma_rows):
@@ -679,6 +660,10 @@ class LayerPlan:
                 or begin + count > self.edge_count
                 or not 1 <= target_count <= count <= manifest.beta_max
                 or nominal < 1
+                or (
+                    not self.branched
+                    and (count != 1 or target_count != 1 or nominal != 1)
+                )
             ):
                 raise TopologyError("LayerPlan child span is out of bounds")
             for edge in range(begin, begin + count):
@@ -767,7 +752,12 @@ class LayerPlan:
             or self.rb_written_components != written_components
         ):
             raise TopologyError("LayerPlan traffic summary is inconsistent")
+        if self.target_edge_count != sum(
+            int(value) for value in self.target_degree
+        ):
+            raise TopologyError("LayerPlan target-edge summary is inconsistent")
         movement_destinations: set[tuple[int, int, int]] = set()
+        group_counts: dict[tuple[int, int], int] = {}
         for movement in range(self.movement_count):
             lane = int(self.movement_replica[movement])
             output = int(self.movement_output_type[movement])
@@ -784,6 +774,18 @@ class LayerPlan:
             if key in movement_destinations:
                 raise TopologyError("LayerPlan movement destinations overlap")
             movement_destinations.add(key)
+            group = (lane, output)
+            expected_destination = group_counts.get(group, 0)
+            if destination != expected_destination:
+                raise TopologyError("LayerPlan movement destinations are not dense")
+            group_counts[group] = expected_destination + 1
+            if source >= self.leaf_rows[lane]:
+                raise TopologyError("LayerPlan movement exceeds sealed leaf rows")
+        expected_index_bytes = max(group_counts.values(), default=0) * 8
+        if self.movement_index_bytes != expected_index_bytes:
+            raise TopologyError("LayerPlan movement scratch summary is inconsistent")
+        if self.movement_index_bytes > manifest.movement_scratch_bytes:
+            raise TopologyError("LayerPlan movement indices exceed admitted scratch")
         for lane in range(n_replica):
             for input_type, name in enumerate(self.input_names):
                 if self.sigma_rows[lane][input_type] > trained_caps[name]:
@@ -837,9 +839,11 @@ def build_layer_plan(
     if mode.rollout_mode is RolloutMode.SEQUENTIAL and any(
         int(value) != 1
         for topology in topologies
-        for value in topology.executed_degree
+        for value in (*topology.executed_degree, *topology.nominal_degree)
     ):
-        raise TopologyError("sequential topology requires N=1 at every row")
+        raise TopologyError(
+            "sequential topology requires N=N_tilde=1 at every row"
+        )
     compacted = [
         topology.compact(binding, p_train=p_train)
         for topology, binding in zip(topologies, bindings, strict=True)
@@ -947,7 +951,6 @@ def build_layer_plan(
     node_records: list[tuple[int, ...]] = []
     child_records: list[tuple[int, int, int, float]] = []
     layer_ptr = [0]
-    carry_ptr = [0]
 
     for layer in range(layer_count):
         selected: list[tuple[int, int, int, int]] = []
@@ -1063,7 +1066,6 @@ def build_layer_plan(
                     next_slot[lane][output][1],
                 )
         layer_ptr.append(len(node_records))
-        carry_ptr.append(0)
 
     def i32_column(records: Sequence[tuple], index: int) -> Tensor:
         return torch.tensor(
@@ -1080,6 +1082,12 @@ def build_layer_plan(
         [0] * (input_count if not mode.rollout_mode.is_branched else output_count)
         for _ in compacted
     ]
+    leaf_rows = [0] * len(compacted)
+    movement_group_counts: dict[tuple[int, int], int] = {}
+    for lane, leaf, _, output in movement:
+        leaf_rows[lane] = max(leaf_rows[lane], leaf + 1)
+        key = (lane, output)
+        movement_group_counts[key] = movement_group_counts.get(key, 0) + 1
     sigma_seen: dict[tuple[int, int], set[int]] = {}
     action_seen: dict[tuple[int, int], set[int]] = {}
     for record in node_records:
@@ -1128,7 +1136,6 @@ def build_layer_plan(
 
     plan = LayerPlan(
         layer_ptr=torch.tensor(layer_ptr, dtype=torch.int32),
-        carry_ptr=torch.tensor(carry_ptr, dtype=torch.int32),
         replica=i32_column(node_records, 0),
         child_begin=i32_column(node_records, 1),
         child_count=i32_column(node_records, 2),
@@ -1145,10 +1152,6 @@ def build_layer_plan(
         child_source_output_type=i32_column(child_records, 1),
         child_path_length=i32_column(child_records, 2),
         child_cost_multiplier=f32_column(child_records, 3),
-        carry_replica=torch.empty(0, dtype=torch.int32),
-        carry_source_work_row=torch.empty(0, dtype=torch.int32),
-        carry_destination_work_row=torch.empty(0, dtype=torch.int32),
-        carry_output_type=torch.empty(0, dtype=torch.int32),
         movement_replica=i32_column(movement, 0),
         movement_source_leaf_row=i32_column(movement, 1),
         movement_destination_work_row=i32_column(movement, 2),
@@ -1156,6 +1159,7 @@ def build_layer_plan(
         arena_rows=tuple(tuple(values) for values in arena_max),
         sigma_rows=tuple(tuple(values) for values in sigma_rows),
         action_rows=tuple(tuple(values) for values in action_rows),
+        leaf_rows=tuple(leaf_rows),
         input_names=input_names,
         output_names=output_names,
         output_widths=output_widths,
@@ -1163,6 +1167,8 @@ def build_layer_plan(
         rb_first_source_components=rb_first_source_components,
         rb_owner_source_components=rb_owner_source_components,
         rb_written_components=rb_written_components,
+        target_edge_count=sum(int(record[8]) for record in node_records),
+        movement_index_bytes=max(movement_group_counts.values(), default=0) * 8,
         branched=mode.rollout_mode.is_branched,
     )
     if manifest is not None:

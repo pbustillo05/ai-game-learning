@@ -19,6 +19,7 @@ from pbg.queued import (
     GameGeometry,
     GeneratedOwners,
     HardwareLimits,
+    LayerPlan,
     LayeredTargetExecutor,
     NamedShape,
     Partition,
@@ -363,7 +364,7 @@ def test_layer_plan_handles_duplicates_unbalanced_last_consumers_and_dense_rows(
     assert plan.layer_count == 2
     assert plan.node_count == 2
     assert plan.edge_count == 4
-    assert plan.carry_count == 0
+    assert not hasattr(plan, "carry_count")
     assert plan.sigma_rows == ((2, 0),)
     assert plan.action_rows == ((4,),)
     assert plan.arena_rows[0][0] == 3
@@ -404,6 +405,67 @@ def test_protected_root_prefix_excludes_refill_child_from_targets() -> None:
     assert plan.target_degree.tolist() == [2]
 
 
+@CUDA
+def test_protected_root_prefix_is_numerical_and_ignores_refill_child() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    mode = mode_schema("self_play", "branched.fixed", "sampled")
+    topology = Topology(
+        parent=_i32([-1]),
+        child_begin=_i32([0]),
+        executed_degree=_i32([3]),
+        nominal_degree=_i32([2]),
+        target_degree=_i32([2]),
+        owner=_i32([0]),
+        familywork_row=_i32([0]),
+        sigma_head_row=_i32([0]),
+        action_begin=_i32([0]),
+        label=_i32([1, 2, 3]),
+        path_length=_i32([1, 1, 1]),
+        target_kind=_i32([int(TargetKind.LEAF)] * 3),
+        target_row=_i32([0, 1, 2]),
+    )
+    bindings = TopologyBindings(
+        input_type=_i32([0]),
+        output_type=_i32([0]),
+        sigma_target_row=_i32([0]),
+        child_output_type=_i32([0, 0, 0]),
+    )
+    partitions = _partitions(mode.private_estimator)
+    manifest = _manifest(mode, device)
+    plan = build_layer_plan(
+        mode, partitions, (topology,), (bindings,), p_train=2, manifest=manifest
+    )
+    owners = GeneratedOwners(
+        build_storage_plan(mode, partitions, manifest, _layout(), device)
+    )
+    _enter_through_targets(
+        owners,
+        mode,
+        plan,
+        {
+            (0, "all"): sampled_completion(
+                torch.tensor(
+                    [[2.0, -2.0], [4.0, -4.0], [100.0, -100.0]],
+                    device=device,
+                ),
+                branched=True,
+            )
+        },
+        1,
+    )
+    result = LayeredTargetExecutor(
+        mode, _algebra(mode.private_estimator), lambda_=1.0
+    ).execute(owners, plan)
+    sigma = owners.slab("SigmaTarget", "pre").published(0, "value_target")
+    action = owners.slab("ActionTarget", "all").published(
+        0, "advantage_target"
+    )
+    assert torch.equal(sigma[0], torch.tensor([3.0], device=device))
+    assert action.shape[0] == 2
+    assert result.counters.child_edges_read == 2
+    _close(owners)
+
+
 def test_layer_plan_rejects_unsupported_conversion_and_raw_addresses() -> None:
     mode = mode_schema("self_play", "sequential", "rao_blackwell")
     topology, bindings = _topology(mode)
@@ -421,6 +483,182 @@ def test_layer_plan_rejects_unsupported_conversion_and_raw_addresses() -> None:
             (unsupported,),
             p_train=2,
         )
+
+
+def test_topology_rejects_overlapping_or_orphan_child_spans() -> None:
+    mode = mode_schema("self_play", "branched.fixed", "sampled")
+    topology = Topology(
+        parent=_i32([-1, -1]),
+        child_begin=_i32([0, 0]),
+        executed_degree=_i32([1, 1]),
+        nominal_degree=_i32([1, 1]),
+        target_degree=_i32([1, 1]),
+        owner=_i32([0, 0]),
+        familywork_row=_i32([0, 1]),
+        sigma_head_row=_i32([0, 1]),
+        action_begin=_i32([0, 1]),
+        label=_i32([1, 2]),
+        path_length=_i32([1, 1]),
+        target_kind=_i32([int(TargetKind.LEAF), int(TargetKind.LEAF)]),
+        target_row=_i32([0, 1]),
+    )
+    bindings = TopologyBindings(
+        input_type=_i32([0, 0]),
+        output_type=_i32([0, 0]),
+        sigma_target_row=_i32([0, 1]),
+        child_output_type=_i32([0, 0]),
+    )
+    with pytest.raises(TopologyError, match="overlap"):
+        build_layer_plan(
+            mode,
+            _partitions(mode.private_estimator),
+            (topology,),
+            (bindings,),
+            p_train=2,
+        )
+    orphaned = replace(
+        topology,
+        child_begin=_i32([0, 1]),
+        label=_i32([1, 2, 3]),
+        path_length=_i32([1, 1, 1]),
+        target_kind=_i32([int(TargetKind.LEAF)] * 3),
+        target_row=_i32([0, 1, 2]),
+    )
+    orphan_bindings = replace(
+        bindings, child_output_type=_i32([0, 0, 0])
+    )
+    with pytest.raises(TopologyError, match="orphan"):
+        orphaned.validate(orphan_bindings, p_train=2)
+
+
+def test_sequential_rejects_nonunit_nominal_degree() -> None:
+    mode = mode_schema("self_play", "sequential", "sampled")
+    topology, bindings = _topology(mode)
+    with pytest.raises(TopologyError, match="N=N_tilde=1"):
+        build_layer_plan(
+            mode,
+            _partitions(mode.private_estimator),
+            (replace(topology, nominal_degree=_i32([2])),),
+            (bindings,),
+            p_train=2,
+        )
+
+
+def test_sampled_completion_rejects_cpu_state() -> None:
+    with pytest.raises(TargetError, match="CUDA FP32"):
+        sampled_completion(torch.ones((1, 2)), branched=False)
+
+
+@CUDA
+def test_completion_payload_contract_rejects_broadcast_before_reservation() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    mode = mode_schema("self_play", "sequential", "sampled")
+    topology, bindings = _topology(mode)
+    partitions = _partitions(mode.private_estimator)
+    manifest = _manifest(mode, device)
+    plan = build_layer_plan(
+        mode, partitions, (topology,), (bindings,), p_train=2, manifest=manifest
+    )
+    owners = GeneratedOwners(
+        build_storage_plan(mode, partitions, manifest, _layout(), device)
+    )
+    invalid = SampledLeafWork(torch.ones((1, 1, 1), device=device))
+    with pytest.raises(TargetError, match="closed|must be contiguous"):
+        _enter_through_targets(
+            owners, mode, plan, {(0, "all"): invalid}, 1
+        )
+    assert owners.slab("LayerWork", "all").tail(0) == 0
+    initialize_work_arenas(
+        owners,
+        plan,
+        {
+            (0, "all"): sampled_completion(
+                torch.ones((1, 2), device=device), branched=False
+            )
+        },
+    )
+    owners.release_after(ExecutionPhase.COMPLETION)
+    owners.enter_phase(ExecutionPhase.ALIGN_AND_SEAL)
+    owners.release_after(ExecutionPhase.ALIGN_AND_SEAL)
+    owners.enter_phase(ExecutionPhase.TARGETS)
+    _close(owners)
+
+
+@CUDA
+def test_negative_post_mass_cannot_cancel_before_h_to_k_validation() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    mode = mode_schema("self_play", "sequential", "rao_blackwell")
+    topology, bindings = _topology(mode)
+    bindings = replace(bindings, child_output_type=_i32([1]))
+    partitions = _partitions(mode.private_estimator)
+    manifest = _manifest(mode, device)
+    plan = build_layer_plan(
+        mode, partitions, (topology,), (bindings,), p_train=2, manifest=manifest
+    )
+    owners = GeneratedOwners(
+        build_storage_plan(mode, partitions, manifest, _layout(), device)
+    )
+    mass = torch.tensor(
+        [[[-1.0, 2.0, 0.0, 0.0], [-1.0, 2.0, 0.0, 0.0]]],
+        device=device,
+    )
+    invalid = RBLeafWork(mass, torch.zeros_like(mass))
+    with pytest.raises(TargetError, match="mass/moment"):
+        _enter_through_targets(
+            owners, mode, plan, {(0, "post"): invalid}, 1
+        )
+    assert owners.slab("LayerWork", "post").tail(0) == 0
+    valid_mass = mass.abs()
+    initialize_work_arenas(
+        owners,
+        plan,
+        {(0, "post"): RBLeafWork(valid_mass, torch.zeros_like(mass))},
+    )
+    owners.release_after(ExecutionPhase.COMPLETION)
+    owners.enter_phase(ExecutionPhase.ALIGN_AND_SEAL)
+    owners.release_after(ExecutionPhase.ALIGN_AND_SEAL)
+    owners.enter_phase(ExecutionPhase.TARGETS)
+    _close(owners)
+
+
+@CUDA
+def test_configured_maximum_sequential_depth_is_admitted() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    mode = mode_schema("self_play", "sequential", "sampled")
+    nodes = 8
+    topology = Topology(
+        parent=_i32([-1, *range(nodes - 1)]),
+        child_begin=_i32(range(nodes)),
+        executed_degree=_i32([1] * nodes),
+        nominal_degree=_i32([1] * nodes),
+        target_degree=_i32([1] * nodes),
+        owner=_i32([0] * nodes),
+        familywork_row=_i32(range(nodes)),
+        sigma_head_row=_i32(range(nodes)),
+        action_begin=_i32(range(nodes)),
+        label=_i32(range(nodes)),
+        path_length=_i32([1] * nodes),
+        target_kind=_i32(
+            [int(TargetKind.TOPOLOGY)] * (nodes - 1)
+            + [int(TargetKind.LEAF)]
+        ),
+        target_row=_i32([*range(1, nodes), 0]),
+    )
+    bindings = TopologyBindings(
+        input_type=_i32([0] * nodes),
+        output_type=_i32([0] * nodes),
+        sigma_target_row=_i32(range(nodes)),
+        child_output_type=_i32([0] * nodes),
+    )
+    plan = build_layer_plan(
+        mode,
+        _partitions(mode.private_estimator),
+        (topology,),
+        (bindings,),
+        p_train=2,
+        manifest=_manifest(mode, device),
+    )
+    assert plan.layer_count == nodes
 
 
 @CUDA
@@ -479,12 +717,8 @@ def test_rb_validates_every_work_channel(
     owners = GeneratedOwners(
         build_storage_plan(mode, partitions, manifest, _layout(), device)
     )
-    mass = torch.tensor(
-        [[[1.0, 1.0], [bad_mass, 1.0]]], device=device
-    )
-    moment = torch.tensor(
-        [[[2.0, 2.0], [bad_moment, 2.0]]], device=device
-    )
+    mass = torch.ones((1, 2, 2), device=device)
+    moment = torch.full((1, 2, 2), 2.0, device=device)
     _enter_through_targets(
         owners,
         mode,
@@ -492,6 +726,9 @@ def test_rb_validates_every_work_channel(
         {(0, "pre"): RBLeafWork(mass, moment)},
         1,
     )
+    work = owners.slab("LayerWork", "pre")
+    work.columns["mass"][0, 0, 0, 1, 0] = bad_mass
+    work.columns["moment"][0, 0, 0, 1, 0] = bad_moment
     result = LayeredTargetExecutor(
         mode, _algebra(mode.private_estimator), lambda_=0.5
     ).execute(owners, plan)
@@ -988,12 +1225,15 @@ def test_failure_is_isolated_across_replica_axis() -> None:
                 torch.tensor([[3.0, -3.0]], device=device), branched=False
             ),
             (1, "all"): sampled_completion(
-                torch.tensor([[float("nan"), 1.0]], device=device),
+                torch.tensor([[1.0, 1.0]], device=device),
                 branched=False,
             ),
         },
         1,
     )
+    owners.slab("LayerWork", "all").columns["return_value"][
+        1, 0, 0, 0, 0
+    ] = float("nan")
     result = LayeredTargetExecutor(
         mode, _algebra(mode.private_estimator), lambda_=0.5
     ).execute(owners, plan)
@@ -1042,9 +1282,7 @@ def test_failure_keeps_targets_unpublished_and_records_lane() -> None:
     owners = GeneratedOwners(
         build_storage_plan(mode, partitions, manifest, _layout(), device)
     )
-    payoff = torch.tensor(
-        [[float("nan"), 1.0]], dtype=torch.float32, device=device
-    )
+    payoff = torch.tensor([[1.0, 1.0]], dtype=torch.float32, device=device)
     _enter_through_targets(
         owners,
         mode,
@@ -1052,6 +1290,9 @@ def test_failure_keeps_targets_unpublished_and_records_lane() -> None:
         {(0, "all"): sampled_completion(payoff, branched=False)},
         1,
     )
+    owners.slab("LayerWork", "all").columns["return_value"][
+        0, 0, 0, 0, 0
+    ] = float("nan")
     result = LayeredTargetExecutor(
         mode, _algebra(mode.private_estimator), lambda_=0.5
     ).execute(owners, plan)
@@ -1083,6 +1324,7 @@ def test_executor_has_no_python_node_or_action_loop_or_interlayer_sync() -> None
     device_plan_source = inspect.getsource(DeviceLayerPlan)
     assert "LayerPlanCarry" not in device_plan_source
     assert "carry_ptr" not in device_plan_source
+    assert "carry" not in inspect.getsource(LayerPlan).lower()
 
 
 def test_queued_firewall_remains_closed() -> None:
