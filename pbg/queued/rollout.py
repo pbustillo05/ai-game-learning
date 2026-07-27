@@ -1363,11 +1363,6 @@ class AsyncTopologyPublisher:
                     )
             else:
                 raise TopologyError("unknown topology endpoint kind")
-        torch._assert_async(
-            (patch.target_ordinal >= 0).all(),
-            "endpoint ordinal must be nonnegative",
-        )
-
     def resolve_rows(
         self,
         publication: TopologyPublication,
@@ -1394,8 +1389,11 @@ class AsyncTopologyPublisher:
                     (
                         ~selected
                         | (
-                            patch.target_ordinal
-                            < request.counts[publication.lane]
+                            (patch.target_ordinal >= 0)
+                            & (
+                                patch.target_ordinal
+                                < request.counts[publication.lane]
+                            )
                         )
                     ).all(),
                     "endpoint ordinal exceeds its realized reservation",
@@ -1836,6 +1834,10 @@ class RolloutTransaction:
                     torch._assert_async(
                         publication.draft.device_valid.all(),
                         "device topology validation failed before commit",
+                    )
+                    torch._assert_async(
+                        (publication.patch.target_ordinal >= 0).all(),
+                        "endpoint ordinal must be nonnegative",
                     )
                 for publication in plan.topology:
                     self.topology.stage(publication)
