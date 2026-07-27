@@ -18,6 +18,15 @@ exact byte reports, and last-consumer release. The corresponding old-definition
 rows remain open until their legacy callers and definitions are deleted at
 cutover; isolated replacement does not weaken that closure rule.
 
+Phase 3 replacement evidence passed against candidate
+`ec9ef6f725a8f986c4b2910b348b1c2a09b804ea`: compact CPU topology and
+packets, one immutable exact movement/layer plan, two last-consumer work
+arenas, one schema-generated compiled CUDA layer executor, sampled and RB
+carriers, deterministic post-to-pre conversion, branched trace/cost/delta,
+headless structural rows, and atomic target publication. Physical carries and
+total-minus-child are deleted. Legacy topology and target definitions remain
+open until their callers and owners are deleted at cutover.
+
 Disposition meanings:
 
 - `move`: representation-independent behavior relocates once to its final
@@ -158,3 +167,19 @@ read-only audit found no parallel queued allocator, capacity authority, failure
 owner, compatibility path, forbidden import, paging, recycling, growth, or
 wraparound. See `queued_phase2_report_20260726.md` and
 `../queued/storage_and_lifetimes.md`.
+
+Phase 3 candidate `ec9ef6f725a8f986c4b2910b348b1c2a09b804ea`
+passed 45 focused CUDA tests, 70 cumulative queued tests, 66 legacy
+topology/target/memory regressions, and four targeted static gates on
+explicitly selected GPU 1. Evidence covers all twelve mode rows, one kernel per
+layer without interlayer synchronization, exact topology/child/leaf/target
+bijections and sequential row identity, maximum degree/depth, deterministic
+H-to-K, sampled/RB/trace/cost/delta recurrences, exact memory and traffic,
+schema/bounds/failure injection, and replica-local atomic publication. Matched
+comparisons selected direct sibling summation for correctness and
+last-consumer retention for time and memory; both losing implementations and
+all carry surfaces are absent. The independent read-only audit found one
+topology owner, one plan, one target executor, closed completion and conversion
+contracts, and no parallel path or forbidden import. See
+`queued_phase3_report_20260726.md` and
+`../queued/topology_and_targets.md`.
