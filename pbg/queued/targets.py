@@ -34,6 +34,9 @@ from pbg.queued.storage import (
 from pbg.queued.topology import LayerPlan
 
 
+RB_GEMM_LIBRARY_WORKSPACE_BYTES = 8 << 20
+
+
 class TargetError(RuntimeError):
     """Layered target planning or execution failed."""
 
@@ -46,6 +49,27 @@ def rb_conversion_workspace_row_bytes(
     if source_width <= 0 or destination_width <= 0:
         raise ValueError("RB conversion widths must be positive")
     return 4 * (3 * source_width + 2 * destination_width)
+
+
+def rb_conversion_mask_bytes(
+    source_width: int, destination_width: int
+) -> int:
+    """Resident CUDA bytes for the deterministic class-reduction matrix."""
+
+    if source_width <= 0 or destination_width <= 0:
+        raise ValueError("RB conversion widths must be positive")
+    return 4 * source_width * destination_width
+
+
+def rb_conversion_library_workspace_bytes(
+    source_width: int, destination_width: int
+) -> int:
+    """Resident reduction mask plus the versioned cuBLAS workspace bound."""
+
+    return (
+        rb_conversion_mask_bytes(source_width, destination_width)
+        + RB_GEMM_LIBRARY_WORKSPACE_BYTES
+    )
 
 
 def _lambda(value: float) -> float:
@@ -203,6 +227,7 @@ def rb_completion(
     algebra: TargetAlgebra,
     source_output: str,
     destination_output: str | None = None,
+    device_algebra: _DeviceAlgebra | None = None,
 ) -> RBLeafWork:
     """Create mass/moment work, converting before conditionalization."""
 
@@ -227,7 +252,8 @@ def rb_completion(
         if destination_output is None
         else algebra.output_names.index(destination_output)
     )
-    device_algebra = algebra.device(p_hat.device)
+    if device_algebra is None:
+        device_algebra = algebra.device(p_hat.device)
     mass = device_algebra.convert(p_hat, source, destination)
     moment = device_algebra.convert(p_hat * v_hat, source, destination)
     trace = (p_hat * v_hat).sum(-1) if branched else None

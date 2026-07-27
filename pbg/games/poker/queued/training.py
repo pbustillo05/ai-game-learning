@@ -28,6 +28,7 @@ from pbg.games.poker.queued.response import (
     PairedProbeStatistics,
     SequentialSharedResponseEvaluator,
     paired_probe_statistics,
+    probe_evaluation_design,
 )
 from pbg.queued.capacity import (
     ExecutionPhase,
@@ -148,23 +149,26 @@ class SequentialPokerIteration:
             raise ValueError(
                 "family model-input layout omits retained folded statistics"
             )
-        if geometry.players > 2:
-            from pbg.games.poker.queued.folded import (
-                folded_statistics_workspace_row_bytes,
-            )
+        postflop = getattr(model, "postflop", None)
+        postflop_config = getattr(postflop, "cfg", None)
+        m_raise = int(getattr(postflop_config, "m_raise", 1))
+        from pbg.games.poker.queued.folded import (
+            sequential_family_workspace_row_bytes,
+        )
 
-            required_folded_workspace = (
-                folded_statistics_workspace_row_bytes(geometry)
+        required_family_workspace = sequential_family_workspace_row_bytes(
+            geometry, m_raise
+        )
+        if (
+            owners.plan.layout.family_workspace_row_bytes
+            < required_family_workspace
+        ):
+            raise ValueError(
+                "family workspace is below the concurrent sequential bound"
             )
-            if (
-                owners.plan.layout.family_workspace_row_bytes
-                < required_folded_workspace
-            ):
-                raise ValueError(
-                    "family workspace is below the folded-statistics bound"
-                )
         if mode.private_estimator is PrivateEstimator.RAO_BLACKWELL:
             from pbg.queued.targets import (
+                rb_conversion_library_workspace_bytes,
                 rb_conversion_workspace_row_bytes,
             )
 
@@ -180,6 +184,17 @@ class SequentialPokerIteration:
             ):
                 raise ValueError(
                     "completion workspace is below the H-to-K conversion bound"
+                )
+            required_library_bytes = rb_conversion_library_workspace_bytes(
+                geometry.private_hands,
+                geometry.rank_count**2,
+            )
+            if (
+                owners.plan.manifest.library_workspace_bytes
+                < required_library_bytes
+            ):
+                raise ValueError(
+                    "library workspace omits H-to-K mask/GEMM bounds"
                 )
         if (
             mode.training_regime is TrainingRegime.BEST_RESPONSE
@@ -882,6 +897,7 @@ class SequentialSharedResponseProbe:
     iteration: SequentialPokerIteration
     target_sha256: str
     initial_model_sha256: str
+    initialization: str = "random"
 
     def __post_init__(self) -> None:
         mode = self.iteration.mode
@@ -913,6 +929,8 @@ class SequentialSharedResponseProbe:
             raise ValueError(
                 "probe initial_model_sha256 must be lowercase SHA-256"
             )
+        if self.initialization not in ("random", "target"):
+            raise ValueError("probe initialization must be random or target")
 
     @property
     def mode(self) -> ModeSchema:
@@ -922,8 +940,11 @@ class SequentialSharedResponseProbe:
         return self.iteration.run(iteration=iteration)
 
     def summarize_paired_gain(
-        self, differences: Tensor, seats: Tensor
+        self, differences: Tensor, trajectory_ids: Tensor
     ) -> PairedProbeStatistics:
+        seats = probe_evaluation_design(
+            trajectory_ids, self.iteration.geometry.players
+        )
         return paired_probe_statistics(
             differences, seats, self.iteration.geometry.players
         )
@@ -933,6 +954,7 @@ class SequentialSharedResponseProbe:
             self.iteration.geometry.players,
             self.target_sha256,
             self.initial_model_sha256,
+            self.initialization,
         )
 
 
@@ -1097,9 +1119,12 @@ class Phase5TrainingSession:
             != config.reference.interval_effective_hands
         ):
             raise ValueError("reference cadence differs from the public config")
-        required_model_workspace = 4 * (
-            geometry.direct_model_input_width
-            + geometry.private_hands * (5 + 3 * config.model.m_raise)
+        from pbg.games.poker.queued.folded import (
+            sequential_family_workspace_row_bytes,
+        )
+
+        required_model_workspace = sequential_family_workspace_row_bytes(
+            geometry, config.model.m_raise
         )
         if plan.layout.family_workspace_row_bytes < required_model_workspace:
             raise ValueError(

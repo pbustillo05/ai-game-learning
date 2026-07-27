@@ -47,6 +47,35 @@ def folded_statistics_workspace_row_bytes(geometry: NLHEGeometry) -> int:
     return 4 * fp32_values
 
 
+def sequential_family_workspace_row_bytes(
+    geometry: NLHEGeometry, m_raise: int
+) -> int:
+    """Admit concurrent model outputs, transition state, and folded scratch."""
+
+    if isinstance(m_raise, bool) or not isinstance(m_raise, int) or m_raise <= 0:
+        raise ValueError("raise-mixture count must be positive")
+    hands = geometry.private_hands
+    players = geometry.players
+    model_values = (
+        geometry.direct_model_input_width
+        + hands * (5 + 3 * m_raise)
+    )
+    # Transition retains the resolved/current/next family rows, reach updates,
+    # conflict masks, route descriptors, and per-seat leaf/fold operands while
+    # folded statistics consume the model evaluation.
+    transition_values = (
+        2 * geometry.direct_model_input_width
+        + 8 * players * hands
+        + 4 * hands
+        + 128 * players
+        + 256
+    )
+    return (
+        4 * (model_values + transition_values)
+        + folded_statistics_workspace_row_bytes(geometry)
+    )
+
+
 def _removal_queries(cards: int, device: torch.device) -> tuple[Tensor, Tensor, Tensor]:
     pair = torch.triu_indices(cards, cards, offset=1, device=device)
     rows = 1 + cards + pair.shape[1]
@@ -504,5 +533,6 @@ __all__ = [
     "folded_statistics",
     "folded_statistics_workspace_row_bytes",
     "pack_folded_statistics",
+    "sequential_family_workspace_row_bytes",
     "unpack_folded_statistics",
 ]

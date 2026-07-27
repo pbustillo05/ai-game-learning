@@ -20,6 +20,14 @@ def _mapping(value: object, path: str) -> Mapping[str, object]:
     return value
 
 
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _closed(
     cls: type[T], value: object, path: str, aliases: Mapping[str, str] | None = None
 ) -> T:
@@ -381,9 +389,8 @@ class SequentialModeConfig:
             frozen = dict(
                 _mapping(source.get("frozen_profile"), "root.frozen_profile")
             )
-            if set(frozen) != {"sha256"} or (
-                not isinstance(frozen["sha256"], str)
-                or len(frozen["sha256"]) != 64
+            if set(frozen) != {"sha256"} or not _is_sha256(
+                frozen["sha256"]
             ):
                 raise ValueError(
                     "root.frozen_profile.sha256: content hash is required"
@@ -406,8 +413,7 @@ class SequentialModeConfig:
                     "initial_model_sha256",
                 } or (
                     probe["target_sha256"] != frozen["sha256"]
-                    or not isinstance(probe["initial_model_sha256"], str)
-                    or len(probe["initial_model_sha256"]) != 64
+                    or not _is_sha256(probe["initial_model_sha256"])
                 ):
                     raise ValueError(
                         "root.probe: target and initial model identities are required"

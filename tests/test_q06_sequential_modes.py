@@ -12,6 +12,7 @@ from pbg.games.poker.queued.folded import (
     folded_statistics,
     folded_statistics_workspace_row_bytes,
     pack_folded_statistics,
+    sequential_family_workspace_row_bytes,
 )
 from pbg.games.poker.queued.hooks import (
     FOLD,
@@ -59,6 +60,8 @@ from pbg.queued.learner import (
 from pbg.queued.targets import (
     ConversionMap,
     TargetAlgebra,
+    rb_conversion_library_workspace_bytes,
+    rb_conversion_mask_bytes,
     rb_conversion_workspace_row_bytes,
 )
 from pbg.queued.optimization import DenseAdam, OptimizerConfig
@@ -299,12 +302,34 @@ def test_probe_is_the_ordinary_best_response_rb_schema() -> None:
     assert report.semantics == "shared_seat_approximate_response_v1"
     assert report.target_sha256 == "a" * 64
     assert report.initial_model_sha256 == "c" * 64
+    assert report.initialization == "random"
     assert report.statistics.mean_gain == 1.0
     assert len(observed) == 2
     assert all(
         torch.equal(left, right)
         for left, right in zip(observed[0], observed[1])
     )
+    with pytest.raises(ValueError, match="consecutive"):
+        SequentialSharedResponseEvaluator(
+            3, "a" * 64, "c" * 64
+        ).evaluate(
+            torch.tensor(
+                [0, 9, 18, 3, 12, 21, 6, 15, 24],
+                dtype=torch.int64,
+            ),
+            rollout,
+            rollout,
+        )
+    long_values = torch.arange(45, dtype=torch.float64)
+    long_seats = torch.arange(45, dtype=torch.int64).remainder(3)
+    long_summary = paired_probe_statistics(
+        long_values, long_seats, 3
+    )
+    critical = (
+        long_summary.confidence_interval[1] - long_summary.mean_gain
+    ) / long_summary.standard_error
+    assert critical > 1.96
+    assert critical == pytest.approx(2.0154, abs=1.0e-3)
 
 
 def test_sequential_config_rejects_inapplicable_mode_fields() -> None:
@@ -443,7 +468,13 @@ def test_max_geometry_workspace_bounds_are_explicit() -> None:
     assert geometry.private_hands == 1326
     assert geometry.folded_summary_width == 4402
     assert folded_statistics_workspace_row_bytes(geometry) == 3_691_536
+    assert sequential_family_workspace_row_bytes(geometry, 4) == 4_290_160
     assert rb_conversion_workspace_row_bytes(1326, 169) == 17_264
+    assert rb_conversion_mask_bytes(1326, 169) == 896_376
+    assert (
+        rb_conversion_library_workspace_bytes(1326, 169)
+        == 9_284_984
+    )
 
 
 @CUDA
@@ -451,7 +482,7 @@ def test_full_deck_h_to_k_conversion_is_deterministic_and_bounded() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(6, 128.0, 13)
     classes = _combo_class(geometry)
-    algebra = TargetAlgebra(
+    host_algebra = TargetAlgebra(
         rb_partitions(geometry),
         (
             ConversionMap(
@@ -460,7 +491,7 @@ def test_full_deck_h_to_k_conversion_is_deterministic_and_bounded() -> None:
                 tuple(int(value) for value in classes.tolist()),
             ),
         ),
-    ).device(device)
+    )
     value = torch.arange(
         8 * geometry.private_hands,
         dtype=torch.float32,
@@ -469,13 +500,15 @@ def test_full_deck_h_to_k_conversion_is_deterministic_and_bounded() -> None:
     torch.cuda.synchronize()
     baseline = torch.cuda.memory_allocated(device)
     torch.cuda.reset_peak_memory_stats(device)
+    algebra = host_algebra.device(device)
     first = algebra.convert(value, 1, 0)
     second = algebra.convert(value, 1, 0)
     torch.cuda.synchronize()
     assert torch.equal(first, second)
     assert (
         torch.cuda.max_memory_allocated(device) - baseline
-        < 10_000_000
+        <= rb_conversion_library_workspace_bytes(1326, 169)
+        + 8 * rb_conversion_workspace_row_bytes(1326, 169)
     )
 
 
@@ -1090,18 +1123,30 @@ def test_all_four_sequential_modes_complete_an_optimizer_step(
     geometry = NLHEGeometry(2, 8.0, 4)
     mode = mode_schema(regime, "sequential", estimator)
     rb = estimator == "rao_blackwell"
-    layout = _phase5_layout()
+    layout = replace(
+        _phase5_layout(),
+        family_workspace_row_bytes=sequential_family_workspace_row_bytes(
+            geometry, 1
+        ),
+    )
+    manifest = _phase5_manifest(device)
     if rb:
         layout = replace(
             layout,
             evaluator_private_width=geometry.private_hands,
             completion_workspace_row_bytes=4096,
         )
+        manifest = replace(
+            manifest,
+            library_workspace_bytes=rb_conversion_library_workspace_bytes(
+                geometry.private_hands, geometry.rank_count**2
+            ),
+        )
     owners = GeneratedOwners(
         build_storage_plan(
             mode,
             rb_partitions(geometry) if rb else sampled_partitions(2),
-            _phase5_manifest(device),
+            manifest,
             layout,
             device,
         )
@@ -1193,6 +1238,13 @@ def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
         topology_cap=64,
         topology_edge_cap=64,
         target_arena_cap=128,
+        library_workspace_bytes=(
+            rb_conversion_library_workspace_bytes(
+                geometry.private_hands, geometry.rank_count**2
+            )
+            if estimator == "rao_blackwell"
+            else base_manifest.library_workspace_bytes
+        ),
     )
     width = geometry.direct_model_input_width
     layout = PhysicalLayout(
@@ -1202,8 +1254,8 @@ def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
         player_count=3,
         stratum_count=3,
         evaluator_private_width=geometry.private_hands,
-        family_workspace_row_bytes=folded_statistics_workspace_row_bytes(
-            geometry
+        family_workspace_row_bytes=sequential_family_workspace_row_bytes(
+            geometry, 1
         ),
         chance_frontier_row_bytes=32,
         completion_workspace_row_bytes=4096,

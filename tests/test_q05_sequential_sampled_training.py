@@ -25,6 +25,9 @@ from pbg.games.poker.queued import (
     build_model_from_config,
     sampled_partitions,
 )
+from pbg.games.poker.queued.folded import (
+    sequential_family_workspace_row_bytes,
+)
 from pbg.games.poker.queued.training import (
     RecoveringSequentialSampledPokerIteration,
     SequentialSampledPokerIteration,
@@ -621,7 +624,9 @@ def _phase5_layout(
         player_count=2,
         stratum_count=2,
         evaluator_private_width=4,
-        family_workspace_row_bytes=4 * input_width + 64,
+        family_workspace_row_bytes=sequential_family_workspace_row_bytes(
+            geometry, 4
+        ),
         chance_frontier_row_bytes=32,
         completion_workspace_row_bytes=64,
         learner_sigma_workspace_row_bytes=64,
@@ -875,9 +880,8 @@ def test_public_config_composes_checkpoint_preemption_and_exact_resume(
             "utility": "stack_normalized",
         }
     )
-    required_workspace = 4 * (
-        geometry.direct_model_input_width
-        + geometry.private_hands * (5 + 3 * config.model.m_raise)
+    required_workspace = sequential_family_workspace_row_bytes(
+        geometry, config.model.m_raise
     )
     layout = replace(
         _phase5_layout(geometry),

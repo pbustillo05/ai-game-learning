@@ -2210,6 +2210,9 @@ class RBCompletionBinding:
         self.geometry = geometry
         self.layer_work = MappingProxyType(dict(layer_work))
         self.algebra = algebra
+        self.device_algebra = algebra.device(
+            next(iter(self.layer_work.values())).device
+        )
         self.mode = mode
         self.n_replica = int(n_replica)
         self.pack_cap = int(pack_cap)
@@ -2357,6 +2360,7 @@ class RBCompletionBinding:
                 algebra=self.algebra,
                 source_output="post",
                 destination_output=name,
+                device_algebra=self.device_algebra,
             )
             values["mass"][batch.lanes, : batch.rows, 0] = work.mass.reshape(
                 lane_count, batch.rows, p_train, -1

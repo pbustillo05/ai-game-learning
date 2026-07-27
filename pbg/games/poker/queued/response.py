@@ -36,6 +36,41 @@ def balanced_evaluation_probe_seats(
     ).remainder(players).to(torch.int32)
 
 
+def probe_evaluation_design(
+    trajectory_ids: Tensor, players: int
+) -> Tensor:
+    """Validate complete consecutive P-by-P seat/button blocks."""
+
+    block_size = players * players
+    if (
+        trajectory_ids.numel() == 0
+        or trajectory_ids.numel() % block_size
+    ):
+        raise ValueError(
+            "paired evaluation requires complete P^2 trajectory blocks"
+        )
+    first = int(trajectory_ids[0])
+    expected = torch.arange(
+        first,
+        first + trajectory_ids.numel(),
+        dtype=torch.int64,
+        device=trajectory_ids.device,
+    )
+    if first % block_size or not bool(trajectory_ids.eq(expected).all()):
+        raise ValueError(
+            "paired trajectory ids must be consecutive P^2 blocks"
+        )
+    seats = balanced_evaluation_probe_seats(trajectory_ids, players)
+    buttons = trajectory_ids.remainder(players).to(torch.int64)
+    pair = seats.to(torch.int64) * players + buttons
+    pair_counts = torch.bincount(pair, minlength=block_size)
+    if not bool(pair_counts.eq(trajectory_ids.numel() // block_size).all()):
+        raise ValueError(
+            "each probe-seat/button pair must occur once per block"
+        )
+    return seats
+
+
 @dataclass(frozen=True)
 class PairedProbeStatistics:
     mean_gain: float
@@ -81,6 +116,87 @@ _T95 = (
 )
 
 
+def _beta_continued_fraction(a: float, b: float, x: float) -> float:
+    """Numerical Recipes continued fraction for regularized beta."""
+
+    maximum_iterations = 200
+    epsilon = 3.0e-14
+    floor = 1.0e-300
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    d = 1.0 / max(abs(d), floor) * (1.0 if d >= 0 else -1.0)
+    result = d
+    for iteration in range(1, maximum_iterations + 1):
+        even = 2 * iteration
+        coefficient = (
+            iteration
+            * (b - iteration)
+            * x
+            / ((qam + even) * (a + even))
+        )
+        d = 1.0 + coefficient * d
+        d = 1.0 / max(abs(d), floor) * (1.0 if d >= 0 else -1.0)
+        c = 1.0 + coefficient / c
+        c = max(abs(c), floor) * (1.0 if c >= 0 else -1.0)
+        result *= d * c
+        coefficient = -(
+            (a + iteration)
+            * (qab + iteration)
+            * x
+            / ((a + even) * (qap + even))
+        )
+        d = 1.0 + coefficient * d
+        d = 1.0 / max(abs(d), floor) * (1.0 if d >= 0 else -1.0)
+        c = 1.0 + coefficient / c
+        c = max(abs(c), floor) * (1.0 if c >= 0 else -1.0)
+        delta = d * c
+        result *= delta
+        if abs(delta - 1.0) <= epsilon:
+            return result
+    raise RuntimeError("Student-t beta fraction did not converge")
+
+
+def _regularized_beta(x: float, a: float, b: float) -> float:
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    front = math.exp(
+        math.lgamma(a + b)
+        - math.lgamma(a)
+        - math.lgamma(b)
+        + a * math.log(x)
+        + b * math.log1p(-x)
+    )
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _beta_continued_fraction(a, b, x) / a
+    return 1.0 - (
+        front * _beta_continued_fraction(b, a, 1.0 - x) / b
+    )
+
+
+def _student_t_critical_95(degrees: int) -> float:
+    if degrees <= 0:
+        raise ValueError("Student-t degrees of freedom must be positive")
+    if degrees < len(_T95):
+        return _T95[degrees]
+    lower, upper = 0.0, 16.0
+    for _ in range(64):
+        middle = 0.5 * (lower + upper)
+        x = degrees / (degrees + middle * middle)
+        cdf = 1.0 - 0.5 * _regularized_beta(
+            x, 0.5 * degrees, 0.5
+        )
+        if cdf < 0.975:
+            lower = middle
+        else:
+            upper = middle
+    return 0.5 * (lower + upper)
+
+
 def paired_probe_statistics(
     differences: Tensor, seats: Tensor, players: int
 ) -> PairedProbeStatistics:
@@ -120,7 +236,7 @@ def paired_probe_statistics(
         raise RuntimeError("balanced paired-gain identities disagree")
     standard_error = values.std(unbiased=True) / math.sqrt(values.numel())
     degrees = values.numel() - 1
-    critical = _T95[degrees] if degrees < len(_T95) else 1.96
+    critical = _student_t_critical_95(degrees)
     half_width = critical * standard_error
     return PairedProbeStatistics(
         mean_gain=float(mean),
@@ -140,6 +256,7 @@ class SharedResponseEvaluationReport:
     semantics: str
     target_sha256: str
     initial_model_sha256: str
+    initialization: str
     trajectory_count: int
     trajectory_id_sha256: str
     statistics: PairedProbeStatistics
@@ -152,6 +269,7 @@ class SequentialSharedResponseEvaluator:
     players: int
     target_sha256: str
     initial_model_sha256: str
+    initialization: str = "random"
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -163,6 +281,8 @@ class SequentialSharedResponseEvaluator:
                 or any(character not in "0123456789abcdef" for character in value)
             ):
                 raise ValueError(f"{name} must be lowercase SHA-256")
+        if self.initialization not in ("random", "target"):
+            raise ValueError("probe initialization must be random or target")
 
     def evaluate(
         self,
@@ -170,9 +290,7 @@ class SequentialSharedResponseEvaluator:
         mixed_rollout: Callable[[Tensor, Tensor], Tensor],
         baseline_rollout: Callable[[Tensor, Tensor], Tensor],
     ) -> SharedResponseEvaluationReport:
-        seats = balanced_evaluation_probe_seats(
-            trajectory_ids, self.players
-        )
+        seats = probe_evaluation_design(trajectory_ids, self.players)
         mixed = mixed_rollout(trajectory_ids, seats)
         baseline = baseline_rollout(trajectory_ids, seats)
         if (
@@ -190,6 +308,7 @@ class SequentialSharedResponseEvaluator:
             semantics=SHARED_RESPONSE_SEMANTICS,
             target_sha256=self.target_sha256,
             initial_model_sha256=self.initial_model_sha256,
+            initialization=self.initialization,
             trajectory_count=trajectory_ids.numel(),
             trajectory_id_sha256=identity,
             statistics=paired_probe_statistics(
@@ -205,5 +324,6 @@ __all__ = [
     "SharedResponseEvaluationReport",
     "balanced_evaluation_probe_seats",
     "paired_probe_statistics",
+    "probe_evaluation_design",
     "training_probe_seats",
 ]
