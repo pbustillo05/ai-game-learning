@@ -655,6 +655,10 @@ class SequentialPokerIteration:
             torch._assert_async(success.all(), "poker completion failed")
             remaining_leaves -= rows
         completion.release()
+        # RBCompletionBinding owns the resident H-to-K CUDA mask. Completion
+        # is its exact last consumer; do not carry library workspace into
+        # align/targets/learner or the zero-workspace final-backward phase.
+        del binding
         for output, name in enumerate(plan.output_names):
             work = owners.slab("LayerWork", name)
             missing = plan.arena_rows[0][output] - work.tail(0)
