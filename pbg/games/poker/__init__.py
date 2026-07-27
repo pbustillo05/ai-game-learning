@@ -1,2 +1,1 @@
-"""Poker public navigation and evaluator-boundary adapters, scaffolded by P00."""
-
+"""Poker public navigation and isolated queued integration modules."""
