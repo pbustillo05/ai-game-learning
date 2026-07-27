@@ -132,7 +132,9 @@ class NLHEGeometry:
         ).to(torch.int32)
 
 
-def sampled_partitions(players: int) -> PartitionContract:
+def sampled_partitions(
+    players: int, geometry: NLHEGeometry | None = None
+) -> PartitionContract:
     if not 2 <= players <= 6:
         raise ValueError("players must lie in [2,6]")
     inputs = (Partition("pre", 1),) + tuple(
@@ -141,7 +143,14 @@ def sampled_partitions(players: int) -> PartitionContract:
     return PartitionContract(
         inputs=inputs,
         outputs=(Partition("all", 1),),
-        folded=(Partition("pre", 1), Partition("post", 1)),
+        folded=(
+            Partition(
+                "pre", 1 if geometry is None else geometry.rank_count**2
+            ),
+            Partition(
+                "post", 1 if geometry is None else geometry.private_hands
+            ),
+        ),
         input_to_output=tuple(
             PartitionMap(partition.name, "all") for partition in inputs
         ),
@@ -178,7 +187,7 @@ def poker_partitions(
 ) -> PartitionContract:
     if schema.private_estimator is PrivateEstimator.RAO_BLACKWELL:
         return rb_partitions(geometry)
-    return sampled_partitions(geometry.players)
+    return sampled_partitions(geometry.players, geometry)
 
 
 @dataclass(frozen=True)
@@ -1144,11 +1153,112 @@ class SequentialPokerHooks:
         self.last_topology: DeferredUnaryTopologyPublication | None = None
         self._topology_sequence = 0
 
+    def _combo_class(self) -> Tensor:
+        ranks = self.geometry.rank_count
+        cards = self.machine.combo_cards(
+            torch.arange(
+                self.geometry.private_hands,
+                dtype=torch.int32,
+                device=self.owners.device,
+            )
+        ).to(torch.int64)
+        rank = cards // 4 - (13 - ranks)
+        high = rank.max(1).values
+        low = rank.min(1).values
+        high_position = ranks - 1 - high
+        low_position = ranks - 1 - low
+        suited_or_pair = rank[:, 0].eq(rank[:, 1]) | cards[:, 0].remainder(
+            4
+        ).eq(cards[:, 1].remainder(4))
+        return torch.where(
+            suited_or_pair,
+            high_position * ranks + low_position,
+            low_position * ranks + high_position,
+        )
+
+    def _owner_slab(self, owner: str, partition: str) -> MonotoneSlab:
+        name = f"{owner}.{partition}"
+        try:
+            return next(
+                slab for slab in self.owners.slabs if slab.schema.name == name
+            )
+        except StopIteration as exc:
+            raise QueuedPokerError(f"missing retained owner {name}") from exc
+
+    def _resolved_model_input(self, batch: FamilyBatch) -> Tensor:
+        """Refresh folded reaches from the sole retained FoldedRanges owner."""
+
+        model_input = batch.fields["model_input"].reshape(
+            -1, self.geometry.direct_model_input_width
+        )
+        references = batch.fields["folded_range_row"].reshape(
+            -1, self.geometry.players
+        ).to(torch.int64)
+        refreshed = model_input.clone()
+        log_reach, _ = self.machine.model_context(refreshed)
+        log_reach = log_reach.clone()
+        rows = torch.arange(refreshed.shape[0], device=refreshed.device)
+        classes = self._combo_class()
+        class_count = torch.bincount(
+            classes, minlength=self.geometry.rank_count**2
+        ).float()
+        pre = self._owner_slab("FoldedRanges", "pre").columns["range"][0]
+        post = self._owner_slab("FoldedRanges", "post").columns["range"][0]
+        for seat in range(self.geometry.players):
+            reference = references[:, seat]
+            pre_mask = reference.ge(0)
+            post_mask = reference.lt(-1)
+            safe_pre = reference.clamp_min(0)
+            safe_post = (-reference - 2).clamp_min(0)
+            if pre.shape[1] == 1:
+                pre_weight = pre.index_select(0, safe_pre).expand(
+                    -1, self.geometry.private_hands
+                ) / self.geometry.private_hands
+            else:
+                pre_weight = pre.index_select(0, safe_pre).index_select(
+                    1, classes
+                )
+                pre_weight = pre_weight / class_count.index_select(
+                    0, classes
+                )[None]
+            if post.shape[1] == 1:
+                post_weight = post.index_select(0, safe_post).expand(
+                    -1, self.geometry.private_hands
+                ) / self.geometry.private_hands
+            else:
+                post_weight = post.index_select(0, safe_post)
+            weight = torch.where(pre_mask[:, None], pre_weight, post_weight)
+            active = pre_mask | post_mask
+            weight = weight.masked_fill(~active[:, None], 0.0)
+            log_weight = torch.log(
+                weight.clamp_min(torch.finfo(torch.float32).tiny)
+            ).masked_fill(~weight.gt(0), -torch.inf)
+            log_reach[rows, seat] = torch.where(
+                active[:, None], log_weight, log_reach[rows, seat]
+            )
+        offset = 8 + 10 * self.geometry.players
+        refreshed[
+            :, offset : offset + self.geometry.players * self.geometry.private_hands
+        ] = log_reach.flatten(1).to(refreshed.dtype)
+        return refreshed
+
+    def _forward_model_input(self, batch: FamilyBatch) -> Tensor:
+        live = (
+            self.geometry.players
+            if batch.input_type == "pre"
+            else int(batch.input_type[5:])
+        )
+        if self.geometry.players == 2 or live == self.geometry.players:
+            return batch.fields["model_input"].reshape(
+                -1, self.geometry.direct_model_input_width
+            )
+        return self._resolved_model_input(batch)
+
     def model_input(self, batch: FamilyBatch) -> PokerForwardInput:
         shape = (batch.lane_count * batch.rows,)
         return PokerForwardInput(
             batch.input_type,
-            batch.fields["model_input"].reshape(
+            self._forward_model_input(batch).reshape(
                 *shape, self.geometry.direct_model_input_width
             ),
             batch.fields.get(
@@ -1167,7 +1277,7 @@ class SequentialPokerHooks:
     def sample(self, request: SampleRequest) -> SampleWorkspace:
         forward = PokerForwardInput(
             request.batch.input_type,
-            request.batch.fields["model_input"].reshape(
+            self._forward_model_input(request.batch).reshape(
                 -1, self.geometry.direct_model_input_width
             ),
             request.batch.fields.get(
@@ -1281,9 +1391,7 @@ class SequentialPokerHooks:
     def transition(self, request: TransitionRequest) -> CommitPlan:
         batch = request.batch
         lane_count, rows = batch.lane_count, batch.rows
-        flat_input = batch.fields["model_input"].reshape(
-            -1, self.geometry.direct_model_input_width
-        )
+        flat_input = self._forward_model_input(batch)
         flat_private = batch.fields.get(
             "sampled_private_state", batch.fields["true_profile"]
         ).reshape(
@@ -1312,6 +1420,7 @@ class SequentialPokerHooks:
             actor[:, None, None].expand(-1, 1, self.geometry.private_hands),
             (actor_reach + selected_log)[:, None],
         )
+        fold_log_reach = log_reach
         history = self.machine.append_player_history(
             state, action, history
         )
@@ -1530,6 +1639,76 @@ class SequentialPokerHooks:
             "model_input": next_input,
             "owner": next_owner,
         }
+        folded_reference = batch.fields["folded_range_row"].reshape(
+            -1, self.geometry.players
+        ).to(torch.int64)
+        fold = action.eq(FOLD)
+        finite_fold = torch.isfinite(fold_log_reach)
+        fold_gauge = fold_log_reach.masked_fill(
+            ~finite_fold, -torch.inf
+        ).amax(-1, keepdim=True)
+        fold_weight = torch.exp(
+            fold_log_reach
+            - fold_gauge.masked_fill(~torch.isfinite(fold_gauge), 0.0)
+        ).masked_fill(~finite_fold, 0.0)
+        actor_weight = fold_weight[
+            torch.arange(fold_weight.shape[0], device=state.device), actor
+        ]
+        actor_weight /= actor_weight.sum(-1, keepdim=True).clamp_min(
+            torch.finfo(torch.float32).tiny
+        )
+        folded_partition = "pre" if batch.input_type == "pre" else "post"
+        folded_slab = self._owner_slab("FoldedRanges", folded_partition)
+        fold_order = torch.argsort(~fold, stable=True)
+        folded_rows = actor_weight
+        if folded_partition == "pre":
+            classes = self._combo_class()
+            folded_rows = torch.zeros(
+                (
+                    actor_weight.shape[0],
+                    self.geometry.rank_count**2,
+                ),
+                dtype=torch.float32,
+                device=state.device,
+            )
+            folded_rows.scatter_add_(
+                1,
+                classes[None].expand_as(actor_weight),
+                actor_weight,
+            )
+        if folded_slab.columns["range"].shape[-1] == 1:
+            folded_rows = folded_rows.sum(-1, keepdim=True)
+        folded_values = self._defaults(folded_slab, rows)
+        folded_values["range"][0].copy_(
+            folded_rows.index_select(0, fold_order)
+        )
+        fold_counts = torch.zeros(
+            (n_replica,), dtype=torch.int64, device=state.device
+        )
+        fold_counts.index_copy_(
+            0,
+            batch.lanes,
+            fold.reshape(lane_count, rows).sum(1, dtype=torch.int64),
+        )
+        fold_base = folded_slab.tail(0)
+        fold_ordinal = fold.cumsum(0, dtype=torch.int64) - 1
+        encoded_reference = (
+            fold_base + fold_ordinal
+            if folded_partition == "pre"
+            else -(fold_base + fold_ordinal + 2)
+        )
+        folded_reference = folded_reference.scatter(
+            1,
+            actor[:, None],
+            torch.where(
+                fold,
+                encoded_reference,
+                folded_reference.gather(1, actor[:, None]).squeeze(1),
+            )[:, None],
+        )
+        family_source["folded_range_row"] = folded_reference.reshape(
+            lane_count, rows, self.geometry.players
+        ).to(torch.int32)
         if sampled_mode:
             family_source["sampled_private_state"] = next_private
         if response:
@@ -1554,7 +1733,18 @@ class SequentialPokerHooks:
             )
             published_queues.append(queue)
 
-        extent = 3 * rows
+        folded_destination = len(destinations)
+        destinations.append(
+            DeviceDestinationRequest(
+                folded_slab,
+                fold_counts,
+                folded_values,
+                batch.input_type,
+                address,
+            )
+        )
+
+        extent = 4 * rows
         valid = torch.zeros(
             (n_replica, extent), dtype=torch.bool, device=state.device
         )
@@ -1565,22 +1755,30 @@ class SequentialPokerHooks:
         destination_ordinal = torch.zeros_like(source_ordinal)
         ordinal = torch.arange(rows, dtype=torch.int64, device=state.device)
         for local_lane, lane in ((0, 0),):
-            valid[lane, 2::3].fill_(True)
-            valid[lane, 0::3].copy_(trained[local_lane])
-            valid[lane, 1::3].copy_(trained[local_lane])
-            source_ordinal[lane, 0::3].copy_(ordinal)
-            source_ordinal[lane, 1::3].copy_(ordinal)
-            source_ordinal[lane, 2::3].copy_(ordinal)
-            destination[lane, 0::3].fill_(1)
-            destination[lane, 1::3].fill_(2)
+            valid[lane, 2::4].fill_(True)
+            valid[lane, 0::4].copy_(trained[local_lane])
+            valid[lane, 1::4].copy_(trained[local_lane])
+            valid[lane, 3::4].copy_(fold.reshape(lane_count, rows)[local_lane])
+            source_ordinal[lane, 0::4].copy_(ordinal)
+            source_ordinal[lane, 1::4].copy_(ordinal)
+            source_ordinal[lane, 2::4].copy_(ordinal)
+            source_ordinal[lane, 3::4].copy_(ordinal)
+            destination[lane, 0::4].fill_(1)
+            destination[lane, 1::4].fill_(2)
+            destination[lane, 3::4].fill_(folded_destination)
             compact_ordinal = trained[local_lane].cumsum(
                 0, dtype=torch.int64
             ) - 1
-            destination_ordinal[lane, 0::3].copy_(
+            destination_ordinal[lane, 0::4].copy_(
                 compact_ordinal.clamp_min(0)
             )
-            destination_ordinal[lane, 1::3].copy_(
+            destination_ordinal[lane, 1::4].copy_(
                 compact_ordinal.clamp_min(0)
+            )
+            destination_ordinal[lane, 3::4].copy_(
+                fold.reshape(lane_count, rows)[local_lane].cumsum(
+                    0, dtype=torch.int64
+                ).sub(1).clamp_min(0)
             )
             selected_family = route_family[local_lane]
             route_ordinal = torch.zeros_like(ordinal)
@@ -1598,8 +1796,8 @@ class SequentialPokerHooks:
                     torch.full_like(route_destination, request_index),
                     route_destination,
                 )
-            destination[lane, 2::3].copy_(route_destination)
-            destination_ordinal[lane, 2::3].copy_(route_ordinal)
+            destination[lane, 2::4].copy_(route_destination)
+            destination_ordinal[lane, 2::4].copy_(route_ordinal)
 
         topology_next_family = next_family[0]
         if not sampled_mode:

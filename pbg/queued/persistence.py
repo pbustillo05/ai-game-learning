@@ -13,7 +13,7 @@ from typing import Mapping, Sequence
 import torch
 from torch import Tensor, nn
 
-from pbg.queued.config import Phase5Config
+from pbg.queued.config import Phase5Config, SequentialModeConfig
 from pbg.queued.learner import ReferenceState
 from pbg.queued.optimization import DenseAdam, LossScaler
 
@@ -507,6 +507,7 @@ def convert_legacy_sequential(
             probe.get("initialization", "random")
         )
         scientific["probe"] = {"target_sha256": target_hash}
+    scientific = SequentialModeConfig.from_mapping(scientific).scientific_mapping()
     execution = {
         "hardware_profile": dict(legacy["hardware_profile"]),
         "checkpoint_cadence": config["training"].get("checkpoint_every"),
@@ -646,6 +647,7 @@ __all__ = [
     "LEGACY_SCHEMA_V7",
     "PersistenceError",
     "RunState",
+    "convert_legacy_sequential",
     "convert_legacy_sequential_sampled",
     "load_checkpoint",
     "save_checkpoint",

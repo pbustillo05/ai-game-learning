@@ -24,6 +24,10 @@ from pbg.games.poker.queued.hooks import (
     SequentialSampledPokerHooks,
 )
 from pbg.games.poker.queued.policy import PokerPolicyOperator
+from pbg.games.poker.queued.response import (
+    PairedProbeStatistics,
+    paired_probe_statistics,
+)
 from pbg.queued.capacity import (
     ExecutionPhase,
     GeneratedOwners,
@@ -314,12 +318,6 @@ class SequentialPokerIteration:
                 )
             else:
                 assert self.frozen_operation is not None
-                frozen = self.frozen_operation(
-                    forward.input_type,
-                    forward.model_input,
-                    forward.sampled_private_state,
-                    forward.owner,
-                )
                 if forward.role_selector is None:
                     raise PokerIterationError(
                         "best-response forward omitted selected roles"
@@ -327,29 +325,63 @@ class SequentialPokerIteration:
                 trained = forward.owner.to(torch.int64).eq(
                     forward.role_selector.to(torch.int64)
                 )
-                learned = self.rollout_operation(
-                    forward.input_type,
-                    forward.model_input,
-                    forward.sampled_private_state,
-                    forward.owner,
-                )
-                shape = (trained.shape[0],) + (1,) * (learned.value.ndim - 1)
+                trained_row = torch.nonzero(trained, as_tuple=False).flatten()
+                frozen_row = torch.nonzero(~trained, as_tuple=False).flatten()
+
+                def compact_call(
+                    operation: ModelOperation, row: Tensor
+                ) -> ModelEvaluation | None:
+                    if row.numel() == 0:
+                        return None
+                    return operation(
+                        forward.input_type,
+                        forward.model_input.index_select(0, row),
+                        forward.sampled_private_state.index_select(0, row),
+                        forward.owner.index_select(0, row),
+                    )
+
+                learned = compact_call(self.rollout_operation, trained_row)
+                frozen = compact_call(self.frozen_operation, frozen_row)
+                prototype = learned if learned is not None else frozen
+                if prototype is None:
+                    raise PokerIterationError("best-response model batch is empty")
+
+                def merge(
+                    learned_value: Tensor | None, frozen_value: Tensor | None
+                ) -> Tensor:
+                    source = (
+                        learned_value
+                        if learned_value is not None
+                        else frozen_value
+                    )
+                    assert source is not None
+                    result = source.new_empty(
+                        (trained.shape[0], *source.shape[1:])
+                    )
+                    if learned_value is not None:
+                        result.index_copy_(0, trained_row, learned_value)
+                    if frozen_value is not None:
+                        result.index_copy_(0, frozen_row, frozen_value)
+                    return result
+
+                policy_names = tuple(prototype.policy_raw)
+                if learned is not None and tuple(learned.policy_raw) != policy_names:
+                    raise PokerIterationError("learned policy output schema changed")
+                if frozen is not None and tuple(frozen.policy_raw) != policy_names:
+                    raise PokerIterationError("frozen policy output schema changed")
                 evaluation = ModelEvaluation(
                     MappingProxyType(
                         {
-                            name: torch.where(
-                                trained.reshape(
-                                    (trained.shape[0],)
-                                    + (1,) * (value.ndim - 1)
-                                ),
-                                value,
-                                frozen.policy_raw[name],
+                            name: merge(
+                                None if learned is None else learned.policy_raw[name],
+                                None if frozen is None else frozen.policy_raw[name],
                             )
-                            for name, value in learned.policy_raw.items()
+                            for name in policy_names
                         }
                     ),
-                    torch.where(
-                        trained.reshape(shape), learned.value, frozen.value
+                    merge(
+                        None if learned is None else learned.value,
+                        None if frozen is None else frozen.value,
                     ),
                 )
         if not isinstance(evaluation, ModelEvaluation):
@@ -790,6 +822,45 @@ class SequentialPokerIteration:
 SequentialSampledPokerIteration = SequentialPokerIteration
 
 
+@dataclass(frozen=True)
+class SequentialSharedResponseProbe:
+    """Shared-seat probe consumer using the ordinary sequential BR/RB path."""
+
+    iteration: SequentialPokerIteration
+    target_sha256: str
+
+    def __post_init__(self) -> None:
+        mode = self.iteration.mode
+        if (
+            mode.training_regime is not TrainingRegime.BEST_RESPONSE
+            or mode.rollout_mode is not RolloutMode.SEQUENTIAL
+            or mode.private_estimator is not PrivateEstimator.RAO_BLACKWELL
+        ):
+            raise ValueError("shared-response probe requires sequential BR/RB")
+        if (
+            len(self.target_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.target_sha256
+            )
+        ):
+            raise ValueError("probe target_sha256 must be lowercase SHA-256")
+
+    @property
+    def mode(self) -> ModeSchema:
+        return self.iteration.mode
+
+    def run(self, *, iteration: int) -> PokerIterationResult:
+        return self.iteration.run(iteration=iteration)
+
+    def summarize_paired_gain(
+        self, differences: Tensor, seats: Tensor
+    ) -> PairedProbeStatistics:
+        return paired_probe_statistics(
+            differences, seats, self.iteration.geometry.players
+        )
+
+
 def _discard_rollout_attempt(owners: GeneratedOwners) -> None:
     """Reset and close an unpublished failed attempt before replacement."""
 
@@ -1175,4 +1246,5 @@ __all__ = [
     "RecoveringSequentialSampledPokerIteration",
     "SequentialSampledPokerIteration",
     "SequentialPokerIteration",
+    "SequentialSharedResponseProbe",
 ]

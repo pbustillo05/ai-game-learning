@@ -35,8 +35,16 @@ from pbg.games.poker.queued.training import (
     PokerIterationError,
     PokerIterationResult,
     SequentialPokerIteration,
+    SequentialSharedResponseProbe,
 )
 from pbg.games.poker.queued.folded import FoldedStatisticsError, folded_statistics
+from pbg.games.poker.queued.response import (
+    PairedProbeStatistics,
+    SHARED_RESPONSE_SEMANTICS,
+    balanced_evaluation_probe_seats,
+    paired_probe_statistics,
+    training_probe_seats,
+)
 
 __all__ = [
     "ActorSample",
@@ -54,6 +62,7 @@ __all__ = [
     "PokerModelError",
     "PokerPolicyError",
     "PokerPolicyOperator",
+    "PairedProbeStatistics",
     "PokerState",
     "PokerStateMachine",
     "QueuedPokerModel",
@@ -63,10 +72,15 @@ __all__ = [
     "SequentialPokerHooks",
     "SequentialSampledPokerHooks",
     "SequentialPokerIteration",
+    "SequentialSharedResponseProbe",
+    "SHARED_RESPONSE_SEMANTICS",
+    "balanced_evaluation_probe_seats",
     "build_model_from_config",
     "sampled_partitions",
     "rb_partitions",
     "poker_partitions",
+    "paired_probe_statistics",
+    "training_probe_seats",
     "folded_statistics",
     "validate_phase5_mode",
 ]
