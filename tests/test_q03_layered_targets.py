@@ -568,6 +568,17 @@ def test_completion_payload_contract_rejects_broadcast_before_reservation() -> N
             owners, mode, plan, {(0, "all"): invalid}, 1
         )
     assert owners.slab("LayerWork", "all").tail(0) == 0
+    crossed = RBLeafWork(
+        torch.ones((1, 2, 1), device=device),
+        torch.ones((1, 2, 1), device=device),
+    )
+    with pytest.raises(TargetError, match="estimator differs"):
+        initialize_work_arenas(
+            owners, plan, {(0, "all"): crossed}
+        )
+    work = owners.slab("LayerWork", "all")
+    assert work.tail(0) == 0
+    assert work.reserved_tail(0) == 0
     initialize_work_arenas(
         owners,
         plan,
@@ -873,7 +884,7 @@ def test_all_twelve_modes_match_direct_one_node_reference(
 
 
 @CUDA
-def test_unbalanced_last_consumer_slots_match_reference_without_carry_traffic() -> None:
+def test_unbalanced_last_consumer_slots_match_reference_without_copy_traffic() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     mode = mode_schema("self_play", "branched.fixed", "sampled")
     topology, bindings = _topology(mode, unbalanced=True)
@@ -911,8 +922,8 @@ def test_unbalanced_last_consumer_slots_match_reference_without_carry_traffic() 
         if "layered_target_kernel" in event.name
     ]
     assert len(layer_kernels) == plan.layer_count
-    assert result.counters.carry_count == 0
-    assert result.counters.carry_payload_bytes == 0
+    assert not hasattr(result.counters, "carry_count")
+    assert not hasattr(result.counters, "carry_payload_bytes")
     sigma = owners.slab("SigmaTarget", "pre").published(0, "value_target")
     # Node 1 is mean(4,8)=6, root is mean(2,6)=4.
     assert torch.equal(sigma[:, 0], torch.tensor([4.0, 6.0], device=device))

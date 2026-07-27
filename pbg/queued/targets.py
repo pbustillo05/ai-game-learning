@@ -396,6 +396,14 @@ def initialize_work_arenas(
                     ) from exc
                 if not isinstance(payload, (SampledLeafWork, RBLeafWork)):
                     raise TargetError("completion payload type is not supported")
+                expects_sampled = (
+                    owners.plan.mode.private_estimator
+                    is PrivateEstimator.SAMPLED
+                )
+                if expects_sampled != isinstance(payload, SampledLeafWork):
+                    raise TargetError(
+                        "completion payload estimator differs from LayerWork schema"
+                    )
                 leaf_rows = plan.leaf_rows[lane]
                 width = plan.output_widths[output]
                 work_shape = (leaf_rows, p_train, width)
@@ -531,8 +539,6 @@ def initialize_work_arenas(
 class TargetCounters:
     layer_count: int
     node_count_per_layer: tuple[int, ...]
-    carry_count: int
-    carry_payload_bytes: int
     child_edges_read: int
     mass_moment_bytes_read: int
     mass_moment_bytes_written: int
@@ -906,8 +912,6 @@ class LayeredTargetExecutor:
                         int(plan.layer_ptr[layer + 1] - plan.layer_ptr[layer])
                         for layer in range(plan.layer_count)
                     ),
-                    carry_count=0,
-                    carry_payload_bytes=0,
                     child_edges_read=plan.target_edge_count,
                     mass_moment_bytes_read=rb_read_bytes,
                     mass_moment_bytes_written=rb_written_bytes,
