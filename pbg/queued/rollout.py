@@ -279,6 +279,10 @@ def stable_route(
     )
     membership = family_id[..., None] == declared[None, None, :]
     declared_rows = ~active | membership.sum(-1, dtype=torch.int64).eq(1)
+    torch._assert_async(
+        declared_rows.all(),
+        "every active row must have exactly one declared queue family",
+    )
     replicas, rows = family_id.shape
     source = torch.arange(
         rows, dtype=torch.int64, device=family_id.device

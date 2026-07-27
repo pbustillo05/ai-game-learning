@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import ast
 import inspect
+from pathlib import Path
+import subprocess
+import sys
 import textwrap
 from types import MappingProxyType
 
@@ -319,6 +322,31 @@ def test_device_counts_scans_reservations_and_publication_is_lane_atomic() -> No
     packed.release()
     pack_failures.release()
 
+    boundary_failures = DeviceFailureState(1, device)
+    boundary = _slab(
+        _schema("boundary", (SoAField("value", torch.int32),)),
+        4,
+        boundary_failures,
+    )
+    two = torch.tensor([2], dtype=torch.int64, device=device)
+    initial = DevicePublicationTransaction.begin(
+        (_request(boundary, two, max_rows=2, base=3),),
+        phase="initial",
+        active=torch.ones(1, dtype=torch.bool, device=device),
+    )
+    initial.fill_all()
+    initial.publish()
+    final = DevicePublicationTransaction.begin(
+        (_request(boundary, two, max_rows=4, base=9),),
+        phase="final",
+        active=torch.ones(1, dtype=torch.bool, device=device),
+    )
+    final.fill_all()
+    final.publish()
+    assert boundary.published(0, "value").tolist() == [3, 3, 9, 9]
+    boundary.release()
+    boundary_failures.release()
+
 
 @CUDA
 def test_device_stable_route_declares_every_row_once_without_reordering() -> None:
@@ -379,6 +407,63 @@ def test_device_publication_failure_injection_exposes_none_and_poisons() -> None
     assert slab.epoch(0) == 1
     slab.release()
     failures.release()
+
+
+@CUDA
+def test_device_materialization_has_no_hidden_nonzero_or_scalar_sync() -> None:
+    device = torch.device("cuda", 0)
+    failures = DeviceFailureState(2, device)
+    slab = _slab(
+        _schema("profiled", (SoAField("value", torch.int32),)),
+        8,
+        failures,
+    )
+    counts = torch.tensor([4, 3], dtype=torch.int64, device=device)
+    with torch.profiler.profile(
+        activities=(
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ),
+        acc_events=True,
+    ) as profile:
+        transaction = DevicePublicationTransaction.begin(
+            (_request(slab, counts, max_rows=4),),
+            phase="rollout_commit",
+            active=torch.ones(2, dtype=torch.bool, device=device),
+        )
+        transaction.fill_all()
+        transaction.publish()
+        torch.cuda.synchronize(device)
+    keys = {event.key for event in profile.key_averages()}
+    assert "aten::nonzero" not in keys
+    assert "aten::_local_scalar_dense" not in keys
+    names = tuple(event.name.lower() for event in profile.events())
+    assert not any(
+        "memcpy dtoh" in name or "device to host" in name for name in names
+    )
+    slab.release()
+    failures.release()
+
+
+@CUDA
+def test_undeclared_device_route_fails_terminally_without_skipping() -> None:
+    script = """
+import torch
+from pbg.queued import stable_route
+family = torch.tensor([[1, 99, 2]], dtype=torch.int32, device="cuda")
+active = torch.ones_like(family, dtype=torch.bool)
+stable_route(family, active, (1, 2))
+torch.cuda.synchronize()
+"""
+    completed = subprocess.run(
+        (sys.executable, "-c", script),
+        cwd=str(Path(__file__).resolve().parents[1]),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "declared queue family" in completed.stderr
 
 
 @CUDA

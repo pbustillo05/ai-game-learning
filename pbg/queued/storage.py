@@ -1279,19 +1279,51 @@ class DevicePublicationTransaction:
         ordinal = torch.arange(
             max_rows, dtype=torch.int64, device=self.device
         )
-        rows = begin[:, None] + ordinal[None, :]
-        valid = (
-            self.success[:, None]
-            & (ordinal[None, :] < request.counts[:, None])
+        row = begin[:, None] + ordinal[None, :]
+        safe_row = row.clamp(0, request.slab.capacity - 1)
+        valid = self.success[:, None] & (
+            ordinal[None, :] < request.counts[:, None]
         )
-        safe_rows = rows.clamp(0, request.slab.capacity - 1)
-        lanes = torch.arange(
-            self.n_replica, dtype=torch.int64, device=self.device
-        )[:, None].expand_as(safe_rows)
+        valid_last = (
+            self.success
+            & (request.counts > 0)
+            & (begin + request.counts - 1 == request.slab.capacity - 1)
+        )
+        collision = (
+            ~valid
+            & valid_last[:, None]
+            & (safe_row == request.slab.capacity - 1)
+        )
+        last_ordinal = request.counts.clamp(1, max_rows) - 1
         for field in request.slab.schema.fields:
             destination = request.slab._columns[field.name]
             source = request.values[field.name]
-            destination[lanes[valid], safe_rows[valid]] = source[valid]
+            trailing = tuple(1 for _ in field.shape)
+            scatter_index = safe_row.reshape(
+                self.n_replica, max_rows, *trailing
+            ).expand(self.n_replica, max_rows, *field.shape)
+            current = destination.gather(1, scatter_index)
+            payload = torch.where(
+                valid.reshape(self.n_replica, max_rows, *trailing),
+                source,
+                current,
+            )
+            last_index = last_ordinal.reshape(
+                self.n_replica, 1, *trailing
+            ).expand(self.n_replica, 1, *field.shape)
+            last_value = source.gather(1, last_index).expand_as(source)
+            payload = torch.where(
+                collision.reshape(
+                    self.n_replica, max_rows, *trailing
+                ),
+                last_value,
+                payload,
+            )
+            destination.scatter_(
+                1,
+                scatter_index,
+                payload,
+            )
         self._filled[index] = True
 
     def fill_all(self) -> None:
