@@ -19,7 +19,10 @@ from pbg.games.poker.queued.hooks import (
     rb_partitions,
     sampled_partitions,
 )
-from pbg.games.poker.queued.model import QueuedPokerModel
+from pbg.games.poker.queued.model import (
+    QueuedPokerModel,
+    build_model_from_config,
+)
 from pbg.games.poker.queued.training import SequentialPokerIteration
 from pbg.games.poker.queued.training import SequentialSharedResponseProbe
 from pbg.games.poker.queued.response import (
@@ -111,6 +114,73 @@ def test_all_sequential_public_configs_are_closed(
         "rollout_mode": "sequential",
         "private_estimator": estimator,
     }
+
+
+@CUDA
+def test_native_postflop_model_consumes_signed_folded_summary() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    scientific = _config("best_response", "rao_blackwell")
+    scientific["game"] = {
+        "players": 3,
+        "stack_bb": 8.0,
+        "rank_count": 4,
+    }
+    scientific["model"] = {
+        "d_model": 8,
+        "n_heads": 1,
+        "n_layers_pre": 1,
+        "n_layers_post": 1,
+        "max_players": 3,
+        "class_embedding_dim": 4,
+        "ffn_hidden": 16,
+        "folder_beta_rank": 4,
+        "folder_line_dim": 4,
+    }
+    model = build_model_from_config(scientific, device)
+    geometry = model.geometry
+    machine = PokerStateMachine(geometry)
+    state = machine.initial_roots(
+        1, seed=11, iteration=0, retry_epoch=0, device=device
+    )
+    status = state.status.clone()
+    status[:, 2] = FOLDED
+    pending = state.pending.clone()
+    pending[:, 2] = False
+    state = replace(
+        state,
+        street=torch.ones_like(state.street),
+        board_cards=torch.tensor(
+            [[
+                geometry.first_card,
+                geometry.first_card + 1,
+                geometry.first_card + 2,
+                PAD_CARD,
+                PAD_CARD,
+            ]],
+            dtype=torch.uint8,
+            device=device,
+        ),
+        status=status,
+        pending=pending,
+        to_act=torch.zeros_like(state.to_act),
+    )
+    log_reach = torch.zeros(
+        (1, geometry.players, geometry.private_hands),
+        dtype=torch.float32,
+        device=device,
+    )
+    log_reach[:, 2] = torch.linspace(
+        -2.0, 0.0, geometry.private_hands, device=device
+    )
+    model_input = machine.direct_model_input(state, log_reach)
+    evaluation = model.forward_sequential_partition("post_2", model_input)
+    assert evaluation.value.shape == (1, geometry.private_hands)
+    assert torch.isfinite(evaluation.value).all()
+    evaluation.value.mean().backward()
+    assert any(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in model.postflop.parameters()
+    )
 
 
 def test_probe_is_the_ordinary_best_response_rb_schema() -> None:
@@ -264,8 +334,9 @@ def test_repository_folded_statistics_are_deterministic_fp32() -> None:
         beta_rank=4,
         line_dim=3,
     )
-    first = folded_statistics(geometry, **arguments)
-    second = folded_statistics(geometry, **arguments)
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        first = folded_statistics(geometry, **arguments)
+        second = folded_statistics(geometry, **arguments)
     assert first.keys() == second.keys()
     assert all(value.dtype in (torch.float32, torch.bool, torch.int64)
                for value in first.values())
@@ -274,6 +345,225 @@ def test_repository_folded_statistics_are_deterministic_fp32() -> None:
     assert not first["folder_mask"][:, :2].any()
     assert torch.count_nonzero(first["beta_eigenvalue"]) > 0
     assert torch.count_nonzero(first["folder_line_meta"]) > 0
+
+
+@CUDA
+def test_folded_lambda_and_signed_beta_match_one_folder_finite_differences() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    machine = PokerStateMachine(geometry)
+    state = machine.initial_roots(
+        1, seed=31, iteration=0, retry_epoch=0, device=device
+    )
+    combo = machine.combo_cards(
+        torch.arange(
+            geometry.private_hands, dtype=torch.int32, device=device
+        )
+    )
+    raw = torch.arange(
+        1,
+        geometry.private_hands + 1,
+        dtype=torch.float32,
+        device=device,
+    )
+    probability = raw / raw.sum()
+    ranges = torch.zeros(
+        (1, 2, geometry.private_hands), dtype=torch.float32, device=device
+    )
+    ranges[0, 1] = raw
+    status = state.status.clone()
+    status[:, 1] = FOLDED
+    result = folded_statistics(
+        geometry,
+        board_cards=state.board_cards,
+        range_weights=ranges,
+        status=status,
+        combo_cards=combo,
+        beta_rank=geometry.deck_cards,
+        line_dim=4,
+    )
+    local = (combo - geometry.first_card).long()
+    marginal = torch.zeros(
+        geometry.deck_cards, dtype=torch.float32, device=device
+    )
+    marginal.scatter_add_(0, local[:, 0], probability)
+    marginal.scatter_add_(0, local[:, 1], probability)
+    alpha = torch.log1p(-marginal)
+    beta_reference = torch.zeros(
+        (geometry.deck_cards, geometry.deck_cards),
+        dtype=torch.float32,
+        device=device,
+    )
+    pair_survival = (
+        1.0
+        - marginal[local[:, 0]]
+        - marginal[local[:, 1]]
+        + probability
+    )
+    pair_beta = (
+        torch.log(pair_survival)
+        - alpha[local[:, 0]]
+        - alpha[local[:, 1]]
+    )
+    beta_reference[local[:, 0], local[:, 1]] = pair_beta
+    beta_reference[local[:, 1], local[:, 0]] = pair_beta
+    lambda_reference = (
+        alpha[local[:, 0]]
+        + alpha[local[:, 1]]
+        + pair_beta
+    )
+    torch.testing.assert_close(
+        result["hand_log_ratio"][0], lambda_reference, atol=2.0e-5, rtol=2.0e-5
+    )
+    reconstructed = torch.einsum(
+        "cr,r,dr->cd",
+        result["beta_eigenvector"][0],
+        result["beta_eigenvalue"][0],
+        result["beta_eigenvector"][0],
+    )
+    torch.testing.assert_close(
+        reconstructed, beta_reference, atol=2.0e-5, rtol=2.0e-5
+    )
+    assert (result["beta_eigenvalue"] < 0).any()
+    assert (result["beta_eigenvalue"] > 0).any()
+
+
+@CUDA
+def test_folded_exact_combo_content_and_two_folder_oracle() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(3, 8.0, 4)
+    machine = PokerStateMachine(geometry)
+    state = machine.initial_roots(
+        1, seed=37, iteration=0, retry_epoch=0, device=device
+    )
+    combo = machine.combo_cards(
+        torch.arange(
+            geometry.private_hands, dtype=torch.int32, device=device
+        )
+    )
+    local = (combo - geometry.first_card).long()
+    first = torch.arange(
+        1,
+        geometry.private_hands + 1,
+        dtype=torch.float32,
+        device=device,
+    )
+    second = torch.flip(first, dims=(0,))
+    ranges = torch.zeros(
+        (1, 3, geometry.private_hands), dtype=torch.float32, device=device
+    )
+    ranges[0, 1] = first
+    ranges[0, 2] = second
+    status = state.status.clone()
+    status[:, 1:] = FOLDED
+    result = folded_statistics(
+        geometry,
+        board_cards=state.board_cards,
+        range_weights=ranges,
+        status=status,
+        combo_cards=combo,
+        beta_rank=geometry.deck_cards,
+        line_dim=4,
+    )
+    p = torch.stack((first / first.sum(), second / second.sum()))
+    disjoint = (
+        local[:, None, :, None]
+        .ne(local[None, :, None, :])
+        .all(-1)
+        .all(-1)
+    )
+    base = torch.einsum("h,g,hg->", p[0], p[1], disjoint.float())
+    for hand in range(0, geometry.private_hands, 17):
+        removed = local[hand]
+        survives = local.ne(removed[0]).all(-1) & local.ne(removed[1]).all(-1)
+        partition = torch.einsum(
+            "h,g,hg->",
+            p[0] * survives,
+            p[1] * survives,
+            disjoint.float(),
+        )
+        torch.testing.assert_close(
+            result["hand_log_ratio"][0, hand],
+            torch.log(partition / base),
+            atol=3.0e-5,
+            rtol=3.0e-5,
+        )
+
+
+@CUDA
+def test_three_loose_folder_estimator_calibrates_to_exact_enumeration() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(4, 8.0, 4)
+    machine = PokerStateMachine(geometry)
+    state = machine.initial_roots(
+        1, seed=41, iteration=0, retry_epoch=0, device=device
+    )
+    combo = machine.combo_cards(
+        torch.arange(
+            geometry.private_hands, dtype=torch.int32, device=device
+        )
+    )
+    local = (combo - geometry.first_card).long()
+    ordinal = torch.arange(
+        geometry.private_hands, dtype=torch.float32, device=device
+    )
+    probability = torch.stack(
+        tuple(
+            1.0 + 0.1 * torch.sin(ordinal * (folder + 1) * 0.07)
+            for folder in range(3)
+        )
+    )
+    probability /= probability.sum(-1, keepdim=True)
+    ranges = torch.zeros(
+        (1, 4, geometry.private_hands), dtype=torch.float32, device=device
+    )
+    ranges[0, 1:] = probability
+    status = state.status.clone()
+    status[:, 1:] = FOLDED
+    result = folded_statistics(
+        geometry,
+        board_cards=state.board_cards,
+        range_weights=ranges,
+        status=status,
+        combo_cards=combo,
+        beta_rank=geometry.deck_cards,
+        line_dim=4,
+    )
+    disjoint = (
+        local[:, None, :, None]
+        .ne(local[None, :, None, :])
+        .all(-1)
+        .all(-1)
+        .float()
+    )
+
+    def exact_partition(weights: torch.Tensor) -> torch.Tensor:
+        return torch.einsum(
+            "h,i,j,hi,hj,ij->",
+            weights[0],
+            weights[1],
+            weights[2],
+            disjoint,
+            disjoint,
+            disjoint,
+        )
+
+    base = exact_partition(probability)
+    for hand in range(0, geometry.private_hands, 17):
+        removed = local[hand]
+        survives = (
+            local.ne(removed[0]).all(-1)
+            & local.ne(removed[1]).all(-1)
+        )
+        oracle = torch.log(
+            exact_partition(probability * survives) / base
+        )
+        torch.testing.assert_close(
+            result["hand_log_ratio"][0, hand],
+            oracle,
+            atol=1.0e-3,
+            rtol=1.0e-3,
+        )
 
 
 @CUDA

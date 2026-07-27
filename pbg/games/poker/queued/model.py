@@ -8,6 +8,7 @@ import torch
 from torch import Tensor, nn
 
 from pbg.queued.learner import ModelEvaluation
+from pbg.queued.contracts import RolloutMode, mode_schema
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.model.capacity import max_public_history_tokens
 from pbg.games.poker.model.postflop import PostflopMasks, PostflopNet
@@ -469,15 +470,14 @@ def build_model_from_config(
     """
 
     mode = scientific.get("mode")
-    expected_mode = {
-        "training_regime": "self_play",
-        "rollout_mode": "sequential",
-        "private_estimator": "sampled",
-    }
-    if not isinstance(mode, Mapping) or dict(mode) != expected_mode:
-        raise ValueError(
-            "scientific.mode must select self_play/sequential/sampled"
-        )
+    if not isinstance(mode, Mapping):
+        raise ValueError("scientific.mode must select a sequential mode")
+    try:
+        schema = mode_schema(**dict(mode))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("scientific.mode is not a closed queued mode") from exc
+    if schema.rollout_mode is not RolloutMode.SEQUENTIAL:
+        raise ValueError("scientific.mode must select sequential rollout")
     game = scientific.get("game")
     model = scientific.get("model")
     if not isinstance(game, Mapping) or not isinstance(model, Mapping):
