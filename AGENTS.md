@@ -28,74 +28,17 @@ as its sole active game.
 
 ## Where to find things
 
-- `docs/theory/`: authoritative mathematics and ultimate source of design choices here. You must ask for explicit approval to modify anything there.
-  `core_math.tex` is the mathematical abstraction, `MHA_model.md` is the model architecture and `pseudocode/` contains multi-GPU training implementation design.
-- `pbg/core/`: generic rollout, branching, value, loss, and training code.
+- `docs/theory/`: authoritative mathematics, you must ask for explicit approval to modify anything there:
+  - `core_math.tex` is the mathematical abstraction, 
+  - `MHA_model.md` is the model architecture
+  - `pseudocode/` is demoted and is to be replaced by `docs/todo/refactor`
+- `pbg/core/`: legacy implementation of generic rollout, branching, value, loss, and training code.
 - `pbg/games/poker/`: NLHE-specific implementation.
-- `archive/synthetic_games/`: inert historical Kuhn/Leduc/synthetic snapshot;
-  it is not importable and is excluded from CI.
 - `tests/`: behavior and contract tests.
 - `/home/pablob/poker-gpu-evaluator/docs/api.md` (read-only rights, you are not authorized to modify that file): binding interface to the sibling poker evaluator. We **have** to use that sibling repo for posterior sampling and Monte Carlo equity/posterior simulations.
-- `IMPLEMENTATION_NOTES.md`: historical implementation ledger; use
-  `docs/audit/` for current readiness and open issues.
 - In Markdown, write math with `$...$` and `$$...$$` rather than `\(...\)` or `\[...\]` so it renders in VS Code.
 
-## Design authority and drift prevention
-
-- `docs/theory/core_math.tex` is authoritative for sampling laws, estimators,
-  targets, losses, and other mathematical semantics. The documents in
-  `docs/theory/pseudocode/` are authoritative for the production implementation
-  philosophy: ownership, storage layout, phase lifetimes, bounded streaming,
-  memory accounting, scheduling, distributed updates, and failure behavior.
-  Production code is not an authority when it conflicts with either source.
-- In particular, preserve the pseudocode's last-consumer storage discipline:
-  allocate from immutable schemas and realized work, retain only data required
-  by a future consumer, seal exact stores explicitly, release phase-local owners
-  at the specified boundary, and bound transient work independently of logical
-  statistical work. Do not replace these invariants with convenient global
-  capacities, replay/recomputation of discarded rollout state, or post-hoc
-  conversion from a larger legacy representation.
-- A refactor that supersedes a production path must make the new path the sole
-  implementation. Migrate all production and evaluation consumers, then delete
-  obsolete implementations, compatibility allocations, configuration fields,
-  tests, and documentation. Do not keep parallel legacy code "for safety"
-  unless the user explicitly approves a narrowly scoped, time-bounded migration.
-- Before changing a core training path, trace the change to the relevant theory
-  and pseudocode contracts. If a requested or proposed change conflicts with
-  them, flag the conflict to the user before implementing it rather than silently
-  drifting. If you discover that existing code has already drifted, surface it
-  explicitly and treat reconciliation or an explicit user decision as part of
-  the task.
-
-## PBG tree terminology and rollout convention
-
-- A PBG public game tree has exactly one distinguished root,
-  $\varnothing$.
-- In branched mode, each GPU samples exactly one labeled rollout tree rooted at
-  $\varnothing$, not a forest. The root is treated by the same branching rule as every other
-  non-pre-terminal node: $N(\varnothing)$ is obtained from the configured
-  intensity by the ordinary randomized-rounding rule. Do not give
-  $\varnothing$ special multiplicity or branch there more aggressively.
-- In sequential mode (normal or Rao-Blackwell), this logic is reversed: only $\varnothing$ has branching.
-
-## Rollout physical queue policy
-
-- Physical rollout queues follow only the game-declared semantic execution
-  families. Never create a queue per poker street, board width, history length,
-  token width, padding bucket, or any cross-product of those properties.
-- Poker uses `pre` and `post_A` families. Flop, turn, and river nodes with the
-  same live-player count $A$ share one `post_A` FIFO.
-- Reduce padding only within the next stable FIFO prefix: choose the largest
-  feasible prefix, or consecutive subspans of it, and use the minimum realized
-  token width that covers each pack. Never skip or reorder older rows to form a
-  more uniform pack.
-- Queue allocation and admission must therefore scale with semantic families,
-  not with poker streets. This policy is required to remain robust as player
-  count grows.
-
 ## Actual Games
-- Kuhn, Leduc, and synthetic games are retired and archived because they are
-  too small for this setup.
 - **NLHE cash poker** is the only active game. It has three per-run dials:
   players $P\in\{2,\ldots,6\}$, equal stack depth $S\in[8,128]$ bb in 0.5 bb
   increments, and the number of highest ranks $R\in\{4,\ldots,13\}$ with all

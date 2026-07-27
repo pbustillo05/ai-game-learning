@@ -1,6 +1,9 @@
 # Queued-training refactor proposals
 
-This folder designs the replacement before theory or production code changes.
+This folder designs the replacement before production code changes. Its
+external authorities are [`core_math.tex`](../../theory/core_math.tex),
+[`MHA_model.md`](../../theory/MHA_model.md), and
+[`folder_impact.md`](../../theory/folder_impact.md).
 [`storage_redesign.md`](storage_redesign.md) defines the storage and lifecycle contract; focused proposals refine its
 game hooks and implementation plan without overriding it:
 
@@ -9,7 +12,13 @@ game hooks and implementation plan without overriding it:
 - [`poker_folded_statistics.md`](poker_folded_statistics.md): folded-state inputs, outputs, and refresh.
 - [`poker_policy_cuda_operator.md`](poker_policy_cuda_operator.md): canonical differentiable policy composition.
 - [`layered_target_creation.md`](layered_target_creation.md): sole layered CUDA target path.
-- [`storage_redesign_refactorability.md`](storage_redesign_refactorability.md): implementation, cleanup, and cutover.
+- [`features_to_preserve.md`](features_to_preserve.md): residual current
+  capabilities not specified by the other proposals.
+- [`implementation_plan.md`](implementation_plan.md): implementation, cleanup, and cutover.
+
+Supporting audit evidence:
+[`replica_learner_parity_and_rb_determinism.md`](../../audit/replica_learner_parity_and_rb_determinism.md) and
+[`nlhe_hu_32bb_family_timing_attribution_20260724.md`](../../audit/nlhe_hu_32bb_family_timing_attribution_20260724.md).
 
 ## Proposed repository boundary
 
@@ -20,13 +29,17 @@ game hooks and implementation plan without overriding it:
 - `FoldedRanges`, folded statistics, policy composition, RNG, and chance-card generation.
 
 `poker-gpu-evaluator` owns the exact `Leaf -> LayerWork` showdown and completion operations involving `hand_rank`.
-This proposal supersedes current ownership notes after the required theory and interface changes are approved.
+This proposal supersedes current ownership notes after the required
+repository-instruction and evaluator-interface changes are approved and
+landed.
 
 ## Configuration and calibration
 
 One common run-level `rollout.beta_max` bounds fixed and adaptive ordinary-node intensity. Ordinary player and chance
 degrees share `N_max = ceil(beta_max)`; no second degree-bound hyperparameter exists.
 Capacities are fixed run hyperparameters. Hardware profiles tune launch shapes, not algorithms.
+`n_replica` adds independent model lanes with shared schema, capacities, estimator, and schedule; only weights, loss
+coefficients, and schema-identical fixed/KKT controller choice and state may differ.
 Initial tuning loads existing checkpoints and captures short RTX 2080 Ti trajectories for `P in {2,6}`;
 experimental outputs belong under `runs/experiments/`.
 Experiments select one implementation; production deletes every alternative.
@@ -36,5 +49,9 @@ Experiments select one implementation; production deletes every alternative.
 - Duplicate-node computation reuse. Duplicate sampled children always keep distinct logical identities and topology
   edges.
 
-The workflow is: finish the design here, approve and update theory/ownership contracts, then implement, test,
-benchmark, select hardware tables, and delete superseded production paths.
+The workflow is: finish and approve the design here; reconcile it with the
+three external authorities and approve the required repository ownership and
+evaluator contract; freeze capacities and matched-work CUDA gates; then
+implement, test, benchmark, select hardware tables, and delete superseded
+production paths. `docs/theory/pseudocode/` is historical design evidence, not
+an authority or implementation gate for this rewrite.

@@ -75,6 +75,9 @@ seat            lane%P
 active lanes    q*P per sampling warp
 ```
 
+With replicas, $B$ concatenates equal-width stable prefixes of one `input_type`; each CTA and every destination it
+reserves keep one replica owner.
+
 | $P$ | $q$ | active lanes |
 |---:|---:|---:|
 | 2 | 16 | 32 |

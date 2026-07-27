@@ -20,6 +20,9 @@ Active audit documents describe the sole production NLHE implementation:
 - [`distributed_learner_reference_cache_20260717.md`](distributed_learner_reference_cache_20260717.md)
   is historical evidence for the bounded learner and reference-cache work; its
   compatibility-path measurements are not current rollout acceptance.
+- [`replica_learner_parity_and_rb_determinism.md`](replica_learner_parity_and_rb_determinism.md)
+  preserves the verified H100 parity findings and deterministic preflop-RB
+  requirements used by the queued-core rewrite.
 - [`sealed_storage_memory_control_20260717.md`](sealed_storage_memory_control_20260717.md)
   is historical evidence for the initially disconnected sealed-storage work.
 - [`migration_cleanup_gpu_acceptance_20260717.md`](migration_cleanup_gpu_acceptance_20260717.md)

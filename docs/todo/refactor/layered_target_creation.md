@@ -16,6 +16,7 @@ Leaf completion
 
 The mathematical reference is `BranchedValue` in `docs/theory/core_math.tex`.
 Sequential execution is the $N=N_{\rm tgt}=\widetilde N=1$ specialization.
+Replica topologies are independent; layer $\ell$ concatenates work from every replica that has layer $\ell$.
 
 No Python loop launches work per node or action. No layer requires a host read or device synchronization.
 CUDA graph capture is not part of the contract.
@@ -56,6 +57,7 @@ LayerPlan
   carry_ptr <layer_count + 1>
 
   node <node_count>
+    replica
     child_begin
     child_count
     destination_work_row
@@ -76,6 +78,7 @@ LayerPlan
     cost_multiplier
 
   carry <carry_count>
+    replica
     source_work_row
     destination_work_row
     output_type
@@ -92,6 +95,8 @@ every action target span uses the same logical-child order
 sigma_head_row == -1 iff owner_slot == -1
 all source rows are live in input arena parity
 all destination rows are distinct in output arena parity
+every child source and node destination has the node's replica
+every carry source and destination has the carry's replica
 leaf child cost_multiplier == 0
 ```
 
@@ -186,7 +191,8 @@ propagate_layer<Mode><<<node_count[ell] + carry_count[ell], block_threads, share
     DeviceFailure)
 ```
 
-All layer launches are enqueued in order from C++/CUDA orchestration. The host does not synchronize between them.
+Counts are summed across replicas; `replica` selects lane-local arenas, heads, targets, and failures. All layer
+launches are enqueued in order from C++/CUDA orchestration without an intervening host synchronization.
 
 CTA assignment:
 
@@ -409,9 +415,9 @@ valid N, N_tgt, N_tilde
 supported conversion
 ```
 
-The minimum failing logical row writes `DeviceFailure`. Later layers may read the flag and return without writes.
-No target array is visible to the learner until the final layer completes and one validation/publication kernel
-succeeds. Failure discards all partial targets.
+The minimum failing logical row per replica writes its `DeviceFailure`. Later layers skip that replica without
+writes. A replica's targets become learner-visible only after its final layer and validation/publication kernel
+succeed; failure discards only its partial targets.
 
 ## 12. Memory and traffic counters
 

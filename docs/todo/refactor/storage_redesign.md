@@ -16,6 +16,11 @@ private_estimator     sampled | rao_blackwell
 
 The $2\times3\times2$ mode row determines fields and behavior. Inapplicable fields are absent.
 
+`n_replica >= 1` adds independent model lanes, not a mode axis. Replicas share all schema-affecting configuration,
+capacities, estimator, and schedule; weights, loss coefficients, and schema-identical fixed/KKT controller choice and
+state are lane-local. Every rank has the same replica IDs and per-ID configuration; `n_replica = 1` is the ordinary
+path.
+
 `root_count >= 1` is an independent batch dimension, not a branching degree. Root row $r$ starts one rollout tree
 with local distinguished root $(r,\varnothing)$ and its own intrinsic fields.
 
@@ -55,6 +60,7 @@ Here `post_A` means postflop with $A$ live players. The estimator defines:
 sampled                output_partition = {all} with size[all] = 1
 rao_blackwell          output_partition = {pre, post} with size[pre] = R^2 and size[post] = 2R(4R-1)
 ```
+We also have a `folded_partition`, which essentially match `output_partition` but is agnostic to `sampled` mode: `folded_partition = {pre, post}`.
 
 ### 1.3 Indexing
 
@@ -83,6 +89,8 @@ CPU owns only compact topology and movement plans; numerical work and bulk stora
 
 All `*_cap` values are fixed run hyperparameters. Each owner uses one aligned SoA arena; every field is contiguous
 over rows. In particular, a stable `FamilyWork[input_type]` prefix is a direct model batch.
+Schemas below omit the leading replica axis: mutable owner `X <cap,...>` is stored as
+`X <n_replica,cap,...>`, and every row reference, tail, RNG state, and failure is lane-local.
 
 Fix `player_node_cap : input_partition -> int`. For each `input_type` and
 $0\leq\sigma<\mathtt{player\_node\_cap[input\_type]}$:
@@ -175,7 +183,7 @@ TopologyChild <topology_edge_cap>
   target_row[e]
 ```
 
-For each `folded_type \in {pre, post}` and folded-range row $f$:
+For each `folded_type` and folded-range row $f$:
 
 ```text
 FoldedRanges[folded_type] <folded_range_cap[folded_type]>
@@ -238,7 +246,14 @@ flowchart LR
 `SigmaHead` copies direct model outputs. `ActionHead` selects the sampled entries of the model action head.
 The GPU does not wait for the topology transfer. The policy tensor is never expanded to child shape.
 
-Only one `model + sample` batch runs at once. Its commit may overlap the next batch:
+Only one replica-grouped `model + sample` batch runs at once. The scheduler selects one `input_type`, an eligible
+lane set, and one common stable-prefix width; model inference is replica-batched and non-autograd kernels flatten
+`(replica,row)`. 
+In particular, in poker, within a batch, we pad tokens minimally to:
+- the largest history in the family batch,
+- the earliest street in the family batch (later streets have board-masked hands and thus need less tokens).
+
+Inactive lanes add neither padding nor RNG draws. Commit may overlap the next batch:
 
 ```text
 model/sample stream:  [model+sample k]       [model+sample k+1]
@@ -311,11 +326,11 @@ Advancing `head` empties queue work. `FamilyWork.hot` and `FamilyWork.retained` 
 align-and-seal.
 Only declared `input_type` families create queues; street, width, and padding properties do not.
 
-Full queues precede partial queues. Within either set, choose the earliest input-type preorder, then greatest
-`(load, age)` for full work or `(fill, age)` for partial work.
+Order candidate lane queues by full before partial, input-type preorder, then greatest `(load, age)` or `(fill, age)`.
+The first candidate fixes `input_type`; choose a compatible cohort and its largest feasible common prefix.
 
 `Leaf` is another FIFO. Bounded calls to `evaluate_showdowns`, `complete`, or `complete_selected` write into
-`LayerWork`; the consumed `Leaf` row then becomes dead.
+`LayerWork`; compatible lane prefixes share an evaluator call, and each consumed `Leaf` row then becomes dead.
 
 Chance closure repeats `sample -> commit` in a bounded device frontier without a host synchronization per generation.
 
@@ -335,10 +350,9 @@ row expands `K -> H` once when materializing `Leaf.range_weights`, because the e
 [`poker_folded_statistics.md`](poker_folded_statistics.md) and
 [`poker_branched_rb_sample.md`](poker_branched_rb_sample.md).
 
-Commit advances every destination tail together after all writes and dependencies succeed. Failure advances none.
-Overflow discards the whole attempt and uses a disjoint RNG address. Sequential recovery reduces `root_count`;
-branched recovery reduces fixed beta or the KKT controller scale. Caps never change. Recovery at minimum controls
-fails the run.
+Commit advances every lane-local destination tail together after all writes and dependencies succeed. A failed lane
+advances none; completed lanes keep their stores. Its retry uses a disjoint RNG address and reduces sequential
+`root_count`, fixed beta, or KKT controller scale. Caps never change. Recovery at minimum controls fails the run.
 Each iteration logs capacity, high-water tail, used rows, overflow extent, retry address, and old/new controls.
 Recovered attempts are reported as control changes, not law-equivalent retries.
 
@@ -354,7 +368,8 @@ DeviceFailure
   sampler_attempt_count
 ```
 
-Concurrent failures resolve to the minimum logical address; all ranks take the same boundary decision.
+Concurrent failures resolve to the minimum logical address per lane; all ranks take the same lane-local boundary
+decision.
 
 ## 3. Seal and Completion
 
@@ -417,6 +432,8 @@ L(\sigma)
 =1+\max_{e:\sigma\to u}L(u),
 \qquad L(\mathtt{Leaf})=0.
 $$
+
+Planning is replica-local; target execution later concatenates equal-numbered layers.
 
 Let `layer_count`, `layered_node_count`, `layered_edge_count`, and `carry_count` be the realized exact counts.
 Shorter branches carry until their parent layer. The CPU emits the exact `LayerPlan` schema in
@@ -487,14 +504,15 @@ Leaf completion
 ```
 
 One CTA owns one parent or carry row. The host enqueues every layer without synchronization. Sequential mode is the
-$N=N_{\rm tgt}=\widetilde N=1$ specialization.
+$N=N_{\rm tgt}=\widetilde N=1$ specialization. Layer $\ell$ combines every replica that has that layer; work,
+destinations, reductions, failures, and publication remain lane-local.
 
 ## 5. Learner
 
 ### 5.1 Sampling
 
 Sequential mode creates one `randperm` per `input_type` and epoch, then chunks it. The same indices gather all five
-aligned arrays.
+aligned arrays. Each replica owns its permutations and draws.
 
 For each non-empty branched learner/input stratum $m$ with $D_m$ rows and each $0\leq d<D_m$:
 
@@ -526,6 +544,14 @@ action_index <E>
 
 Admission bounds both $B$ and $E$. Gather the aligned sigma arrays and, in branched mode, the aligned action spans.
 Run the current model once per sigma, compute the loss, and backward immediately in one bounded workspace.
+
+Each lane invokes this operation through zero-copy parameter and dense FP32-gradient views; replica learning has no
+`vmap`, padding, replay pack, summed loss, or adapter. Equal-shape lane operations may overlap on CUDA streams; dense
+clipping, AdamW, and collectives may vectorize the lane axis. Replicas advance model versions synchronously.
+
+On BF16-capable CUDA, model compute and large model-facing floating storage use BF16 with FP32 accumulation.
+Parameter owners, policy/CDF arithmetic, posterior and target reductions, loss controls, gradients, clipping, and
+AdamW state use explicit FP32 contracts.
 
 ### 5.3 Loss inputs
 
