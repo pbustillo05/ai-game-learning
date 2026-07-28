@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,10 +97,18 @@ class PokerIterationError(RuntimeError):
 
 @dataclass(frozen=True)
 class PokerIterationResult:
-    learner: IterationResult
+    learner: IterationResult | None
     player_nodes: int
     leaves: int
     target_layers: int
+    telemetry: SequentialBenchmarkTelemetry | None = None
+
+
+@dataclass(frozen=True)
+class SequentialBenchmarkTelemetry:
+    """Rollout-only timing emitted solely by an explicit benchmark run."""
+
+    rollout_seconds: float
 
 
 class SequentialPokerIteration:
@@ -130,6 +139,7 @@ class SequentialPokerIteration:
         frozen_operation: ModelOperation | None = None,
         completion_samples: int = 0,
         probe_cutoff: bool = False,
+        benchmark_rollout_only: bool = False,
     ) -> None:
         if owners.plan.mode != mode:
             raise ValueError("poker iteration mode differs from generated owners")
@@ -247,6 +257,9 @@ class SequentialPokerIteration:
         self.reproducibility = reproducibility
         self.run_state = run_state
         self.policy = PokerPolicyOperator()
+        if type(benchmark_rollout_only) is not bool:
+            raise TypeError("benchmark_rollout_only must be bool")
+        self.benchmark_rollout_only = benchmark_rollout_only
 
     @staticmethod
     def _defaults(slab, rows: int) -> dict[str, Tensor]:
@@ -413,6 +426,9 @@ class SequentialPokerIteration:
 
     def run(self, *, iteration: int) -> PokerIterationResult:
         owners = self.owners
+        if self.benchmark_rollout_only:
+            torch.cuda.synchronize(owners.plan.device)
+            rollout_started = time.perf_counter()
         owners.enter_phase(ExecutionPhase.ROLLOUT)
         registry = RolloutOwnerRegistry.from_generated(owners)
         input_names = tuple(
@@ -549,6 +565,28 @@ class SequentialPokerIteration:
             ),
             manifest=owners.plan.manifest,
         )
+        if self.benchmark_rollout_only:
+            torch.cuda.synchronize(owners.plan.device)
+            rollout_seconds = time.perf_counter() - rollout_started
+            owners.release_after(ExecutionPhase.ROLLOUT)
+            for phase in (
+                ExecutionPhase.QUEUE_DRAIN,
+                ExecutionPhase.COMPLETION,
+                ExecutionPhase.ALIGN_AND_SEAL,
+                ExecutionPhase.TARGETS,
+                ExecutionPhase.LEARNER,
+                ExecutionPhase.FINAL_BACKWARD,
+            ):
+                owners.enter_phase(phase)
+                owners.release_after(phase)
+            owners.close()
+            return PokerIterationResult(
+                None,
+                player_nodes=int(topology.owner.ge(0).sum()),
+                leaves=leaf_count,
+                target_layers=plan.layer_count,
+                telemetry=SequentialBenchmarkTelemetry(rollout_seconds),
+            )
         owners.release_after(ExecutionPhase.ROLLOUT)
         del hooks, transaction, topology_publisher, registry, queues
 

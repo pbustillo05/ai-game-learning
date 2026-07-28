@@ -10,8 +10,8 @@ import torch
 
 from pbg.games.poker.queued import (
     BranchedBenchmarkTelemetry,
-    BranchedPosteriorExhaustion,
     BranchedPokerIteration,
+    BranchedPosteriorExhaustion,
     CollisionConditionedProfileSampler,
     NLHEGeometry,
     RejectionObservation,
@@ -31,19 +31,19 @@ from pbg.queued import (
     OptimizerConfig,
     PartitionRows,
     RunState,
+    SequentialBenchmarkSample,
     build_storage_plan,
     convert_legacy_branched_rb,
     mode_schema,
     run_phase8_benchmark,
 )
 from pbg.queued.targets import rb_conversion_library_workspace_bytes
+from tests.test_q05_sequential_sampled_training import _legacy_checkpoint
 from tests.test_q07_branched_sampled_modes import (
     _manifest,
     _phase7_layout,
     _scientific_config,
 )
-from tests.test_q05_sequential_sampled_training import _legacy_checkpoint
-
 
 CUDA = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Phase 8 requires CUDA"
@@ -151,7 +151,15 @@ def test_frozen_phase8_benchmark_surface_enforces_exact_identity() -> None:
         factory,
         revision="phase8-test",
         legacy_peak_allocated_bytes=1_000,
-        sequential_throughput_ratio=1.0,
+        sequential_samples=tuple(
+            SequentialBenchmarkSample(
+                seed=seed,
+                retained_decisions=100,
+                rollout_seconds=0.1,
+                baseline_ms_per_decision=1.0,
+            )
+            for seed in (104830, 209559, 314288)
+        ),
     )
     assert report.passed
     assert tuple(sample.seed for sample in report.samples) == (

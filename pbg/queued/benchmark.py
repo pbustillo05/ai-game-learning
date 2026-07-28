@@ -6,7 +6,6 @@ import statistics
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-
 FROZEN_PHASE8_SEEDS = (104830, 209559, 314288)
 
 
@@ -20,6 +19,9 @@ class Phase8BenchmarkThresholds:
     target_propagation_seconds: float = 0.500
     peak_growth_fraction: float = 0.05
     sequential_regression_fraction: float = 0.10
+
+
+DEFAULT_PHASE8_BENCHMARK_THRESHOLDS = Phase8BenchmarkThresholds()
 
 
 @dataclass(frozen=True)
@@ -45,10 +47,38 @@ class Phase8BenchmarkSample:
 
 
 @dataclass(frozen=True)
+class SequentialBenchmarkSample:
+    """One matched current/baseline sequential-RB rollout measurement."""
+
+    seed: int
+    retained_decisions: int
+    rollout_seconds: float
+    baseline_ms_per_decision: float
+
+    def __post_init__(self) -> None:
+        if (
+            self.seed < 0
+            or self.retained_decisions <= 0
+            or self.rollout_seconds <= 0
+            or self.baseline_ms_per_decision <= 0
+        ):
+            raise ValueError("sequential benchmark sample is invalid")
+
+    @property
+    def rollout_ms_per_decision(self) -> float:
+        return 1000.0 * self.rollout_seconds / self.retained_decisions
+
+    @property
+    def regression_ratio(self) -> float:
+        return self.rollout_ms_per_decision / self.baseline_ms_per_decision
+
+
+@dataclass(frozen=True)
 class Phase8BenchmarkReport:
     revision: str
     identity: Mapping[str, str]
     samples: tuple[Phase8BenchmarkSample, ...]
+    sequential_samples: tuple[SequentialBenchmarkSample, ...]
     medians: Mapping[str, float]
     violations: tuple[str, ...]
 
@@ -119,8 +149,10 @@ def run_phase8_benchmark(
     *,
     revision: str,
     legacy_peak_allocated_bytes: int,
-    sequential_throughput_ratio: float,
-    thresholds: Phase8BenchmarkThresholds = Phase8BenchmarkThresholds(),
+    sequential_samples: tuple[SequentialBenchmarkSample, ...],
+    thresholds: Phase8BenchmarkThresholds = (
+        DEFAULT_PHASE8_BENCHMARK_THRESHOLDS
+    ),
 ) -> Phase8BenchmarkReport:
     """Run and evaluate the exact frozen three-seed queued workload."""
 
@@ -128,8 +160,13 @@ def run_phase8_benchmark(
         raise ValueError("benchmark revision must be nonempty")
     if legacy_peak_allocated_bytes <= 0:
         raise ValueError("legacy peak allocation must be positive")
-    if sequential_throughput_ratio <= 0:
-        raise ValueError("sequential throughput ratio must be positive")
+    if (
+        tuple(sample.seed for sample in sequential_samples)
+        != FROZEN_PHASE8_SEEDS
+    ):
+        raise ValueError(
+            "sequential benchmark must measure every frozen seed in order"
+        )
     samples: list[Phase8BenchmarkSample] = []
     resolved_identity: Mapping[str, str] | None = None
     for seed in FROZEN_PHASE8_SEEDS:
@@ -199,7 +236,9 @@ def run_phase8_benchmark(
         "peak_allocated_bytes": statistics.median(
             sample.peak_allocated_bytes for sample in samples
         ),
-        "sequential_throughput_ratio": sequential_throughput_ratio,
+        "sequential_throughput_ratio": statistics.median(
+            sample.regression_ratio for sample in sequential_samples
+        ),
     }
     comparisons = (
         (
@@ -242,15 +281,18 @@ def run_phase8_benchmark(
         revision=revision,
         identity={} if resolved_identity is None else resolved_identity,
         samples=tuple(samples),
+        sequential_samples=sequential_samples,
         medians=values,
         violations=violations,
     )
 
 
 __all__ = [
+    "DEFAULT_PHASE8_BENCHMARK_THRESHOLDS",
     "FROZEN_PHASE8_SEEDS",
     "Phase8BenchmarkReport",
     "Phase8BenchmarkSample",
     "Phase8BenchmarkThresholds",
+    "SequentialBenchmarkSample",
     "run_phase8_benchmark",
 ]

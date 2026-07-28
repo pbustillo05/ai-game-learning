@@ -23,6 +23,7 @@ from pbg.queued.benchmark import (
     Phase8BenchmarkReport,
     Phase8BenchmarkSample,
     Phase8BenchmarkThresholds,
+    SequentialBenchmarkSample,
     run_phase8_benchmark,
 )
 from pbg.queued.capacity import (
@@ -309,6 +310,7 @@ __all__ = [
     "Phase8BenchmarkReport",
     "Phase8BenchmarkSample",
     "Phase8BenchmarkThresholds",
+    "SequentialBenchmarkSample",
     "PersistenceError",
     "Phase5Config",
     "Phase5GameConfig",

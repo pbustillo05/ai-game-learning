@@ -1,0 +1,42 @@
+{
+  "schema": "pbg.phase8.sequential-rb-baseline.v1",
+  "source": {
+    "artifact": "runs/experiments/nlhe_hu_32bb_rollout_diagnosis_20260724/summary.json",
+    "sha256": "7d3961b852d1e3be1d123b0304e7488b07e87d72535da6b2769951404bb43797",
+    "git_head": "c5cfd27a877c7e1a2aee9ebfe30723090874fe07",
+    "checkpoint_sha256": "854c449b3b55a158d0fe97533b75cd1ca3d98262ee31cafd95a657b6abfaaa28"
+  },
+  "workload": {
+    "game": "nlhe",
+    "players": 2,
+    "stack_bb": 32.0,
+    "rank_count": 13,
+    "mode": "sequential",
+    "private_estimator": "rao_blackwell",
+    "roots": 3072,
+    "completion_samples": 1024,
+    "warmup": 1,
+    "timed_seed_offset": 104729,
+    "timed_repeats": 1
+  },
+  "samples": [
+    {
+      "seed": 104830,
+      "retained_decisions": 12560,
+      "rollout_seconds": 48.5800514210714,
+      "rollout_ms_per_decision": 3.8678384889388058
+    },
+    {
+      "seed": 209559,
+      "retained_decisions": 11884,
+      "rollout_seconds": 47.13943480490707,
+      "rollout_ms_per_decision": 3.9666303269023113
+    },
+    {
+      "seed": 314288,
+      "retained_decisions": 12428,
+      "rollout_seconds": 49.91762583097443,
+      "rollout_ms_per_decision": 4.016545367796462
+    }
+  ]
+}
