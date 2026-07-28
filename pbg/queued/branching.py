@@ -17,6 +17,7 @@ from types import MappingProxyType
 from typing import Generic, Protocol, TypeVar
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 
 from pbg.queued.contracts import ModeSchema, RolloutMode
@@ -702,11 +703,15 @@ class BranchedRecoveryRecord:
 
 @dataclass(frozen=True)
 class RankCommonFailureAgreement:
-    """Choose one deterministic overflow on every participating rank."""
+    """All-rank attempt boundary with deterministic minimum overflow."""
 
     world_size: int = 1
     collect: (
-        Callable[[RecoverableOverflow], Sequence[RecoverableOverflow]] | None
+        Callable[
+            [RecoverableOverflow | None],
+            Sequence[RecoverableOverflow | None],
+        ]
+        | None
     ) = None
 
     def __post_init__(self) -> None:
@@ -718,20 +723,59 @@ class RankCommonFailureAgreement:
         ):
             raise ValueError("rank failure agreement ownership is invalid")
 
-    def agree(self, local: RecoverableOverflow) -> RecoverableOverflow:
+    @classmethod
+    def from_runtime(cls) -> RankCommonFailureAgreement:
+        if not dist.is_available() or not dist.is_initialized():
+            return cls()
+        world_size = dist.get_world_size()
+
+        def collect(
+            local: RecoverableOverflow | None,
+        ) -> Sequence[RecoverableOverflow | None]:
+            wire = (
+                None
+                if local is None
+                else (
+                    local.failure,
+                    local.capacity,
+                    local.observed_demand,
+                )
+            )
+            gathered: list[object | None] = [None for _ in range(world_size)]
+            dist.all_gather_object(gathered, wire)
+            return tuple(
+                None
+                if item is None
+                else RecoverableOverflow(
+                    item[0],  # type: ignore[index]
+                    capacity=item[1],  # type: ignore[index]
+                    observed_demand=item[2],  # type: ignore[index]
+                )
+                for item in gathered
+            )
+
+        return cls(world_size=world_size, collect=collect)
+
+    def agree(
+        self, local: RecoverableOverflow | None
+    ) -> RecoverableOverflow | None:
         failures = (
             (local,)
             if self.world_size == 1
             else tuple(self.collect(local))  # type: ignore[misc]
         )
         if len(failures) != self.world_size or any(
-            not isinstance(item, RecoverableOverflow) for item in failures
+            item is not None and not isinstance(item, RecoverableOverflow)
+            for item in failures
         ):
             raise BranchingError(
                 "rank failure agreement returned an invalid rank set"
             )
+        present = tuple(item for item in failures if item is not None)
+        if not present:
+            return None
         return min(
-            failures,
+            present,
             key=lambda item: (
                 item.failure.logical_address,
                 item.failure.phase,
@@ -763,7 +807,7 @@ class BranchedOverflowRecovery(Generic[AttemptResult]):
         self.run_state = run_state
         self.logger = logging.getLogger(__name__) if logger is None else logger
         self.rank_agreement = (
-            RankCommonFailureAgreement()
+            RankCommonFailureAgreement.from_runtime()
             if rank_agreement is None
             else rank_agreement
         )
@@ -771,56 +815,92 @@ class BranchedOverflowRecovery(Generic[AttemptResult]):
     def run(
         self,
         attempt: Callable[[AttemptAddress], AttemptResult],
-        discard: Callable[[RecoverableOverflow], None],
+        discard: Callable[[RecoverableOverflow | None], None],
+        *,
+        agreement_in_attempt: bool = False,
     ) -> AttemptResult:
         epoch = self.run_state.retry_epoch
         logical_base = self.run_state.attempt_logical_base
         while True:
             address = AttemptAddress(epoch, logical_base)
+            result: AttemptResult | None = None
+            local_failure: RecoverableOverflow | None = None
+            rank_agreed = False
             try:
-                return attempt(address)
-            except RecoverableOverflow as local:
-                failure = self.rank_agreement.agree(local)
+                result = attempt(address)
+            except RecoverableOverflow as caught:
+                # Strip the traceback before releasing the failed owner. The
+                # collective and replacement allocation retain only the small
+                # immutable diagnostic record.
+                local_failure = RecoverableOverflow(
+                    caught.failure,
+                    capacity=caught.capacity,
+                    observed_demand=caught.observed_demand,
+                )
+                rank_agreed = bool(
+                    getattr(caught, "_rank_agreed", False)
+                )
+                caught = None
+                discard(local_failure)
+            failure = (
+                local_failure
+                if rank_agreed
+                else (
+                    None
+                    if agreement_in_attempt and result is not None
+                    else self.rank_agreement.agree(local_failure)
+                )
+            )
+            if failure is None:
+                if result is None:
+                    raise BranchingError(
+                        "rank agreement lost a local overflow"
+                    )
+                return result
+            if local_failure is None:
                 discard(failure)
-                if self.controller.at_minimum:
-                    raise TrainingError(
-                        "minimum branched control overflowed fixed capacity"
-                    ) from failure
-                old = self.controller.state_dict()
-                self.controller.backoff()
-                new = self.controller.state_dict()
-                replacement = AttemptAddress(
-                    epoch + 1,
-                    logical_base + self.run_state.root_count,
-                )
-                record = BranchedRecoveryRecord(
-                    severity="critical",
-                    iteration=self.iteration,
-                    replica=self.replica,
-                    failed_phase=failure.failure.phase,
-                    failed_address=AttemptAddress(
-                        epoch, failure.failure.logical_address
-                    ).as_text(),
-                    replacement_address=replacement.as_text(),
-                    old_control=old,
-                    new_control=new,
-                    capacity=failure.capacity,
-                    observed_demand=failure.observed_demand,
-                )
-                self.run_state.recovered_overflow = True
-                self.run_state.retry_epoch = replacement.retry_epoch
-                self.run_state.attempt_logical_base = replacement.logical_base
-                self.run_state.branch_controller_state = new
-                self.run_state.overflow_recoveries.append(record.as_dict())
-                payload = json.dumps(record.as_dict(), sort_keys=True)
-                self.logger.critical("RECOVERED_BRANCHED_OVERFLOW %s", payload)
-                warnings.warn(
-                    f"RECOVERED_BRANCHED_OVERFLOW {payload}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                epoch = replacement.retry_epoch
-                logical_base = replacement.logical_base
+            result = None
+            local_failure = None
+            if self.controller.at_minimum:
+                raise TrainingError(
+                    "minimum branched control overflowed fixed capacity"
+                ) from failure
+            old = self.controller.state_dict()
+            self.controller.backoff()
+            new = self.controller.state_dict()
+            replacement = AttemptAddress(
+                epoch + 1,
+                logical_base + self.run_state.root_count,
+            )
+            record = BranchedRecoveryRecord(
+                severity="critical",
+                iteration=self.iteration,
+                replica=self.replica,
+                failed_phase=failure.failure.phase,
+                failed_address=AttemptAddress(
+                    epoch, failure.failure.logical_address
+                ).as_text(),
+                replacement_address=replacement.as_text(),
+                old_control=old,
+                new_control=new,
+                capacity=failure.capacity,
+                observed_demand=failure.observed_demand,
+            )
+            self.run_state.recovered_overflow = True
+            self.run_state.retry_epoch = replacement.retry_epoch
+            self.run_state.attempt_logical_base = replacement.logical_base
+            self.run_state.branch_controller_state = new
+            self.run_state.overflow_recoveries.append(record.as_dict())
+            payload = json.dumps(record.as_dict(), sort_keys=True)
+            self.logger.critical("RECOVERED_BRANCHED_OVERFLOW %s", payload)
+            warnings.warn(
+                f"RECOVERED_BRANCHED_OVERFLOW {payload}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            epoch = replacement.retry_epoch
+            logical_base = replacement.logical_base
+            failure = None
 
 
 __all__ = [

@@ -1357,8 +1357,11 @@ class AsyncTopologyPublisher:
         ] = {}
         self._branched_pending: list[_PendingDeferredBranched] = []
         self._branched_accepted: dict[tuple[int, int], object] = {}
-        self._branched_reserved_nodes = 0
-        self._branched_reserved_edges = 0
+        self._branched_success_buffer = torch.empty(
+            owners.topology_cap,
+            dtype=torch.bool,
+            pin_memory=True,
+        )
 
     @staticmethod
     def _key(publication: TopologyPublication) -> tuple[int, int]:
@@ -1399,17 +1402,17 @@ class AsyncTopologyPublisher:
         if key in self._branched_staged:
             raise TopologyError("duplicate deferred branched topology sequence")
         if (
-            self._branched_reserved_nodes + publication.declared_nodes
-            > self.owners.topology_cap + self.owners.topology_edge_cap
-            or self._branched_reserved_edges + publication.declared_edges
-            > self.owners.topology_edge_cap
+            publication.declared_nodes + publication.declared_edges
+            > self.owners.topology_packet_cap
         ):
             raise TopologyError(
-                "deferred branched topology exceeds its fixed cumulative cap"
+                "deferred branched topology exceeds its fixed packet cap"
+            )
+        if publication.sequence >= self._branched_success_buffer.numel():
+            raise TopologyError(
+                "deferred branched topology exceeds its sequence arena"
             )
         self._branched_staged[key] = publication
-        self._branched_reserved_nodes += publication.declared_nodes
-        self._branched_reserved_edges += publication.declared_edges
 
     def finalize_branched(
         self,
@@ -1421,7 +1424,7 @@ class AsyncTopologyPublisher:
         key = (publication.lane, publication.sequence)
         if self._branched_staged.get(key) is not publication:
             raise TopologyError("deferred branched topology was not staged")
-        host_success = torch.empty((), dtype=torch.bool, pin_memory=True)
+        host_success = self._branched_success_buffer[publication.sequence]
         host_success.copy_(success[publication.lane], non_blocking=True)
         event = torch.cuda.Event(blocking=False)
         event.record(stream)
@@ -1478,7 +1481,7 @@ class AsyncTopologyPublisher:
         self._accept_branched_ready()
         key = (publication.lane, publication.sequence)
         if key in self._branched_accepted:
-            return False, self._branched_accepted[key]
+            return False, self._branched_accepted.pop(key)
         if key not in self._branched_staged:
             return True, None
         return None

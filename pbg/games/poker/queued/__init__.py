@@ -51,7 +51,6 @@ from pbg.games.poker.queued.branching import (
     BranchedSampledPokerHooks,
     BranchedSampledPokerIteration,
     BranchedTopologyRecorder,
-    RecoveringBranchedSampledPokerIteration,
 )
 
 __all__ = [
@@ -82,7 +81,6 @@ __all__ = [
     "QueuedPokerError",
     "SampledShowdownBinding",
     "RBCompletionBinding",
-    "RecoveringBranchedSampledPokerIteration",
     "SequentialPokerHooks",
     "SequentialSampledPokerHooks",
     "SequentialPokerIteration",

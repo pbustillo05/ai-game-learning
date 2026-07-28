@@ -10,9 +10,14 @@ import torch
 from torch import nn
 
 from pbg.games.poker.queued import (
-    BranchedSampledPokerIteration,
+    BranchedSampledPokerIteration as PublicBranchedSampledPokerIteration,
+)
+from pbg.games.poker.queued import (
     NLHEGeometry,
     sampled_partitions,
+)
+from pbg.games.poker.queued.branching import (
+    _BranchedSampledPokerAttempt as BranchedSampledPokerIteration,
 )
 from pbg.games.poker.queued.branching import _discard_attempt
 from pbg.queued import (
@@ -47,6 +52,7 @@ from pbg.queued import (
     randomized_round,
     save_checkpoint,
 )
+from pbg.queued.learner import _alias_table
 from pbg.queued.rollout import (
     AsyncTopologyPublisher,
     DeferredBranchedTopologyPublication,
@@ -67,6 +73,7 @@ class _BranchedModel(_EndToEndPokerModel):
         super().__init__(device, hands, check_down=True)
         self.trace_logit = nn.Parameter(torch.tensor(0.2, device=device))
         self.cost_logit = nn.Parameter(torch.tensor(0.1, device=device))
+        self.no_grad_batch_sizes: list[int] = []
 
     def evaluate(
         self,
@@ -75,6 +82,8 @@ class _BranchedModel(_EndToEndPokerModel):
         private: torch.Tensor,
         owner: torch.Tensor,
     ) -> ModelEvaluation:
+        if not torch.is_grad_enabled():
+            self.no_grad_batch_sizes.append(int(model_input.shape[0]))
         ordinary = super().evaluate(input_type, model_input, private, owner)
         batch = model_input.shape[0]
         return ModelEvaluation(
@@ -259,6 +268,30 @@ def test_rounding_and_kkt_path_math_match_direct_fp32_references() -> None:
 
 
 @CUDA
+def test_cuda_alias_table_preserves_log_mass_without_cpu_underflow() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    log_weight = torch.tensor(
+        [-1000.0, -3.0, -1.0, 0.0],
+        dtype=torch.float64,
+        device=device,
+    )
+    threshold, alias = _alias_table(log_weight)
+    rows = log_weight.numel()
+    observed = threshold / rows
+    observed.scatter_add_(
+        0,
+        alias.to(torch.int64),
+        (1 - threshold) / rows,
+    )
+    torch.testing.assert_close(
+        observed,
+        torch.softmax(log_weight, 0),
+        atol=1.0e-15,
+        rtol=1.0e-12,
+    )
+
+
+@CUDA
 def test_fixed_and_kkt_share_decision_contract_and_round_the_root() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     root = torch.tensor([0, 1, 2, 3], dtype=torch.int64, device=device)
@@ -424,6 +457,11 @@ def test_whole_attempt_backoff_is_disjoint_and_other_failures_terminate() -> Non
     )
     assert agreement.agree(local) is remote
     assert agreement.agree(remote) is remote
+    rounds = iter(((local, remote), (None, None)))
+    agreement = RankCommonFailureAgreement(
+        world_size=2,
+        collect=lambda _local: next(rounds),
+    )
     recovery = BranchedOverflowRecovery(
         iteration=5,
         replica=0,
@@ -434,7 +472,7 @@ def test_whole_attempt_backoff_is_disjoint_and_other_failures_terminate() -> Non
     with pytest.warns(RuntimeWarning, match="RECOVERED_BRANCHED_OVERFLOW"):
         assert recovery.run(attempt, discarded.append) == "committed"
     assert len(discarded) == 1
-    assert discarded[0].failure.logical_address == 7
+    assert discarded[0].failure.logical_address == 19
     assert calls[1].retry_epoch == calls[0].retry_epoch + 1
     assert calls[1].logical_base == calls[0].logical_base + 3
     assert run.branch_controller_state == controller.state_dict()
@@ -444,6 +482,34 @@ def test_whole_attempt_backoff_is_disjoint_and_other_failures_terminate() -> Non
             lambda _address: (_ for _ in ()).throw(RuntimeError("terminal")),
             discarded.append,
         )
+
+    healthy_discards = []
+    healthy_rounds = iter(((None, remote), (None, None)))
+    healthy_recovery = BranchedOverflowRecovery(
+        iteration=6,
+        replica=0,
+        controller=FixedBranchController(
+            {"player": 2.0, "chance": 1.0},
+            2,
+            minimum_scale=0.25,
+        ),
+        run_state=RunState("phase7-healthy-rank", root_count=1),
+        rank_agreement=RankCommonFailureAgreement(
+            world_size=2,
+            collect=lambda _local: next(healthy_rounds),
+        ),
+    )
+    healthy_calls = []
+    with pytest.warns(RuntimeWarning, match="RECOVERED_BRANCHED_OVERFLOW"):
+        assert (
+            healthy_recovery.run(
+                lambda address: healthy_calls.append(address) or "committed",
+                healthy_discards.append,
+            )
+            == "committed"
+        )
+    assert len(healthy_calls) == 2
+    assert healthy_discards == [remote]
 
 
 @CUDA
@@ -745,6 +811,8 @@ def test_multi_pack_roots_use_complete_frontier_cost_forecast() -> None:
         cost_safeguard=safeguard,
     ).run(iteration=0)
     assert result.root_executed_degree == (1, 1, 1)
+    assert model.no_grad_batch_sizes
+    assert max(model.no_grad_batch_sizes) <= 1
 
 
 @CUDA
@@ -914,25 +982,28 @@ def test_four_sampled_branched_modes_complete_optimizer_step(
     )
     optimizer = DenseAdam(model, OptimizerConfig(name="adamw", grad_clip=5))
     run_state = RunState(f"phase7-{regime}-{rollout}", root_count=1)
-    result = BranchedSampledPokerIteration(
-        geometry=geometry,
-        owners=GeneratedOwners(plan),
-        mode=mode,
+    result = PublicBranchedSampledPokerIteration(
+        owner_factory=lambda: GeneratedOwners(plan),
+        plan=plan,
         controller=controller,
-        model=model,
-        model_operation=model.evaluate,
-        frozen_operation=None if frozen is None else frozen.evaluate,
-        optimizer=optimizer,
-        loss=LossConfig(
-            reference_kl_coefficient=0,
-            trace_coefficient=0.1,
-            cost_coefficient=0.1,
-        ),
-        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
-        generator=torch.Generator(device=device).manual_seed(991),
-        seed=991,
-        lambda_=0.95,
         run_state=run_state,
+        arguments={
+            "geometry": geometry,
+            "mode": mode,
+            "model": model,
+            "model_operation": model.evaluate,
+            "frozen_operation": None if frozen is None else frozen.evaluate,
+            "optimizer": optimizer,
+            "loss": LossConfig(
+                reference_kl_coefficient=0,
+                trace_coefficient=0.1,
+                cost_coefficient=0.1,
+            ),
+            "schedule": LearnerSchedule(batch_size=2, gradient_steps=1),
+            "generator": torch.Generator(device=device).manual_seed(991),
+            "seed": 991,
+            "lambda_": 0.95,
+        },
     ).run(iteration=0)
     assert result.player_nodes > 8
     assert result.executed_edges > result.player_nodes

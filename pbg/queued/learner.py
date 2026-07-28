@@ -10,6 +10,7 @@ backward.
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -728,7 +729,7 @@ class BranchedLearnerBatch:
     action_fields: Mapping[str, Tensor]
     logical_step: int = 0
     logical_rows: int | None = None
-    statistical_weight: float | None = None
+    statistical_weight: float | Tensor | None = None
 
     def __post_init__(self) -> None:
         device = self.sigma_index.device
@@ -767,7 +768,7 @@ class BranchedLearnerBatch:
         return self.rows if self.logical_rows is None else self.logical_rows
 
     @property
-    def objective_weight(self) -> float:
+    def objective_weight(self) -> float | Tensor:
         return (
             self.rows / self.objective_rows
             if self.statistical_weight is None
@@ -951,7 +952,12 @@ class RaggedBranchedStore:
         self.rows = sealed_inputs.rows
         self.device = owners.plan.device
 
-    def gather(self, sigma_index: Tensor) -> BranchedLearnerBatch:
+    def gather(
+        self,
+        sigma_index: Tensor,
+        *,
+        expected_action_rows: int,
+    ) -> BranchedLearnerBatch:
         if (
             sigma_index.device != self.device
             or sigma_index.dtype not in (torch.int32, torch.int64)
@@ -960,6 +966,12 @@ class RaggedBranchedStore:
         ):
             raise LearnerError("branched sigma indices must be CUDA integers")
         selected = sigma_index.to(torch.int64)
+        if (
+            isinstance(expected_action_rows, bool)
+            or not isinstance(expected_action_rows, int)
+            or expected_action_rows <= 0
+        ):
+            raise LearnerError("expected ragged action extent must be positive")
         torch._assert_async(
             (selected.ge(0) & selected.lt(self.rows)).all(),
             "branched sigma index is outside its sealed extent",
@@ -973,10 +985,20 @@ class RaggedBranchedStore:
                 count.cumsum(0),
             )
         )
-        action_index = torch.repeat_interleave(begin, count)
+        action_index = torch.repeat_interleave(
+            begin,
+            count,
+            output_size=expected_action_rows,
+        )
         action_index += torch.arange(
-            int(ptr[-1]), dtype=torch.int64, device=self.device
-        ) - torch.repeat_interleave(ptr[:-1], count)
+            expected_action_rows,
+            dtype=torch.int64,
+            device=self.device,
+        ) - torch.repeat_interleave(
+            ptr[:-1],
+            count,
+            output_size=expected_action_rows,
+        )
         sigma_fields: dict[str, Tensor] = {
             name: value[selected]
             for name, value in index.items()
@@ -1003,27 +1025,46 @@ class RaggedBranchedStore:
         )
 
 
-def _alias_table(weights: Tensor) -> tuple[Tensor, Tensor]:
-    """Build one deterministic Walker alias table in float64."""
+def _alias_table(log_weights: Tensor) -> tuple[Tensor, Tensor]:
+    """Build one deterministic Walker table entirely on CUDA in float64."""
 
-    if weights.ndim != 1 or weights.numel() == 0:
-        raise LearnerError("alias weights must be a nonempty vector")
-    work = weights.detach().double().cpu()
-    if not bool(torch.isfinite(work).all()) or bool((work <= 0).any()):
-        raise LearnerError("alias weights must be finite and positive")
-    scaled = work * work.numel() / work.sum()
+    if (
+        log_weights.device.type != "cuda"
+        or log_weights.ndim != 1
+        or log_weights.numel() == 0
+    ):
+        raise LearnerError("alias log weights must be a nonempty CUDA vector")
+    work = log_weights.detach().double()
+    torch._assert_async(
+        torch.isfinite(work).all(), "alias log weights must be finite"
+    )
+    size = work.numel()
+    scaled = torch.exp(work - torch.logsumexp(work, 0)) * size
     probability = torch.ones_like(scaled)
-    alias = torch.arange(work.numel(), dtype=torch.int32)
-    small = [index for index, value in enumerate(scaled.tolist()) if value < 1]
-    large = [index for index, value in enumerate(scaled.tolist()) if value >= 1]
-    while small and large:
-        low = small.pop()
-        high = large.pop()
-        probability[low] = scaled[low]
-        alias[low] = high
-        scaled[high] = scaled[high] - (1 - scaled[low])
-        (small if scaled[high] < 1 else large).append(high)
-    return probability.to(weights.device), alias.to(weights.device)
+    alias = torch.arange(size, dtype=torch.int32, device=work.device)
+    indices = torch.arange(size, dtype=torch.int64, device=work.device)
+    live = torch.ones(size, dtype=torch.bool, device=work.device)
+    # A fixed N-step device program implements deterministic LIFO Walker
+    # pairing. Tensor scalar indices remain on the accelerator.
+    for _ in range(size):
+        small = live & scaled.lt(1)
+        large = live & ~small
+        low = torch.where(small, indices, -1).argmax()
+        high = torch.where(large, indices, -1).argmax()
+        active = small.any() & large.any()
+        low_mask = indices.eq(low) & active
+        high_mask = indices.eq(high) & active
+        low_value = scaled.gather(0, low.reshape(1)).squeeze(0)
+        high_value = scaled.gather(0, high.reshape(1)).squeeze(0)
+        probability = torch.where(low_mask, low_value, probability)
+        alias = torch.where(low_mask, high.to(torch.int32), alias)
+        scaled = torch.where(
+            high_mask,
+            high_value - (1 - low_value),
+            scaled,
+        )
+        live = live & ~low_mask
+    return probability, alias
 
 
 class BranchedBatchSampler:
@@ -1047,19 +1088,20 @@ class BranchedBatchSampler:
         devices = {store.device for store in stores.values()}
         if len(devices) != 1 or generator.device != next(iter(devices)):
             raise LearnerError("branched sampler must remain on one CUDA device")
-        weights = {
+        log_weights = {
             name: store.sealed_inputs.columns[
                 "log_sampling_weight"
-            ].double().exp()
+            ].double()
             for name, store in stores.items()
         }
         self.log_Z = MappingProxyType(
-            {name: value.sum().log() for name, value in weights.items()}
+            {name: torch.logsumexp(value, 0) for name, value in log_weights.items()}
         )
         self.alias = MappingProxyType(
-            {name: _alias_table(value) for name, value in weights.items()}
+            {name: _alias_table(value) for name, value in log_weights.items()}
         )
-        mass = torch.stack(tuple(value.exp() for value in self.log_Z.values()))
+        log_mass = torch.stack(tuple(self.log_Z.values()))
+        mass = torch.softmax(log_mass, 0)
         self.stratum_probability = MappingProxyType(
             {
                 name: mass[index] / mass.sum()
@@ -1067,14 +1109,39 @@ class BranchedBatchSampler:
             }
         )
         if statistical_counts is None:
-            allocated = allocate_statistical_counts(
-                mass.cpu(),
-                torch.ones(mass.numel(), dtype=torch.float64),
-                torch.ones(mass.numel(), dtype=torch.float64),
-                schedule.batch_size,
+            stratum_count = mass.numel()
+            if schedule.batch_size < stratum_count:
+                raise LearnerError(
+                    "branched batch size cannot cover every stratum"
+                )
+            remaining = schedule.batch_size - stratum_count
+            raw = mass * remaining
+            extra = raw.floor().to(torch.int64)
+            leftover = remaining - extra.sum()
+            order = torch.argsort(
+                raw - extra,
+                descending=True,
+                stable=True,
             )
+            rank = torch.empty_like(order)
+            rank.scatter_(
+                0,
+                order,
+                torch.arange(stratum_count, device=mass.device),
+            )
+            allocated = 1 + extra + rank.lt(leftover)
+            host_allocated = torch.empty(
+                stratum_count,
+                dtype=torch.int64,
+                pin_memory=True,
+            )
+            host_allocated.copy_(allocated, non_blocking=True)
+            ready = torch.cuda.Event(blocking=False)
+            ready.record(torch.cuda.current_stream(mass.device))
+            while not ready.query():
+                time.sleep(0)
             statistical_counts = {
-                name: int(allocated[index])
+                name: int(host_allocated[index])
                 for index, name in enumerate(stores)
             }
         if set(statistical_counts) != set(stores) or any(
@@ -1165,7 +1232,8 @@ class BranchedBatchSampler:
                         actions += next_actions
                         take += 1
                     gathered = self.stores[name].gather(
-                        draw[emitted : emitted + take]
+                        draw[emitted : emitted + take],
+                        expected_action_rows=actions,
                     )
                     yield BranchedLearnerBatch(
                         gathered.input_type,
@@ -1177,9 +1245,7 @@ class BranchedBatchSampler:
                         logical_step=logical_step,
                         logical_rows=logical_rows,
                         statistical_weight=(
-                            float(self.stratum_probability[name])
-                            * take
-                            / requested
+                            self.stratum_probability[name] * (take / requested)
                         ),
                     )
                     emitted += take
@@ -1281,7 +1347,7 @@ class LearnerOperation:
         reference_operation: ModelOperation | None = None,
         reference_cache: ReferenceOutputCache | None = None,
         loss_scale: float = 1.0,
-        objective_weight: float = 1.0,
+        objective_weight: float | Tensor = 1.0,
     ) -> LossResult:
         if self.mode.rollout_mode.is_branched:
             if not isinstance(batch, BranchedLearnerBatch):
@@ -1505,7 +1571,7 @@ class LearnerOperation:
         iteration: int,
         reference_operation: ModelOperation | None,
         loss_scale: float,
-        objective_weight: float,
+        objective_weight: float | Tensor,
     ) -> LossResult:
         if self.mode.private_estimator is not PrivateEstimator.SAMPLED:
             raise LearnerError("Phase 7 branched learner requires sampled mode")
@@ -1519,6 +1585,7 @@ class LearnerOperation:
         action_to_sigma = torch.repeat_interleave(
             torch.arange(batch.rows, device=batch.sigma_index.device),
             counts,
+            output_size=batch.action_rows,
         )
         autocast_dtype = {
             "fp32": torch.float32,
@@ -1703,7 +1770,24 @@ class LearnerOperation:
         )
         if self.precision != "fp16" and not torch.isfinite(total):
             raise LearnerError("branched learner loss is nonfinite")
-        if not math.isfinite(objective_weight) or not 0 < objective_weight <= 1:
+        if isinstance(objective_weight, Tensor):
+            if (
+                objective_weight.device != batch.sigma_index.device
+                or objective_weight.numel() != 1
+            ):
+                raise LearnerError(
+                    "physical objective weight must be one device scalar"
+                )
+            torch._assert_async(
+                torch.isfinite(objective_weight)
+                & objective_weight.gt(0)
+                & objective_weight.le(1),
+                "physical objective weight must lie in (0,1]",
+            )
+        elif (
+            not math.isfinite(objective_weight)
+            or not 0 < objective_weight <= 1
+        ):
             raise LearnerError("physical objective weight must lie in (0,1]")
         (total * float(loss_scale) * objective_weight).backward()
         return LossResult(

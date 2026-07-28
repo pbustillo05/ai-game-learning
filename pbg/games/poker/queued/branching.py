@@ -69,6 +69,7 @@ from pbg.queued.rollout import (
 )
 from pbg.queued.storage import (
     DeviceDestinationRequest,
+    DeviceFailure,
     MonotoneSlab,
     PublicationTransaction,
 )
@@ -90,6 +91,17 @@ class BranchedPokerError(RuntimeError):
     """The sampled branched poker composition violated its contract."""
 
 
+class BranchedTopologyArenaOverflow(BranchedPokerError):
+    """A compact rollout packet or cumulative topology exceeded admission."""
+
+    def __init__(self, *, capacity: int, observed_demand: int) -> None:
+        self.capacity = int(capacity)
+        self.observed_demand = int(observed_demand)
+        super().__init__(
+            "branched compact topology exceeded its fixed admitted arena"
+        )
+
+
 @dataclass(frozen=True)
 class BranchedPokerResult:
     learner: object
@@ -105,6 +117,8 @@ class BranchedPokerResult:
 
 @dataclass(frozen=True)
 class _ExpansionRecord:
+    node_active: Tensor
+    edge_active: Tensor
     parent_key: Tensor
     child_key: Tensor
     source_ordinal: Tensor
@@ -128,9 +142,36 @@ class _ExpansionRecord:
 @dataclass(frozen=True)
 class _StagedBranchedPayload:
     records: tuple[_ExpansionRecord, ...]
-    produced: tuple[int, ...]
+    produced: Tensor
     sampled_nodes: Tensor
     counterfactual_correction: Tensor
+    node_count: Tensor
+    edge_count: Tensor
+    overflow: Tensor
+    observed_demand: Tensor
+
+
+@dataclass
+class _CompactEdge:
+    label: int
+    path_length: int
+    terminal: bool
+    child_key: tuple[int, int]
+    child_leaf_row: int
+
+
+@dataclass
+class _CompactNode:
+    key: tuple[int, int]
+    executed_degree: int
+    nominal_degree: int
+    target_degree: int
+    owner: int
+    input_type: int
+    familywork_row: int
+    sigma_head_row: int
+    action_begin: int
+    edges: list[_CompactEdge]
 
 
 class BranchedTopologyRecorder:
@@ -143,28 +184,34 @@ class BranchedTopologyRecorder:
         p_train: int,
         topology_cap: int,
         topology_edge_cap: int,
+        topology_packet_cap: int,
+        device: torch.device,
     ) -> None:
         self.input_names = input_names
         self.p_train = p_train
         self.topology_cap = topology_cap
         self.topology_edge_cap = topology_edge_cap
-        self._records: list[_ExpansionRecord] = []
+        self.topology_packet_cap = topology_packet_cap
+        self.device = device
+        self._nodes: dict[tuple[int, int], _CompactNode] = {}
+        self._pending: dict[tuple[int, int], list[_CompactEdge]] = {}
+        self._tree_edges: dict[int, int] = {}
+        self._root_degrees: dict[int, int] = {}
+        self._sampled_roots: set[int] = set()
+        self._sampled_prefix: list[int] = []
         self._record_corrections: list[float] = []
-        self._node_capacity = topology_cap + topology_edge_cap
-        self._node_tail = 0
-        self._edge_tail = 0
-        self._feedback_tail = 0
-        self._node_buffers = {
+        packet_rows = topology_packet_cap + 1
+        self._device_node_buffers = {
             "parent_key": torch.empty(
-                (self._node_capacity, 2),
+                (packet_rows, 2),
                 dtype=torch.int64,
-                pin_memory=True,
+                device=device,
             ),
             **{
                 name: torch.empty(
-                    self._node_capacity,
+                    packet_rows,
                     dtype=dtype,
-                    pin_memory=True,
+                    device=device,
                 )
                 for name, dtype in (
                     ("owner", torch.int32),
@@ -180,17 +227,17 @@ class BranchedTopologyRecorder:
                 )
             },
         }
-        self._edge_buffers = {
+        self._device_edge_buffers = {
             "child_key": torch.empty(
-                (topology_edge_cap, 2),
+                (packet_rows, 2),
                 dtype=torch.int64,
-                pin_memory=True,
+                device=device,
             ),
             **{
                 name: torch.empty(
-                    topology_edge_cap,
+                    packet_rows,
                     dtype=dtype,
-                    pin_memory=True,
+                    device=device,
                 )
                 for name, dtype in (
                     ("source_ordinal", torch.int64),
@@ -202,117 +249,308 @@ class BranchedTopologyRecorder:
                 )
             },
         }
-        self._sampled_nodes = torch.empty(
-            self._node_capacity, dtype=torch.int64, pin_memory=True
+        self._host_node_buffers = {
+            name: torch.empty_like(
+                value[:topology_packet_cap],
+                device="cpu",
+                pin_memory=True,
+            )
+            for name, value in self._device_node_buffers.items()
+        }
+        self._host_edge_buffers = {
+            name: torch.empty_like(
+                value[:topology_packet_cap],
+                device="cpu",
+                pin_memory=True,
+            )
+            for name, value in self._device_edge_buffers.items()
+        }
+        self._host_node_active = torch.ones(
+            topology_packet_cap, dtype=torch.bool, pin_memory=True
         )
-        self._correction = torch.empty(
-            self._node_capacity, dtype=torch.float32, pin_memory=True
+        self._host_edge_active = torch.ones(
+            topology_packet_cap, dtype=torch.bool, pin_memory=True
+        )
+        self._produced = torch.empty(
+            len(input_names), dtype=torch.int64, pin_memory=True
+        )
+        self._sampled_nodes = torch.empty((), dtype=torch.int64, pin_memory=True)
+        self._correction = torch.empty((), dtype=torch.float32, pin_memory=True)
+        self._node_count = torch.empty((), dtype=torch.int64, pin_memory=True)
+        self._edge_count = torch.empty((), dtype=torch.int64, pin_memory=True)
+        self._overflow = torch.empty((), dtype=torch.bool, pin_memory=True)
+        self._observed_demand = torch.empty(
+            (), dtype=torch.int64, pin_memory=True
         )
 
     def accept_payload(self, payload: _StagedBranchedPayload) -> None:
         if not payload.records:
             raise BranchedPokerError("branched topology payload is empty")
-        self._records.extend(payload.records)
-        self._record_corrections.extend(
-            (
-                float(payload.counterfactual_correction),
-                *(0.0 for _ in payload.records[1:]),
+        node_count = int(payload.node_count)
+        edge_count = int(payload.edge_count)
+        if bool(payload.overflow) or (
+            node_count > self.topology_packet_cap
+            or edge_count > self.topology_packet_cap
+        ):
+            raise BranchedTopologyArenaOverflow(
+                capacity=self.topology_packet_cap,
+                observed_demand=int(payload.observed_demand),
             )
+        record = payload.records[0]
+        roots_before = len(self._sampled_roots)
+        edges_by_source: list[list[int]] = [[] for _ in range(node_count)]
+        for edge in range(edge_count):
+            edges_by_source[int(record.source_ordinal[edge])].append(edge)
+        for row in range(node_count):
+            key_values = record.parent_key[row]
+            key = (int(key_values[0]), int(key_values[1]))
+            edge_rows = edges_by_source[row]
+            degree = int(record.executed_degree[row])
+            if len(edge_rows) != degree:
+                raise BranchedPokerError(
+                    "compact packet lost an executed child"
+                )
+            outgoing = [
+                _CompactEdge(
+                    label=int(record.label[edge]),
+                    path_length=int(record.path_length[edge]),
+                    terminal=bool(record.terminal[edge]),
+                    child_key=(
+                        int(record.child_key[edge, 0]),
+                        int(record.child_key[edge, 1]),
+                    ),
+                    child_leaf_row=int(record.child_leaf_row[edge]),
+                )
+                for edge in edge_rows
+            ]
+            logical_root = key[0]
+            self._tree_edges[logical_root] = (
+                self._tree_edges.get(logical_root, 0) + len(outgoing)
+            )
+            if key[1] == 0:
+                self._sampled_roots.add(logical_root)
+                self._root_degrees[logical_root] = (
+                    self._root_degrees.get(logical_root, 0) + degree
+                )
+            incoming = self._pending.pop(key, [])
+            trained = bool(record.trained[row])
+            retain = (
+                key in self._nodes
+                or trained
+                or degree >= 2
+                or int(record.nominal_degree[row]) >= 2
+            )
+            if retain:
+                node = self._nodes.get(key)
+                if node is None:
+                    node = _CompactNode(
+                        key=key,
+                        executed_degree=degree,
+                        nominal_degree=int(record.nominal_degree[row]),
+                        target_degree=int(record.target_degree[row]),
+                        owner=(
+                            int(record.owner[row]) if trained else -1
+                        ),
+                        input_type=(
+                            int(record.input_type[row]) if trained else -1
+                        ),
+                        familywork_row=(
+                            int(record.familywork_row[row]) if trained else -1
+                        ),
+                        sigma_head_row=(
+                            int(record.sigma_head_row[row]) if trained else -1
+                        ),
+                        action_begin=(
+                            int(record.action_begin[row]) if trained else -1
+                        ),
+                        edges=[],
+                    )
+                    self._nodes[key] = node
+                elif not bool(record.refill[row]):
+                    raise BranchedPokerError(
+                        "a branched logical node was expanded twice"
+                    )
+                else:
+                    node.executed_degree += degree
+                node.edges.extend(outgoing)
+                for edge in outgoing:
+                    if not edge.terminal:
+                        self._pending.setdefault(edge.child_key, []).append(edge)
+                del incoming
+            else:
+                if degree != 1:
+                    raise BranchedPokerError(
+                        "only ordinary unary rows may be compressed"
+                    )
+                child = outgoing[0]
+                for edge in incoming:
+                    edge.path_length += child.path_length
+                    edge.terminal = child.terminal
+                    edge.child_key = child.child_key
+                    edge.child_leaf_row = child.child_leaf_row
+                    if not edge.terminal:
+                        self._pending.setdefault(edge.child_key, []).append(edge)
+        if len(self._nodes) > self.topology_cap:
+            raise BranchedTopologyArenaOverflow(
+                capacity=self.topology_cap,
+                observed_demand=len(self._nodes),
+            )
+        compact_edges = sum(len(node.edges) for node in self._nodes.values())
+        if compact_edges > self.topology_edge_cap:
+            raise BranchedTopologyArenaOverflow(
+                capacity=self.topology_edge_cap,
+                observed_demand=compact_edges,
+            )
+        sampled = int(payload.sampled_nodes)
+        self._sampled_prefix.append(
+            sampled
+            + len(self._sampled_roots)
+            - roots_before
+            + (self._sampled_prefix[-1] if self._sampled_prefix else 0)
+        )
+        self._record_corrections.append(
+            float(payload.counterfactual_correction)
         )
 
     def stage_payload(
         self,
         records: tuple[_ExpansionRecord, ...],
         *,
-        produced: tuple[int, ...],
+        produced: Tensor,
         sampled_nodes: Tensor,
         counterfactual_correction: Tensor,
+        frontier_overflow: Tensor,
+        frontier_demand: Tensor,
     ) -> _StagedBranchedPayload:
-        node_rows = sum(record.parent_key.shape[0] for record in records)
-        edge_rows = sum(record.child_key.shape[0] for record in records)
         if (
             not records
-            or self._node_tail + node_rows > self._node_capacity
-            or self._edge_tail + edge_rows > self.topology_edge_cap
-            or self._feedback_tail >= self._node_capacity
+            or produced.device != self.device
+            or produced.shape != (len(self.input_names),)
         ):
-            raise BranchedPokerError(
-                "branched topology exceeds its fixed pinned arena"
-            )
-        staged: list[_ExpansionRecord] = []
+            raise BranchedPokerError("branched topology payload is invalid")
+        node_offset = torch.zeros((), dtype=torch.int64, device=self.device)
+        edge_offset = torch.zeros((), dtype=torch.int64, device=self.device)
+        dummy = self.topology_packet_cap
         for record in records:
-            node_count = record.parent_key.shape[0]
-            edge_count = record.child_key.shape[0]
-            node_slice = slice(self._node_tail, self._node_tail + node_count)
-            edge_slice = slice(self._edge_tail, self._edge_tail + edge_count)
-            values: dict[str, Tensor] = {}
-            for name, buffer in self._node_buffers.items():
-                destination = buffer[node_slice]
-                destination.copy_(getattr(record, name), non_blocking=True)
-                values[name] = destination
-            for name, buffer in self._edge_buffers.items():
-                destination = buffer[edge_slice]
-                destination.copy_(getattr(record, name), non_blocking=True)
-                values[name] = destination
-            staged.append(_ExpansionRecord(**values))
-            self._node_tail += node_count
-            self._edge_tail += edge_count
-        feedback = self._feedback_tail
-        self._sampled_nodes[feedback].copy_(
-            sampled_nodes.detach(), non_blocking=True
-        )
-        self._correction[feedback].copy_(
+            node_rank = record.node_active.cumsum(0, dtype=torch.int64) - 1
+            edge_rank = record.edge_active.cumsum(0, dtype=torch.int64) - 1
+            node_destination = node_offset + node_rank
+            edge_destination = edge_offset + edge_rank
+            valid_node = record.node_active & node_destination.lt(dummy)
+            valid_edge = record.edge_active & edge_destination.lt(dummy)
+            node_destination = torch.where(
+                valid_node,
+                node_destination,
+                torch.full_like(node_destination, dummy),
+            )
+            edge_destination = torch.where(
+                valid_edge,
+                edge_destination,
+                torch.full_like(edge_destination, dummy),
+            )
+            for name, buffer in self._device_node_buffers.items():
+                buffer.index_copy_(
+                    0,
+                    node_destination,
+                    getattr(record, name),
+                )
+            for name, buffer in self._device_edge_buffers.items():
+                value = getattr(record, name)
+                if name == "source_ordinal":
+                    value = node_destination.index_select(
+                        0, value.to(torch.int64)
+                    )
+                buffer.index_copy_(0, edge_destination, value)
+            node_offset += record.node_active.sum(dtype=torch.int64)
+            edge_offset += record.edge_active.sum(dtype=torch.int64)
+        for name, host in self._host_node_buffers.items():
+            host.copy_(
+                self._device_node_buffers[name][:-1],
+                non_blocking=True,
+            )
+        for name, host in self._host_edge_buffers.items():
+            host.copy_(
+                self._device_edge_buffers[name][:-1],
+                non_blocking=True,
+            )
+        self._produced.copy_(produced, non_blocking=True)
+        self._sampled_nodes.copy_(sampled_nodes.detach(), non_blocking=True)
+        self._correction.copy_(
             counterfactual_correction.detach(), non_blocking=True
         )
-        self._feedback_tail += 1
+        self._node_count.copy_(node_offset, non_blocking=True)
+        self._edge_count.copy_(edge_offset, non_blocking=True)
+        self._overflow.copy_(
+            node_offset.gt(self.topology_packet_cap)
+            | edge_offset.gt(self.topology_packet_cap)
+            | frontier_overflow,
+            non_blocking=True,
+        )
+        self._observed_demand.copy_(
+            torch.maximum(
+                torch.maximum(node_offset, edge_offset),
+                frontier_demand,
+            ),
+            non_blocking=True,
+        )
+        staged = _ExpansionRecord(
+            node_active=self._host_node_active,
+            edge_active=self._host_edge_active,
+            **self._host_node_buffers,
+            **self._host_edge_buffers,
+        )
         return _StagedBranchedPayload(
-            tuple(staged),
-            produced,
-            self._sampled_nodes[feedback],
-            self._correction[feedback],
+            (staged,),
+            self._produced,
+            self._sampled_nodes,
+            self._correction,
+            self._node_count,
+            self._edge_count,
+            self._overflow,
+            self._observed_demand,
         )
 
     def materialize_cpu(self) -> None:
-        if any(
-            getattr(record, name).device.type != "cpu"
-            for record in self._records
-            for name in record.__dataclass_fields__
-        ):
-            raise BranchedPokerError(
-                "committed topology was not staged in CPU storage"
-            )
+        return None
 
     def release(self) -> None:
         """Release the fixed pinned topology arena at its rollout consumer."""
 
-        self._records.clear()
+        self._nodes.clear()
+        self._pending.clear()
+        self._tree_edges.clear()
+        self._root_degrees.clear()
+        self._sampled_roots.clear()
+        self._sampled_prefix.clear()
         self._record_corrections.clear()
-        self._node_buffers.clear()
-        self._edge_buffers.clear()
+        self._device_node_buffers.clear()
+        self._device_edge_buffers.clear()
+        self._host_node_buffers.clear()
+        self._host_edge_buffers.clear()
+        self._host_node_active = torch.empty(0, dtype=torch.bool)
+        self._host_edge_active = torch.empty(0, dtype=torch.bool)
+        self._produced = torch.empty(0, dtype=torch.int64)
         self._sampled_nodes = torch.empty(0, dtype=torch.int64)
         self._correction = torch.empty(0, dtype=torch.float32)
+        self._node_count = torch.empty(0, dtype=torch.int64)
+        self._edge_count = torch.empty(0, dtype=torch.int64)
+        self._overflow = torch.empty(0, dtype=torch.bool)
+        self._observed_demand = torch.empty(0, dtype=torch.int64)
 
     def seal(self) -> tuple[Topology, TopologyBindings, int]:
-        if not self._records:
+        if not self._nodes:
             raise BranchedPokerError("branched topology is empty")
-        keys: list[tuple[int, int]] = []
-        record_for_key: dict[tuple[int, int], list[tuple[_ExpansionRecord, int]]] = {}
-        for record in self._records:
-            for row, values in enumerate(record.parent_key.tolist()):
-                key = (int(values[0]), int(values[1]))
-                if key in record_for_key:
-                    if not bool(record.refill[row]):
-                        raise BranchedPokerError(
-                            "a branched logical node was expanded twice"
-                        )
-                    record_for_key[key].append((record, row))
-                else:
-                    if bool(record.refill[row]):
-                        raise BranchedPokerError(
-                            "root refill preceded its ordinary expansion"
-                        )
-                    record_for_key[key] = [(record, row)]
-                    keys.append(key)
+        if self._pending:
+            raise BranchedPokerError(
+                "branched topology retains unresolved compact endpoints"
+            )
+        keys = list(self._nodes)
+        targeted = {
+            edge.child_key
+            for node in self._nodes.values()
+            for edge in node.edges
+            if not edge.terminal
+        }
         ordered_keys: list[tuple[int, int]] = []
         visited: set[tuple[int, int]] = set()
 
@@ -321,16 +559,13 @@ class BranchedTopologyRecorder:
                 return
             visited.add(key)
             ordered_keys.append(key)
-            for expansion, row in record_for_key[key]:
-                edges = expansion.source_ordinal.eq(row).nonzero().flatten()
-                for edge in edges.tolist():
-                    if not bool(expansion.terminal[edge]):
-                        child = expansion.child_key[edge].tolist()
-                        visit((int(child[0]), int(child[1])))
+            for edge in self._nodes[key].edges:
+                if not edge.terminal:
+                    visit(edge.child_key)
 
-        for root_key in sorted(key for key in keys if key[1] == 0):
+        for root_key in sorted(key for key in keys if key not in targeted):
             visit(root_key)
-        if len(visited) != len(record_for_key):
+        if len(visited) != len(self._nodes):
             raise BranchedPokerError(
                 "branched topology contains an unreachable logical node"
             )
@@ -355,71 +590,46 @@ class BranchedTopologyRecorder:
         child_output: list[int] = []
         leaves: set[int] = set()
         for node, key in enumerate(keys):
-            expansions = record_for_key[key]
-            record, row = expansions[0]
-            edge_groups = [
-                item.source_ordinal.eq(item_row).nonzero().flatten()
-                for item, item_row in expansions
-            ]
-            degrees = [
-                int(item.executed_degree[item_row]) for item, item_row in expansions
-            ]
-            if any(
-                edge_rows.numel() != degree
-                for edge_rows, degree in zip(edge_groups, degrees, strict=True)
-            ):
-                raise BranchedPokerError("recorded branch degree is incomplete")
-            degree = sum(degrees)
+            record = self._nodes[key]
+            degree = record.executed_degree
             child_begin.append(len(labels))
             executed.append(degree)
-            nominal.append(int(record.nominal_degree[row]))
-            target.append(int(record.target_degree[row]))
-            trained = bool(record.trained[row])
-            owner.append(int(record.owner[row]) if trained else -1)
-            family.append(int(record.familywork_row[row]) if trained else -1)
-            sigma.append(int(record.sigma_head_row[row]) if trained else -1)
-            action_begin.append(int(record.action_begin[row]) if trained else -1)
-            input_index = int(record.input_type[row])
-            input_type.append(input_index if trained else -1)
+            nominal.append(record.nominal_degree)
+            target.append(record.target_degree)
+            owner.append(record.owner)
+            family.append(record.familywork_row)
+            sigma.append(record.sigma_head_row)
+            action_begin.append(record.action_begin)
+            input_type.append(record.input_type)
             output_type.append(0)
-            sigma_target.append(int(record.sigma_head_row[row]) if trained else -1)
-            for expansion, edge_rows in zip(
-                (item for item, _ in expansions),
-                edge_groups,
-                strict=True,
-            ):
-                for edge_row in edge_rows.tolist():
-                    labels.append(int(expansion.label[edge_row]))
-                    path_length.append(int(expansion.path_length[edge_row]))
-                    child_output.append(0)
-                    if bool(expansion.terminal[edge_row]):
-                        leaf = int(expansion.child_leaf_row[edge_row])
-                        if leaf < 0:
-                            raise BranchedPokerError(
-                                "terminal branch has no committed leaf row"
-                            )
-                        target_kind.append(int(TargetKind.LEAF))
-                        target_row.append(leaf)
-                        leaves.add(leaf)
-                    else:
-                        child_values = expansion.child_key[edge_row].tolist()
-                        child_key = (
-                            int(child_values[0]),
-                            int(child_values[1]),
+            sigma_target.append(record.sigma_head_row)
+            for edge in record.edges:
+                labels.append(edge.label)
+                path_length.append(edge.path_length)
+                child_output.append(0)
+                if edge.terminal:
+                    leaf = edge.child_leaf_row
+                    if leaf < 0:
+                        raise BranchedPokerError(
+                            "terminal branch has no committed leaf row"
                         )
-                        try:
-                            child = node_for_key[child_key]
-                        except KeyError as exc:
-                            raise BranchedPokerError(
-                                "branched child was never expanded"
-                            ) from exc
-                        if parent[child] != -1:
-                            raise BranchedPokerError(
-                                "branched child has two structural parents"
-                            )
-                        parent[child] = node
-                        target_kind.append(int(TargetKind.TOPOLOGY))
-                        target_row.append(child)
+                    target_kind.append(int(TargetKind.LEAF))
+                    target_row.append(leaf)
+                    leaves.add(leaf)
+                else:
+                    try:
+                        child = node_for_key[edge.child_key]
+                    except KeyError as exc:
+                        raise BranchedPokerError(
+                            "branched child was never expanded"
+                        ) from exc
+                    if parent[child] != -1:
+                        raise BranchedPokerError(
+                            "branched child has two structural parents"
+                        )
+                    parent[child] = node
+                    target_kind.append(int(TargetKind.TOPOLOGY))
+                    target_row.append(child)
 
         def i32(values: list[int]) -> Tensor:
             return torch.tensor(values, dtype=torch.int32)
@@ -445,9 +655,11 @@ class BranchedTopologyRecorder:
             sigma_target_row=i32(sigma_target),
             child_output_type=i32(child_output),
         )
-        topology.validate(bindings, p_train=self.p_train, _allow_zero_path=True)
-        topology, bindings = topology.compact(
-            bindings, p_train=self.p_train, _allow_zero_path=True
+        topology.validate(
+            bindings,
+            p_train=self.p_train,
+            compact=True,
+            _allow_zero_path=True,
         )
         if topology.node_count > self.topology_cap:
             raise BranchedPokerError("realized topology exceeds its fixed cap")
@@ -456,49 +668,29 @@ class BranchedTopologyRecorder:
         return topology, bindings, len(leaves)
 
     def tree_size(self, logical_root: int) -> int:
-        nodes = 1
-        for record in self._records:
-            parent_selected = record.parent_key[:, 0].eq(logical_root)
-            edge_selected = parent_selected.index_select(
-                0, record.source_ordinal.to(torch.int64)
-            )
-            nodes += int(record.path_length[edge_selected].sum())
-        return nodes
+        return 1 + self._tree_edges.get(logical_root, 0)
 
     def sampled_tree_size(self, record_limit: int | None = None) -> int:
-        records = (
-            self._records
-            if record_limit is None
-            else self._records[:record_limit]
-        )
-        roots = {
-            int(record.parent_key[row, 0])
-            for record in records
-            for row in range(record.parent_key.shape[0])
-            if int(record.parent_key[row, 1]) == 0
-        }
-        return len(roots) + sum(
-            int(record.path_length.sum()) for record in records
-        )
+        if not self._sampled_prefix:
+            return 0
+        if record_limit is None:
+            return self._sampled_prefix[-1]
+        if not 0 <= record_limit <= len(self._sampled_prefix):
+            raise ValueError("sampled record limit is invalid")
+        return 0 if record_limit == 0 else self._sampled_prefix[record_limit - 1]
 
     def root_degree(self, logical_root: int) -> int:
-        degree = 0
-        for record in self._records:
-            selected = record.parent_key[:, 0].eq(logical_root) & record.parent_key[
-                :, 1
-            ].eq(0)
-            if bool(selected.any()):
-                degree += int(record.executed_degree[selected].sum())
+        degree = self._root_degrees.get(logical_root, 0)
         if degree <= 0:
             raise BranchedPokerError("logical root has no committed expansion")
         return degree
 
     @property
     def record_count(self) -> int:
-        return len(self._records)
+        return len(self._sampled_prefix)
 
     def counterfactual_correction(self, record_limit: int) -> float:
-        if not 0 <= record_limit <= len(self._records):
+        if not 0 <= record_limit <= len(self._record_corrections):
             raise ValueError("counterfactual record limit is invalid")
         return sum(self._record_corrections[:record_limit])
 
@@ -543,6 +735,13 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             device=owners.device,
         )
         self.controller = controller
+        if (
+            owners.family_pack_cap * controller.beta_max
+            > owners.chance_frontier_cap
+        ):
+            raise ValueError(
+                "chance frontier does not cover one maximal player pack"
+            )
         self.cost_safeguard = cost_safeguard
         self.child_model = child_model
         self.topology_recorder = topology_recorder
@@ -552,9 +751,6 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         self.realized_tree_size = 0
         self.last_topology: DeferredBranchedTopologyPublication | None = None
         self._topology_sequence = 0
-        self._count_feedback = torch.empty(
-            (), dtype=torch.int64, pin_memory=True
-        )
         self._refill = False
         self._refill_child_ordinal = 0
 
@@ -563,18 +759,6 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             raise BranchedPokerError("invalid or overlapping root refill")
         self._refill = True
         self._refill_child_ordinal = int(child_ordinal)
-
-    def _pinned_count(self, value: Tensor) -> int:
-        if value.device.type != "cuda" or value.numel() != 1:
-            raise BranchedPokerError("dynamic count must be one CUDA scalar")
-        self._count_feedback.copy_(
-            value.to(torch.int64), non_blocking=True
-        )
-        ready = torch.cuda.Event(blocking=False)
-        ready.record(torch.cuda.current_stream(value.device))
-        while not ready.query():
-            time.sleep(0)
-        return int(self._count_feedback)
 
     def sample(self, request: SampleRequest) -> SampleWorkspace:
         batch = request.batch
@@ -622,20 +806,17 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             )
         degree = decision.executed_degree.to(torch.int64)
         total_tensor = degree.sum()
-        total = self._pinned_count(total_tensor)
-        source = torch.repeat_interleave(
-            torch.arange(rows, device=root.device),
-            degree,
-            output_size=total,
-        )
-        prefix = torch.cat(
-            (
-                torch.zeros(1, dtype=torch.int64, device=root.device),
-                degree.cumsum(0)[:-1],
-            )
-        )
-        ordinal = torch.arange(total, device=root.device) - torch.repeat_interleave(
-            prefix, degree
+        beta_max = self.controller.beta_max
+        source = torch.arange(
+            rows, dtype=torch.int64, device=root.device
+        ).repeat_interleave(beta_max)
+        ordinal = torch.arange(
+            beta_max, dtype=torch.int64, device=root.device
+        ).repeat(rows)
+        active = ordinal < degree.index_select(0, source)
+        torch._assert_async(
+            active.sum(dtype=torch.int64).eq(total_tensor),
+            "fixed player expansion envelope lost a child",
         )
         child_ordinal = (
             torch.full_like(ordinal, self._refill_child_ordinal)
@@ -661,6 +842,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             draw=0,
             purpose=DrawPurpose.ACTION,
             retry_epoch=self.owners.retry_epoch()[0],
+            active=active,
         )
         sampled = self.policy.sample_actor(
             raw,
@@ -675,6 +857,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                     "selected_log_policy": sampled.selected_log_policy,
                     "source": source,
                     "ordinal": ordinal,
+                    "active": active,
                     "child_path": child_path,
                     "beta": decision.beta,
                     "nominal_degree": decision.nominal_degree,
@@ -691,6 +874,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         device = self.owners.device
         sample = request.sample.values
         source = sample["source"].to(torch.int64)
+        action_active = sample["active"].to(torch.bool)
         action_source = source
         action_total = int(action_source.numel())
         flat_input = self._forward_model_input(batch)
@@ -738,35 +922,66 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         child_path = sample["child_path"]
         retry = self.owners.retry_epoch()[0]
         first_child_key = torch.stack((root, child_path), -1)
-        endpoint_source = action_source
-        endpoint_mass = (
+        initial_endpoint_source = action_source
+        initial_endpoint_mass = (
             batch.fields["path_mass"][0].index_select(0, action_source)
             / sample["executed_degree"].index_select(0, action_source).float()
         )
-        endpoint_log_sum, endpoint_log_product = child_path_factors(
+        initial_log_sum, initial_log_product = child_path_factors(
             batch.fields["log_player_ancestor_sum"][0].index_select(0, action_source),
             batch.fields["log_ancestor_product"][0].index_select(0, action_source),
             sample["beta"].index_select(0, action_source),
             child_is_player=torch.zeros(action_total, dtype=torch.bool, device=device),
         )
+        chance_capacity = self.owners.chance_frontier_cap
+        if action_total > chance_capacity:
+            raise BranchedPokerError(
+                "player expansion exceeds the admitted chance frontier"
+            )
+        frontier_row = torch.arange(
+            chance_capacity, dtype=torch.int64, device=device
+        )
+        action_row = frontier_row.clamp_max(action_total - 1)
+        current_active = frontier_row.lt(action_total) & action_active.index_select(
+            0, action_row
+        )
+        current_key = first_child_key.index_select(0, action_row)
+        current_state = replace(
+            next_state,
+            **{
+                name: value.index_select(0, action_row)
+                for name, value in next_state.__dict__.items()
+                if isinstance(value, Tensor)
+            },
+        )
+        current_private = private.index_select(0, action_row)
+        current_history = replace(
+            history,
+            **{
+                name: value.index_select(0, action_row)
+                for name, value in history.__dict__.items()
+            },
+        )
+        current_log_reach = log_reach.index_select(0, action_row)
+        endpoint_source = initial_endpoint_source.index_select(0, action_row)
+        endpoint_mass = initial_endpoint_mass.index_select(0, action_row)
+        endpoint_log_sum = initial_log_sum.index_select(0, action_row)
+        endpoint_log_product = initial_log_product.index_select(0, action_row)
         chance_records: list[_ExpansionRecord] = []
-        current_key = first_child_key
-        current_state = next_state
-        current_private = private
-        current_history = history
-        current_log_reach = log_reach
-        current_beta = torch.ones(action_total, dtype=torch.float32, device=device)
-        sampled_nodes = torch.tensor(
-            action_total, dtype=torch.int64, device=device
+        current_beta = torch.ones(
+            chance_capacity, dtype=torch.float32, device=device
+        )
+        sampled_nodes = action_active.sum(dtype=torch.int64)
+        frontier_demand = sampled_nodes.clone()
+        frontier_overflow = torch.zeros(
+            (), dtype=torch.bool, device=device
         )
         endpoint_record = torch.zeros(
-            action_total, dtype=torch.int64, device=device
+            chance_capacity, dtype=torch.int64, device=device
         )
-        endpoint_record_edge = torch.arange(
-            action_total, dtype=torch.int64, device=device
-        )
+        endpoint_record_edge = action_row
         for generation in range(3):
-            chance = self.machine.needs_chance(current_state)
+            chance = self.machine.needs_chance(current_state) & current_active
             chance_decision = self.controller.decide(
                 schema=self.mode,
                 root=current_key[:, 0],
@@ -787,31 +1002,45 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                     chance_decision.beta,
                     torch.ones_like(chance_decision.beta),
                 ),
-                torch.where(chance, chance_decision.nominal_degree, ones),
-                torch.where(chance, chance_decision.executed_degree, ones),
-                torch.where(chance, chance_decision.target_degree, ones),
-            )
-            degree = chance_decision.executed_degree.to(torch.int64)
-            sampled_nodes += degree.masked_select(chance).sum()
-            chance_total = self._pinned_count(degree.sum())
-            chance_source = torch.repeat_interleave(
-                torch.arange(
-                    current_key.shape[0],
-                    dtype=torch.int64,
-                    device=device,
+                torch.where(
+                    chance,
+                    chance_decision.nominal_degree,
+                    ones,
                 ),
-                degree,
-                output_size=chance_total,
+                torch.where(
+                    chance,
+                    chance_decision.executed_degree,
+                    ones,
+                ),
+                torch.where(
+                    chance,
+                    chance_decision.target_degree,
+                    ones,
+                ),
             )
+            degree = torch.where(
+                current_active,
+                chance_decision.executed_degree,
+                torch.zeros_like(chance_decision.executed_degree),
+            ).to(torch.int64)
+            sampled_nodes += degree.masked_fill(~chance, 0).sum()
+            cumulative = degree.cumsum(0)
+            chance_total = cumulative[-1]
+            frontier_demand = torch.maximum(frontier_demand, chance_total)
+            frontier_overflow |= chance_total.gt(chance_capacity)
+            next_active = frontier_row < chance_total
+            chance_source = torch.searchsorted(
+                cumulative,
+                frontier_row,
+                right=True,
+            ).clamp_max(chance_capacity - 1)
             prefix = torch.cat(
                 (
                     torch.zeros(1, dtype=torch.int64, device=device),
-                    degree.cumsum(0)[:-1],
+                    cumulative[:-1],
                 )
             )
-            ordinal = torch.arange(
-                chance_total, dtype=torch.int64, device=device
-            ) - torch.repeat_interleave(prefix, degree)
+            ordinal = frontier_row - prefix.index_select(0, chance_source)
             next_path = child_path_keys(
                 current_key[:, 1].index_select(0, chance_source),
                 ordinal + 1,
@@ -877,103 +1106,90 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             next_endpoint_record_edge = endpoint_record_edge.index_select(
                 0, chance_source
             )
-            chance_parent_rows = chance.nonzero().flatten()
-            chance_edge_rows = chance.index_select(
-                0, chance_source
-            ).nonzero().flatten()
-            if chance_parent_rows.numel():
-                compact_parent = chance.to(torch.int64).cumsum(0) - 1
-                record_source = compact_parent.index_select(
-                    0,
-                    chance_source.index_select(0, chance_edge_rows),
+            chance_edge_active = (
+                next_active & chance.index_select(0, chance_source)
+            )
+            record_identifier = 1 + len(chance_records)
+            next_endpoint_record = torch.where(
+                chance_edge_active,
+                torch.full_like(next_endpoint_record, record_identifier),
+                next_endpoint_record,
+            )
+            next_endpoint_record_edge = torch.where(
+                chance_edge_active,
+                frontier_row,
+                next_endpoint_record_edge,
+            )
+            chance_records.append(
+                _ExpansionRecord(
+                    node_active=chance,
+                    edge_active=chance_edge_active,
+                    parent_key=current_key,
+                    child_key=next_key,
+                    source_ordinal=chance_source,
+                    terminal=terminal_child,
+                    child_input=self.machine.input_type(dealt_state),
+                    child_leaf_row=torch.full(
+                        (chance_capacity,),
+                        -1,
+                        dtype=torch.int64,
+                        device=device,
+                    ),
+                    label=chance_label,
+                    owner=torch.full(
+                        (chance_capacity,),
+                        -1,
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    input_type=torch.full(
+                        (chance_capacity,),
+                        -1,
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    familywork_row=torch.full(
+                        (chance_capacity,),
+                        -1,
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    sigma_head_row=torch.full(
+                        (chance_capacity,),
+                        -1,
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    action_begin=torch.full(
+                        (chance_capacity,),
+                        -1,
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    executed_degree=chance_decision.executed_degree,
+                    nominal_degree=chance_decision.nominal_degree,
+                    target_degree=chance_decision.target_degree,
+                    trained=torch.zeros(
+                        chance_capacity,
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                    refill=torch.zeros(
+                        chance_capacity,
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                    path_length=torch.ones(
+                        chance_capacity,
+                        dtype=torch.int32,
+                        device=device,
+                    ),
                 )
-                parent_count = chance_parent_rows.numel()
-                edge_count = chance_edge_rows.numel()
-                record_identifier = 1 + len(chance_records)
-                next_endpoint_record[chance_edge_rows] = record_identifier
-                next_endpoint_record_edge[chance_edge_rows] = torch.arange(
-                    edge_count, dtype=torch.int64, device=device
-                )
-                chance_records.append(
-                    _ExpansionRecord(
-                        parent_key=current_key.index_select(
-                            0, chance_parent_rows
-                        ),
-                        child_key=next_key.index_select(0, chance_edge_rows),
-                        source_ordinal=record_source,
-                        terminal=terminal_child.index_select(
-                            0, chance_edge_rows
-                        ),
-                        child_input=self.machine.input_type(
-                            dealt_state
-                        ).index_select(0, chance_edge_rows),
-                        child_leaf_row=torch.full(
-                            (edge_count,),
-                            -1,
-                            dtype=torch.int64,
-                            device=device,
-                        ),
-                        label=chance_label.index_select(0, chance_edge_rows),
-                        owner=torch.full(
-                            (parent_count,),
-                            -1,
-                            dtype=torch.int32,
-                            device=device,
-                        ),
-                        input_type=torch.full(
-                            (parent_count,),
-                            -1,
-                            dtype=torch.int32,
-                            device=device,
-                        ),
-                        familywork_row=torch.full(
-                            (parent_count,),
-                            -1,
-                            dtype=torch.int32,
-                            device=device,
-                        ),
-                        sigma_head_row=torch.full(
-                            (parent_count,),
-                            -1,
-                            dtype=torch.int32,
-                            device=device,
-                        ),
-                        action_begin=torch.full(
-                            (parent_count,),
-                            -1,
-                            dtype=torch.int32,
-                            device=device,
-                        ),
-                        executed_degree=chance_decision.executed_degree.index_select(
-                            0, chance_parent_rows
-                        ),
-                        nominal_degree=chance_decision.nominal_degree.index_select(
-                            0, chance_parent_rows
-                        ),
-                        target_degree=chance_decision.target_degree.index_select(
-                            0, chance_parent_rows
-                        ),
-                        trained=torch.zeros(
-                            parent_count,
-                            dtype=torch.bool,
-                            device=device,
-                        ),
-                        refill=torch.zeros(
-                            parent_count,
-                            dtype=torch.bool,
-                            device=device,
-                        ),
-                        path_length=torch.ones(
-                            edge_count,
-                            dtype=torch.int32,
-                            device=device,
-                        ),
-                    )
-                )
+            )
             endpoint_source = endpoint_source.index_select(0, chance_source)
             endpoint_mass = (
                 endpoint_mass.index_select(0, chance_source)
-                / degree.index_select(0, chance_source).float()
+                / degree.index_select(0, chance_source).clamp_min(1).float()
             )
             endpoint_log_sum, endpoint_log_product = child_path_factors(
                 endpoint_log_sum.index_select(0, chance_source),
@@ -982,7 +1198,9 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 child_is_player=(
                     ~dealt_state.terminal & ~self.machine.needs_chance(dealt_state)
                     if final_generation
-                    else torch.zeros(chance_total, dtype=torch.bool, device=device)
+                    else torch.zeros(
+                        chance_capacity, dtype=torch.bool, device=device
+                    )
                 ),
             )
             current_key = next_key
@@ -991,6 +1209,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             current_history = chance_history
             current_log_reach = current_log_reach.index_select(0, chance_source)
             current_beta = chance_decision.beta.index_select(0, chance_source)
+            current_active = next_active
             endpoint_record = next_endpoint_record
             endpoint_record_edge = next_endpoint_record_edge
         next_state = current_state
@@ -999,7 +1218,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         log_reach = current_log_reach
         root = current_key[:, 0]
         child_path = current_key[:, 1]
-        total = int(root.numel())
+        total = chance_capacity
         board = next_state.board_cards
         cards = self.machine.combo_cards(
             torch.arange(
@@ -1026,7 +1245,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         )[None]
         route = stable_route(
             route_family,
-            torch.ones_like(route_family, dtype=torch.bool),
+            current_active[None],
             self._route_family_values,
             declared_values=self._route_families,
         )
@@ -1055,15 +1274,10 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                         0, endpoint_source
                     ).to(torch.int32),
                 }
-            )
+        )
         terminal_rows = route.source_row[0, 0]
-        valid_terminal = route.valid[0, 0]
-        selected_terminal = terminal_rows[valid_terminal]
         for name, value in leaf_source.items():
-            if selected_terminal.numel():
-                leaf_values[name][0, : selected_terminal.numel()].copy_(
-                    value.index_select(0, selected_terminal)
-                )
+            leaf_values[name][0].copy_(value.index_select(0, terminal_rows))
         leaf_count = route.counts[0, 0].reshape(1)
         destinations.append(
             DeviceDestinationRequest(
@@ -1078,7 +1292,8 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         )
         if self._refill:
             trained = torch.zeros_like(trained)
-        trained_row = torch.nonzero(trained, as_tuple=False).flatten()
+        trained_row = torch.argsort(~trained, stable=True)
+        trained_valid = trained.index_select(0, trained_row)
         trained_count = trained.sum(dtype=torch.int64).reshape(1)
         sigma = next(
             slab
@@ -1090,13 +1305,13 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         model_value = request.model.values["value"]
         actor_combo = parent_private.gather(1, owner[:, None]).to(torch.int64)
         selected_value = model_value.gather(1, actor_combo).float()
-        sigma_values["old_value"][0, : trained_row.numel()].copy_(
+        sigma_values["old_value"][0].copy_(
             selected_value.index_select(0, trained_row)
         )
-        sigma_values["old_trace"][0, : trained_row.numel()].copy_(
+        sigma_values["old_trace"][0].copy_(
             request.model.values["trace"].index_select(0, trained_row)
         )
-        sigma_values["old_cost"][0, : trained_row.numel()].copy_(
+        sigma_values["old_cost"][0].copy_(
             request.model.values["cost"].index_select(0, trained_row)
         )
         destinations.append(
@@ -1109,15 +1324,18 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             slab for slab in self.owners.slabs if slab.schema.name == "ActionHead.all"
         )
         action_old_tail = action_head.reserved_tails_device()[0]
-        trained_child = trained.index_select(0, action_source)
-        trained_action_row = torch.nonzero(trained_child, as_tuple=False).flatten()
+        trained_child = trained.index_select(0, action_source) & action_active
+        trained_action_row = torch.argsort(~trained_child, stable=True)
+        trained_action_valid = trained_child.index_select(
+            0, trained_action_row
+        )
         trained_action_count = trained_child.sum(dtype=torch.int64).reshape(1)
         action_values = self._defaults(action_head, action_total)
-        action_values["action"][0, : trained_action_row.numel()].copy_(
+        action_values["action"][0].copy_(
             action.index_select(0, trained_action_row)
         )
         retained_log = sample["selected_log_policy"].reshape(action_total, -1)[:, :1]
-        action_values["old_log_policy"][0, : trained_action_row.numel()].copy_(
+        action_values["old_log_policy"][0].copy_(
             retained_log.index_select(0, trained_action_row)
         )
         destinations.append(
@@ -1154,22 +1372,20 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 0
             ].index_select(0, endpoint_source)
         published: list[SemanticFamilyFIFO] = []
-        produced: list[int] = []
         queue_cost_additions: list[Tensor] = []
         for family_index, (name, queue) in enumerate(self.queues.items()):
-            selected_rows = route.source_row[0, family_index + 1][
-                route.valid[0, family_index + 1]
-            ]
+            selected_rows = route.source_row[0, family_index + 1]
+            selected_valid = route.valid[0, family_index + 1]
             values = self._defaults(queue.family, total)
             for field, value in family_source.items():
-                if field in values and selected_rows.numel():
-                    values[field][0, : selected_rows.numel()].copy_(
+                if field in values:
+                    values[field][0].copy_(
                         value.index_select(0, selected_rows)
                     )
             cost_addition = torch.zeros(
                 1, dtype=torch.float32, device=device
             )
-            if self.cost_safeguard is not None and selected_rows.numel():
+            if self.cost_safeguard is not None:
                 selected_role = (
                     None
                     if "role_selector" not in family_source
@@ -1191,9 +1407,8 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                         ),
                     )
                 child_cost = child_evaluation["cost"].detach().float()
-                values["frontier_cost_contribution"][
-                    0, : selected_rows.numel()
-                ].copy_(child_cost)
+                child_cost = child_cost.masked_fill(~selected_valid, 0)
+                values["frontier_cost_contribution"][0].copy_(child_cost)
                 cost_addition[0] = child_cost.sum()
             count = route.counts[0, family_index + 1].reshape(1)
             destinations.append(
@@ -1201,53 +1416,53 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             )
             published.append(queue)
             queue_cost_additions.append(cost_addition)
-            produced.append(selected_rows.numel())
 
         descriptor_source: list[Tensor] = []
         descriptor_destination: list[Tensor] = []
         descriptor_ordinal: list[Tensor] = []
-        if trained_row.numel():
-            compact = torch.arange(
-                trained_row.numel(), dtype=torch.int64, device=device
-            )
-            descriptor_source.append(trained_row)
-            descriptor_destination.append(torch.full_like(compact, 1))
-            descriptor_ordinal.append(compact)
-        if trained_action_row.numel():
-            descriptor_source.append(action_source.index_select(0, trained_action_row))
-            descriptor_destination.append(
-                torch.full(
-                    (trained_action_row.numel(),),
-                    2,
-                    dtype=torch.int64,
-                    device=device,
-                )
-            )
-            descriptor_ordinal.append(
-                torch.arange(
-                    trained_action_row.numel(),
-                    dtype=torch.int64,
-                    device=device,
-                )
-            )
-        endpoint_destination = torch.empty(total, dtype=torch.int64, device=device)
-        endpoint_ordinal = torch.empty_like(endpoint_destination)
+        descriptor_valid: list[Tensor] = []
+        compact = torch.arange(rows, dtype=torch.int64, device=device)
+        descriptor_source.append(trained_row)
+        descriptor_destination.append(torch.full_like(compact, 1))
+        descriptor_ordinal.append(compact)
+        descriptor_valid.append(trained_valid)
+        action_compact = torch.arange(
+            action_total, dtype=torch.int64, device=device
+        )
+        descriptor_source.append(
+            action_source.index_select(0, trained_action_row)
+        )
+        descriptor_destination.append(torch.full_like(action_compact, 2))
+        descriptor_ordinal.append(action_compact)
+        descriptor_valid.append(trained_action_valid)
+        endpoint_destination = torch.zeros(
+            total, dtype=torch.int64, device=device
+        )
+        endpoint_ordinal = torch.zeros_like(endpoint_destination)
         for family_value in self._route_family_values:
             selected = route_family[0].eq(family_value)
             request_index = 0 if family_value == -1 else 3 + family_value
-            endpoint_destination[selected] = request_index
-            endpoint_ordinal[selected] = (
-                selected.cumsum(0, dtype=torch.int64)[selected] - 1
+            endpoint_destination = torch.where(
+                selected,
+                torch.full_like(endpoint_destination, request_index),
+                endpoint_destination,
+            )
+            endpoint_ordinal = torch.where(
+                selected,
+                selected.cumsum(0, dtype=torch.int64) - 1,
+                endpoint_ordinal,
             )
         descriptor_source.append(endpoint_source)
         descriptor_destination.append(endpoint_destination)
         descriptor_ordinal.append(endpoint_ordinal)
+        descriptor_valid.append(current_active)
         source_descriptor = torch.cat(descriptor_source)
         destination_descriptor = torch.cat(descriptor_destination)
         ordinal_descriptor = torch.cat(descriptor_ordinal)
+        valid_descriptor = torch.cat(descriptor_valid)
         extent = int(source_descriptor.numel())
         coverage = CommitCoverage(
-            valid=torch.ones((1, extent), dtype=torch.bool, device=device),
+            valid=valid_descriptor.reshape(1, extent),
             source_ordinal=source_descriptor[None],
             destination=destination_descriptor[None],
             destination_ordinal=ordinal_descriptor[None],
@@ -1262,9 +1477,14 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         )
         trained_degree = sample["executed_degree"].to(torch.int64) * trained
         action_prefix = trained_degree.cumsum(0) - trained_degree
-        leaf_row = torch.full((total,), -1, dtype=torch.int64, device=device)
-        leaf_row[terminal] = leaf_old_tail + endpoint_ordinal[terminal]
+        leaf_row = torch.where(
+            current_active & terminal,
+            leaf_old_tail + endpoint_ordinal,
+            torch.full_like(endpoint_ordinal, -1),
+        )
         player_record = _ExpansionRecord(
+            node_active=torch.ones(rows, dtype=torch.bool, device=device),
+            edge_active=action_active,
             parent_key=batch.fields["logical_rng_key"][0],
             child_key=first_child_key,
             source_ordinal=action_source,
@@ -1308,21 +1528,49 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         device_records = (player_record, *chance_records)
         final_key = torch.stack((root, child_path), -1)
         for record_identifier, record in enumerate(device_records):
-            selected = endpoint_record.eq(record_identifier).nonzero().flatten()
-            if not selected.numel():
-                continue
-            edge = endpoint_record_edge.index_select(0, selected)
-            record.child_key.index_copy_(
-                0, edge, final_key.index_select(0, selected)
+            edge_count = record.child_key.shape[0]
+            matching = current_active & endpoint_record.eq(record_identifier)
+            candidate = torch.where(
+                matching,
+                frontier_row,
+                torch.full_like(frontier_row, total),
             )
-            record.terminal.index_copy_(
-                0, edge, terminal.index_select(0, selected)
+            edge = endpoint_record_edge.clamp(0, edge_count - 1)
+            inverse = torch.full(
+                (edge_count,), total, dtype=torch.int64, device=device
             )
-            record.child_input.index_copy_(
-                0, edge, next_family.index_select(0, selected)
+            inverse.scatter_reduce_(
+                0, edge, candidate, reduce="amin", include_self=True
             )
-            record.child_leaf_row.index_copy_(
-                0, edge, leaf_row.index_select(0, selected)
+            valid_edge = inverse.lt(total)
+            final_row = inverse.clamp_max(total - 1)
+            record.child_key.copy_(
+                torch.where(
+                    valid_edge[:, None],
+                    final_key.index_select(0, final_row),
+                    record.child_key,
+                )
+            )
+            record.terminal.copy_(
+                torch.where(
+                    valid_edge,
+                    terminal.index_select(0, final_row),
+                    record.terminal,
+                )
+            )
+            record.child_input.copy_(
+                torch.where(
+                    valid_edge,
+                    next_family.index_select(0, final_row),
+                    record.child_input,
+                )
+            )
+            record.child_leaf_row.copy_(
+                torch.where(
+                    valid_edge,
+                    leaf_row.index_select(0, final_row),
+                    record.child_leaf_row,
+                )
             )
         correction = (
             (
@@ -1333,19 +1581,17 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         ).sum()
         staged_payload = self.topology_recorder.stage_payload(
             device_records,
-            produced=tuple(produced),
+            produced=route.counts[0, 1:],
             sampled_nodes=sampled_nodes,
             counterfactual_correction=correction,
+            frontier_overflow=frontier_overflow,
+            frontier_demand=frontier_demand,
         )
         topology_publication = DeferredBranchedTopologyPublication(
             lane=0,
             sequence=self._topology_sequence,
-            declared_nodes=sum(
-                record.parent_key.shape[0] for record in device_records
-            ),
-            declared_edges=sum(
-                record.child_key.shape[0] for record in device_records
-            ),
+            declared_nodes=self.topology_recorder.topology_packet_cap,
+            declared_edges=0,
             payload=staged_payload,
         )
         self._topology_sequence += 1
@@ -1362,8 +1608,8 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         )
 
 
-class BranchedSampledPokerIteration:
-    """Run fixed or KKT sampled-private trees through one queued composition."""
+class _BranchedSampledPokerAttempt:
+    """One internal fixed-capacity sampled branched attempt."""
 
     def __init__(
         self,
@@ -1387,6 +1633,7 @@ class BranchedSampledPokerIteration:
         run_state: RunState | None = None,
         frozen_operation: ModelOperation | None = None,
         reference_operation: ModelOperation | None = None,
+        rank_boundary: Callable[[], None] | None = None,
     ) -> None:
         if (
             not mode.rollout_mode.is_branched
@@ -1448,7 +1695,27 @@ class BranchedSampledPokerIteration:
             raise ValueError("cost safeguard differs from checkpointed run state")
         self.frozen_operation = frozen_operation
         self.reference_operation = reference_operation
+        self.rank_boundary = rank_boundary
+        self._attempt_success = torch.empty(
+            (), dtype=torch.bool, pin_memory=True
+        )
+        self._attempt_success_event = torch.cuda.Event(blocking=False)
         self.policy = PokerPolicyOperator()
+
+    def _publication_succeeded(self, success: Tensor) -> bool:
+        """Poll the fixed attempt-boundary feedback slot."""
+
+        if success.device != self.owners.plan.device or success.numel() != 1:
+            raise BranchedPokerError(
+                "attempt publication success has an invalid shape"
+            )
+        self._attempt_success.copy_(success.reshape(()), non_blocking=True)
+        self._attempt_success_event.record(
+            torch.cuda.current_stream(success.device)
+        )
+        while not self._attempt_success_event.query():
+            time.sleep(0)
+        return bool(self._attempt_success)
 
     @staticmethod
     def _defaults(slab: MonotoneSlab, rows: int) -> dict[str, Tensor]:
@@ -1508,7 +1775,7 @@ class BranchedSampledPokerIteration:
         )
         if self.cost_safeguard is not None:
             with torch.no_grad():
-                root_cost = self._model(
+                root_cost = self._bounded_model(
                     PokerForwardInput(
                         "pre",
                         values["model_input"][0],
@@ -1540,7 +1807,7 @@ class BranchedSampledPokerIteration:
             active=torch.ones(1, dtype=torch.bool, device=state.device),
         )
         transaction.fill_all()
-        if not bool(transaction.publish().all()):
+        if not self._publication_succeeded(transaction.publish().all()):
             raise BranchedPokerError("branched roots exceeded fixed capacity")
         queue.publish_family_tail(torch.ones(1, dtype=torch.bool, device=state.device))
         queue.frontier_cost.copy_(root_cost.sum().reshape(1))
@@ -1575,7 +1842,7 @@ class BranchedSampledPokerIteration:
             active=torch.ones(1, dtype=torch.bool, device=queue.family.device),
         )
         transaction.fill_all()
-        if not bool(transaction.publish().all()):
+        if not self._publication_succeeded(transaction.publish().all()):
             failure = self.owners.failure_state.snapshot(0)
             if failure is None:
                 raise BranchedPokerError(
@@ -1671,6 +1938,38 @@ class BranchedSampledPokerIteration:
             }
         )
 
+    def _bounded_model(
+        self, forward: PokerForwardInput, lanes: Tensor
+    ) -> Mapping[str, Tensor]:
+        """Run auxiliary T/C forwards in admitted family-pack subspans."""
+
+        rows = int(forward.owner.numel())
+        cap = self.owners.plan.manifest.family_pack_cap
+        if rows <= cap:
+            return self._model(forward, lanes)
+        pieces: dict[str, list[Tensor]] = {}
+        for begin in range(0, rows, cap):
+            end = min(begin + cap, rows)
+            item = self._model(
+                PokerForwardInput(
+                    forward.input_type,
+                    forward.model_input[begin:end],
+                    forward.sampled_private_state[begin:end],
+                    forward.owner[begin:end],
+                    (
+                        None
+                        if forward.role_selector is None
+                        else forward.role_selector[begin:end]
+                    ),
+                ),
+                lanes,
+            )
+            for name, value in item.items():
+                pieces.setdefault(name, []).append(value)
+        return MappingProxyType(
+            {name: torch.cat(values) for name, values in pieces.items()}
+        )
+
     def run(self, *, iteration: int) -> BranchedPokerResult:
         owners = self.owners
         owners.enter_phase(ExecutionPhase.ROLLOUT)
@@ -1715,6 +2014,8 @@ class BranchedSampledPokerIteration:
             ),
             topology_cap=owners.plan.manifest.topology_cap,
             topology_edge_cap=owners.plan.manifest.topology_edge_cap,
+            topology_packet_cap=owners.plan.manifest.topology_packet_cap,
+            device=owners.plan.device,
         )
         hooks = BranchedSampledPokerHooks(
             self.geometry,
@@ -1725,11 +2026,24 @@ class BranchedSampledPokerIteration:
             mode=self.mode,
             controller=self.controller,
             cost_safeguard=self.cost_safeguard,
-            child_model=self._model,
+            child_model=self._bounded_model,
             topology_recorder=recorder,
             policy=self.policy,
         )
-        scheduler = FamilyScheduler(input_names, owners.plan.manifest.family_pack_cap)
+        beta_max = owners.plan.manifest.beta_max
+        topology_rows_per_root = sum(
+            beta_max**generation for generation in range(1, 5)
+        )
+        if topology_rows_per_root > owners.plan.manifest.topology_packet_cap:
+            raise ValueError(
+                "topology packet cannot cover one maximal branched root"
+            )
+        rollout_pack_cap = min(
+            owners.plan.manifest.family_pack_cap,
+            owners.plan.manifest.topology_packet_cap
+            // topology_rows_per_root,
+        )
+        scheduler = FamilyScheduler(input_names, rollout_pack_cap)
         roots = (
             owners.plan.manifest.root_count
             if self.run_state is None
@@ -1763,6 +2077,22 @@ class BranchedSampledPokerIteration:
                 scheduled = scheduler.select(states, allow_partial=True)
                 if scheduled is None:
                     raise BranchedPokerError("branched scheduler lost queued work")
+                if logical_time >= owners.plan.manifest.topology_cap:
+                    recorder.release()
+                    raise RecoverableOverflow(
+                        DeviceFailure(
+                            lane=0,
+                            status=1,
+                            phase="branched_topology_sequence",
+                            failure_code="capacity_overflow",
+                            input_type=scheduled.input_type,
+                            logical_address=logical_base,
+                            requested_extent=logical_time + 1,
+                            available_extent=owners.plan.manifest.topology_cap,
+                        ),
+                        capacity=owners.plan.manifest.topology_cap,
+                        observed_demand=logical_time + 1,
+                    )
                 hooks.frontier_cost_forecast = torch.stack(
                     tuple(queue.frontier_cost[0] for queue in queues.values())
                 ).sum()
@@ -1781,6 +2111,8 @@ class BranchedSampledPokerIteration:
                     failure = owners.failure_state.snapshot(0)
                     if failure is None or failure.failure_code != "capacity_overflow":
                         raise BranchedPokerError("branched rollout failed terminally")
+                    recorder.release()
+                    del feedback, publication
                     raise RecoverableOverflow(
                         failure,
                         capacity=failure.available_extent,
@@ -1790,22 +2122,35 @@ class BranchedSampledPokerIteration:
                     raise BranchedPokerError(
                         "branched commit returned invalid pinned feedback"
                     )
+                try:
+                    recorder.accept_payload(feedback)
+                except BranchedTopologyArenaOverflow as overflow:
+                    failure = DeviceFailure(
+                        lane=0,
+                        status=1,
+                        phase="branched_topology",
+                        failure_code="capacity_overflow",
+                        input_type=scheduled.input_type,
+                        logical_address=logical_base,
+                        requested_extent=overflow.observed_demand,
+                        available_extent=overflow.capacity,
+                    )
+                    recorder.release()
+                    hooks.last_topology = None
+                    del feedback, publication
+                    raise RecoverableOverflow(
+                        failure,
+                        capacity=overflow.capacity,
+                        observed_demand=overflow.observed_demand,
+                    ) from None
                 hooks.realized_tree_size += int(feedback.sampled_nodes)
                 depths[scheduled.input_type] -= scheduled.rows
-                for name, count in zip(
-                    input_names, feedback.produced, strict=True
-                ):
+                produced = tuple(int(value) for value in feedback.produced)
+                for name, count in zip(input_names, produced, strict=True):
                     depths[name] += count
                 logical_time += 1
                 last_event = commit.event
-                if logical_time > owners.plan.manifest.topology_cap:
-                    raise BranchedPokerError("branched rollout exceeded topology cap")
-            for payload in publisher.drain_branched(block=True):
-                if not isinstance(payload, _StagedBranchedPayload):
-                    raise BranchedPokerError(
-                        "branched publisher returned an invalid topology payload"
-                    )
-                recorder.accept_payload(payload)
+                del feedback, publication
             deficient = next(
                 (
                     root
@@ -1820,11 +2165,15 @@ class BranchedSampledPokerIteration:
                 pre_refill_size = recorder.sampled_tree_size()
                 pre_refill_record_count = recorder.record_count
             hooks.begin_root_refill(recorder.root_degree(deficient) + 1)
-            self._publish_refill_root(
-                queues["pre"],
-                original_row=deficient - logical_base,
-                logical_root=deficient,
-            )
+            try:
+                self._publish_refill_root(
+                    queues["pre"],
+                    original_row=deficient - logical_base,
+                    logical_root=deficient,
+                )
+            except RecoverableOverflow:
+                recorder.release()
+                raise
             depths["pre"] = 1
         assert last_event is not None
         recorder.materialize_cpu()
@@ -1852,8 +2201,10 @@ class BranchedSampledPokerIteration:
             ),
             manifest=owners.plan.manifest,
         )
-        owners.release_after(ExecutionPhase.ROLLOUT)
         del transaction, publisher, registry, queues, hooks
+        if self.rank_boundary is not None:
+            self.rank_boundary()
+        owners.release_after(ExecutionPhase.ROLLOUT)
         owners.enter_phase(ExecutionPhase.QUEUE_DRAIN)
         owners.release_after(ExecutionPhase.QUEUE_DRAIN)
 
@@ -2032,8 +2383,8 @@ def _discard_attempt(owners: GeneratedOwners) -> None:
     owners.close()
 
 
-class RecoveringBranchedSampledPokerIteration:
-    """Allocate and discard whole attempts around the branched controller."""
+class BranchedSampledPokerIteration:
+    """Sole public sampled-branched iteration with whole-attempt recovery."""
 
     def __init__(
         self,
@@ -2049,9 +2400,11 @@ class RecoveringBranchedSampledPokerIteration:
         self.plan = plan
         self.controller = controller
         self.run_state = run_state
+        if "rank_boundary" in arguments:
+            raise ValueError("rank agreement is owned by the iteration")
         self.arguments = MappingProxyType(dict(arguments))
         self.rank_agreement = (
-            RankCommonFailureAgreement()
+            RankCommonFailureAgreement.from_runtime()
             if rank_agreement is None
             else rank_agreement
         )
@@ -2066,6 +2419,18 @@ class RecoveringBranchedSampledPokerIteration:
             rank_agreement=self.rank_agreement,
         )
 
+        def rank_boundary() -> None:
+            failure = self.rank_agreement.agree(None)
+            if failure is None:
+                return
+            agreed = RecoverableOverflow(
+                failure.failure,
+                capacity=failure.capacity,
+                observed_demand=failure.observed_demand,
+            )
+            agreed._rank_agreed = True  # type: ignore[attr-defined]
+            raise agreed
+
         def attempt(address: AttemptAddress) -> BranchedPokerResult:
             if (
                 address.retry_epoch != self.run_state.retry_epoch
@@ -2077,19 +2442,24 @@ class RecoveringBranchedSampledPokerIteration:
                 owners.failure_state.release()
                 raise BranchedPokerError("branched retry changed storage plan")
             active[:] = [owners]
-            return BranchedSampledPokerIteration(
+            return _BranchedSampledPokerAttempt(
                 owners=owners,
                 controller=self.controller,
                 run_state=self.run_state,
+                rank_boundary=rank_boundary,
                 **self.arguments,
             ).run(iteration=iteration)
 
-        def discard(_failure: RecoverableOverflow) -> None:
+        def discard(_failure: RecoverableOverflow | None) -> None:
             if len(active) != 1:
                 raise BranchedPokerError("failed attempt owner is unavailable")
             _discard_attempt(active.pop())
 
-        return recovery.run(attempt, discard)
+        return recovery.run(
+            attempt,
+            discard,
+            agreement_in_attempt=True,
+        )
 
 
 __all__ = [
@@ -2098,5 +2468,4 @@ __all__ = [
     "BranchedSampledPokerHooks",
     "BranchedSampledPokerIteration",
     "BranchedTopologyRecorder",
-    "RecoveringBranchedSampledPokerIteration",
 ]
