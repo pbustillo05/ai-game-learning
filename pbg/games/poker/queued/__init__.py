@@ -46,21 +46,32 @@ from pbg.games.poker.queued.response import (
     training_probe_seats,
 )
 from pbg.games.poker.queued.branching import (
+    BranchedPokerHooks,
+    BranchedPokerIteration,
     BranchedPokerError,
     BranchedPokerResult,
     BranchedSampledPokerHooks,
     BranchedSampledPokerIteration,
     BranchedTopologyRecorder,
+    branched_rb_chance_frontier_row_bytes,
+)
+from pbg.games.poker.queued.rb_sampling import (
+    CollisionConditionedProfileSampler,
+    PosteriorSamplingError,
+    RejectionObservation,
 )
 
 __all__ = [
     "ActorSample",
     "BoundPokerPolicy",
     "BranchedPokerError",
+    "BranchedPokerHooks",
+    "BranchedPokerIteration",
     "BranchedPokerResult",
     "BranchedSampledPokerHooks",
     "BranchedSampledPokerIteration",
     "BranchedTopologyRecorder",
+    "CollisionConditionedProfileSampler",
     "CHECK_CALL",
     "FOLD",
     "NLHEGeometry",
@@ -74,6 +85,8 @@ __all__ = [
     "PokerModelError",
     "PokerPolicyError",
     "PokerPolicyOperator",
+    "PosteriorSamplingError",
+    "RejectionObservation",
     "PairedProbeStatistics",
     "PokerState",
     "PokerStateMachine",
@@ -87,6 +100,7 @@ __all__ = [
     "SequentialSharedResponseProbe",
     "SHARED_RESPONSE_SEMANTICS",
     "balanced_evaluation_probe_seats",
+    "branched_rb_chance_frontier_row_bytes",
     "build_model_from_config",
     "sampled_partitions",
     "rb_partitions",

@@ -514,8 +514,6 @@ def build_model_from_config(
         schema = mode_schema(**dict(mode))
     except (TypeError, ValueError) as exc:
         raise ValueError("scientific.mode is not a closed queued mode") from exc
-    if schema.rollout_mode.is_branched and schema.private_estimator.value != "sampled":
-        raise ValueError("Phase 7 model construction supports sampled branched modes")
     game = scientific.get("game")
     model = scientific.get("model")
     if not isinstance(game, Mapping) or not isinstance(model, Mapping):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -13,7 +14,11 @@ from pathlib import Path
 import torch
 from torch import Tensor, nn
 
-from pbg.queued.config import Phase5Config, SequentialModeConfig
+from pbg.queued.config import (
+    BranchedModeConfig,
+    Phase5Config,
+    SequentialModeConfig,
+)
 from pbg.queued.learner import ReferenceState
 from pbg.queued.optimization import DenseAdam, LossScaler
 
@@ -434,7 +439,7 @@ def convert_legacy_sequential(
     expected_training_regime: str | None = None,
     expected_estimator: str | None = None,
 ) -> dict[str, object]:
-    """Convert an approved sequential sampled, RB, or probe artifact offline."""
+    """Convert an approved sequential or branched-RB artifact offline."""
 
     source = Path(source_path)
     destination = Path(destination_path)
@@ -451,31 +456,43 @@ def convert_legacy_sequential(
     }.get(source_schema)
     if expected_fields is None or set(legacy) != expected_fields:
         raise PersistenceError("legacy checkpoint schema has unknown or missing fields")
-    if source_schema == LEGACY_SCHEMA and (
-        legacy["cost_safeguard_controller_schema_version"] is not None
-        or legacy["cost_safeguard_controller_state"] is not None
-    ):
-        raise PersistenceError("sequential artifact cannot carry a cost safeguard")
     config = legacy["config"]
     legacy_mode = config["training"]["mode"]
-    if config["rollout"]["branching_mode"] is not None:
-        raise PersistenceError("sequential converter rejects branched artifacts")
+    branching_mode = config["rollout"]["branching_mode"]
     completion_samples = config["completion"]["n_samples"]
-    if legacy_mode == "nor" + "mal" and completion_samples is None:
-        regime, estimator = "self_play", "sampled"
-    elif legacy_mode == "rao_blackwell" and completion_samples is not None:
+    branched = (
+        legacy_mode == "branched_" + "rao_blackwell"
+        and branching_mode in ("fixed", "adaptive_kkt", "kkt")
+        and completion_samples is not None
+    )
+    if legacy_mode == "nor" + "mal" and completion_samples is None and branching_mode is None:
+        regime, estimator, rollout_mode = "self_play", "sampled", "sequential"
+    elif (
+        legacy_mode == "rao_blackwell"
+        and completion_samples is not None
+        and branching_mode is None
+    ):
         probe = config.get("probe")
         if (probe is None) != (legacy["probe_target"] is None):
             raise PersistenceError(
                 "probe target metadata disagrees with legacy configuration"
             )
-        regime, estimator = (
-            ("best_response", "rao_blackwell")
+        regime, estimator, rollout_mode = (
+            ("best_response", "rao_blackwell", "sequential")
             if probe is not None
-            else ("self_play", "rao_blackwell")
+            else ("self_play", "rao_blackwell", "sequential")
+        )
+    elif branched:
+        regime, estimator = "self_play", "rao_blackwell"
+        rollout_mode = (
+            "branched.fixed"
+            if branching_mode == "fixed"
+            else "branched.KKT"
         )
     else:
-        raise PersistenceError("legacy artifact is not an approved sequential mode")
+        raise PersistenceError(
+            "legacy artifact is not an approved sequential or branched-RB mode"
+        )
     if (
         expected_training_regime is not None and regime != expected_training_regime
     ) or (expected_estimator is not None and estimator != expected_estimator):
@@ -509,6 +526,8 @@ def convert_legacy_sequential(
             "value_coefficient": float(legacy_loss["c_v"]),
             "entropy_coefficient": float(legacy_loss["c_h"]),
             "reference_kl_coefficient": float(legacy_loss["c_kl"]),
+            "trace_coefficient": float(legacy_loss.get("c_t", 0.0)),
+            "cost_coefficient": float(legacy_loss.get("c_c", 0.0)),
             "value_loss": str(legacy_loss["value_loss"]),
             "entropy_schedule": (
                 "constant"
@@ -555,7 +574,7 @@ def convert_legacy_sequential(
     scientific = Phase5Config.from_mapping(scientific).scientific_mapping()
     scientific["mode"] = {
         "training_regime": regime,
-        "rollout_mode": "sequential",
+        "rollout_mode": rollout_mode,
         "private_estimator": estimator,
     }
     if estimator == "rao_blackwell":
@@ -617,7 +636,104 @@ def convert_legacy_sequential(
             "target_sha256": target_hash,
             "initial_model_sha256": initial_hash,
         }
-    scientific = SequentialModeConfig.from_mapping(scientific).scientific_mapping()
+    if branched:
+        rollout = config["rollout"]
+        beta = rollout.get("beta") or {"default": 1.0}
+        default_beta = float(beta.get("default", 1.0))
+        player_beta = float(beta.get("player", default_beta))
+        chance_beta = float(beta.get("chance", default_beta))
+        beta_max = max(
+            1,
+            int(
+                math.ceil(
+                    max(player_beta, chance_beta)
+                    * float(rollout.get("fixed_beta_scale_max", 1.0))
+                )
+            ),
+        )
+        safe_tree_size = rollout.get("safe_tree_size")
+        scientific["branching"] = {
+            "fixed_beta": {
+                "player": min(player_beta, beta_max),
+                "chance": min(chance_beta, beta_max),
+            },
+            "beta_max": beta_max,
+            "minimum_tree_size": int(
+                rollout.get("branching_min_nodes", 1)
+            ),
+            "minimum_scale": float(
+                rollout.get("fixed_beta_scale_min", 0.25)
+            ),
+            "backoff_factor": float(
+                rollout.get("branching_emergency_backoff", 0.5)
+            ),
+            "safe_tree_size": float(
+                safe_tree_size
+                if safe_tree_size is not None
+                else rollout.get("branching_ideal_nodes", 1.0e12)
+            ),
+        }
+        if rollout_mode == "branched.KKT":
+            adaptive = rollout.get("adaptive_kkt") or {}
+            scientific["branching"].update(
+                {
+                    "warmup_iterations": int(
+                        adaptive.get("warmup_iterations", 0)
+                    ),
+                    "target_tree_size": float(
+                        adaptive.get(
+                            "target_tree_size",
+                            rollout.get("branching_ideal_nodes", 1),
+                        )
+                    ),
+                    "gamma_kappa": float(
+                        adaptive.get("gamma_kappa", 0.2)
+                    ),
+                    "eta_kappa": float(
+                        adaptive.get("eta_kappa", 0.2)
+                    ),
+                    "kappa_min": float(
+                        adaptive.get("kappa_min", 0.25)
+                    ),
+                    "kappa_max": float(
+                        adaptive.get("kappa_max", 4.0)
+                    ),
+                    "log_kappa": float(
+                        adaptive.get("log_kappa", 0.0)
+                    ),
+                }
+            )
+        scientific["cost_safeguard"] = {
+            "gamma_deviance_max": float(
+                rollout.get(
+                    "safe_tree_activation_gamma_deviance_max", 0.2
+                )
+            ),
+            "p95_underprediction_max": float(
+                rollout.get(
+                    "safe_tree_activation_p95_underprediction_max", 1.5
+                )
+            ),
+            "consecutive_iterations": int(
+                rollout.get(
+                    "safe_tree_activation_consecutive_iters", 4
+                )
+            ),
+        }
+        scientific = BranchedModeConfig.from_mapping(
+            scientific
+        ).scientific_mapping()
+    else:
+        if source_schema == LEGACY_SCHEMA and (
+            legacy["cost_safeguard_controller_schema_version"] is not None
+            or legacy["cost_safeguard_controller_state"] is not None
+        ):
+            raise PersistenceError(
+                "sequential artifact cannot carry a cost safeguard"
+            )
+        scientific = SequentialModeConfig.from_mapping(
+            scientific
+        ).scientific_mapping()
     execution = {
         "hardware_profile": dict(legacy["hardware_profile"]),
         "checkpoint_cadence": config["training"].get("checkpoint_every"),
@@ -648,11 +764,26 @@ def convert_legacy_sequential(
                         ),
                     }
                 )
+    adaptive_state = legacy["adaptive_work_state"]
+    legacy_root_count = (
+        int(adaptive_state["current_roots_per_gpu"])
+        if isinstance(adaptive_state, Mapping)
+        else int(config["rollout"]["sequential_roots_per_gpu_initial"])
+    )
+    logical_work = legacy["logical_work"]
     run_state = RunState(
         run_id=legacy["run_id"],
         iteration=int(legacy["iteration"]),
-        root_count=int(legacy["adaptive_work_state"]["current_roots_per_gpu"]),
-        logical_work=dict(legacy["logical_work"]),
+        root_count=legacy_root_count,
+        logical_work=(
+            dict(logical_work)
+            if isinstance(logical_work, Mapping)
+            else {
+                "trajectories": 0,
+                "minibatches": 0,
+                "optimizer_steps": 0,
+            }
+        ),
         metrics_prefix=metrics_prefix,
     )
     converted = {
@@ -684,7 +815,7 @@ def convert_legacy_sequential(
             "schema": CONVERSION_SCHEMA,
             "source_sha256": source_hash,
             "source_schema": source_schema,
-            "mode": f"{regime}/sequential/{estimator}",
+            "mode": f"{regime}/{rollout_mode}/{estimator}",
         },
     }
     # Conversion provenance is recorded beside the strict runtime payload,
@@ -736,6 +867,20 @@ def convert_legacy_sequential_sampled(
     )
 
 
+def convert_legacy_branched_rb(
+    source_path: str | os.PathLike[str],
+    destination_path: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Phase 8 spelling for the sole offline poker converter."""
+
+    return convert_legacy_sequential(
+        source_path,
+        destination_path,
+        expected_training_regime="self_play",
+        expected_estimator="rao_blackwell",
+    )
+
+
 def trim_metrics_after_checkpoint(
     metrics: Sequence[Mapping[str, object]], iteration: int
 ) -> list[dict[str, object]]:
@@ -758,6 +903,7 @@ __all__ = [
     "RunState",
     "convert_legacy_sequential",
     "convert_legacy_sequential_sampled",
+    "convert_legacy_branched_rb",
     "convert_queued_checkpoint_v1",
     "load_checkpoint",
     "save_checkpoint",

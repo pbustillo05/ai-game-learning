@@ -421,7 +421,7 @@ class SequentialModeConfig:
 
 @dataclass(frozen=True)
 class BranchedModeConfig:
-    """Closed Phase 7 scientific configuration for sampled branched modes."""
+    """Closed scientific configuration for every branched mode."""
 
     mode: Mapping[str, str]
     common: Phase5Config
@@ -443,11 +443,15 @@ class BranchedModeConfig:
             raise ValueError("root.mode.training_regime: invalid branched axis")
         if mode["rollout_mode"] not in ("branched.fixed", "branched.KKT"):
             raise ValueError("root.mode.rollout_mode: invalid branched axis")
-        if mode["private_estimator"] != "sampled":
-            raise ValueError("root.mode.private_estimator: Phase 7 requires sampled")
+        if mode["private_estimator"] not in ("sampled", "rao_blackwell"):
+            raise ValueError(
+                "root.mode.private_estimator: invalid branched axis"
+            )
+        rb = mode["private_estimator"] == "rao_blackwell"
         extensions = {
             "branching",
             "cost_safeguard",
+            "completion",
             "frozen_profile",
             "response_initialization",
         }
@@ -567,6 +571,27 @@ class BranchedModeConfig:
         ):
             raise ValueError("root.cost_safeguard: calibration bounds are invalid")
         applicable: dict[str, object] = {}
+        if rb:
+            completion = dict(
+                _mapping(source.get("completion"), "root.completion")
+            )
+            if set(completion) != {"n_samples", "strata"}:
+                raise ValueError(
+                    "root.completion: RB requires exactly n_samples and strata"
+                )
+            if (
+                isinstance(completion["n_samples"], bool)
+                or not isinstance(completion["n_samples"], int)
+                or completion["n_samples"] <= 0
+            ):
+                raise ValueError(
+                    "root.completion.n_samples: must be positive"
+                )
+            applicable["completion"] = completion
+        elif "completion" in source:
+            raise ValueError(
+                "root.completion: inapplicable to sampled mode"
+            )
         response = mode["training_regime"] == "best_response"
         if response:
             frozen = dict(_mapping(source.get("frozen_profile"), "root.frozen_profile"))

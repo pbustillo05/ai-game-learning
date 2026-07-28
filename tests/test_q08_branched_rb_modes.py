@@ -1,0 +1,449 @@
+from __future__ import annotations
+
+import math
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+import torch
+
+from pbg.games.poker.queued import (
+    BranchedPokerIteration,
+    CollisionConditionedProfileSampler,
+    NLHEGeometry,
+    branched_rb_chance_frontier_row_bytes,
+    rb_partitions,
+)
+from pbg.games.poker.queued.model import build_model_from_config
+from pbg.queued import (
+    BranchedModeConfig,
+    DenseAdam,
+    FixedBranchController,
+    GeneratedOwners,
+    KKTBranchController,
+    LearnerSchedule,
+    LossConfig,
+    OptimizerConfig,
+    PartitionRows,
+    RunState,
+    build_storage_plan,
+    convert_legacy_branched_rb,
+    mode_schema,
+)
+from pbg.queued.targets import rb_conversion_library_workspace_bytes
+from tests.test_q07_branched_sampled_modes import (
+    _manifest,
+    _phase7_layout,
+    _scientific_config,
+)
+from tests.test_q05_sequential_sampled_training import _legacy_checkpoint
+
+
+CUDA = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Phase 8 requires CUDA"
+)
+
+
+def _config(regime: str, rollout: str) -> dict[str, object]:
+    result = _scientific_config(regime, rollout)
+    result["mode"]["private_estimator"] = "rao_blackwell"
+    result["completion"] = {"n_samples": 4, "strata": "default"}
+    return result
+
+
+def _plan(device: torch.device, mode, geometry: NLHEGeometry):
+    partitions = rb_partitions(geometry)
+    manifest = replace(
+        _manifest(device, geometry),
+        action_cap=(
+            PartitionRows("pre", 2048),
+            PartitionRows("post", 2048),
+        ),
+        library_workspace_bytes=rb_conversion_library_workspace_bytes(
+            geometry.private_hands, geometry.rank_count**2
+        ),
+    )
+    layout = replace(
+        _phase7_layout(geometry),
+        evaluator_private_width=geometry.private_hands,
+        chance_frontier_row_bytes=branched_rb_chance_frontier_row_bytes(
+            geometry, max_attempts=16
+        ),
+        completion_workspace_row_bytes=8192,
+        learner_sigma_workspace_row_bytes=8192,
+        learner_action_workspace_row_bytes=8192,
+    )
+    return build_storage_plan(
+        mode, partitions, manifest, layout, device
+    )
+
+
+@pytest.mark.parametrize("regime", ("self_play", "best_response"))
+@pytest.mark.parametrize("rollout", ("branched.fixed", "branched.KKT"))
+def test_phase8_config_closes_all_four_rb_modes(
+    regime: str, rollout: str
+) -> None:
+    value = _config(regime, rollout)
+    assert (
+        BranchedModeConfig.from_mapping(value)
+        .scientific_mapping()["mode"]
+        == value["mode"]
+    )
+    missing = dict(value)
+    del missing["completion"]
+    with pytest.raises(ValueError, match="root.completion"):
+        BranchedModeConfig.from_mapping(missing)
+
+
+def test_offline_converter_accepts_approved_fixed_branched_rb(
+    tmp_path: Path,
+) -> None:
+    legacy = _legacy_checkpoint()
+    legacy["config"]["training"]["mode"] = "branched_rao_blackwell"
+    legacy["config"]["completion"] = {
+        "n_samples": 8,
+        "strata": "default",
+    }
+    legacy["config"]["rollout"].update(
+        {
+            "branching_mode": "fixed",
+            "beta": {"default": 2.0},
+            "branching_min_nodes": 4,
+            "branching_ideal_nodes": 16.0,
+            "fixed_beta_scale_min": 0.25,
+            "fixed_beta_scale_max": 1.0,
+            "branching_emergency_backoff": 0.5,
+            "safe_tree_activation_gamma_deviance_max": 0.2,
+            "safe_tree_activation_p95_underprediction_max": 1.5,
+            "safe_tree_activation_consecutive_iters": 4,
+        }
+    )
+    source = tmp_path / "legacy.pt"
+    destination = tmp_path / "queued.pt"
+    torch.save(legacy, source)
+    result = convert_legacy_branched_rb(source, destination)
+    assert result["mode"] == (
+        "self_play/branched.fixed/rao_blackwell"
+    )
+    converted = torch.load(
+        destination, map_location="cpu", weights_only=False
+    )
+    config = BranchedModeConfig.from_mapping(
+        converted["scientific_config"]
+    )
+    assert config.applicable["completion"]["n_samples"] == 8
+
+
+@CUDA
+def test_collision_sampler_reuses_child_zero_and_is_subdivision_invariant() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    sampler = CollisionConditionedProfileSampler(
+        geometry, max_attempts=16
+    )
+    weights = torch.ones(
+        (2, 2, geometry.private_hands),
+        dtype=torch.float32,
+        device=device,
+    )
+    board = torch.full(
+        (2, 5), 255, dtype=torch.uint8, device=device
+    )
+    first = geometry.first_card
+    inherited_cards = torch.tensor(
+        (
+            ((first, first + 1), (first + 2, first + 3)),
+            ((first + 4, first + 5), (first + 6, first + 7)),
+        ),
+        dtype=torch.int64,
+        device=device,
+    )
+    inherited = geometry.combo_id(
+        inherited_cards[..., 0], inherited_cards[..., 1]
+    )
+    source = torch.tensor(
+        (0, 0, 1, 1), dtype=torch.int64, device=device
+    )
+    ordinal = torch.tensor(
+        (0, 1, 0, 1), dtype=torch.int64, device=device
+    )
+    active = torch.ones(4, dtype=torch.bool, device=device)
+    root = torch.tensor(
+        (5, 5, 6, 6), dtype=torch.int64, device=device
+    )
+    path = torch.tensor(
+        (11, 12, 21, 22), dtype=torch.int64, device=device
+    )
+
+    def sample(selected: torch.Tensor) -> torch.Tensor:
+        return sampler.sample_children(
+            range_weights=weights,
+            board_cards=board,
+            inherited_profile=inherited,
+            source=source.index_select(0, selected),
+            ordinal=ordinal.index_select(0, selected),
+            active=active.index_select(0, selected),
+            root=root.index_select(0, selected),
+            path=path.index_select(0, selected),
+            seed=73,
+            iteration=4,
+            retry_epoch=2,
+        )
+
+    whole = sample(torch.arange(4, device=device))
+    observation = sampler.last_observation
+    assert observation is not None
+    assert observation.attempt_count[::2].tolist() == [0, 0]
+    split = torch.cat(
+        (
+            sample(torch.arange(2, device=device)),
+            sample(torch.arange(2, 4, device=device)),
+        )
+    )
+    torch.testing.assert_close(whole, split)
+    torch.testing.assert_close(whole[::2], inherited)
+    cards = sampler._combo_cards(whole.flatten()).reshape(4, 2, 2)
+    assert bool(
+        cards[:, 0, :, None].ne(cards[:, 1, None, :]).all()
+    )
+
+
+@CUDA
+def test_collision_sampler_matches_the_exact_conditioned_sparse_law() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    sampler = CollisionConditionedProfileSampler(
+        geometry, max_attempts=16
+    )
+    first = geometry.first_card
+
+    def combo(a: int, b: int) -> int:
+        value = geometry.combo_id(
+            torch.tensor(a, dtype=torch.int64, device=device),
+            torch.tensor(b, dtype=torch.int64, device=device),
+        )
+        return int(value)
+
+    seat_zero = (
+        combo(first, first + 1),
+        combo(first + 2, first + 3),
+    )
+    seat_one = (
+        combo(first, first + 2),
+        combo(first + 4, first + 5),
+    )
+    weights = torch.zeros(
+        (1, 2, geometry.private_hands),
+        dtype=torch.float32,
+        device=device,
+    )
+    weights[0, 0, seat_zero[0]] = 1
+    weights[0, 0, seat_zero[1]] = 2
+    weights[0, 1, seat_one[0]] = 1
+    weights[0, 1, seat_one[1]] = 3
+    samples = 4096
+    sampled = sampler.sample_children(
+        range_weights=weights,
+        board_cards=torch.full(
+            (1, 5), 255, dtype=torch.uint8, device=device
+        ),
+        inherited_profile=torch.tensor(
+            ((seat_zero[0], seat_one[1]),),
+            dtype=torch.int32,
+            device=device,
+        ),
+        source=torch.zeros(samples, dtype=torch.int64, device=device),
+        ordinal=torch.ones(samples, dtype=torch.int64, device=device),
+        active=torch.ones(samples, dtype=torch.bool, device=device),
+        root=torch.zeros(samples, dtype=torch.int64, device=device),
+        path=torch.arange(
+            1, samples + 1, dtype=torch.int64, device=device
+        ),
+        seed=719,
+        iteration=3,
+        retry_epoch=0,
+    )
+    observation = sampler.last_observation
+    assert observation is not None
+    assert not bool(observation.exhausted.any())
+    assert bool(sampled[:, 1].eq(seat_one[1]).all())
+    first_probability = sampled[:, 0].eq(seat_zero[0]).float().mean()
+    # Conditioning removes both proposals using seat_one[0], leaving
+    # product masses 3 and 6 for the two valid joint profiles.
+    assert float(first_probability) == pytest.approx(1 / 3, abs=0.04)
+
+
+@CUDA
+@pytest.mark.parametrize(
+    ("players", "ranks"),
+    ((2, 4), (3, 4), (4, 4), (5, 4), (6, 5)),
+)
+def test_conditioned_sampler_covers_player_rank_boundaries_and_zero_plateaus(
+    players: int, ranks: int
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(players, 8.0, ranks)
+    sampler = CollisionConditionedProfileSampler(
+        geometry, max_attempts=8
+    )
+    first = geometry.first_card
+    desired_cards = torch.tensor(
+        [
+            (first + 1 + 2 * seat, first + 2 + 2 * seat)
+            for seat in range(players)
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    desired = geometry.combo_id(
+        desired_cards[:, 0], desired_cards[:, 1]
+    )
+    conflicting = geometry.combo_id(
+        torch.full(
+            (players,), first, dtype=torch.int64, device=device
+        ),
+        desired_cards[:, 0],
+    )
+    weights = torch.zeros(
+        (1, players, geometry.private_hands),
+        dtype=torch.float32,
+        device=device,
+    )
+    seat = torch.arange(players, device=device)
+    weights[0, seat, desired.to(torch.int64)] = 1
+    weights[0, seat, conflicting.to(torch.int64)] = 1_000
+    board = torch.full(
+        (1, 5), 255, dtype=torch.uint8, device=device
+    )
+    board[0, 0] = first
+    sampled = sampler.sample_children(
+        range_weights=weights,
+        board_cards=board,
+        inherited_profile=desired[None].to(torch.int32),
+        source=torch.zeros(1, dtype=torch.int64, device=device),
+        ordinal=torch.ones(1, dtype=torch.int64, device=device),
+        active=torch.ones(1, dtype=torch.bool, device=device),
+        root=torch.tensor((players,), dtype=torch.int64, device=device),
+        path=torch.tensor((ranks,), dtype=torch.int64, device=device),
+        seed=101,
+        iteration=7,
+        retry_epoch=0,
+    )
+    torch.testing.assert_close(sampled[0], desired.to(torch.int32))
+
+
+@CUDA
+def test_rejection_tail_reports_minimum_address_and_full_attempt_count() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    sampler = CollisionConditionedProfileSampler(
+        geometry, max_attempts=3
+    )
+    weights = torch.zeros(
+        (1, 2, geometry.private_hands),
+        dtype=torch.float32,
+        device=device,
+    )
+    weights[:, :, 0] = 1
+    inherited = torch.zeros(
+        (1, 2), dtype=torch.int32, device=device
+    )
+    sampler.sample_children(
+        range_weights=weights,
+        board_cards=torch.full(
+            (1, 5), 255, dtype=torch.uint8, device=device
+        ),
+        inherited_profile=inherited,
+        source=torch.zeros(1, dtype=torch.int64, device=device),
+        ordinal=torch.ones(1, dtype=torch.int64, device=device),
+        active=torch.ones(1, dtype=torch.bool, device=device),
+        root=torch.tensor((9,), dtype=torch.int64, device=device),
+        path=torch.tensor((17,), dtype=torch.int64, device=device),
+        seed=3,
+        iteration=2,
+        retry_epoch=0,
+    )
+    observation = sampler.last_observation
+    assert observation is not None
+    assert observation.exhausted.tolist() == [True]
+    assert observation.attempt_count.tolist() == [3]
+    assert int(observation.minimum_failing_address) == 17
+
+
+@CUDA
+@pytest.mark.parametrize("regime", ("self_play", "best_response"))
+@pytest.mark.parametrize("rollout", ("branched.fixed", "branched.KKT"))
+def test_four_branched_rb_modes_complete_optimizer_step(
+    regime: str, rollout: str
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = mode_schema(regime, rollout, "rao_blackwell")
+    plan = _plan(device, mode, geometry)
+    model = build_model_from_config(_config(regime, rollout), device)
+    frozen = (
+        build_model_from_config(_config("self_play", rollout), device)
+        if regime == "best_response"
+        else None
+    )
+    controller = (
+        FixedBranchController(
+            {
+                "player": (
+                    2.0 if regime == "self_play" else 1.0
+                ),
+                "chance": 1.0,
+            },
+            2,
+        )
+        if rollout == "branched.fixed"
+        else KKTBranchController(
+            {"player": 1.0, "chance": 1.0},
+            2,
+            warmup_iterations=0,
+            target_tree_size=64,
+            gamma_kappa=0.2,
+            eta_kappa=0.2,
+            kappa_min=0.25,
+            kappa_max=4,
+            log_kappa=math.log(1.0),
+        )
+    )
+    result = BranchedPokerIteration(
+        owner_factory=lambda: GeneratedOwners(plan),
+        plan=plan,
+        controller=controller,
+        run_state=RunState(
+            f"phase8-{regime}-{rollout}", root_count=1
+        ),
+        arguments={
+            "geometry": geometry,
+            "mode": mode,
+            "model": model,
+            "model_operation": model.rb_learner_operation,
+            "rollout_operation": model.rollout_operation,
+            "frozen_operation": (
+                None if frozen is None else frozen.rollout_operation
+            ),
+            "optimizer": DenseAdam(
+                model, OptimizerConfig(name="adamw", grad_clip=5)
+            ),
+            "loss": LossConfig(
+                reference_kl_coefficient=0,
+                trace_coefficient=0.1,
+                cost_coefficient=0.1,
+            ),
+            "schedule": LearnerSchedule(
+                batch_size=2, gradient_steps=1
+            ),
+            "generator": torch.Generator(device=device).manual_seed(991),
+            "seed": 991,
+            "lambda_": 0.95,
+            "completion_samples": 4,
+            "posterior_max_attempts": 16,
+        },
+    ).run(iteration=0)
+    assert result.player_nodes
+    assert result.leaves
+    assert result.learner.optimizer_steps
+    assert result.learner.optimizer_steps[0].applied
