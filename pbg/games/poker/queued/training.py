@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 
@@ -24,6 +24,7 @@ from pbg.games.poker.queued.hooks import (
     SequentialPokerHooks,
 )
 from pbg.games.poker.queued.policy import PokerPolicyOperator
+from pbg.games.poker.queued.observability import topology_diagnostics
 from pbg.games.poker.queued.replica import PokerReplicaInference
 from pbg.games.poker.queued.response import (
     PairedProbeStatistics,
@@ -107,6 +108,9 @@ class PokerIterationResult:
     leaves: int
     target_layers: int
     telemetry: SequentialBenchmarkTelemetry | None = None
+    observability: Mapping[str, object] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
 
 @dataclass(frozen=True)
@@ -888,6 +892,9 @@ class SequentialPokerIteration:
                 leaves=leaf_counts[0],
                 target_layers=plan.layer_count,
                 telemetry=SequentialBenchmarkTelemetry(rollout_seconds),
+                observability=topology_diagnostics(
+                    topologies[0], bindings[0], owners.plan.partitions
+                ),
             )
         owners.release_after(ExecutionPhase.ROLLOUT)
         del hooks, transaction, topology_publisher, registry, queues
@@ -1049,6 +1056,11 @@ class SequentialPokerIteration:
                 player_nodes=topologies[lane].node_count,
                 leaves=leaf_counts[lane],
                 target_layers=plan.layer_count,
+                observability=topology_diagnostics(
+                    topologies[lane],
+                    bindings[lane],
+                    owners.plan.partitions,
+                ),
             )
             for lane in range(self.n_replica)
         )

@@ -34,7 +34,8 @@ def _closed(
     source = dict(_mapping(value, path))
     aliases = {} if aliases is None else aliases
     translated: dict[str, object] = {}
-    allowed = {field.name for field in fields(cls)}
+    field_names = tuple(field.name for field in fields(cls))
+    allowed = set(field_names)
     for key, item in source.items():
         name = aliases.get(key, key)
         if name not in allowed:
@@ -46,7 +47,10 @@ def _closed(
         return cls(**translated)
     except (TypeError, ValueError) as exc:
         message = str(exc)
-        field = next((name for name in allowed if name in message), "configuration")
+        field = next(
+            (name for name in field_names if name in message),
+            "configuration",
+        )
         raise ValueError(f"{path}.{field}: {message}") from exc
 
 
@@ -106,21 +110,23 @@ class Phase5ModelConfig:
     epsilon: float = 1.0e-8
 
     def __post_init__(self) -> None:
-        integers = (
-            self.d_model,
-            self.n_heads,
-            self.n_layers_pre,
-            self.n_layers_post,
-            self.m_raise,
-            self.max_players,
-            self.class_embedding_dim,
-            self.folder_line_dim,
-        )
-        if any(
-            isinstance(value, bool) or not isinstance(value, int) or value <= 0
-            for value in integers
+        for name in (
+            "d_model",
+            "n_heads",
+            "n_layers_pre",
+            "n_layers_post",
+            "m_raise",
+            "max_players",
+            "class_embedding_dim",
+            "folder_line_dim",
         ):
-            raise ValueError("model dimensions must be positive integers")
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer")
         if (
             isinstance(self.folder_beta_rank, bool)
             or not isinstance(self.folder_beta_rank, int)
@@ -143,7 +149,12 @@ class Phase5ModelConfig:
             or not math.isfinite(self.epsilon)
             or self.epsilon <= 0
         ):
-            raise ValueError("model scale and epsilon must be positive")
+            field = (
+                "s_min"
+                if not math.isfinite(self.s_min) or self.s_min <= 0
+                else "epsilon"
+            )
+            raise ValueError(f"{field} must be finite and positive")
 
     @property
     def action_head_width(self) -> int:

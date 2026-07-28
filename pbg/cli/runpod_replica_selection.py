@@ -26,18 +26,8 @@ def main() -> None:
         parser.error("replica count must match the strict manifest and exceed one")
     started = time.monotonic()
     session = TrainingSession(cfg, resume_from=args.resume)
-    completed = 0
-    while (
-        min(state.iteration for state in session.run_states)
-        < cfg.execution.iterations
-        and time.monotonic() - started < args.deadline_minutes * 60
-    ):
-        iteration = min(state.iteration for state in session.run_states)
-        if cfg.mode["rollout_mode"] == "sequential":
-            session._run_sequential(iteration)
-        else:
-            session._run_branched(iteration)
-        completed += 1
+    deadline = started + args.deadline_minutes * 60
+    completed = session.run(deadline_monotonic=deadline)
     checkpoint = cfg.execution.output_dir / "selection_final.pt"
     digest = session.checkpoint(checkpoint)
     report = {

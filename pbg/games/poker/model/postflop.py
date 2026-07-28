@@ -282,12 +282,15 @@ class PostflopNet(nn.Module):
             1, cards[..., 1, None].expand(-1, -1, self.cfg.d_model)
         )
         folder_pool = context * unnormalized.sum(2, keepdim=True)
-        seat_context = empty_seats.clone()
+        seat_context = empty_seats
         if seat is not None:
             if seat.shape != (batch, folder_count):
                 raise ValueError("folder_seat must have shape [B,F]")
             safe_seat = seat.to(device=device, dtype=torch.long).clamp(0, players - 1)
-            seat_context.scatter_add_(
+            # Out-of-place scatter is required when replica inference vmaps
+            # model parameters: ``context`` then carries the vmap level while
+            # a shape-only zero allocation does not.
+            seat_context = seat_context.scatter_add(
                 1,
                 safe_seat[..., None].expand(-1, -1, self.cfg.d_model),
                 context + folder_pool,

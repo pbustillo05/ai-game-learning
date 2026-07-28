@@ -340,7 +340,48 @@ class PokerInferenceSession:
             tuple(hands), actions, probabilities, values, legal, compatible, None
         )
 
-    def advance(self, hand: HandHandle, action: str | PokerAction | tuple) -> None:
+    def actor(self, hand: HandHandle) -> int:
+        """Return the seat owning the current decision."""
+
+        item = self._hand(hand)
+        if bool(item.state.terminal[0]) or bool(self.machine.needs_chance(item.state)[0]):
+            raise ValueError("hand is not at a player decision")
+        return int(item.state.to_act[0])
+
+    def private_cards(self, hand: HandHandle, seat: int) -> tuple[int, int]:
+        """Return the already-dealt compact-deck cards for one seat."""
+
+        item = self._hand(hand)
+        if not 0 <= seat < self.geometry.players:
+            raise ValueError("seat is outside the table")
+        cards = self.machine.combo_cards(item.state.combo_ids)[0, seat]
+        return int(cards[0]), int(cards[1])
+
+    def private_hand_id(self, hand: HandHandle, seat: int) -> int:
+        item = self._hand(hand)
+        if not 0 <= seat < self.geometry.players:
+            raise ValueError("seat is outside the table")
+        return int(item.state.combo_ids[0, seat])
+
+    def is_terminal(self, hand: HandHandle) -> bool:
+        return bool(self._hand(hand).state.terminal[0])
+
+    def needs_chance(self, hand: HandHandle) -> bool:
+        return bool(self.machine.needs_chance(self._hand(hand).state)[0])
+
+    def policy_table(self, hand: HandHandle) -> tuple[tuple[PokerAction, ...], Tensor]:
+        """Return legal actions and the full private-hand policy on-device."""
+
+        _evaluation, legality, probabilities = self._evaluate(self._hand(hand))
+        return self._actions(legality), probabilities[0]
+
+    def advance(
+        self,
+        hand: HandHandle,
+        action: str | PokerAction | tuple,
+        *,
+        policy_probabilities: Tensor | None = None,
+    ) -> None:
         item = self._hand(hand)
         _evaluation, legality, probabilities = self._evaluate(item)
         actions = self._actions(legality)
@@ -375,7 +416,20 @@ class PokerInferenceSession:
         else:
             raise TypeError("unsupported poker action")
         actor = int(item.state.to_act[0])
-        selected = probabilities[0, :, event].clamp_min(torch.finfo(torch.float32).tiny)
+        policy = probabilities[0] if policy_probabilities is None else policy_probabilities
+        if (
+            policy.device != self.device
+            or policy.dtype not in (torch.float16, torch.float32, torch.bfloat16)
+            or policy.shape != probabilities.shape[1:]
+            or not bool(torch.isfinite(policy).all())
+            or bool((policy < 0).any())
+        ):
+            raise ValueError(
+                "external policy probabilities must be finite accelerator [H,E]"
+            )
+        selected = policy[:, event].float().clamp_min(
+            torch.finfo(torch.float32).tiny
+        )
         item.log_reach[:, actor].add_(selected.log())
         event_tensor = torch.tensor([event], dtype=torch.int32, device=self.device)
         item.history = self.machine.append_player_history(
@@ -387,6 +441,86 @@ class PokerInferenceSession:
                 raise RuntimeError(
                     "MPS folded-state inference is unsupported before CPU staging"
                 )
+
+    def deal_keyed(
+        self,
+        hand: HandHandle,
+        *,
+        seed: int,
+        trajectory_id: int,
+        decision_index: int,
+    ) -> None:
+        """Execute one schedule-independent chance transition on-device."""
+
+        if self.device.type == "mps":
+            raise RuntimeError(
+                "MPS chance/postflop inference is unsupported before CPU staging"
+            )
+        item = self._hand(hand)
+        if not bool(self.machine.needs_chance(item.state)[0]):
+            raise ValueError("hand is not at a chance node")
+        item.history = self.machine.append_chance_history(
+            item.state,
+            torch.ones(1, dtype=torch.bool, device=self.device),
+            item.history,
+        )
+        item.state = self.machine.deal_next_street_keyed(
+            item.state,
+            seed=seed,
+            iteration=0,
+            root=torch.tensor(
+                [trajectory_id], dtype=torch.int64, device=self.device
+            ),
+            path=torch.tensor(
+                [decision_index], dtype=torch.int64, device=self.device
+            ),
+            draw=int(item.state.street[0]),
+            retry_epoch=0,
+        )
+
+    def terminal_payoffs(self, hand: HandHandle) -> Tensor:
+        """Settle one terminal equal-stack hand on the selected accelerator."""
+
+        item = self._hand(hand)
+        state = item.state
+        if not bool(state.terminal[0]):
+            raise ValueError("hand is not terminal")
+        contenders = state.status[0].ne(FOLDED)
+        baseline = -state.committed
+        pot = state.committed.sum(-1)
+        if int(contenders.sum()) == 1:
+            result = baseline.clone()
+            winner = torch.nonzero(contenders, as_tuple=False)[0, 0]
+            result[0, winner] += pot[0]
+            return result[0]
+        if bool(state.board_cards[0].eq(PAD_CARD).any()):
+            raise RuntimeError("showdown terminal omitted a complete board")
+        import poker_gpu_evaluator as poker
+
+        evaluator = poker.bind(rank_count=self.geometry.rank_count)
+        combo_ids = torch.where(
+            contenders[None],
+            state.combo_ids,
+            torch.full_like(state.combo_ids, -1),
+        ).to(torch.int32)
+        stratum_level = torch.where(
+            contenders[None],
+            torch.zeros_like(state.combo_ids, dtype=torch.int32),
+            torch.full_like(state.combo_ids, -1, dtype=torch.int32),
+        )
+        amounts = torch.zeros(
+            (1, self.geometry.players),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        amounts[:, 0] = pot
+        return evaluator.evaluate_showdowns(
+            board_cards=state.board_cards,
+            combo_ids=combo_ids,
+            stratum_level=stratum_level,
+            payoff_baseline=baseline,
+            stratum_amount=amounts,
+        )[0]
 
     def advance_many(
         self, hands: Sequence[HandHandle], actions: Sequence[object]

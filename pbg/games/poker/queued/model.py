@@ -360,11 +360,13 @@ class QueuedPokerModel(nn.Module):
         self, input_type: str, model_input: Tensor
     ) -> ModelEvaluation:
         if (
-            model_input.device.type != "cuda"
+            model_input.device.type not in ("cuda", "mps")
             or model_input.ndim != 2
             or not model_input.is_floating_point()
         ):
-            raise PokerModelError("queued poker model input must be CUDA [B,F]")
+            raise PokerModelError(
+                "queued poker model input must be accelerator [B,F]"
+            )
         batch = model_input.shape[0]
         if input_type == "pre":
             compact = (

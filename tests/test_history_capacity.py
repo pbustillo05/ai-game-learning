@@ -47,8 +47,12 @@ def test_partition_attention_bounds_preserve_the_global_worst_case() -> None:
 
 
 def test_explicitly_small_history_capacity_is_a_dotted_load_error(tmp_path: Path) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
-    raw["model"]["max_history_tokens"] = 521
+    raw = yaml.safe_load(
+        (
+            ROOT / "configs" / "train" / "nlhe_6max_10bb_branched.yaml"
+        ).read_text()
+    )
+    raw["model"]["max_history_tokens"] = 1
     path = tmp_path / "short_history.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ConfigError, match=r"root\.model\.max_history_tokens"):
@@ -56,7 +60,11 @@ def test_explicitly_small_history_capacity_is_a_dotted_load_error(tmp_path: Path
 
 
 def test_worst_history_attention_footprint_is_checked_against_profile(tmp_path: Path) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
+    raw = yaml.safe_load(
+        (
+            ROOT / "configs" / "train" / "nlhe_6max_10bb_branched.yaml"
+        ).read_text()
+    )
     raw["game"]["stack_bb"] = 128.0
     path = tmp_path / "deep.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
@@ -64,5 +72,13 @@ def test_worst_history_attention_footprint_is_checked_against_profile(tmp_path: 
         n_players=6, stack_bb=128.0, rank_count=13, k_act=7
     )
     assert width > 8192
+    hardware = yaml.safe_load(
+        (
+            ROOT / "configs" / "hardware" / "local_3x2080ti.yaml"
+        ).read_text()
+    )
+    hardware["training_max_tokens"] = 8192
+    hardware_path = tmp_path / "bounded_hardware.yaml"
+    hardware_path.write_text(yaml.safe_dump(hardware), encoding="utf-8")
     with pytest.raises(ConfigError, match=r"hardware\.training_max_tokens"):
-        load_config(path, hardware_profile="quest_slurm")
+        load_config(path, hardware_profile=hardware_path)

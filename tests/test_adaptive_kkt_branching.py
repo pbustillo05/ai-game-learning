@@ -107,7 +107,11 @@ def test_legacy_player_count_alias_is_rejected_loudly() -> None:
 
 
 def test_branching_modes_are_explicit_typed_and_fail_early() -> None:
-    raw = yaml.safe_load(Path("configs/train/nlhe6.yaml").read_text(encoding="utf-8"))
+    raw = yaml.safe_load(
+        Path("configs/train/nlhe_6max_10bb_branched.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
     fixed = load_config_mapping(copy.deepcopy(raw))
     assert fixed.rollout.branching_mode == "fixed"
     assert fixed.rollout.adaptive_kkt is None
@@ -273,7 +277,7 @@ def test_cost_safeguard_requires_eight_strictly_passing_iterations() -> None:
 
 
 def test_controller_state_round_trips_through_training_checkpoint(tmp_path) -> None:
-    cfg = load_config("configs/train/nlhe6.yaml")
+    cfg = load_config("configs/train/nlhe_6max_10bb_branched.yaml")
     model = nn.Linear(2, 1)
     optimizer = torch.optim.Adam(model.parameters())
     try:

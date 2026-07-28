@@ -19,6 +19,7 @@ pbg-br-eval = "pbg.cli.br_eval:main"
 pbg-export-inference = "pbg.cli.export_inference:main"
 pbg-inference-benchmark = "pbg.cli.benchmark_inference:main"
 pbg-replica-learner-benchmark = "pbg.cli.benchmark_replica_learner:main"
+pbg-variance = "pbg.cli.variance:main"
 
 [project.optional-dependencies]
 mac = ["torch>=2.13; platform_system == 'Darwin' and platform_machine == 'arm64'"]

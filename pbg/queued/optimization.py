@@ -26,21 +26,19 @@ class OptimizerConfig:
 
     def __post_init__(self) -> None:
         if self.name not in ("adam", "adamw"):
-            raise ValueError("optimizer must be 'adam' or 'adamw'")
-        finite_positive = (
-            self.learning_rate,
-            self.epsilon,
-            self.grad_clip,
-        )
-        if any(not math.isfinite(value) or value <= 0 for value in finite_positive):
-            raise ValueError("optimizer rates, epsilon, and clipping must be positive")
-        if (
-            not 0 <= self.beta1 < 1
-            or not 0 <= self.beta2 < 1
-            or not math.isfinite(self.weight_decay)
-            or self.weight_decay < 0
-        ):
-            raise ValueError("optimizer betas or weight decay are invalid")
+            raise ValueError("name must be 'adam' or 'adamw'")
+        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
+            raise ValueError("learning_rate must be positive")
+        if not math.isfinite(self.epsilon) or self.epsilon <= 0:
+            raise ValueError("epsilon must be positive")
+        if not math.isfinite(self.grad_clip) or self.grad_clip <= 0:
+            raise ValueError("grad_clip must be positive")
+        if not math.isfinite(self.beta1) or not 0 <= self.beta1 < 1:
+            raise ValueError("beta1 must be finite in [0,1)")
+        if not math.isfinite(self.beta2) or not 0 <= self.beta2 < 1:
+            raise ValueError("beta2 must be finite in [0,1)")
+        if not math.isfinite(self.weight_decay) or self.weight_decay < 0:
+            raise ValueError("weight_decay must be finite and nonnegative")
 
 
 @dataclass

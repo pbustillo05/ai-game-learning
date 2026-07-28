@@ -551,7 +551,11 @@ def test_branched_sampler_rejects_multiple_root_replicas() -> None:
 
 
 def test_strict_config_rejects_neyman_and_invalid_fixed_beta(tmp_path: Path) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
+    raw = yaml.safe_load(
+        (
+            ROOT / "configs" / "train" / "nlhe_6max_10bb_branched.yaml"
+        ).read_text()
+    )
     raw["training"]["mode"] = "neyman"
     path = tmp_path / "neyman.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")

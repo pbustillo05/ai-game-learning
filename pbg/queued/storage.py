@@ -57,7 +57,8 @@ def _nonnegative_integer(value: object, label: str) -> int:
 
 
 def _align(value: int, alignment: int) -> int:
-    return ((value + alignment - 1) // alignment) * alignment
+    quotient, remainder = divmod(value, alignment)
+    return (quotient + int(remainder != 0)) * alignment
 
 
 def _dtype_size(dtype: torch.dtype) -> int:
@@ -148,7 +149,10 @@ class SoASchema:
 
     @property
     def by_name(self) -> Mapping[str, SoAField]:
-        return MappingProxyType({field.name: field for field in self.fields})
+        indexed: dict[str, SoAField] = {}
+        for field in self.fields:
+            indexed[field.name] = field
+        return MappingProxyType(indexed)
 
     def field_extents(self, rows: int, n_replica: int = 1) -> tuple[FieldExtent, ...]:
         rows = _nonnegative_integer(rows, "rows")

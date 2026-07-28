@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
+import shutil
+import time
 from pathlib import Path
 from types import MappingProxyType
 
@@ -23,6 +26,8 @@ from pbg.games.poker.queued import (
     poker_partitions,
 )
 from pbg.queued import (
+    CHECKPOINT_SCHEMA,
+    REPLICA_CHECKPOINT_SCHEMA,
     BranchedModeConfig,
     CostSafeguardController,
     DistributedSUM,
@@ -37,9 +42,11 @@ from pbg.queued import (
     SequentialModeConfig,
     build_storage_plan,
     load_checkpoint,
+    load_distributed_checkpoint_manifest,
     load_replica_checkpoint,
     mode_schema,
     save_checkpoint,
+    save_distributed_checkpoint_manifest,
     save_replica_checkpoint,
     sha256_file,
     PreemptionNotice,
@@ -54,8 +61,8 @@ class RuntimeError(RuntimeError):
 def _checkpoint_payload(path: Path) -> dict[str, object]:
     value = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(value, dict) or value.get("checkpoint_schema") not in {
-        "pbg-queued-checkpoint-v2",
-        "pbg-queued-replica-checkpoint-v1",
+        CHECKPOINT_SCHEMA,
+        REPLICA_CHECKPOINT_SCHEMA,
     }:
         raise RuntimeError(
             "runtime accepts only queued checkpoints; convert legacy artifacts offline"
@@ -116,6 +123,7 @@ class TrainingSession:
         resume_from: str | Path | None = None,
     ) -> None:
         self.config = config
+        self.resume_from = None if resume_from is None else Path(resume_from)
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         workload = (
             "distributed training" if config.execution.distributed else "training"
@@ -128,12 +136,22 @@ class TrainingSession:
         validate_workload_capabilities(self.device, workload=workload)
         torch.cuda.set_device(self.device)
         if config.execution.distributed:
+            self._owns_process_group = not dist.is_initialized()
             if not dist.is_initialized():
                 dist.init_process_group("nccl")
             self.distributed = DistributedSUM()
         else:
+            self._owns_process_group = False
             self.distributed = None
         scientific = config.scientific_mapping()
+        self.scientific_sha256 = hashlib.sha256(
+            json.dumps(
+                scientific,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        ).hexdigest()
         self.mode = mode_schema(**dict(config.mode))
         self.geometry = NLHEGeometry(
             config.scientific.common.game.players,
@@ -212,6 +230,17 @@ class TrainingSession:
                 module.eval().requires_grad_(False)
                 frozen_modules.append(module)
             self.frozen_inference = PokerReplicaInference(frozen_modules)
+            if (
+                config.scientific.applicable.get("response_initialization")
+                == "target"
+            ):
+                for lane in range(count):
+                    self.modules.lane_module(lane).load_state_dict(
+                        frozen, strict=True
+                    )
+                    self.reference_modules.lane_module(lane).load_state_dict(
+                        frozen, strict=True
+                    )
         self.controllers = (
             tuple(_controller(config.scientific) for _ in range(count))
             if isinstance(config.scientific, BranchedModeConfig)
@@ -228,8 +257,64 @@ class TrainingSession:
         if resume_from is not None:
             self._resume(Path(resume_from))
 
+    def _prepare_metrics_for_resume(self, path: Path) -> None:
+        if self.resume_from is None:
+            return
+        completed_values = {state.iteration for state in self.run_states}
+        if len(completed_values) != 1:
+            raise RuntimeError("resume checkpoint lane iterations differ")
+        completed = completed_values.pop()
+        expected = [
+            {
+                "iteration": iteration,
+                "lanes": [
+                    state.metrics_prefix[iteration] for state in self.run_states
+                ],
+            }
+            for iteration in range(completed)
+        ]
+        if not path.exists():
+            path.write_text(
+                "".join(
+                    json.dumps(row, sort_keys=True) + "\n" for row in expected
+                ),
+                encoding="utf-8",
+            )
+            return
+        raw_lines = [
+            line
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        try:
+            records = [json.loads(line) for line in raw_lines]
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("resume metrics file is not valid JSONL") from exc
+        if len(records) < completed or records[:completed] != expected:
+            raise RuntimeError(
+                "metrics.jsonl is not the checkpoint's exact gap-free prefix"
+            )
+        if len(records) > completed:
+            backup = path.with_name(
+                f"{path.name}.before_resume_{completed:07d}.bak"
+            )
+            if not backup.exists():
+                shutil.copy2(path, backup)
+            path.write_text(
+                "\n".join(raw_lines[:completed])
+                + ("\n" if completed else ""),
+                encoding="utf-8",
+            )
+
     def _resume(self, path: Path) -> None:
         scientific = self.config.scientific_mapping()
+        if self.distributed is not None and dist.get_world_size() > 1:
+            rank_paths = load_distributed_checkpoint_manifest(
+                path,
+                expected_scientific_config=scientific,
+                world_size=dist.get_world_size(),
+            )
+            path = rank_paths[dist.get_rank()]
         if self.plan.manifest.n_replica == 1:
             optimizer = self.optimizers.optimizers[0]
             scaler, reference, state, _execution = load_checkpoint(
@@ -244,7 +329,7 @@ class TrainingSession:
             self.reference_states = (reference,)
             self.run_states = (state,)
         else:
-            states, _execution = load_replica_checkpoint(
+            references, states, _execution = load_replica_checkpoint(
                 path,
                 modules=self.modules,
                 optimizers=self.optimizers,
@@ -254,6 +339,9 @@ class TrainingSession:
                 generators=self.generators,
                 reference_modules=self.reference_modules,
             )
+            if references is None:
+                raise RuntimeError("replica resume omitted reference cadence state")
+            self.reference_states = references
             self.run_states = states
         if self.controllers:
             restored = []
@@ -272,9 +360,18 @@ class TrainingSession:
     def checkpoint(self, path: str | Path) -> str:
         scientific = self.config.scientific_mapping()
         destination = Path(path)
+        distributed = self.distributed is not None and dist.get_world_size() > 1
+        local_destination = (
+            destination.with_name(
+                f"{destination.stem}.rank_{dist.get_rank():04d}"
+                f"{destination.suffix}"
+            )
+            if distributed
+            else destination
+        )
         if self.plan.manifest.n_replica == 1:
-            return save_checkpoint(
-                destination,
+            digest = save_checkpoint(
+                local_destination,
                 model=self.modules.lane_module(0),
                 optimizer=self.optimizers.optimizers[0],
                 scaler=self.optimizers.optimizers[0].scaler,
@@ -285,16 +382,39 @@ class TrainingSession:
                 execution_config=self.config.execution.mapping(),
                 generator=self.generators[0],
             )
-        return save_replica_checkpoint(
-            destination,
-            modules=self.modules,
-            optimizers=self.optimizers,
-            run_states=self.run_states,
-            scientific_configs=tuple(scientific for _ in self.run_states),
-            execution_config=self.config.execution.mapping(),
-            generators=self.generators,
-            reference_modules=self.reference_modules,
-        )
+        else:
+            digest = save_replica_checkpoint(
+                local_destination,
+                modules=self.modules,
+                optimizers=self.optimizers,
+                run_states=self.run_states,
+                scientific_configs=tuple(scientific for _ in self.run_states),
+                execution_config=self.config.execution.mapping(),
+                generators=self.generators,
+                reference_modules=self.reference_modules,
+                reference_states=self.reference_states,
+            )
+        if distributed:
+            hashes: list[str | None] = [None] * dist.get_world_size()
+            dist.all_gather_object(hashes, digest)
+            if dist.get_rank() == 0:
+                names = tuple(
+                    f"{destination.stem}.rank_{rank:04d}{destination.suffix}"
+                    for rank in range(dist.get_world_size())
+                )
+                manifest_hash = save_distributed_checkpoint_manifest(
+                    destination,
+                    rank_files=names,
+                    rank_sha256=tuple(str(value) for value in hashes),
+                    scientific_config=scientific,
+                    execution_config=self.config.execution.mapping(),
+                )
+            else:
+                manifest_hash = ""
+            broadcast = [manifest_hash]
+            dist.broadcast_object_list(broadcast, src=0)
+            return str(broadcast[0])
+        return digest
 
     def _run_sequential(self, iteration: int):
         count = self.plan.manifest.n_replica
@@ -413,84 +533,195 @@ class TrainingSession:
             arguments=MappingProxyType(arguments),
         ).run(iteration=iteration)
 
-    def run(self) -> None:
+    @staticmethod
+    def _lane_results(result: object) -> tuple[object | None, ...]:
+        values = getattr(result, "results", ())
+        return tuple(values) if values else (result,)
+
+    def step(self) -> object:
+        """Execute and commit exactly one production iteration in memory."""
+
+        iterations = {state.iteration for state in self.run_states}
+        if len(iterations) != 1:
+            raise RuntimeError("all active lanes must enter an iteration together")
+        iteration = iterations.pop()
+        result = (
+            self._run_sequential(iteration)
+            if isinstance(self.config.scientific, SequentialModeConfig)
+            else self._run_branched(iteration)
+        )
+        lane_results = self._lane_results(result)
+        local_nodes = [
+            int(
+                getattr(
+                    lane_results[lane] if lane < len(lane_results) else None,
+                    "player_nodes",
+                    0,
+                )
+            )
+            for lane in range(len(self.run_states))
+        ]
+        local_total = sum(local_nodes)
+        if self.distributed is not None:
+            total = torch.tensor(
+                [local_total], dtype=torch.int64, device=self.device
+            )
+            gathered = [torch.empty_like(total) for _ in range(dist.get_world_size())]
+            dist.all_gather(gathered, total)
+            per_rank_nodes = [int(value.item()) for value in gathered]
+        else:
+            per_rank_nodes = [local_total]
+        global_nodes = sum(per_rank_nodes)
+        for lane, (state, reference) in enumerate(
+            zip(self.run_states, self.reference_states, strict=True)
+        ):
+            lane_result = lane_results[lane] if lane < len(lane_results) else None
+            player_nodes = int(
+                getattr(
+                    lane_result,
+                    "player_nodes",
+                    getattr(lane_result, "nodes", 0),
+                )
+            )
+            if reference.observe(
+                iteration=state.iteration,
+                effective_hands=float(player_nodes),
+            ):
+                self.reference_modules.lane_module(lane).load_state_dict(
+                    self.modules.lane_module(lane).state_dict(),
+                    strict=True,
+                )
+            if self.mode.private_estimator.value == "rao_blackwell":
+                completion = self.config.scientific.applicable["completion"]
+                leaves = int(getattr(lane_result, "leaves", 0))
+                state.logical_work["completion_samples"] += (
+                    leaves * int(completion["n_samples"])
+                )
+            state.iteration = iteration + 1
+            if not state.metrics_prefix:
+                raise RuntimeError("learner omitted the iteration metrics row")
+            state.metrics_prefix[-1].update(
+                {
+                    "player_nodes": player_nodes,
+                    "leaves": int(getattr(lane_result, "leaves", 0)),
+                    "target_layers": int(
+                        getattr(lane_result, "target_layers", 0)
+                    ),
+                    "mode": self.mode.key,
+                    "lane": lane,
+                    "rank": dist.get_rank() if self.distributed is not None else 0,
+                    "world_size": (
+                        dist.get_world_size()
+                        if self.distributed is not None
+                        else 1
+                    ),
+                    "per_rank_player_nodes": per_rank_nodes,
+                    "global_player_nodes": global_nodes,
+                    "logical_work": dict(state.logical_work),
+                    "reference": reference.state_dict(),
+                    "structure": dict(
+                        getattr(lane_result, "observability", {})
+                    ),
+                    "completion_health": {
+                        "leaf_rows": int(getattr(lane_result, "leaves", 0)),
+                        "samples_per_leaf": int(
+                            self.config.scientific.applicable.get(
+                                "completion", {}
+                            ).get("n_samples", 0)
+                        ),
+                        "logical_samples": int(
+                            state.logical_work["completion_samples"]
+                        ),
+                    },
+                    "identity": {
+                        "run_id": state.run_id,
+                        "scientific_sha256": self.scientific_sha256,
+                        "mode": self.mode.key,
+                    },
+                }
+            )
+            learner = getattr(lane_result, "learner", None)
+            losses = tuple(getattr(learner, "losses", ()))
+            if losses:
+                state.metrics_prefix[-1]["objective"] = {
+                    name: sum(float(row[name]) for row in losses) / len(losses)
+                    for name in losses[0]
+                }
+            steps = tuple(getattr(learner, "steps", ()))
+            if steps:
+                state.metrics_prefix[-1]["gradient"] = {
+                    "finite": all(step.gradients_finite for step in steps),
+                    "norm_mean": sum(step.grad_norm for step in steps)
+                    / len(steps),
+                    "norm_max": max(step.grad_norm for step in steps),
+                    "clip_scale_min": min(step.clip_scale for step in steps),
+                    "applied_steps": sum(int(step.applied) for step in steps),
+                    "loss_scale_before": steps[0].loss_scale_before,
+                    "loss_scale_after": steps[-1].loss_scale_after,
+                }
+        if self.controllers:
+            for state, controller, safeguard in zip(
+                self.run_states,
+                self.controllers,
+                self.safeguards,
+                strict=True,
+            ):
+                state.branch_controller_state = controller.state_dict()
+                state.cost_safeguard_state = safeguard.state_dict()
+        return result
+
+    def run(self, *, deadline_monotonic: float | None = None) -> int:
+        """Run configured iterations, optionally stopping before a deadline."""
+
+        if deadline_monotonic is not None and not isinstance(
+            deadline_monotonic, (int, float)
+        ):
+            raise TypeError("deadline_monotonic must be a monotonic timestamp")
         output = self.config.execution.output_dir
         output.mkdir(parents=True, exist_ok=True)
+        write_rank = self.distributed is None or dist.get_rank() == 0
+        if write_rank:
+            self._prepare_metrics_for_resume(output / "metrics.jsonl")
         start = min(state.iteration for state in self.run_states)
         notice = PreemptionNotice()
         notice.install()
+        completed = 0
         try:
             for iteration in range(start, self.config.execution.iterations):
-                result = (
-                    self._run_sequential(iteration)
-                    if isinstance(self.config.scientific, SequentialModeConfig)
-                    else self._run_branched(iteration)
-                )
-                lane_results = tuple(
-                    value
-                    for value in (getattr(result, "results", ()) or (result,))
-                )
-                for lane, (state, reference) in enumerate(
-                    zip(self.run_states, self.reference_states, strict=True)
+                if (
+                    deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic
                 ):
-                    lane_result = (
-                        lane_results[lane]
-                        if lane < len(lane_results)
-                        else None
-                    )
-                    player_nodes = int(
-                        getattr(
-                            lane_result,
-                            "player_nodes",
-                            getattr(lane_result, "nodes", 0),
-                        )
-                    )
-                    if reference.observe(
-                        iteration=state.iteration,
-                        effective_hands=float(player_nodes),
+                    break
+                try:
+                    result = self.step()
+                except Exception:
+                    if all(
+                        state.iteration == iteration
+                        for state in self.run_states
                     ):
-                        self.reference_modules.lane_module(lane).load_state_dict(
-                            self.modules.lane_module(lane).state_dict(),
-                            strict=True,
+                        self.checkpoint(
+                            output
+                            / f"failure_checkpoint_{iteration:08d}.pt"
                         )
-                    if self.mode.private_estimator.value == "rao_blackwell":
-                        completion = self.config.scientific.applicable["completion"]
-                        leaves = int(getattr(lane_result, "leaves", 0))
-                        state.logical_work["completion_samples"] += (
-                            leaves * int(completion["n_samples"])
+                    raise
+                completed += 1
+                if write_rank:
+                    metrics = output / "metrics.jsonl"
+                    with metrics.open("a", encoding="utf-8") as stream:
+                        stream.write(
+                            json.dumps(
+                                {
+                                    "iteration": iteration,
+                                    "lanes": [
+                                        state.metrics_prefix[-1]
+                                        for state in self.run_states
+                                    ],
+                                },
+                                sort_keys=True,
+                            )
+                            + "\n"
                         )
-                    state.iteration = iteration + 1
-                    state.metrics_prefix[-1].update(
-                        {
-                            "player_nodes": player_nodes,
-                            "mode": self.mode.key,
-                            "lane": lane,
-                        }
-                    )
-                if self.controllers:
-                    for state, controller, safeguard in zip(
-                        self.run_states,
-                        self.controllers,
-                        self.safeguards,
-                        strict=True,
-                    ):
-                        state.branch_controller_state = controller.state_dict()
-                        state.cost_safeguard_state = safeguard.state_dict()
-                metrics = output / "metrics.jsonl"
-                with metrics.open("a", encoding="utf-8") as stream:
-                    stream.write(
-                        json.dumps(
-                            {
-                                "iteration": iteration,
-                                "lanes": [
-                                    state.metrics_prefix[-1]
-                                    for state in self.run_states
-                                ],
-                            },
-                            sort_keys=True,
-                        )
-                        + "\n"
-                    )
                 checkpoint_due = (
                     (iteration + 1) % self.config.execution.checkpoint_every == 0
                     or notice.requested
@@ -504,6 +735,9 @@ class TrainingSession:
                     break
         finally:
             notice.restore()
+            if self._owns_process_group and dist.is_initialized():
+                dist.destroy_process_group()
+        return completed
 
 
 def train(

@@ -1233,7 +1233,7 @@ def test_replica_checkpoint_round_trip_preserves_every_lane(tmp_path: Path) -> N
     optimizers.exp_avg.fill_(17)
     for generator in generators:
         generator.manual_seed(1)
-    restored_runs, execution = load_replica_checkpoint(
+    _references, restored_runs, execution = load_replica_checkpoint(
         path,
         modules=modules,
         optimizers=optimizers,

@@ -206,20 +206,19 @@ class LossConfig:
     trace_epsilon: float = 1.0e-6
 
     def __post_init__(self) -> None:
-        finite = (
-            self.clip_epsilon,
-            self.value_clip_epsilon,
-            self.value_coefficient,
-            self.entropy_coefficient,
-            self.reference_kl_coefficient,
-            self.trace_coefficient,
-            self.cost_coefficient,
-            self.trace_epsilon,
-        )
-        if any(not math.isfinite(value) or value < 0 for value in finite):
-            raise ValueError(
-                "loss coefficients and clips must be finite and nonnegative"
-            )
+        for name in (
+            "clip_epsilon",
+            "value_clip_epsilon",
+            "value_coefficient",
+            "entropy_coefficient",
+            "reference_kl_coefficient",
+            "trace_coefficient",
+            "cost_coefficient",
+            "trace_epsilon",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
         if self.value_loss not in ("mse", "clipped"):
             raise ValueError("value_loss must be 'mse' or 'clipped'")
         if self.trace_epsilon <= 0:

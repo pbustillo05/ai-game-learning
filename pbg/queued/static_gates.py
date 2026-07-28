@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 from collections import deque
 from pathlib import Path
 from typing import Iterable
@@ -132,10 +133,67 @@ def dual_engine_roots(
     return tuple(violations)
 
 
+def migrated_similarity_violations(
+    root: Path,
+    production_roots: Iterable[str],
+    *,
+    minimum_nodes: int = 24,
+) -> tuple[str, ...]:
+    """Find exact nontrivial function bodies copied from the legacy core."""
+
+    if minimum_nodes <= 0:
+        raise ValueError("minimum_nodes must be positive")
+    graph = local_import_graph(root)
+    reached = set().union(
+        *(reachable_modules(graph, module) for module in production_roots)
+    )
+
+    def bodies(paths: Iterable[Path]) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for path in sorted(paths):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                count = sum(1 for _ in ast.walk(node))
+                if count < minimum_nodes:
+                    continue
+                normalized = ast.dump(
+                    ast.Module(body=node.body, type_ignores=[]),
+                    annotate_fields=True,
+                    include_attributes=False,
+                )
+                digest = hashlib.sha256(normalized.encode()).hexdigest()
+                result.setdefault(digest, []).append(
+                    f"{path.relative_to(root)}:{node.lineno}:{node.name}"
+                )
+        return result
+
+    legacy = bodies((root / "pbg/core").rglob("*.py"))
+    migrated_paths = [
+        root / f"{module.replace('.', '/')}.py"
+        for module in reached
+        if not (module == "pbg.core" or module.startswith("pbg.core."))
+    ]
+    migrated_paths.extend(
+        root / module.replace(".", "/") / "__init__.py"
+        for module in reached
+        if not (module == "pbg.core" or module.startswith("pbg.core."))
+    )
+    migrated = bodies(path for path in migrated_paths if path.is_file())
+    return tuple(
+        f"{old} == {new}"
+        for digest in sorted(set(legacy).intersection(migrated))
+        for old in legacy[digest]
+        for new in migrated[digest]
+    )
+
+
 __all__ = [
     "dual_engine_roots",
     "forbidden_literal_violations",
     "local_import_graph",
+    "migrated_similarity_violations",
     "module_imports",
     "queued_firewall_violations",
     "reachable_modules",

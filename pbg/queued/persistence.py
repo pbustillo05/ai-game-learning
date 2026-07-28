@@ -23,7 +23,8 @@ from pbg.queued.learner import ReferenceState
 from pbg.queued.optimization import DenseAdam, LossScaler
 
 CHECKPOINT_SCHEMA = "pbg-queued-checkpoint-v2"
-REPLICA_CHECKPOINT_SCHEMA = "pbg-queued-replica-checkpoint-v1"
+REPLICA_CHECKPOINT_SCHEMA = "pbg-queued-replica-checkpoint-v2"
+DISTRIBUTED_CHECKPOINT_SCHEMA = "pbg-queued-distributed-checkpoint-v1"
 QUEUED_CHECKPOINT_V1 = "pbg-queued-checkpoint-v1"
 CONVERSION_SCHEMA = "pbg-queued-conversion-v1"
 LEGACY_SCHEMA = "pbg-checkpoint-v8"
@@ -290,6 +291,7 @@ def save_replica_checkpoint(
     execution_config: Mapping[str, object],
     generators: Sequence[torch.Generator],
     reference_modules: object | None = None,
+    reference_states: Sequence[ReferenceState] | None = None,
 ) -> str:
     """Atomically preserve every independent lane at one optimizer boundary."""
 
@@ -305,6 +307,7 @@ def save_replica_checkpoint(
         or len(run_states) != count
         or len(scientific_configs) != count
         or len(generators) != count
+        or (reference_states is not None and len(reference_states) != count)
         or (
             reference_modules is not None
             and (
@@ -314,6 +317,10 @@ def save_replica_checkpoint(
         )
     ):
         raise ValueError("replica checkpoint lane owners are not aligned")
+    if (reference_modules is None) != (reference_states is None):
+        raise ValueError(
+            "replica reference models and cadence states must be owned together"
+        )
     if any(
         generator.device.type != modules.device.type
         or (
@@ -339,6 +346,11 @@ def save_replica_checkpoint(
             if reference_modules is None
             else _clone_cpu(reference_modules.state_dict())
         ),
+        "reference_state": (
+            None
+            if reference_states is None
+            else tuple(value.state_dict() for value in reference_states)
+        ),
         "run_state": tuple(value.state_dict() for value in run_states),
         "explicit_rng": tuple(generator.get_state().cpu() for generator in generators),
         "ambient_cpu_rng": torch.get_rng_state(),
@@ -360,6 +372,7 @@ _REPLICA_CHECKPOINT_FIELDS = {
     "model",
     "optimizer",
     "reference_model",
+    "reference_state",
     "run_state",
     "explicit_rng",
     "ambient_cpu_rng",
@@ -376,7 +389,11 @@ def load_replica_checkpoint(
     generators: Sequence[torch.Generator],
     reference_modules: object | None = None,
     restore_ambient_rng: bool = True,
-) -> tuple[tuple[RunState, ...], Mapping[str, object]]:
+) -> tuple[
+    tuple[ReferenceState, ...] | None,
+    tuple[RunState, ...],
+    Mapping[str, object],
+]:
     """Strictly restore a queued replica checkpoint without compatibility."""
 
     from pbg.queued.replica import ReplicaModuleOwner, ReplicaOptimizerGroup
@@ -408,8 +425,13 @@ def load_replica_checkpoint(
     modules.load_state_dict(state["model"])
     optimizers.load_state_dict(state["optimizer"])
     stored_reference = state["reference_model"]
-    if (stored_reference is None) != (reference_modules is None):
+    stored_reference_states = state["reference_state"]
+    if (
+        (stored_reference is None) != (reference_modules is None)
+        or (stored_reference_states is None) != (reference_modules is None)
+    ):
         raise PersistenceError("replica reference ownership differs")
+    references: tuple[ReferenceState, ...] | None = None
     if reference_modules is not None:
         if (
             not isinstance(reference_modules, ReplicaModuleOwner)
@@ -417,6 +439,18 @@ def load_replica_checkpoint(
         ):
             raise PersistenceError("replica reference lanes are invalid")
         reference_modules.load_state_dict(stored_reference)
+        if (
+            not isinstance(stored_reference_states, (tuple, list))
+            or len(stored_reference_states) != count
+        ):
+            raise PersistenceError("replica reference-state lanes are invalid")
+        try:
+            references = tuple(
+                ReferenceState.from_state_dict(value)
+                for value in stored_reference_states
+            )
+        except (TypeError, ValueError) as exc:
+            raise PersistenceError("replica reference-state lanes are invalid") from exc
     run_fields = {
         "run_id",
         "iteration",
@@ -452,7 +486,92 @@ def load_replica_checkpoint(
         if len(cuda_states) != torch.cuda.device_count():
             raise PersistenceError("checkpoint CUDA rank/device count differs")
         torch.cuda.set_rng_state_all(list(cuda_states))
-    return runs, state["execution_config"]
+    return references, runs, state["execution_config"]
+
+
+def save_distributed_checkpoint_manifest(
+    path: str | os.PathLike[str],
+    *,
+    rank_files: Sequence[str],
+    rank_sha256: Sequence[str],
+    scientific_config: Mapping[str, object],
+    execution_config: Mapping[str, object],
+) -> str:
+    """Atomically publish one strict manifest after every rank file exists."""
+
+    if (
+        not rank_files
+        or len(rank_files) != len(rank_sha256)
+        or len(set(rank_files)) != len(rank_files)
+        or any(
+            len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in rank_sha256
+        )
+    ):
+        raise PersistenceError("distributed checkpoint rank inventory is invalid")
+    state = {
+        "checkpoint_schema": DISTRIBUTED_CHECKPOINT_SCHEMA,
+        "world_size": len(rank_files),
+        "scientific_config": dict(scientific_config),
+        "scientific_sha256": _canonical_hash(scientific_config),
+        "execution_config": dict(execution_config),
+        "rank_files": tuple(rank_files),
+        "rank_sha256": tuple(rank_sha256),
+    }
+    destination = Path(path)
+    _atomic_torch_save(state, destination)
+    return sha256_file(destination)
+
+
+def load_distributed_checkpoint_manifest(
+    path: str | os.PathLike[str],
+    *,
+    expected_scientific_config: Mapping[str, object],
+    world_size: int,
+) -> tuple[Path, ...]:
+    """Validate a distributed manifest and every content-addressed rank file."""
+
+    source = Path(path)
+    state = torch.load(source, map_location="cpu", weights_only=False)
+    fields = {
+        "checkpoint_schema",
+        "world_size",
+        "scientific_config",
+        "scientific_sha256",
+        "execution_config",
+        "rank_files",
+        "rank_sha256",
+    }
+    if (
+        not isinstance(state, dict)
+        or set(state) != fields
+        or state["checkpoint_schema"] != DISTRIBUTED_CHECKPOINT_SCHEMA
+        or state["world_size"] != world_size
+    ):
+        raise PersistenceError("distributed checkpoint manifest is invalid")
+    expected = dict(expected_scientific_config)
+    if (
+        state["scientific_config"] != expected
+        or state["scientific_sha256"] != _canonical_hash(expected)
+    ):
+        raise PersistenceError("distributed resume rejected scientific drift")
+    files = state["rank_files"]
+    hashes = state["rank_sha256"]
+    if (
+        not isinstance(files, (tuple, list))
+        or not isinstance(hashes, (tuple, list))
+        or len(files) != world_size
+        or len(hashes) != world_size
+    ):
+        raise PersistenceError("distributed checkpoint rank inventory is invalid")
+    paths = tuple(source.parent / str(value) for value in files)
+    if any(
+        not rank_path.is_file() or sha256_file(rank_path) != expected_hash
+        for rank_path, expected_hash in zip(paths, hashes, strict=True)
+    ):
+        raise PersistenceError("distributed checkpoint rank hash differs")
+    return paths
 
 
 def convert_queued_checkpoint_v1(
@@ -1098,6 +1217,7 @@ def trim_metrics_after_checkpoint(
 __all__ = [
     "CHECKPOINT_SCHEMA",
     "CONVERSION_SCHEMA",
+    "DISTRIBUTED_CHECKPOINT_SCHEMA",
     "LEGACY_SCHEMA",
     "LEGACY_SCHEMA_V7",
     "QUEUED_CHECKPOINT_V1",
@@ -1110,8 +1230,10 @@ __all__ = [
     "convert_legacy_sequential_sampled",
     "convert_queued_checkpoint_v1",
     "load_checkpoint",
+    "load_distributed_checkpoint_manifest",
     "load_replica_checkpoint",
     "save_checkpoint",
+    "save_distributed_checkpoint_manifest",
     "save_replica_checkpoint",
     "sha256_file",
     "trim_metrics_after_checkpoint",

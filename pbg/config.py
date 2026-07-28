@@ -74,6 +74,8 @@ class ExecutionConfig:
             raise ConfigError("root.execution.iterations: must be positive")
         if self.checkpoint_every <= 0:
             raise ConfigError("root.execution.checkpoint_every: must be positive")
+        if not str(self.output_dir):
+            raise ConfigError("root.execution.output_dir: must be nonempty")
         if not self.run_id:
             raise ConfigError("root.execution.run_id: must be nonempty")
         if self.attention_backend not in ("sdpa", "chunked_dense"):
@@ -212,6 +214,35 @@ def _parse_execution(
         },
         "root.execution",
     )
+    required_execution = {
+        "device",
+        "iterations",
+        "checkpoint_every",
+        "output_dir",
+        "run_id",
+        "attention_backend",
+        "query_chunk_size",
+        "manifest",
+        "layout",
+    }
+    missing = sorted(required_execution.difference(source))
+    if missing:
+        raise ConfigError(f"root.execution.{missing[0]}: missing field")
+    if type(source.get("distributed", False)) is not bool:
+        raise ConfigError("root.execution.distributed: expected bool")
+    for name in (
+        "device",
+        "output_dir",
+        "run_id",
+        "attention_backend",
+    ):
+        value = source[name]
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(f"root.execution.{name}: expected nonempty string")
+    for name in ("iterations", "checkpoint_every", "query_chunk_size"):
+        value = source[name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"root.execution.{name}: expected integer")
     manifest_raw = _object(source.get("manifest"), "root.execution.manifest")
     manifest_fields = {
         "model_token_bound",
@@ -255,6 +286,11 @@ def _parse_execution(
         "query_chunk_size",
     }
     _closed(hardware_raw, hardware_fields, "root.execution.manifest.hardware")
+    missing = sorted(hardware_fields.difference(hardware_raw))
+    if missing:
+        raise ConfigError(
+            f"root.execution.manifest.hardware.{missing[0]}: missing field"
+        )
     external_raw = _object(
         manifest_raw["required_external"],
         "root.execution.manifest.required_external",
@@ -264,6 +300,12 @@ def _parse_execution(
         {"library_bytes", "evaluator_bytes"},
         "root.execution.manifest.required_external",
     )
+    missing = sorted({"library_bytes", "evaluator_bytes"}.difference(external_raw))
+    if missing:
+        raise ConfigError(
+            "root.execution.manifest.required_external."
+            f"{missing[0]}: missing field"
+        )
     common = scientific.common
     try:
         manifest = CapacityManifest(
@@ -374,6 +416,12 @@ def _parse_execution(
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"root.execution.layout: {exc}") from exc
     frozen = source.get("frozen_checkpoint")
+    if frozen is not None and (
+        not isinstance(frozen, str) or not frozen.strip()
+    ):
+        raise ConfigError(
+            "root.execution.frozen_checkpoint: expected nonempty path or null"
+        )
     if scientific.mode["training_regime"] == "best_response" and frozen is None:
         raise ConfigError(
             "root.execution.frozen_checkpoint: best response requires a target"
@@ -407,6 +455,19 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
         raise ConfigError(f"root.{missing[0]}: missing field")
     scientific_raw = _object(source["scientific"], "root.scientific")
     mode = _object(scientific_raw.get("mode"), "root.scientific.mode")
+    mode_fields = {
+        "training_regime",
+        "rollout_mode",
+        "private_estimator",
+    }
+    unknown_mode = sorted(set(mode).difference(mode_fields))
+    if unknown_mode:
+        raise ConfigError(
+            f"root.scientific.mode.{unknown_mode[0]}: unknown configuration field"
+        )
+    missing_mode = sorted(mode_fields.difference(mode))
+    if missing_mode:
+        raise ConfigError(f"root.scientific.mode.{missing_mode[0]}: missing field")
     try:
         scientific = (
             SequentialModeConfig.from_mapping(scientific_raw)
@@ -417,7 +478,28 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
     except ConfigError:
         raise
     except (TypeError, ValueError) as exc:
-        raise ConfigError(str(exc).replace("root.", "root.scientific.", 1)) from exc
+        message = str(exc)
+        if message.startswith("root."):
+            message = message.replace("root.", "root.scientific.", 1)
+        elif "root_count" in message:
+            message = f"root.scientific.root_count: {message}"
+        elif "lambda_" in message:
+            message = f"root.scientific.lambda: {message}"
+        elif "seed" in message:
+            message = f"root.scientific.seed: {message}"
+        elif "reproducibility" in message:
+            message = f"root.scientific.reproducibility: {message}"
+        elif "utility" in message:
+            message = f"root.scientific.utility: {message}"
+        elif "game must satisfy" in message:
+            message = f"root.scientific.game: {message}"
+        elif "model max_players" in message:
+            message = f"root.scientific.model.max_players: {message}"
+        elif "folder_beta_rank" in message:
+            message = f"root.scientific.model.folder_beta_rank: {message}"
+        else:
+            message = f"root.scientific.configuration: {message}"
+        raise ConfigError(message) from exc
     return RootConfig(scientific, execution)
 
 

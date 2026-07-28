@@ -1,346 +1,192 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
-import numpy as np
 import pytest
-import torch
 import yaml
 
-from tests.legacy_config import ConfigError, load_config
-from pbg.core.config import seed_all
-from pbg.core.training import _configure_reproducibility
+from pbg.config import ConfigError, load_config, load_config_mapping
+from pbg.queued.config import SequentialModeConfig
 
 
 ROOT = Path(__file__).parents[1]
+CONFIG = ROOT / "configs/train/nlhe_hu_8bb_normal_queued_smoke.yaml"
 
 
-def test_nlhe_loads_every_config_field() -> None:
-    cfg = load_config(ROOT / "configs" / "train" / "nlhe6.yaml")
-    assert cfg.game.n_players == 6
-    assert cfg.game.stack_bb == 100.0
-    assert cfg.game.rank_count == 13
-    assert cfg.rollout.beta is not None
-    assert cfg.rollout.beta["preflop"] == 1.0
-    assert cfg.completion.n_samples == 256
-    assert cfg.device == "cuda"
-    assert cfg.model["d_model"] == 192
-    assert cfg.loss.lam == pytest.approx(0.95)
-    assert cfg.loss.value_loss == "clipped"
-    assert cfg.training.adam_betas == (0.9, 0.999)
-    assert cfg.training.reproducibility == "throughput"
+def _raw() -> dict[str, object]:
+    value = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    return value
 
 
-def test_hardware_profile_is_composed_without_changing_scientific_config() -> None:
-    cfg = load_config(
-        ROOT / "configs" / "train" / "nlhe6.yaml",
-        hardware_profile="local_3x2080ti",
-    )
-    assert cfg.hardware is not None
-    assert cfg.hardware.name == "local_3x2080ti"
-    assert cfg.hardware.expected_compute_capability == (7, 5)
-    assert cfg.hardware.training_max_tokens == 65536
-    assert cfg.training.minibatch_size == 128
+def test_public_config_loads_complete_scientific_and_execution_contract() -> None:
+    cfg = load_config(CONFIG)
+    assert isinstance(cfg.scientific, SequentialModeConfig)
+    assert cfg.mode == {
+        "training_regime": "self_play",
+        "rollout_mode": "sequential",
+        "private_estimator": "sampled",
+    }
+    assert cfg.scientific.common.game.players == 2
+    assert cfg.scientific.common.game.stack_bb == 8.0
+    assert cfg.scientific.common.game.rank_count == 4
+    assert cfg.scientific.common.model.d_model == 16
+    assert cfg.scientific.common.loss.value_loss == "mse"
+    assert cfg.scientific.common.optimizer.name == "adamw"
+    assert cfg.scientific.common.reproducibility == "strict"
+    assert cfg.execution.device == "cuda:0"
+    assert cfg.execution.manifest.root_count == 1
+    assert cfg.execution.layout.input_shapes == {
+        "pre": (448,),
+        "post_2": (448,),
+    }
 
 
-def test_unknown_nested_key_reports_full_path(tmp_path: Path) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
-    raw["rollout"]["surprise"] = 1
-    path = tmp_path / "bad.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match=r"root\.rollout\.surprise"):
-        load_config(path)
-
-
-@pytest.mark.parametrize(
-    ("section", "key", "pattern"),
-    [
-        ("game", "mispelled_ante", r"root\.game\.mispelled_ante"),
-        ("model", "e_max", r"unknown poker model configuration key"),
-    ],
-)
-def test_game_owned_mappings_reject_unknown_keys(
-    tmp_path: Path, section: str, key: str, pattern: str
-) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
-    target = raw
-    for component in section.split("."):
-        target = target[component]
-    target[key] = 3
-    path = tmp_path / "bad_owned.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match=pattern):
-        load_config(path)
-
-
-@pytest.mark.parametrize(
-    ("section", "key", "pattern"),
-    [
-        ("game", "stacks_bb", r"root\.game\.stacks_bb"),
-        ("model", "unknown_head", r"unknown poker model configuration key"),
-    ],
-)
-def test_poker_owned_mappings_are_strict_at_top_level_load(
-    tmp_path: Path, section: str, key: str, pattern: str
-) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
-    target = raw
-    for component in section.split("."):
-        target = target[component]
-    target[key] = 3
-    path = tmp_path / "bad_poker_owned.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match=pattern):
-        load_config(path)
-
-
-@pytest.mark.parametrize("field", ["debug_asserts", "use_suit_consistency"])
-def test_removed_noop_controls_are_rejected(tmp_path: Path, field: str) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
-    if field == "debug_asserts":
-        raw[field] = True
-    else:
-        raw["loss"][field] = True
-    path = tmp_path / "noop.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match=field):
-        load_config(path)
-
-
-def test_training_mode_validates_beta_completion_and_loss_axes(tmp_path: Path) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
-    raw["training"]["mode"] = "normal"
-    raw["completion"]["n_samples"] = None
-    raw["loss"]["name"] = "ppo"
-    raw["rollout"]["beta"] = None
-    raw["rollout"]["branching_mode"] = None
-    raw["rollout"]["branching_ideal_nodes"] = None
-    raw["rollout"]["safe_tree_size"] = None
-    raw["rollout"]["queue_capacity_rows"] = None
-    path = tmp_path / "normal.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    cfg = load_config(path)
-    assert cfg.training.mode == "normal"
-    assert cfg.rollout.beta is None
-
-    raw["rollout"]["beta"] = {"default": 2.0}
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match="only valid for branched"):
-        load_config(path)
-
-    raw["rollout"]["beta"] = None
-    raw["loss"]["name"] = "rb_ppo"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match="does not support mode 'normal'"):
-        load_config(path)
-
-
-@pytest.mark.parametrize(
-    "key", ["executor", "trajectory_chunk_size", "queue_packing", "n_trees"]
-)
-def test_removed_rollout_implementation_keys_are_rejected(
-    tmp_path: Path, key: str
-) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
-    raw["rollout"][key] = "wavefront_v1" if key == "executor" else 4
-    path = tmp_path / "removed.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match=key):
-        load_config(path)
-
-
-def test_production_execution_config_is_explicit_and_strict(
-    tmp_path: Path,
-) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
-    raw["training"]["mode"] = "rao_blackwell"
-    raw["rollout"]["beta"] = None
-    raw["rollout"]["branching_mode"] = None
-    raw["rollout"]["branching_ideal_nodes"] = None
-    raw["rollout"]["safe_tree_size"] = None
-    raw["rollout"]["queue_capacity_rows"] = None
-    raw["rollout"]["sequential_roots_per_gpu_initial"] = 10
-    raw["rollout"].update(
+def test_public_config_round_trip_is_exact() -> None:
+    cfg = load_config(CONFIG)
+    rebuilt = load_config_mapping(
         {
-            "family_batch_rows": 8,
-            "max_active_trajectories": 16,
-            "storage_page_rows": 32,
-            "execution_memory_bytes": 1_000_000,
+            "scientific": cfg.scientific_mapping(),
+            "execution": cfg.execution.mapping(),
         }
     )
-    path = tmp_path / "execution.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    cfg = load_config(path)
-    assert cfg.rollout.family_batch_rows == 8
-    assert cfg.rollout.max_active_trajectories == 16
-    assert cfg.rollout.storage_page_rows == 32
-    assert cfg.rollout.execution_memory_bytes == 1_000_000
-
-    raw["rollout"]["family_batch_rows"] = 0
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match="family_batch_rows"):
-        load_config(path)
-
-    raw["rollout"]["family_batch_rows"] = 8
-    raw["rollout"]["trajectory_start_index"] = 3
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match="unknown configuration key"):
-        load_config(path)
-
-def test_seed_all_returns_repeatable_explicit_generators() -> None:
-    torch_a, numpy_a = seed_all(19, rank=2)
-    torch_b, numpy_b = seed_all(19, rank=2)
-    torch_other, numpy_other = seed_all(19, rank=3)
-    draw_torch_a = torch.rand(8, generator=torch_a)
-    draw_torch_b = torch.rand(8, generator=torch_b)
-    draw_numpy_a = numpy_a.random(8)
-    draw_numpy_b = numpy_b.random(8)
-    assert torch.equal(draw_torch_a, draw_torch_b)
-    assert np.array_equal(draw_numpy_a, draw_numpy_b)
-    assert not torch.equal(draw_torch_a, torch.rand(8, generator=torch_other))
-    assert not np.array_equal(draw_numpy_a, numpy_other.random(8))
+    assert rebuilt == cfg
 
 
-def test_reproducibility_profiles_change_backend_controls() -> None:
-    _configure_reproducibility("strict")
-    assert torch.are_deterministic_algorithms_enabled()
-    assert torch.backends.cudnn.deterministic
-    assert not torch.backends.cudnn.benchmark
+@pytest.mark.parametrize("legacy_root", ["game", "rollout", "training", "hardware"])
+def test_legacy_root_shapes_are_rejected_with_dotted_paths(
+    legacy_root: str,
+) -> None:
+    raw = _raw()
+    raw[legacy_root] = {}
+    with pytest.raises(ConfigError, match=rf"root\.{legacy_root}"):
+        load_config_mapping(raw)
 
-    _configure_reproducibility("seeded")
-    assert not torch.are_deterministic_algorithms_enabled()
-    assert not torch.backends.cudnn.deterministic
-    assert not torch.backends.cudnn.benchmark
 
-    _configure_reproducibility("throughput")
-    assert not torch.are_deterministic_algorithms_enabled()
-    assert not torch.backends.cudnn.deterministic
-    assert torch.backends.cudnn.benchmark
-    _configure_reproducibility("strict")
+def test_runtime_hardware_overlay_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="profile overlays"):
+        load_config(CONFIG, hardware_profile="local_3x2080ti")
 
 
 @pytest.mark.parametrize(
-    ("section", "field", "value"),
+    ("path", "field"),
     [
-        ("training", "reproducibility", "sometimes"),
-        ("loss", "value_loss", "silent_noop"),
+        (("scientific",), "surprise"),
+        (("scientific", "mode"), "legacy_mode"),
+        (("scientific", "game"), "ante"),
+        (("scientific", "model"), "unknown_head"),
+        (("scientific", "loss"), "ignored_coefficient"),
+        (("scientific", "optimizer"), "momentum"),
+        (("execution",), "auto_device"),
+        (("execution", "manifest"), "capacity_growth"),
+        (("execution", "manifest", "hardware"), "profile"),
+        (("execution", "layout"), "cpu_staging"),
     ],
 )
-def test_behavioral_profile_enums_are_strict(
-    tmp_path: Path, section: str, field: str, value: str
+def test_unknown_nested_key_reports_full_path(
+    path: tuple[str, ...],
+    field: str,
 ) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
-    raw[section][field] = value
-    path = tmp_path / "bad_profile.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match=field):
-        load_config(path)
+    raw = _raw()
+    target = raw
+    for component in path:
+        target = target[component]  # type: ignore[index,assignment]
+    target[field] = 1
+    dotted = r"\.".join((*path, field))
+    with pytest.raises(ConfigError, match=rf"root\.{dotted}"):
+        load_config_mapping(raw)
 
 
-def test_loss_unit_and_explicit_entropy_horizon_are_strict(tmp_path: Path) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
-    raw["loss"].update(
-        {
-            "utility_normalization": "stack",
-            "entropy_schedule": "linear_decay",
-            "entropy_decay_iters": 500,
-        }
-    )
-    path = tmp_path / "normalized.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    cfg = load_config(path)
-    assert cfg.loss.utility_normalization == "stack"
-    assert cfg.loss.entropy_decay_iters == 500
-
-    raw["loss"]["utility_normalization"] = "mystery"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match="utility_normalization"):
-        load_config(path)
-
-    raw["loss"]["utility_normalization"] = "stack"
-    raw["loss"]["entropy_decay_iters"] = 0
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match="entropy_decay_iters"):
-        load_config(path)
+@pytest.mark.parametrize("device", ["cpu", "mps", "auto", ""])
+def test_training_device_must_be_explicit_cuda(device: str) -> None:
+    raw = _raw()
+    raw["execution"]["device"] = device  # type: ignore[index]
+    with pytest.raises(ConfigError, match=r"root\.execution\.device"):
+        load_config_mapping(raw)
 
 
 @pytest.mark.parametrize(
-    ("section", "field", "value", "pattern"),
+    ("path", "value", "pattern"),
     [
-        ("rollout", "storage_page_rows", 0, r"root\.rollout\.storage_page_rows"),
-        ("loss", "lam", -0.01, r"root\.loss\.lam"),
-        ("loss", "lam", 1.01, r"root\.loss\.lam"),
-        ("loss", "clip_eps", 0.0, r"root\.loss\.clip_eps"),
-        ("loss", "clip_eps", 1.01, r"root\.loss\.clip_eps"),
-        ("loss", "clip_eps_v", float("nan"), r"root\.loss\.clip_eps_v"),
-        ("loss", "c_v", -0.01, r"root\.loss\.c_v"),
-        ("loss", "c_h", float("inf"), r"root\.loss\.c_h"),
-        ("loss", "c_kl", -0.01, r"root\.loss\.c_kl"),
-        ("training", "iters", 0, r"root\.training\.iters"),
-        ("training", "gd_steps_per_iter", 0, r"root\.training\.gd_steps_per_iter"),
-        ("training", "minibatch_size", 0, r"root\.training\.minibatch_size"),
-        ("training", "lr", -1.0, r"root\.training\.lr"),
-        ("training", "grad_clip", 0.0, r"root\.training\.grad_clip"),
-        ("training", "checkpoint_every", 0, r"root\.training\.checkpoint_every"),
-        ("training", "seed", -1, r"root\.training\.seed"),
-        ("training", "out_dir", "", r"root\.training\.out_dir"),
-        ("model", "d_model", 0, r"root\.model\.d_model"),
-        ("model", "s_min", float("nan"), r"root\.model\.s_min"),
-        ("model", "folder_beta_rank", 53, r"root\.model\.folder_beta_rank"),
+        (("execution", "iterations"), 0, r"root\.execution\.iterations"),
+        (
+            ("execution", "checkpoint_every"),
+            0,
+            r"root\.execution\.checkpoint_every",
+        ),
+        (
+            ("execution", "query_chunk_size"),
+            0,
+            r"root\.execution\.query_chunk_size",
+        ),
+        (
+            ("execution", "manifest", "root_count"),
+            0,
+            r"root\.execution\.manifest",
+        ),
+        (
+            ("execution", "manifest", "family_pack_cap"),
+            0,
+            r"root\.execution\.manifest",
+        ),
+        (
+            ("execution", "layout", "field_alignment"),
+            0,
+            r"root\.execution\.layout",
+        ),
+        (
+            ("scientific", "root_count"),
+            0,
+            r"root\.scientific\.root_count",
+        ),
+        (
+            ("scientific", "lambda"),
+            -0.01,
+            r"root\.scientific\.lambda",
+        ),
+        (
+            ("scientific", "optimizer", "learning_rate"),
+            -1.0,
+            r"root\.scientific\.optimizer\.learning_rate",
+        ),
+        (
+            ("scientific", "schedule", "batch_size"),
+            0,
+            r"root\.scientific\.schedule\.batch_size",
+        ),
     ],
 )
-def test_all_scientific_numeric_boundaries_reject_with_dotted_paths(
-    tmp_path: Path, section: str, field: str, value, pattern: str
+def test_numeric_boundaries_reject_with_dotted_paths(
+    path: tuple[str, ...],
+    value: object,
+    pattern: str,
 ) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
-    raw[section][field] = value
-    path = tmp_path / f"bad_{section}_{field}.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    raw = _raw()
+    target = raw
+    for component in path[:-1]:
+        target = target[component]  # type: ignore[index,assignment]
+    target[path[-1]] = value
     with pytest.raises(ConfigError, match=pattern):
-        load_config(path)
+        load_config_mapping(raw)
 
 
-@pytest.mark.parametrize(
-    ("betas", "pattern"),
-    [
-        ((-0.01, 0.999), r"root\.training\.adam_betas\[0\]"),
-        ((0.9, 1.0), r"root\.training\.adam_betas\[1\]"),
-        ((0.9, float("nan")), r"root\.training\.adam_betas\[1\]"),
-    ],
-)
-def test_adam_beta_boundaries_are_finite_and_dotted(
-    tmp_path: Path, betas: tuple[float, float], pattern: str
-) -> None:
-    raw = yaml.safe_load((ROOT / "configs" / "train" / "nlhe6.yaml").read_text())
-    raw["training"]["adam_betas"] = list(betas)
-    path = tmp_path / "bad_betas.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ConfigError, match=pattern):
-        load_config(path)
+def test_manifest_root_count_must_match_scientific_root_count() -> None:
+    raw = _raw()
+    raw["execution"]["manifest"]["root_count"] = 2  # type: ignore[index]
+    with pytest.raises(ConfigError, match="differs from scientific root_count"):
+        load_config_mapping(raw)
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("worker_count", -1),
-        ("checkpoint_every", 0),
-        ("reserve_vram_gib", float("nan")),
-        ("max_memory_fraction", float("inf")),
-        ("min_vram_gib", 0.0),
-        ("max_vram_gib", -1.0),
-    ],
-)
-def test_hardware_numeric_boundaries_reject_with_dotted_paths(
-    tmp_path: Path, field: str, value
-) -> None:
-    profile = yaml.safe_load(
-        (ROOT / "configs" / "hardware" / "local_3x2080ti.yaml").read_text()
-    )
-    profile[field] = value
-    profile_path = tmp_path / "bad_hardware.yaml"
-    profile_path.write_text(yaml.safe_dump(profile), encoding="utf-8")
-    with pytest.raises(ConfigError, match=rf"hardware\.{field}"):
-        load_config(
-            ROOT / "configs" / "train" / "nlhe6.yaml",
-            hardware_profile=profile_path,
-        )
+def test_self_play_rejects_frozen_target() -> None:
+    raw = _raw()
+    raw["execution"]["frozen_checkpoint"] = "target.pt"  # type: ignore[index]
+    with pytest.raises(ConfigError, match="inapplicable to self play"):
+        load_config_mapping(raw)
+
+
+def test_input_mapping_is_copied_not_mutated() -> None:
+    raw = _raw()
+    before = copy.deepcopy(raw)
+    load_config_mapping(raw)
+    assert raw == before

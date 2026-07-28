@@ -136,7 +136,7 @@ def test_emergency_backoff_is_monotone_bounded_in_both_modes() -> None:
 
 
 def test_fixed_beta_and_branched_memory_checkpoint_round_trip(tmp_path: Path) -> None:
-    cfg = load_config("configs/train/nlhe6.yaml")
+    cfg = load_config("configs/train/nlhe_6max_10bb_branched.yaml")
     model = nn.Linear(2, 1)
     optimizer = torch.optim.Adam(model.parameters())
     scaler = torch.amp.GradScaler("cuda", enabled=False)
@@ -176,7 +176,11 @@ def test_fixed_beta_and_branched_memory_checkpoint_round_trip(tmp_path: Path) ->
 
 
 def test_lower_ideal_upper_configuration_order_is_strict() -> None:
-    raw = yaml.safe_load(Path("configs/train/nlhe6.yaml").read_text(encoding="utf-8"))
+    raw = yaml.safe_load(
+        Path("configs/train/nlhe_6max_10bb_branched.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
     raw["rollout"]["branching_min_nodes"] = 1000
     raw["rollout"]["branching_ideal_nodes"] = 2000.0
     raw["rollout"]["safe_tree_size"] = 3000.0

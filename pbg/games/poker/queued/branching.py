@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 
 import torch
@@ -25,6 +25,7 @@ from pbg.games.poker.queued.hooks import (
     SequentialPokerHooks,
 )
 from pbg.games.poker.queued.policy import PokerPolicyOperator
+from pbg.games.poker.queued.observability import topology_diagnostics
 from pbg.games.poker.queued.rb_sampling import (
     CollisionConditionedProfileSampler,
 )
@@ -252,6 +253,9 @@ class BranchedPokerResult:
     duplicate_child_labels: int
     sampled_tree_nodes: int
     telemetry: BranchedBenchmarkTelemetry | None = None
+    observability: Mapping[str, object] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
 
 @dataclass(frozen=True)
@@ -3509,6 +3513,9 @@ class _BranchedSampledPokerAttempt:
                 duplicate_child_labels=duplicate_labels,
                 sampled_tree_nodes=sampled_tree_nodes,
                 telemetry=telemetry,
+                observability=topology_diagnostics(
+                    topology, bindings, owners.plan.partitions
+                ),
             )
 
         if self.benchmark_rollout_only:
@@ -4505,6 +4512,11 @@ class ReplicaBranchedPokerIteration:
                     ),
                     duplicate_child_labels=duplicate_labels,
                     sampled_tree_nodes=sampled_nodes[lane],
+                    observability=topology_diagnostics(
+                        topology,
+                        bindings[lane],
+                        owners.plan.partitions,
+                    ),
                 )
             )
         return ReplicaBranchedPokerResult(

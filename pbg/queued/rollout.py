@@ -69,11 +69,14 @@ def _int64_like(reference: Tensor, value: Tensor | int) -> Tensor:
 
 
 def _mix63(value: Tensor) -> Tensor:
-    value = torch.bitwise_xor(value, value >> 30)
-    value = (value * 0x3C79AC492BA7B653) & _MASK63
-    value = torch.bitwise_xor(value, value >> 27)
-    value = (value * 0x1C69B3F74AC4AE35) & _MASK63
-    return torch.bitwise_xor(value, value >> 31) & _MASK63
+    first = torch.bitwise_xor(value, torch.bitwise_right_shift(value, 30))
+    first = torch.bitwise_and(first * 0x3C79AC492BA7B653, _MASK63)
+    second = torch.bitwise_xor(first, torch.bitwise_right_shift(first, 27))
+    second = torch.bitwise_and(second * 0x1C69B3F74AC4AE35, _MASK63)
+    return torch.bitwise_and(
+        torch.bitwise_xor(second, torch.bitwise_right_shift(second, 31)),
+        _MASK63,
+    )
 
 
 def _mix63_scalar(value: int) -> int:
