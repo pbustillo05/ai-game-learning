@@ -97,6 +97,29 @@ class ReferenceOutputCache:
     allocated_bytes: int
     released: bool = False
 
+    @staticmethod
+    def eligible(
+        *,
+        byte_budget: int,
+        resident_bytes: int,
+        build_bytes: int,
+        payload_bytes: int,
+        predicted_saved_seconds: float,
+        predicted_build_seconds: float,
+    ) -> bool:
+        if min(byte_budget, resident_bytes, build_bytes, payload_bytes) < 0:
+            raise ValueError("reference cache byte values must be nonnegative")
+        if (
+            not math.isfinite(predicted_saved_seconds)
+            or not math.isfinite(predicted_build_seconds)
+            or min(predicted_saved_seconds, predicted_build_seconds) < 0
+        ):
+            raise ValueError("reference cache time predictions must be nonnegative")
+        return (
+            resident_bytes + build_bytes + payload_bytes <= byte_budget
+            and predicted_saved_seconds > predicted_build_seconds
+        )
+
     @classmethod
     def admit(
         cls,
@@ -108,18 +131,14 @@ class ReferenceOutputCache:
         predicted_saved_seconds: float,
         predicted_build_seconds: float,
     ) -> ReferenceOutputCache | None:
-        if min(byte_budget, resident_bytes, build_bytes) < 0:
-            raise ValueError("reference cache byte values must be nonnegative")
-        if (
-            not math.isfinite(predicted_saved_seconds)
-            or not math.isfinite(predicted_build_seconds)
-            or min(predicted_saved_seconds, predicted_build_seconds) < 0
-        ):
-            raise ValueError("reference cache time predictions must be nonnegative")
         payload = sum(value.numel() * value.element_size() for value in fields.values())
-        if (
-            resident_bytes + build_bytes + payload > byte_budget
-            or predicted_saved_seconds <= predicted_build_seconds
+        if not cls.eligible(
+            byte_budget=byte_budget,
+            resident_bytes=resident_bytes,
+            build_bytes=build_bytes,
+            payload_bytes=payload,
+            predicted_saved_seconds=predicted_saved_seconds,
+            predicted_build_seconds=predicted_build_seconds,
         ):
             return None
         cached = MappingProxyType(
@@ -256,6 +275,188 @@ class ModelOperation(Protocol):
         sampled_private_state: Tensor,
         owner: Tensor,
     ) -> ModelEvaluation: ...
+
+
+def compact_best_response_evaluation(
+    learned_operation: ModelOperation,
+    frozen_operation: ModelOperation,
+    *,
+    input_type: str,
+    model_input: Tensor,
+    sampled_private_state: Tensor,
+    owner: Tensor,
+    role_selector: Tensor,
+) -> ModelEvaluation:
+    """Evaluate learned/frozen BR rows once each and restore FIFO order."""
+
+    trained = owner.to(torch.int64).eq(role_selector.to(torch.int64))
+    trained_row = torch.nonzero(trained, as_tuple=False).flatten()
+    frozen_row = torch.nonzero(~trained, as_tuple=False).flatten()
+
+    def compact_call(
+        operation: ModelOperation, row: Tensor
+    ) -> ModelEvaluation | None:
+        if row.numel() == 0:
+            return None
+        return operation(
+            input_type,
+            model_input.index_select(0, row),
+            sampled_private_state.index_select(0, row),
+            owner.index_select(0, row),
+        )
+
+    learned = compact_call(learned_operation, trained_row)
+    frozen = compact_call(frozen_operation, frozen_row)
+    prototype = learned if learned is not None else frozen
+    if prototype is None:
+        raise LearnerError("best-response model batch is empty")
+
+    def merge(
+        learned_value: Tensor | None,
+        frozen_value: Tensor | None,
+    ) -> Tensor:
+        source = learned_value if learned_value is not None else frozen_value
+        assert source is not None
+        result = source.new_empty((trained.shape[0], *source.shape[1:]))
+        if learned_value is not None:
+            result.index_copy_(0, trained_row, learned_value)
+        if frozen_value is not None:
+            result.index_copy_(0, frozen_row, frozen_value)
+        return result
+
+    policy_names = tuple(prototype.policy_raw)
+    public_names = tuple(prototype.public_heads)
+    for item in (learned, frozen):
+        if item is not None and (
+            tuple(item.policy_raw) != policy_names
+            or tuple(item.public_heads) != public_names
+        ):
+            raise LearnerError("trained and frozen BR model schemas differ")
+    return ModelEvaluation(
+        MappingProxyType(
+            {
+                name: merge(
+                    None if learned is None else learned.policy_raw[name],
+                    None if frozen is None else frozen.policy_raw[name],
+                )
+                for name in policy_names
+            }
+        ),
+        merge(
+            None if learned is None else learned.value,
+            None if frozen is None else frozen.value,
+        ),
+        MappingProxyType(
+            {
+                name: merge(
+                    None if learned is None else learned.public_heads[name],
+                    None if frozen is None else frozen.public_heads[name],
+                )
+                for name in public_names
+            }
+        ),
+    )
+
+
+def build_reference_output_cache(
+    operation: ModelOperation,
+    *,
+    input_type: str,
+    model_input: Tensor,
+    sampled_private_state: Tensor,
+    owner: Tensor,
+    pack_cap: int,
+    precision: str,
+    byte_budget: int,
+    resident_bytes: int,
+    predicted_saved_seconds: float,
+    predicted_build_seconds: float,
+) -> ReferenceOutputCache | None:
+    """Build one cache only after a bounded first chunk proves admission."""
+
+    rows = int(owner.numel())
+    if (
+        rows <= 0
+        or model_input.shape[0] != rows
+        or sampled_private_state.shape[0] != rows
+        or isinstance(pack_cap, bool)
+        or not isinstance(pack_cap, int)
+        or pack_cap <= 0
+    ):
+        raise LearnerError("reference cache inputs or pack capacity are invalid")
+    if precision not in ("fp32", "fp16", "bf16"):
+        raise ValueError("reference cache precision is invalid")
+    if precision == "bf16" and not torch.cuda.is_bf16_supported():
+        raise LearnerError("selected CUDA device does not support BF16")
+    autocast_dtype = {
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }[precision]
+
+    def evaluate(begin: int, end: int) -> Mapping[str, Tensor]:
+        with torch.no_grad(), torch.autocast(
+            device_type="cuda",
+            dtype=autocast_dtype,
+            enabled=precision != "fp32",
+        ):
+            result = operation(
+                input_type,
+                model_input[begin:end],
+                sampled_private_state[begin:end],
+                owner[begin:end],
+            )
+        return result.policy_raw
+
+    first_end = min(rows, pack_cap)
+    first = evaluate(0, first_end)
+    if not first or any(
+        value.shape[0] != first_end for value in first.values()
+    ):
+        raise LearnerError("reference operation returned invalid policy rows")
+    payload_bytes = sum(
+        rows
+        * value[0].numel()
+        * value.element_size()
+        for value in first.values()
+    )
+    if not ReferenceOutputCache.eligible(
+        byte_budget=byte_budget,
+        resident_bytes=resident_bytes,
+        build_bytes=payload_bytes,
+        payload_bytes=payload_bytes,
+        predicted_saved_seconds=predicted_saved_seconds,
+        predicted_build_seconds=predicted_build_seconds,
+    ):
+        return None
+    pieces: dict[str, list[Tensor]] = {
+        name: [value] for name, value in first.items()
+    }
+    for begin in range(first_end, rows, pack_cap):
+        end = min(rows, begin + pack_cap)
+        current = evaluate(begin, end)
+        if tuple(current) != tuple(pieces) or any(
+            value.shape[0] != end - begin
+            for value in current.values()
+        ):
+            raise LearnerError("reference operation policy schema changed")
+        for name, value in current.items():
+            pieces[name].append(value)
+    fields = MappingProxyType(
+        {name: torch.cat(values) for name, values in pieces.items()}
+    )
+    del pieces, first
+    cache = ReferenceOutputCache.admit(
+        fields,
+        byte_budget=byte_budget,
+        resident_bytes=resident_bytes,
+        build_bytes=payload_bytes,
+        predicted_saved_seconds=predicted_saved_seconds,
+        predicted_build_seconds=predicted_build_seconds,
+    )
+    if cache is None:
+        raise LearnerError("pre-admitted reference cache changed size")
+    return cache
 
 
 class PolicyOperation(Protocol):
@@ -1239,6 +1440,14 @@ class BranchedBatchSampler:
                     )
                     emitted += take
 
+    def release(self) -> None:
+        """Release alias and stratum tensors at their final optimizer consumer."""
+
+        self.alias = MappingProxyType({})
+        self.log_Z = MappingProxyType({})
+        self.stratum_probability = MappingProxyType({})
+        self.stores = MappingProxyType({})
+
 
 @dataclass(frozen=True)
 class LossResult:
@@ -1885,4 +2094,6 @@ __all__ = [
     "SequentialBatchSampler",
     "SequentialLearnerBatch",
     "allocate_statistical_counts",
+    "build_reference_output_cache",
+    "compact_best_response_evaluation",
 ]

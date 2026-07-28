@@ -52,6 +52,8 @@ from pbg.queued.learner import (
     ReferenceState,
     SealedSequentialInputs,
     SequentialBatchSampler,
+    build_reference_output_cache,
+    compact_best_response_evaluation,
 )
 from pbg.queued.optimization import DenseAdam, LossScaler
 from pbg.queued.persistence import (
@@ -388,67 +390,14 @@ class SequentialPokerIteration:
                     raise PokerIterationError(
                         "best-response forward omitted selected roles"
                     )
-                trained = forward.owner.to(torch.int64).eq(
-                    forward.role_selector.to(torch.int64)
-                )
-                trained_row = torch.nonzero(trained, as_tuple=False).flatten()
-                frozen_row = torch.nonzero(~trained, as_tuple=False).flatten()
-
-                def compact_call(
-                    operation: ModelOperation, row: Tensor
-                ) -> ModelEvaluation | None:
-                    if row.numel() == 0:
-                        return None
-                    return operation(
-                        forward.input_type,
-                        forward.model_input.index_select(0, row),
-                        forward.sampled_private_state.index_select(0, row),
-                        forward.owner.index_select(0, row),
-                    )
-
-                learned = compact_call(self.rollout_operation, trained_row)
-                frozen = compact_call(self.frozen_operation, frozen_row)
-                prototype = learned if learned is not None else frozen
-                if prototype is None:
-                    raise PokerIterationError("best-response model batch is empty")
-
-                def merge(
-                    learned_value: Tensor | None, frozen_value: Tensor | None
-                ) -> Tensor:
-                    source = (
-                        learned_value
-                        if learned_value is not None
-                        else frozen_value
-                    )
-                    assert source is not None
-                    result = source.new_empty(
-                        (trained.shape[0], *source.shape[1:])
-                    )
-                    if learned_value is not None:
-                        result.index_copy_(0, trained_row, learned_value)
-                    if frozen_value is not None:
-                        result.index_copy_(0, frozen_row, frozen_value)
-                    return result
-
-                policy_names = tuple(prototype.policy_raw)
-                if learned is not None and tuple(learned.policy_raw) != policy_names:
-                    raise PokerIterationError("learned policy output schema changed")
-                if frozen is not None and tuple(frozen.policy_raw) != policy_names:
-                    raise PokerIterationError("frozen policy output schema changed")
-                evaluation = ModelEvaluation(
-                    MappingProxyType(
-                        {
-                            name: merge(
-                                None if learned is None else learned.policy_raw[name],
-                                None if frozen is None else frozen.policy_raw[name],
-                            )
-                            for name in policy_names
-                        }
-                    ),
-                    merge(
-                        None if learned is None else learned.value,
-                        None if frozen is None else frozen.value,
-                    ),
+                evaluation = compact_best_response_evaluation(
+                    self.rollout_operation,
+                    self.frozen_operation,
+                    input_type=forward.input_type,
+                    model_input=forward.model_input,
+                    sampled_private_state=forward.sampled_private_state,
+                    owner=forward.owner,
+                    role_selector=forward.role_selector,
                 )
         if not isinstance(evaluation, ModelEvaluation):
             raise PokerIterationError("rollout model returned the wrong contract")
@@ -754,29 +703,23 @@ class SequentialPokerIteration:
             budget = owners.plan.layout.reference_cache_bytes
             for name, store in stores.items():
                 columns = store.sealed_inputs.columns
-                with torch.no_grad():
-                    evaluation = self.reference_operation(
-                        name,
-                        columns["model_input"],
-                        columns.get(
-                            "sampled_private_state", columns["owner"][:, None]
-                        ),
-                        columns["owner"],
-                    )
                 batch_calls = max(
                     1,
                     (store.rows + self.schedule.batch_size - 1)
                     // self.schedule.batch_size,
                 )
-                build_bytes = sum(
-                    value.numel() * value.element_size()
-                    for value in evaluation.policy_raw.values()
-                )
-                candidate = ReferenceOutputCache.admit(
-                    evaluation.policy_raw,
+                candidate = build_reference_output_cache(
+                    self.reference_operation,
+                    input_type=name,
+                    model_input=columns["model_input"],
+                    sampled_private_state=columns.get(
+                        "sampled_private_state", columns["owner"][:, None]
+                    ),
+                    owner=columns["owner"],
+                    pack_cap=owners.plan.manifest.learner_sigma_pack_cap,
+                    precision=self.precision,
                     byte_budget=budget,
                     resident_bytes=resident,
-                    build_bytes=build_bytes,
                     predicted_saved_seconds=float(max(0, batch_calls - 1)),
                     predicted_build_seconds=0.5,
                 )

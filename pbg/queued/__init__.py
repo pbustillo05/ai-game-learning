@@ -85,6 +85,8 @@ from pbg.queued.learner import (
     SequentialBatchSampler,
     SequentialLearnerBatch,
     allocate_statistical_counts,
+    build_reference_output_cache,
+    compact_best_response_evaluation,
 )
 from pbg.queued.optimization import (
     DenseAdam,
@@ -357,9 +359,11 @@ __all__ = [
     "allocate_statistical_counts",
     "assemble_topology_packets",
     "build_layer_plan",
+    "build_reference_output_cache",
     "build_storage_plan",
     "child_path_factors",
     "child_path_keys",
+    "compact_best_response_evaluation",
     "conditionalize",
     "controller_from_state_dict",
     "convert_legacy_sequential",

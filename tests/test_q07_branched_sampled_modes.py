@@ -362,6 +362,23 @@ def test_phase7_admission_covers_fixed_and_full_decision_workspaces() -> None:
             run_state=RunState("phase7-root-bound", root_count=2),
             arguments={},
         )
+    two_root_plan = build_storage_plan(
+        self_plan.mode,
+        sampled_partitions(2),
+        replace(manifest, root_count=2),
+        layout,
+        device,
+    )
+    with pytest.raises(ValueError, match="root count"):
+        PublicBranchedSampledPokerIteration(
+            owner_factory=lambda: GeneratedOwners(two_root_plan),
+            plan=two_root_plan,
+            controller=FixedBranchController(
+                {"player": 1.0, "chance": 1.0}, 2
+            ),
+            run_state=RunState("phase7-root-exact", root_count=1),
+            arguments={},
+        )
 
 
 @CUDA
@@ -903,7 +920,6 @@ def test_untrained_unary_root_refill_restores_one_structural_root() -> None:
         return _StagedBranchedPayload(
             (record,),
             torch.tensor([0], dtype=torch.int64),
-            torch.zeros((1, 4), dtype=torch.bool),
             torch.tensor(1, dtype=torch.int64),
             torch.tensor(0, dtype=torch.float32),
             torch.tensor(1, dtype=torch.int64),
@@ -1359,6 +1375,72 @@ def test_best_response_rollout_selects_one_model_per_role_subspan() -> None:
 
 
 @CUDA
+def test_multiplayer_best_response_root_uses_frozen_opponent_model() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(4, 8.0, 4)
+    mode = mode_schema("best_response", "branched.fixed", "sampled")
+    partitions = sampled_partitions(geometry.players)
+    plan = build_storage_plan(
+        mode,
+        partitions,
+        _manifest(device, geometry),
+        replace(
+            _phase7_layout(geometry),
+            model_input_shapes=tuple(
+                NamedShape(
+                    partition.name,
+                    (geometry.direct_model_input_width,),
+                )
+                for partition in partitions.inputs
+            ),
+            player_count=geometry.players,
+            stratum_count=geometry.players,
+        ),
+        device,
+    )
+
+    class RoleRecordingModel(_BranchedModel):
+        def __init__(self):
+            super().__init__(device, geometry.private_hands)
+            self.rollout_owners: list[torch.Tensor] = []
+
+        def evaluate(self, input_type, model_input, private, owner):
+            if not torch.is_grad_enabled():
+                self.rollout_owners.append(owner.detach().clone())
+            return super().evaluate(input_type, model_input, private, owner)
+
+    learned = RoleRecordingModel()
+    frozen = RoleRecordingModel()
+    BranchedSampledPokerIteration(
+        geometry=geometry,
+        owners=GeneratedOwners(plan),
+        mode=mode,
+        controller=FixedBranchController(
+            {"player": 1.0, "chance": 1.0}, 2
+        ),
+        model=learned,
+        model_operation=learned.evaluate,
+        frozen_operation=frozen.evaluate,
+        optimizer=DenseAdam(
+            learned,
+            OptimizerConfig(name="adamw", grad_clip=5),
+        ),
+        loss=LossConfig(
+            reference_kl_coefficient=0,
+            trace_coefficient=0.1,
+            cost_coefficient=0.1,
+        ),
+        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        generator=torch.Generator(device=device).manual_seed(703),
+        seed=703,
+        lambda_=0.95,
+    ).run(iteration=0)
+    assert frozen.rollout_owners
+    assert int(frozen.rollout_owners[0][0]) == 3
+    assert not learned.rollout_owners or int(learned.rollout_owners[0][0]) != 3
+
+
+@CUDA
 def test_branched_allocator_and_reference_cache_controls_are_wired() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 4)
@@ -1366,7 +1448,7 @@ def test_branched_allocator_and_reference_cache_controls_are_wired() -> None:
     plan = build_storage_plan(
         mode,
         sampled_partitions(2),
-        _manifest(device),
+        replace(_manifest(device), learner_sigma_pack_cap=1),
         replace(
             _phase7_layout(geometry),
             reference_cache_bytes=4 << 20,
@@ -1407,7 +1489,8 @@ def test_branched_allocator_and_reference_cache_controls_are_wired() -> None:
         lambda_=0.95,
     ).run(iteration=0)
     assert result.learner.statistical_presentations == 8
-    assert len(reference.no_grad_batch_sizes) == 2
+    assert len(reference.no_grad_batch_sizes) > 2
+    assert max(reference.no_grad_batch_sizes) == 1
 
 
 @CUDA
