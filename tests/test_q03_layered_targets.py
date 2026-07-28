@@ -1448,6 +1448,70 @@ def test_direct_sibling_sum_avoids_total_minus_child_cancellation() -> None:
 
 
 @CUDA
+def test_cuda_executor_uses_direct_sibling_sum_for_concentrated_rows() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    mode = mode_schema("self_play", "branched.fixed", "sampled")
+    topology = Topology(
+        parent=_i32([-1]),
+        child_begin=_i32([0]),
+        executed_degree=_i32([3]),
+        nominal_degree=_i32([3]),
+        target_degree=_i32([3]),
+        owner=_i32([0]),
+        familywork_row=_i32([0]),
+        sigma_head_row=_i32([0]),
+        action_begin=_i32([0]),
+        label=_i32([0, 1, 2]),
+        path_length=_i32([1, 1, 1]),
+        target_kind=_i32([int(TargetKind.LEAF)] * 3),
+        target_row=_i32([0, 1, 2]),
+    )
+    bindings = TopologyBindings(
+        input_type=_i32([0]),
+        output_type=_i32([0]),
+        sigma_target_row=_i32([0]),
+        child_output_type=_i32([0, 0, 0]),
+    )
+    partitions = _partitions(mode.private_estimator)
+    manifest = _manifest(mode, device)
+    plan = build_layer_plan(
+        mode,
+        partitions,
+        (topology,),
+        (bindings,),
+        p_train=2,
+        manifest=manifest,
+    )
+    owners = GeneratedOwners(
+        build_storage_plan(mode, partitions, manifest, _layout(), device)
+    )
+    payoff = torch.tensor(
+        (
+            (1.0e8, 0.0),
+            (1.0, 0.0),
+            (-1.0e8, 0.0),
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+    _enter_through_targets(
+        owners,
+        mode,
+        plan,
+        {(0, "all"): sampled_completion(payoff, branched=True)},
+        1,
+    )
+    LayeredTargetExecutor(
+        mode, _algebra(mode.private_estimator), lambda_=1.0
+    ).execute(owners, plan)
+    advantage = owners.slab(
+        "ActionTarget", "all"
+    ).published(0, "advantage_target")
+    assert float(advantage[1, 0]) == 1.0
+    _close(owners)
+
+
+@CUDA
 def test_failure_keeps_targets_unpublished_and_records_lane() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     mode = mode_schema("self_play", "sequential", "sampled")

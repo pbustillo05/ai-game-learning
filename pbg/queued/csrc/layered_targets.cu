@@ -202,8 +202,22 @@ __global__ void layered_target_kernel(
                          p, d, p_train, output_count, max_width));
         float baseline = old_v;
         if (ntgt > 1) {
-          const float sibling0 = mass_sum - child0;
-          const float sibling1 = moment_sum - child1;
+          float sibling0 = 0.0f;
+          float sibling1 = 0.0f;
+          for (int sibling = 0; sibling < ntgt; ++sibling) {
+            if (sibling == a) continue;
+            const int sibling_edge = begin + sibling;
+            const int sibling_source = child_source_type[sibling_edge];
+            const int sibling_encoded = child_source_row[sibling_edge];
+            sibling0 += converted(
+                tables.work0, tables, sibling_source, output, lane,
+                sibling_encoded, p, d, p_train, output_count, max_width);
+            if (!sampled) {
+              sibling1 += converted(
+                  tables.work1, tables, sibling_source, output, lane,
+                  sibling_encoded, p, d, p_train, output_count, max_width);
+            }
+          }
           const float continuation = sampled
               ? sibling0 / static_cast<float>(ntgt - 1)
               : (sibling0 > 0.0f ? sibling1 / sibling0 : 0.0f);

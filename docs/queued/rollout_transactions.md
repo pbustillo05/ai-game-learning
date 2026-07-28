@@ -101,7 +101,7 @@ path. It binds the complete live owner set and immutable manifest. The
 
 ## Logical RNG
 
-The logical RNG version is `counter_hash_v3`. A key is a pure function of:
+The logical RNG version is `counter_hash_v4`. A key is a pure function of:
 
 $$
 (\text{seed},\text{iteration},\text{root},\text{path},

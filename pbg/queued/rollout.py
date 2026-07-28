@@ -54,7 +54,7 @@ class DrawPurpose(IntEnum):
     PROBE_SEAT = 8
 
 
-LOGICAL_RNG_VERSION = "counter_hash_v3"
+LOGICAL_RNG_VERSION = "counter_hash_v4"
 _MASK63 = (1 << 63) - 1
 _OWNER_REGISTRY_TOKEN = object()
 
@@ -188,6 +188,13 @@ def logical_uniform(
         torch.float32
     )
     uniform = ((mantissa + 0.5) * (1.0 / (1 << 24))).to(dtype)
+    uniform = torch.minimum(
+        uniform,
+        torch.nextafter(
+            torch.ones((), dtype=dtype, device=keys.device),
+            torch.zeros((), dtype=dtype, device=keys.device),
+        ),
+    )
     if active is not None:
         if active.device != keys.device:
             raise ValueError("active uniform mask must share the key device")
@@ -217,7 +224,10 @@ def logical_categorical(
     elif mass.shape != keys.shape or mass.device != probability.device:
         raise ValueError("categorical mass must be device-local [B]")
     cdf = probability.cumsum(1)
-    threshold = (logical_uniform(keys) * mass).unsqueeze(1).contiguous()
+    threshold = torch.minimum(
+        logical_uniform(keys) * mass,
+        torch.nextafter(mass, torch.zeros_like(mass)),
+    ).unsqueeze(1).contiguous()
     selected = torch.searchsorted(cdf, threshold, right=False).squeeze(1)
     selected = selected.clamp_max(probability.shape[1] - 1)
     if active is not None:

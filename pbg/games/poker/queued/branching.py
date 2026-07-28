@@ -1197,7 +1197,10 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 board_cards=parent_state.board_cards,
                 inherited_profile=parent_profile,
                 source=source,
-                ordinal=ordinal,
+                # Posterior ordinals are zero-based across the complete
+                # logical root degree, including later refill packets.
+                # Only the original child zero inherits the parent profile.
+                ordinal=child_ordinal - 1,
                 active=active,
                 root=root.index_select(0, source),
                 path=child_path,

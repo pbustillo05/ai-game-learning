@@ -193,8 +193,10 @@ class CollisionConditionedProfileSampler:
             mass.index_select(0, source64)[:, None]
             .expand(edges, self.max_attempts, players)
         )
-        target = logical_uniform(keys) * totals
-        # Uniforms are open-interval and therefore strictly below the total.
+        target = torch.minimum(
+            logical_uniform(keys) * totals,
+            torch.nextafter(totals, torch.zeros_like(totals)),
+        )
         selected = _fixed_upper_bound(
             cdf,
             target,

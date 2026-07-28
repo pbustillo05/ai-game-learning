@@ -27,6 +27,7 @@ from pbg.queued import (
     EndpointPatch,
     FamilyQueueState,
     FamilyScheduler,
+    LOGICAL_RNG_VERSION,
     MonotoneSlab,
     Partition,
     PartitionContract,
@@ -583,6 +584,7 @@ def test_terminal_device_contract_failures(body: str, message: str) -> None:
 @CUDA
 def test_logical_rng_is_invariant_to_order_subdivision_stream_and_placement() -> None:
     device = torch.device("cuda", 0)
+    assert LOGICAL_RNG_VERSION == "counter_hash_v4"
     root = torch.tensor([3, 5, 8, 13, 21, 34], dtype=torch.int64, device=device)
     path = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int64, device=device)
     lane = torch.tensor([2, 0, 1, 2, 0, 1], dtype=torch.int64, device=device)
@@ -695,6 +697,18 @@ def test_logical_rng_is_invariant_to_order_subdivision_stream_and_placement() ->
     selected = logical_categorical(probability, keys[:2])
     assert selected.shape == (2,)
     assert torch.all((logical_uniform(keys) > 0) & (logical_uniform(keys) < 1))
+    endpoint_key = torch.tensor(
+        [((1 << 24) - 1) << 39],
+        dtype=torch.int64,
+        device=device,
+    )
+    assert float(logical_uniform(endpoint_key)[0]) < 1.0
+    assert int(
+        logical_categorical(
+            torch.tensor([[1.0, 0.0]], device=device),
+            endpoint_key,
+        )[0]
+    ) == 0
 
 
 @CUDA
