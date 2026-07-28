@@ -478,6 +478,48 @@ class ReplicaOptimizerGroup:
             optimizer.load_state_dict(lanes[lane])
             optimizer.scaler = LossScaler.from_state_dict(scalers[lane])
 
+    def lane_stepper(
+        self,
+        lane: int,
+        *,
+        distributed: DistributedSUM | None = None,
+    ) -> ReplicaLaneOptimizer:
+        """Expose ordinary optimizer calls while retaining group ownership."""
+
+        self.modules._check_lane(lane)
+        return ReplicaLaneOptimizer(self, lane, distributed=distributed)
+
+
+class ReplicaLaneOptimizer:
+    """Scheduling-only view of one dense optimizer lane."""
+
+    def __init__(
+        self,
+        group: ReplicaOptimizerGroup,
+        lane: int,
+        *,
+        distributed: DistributedSUM | None,
+    ) -> None:
+        self.group = group
+        self.lane = lane
+        self.distributed = distributed
+
+    @property
+    def scaler(self) -> LossScaler:
+        return self.group.optimizers[self.lane].scaler
+
+    def zero_grad(self) -> None:
+        self.group.zero_grad((self.lane,))
+
+    def step(self) -> OptimizerStep:
+        result = self.group.step(
+            (self.lane,),
+            distributed=self.distributed,
+        )[self.lane]
+        if result is None:
+            raise ReplicaError("active optimizer lane did not produce a step")
+        return result
+
 
 class ReplicaLearnerScheduler:
     """Schedule the existing lane learner operation without padding."""
@@ -540,6 +582,7 @@ __all__ = [
     "DistributedSUM",
     "FunctionalReplicaInference",
     "ReplicaError",
+    "ReplicaLaneOptimizer",
     "ReplicaLearnerScheduler",
     "ReplicaMemoryReport",
     "ReplicaModuleOwner",

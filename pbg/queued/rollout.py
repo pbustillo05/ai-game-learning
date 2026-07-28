@@ -1360,7 +1360,7 @@ class AsyncTopologyPublisher:
         self._deferred_staged: dict[
             tuple[int, int], DeferredUnaryTopologyPublication
         ] = {}
-        self._deferred_accepted: list[tuple[int, Tensor]] = []
+        self._deferred_accepted: list[tuple[int, int, Tensor]] = []
         self._deferred_reserved_rows = 0
         self._branched_staged: dict[
             tuple[int, int], DeferredBranchedTopologyPublication
@@ -1368,7 +1368,7 @@ class AsyncTopologyPublisher:
         self._branched_pending: list[_PendingDeferredBranched] = []
         self._branched_accepted: dict[tuple[int, int], object] = {}
         self._branched_success_buffer = torch.empty(
-            owners.topology_cap,
+            owners.n_replica * owners.topology_cap,
             dtype=torch.bool,
             pin_memory=True,
         )
@@ -1418,7 +1418,7 @@ class AsyncTopologyPublisher:
             raise TopologyError(
                 "deferred branched topology exceeds its fixed packet cap"
             )
-        if publication.sequence >= self._branched_success_buffer.numel():
+        if publication.sequence >= self.owners.topology_cap:
             raise TopologyError(
                 "deferred branched topology exceeds its sequence arena"
             )
@@ -1434,7 +1434,10 @@ class AsyncTopologyPublisher:
         key = (publication.lane, publication.sequence)
         if self._branched_staged.get(key) is not publication:
             raise TopologyError("deferred branched topology was not staged")
-        host_success = self._branched_success_buffer[publication.sequence]
+        host_success = self._branched_success_buffer[
+            publication.lane * self.owners.topology_cap
+            + publication.sequence
+        ]
         host_success.copy_(success[publication.lane], non_blocking=True)
         event = torch.cuda.Event(blocking=False)
         event.record(stream)
@@ -1573,7 +1576,7 @@ class AsyncTopologyPublisher:
             raise TopologyError("deferred topology was not staged")
         rows = publication.terminal.numel()
         begin = sum(
-            item[1].shape[0] for item in self._deferred_accepted
+            item[2].shape[0] for item in self._deferred_accepted
         ) + sum(
             item.publication.terminal.numel()
             for item in self._deferred_pending
@@ -1673,6 +1676,7 @@ class AsyncTopologyPublisher:
             if marker == publication.sequence:
                 self._deferred_accepted.append(
                     (
+                        publication.lane,
                         publication.sequence,
                         self._deferred_buffer[item.row_slice],
                     )
@@ -1691,8 +1695,9 @@ class AsyncTopologyPublisher:
         accepted = next(
             (
                 rows
-                for sequence, rows in self._deferred_accepted
-                if sequence == publication.sequence
+                for lane, sequence, rows in self._deferred_accepted
+                if lane == publication.lane
+                and sequence == publication.sequence
             ),
             None,
         )
@@ -2062,11 +2067,14 @@ class AsyncTopologyPublisher:
     def seal_deferred_unary(
         self,
         *,
+        lane: int = 0,
         input_count: int,
         input_output: Sequence[int] | None = None,
     ) -> tuple[Topology, TopologyBindings, int]:
         """Aggregate once, then link the committed unary logical trace."""
 
+        if not 0 <= lane < self.owners.n_replica:
+            raise TopologyError("deferred topology lane is outside replicas")
         if self._deferred_pending:
             with torch.cuda.stream(self._accept_stream):
                 for item in self._deferred_pending:
@@ -2079,9 +2087,10 @@ class AsyncTopologyPublisher:
             raise TopologyError("deferred topology did not reach commit visibility")
         ordered = [
             rows
-            for _sequence, rows in sorted(
-                self._deferred_accepted, key=lambda item: item[0]
+            for accepted_lane, _sequence, rows in sorted(
+                self._deferred_accepted, key=lambda item: (item[0], item[1])
             )
+            if accepted_lane == lane
         ]
         if not ordered:
             raise TopologyError("deferred topology is empty")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import runpy
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 import torch
@@ -10,19 +12,32 @@ import torch.multiprocessing as mp
 
 from pbg.games.poker.queued import (
     NLHEGeometry,
+    PokerForwardInput,
     PokerReplicaInference,
     QueuedPokerModel,
-    ReplicaPokerIterationGroup,
+    ReplicaPokerIterationResult,
+    sampled_partitions,
 )
+from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
+from pbg.games.poker.queued.training import SequentialSampledPokerIteration
 from pbg.queued import (
+    CapacityManifest,
     DistributedSUM,
+    ExternalWorkspaceBounds,
     FunctionalReplicaInference,
+    GameGeometry,
+    GeneratedOwners,
+    HardwareLimits,
     LearnerDTypes,
     LearnerOperation,
+    LearnerSchedule,
     LossConfig,
     LossScaler,
     ModelEvaluation,
+    NamedShape,
     OptimizerConfig,
+    PartitionRows,
+    PhysicalLayout,
     PolicyEvaluation,
     ReplicaLearnerScheduler,
     ReplicaMemoryReport,
@@ -30,6 +45,7 @@ from pbg.queued import (
     ReplicaOptimizerGroup,
     RunState,
     SequentialLearnerBatch,
+    build_storage_plan,
     load_replica_checkpoint,
     mode_schema,
     save_replica_checkpoint,
@@ -87,6 +103,55 @@ class _PokerPartition(torch.nn.Module):
         )
 
 
+class _CheckDownPartition(torch.nn.Module):
+    def __init__(self, input_width: int, output_width: int) -> None:
+        super().__init__()
+        del input_width
+        self.output_width = output_width
+        self.public = torch.nn.Linear(26, 1)
+        self.value_bias = torch.nn.Parameter(torch.zeros(output_width))
+
+    def forward(self, value: torch.Tensor) -> ModelEvaluation:
+        rows = value.shape[0]
+        public = self.public(value[:, :26].float())
+        actor = value[:, 6:8].argmax(-1)
+        committed = value[:, 14:16].gather(1, actor[:, None]).squeeze(1)
+        facing = value[:, 24].float().gt(committed + 1.0e-6)
+        logits = torch.stack(
+            (
+                torch.where(facing, -30.0, 30.0),
+                torch.where(facing, 30.0, -30.0),
+                torch.full_like(public[:, 0], -60.0),
+            ),
+            -1,
+        )[:, None].expand(-1, self.output_width, -1)
+        base = public.expand(-1, self.output_width)
+        return ModelEvaluation(
+            MappingProxyType(
+                {
+                    "type_logits": logits + base[..., None] * 0.001,
+                    "omega": torch.ones(
+                        (rows, self.output_width, 1),
+                        device=value.device,
+                    ),
+                    "mu": torch.full(
+                        (rows, self.output_width, 1),
+                        0.5,
+                        device=value.device,
+                    ),
+                    "s": torch.ones(
+                        (rows, self.output_width, 1),
+                        device=value.device,
+                    ),
+                    "iota": torch.full(
+                        (rows, self.output_width),
+                        0.02,
+                        device=value.device,
+                    ),
+                }
+            ),
+            self.value_bias[None] + base,
+        )
 class _LearnerToy(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -146,6 +211,90 @@ def _learner_batch() -> SequentialLearnerBatch:
 
 def _modules(count: int) -> list[_Toy]:
     return [_Toy(100 + lane).cuda() for lane in range(count)]
+
+
+def _poker_manifest(
+    device: torch.device, *, n_replica: int
+) -> CapacityManifest:
+    return CapacityManifest(
+        geometry=GameGeometry(2, 8.0, 4, 64, 4096),
+        root_count=1,
+        n_replica=n_replica,
+        beta_max=1,
+        player_node_cap=(
+            PartitionRows("pre", 40),
+            PartitionRows("post_2", 40),
+        ),
+        trained_player_cap=(
+            PartitionRows("pre", 20),
+            PartitionRows("post_2", 20),
+        ),
+        action_cap=(
+            PartitionRows("pre", 20),
+            PartitionRows("post_2", 20),
+        ),
+        folded_range_cap=(
+            PartitionRows("pre", 2),
+            PartitionRows("post", 2),
+        ),
+        leaf_cap=8,
+        topology_cap=8 * n_replica,
+        topology_edge_cap=8 * n_replica,
+        family_pack_cap=8,
+        chance_frontier_cap=8,
+        completion_pack_cap=8,
+        learner_sigma_pack_cap=8,
+        learner_action_pack_cap=8,
+        topology_packet_cap=8,
+        target_arena_cap=16 * n_replica,
+        movement_scratch_bytes=1 << 20,
+        library_workspace_bytes=1024,
+        evaluator_workspace_bytes=1024,
+        memory_guard_bytes=1024,
+        hardware=HardwareLimits(
+            torch.cuda.get_device_properties(device).total_memory,
+            64 << 20,
+            1024,
+            1_000_000,
+            64,
+        ),
+        required_external=ExternalWorkspaceBounds(0, 0),
+    )
+
+
+def _poker_layout(geometry: NLHEGeometry) -> PhysicalLayout:
+    width = geometry.direct_model_input_width
+    return PhysicalLayout(
+        model_input_shapes=(
+            NamedShape("pre", (width,)),
+            NamedShape("post_2", (width,)),
+        ),
+        player_count=2,
+        stratum_count=2,
+        evaluator_private_width=4,
+        family_workspace_row_bytes=sequential_family_workspace_row_bytes(
+            geometry, 1
+        ),
+        chance_frontier_row_bytes=32,
+        completion_workspace_row_bytes=64,
+        learner_sigma_workspace_row_bytes=64,
+        learner_action_workspace_row_bytes=64,
+        topology_packet_row_bytes=88,
+    )
+
+
+def _check_down_model(geometry: NLHEGeometry) -> QueuedPokerModel:
+    return QueuedPokerModel(
+        geometry,
+        _CheckDownPartition(
+            geometry.direct_model_input_width,
+            geometry.rank_count**2,
+        ),
+        _CheckDownPartition(
+            geometry.direct_model_input_width,
+            geometry.private_hands,
+        ),
+    ).cuda()
 
 
 def _distributed_sum_worker(
@@ -261,72 +410,224 @@ def test_poker_rollout_vmap_preserves_lane_weights_and_natural_labels() -> None:
     torch.testing.assert_close(actual.value, expected)
     assert actual.value.shape == (2, rows, geometry.private_hands)
     assert float(actual.value[0, 0, 0]) != float(actual.value[1, 0, 0])
-    lane_operation = inference.lane_operation(2)
-    lane_value = lane_operation("pre", model_input[0], private[0], owner[0]).value
-    torch.testing.assert_close(lane_value, expected[0])
-
-
 @CUDA
-def test_production_poker_group_binds_vmap_rollout_and_ordinary_learner_lanes() -> None:
+def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 4)
-    source = [
-        QueuedPokerModel(
-            geometry,
-            _PokerPartition(geometry.rank_count**2, 0.3 + lane),
-            _PokerPartition(geometry.private_hands, 0.4 + lane),
-        ).cuda()
-        for lane in range(2)
-    ]
+    mode = mode_schema("self_play", "sequential", "sampled")
+    source = (_check_down_model(geometry), _check_down_model(geometry))
+    ordinary_model = copy.deepcopy(source[0])
+    ordinary_optimizer = DenseAdam(
+        ordinary_model,
+        OptimizerConfig(name="adamw", grad_clip=5.0),
+    )
+    ordinary = SequentialSampledPokerIteration(
+        geometry=geometry,
+        owners=GeneratedOwners(
+            build_storage_plan(
+                mode,
+                sampled_partitions(geometry.players),
+                _poker_manifest(device, n_replica=1),
+                _poker_layout(geometry),
+                device,
+            )
+        ),
+        mode=mode,
+        model=ordinary_model,
+        model_operation=ordinary_model.learner_operation,
+        optimizer=ordinary_optimizer,
+        loss=LossConfig(reference_kl_coefficient=0),
+        schedule=LearnerSchedule(batch_size=1),
+        generator=torch.Generator(device=device).manual_seed(710),
+        seed=710,
+        lambda_=0.95,
+        run_state=RunState("ordinary-oracle", root_count=1),
+    ).run(iteration=0)
     inference = PokerReplicaInference(source)
     optimizers = ReplicaOptimizerGroup(
         inference.modules,
-        OptimizerConfig(learning_rate=1.0e-3),
+        OptimizerConfig(name="adamw", grad_clip=5.0),
     )
-    schemas = (
-        mode_schema("self_play", "branched.fixed", "sampled"),
-        mode_schema("self_play", "branched.KKT", "sampled"),
+    owners = GeneratedOwners(
+        build_storage_plan(
+            mode,
+            sampled_partitions(geometry.players),
+            _poker_manifest(device, n_replica=2),
+            _poker_layout(geometry),
+            device,
+        )
     )
-
-    class _Iteration:
-        def __init__(self, lane: int) -> None:
-            self.model = inference.modules.lane_module(lane)
-            self.optimizer = optimizers.optimizers[lane]
-            self.mode = schemas[lane]
-            self.rollout_operation = inference.lane_operation(lane)
-            self.model_operation = self.model.learner_operation
-            self.calls = 0
-
-        def run(self, *, iteration: int) -> ModelEvaluation:
-            del iteration
-            self.calls += 1
-            rows = 2
-            model_input = torch.zeros(
-                (rows, geometry.direct_model_input_width), device="cuda"
-            )
-            private = torch.zeros(
-                (rows, geometry.players), dtype=torch.int32, device="cuda"
-            )
-            owner = torch.zeros(rows, dtype=torch.uint8, device="cuda")
-            rollout = self.rollout_operation("pre", model_input, private, owner)
-            self.optimizer.zero_grad()
-            learned = self.model_operation("pre", model_input, private, owner)
-            learned.value.mean().backward()
-            self.optimizer.step()
-            return rollout
-
-    iterations = (_Iteration(0), _Iteration(1))
-    group = ReplicaPokerIterationGroup(
-        iterations,
-        inference=inference,
-        optimizers=optimizers,
+    modules = tuple(
+        inference.modules.lane_module(lane) for lane in range(2)
     )
-    result = group.run(iteration=0, active_lanes=(1,))
+    generators = tuple(
+        torch.Generator(device=device).manual_seed(710 + lane)
+        for lane in range(2)
+    )
+    run_states = tuple(
+        RunState(f"real-replica-{lane}", root_count=1)
+        for lane in range(2)
+    )
+    result = SequentialSampledPokerIteration(
+        geometry=geometry,
+        owners=owners,
+        mode=mode,
+        model=modules[0],
+        model_operation=modules[0].learner_operation,
+        optimizer=optimizers.optimizers[0],
+        loss=LossConfig(reference_kl_coefficient=0),
+        schedule=LearnerSchedule(batch_size=1),
+        generator=generators[0],
+        seed=710,
+        lambda_=0.95,
+        replica_inference=inference,
+        replica_optimizers=optimizers,
+        replica_generators=generators,
+        replica_run_states=run_states,
+        replica_model_operations=tuple(
+            module.learner_operation for module in modules
+        ),
+    ).run(iteration=0)
+    assert isinstance(result, ReplicaPokerIterationResult)
     assert result.failures == {}
-    assert result.results[0] is None
-    assert isinstance(result.results[1], ModelEvaluation)
-    assert iterations[0].calls == 0
-    assert iterations[1].calls == 1
-    assert result.versions == (0, 1)
+    assert result.versions == (8, 8)
+    assert all(value is not None for value in result.results)
+    for value in result.results:
+        assert value is not None
+        assert (value.player_nodes, value.leaves) == (8, 1)
+        assert value.learner is not None
+        assert value.learner.statistical_presentations == 8
+    assert tuple(state.iteration for state in run_states) == (1, 1)
+    inference.modules.assert_zero_copy()
+    lane_zero = result.results[0]
+    assert lane_zero is not None
+    assert (
+        lane_zero.player_nodes,
+        lane_zero.leaves,
+        lane_zero.target_layers,
+    ) == (
+        ordinary.player_nodes,
+        ordinary.leaves,
+        ordinary.target_layers,
+    )
+    for name, expected in ordinary_model.state_dict().items():
+        torch.testing.assert_close(
+            inference.modules.lane_state_dict(0)[name],
+            expected,
+            atol=3.0e-7,
+            rtol=0,
+        )
+
+
+@CUDA
+def test_replica_best_response_groups_compact_learned_and_frozen_rows() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = mode_schema("best_response", "sequential", "sampled")
+    learned_source = (_check_down_model(geometry), _check_down_model(geometry))
+    frozen_source = (_check_down_model(geometry), _check_down_model(geometry))
+    learned = PokerReplicaInference(learned_source)
+    frozen = PokerReplicaInference(frozen_source)
+    optimizers = ReplicaOptimizerGroup(
+        learned.modules,
+        OptimizerConfig(name="adamw"),
+    )
+    modules = tuple(learned.modules.lane_module(lane) for lane in range(2))
+    iteration = SequentialSampledPokerIteration(
+        geometry=geometry,
+        owners=GeneratedOwners(
+            build_storage_plan(
+                mode,
+                sampled_partitions(geometry.players),
+                _poker_manifest(device, n_replica=2),
+                _poker_layout(geometry),
+                device,
+            )
+        ),
+        mode=mode,
+        model=modules[0],
+        model_operation=modules[0].learner_operation,
+        optimizer=optimizers.optimizers[0],
+        loss=LossConfig(reference_kl_coefficient=0),
+        schedule=LearnerSchedule(batch_size=1),
+        generator=torch.Generator(device=device).manual_seed(812),
+        seed=812,
+        lambda_=0.95,
+        frozen_operation=frozen.modules.lane_module(0).rollout_operation,
+        replica_inference=learned,
+        replica_frozen_inference=frozen,
+        replica_optimizers=optimizers,
+        replica_generators=tuple(
+            torch.Generator(device=device).manual_seed(812 + lane)
+            for lane in range(2)
+        ),
+        replica_run_states=tuple(
+            RunState(f"br-lane-{lane}", root_count=1)
+            for lane in range(2)
+        ),
+        replica_model_operations=tuple(
+            module.learner_operation for module in modules
+        ),
+    )
+
+    class _Observed:
+        def __init__(self, operation: object) -> None:
+            self.operation = operation
+            self.calls: list[tuple[int, int]] = []
+
+        def __call__(
+            self, active_lanes: torch.Tensor, *arguments: torch.Tensor, **keywords
+        ):
+            self.calls.append((int(active_lanes.numel()), arguments[0].shape[1]))
+            return self.operation(active_lanes, *arguments, **keywords)
+
+    learned_calls = _Observed(learned.operation)
+    frozen_calls = _Observed(frozen.operation)
+    learned.operation = learned_calls  # type: ignore[assignment]
+    frozen.operation = frozen_calls  # type: ignore[assignment]
+    rows = 3
+    model_input = torch.zeros(
+        (2, rows, geometry.direct_model_input_width), device=device
+    )
+    private = torch.zeros(
+        (2, rows, geometry.players), dtype=torch.int32, device=device
+    )
+    owner = torch.tensor(
+        [[0, 1, 0], [1, 0, 1]], dtype=torch.uint8, device=device
+    )
+    role = torch.tensor(
+        [[0, 1, 1], [1, 1, 1]], dtype=torch.uint8, device=device
+    )
+    observed = iteration._model(
+        PokerForwardInput(
+            "pre",
+            model_input.flatten(0, 1),
+            private.flatten(0, 1),
+            owner.flatten(),
+            role.flatten(),
+        ),
+        torch.tensor([0, 1], dtype=torch.int64, device=device),
+    )
+    assert learned_calls.calls == [(2, 2)]
+    assert frozen_calls.calls == [(2, 1)]
+    expected = []
+    for lane in range(2):
+        learned_value = learned_source[lane].rollout_operation(
+            "pre", model_input[lane], private[lane], owner[lane]
+        ).value
+        frozen_value = frozen_source[lane].rollout_operation(
+            "pre", model_input[lane], private[lane], owner[lane]
+        ).value
+        expected.append(
+            torch.where(
+                owner[lane].eq(role[lane])[:, None],
+                learned_value,
+                frozen_value,
+            )
+        )
+    torch.testing.assert_close(
+        observed["value"], torch.stack(expected).flatten(0, 1)
+    )
 
 
 @CUDA
@@ -616,35 +917,34 @@ def test_learner_dtype_contract_is_explicit() -> None:
 
 def test_distributed_and_replica_lane_artifacts_use_the_sole_converter(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sources = (tmp_path / "source-0.pt", tmp_path / "source-1.pt")
-    for source in sources:
-        source.write_bytes(b"approved legacy lane")
-    calls: list[tuple[Path, Path]] = []
-
-    def convert(source: Path, destination: Path) -> dict[str, object]:
-        calls.append((Path(source), Path(destination)))
-        destination.write_bytes(b"queued lane")
-        return {
-            "source_sha256": f"{len(calls):064x}",
-            "result_sha256": f"{len(calls) + 10:064x}",
-        }
-
-    monkeypatch.setattr(
-        "pbg.queued.persistence.convert_legacy_sequential",
-        convert,
-    )
+    legacy_fixture = runpy.run_path(
+        str(Path(__file__).with_name("test_q06_sequential_modes.py"))
+    )["_legacy_checkpoint"]
+    for lane, source in enumerate(sources):
+        legacy = legacy_fixture()
+        legacy["iteration"] = lane
+        torch.save(legacy, source)
     destination = tmp_path / "converted"
     result = convert_legacy_lane_artifacts(
         sources,
         destination,
         execution_kind="replica",
     )
+    distributed = convert_legacy_lane_artifacts(
+        sources,
+        tmp_path / "distributed",
+        execution_kind="distributed",
+    )
     assert result["lane_count"] == 2
     assert result["execution_kind"] == "replica"
-    assert calls == [
-        (sources[0], destination / "lane_000.pt"),
-        (sources[1], destination / "lane_001.pt"),
-    ]
     assert (destination / "manifest.json").is_file()
+    assert distributed["lane_count"] == 2
+    for lane in range(2):
+        converted = torch.load(
+            destination / f"lane_{lane:03d}.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
+        assert converted["run_state"]["iteration"] == lane

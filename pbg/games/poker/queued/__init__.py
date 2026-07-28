@@ -34,6 +34,7 @@ from pbg.games.poker.queued.training import (
     Phase5TrainingSession,
     PokerIterationError,
     PokerIterationResult,
+    ReplicaPokerIterationResult,
     SequentialPokerIteration,
     SequentialSharedResponseProbe,
 )
@@ -65,9 +66,6 @@ from pbg.games.poker.queued.rb_sampling import (
 )
 from pbg.games.poker.queued.replica import (
     PokerReplicaInference,
-    PokerReplicaLaneOperation,
-    ReplicaPokerGroupResult,
-    ReplicaPokerIterationGroup,
 )
 
 __all__ = [
@@ -91,17 +89,15 @@ __all__ = [
     "PokerForwardInput",
     "PokerIterationError",
     "PokerIterationResult",
+    "ReplicaPokerIterationResult",
     "PokerLearnerPolicy",
     "PokerLegality",
     "PokerModelError",
     "PokerPolicyError",
     "PokerPolicyOperator",
     "PokerReplicaInference",
-    "PokerReplicaLaneOperation",
     "PosteriorSamplingError",
     "RejectionObservation",
-    "ReplicaPokerGroupResult",
-    "ReplicaPokerIterationGroup",
     "PairedProbeStatistics",
     "PokerState",
     "PokerStateMachine",
