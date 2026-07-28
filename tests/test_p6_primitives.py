@@ -1,13 +1,39 @@
+import math
+
 import pytest
 import torch
 
 from pbg.games.poker.model.primitives import MHA
 
 
+def _explicit_attention(
+    mha: MHA,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_bias: torch.Tensor,
+    key_mask: torch.Tensor,
+) -> torch.Tensor:
+    temperature = mha.temperature.float()[None, :, None, None]
+    content = torch.matmul(query.float(), key.float().transpose(-2, -1))
+    content = content / (temperature * math.sqrt(mha.d_head))
+    logits = content + key_bias[:, None, None, :]
+    logits = logits.masked_fill(~key_mask[:, None, None, :], -torch.inf)
+    probability = torch.nan_to_num(torch.softmax(logits, dim=-1), nan=0.0)
+    return torch.matmul(probability.to(value.dtype), value)
+
+
 @pytest.mark.parametrize("backend", ("auto", "flex"))
 def test_attention_rejects_implicit_or_unpublished_backends(backend: str) -> None:
     with pytest.raises(ValueError, match="unknown attention backend"):
         MHA(16, 4).configure_execution(backend, query_chunk_size=8)
+
+
+def test_attention_rejects_cpu_before_projection() -> None:
+    mha = MHA(16, 4)
+    query = torch.randn(2, 3, 16)
+    with pytest.raises(ValueError, match="requires CUDA or MPS"):
+        mha(query, query, None, None)
 
 
 def test_key_bias_is_not_tempered() -> None:
@@ -22,10 +48,11 @@ def test_key_bias_is_not_tempered() -> None:
     context = torch.randn(2, 5, 16)
     bias = torch.randn(2, 5, dtype=torch.float32)
     mask = torch.ones(2, 5, dtype=torch.bool)
-    before = mha(query, context, bias, mask)
+    q_head, k_head, v_head = mha._project(query, context)
+    before = _explicit_attention(mha, q_head, k_head, v_head, bias, mask)
     with torch.no_grad():
         mha.theta.mul_(2.0)
-    after = mha(query, context, bias, mask)
+    after = _explicit_attention(mha, q_head, k_head, v_head, bias, mask)
     torch.testing.assert_close(before, after, atol=1e-6, rtol=1e-6)
 
 
@@ -44,7 +71,7 @@ def test_query_chunk_attention_matches_explicit_forward_and_backward() -> None:
     )
     q_a, k_a, v_a = explicit._project(query_a, query_a)
     q_b, k_b, v_b = chunked._project(query_b, query_b)
-    wanted, _ = explicit._explicit_attention(q_a, k_a, v_a, bias, mask)
+    wanted = _explicit_attention(explicit, q_a, k_a, v_a, bias, mask)
     actual = chunked._chunked_attention(q_b, k_b, v_b, bias, mask)
     torch.testing.assert_close(actual, wanted, atol=1e-5, rtol=1e-5)
     wanted.square().sum().backward()
@@ -68,7 +95,7 @@ def test_biased_sdpa_matches_explicit_forward_and_backward() -> None:
     )
     q_a, k_a, v_a = explicit._project(query_a, query_a)
     q_b, k_b, v_b = sdpa._project(query_b, query_b)
-    wanted, _ = explicit._explicit_attention(q_a, k_a, v_a, bias, mask)
+    wanted = _explicit_attention(explicit, q_a, k_a, v_a, bias, mask)
     actual = sdpa._sdpa_biased_attention(q_b, k_b, v_b, bias, mask)
     torch.testing.assert_close(actual, wanted, atol=1e-5, rtol=1e-5)
     wanted.square().sum().backward()

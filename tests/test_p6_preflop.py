@@ -9,6 +9,10 @@ from pbg.games.poker.model.preflop import (
     PreflopNet,
 )
 
+CUDA = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is unavailable"
+)
+
 
 def _config(*, moment: bool = False, players: int = 3) -> PokerModelConfig:
     return PokerModelConfig(
@@ -65,9 +69,29 @@ def _inputs(batch: int = 2, players: int = 3) -> tuple[PokerPublicBatch, torch.T
     return pub, ranges
 
 
+def _cuda_inputs(
+    batch: int = 2, players: int = 3
+) -> tuple[PokerPublicBatch, torch.Tensor]:
+    pub, ranges = _inputs(batch, players)
+    values = {}
+    for name in pub.__dataclass_fields__:
+        value = getattr(pub, name)
+        if isinstance(value, PackedPublicHistory):
+            values[name] = PackedPublicHistory(
+                **{
+                    field: getattr(value, field).cuda()
+                    for field in value.__dataclass_fields__
+                }
+            )
+        else:
+            values[name] = None if value is None else value.cuda()
+    return PokerPublicBatch(**values), ranges.cuda()
+
+
+@CUDA
 def test_preflop_forward_shapes_fp32_and_autocast() -> None:
-    model = PreflopNet(_config(moment=True))
-    pub, ranges = _inputs()
+    model = PreflopNet(_config(moment=True)).cuda()
+    pub, ranges = _cuda_inputs()
     output = model(pub, ranges)
     assert output.raw["type_logits"].shape == (2, 169, 3)
     for name in ("omega", "mu", "s"):
@@ -78,17 +102,21 @@ def test_preflop_forward_shapes_fp32_and_autocast() -> None:
     assert all(tensor.dtype == torch.float32 for tensor in output.raw.values())
     assert output.v.dtype == torch.float32
 
-    with torch.autocast(device_type="cpu", dtype=torch.float16):
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
         mixed = model(pub, ranges)
-    assert all(tensor.dtype == torch.float16 for tensor in mixed.raw.values())
+    for name in ("type_logits", "mu", "iota"):
+        assert mixed.raw[name].dtype == torch.float16
+    for name in ("omega", "s"):
+        assert mixed.raw[name].dtype == torch.float32
     assert mixed.v.dtype == torch.float16
 
 
+@CUDA
 def test_class_order_equivariance() -> None:
     torch.manual_seed(63)
-    model = PreflopNet(_config(players=2)).eval()
-    pub, ranges = _inputs(batch=1, players=2)
-    permutation = torch.randperm(169)
+    model = PreflopNet(_config(players=2)).cuda().eval()
+    pub, ranges = _cuda_inputs(batch=1, players=2)
+    permutation = torch.randperm(169, device="cuda")
     base = model(pub, ranges)
     permuted = model(
         pub,
@@ -102,10 +130,11 @@ def test_class_order_equivariance() -> None:
     torch.testing.assert_close(permuted.v, base.v[:, permutation], atol=1e-5, rtol=1e-5)
 
 
+@CUDA
 def test_masked_empty_seat_cannot_change_output() -> None:
     torch.manual_seed(64)
-    model = PreflopNet(_config()).eval()
-    pub, ranges = _inputs(batch=1)
+    model = PreflopNet(_config()).cuda().eval()
+    pub, ranges = _cuda_inputs(batch=1)
     pub.seat_mask[:, -1] = False
     first = model(pub, ranges)
     changed_ranges = ranges.clone()
@@ -119,11 +148,12 @@ def test_masked_empty_seat_cannot_change_output() -> None:
     torch.testing.assert_close(first.v, second.v, atol=1e-5, rtol=1e-5)
 
 
+@CUDA
 def test_gradient_reaches_every_parameter() -> None:
     torch.manual_seed(65)
-    model = PreflopNet(_config(moment=True))
-    pub, ranges = _inputs(batch=2)
-    pub.status[0] = torch.tensor([0, 1, 2])
+    model = PreflopNet(_config(moment=True)).cuda()
+    pub, ranges = _cuda_inputs(batch=2)
+    pub.status[0] = torch.tensor([0, 1, 2], device="cuda")
     output = model(pub, ranges)
     tensors = list(output.raw.values()) + [output.v, output.t, output.c]
     loss = sum((tensor * torch.randn_like(tensor)).sum() for tensor in tensors if tensor is not None)
@@ -143,14 +173,18 @@ def test_model_config_is_strict() -> None:
         PokerModelConfig.from_dict({"d_modle": 16})
 
 
+@CUDA
 def test_preflop_orbit_geometry_is_exact_and_history_changes_output() -> None:
-    model = PreflopNet(_config()).eval()
-    torch.testing.assert_close(model.class_card_geometry.sum(1), torch.full((169,), 2.0))
+    model = PreflopNet(_config()).cuda().eval()
+    torch.testing.assert_close(
+        model.class_card_geometry.sum(1),
+        torch.full((169,), 2.0, device="cuda"),
+    )
     expected_overlap = model.class_card_geometry @ model.class_card_geometry.T
     torch.testing.assert_close(
         model.class_overlap_scalars[:, 0], expected_overlap.diagonal()
     )
-    pub, ranges = _inputs(batch=1)
+    pub, ranges = _cuda_inputs(batch=1)
     first = model(pub, ranges)
     pub.history.action[0, 0] = 2
     pub.history.amount[0, 0] = 37.5
@@ -158,22 +192,10 @@ def test_preflop_orbit_geometry_is_exact_and_history_changes_output() -> None:
     assert not torch.allclose(first.v, second.v)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@CUDA
 def test_preflop_conformance_paths_run_forward_backward_on_cuda() -> None:
-    pub, ranges = _inputs(batch=1)
-    values = {}
-    for name in pub.__dataclass_fields__:
-        value = getattr(pub, name)
-        if isinstance(value, PackedPublicHistory):
-            values[name] = PackedPublicHistory(
-                **{
-                    field: getattr(value, field).cuda()
-                    for field in value.__dataclass_fields__
-                }
-            )
-        else:
-            values[name] = None if value is None else value.cuda()
+    pub, ranges = _cuda_inputs(batch=1)
     model = PreflopNet(_config()).cuda()
-    output = model(PokerPublicBatch(**values), ranges.cuda())
+    output = model(pub, ranges)
     (output.v.square().mean() + output.raw["type_logits"].square().mean()).backward()
     assert torch.isfinite(output.v).all()

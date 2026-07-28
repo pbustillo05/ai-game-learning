@@ -150,31 +150,6 @@ class MHA(nn.Module):
             dropout_p=0.0,
         )
 
-    def _explicit_attention(
-        self,
-        q_head: Tensor,
-        k_head: Tensor,
-        v_head: Tensor,
-        key_bias: Tensor,
-        key_mask: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        """Return explicit attention output and probabilities.
-
-        Shapes are ``[B,H,Nq,Dh]`` and ``[B,H,Nq,Nk]`` respectively.
-        The logits are accumulated in fp32, including during autocast.
-        """
-
-        temperature = self.temperature.float()[None, :, None, None]
-        content = torch.matmul(q_head.float(), k_head.float().transpose(-2, -1))
-        content = content / (temperature * math.sqrt(self.d_head))
-        logits = content + key_bias[:, None, None, :]
-        logits = logits.masked_fill(~key_mask[:, None, None, :], -torch.inf)
-        probability = torch.softmax(logits, dim=-1)
-        # This also defines a safe zero output for an entirely masked key row.
-        probability = torch.nan_to_num(probability, nan=0.0)
-        output = torch.matmul(probability.to(v_head.dtype), v_head)
-        return output, probability
-
     def configure_execution(self, backend: str, query_chunk_size: int) -> None:
         """Select a mathematically exact bounded-memory execution strategy."""
 
@@ -234,22 +209,11 @@ class MHA(nn.Module):
     ) -> Tensor:
         """Attend from ``q [B,Nq,d]`` to ``kv [B,Nk,d]`` and return ``[B,Nq,d]``."""
 
+        if q.device.type not in ("cuda", "mps"):
+            raise ValueError("attention forward requires CUDA or MPS")
         key_bias, key_mask = self._validate(q, kv, key_bias, key_mask)
         q_head, k_head, v_head = self._project(q, kv)
-        if q.device.type == "mps" and self.attention_backend != "chunked_dense":
-            # MPS must not take the generic explicit path: postflop sequences
-            # make its fp32 [B,H,Nq,Nk] score/probability materialization both
-            # slow and prohibitively large. PyTorch's Metal SDPA accepts the
-            # same additive reach bias and keeps the whole neural forward on
-            # the MPS device.
-            attended = self._sdpa_biased_attention(
-                q_head, k_head, v_head, key_bias, key_mask
-            )
-        elif q.device.type != "cuda":
-            attended, _ = self._explicit_attention(
-                q_head, k_head, v_head, key_bias, key_mask
-            )
-        elif self.attention_backend == "sdpa":
+        if self.attention_backend == "sdpa":
             attended = self._sdpa_biased_attention(
                 q_head, k_head, v_head, key_bias, key_mask
             )

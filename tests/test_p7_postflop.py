@@ -16,6 +16,10 @@ from pbg.games.poker.model.postflop import (
 )
 from pbg.games.poker.model.preflop import PokerModelConfig, PokerPublicBatch
 
+CUDA = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is unavailable"
+)
+
 
 @dataclass(frozen=True)
 class PartitionSummaryBatch:
@@ -48,6 +52,18 @@ def _inputs():
     return pub, ranges, PostflopMasks(compatibility)
 
 
+def _cuda_inputs():
+    pub, ranges, masks = _inputs()
+    pub = type(pub)(
+        **{
+            name: None if getattr(pub, name) is None else getattr(pub, name).cuda()
+            for name in pub.__dataclass_fields__
+        }
+    )
+    masks.compatibility = masks.compatibility.cuda()
+    return pub, ranges.cuda(), masks
+
+
 def _cfg():
     return PokerModelConfig(
         d_model=16, n_heads=4, n_layers_pre=1, n_layers_post=1,
@@ -68,10 +84,11 @@ def test_compact_gather_scatter_is_ragged_and_differentiable():
     assert source.grad.tolist() == [[1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
 
 
+@CUDA
 def test_postflop_forward_scatter_and_autocast():
     torch.manual_seed(70)
-    pub, ranges, masks = _inputs()
-    model = PostflopNet(_cfg()).eval()
+    pub, ranges, masks = _cuda_inputs()
+    model = PostflopNet(_cfg()).cuda().eval()
     output = model(pub, ranges, masks=masks)
     assert output.raw["type_logits"].shape == (2, 1326, 3)
     assert output.raw["omega"].shape == output.raw["mu"].shape == output.raw["s"].shape == (2, 1326, 2)
@@ -79,7 +96,7 @@ def test_postflop_forward_scatter_and_autocast():
     assert output.t is not None and output.t.shape == (2,)
     assert output.c is not None and output.c.shape == (2,)
     assert torch.count_nonzero(output.v[0, 12:]) == 0
-    with torch.autocast(device_type="cpu", dtype=torch.float16):
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
         mixed = model(pub, ranges, masks=masks)
     assert mixed.v.dtype == torch.float16
 
@@ -148,9 +165,10 @@ def test_signed_beta_coordinates_consume_current_evaluator_eigenpairs():
     torch.testing.assert_close(reconstructed, direct, atol=2e-4, rtol=2e-4)
 
 
+@CUDA
 def test_folder_pressure_and_folder_seat_readout_consume_semantic_fields():
     torch.manual_seed(73)
-    pub, ranges, masks = _inputs()
+    pub, ranges, masks = _cuda_inputs()
     pub.status[:, 1] = 1
     pub.to_act.zero_()
     masks.status = pub.status
@@ -159,20 +177,27 @@ def test_folder_pressure_and_folder_seat_readout_consume_semantic_fields():
     masks.live_seat_ids = torch.zeros((pub.street.shape[0], 1), dtype=torch.long)
     masks.compact_size = int(masks.compatibility.sum(1).max())
     batch = ranges.shape[0]
+    device = ranges.device
     cfg = _cfg()
     fields = {
-        "hand_log_ratio": torch.zeros(batch, 1326),
-        "beta_eigenvalue": torch.zeros(batch, cfg.folder_beta_rank),
-        "beta_eigenvector": torch.zeros(batch, 52, cfg.folder_beta_rank),
-        "folder_log_mass": torch.zeros(batch, 1),
-        "folder_card_mass": torch.full((batch, 1, 52), 2.0 / 52.0),
-        "tight_cluster_scalar": torch.zeros(batch),
-        "folder_mask": torch.ones(batch, 1, dtype=torch.bool),
-        "folder_line_meta": torch.randn(batch, 1, 8),
-        "folder_seat": torch.ones(batch, 1, dtype=torch.long),
+        "hand_log_ratio": torch.zeros(batch, 1326, device=device),
+        "beta_eigenvalue": torch.zeros(
+            batch, cfg.folder_beta_rank, device=device
+        ),
+        "beta_eigenvector": torch.zeros(
+            batch, 52, cfg.folder_beta_rank, device=device
+        ),
+        "folder_log_mass": torch.zeros(batch, 1, device=device),
+        "folder_card_mass": torch.full(
+            (batch, 1, 52), 2.0 / 52.0, device=device
+        ),
+        "tight_cluster_scalar": torch.zeros(batch, device=device),
+        "folder_mask": torch.ones(batch, 1, dtype=torch.bool, device=device),
+        "folder_line_meta": torch.randn(batch, 1, 8, device=device),
+        "folder_seat": torch.ones(batch, 1, dtype=torch.long, device=device),
     }
     masks.evaluator_summary = PartitionSummaryBatch(fields, {"contract_version": "2"})
-    model = PostflopNet(cfg).eval()
+    model = PostflopNet(cfg).cuda().eval()
     first = model(pub, ranges, masks=masks)
     changed = {key: value.clone() for key, value in fields.items()}
     changed["folder_card_mass"][..., :4] = 0.0
@@ -182,27 +207,29 @@ def test_folder_pressure_and_folder_seat_readout_consume_semantic_fields():
     assert not torch.allclose(first.v, second.v)
 
 
+@CUDA
 def test_compact_contract_v2_folder_features_feed_postflop_model():
     torch.manual_seed(74)
-    pub, ranges, masks = _inputs()
+    pub, ranges, masks = _cuda_inputs()
     pub.status[:, 1] = 1
     pub.to_act.zero_()
     masks.status = pub.status
     batch = ranges.shape[0]
+    device = ranges.device
     fields = {
-        "hand_log_ratio": torch.randn(batch, 1326) * 0.01,
-        "beta_eigenvalue": torch.randn(batch, 2),
-        "beta_eigenvector": torch.randn(batch, 52, 2),
-        "folder_log_mass": torch.zeros(batch, 1),
-        "folder_card_mass": torch.rand(batch, 1, 52),
-        "tight_cluster_scalar": torch.zeros(batch),
-        "folder_mask": torch.ones(batch, 1, dtype=torch.bool),
-        "folder_line_meta": torch.randn(batch, 1, 8),
-        "folder_seat": torch.ones(batch, 1, dtype=torch.long),
+        "hand_log_ratio": torch.randn(batch, 1326, device=device) * 0.01,
+        "beta_eigenvalue": torch.randn(batch, 2, device=device),
+        "beta_eigenvector": torch.randn(batch, 52, 2, device=device),
+        "folder_log_mass": torch.zeros(batch, 1, device=device),
+        "folder_card_mass": torch.rand(batch, 1, 52, device=device),
+        "tight_cluster_scalar": torch.zeros(batch, device=device),
+        "folder_mask": torch.ones(batch, 1, dtype=torch.bool, device=device),
+        "folder_line_meta": torch.randn(batch, 1, 8, device=device),
+        "folder_seat": torch.ones(batch, 1, dtype=torch.long, device=device),
     }
     masks.evaluator_summary = PartitionSummaryBatch(fields, {"contract_version": "2"})
     cfg = type(_cfg())(**{**_cfg().__dict__, "folder_beta_rank": 2})
-    output = PostflopNet(cfg).eval()(pub, ranges, masks=masks)
+    output = PostflopNet(cfg).cuda().eval()(pub, ranges, masks=masks)
     assert torch.isfinite(output.v).all()
 
 
@@ -230,14 +257,15 @@ def test_current_evaluator_summary_rejects_retired_field_aliases():
         PostflopNet(cfg).eval()(pub, ranges, masks=masks)
 
 
+@CUDA
 def test_folded_seats_do_not_create_postflop_attention_rows():
-    pub, ranges, masks = _inputs()
+    pub, ranges, masks = _cuda_inputs()
     pub.status[:, 1] = 1
     pub.to_act.zero_()
     masks.status = pub.status
     masks.live_seat_ids = torch.zeros((pub.street.shape[0], 1), dtype=torch.long)
     masks.compact_size = int(masks.compatibility.sum(1).max())
-    model = PostflopNet(_cfg()).eval()
+    model = PostflopNet(_cfg()).cuda().eval()
     lengths: list[int] = []
     hook = model.attentions[0].register_forward_pre_hook(
         lambda module, args: lengths.append(args[0].shape[1])
@@ -247,24 +275,19 @@ def test_folded_seats_do_not_create_postflop_attention_rows():
     finally:
         hook.remove()
     players = pub.stacks.shape[1]
-    seats = torch.arange(players)[None].expand(pub.street.shape[0], -1)
+    seats = torch.arange(players, device=ranges.device)[None].expand(
+        pub.street.shape[0], -1
+    )
     relative = torch.remainder(seats - pub.button[:, None], players)
     public, _ = model._public_tokens(pub, None, ranges.dtype, relative)
     expected = masks.compatibility.sum(1).max().item() + public.shape[1] + model.cfg.k_act
     assert lengths == [expected]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@CUDA
 def test_postflop_conformance_paths_run_forward_backward_on_cuda():
-    pub, ranges, masks = _inputs()
-    pub = type(pub)(
-        **{
-            name: None if getattr(pub, name) is None else getattr(pub, name).cuda()
-            for name in pub.__dataclass_fields__
-        }
-    )
-    masks.compatibility = masks.compatibility.cuda()
+    pub, ranges, masks = _cuda_inputs()
     model = PostflopNet(_cfg()).cuda()
-    output = model(pub, ranges.cuda(), masks=masks)
+    output = model(pub, ranges, masks=masks)
     (output.v.square().mean() + output.raw["type_logits"].square().mean()).backward()
     assert torch.isfinite(output.v).all()
