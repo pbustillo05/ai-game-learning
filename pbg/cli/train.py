@@ -12,14 +12,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train a PBG model")
     parser.add_argument("--config", required=True, help="scientific YAML configuration")
     parser.add_argument(
-        "--hardware-profile",
-        default="local_3x2080ti",
-        help=(
-            "profile name under configs/hardware or an explicit YAML path "
-            "(default: local_3x2080ti; Quest must be selected explicitly)"
-        ),
-    )
-    parser.add_argument(
         "--resume",
         default=None,
         help="checkpoint in training.out_dir from which to resume safely",
@@ -34,7 +26,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     train(
-        load_config(args.config, hardware_profile=args.hardware_profile),
+        load_config(args.config),
         resume_from=args.resume,
         init_checkpoint=args.init_checkpoint,
     )

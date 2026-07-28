@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import yaml
 
-from pbg.config import ConfigError, load_config
+from tests.legacy_config import ConfigError, load_config
 from pbg.core.br import SHARED_RESPONSE_SEMANTICS
 from pbg.core.checkpointing import save_checkpoint, scientific_config
 from pbg.core.game import PRETERM, PROBE_FOLD, EventBatch

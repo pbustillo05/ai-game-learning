@@ -18,7 +18,7 @@ from pbg.core.branching import (
     _index_policy_output,
     sample_branched_tree,
 )
-from pbg.config import ConfigError, load_config
+from tests.legacy_config import ConfigError, load_config
 from pbg.core.game import EventBatch, GameBundle, TERMINAL
 from pbg.core.partition import ByteWorkContract, PartitionSet, PartitionSpec
 from pbg.core.rollout import _selected_policy_logp

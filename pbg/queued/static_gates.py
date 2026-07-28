@@ -121,7 +121,10 @@ def dual_engine_roots(
             for module in reached
         )
         queued_reached = any(
-            module == "pbg.queued" or module.startswith("pbg.queued.")
+            module == "pbg.queued"
+            or module.startswith("pbg.queued.")
+            or module == "pbg.games.poker.queued"
+            or module.startswith("pbg.games.poker.queued.")
             for module in reached
         )
         if old_reached and queued_reached:

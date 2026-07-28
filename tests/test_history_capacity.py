@@ -7,7 +7,7 @@ import pytest
 import torch
 import yaml
 
-from pbg.config import ConfigError, load_config
+from tests.legacy_config import ConfigError, load_config
 from pbg.core.game import CHANCE, PRETERM, TERMINAL, EventBatch
 from pbg.games.poker.bundle import build_bundle
 from pbg.games.poker.rules import CHECK_CALL, LIVE, RAISE_OFFSET, PokerConfig

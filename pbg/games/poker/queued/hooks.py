@@ -259,12 +259,12 @@ class PokerState:
         for name, (value, dtype, shape) in contracts.items():
             if (
                 value.device != self.device
-                or value.device.type != "cuda"
+                or value.device.type not in ("cuda", "mps")
                 or value.dtype != dtype
                 or value.shape != shape
             ):
                 raise QueuedPokerError(
-                    f"{name} must be CUDA {dtype} with shape {shape}"
+                    f"{name} must be accelerator {dtype} with shape {shape}"
                 )
         accelerator_assert(
             ((self.button >= 0) & (self.button < players)).all(),
@@ -329,8 +329,8 @@ class PokerStateMachine:
         device: torch.device | str,
     ) -> PokerState:
         device = torch.device(device)
-        if device.type != "cuda":
-            raise ValueError("queued poker roots require CUDA")
+        if device.type not in ("cuda", "mps"):
+            raise ValueError("queued poker roots require CUDA or MPS")
         if root_count <= 0:
             raise ValueError("root_count must be positive")
         roots = torch.arange(root_count, dtype=torch.int64, device=device) + int(
@@ -677,7 +677,7 @@ class PokerStateMachine:
 
         players = self.geometry.players
         if (
-            model_input.device.type != "cuda"
+            model_input.device.type not in ("cuda", "mps")
             or model_input.dtype not in (torch.float32, torch.float16, torch.bfloat16)
             or model_input.ndim != 2
             or model_input.shape[1] != self.geometry.direct_model_input_width

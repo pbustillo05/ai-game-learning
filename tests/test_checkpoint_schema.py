@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from pbg.config import load_config
+from tests.legacy_config import load_config
 from pbg.core.checkpointing import (
     CHECKPOINT_SCHEMA_VERSION,
     inspect_checkpoint,

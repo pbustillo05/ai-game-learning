@@ -1,109 +1,48 @@
 from __future__ import annotations
 
 import copy
-import pytest
 
-from pbg.benchmark import _mode_config, compare_benchmark
+from pbg.benchmark import compare_benchmark
 from pbg.config import load_config
 
 
-def _result(speed: float, seconds: float, target_bytes: float) -> dict:
+def _result(rate: float) -> dict:
+    cfg = load_config("configs/train/nlhe_hu_8bb_normal_queued_smoke.yaml")
     return {
-        "schema": "pbg-performance-v1",
-        "environment": {
-            "device_type": "cuda",
-            "device_name": "test-gpu",
-            "compute_capability": None,
-            "torch_threads": 1,
-        },
-        "workload": {
-            "game": "poker",
-            "roots_per_gpu": 64,
-            "storage_page_rows": 128,
-            "completion_samples": 32,
-            "execution_device": "cuda:0",
-            "minibatch_size": 32,
-            "gd_steps_per_iter": 1,
-            "logical_rng": "counter_hash_v2",
-            "training_seed": 7,
-            "model_initialization_protocol": "torch_seed_before_bundle_v1",
-            "model_initialization_seed": 7,
-            "repeat_seeds": [104_736, 209_465],
-            "profile_iteration": 1,
-            "family_batch_rows": None,
-            "max_active_trajectories": None,
-            "storage_page_rows": None,
-        },
-        "modes": [
-            {
-                "mode": "normal",
-                "metrics": {
-                    "decisions_per_second": speed,
-                    "profiled_iteration_seconds": seconds,
-                    "target_bytes_per_decision": target_bytes,
-                },
-            }
-        ],
+        "schema": "pbg-queued-benchmark-v1",
+        "mode": dict(cfg.mode),
+        "scientific_config": cfg.scientific_mapping(),
+        "execution": cfg.execution.mapping(),
+        "environment": {"device": "cuda:0", "device_name": "test-gpu"},
+        "median": {"player_nodes_per_second": rate},
     }
 
 
-def test_performance_gate_accepts_tolerance_and_reports_regressions() -> None:
-    baseline = _result(100.0, 1.0, 50.0)
-    assert compare_benchmark(_result(81.0, 1.19, 59.0), baseline) == []
-    failures = compare_benchmark(_result(79.0, 1.21, 61.0), baseline)
-    assert {failure.split(":", 1)[0] for failure in failures} == {
-        "normal.decisions_per_second",
-        "normal.profiled_iteration_seconds",
-        "normal.target_bytes_per_decision",
-    }
+def test_performance_gate_accepts_tolerance_and_reports_regression() -> None:
+    baseline = _result(100.0)
+    assert compare_benchmark(_result(90.0), baseline) == []
+    assert compare_benchmark(_result(89.0), baseline) == [
+        "player-node throughput regressed"
+    ]
 
 
-def test_performance_gate_rejects_cross_environment_comparisons() -> None:
-    baseline = _result(100.0, 1.0, 50.0)
+def test_performance_gate_rejects_identity_and_environment_mismatch() -> None:
+    baseline = _result(100.0)
     current = copy.deepcopy(baseline)
-    current["environment"]["torch_threads"] = 8
-    with pytest.raises(ValueError, match="environment"):
-        compare_benchmark(current, baseline)
-
-
-def test_performance_gate_rejects_execution_device_mismatch() -> None:
-    baseline = _result(100.0, 1.0, 50.0)
+    current["environment"]["device"] = "cuda:1"
+    assert "environment identity differs" in compare_benchmark(current, baseline)
+    assert compare_benchmark(
+        current, baseline, allow_environment_mismatch=True
+    ) == []
     current = copy.deepcopy(baseline)
-    current["workload"]["execution_device"] = "cuda:1"
-    with pytest.raises(ValueError, match="workload"):
-        compare_benchmark(current, baseline)
-
-
-def test_performance_gate_rejects_logical_rng_version_mismatch() -> None:
-    baseline = _result(100.0, 1.0, 50.0)
-    current = copy.deepcopy(baseline)
-    baseline["workload"]["logical_rng"] = "counter_hash_v1"
-    current["workload"]["logical_rng"] = "counter_hash_v2"
-    with pytest.raises(ValueError, match="workload"):
-        compare_benchmark(current, baseline)
-
-
-def test_benchmark_mode_conversion_closes_branching_controls() -> None:
-    branched = load_config("configs/train/nlhe_6max_10bb_branched.yaml")
-    sequential = _mode_config(branched, "rao_blackwell")
-    assert sequential.rollout.branching_mode is None
-    assert sequential.rollout.beta is None
-    assert sequential.rollout.branching_min_nodes is None
-    assert sequential.rollout.safe_tree_size is None
-    assert sequential.rollout.queue_capacity_rows is None
-    assert sequential.model["use_branching_heads"] is False
-    assert sequential.loss.c_t == 0.0
-    assert sequential.loss.c_c == 0.0
-
-
-def test_benchmark_requires_explicit_queue_capacity_for_synthetic_branching() -> None:
-    sequential = load_config("configs/train/nlhe_hu_32bb_rb.yaml")
-    with pytest.raises(ValueError, match="branching_queue_capacity_rows"):
-        _mode_config(sequential, "branched_rao_blackwell")
-    branched = _mode_config(
-        sequential,
-        "branched_rao_blackwell",
-        branching_queue_capacity_rows=512,
+    current["scientific_config"]["seed"] += 1
+    assert "scientific_config identity differs" in compare_benchmark(
+        current, baseline
     )
-    assert branched.rollout.branching_mode == "fixed"
-    assert branched.rollout.queue_capacity_rows == 512
+
+
+def test_benchmark_never_converts_modes_or_capacity_manifests() -> None:
+    config = load_config("configs/train/nlhe_hu_8bb_normal_queued_smoke.yaml")
+    result = _result(100.0)
+    assert result["mode"] == dict(config.mode)
+    assert result["execution"]["manifest"] == config.execution.mapping()["manifest"]

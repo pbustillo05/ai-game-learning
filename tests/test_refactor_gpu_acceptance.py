@@ -9,7 +9,7 @@ import socket
 import pytest
 import torch
 
-from pbg.config import load_config
+from tests.legacy_config import load_config
 from pbg.core.config import AdaptiveKKTConfig
 from pbg.core.memory_control import (
     BranchedMemoryRejection,

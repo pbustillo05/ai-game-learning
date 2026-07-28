@@ -10,7 +10,6 @@ import time
 
 import torch
 
-from pbg.core.game import CHANCE
 from pbg.inference import PokerInferenceSession
 
 
@@ -25,15 +24,13 @@ def _prepare_hands(
     if street == "preflop":
         return hands, private
     for hand in hands:
-        while session._owner(session._state(hand)) != CHANCE:
-            ref = torch.tensor(
-                [session._state(hand).ref], dtype=torch.int64, device=session.device
-            )
-            actor = session.backend.states.actor[ref].long()
+        while not bool(session.machine.needs_chance(session._hand(hand).state)[0]):
+            state = session._hand(hand).state
+            actor = state.to_act.long()
             to_call = float((
-                session.backend.states.current_bet[ref]
-                - session.backend.states.committed_street[ref, actor]
-            ).clamp_min(0).to("cpu")[0])
+                state.current_bet
+                - state.committed_street.gather(1, actor[:, None]).squeeze(1)
+            ).clamp_min(0).cpu()[0])
             session.advance(hand, "call" if to_call > 0 else "check")
         session.deal(hand, active[:3])
     return hands, private
@@ -45,9 +42,9 @@ def main() -> None:
     )
     parser.add_argument("checkpoint")
     parser.add_argument("--device", required=True, choices=("cuda", "mps"))
-    parser.add_argument("--precision", default="auto", choices=("auto", "fp32", "fp16"))
+    parser.add_argument("--precision", default="fp32", choices=("fp32", "fp16"))
     parser.add_argument(
-        "--mode", default="auto", choices=("auto", "latency", "throughput")
+        "--mode", default="latency", choices=("latency", "throughput")
     )
     parser.add_argument("--street", default="preflop", choices=("preflop", "flop"))
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 2, 8, 32])

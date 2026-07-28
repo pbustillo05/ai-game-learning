@@ -23,7 +23,7 @@ from pbg.core.adaptive_branching import (
 from pbg.core.branching import sample_branched_tree
 from pbg.core.game import GameBundle, TERMINAL
 from pbg.core.learner import mode_loss
-from pbg.config import load_config, load_config_mapping, ConfigError
+from tests.legacy_config import load_config, load_config_mapping, ConfigError
 from pbg.core.checkpointing import load_checkpoint, save_checkpoint
 from tests.categorical_policy_fixture import CategoricalPolicyAdapter
 from tests.test_c09_labeled_branching import _Adapter, _LabeledBackend

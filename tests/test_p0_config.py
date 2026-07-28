@@ -7,7 +7,7 @@ import pytest
 import torch
 import yaml
 
-from pbg.config import ConfigError, load_config
+from tests.legacy_config import ConfigError, load_config
 from pbg.core.config import seed_all
 from pbg.core.training import _configure_reproducibility
 

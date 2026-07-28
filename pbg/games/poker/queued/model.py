@@ -587,12 +587,9 @@ def build_model_from_config(
         raise ValueError("scientific.model.folder_beta_rank exceeds the compact deck")
 
     target = torch.device(device)
-    if target.type != "cuda":
-        raise ValueError(
-            "Phase 5 queued poker model construction requires CUDA; "
-            "a supported MPS inference composition lands at cutover"
-        )
-    if target.index is None:
+    if target.type not in ("cuda", "mps"):
+        raise ValueError("queued poker model construction requires CUDA or MPS")
+    if target.type == "cuda" and target.index is None:
         target = torch.device("cuda", torch.cuda.current_device())
     deck = DeckGeometry(geometry.rank_count)
     result = QueuedPokerModel(

@@ -13,7 +13,7 @@ import torch
 import yaml
 from torch import nn
 
-from pbg.config import ConfigError, load_config, load_config_mapping
+from tests.legacy_config import ConfigError, load_config, load_config_mapping
 from pbg.core.adaptive_branching import (
     AdaptiveKKTController,
     branched_attempt_address,

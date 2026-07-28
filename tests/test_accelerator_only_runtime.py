@@ -1,21 +1,20 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
 
-from pbg.core.devices import resolve_execution_device, validate_workload_capabilities
-from pbg.benchmark import benchmark_modes
 from pbg.config import load_config
-from pbg.eval.br_probe import evaluate_br_probe
-from pbg.games.poker.bundle import build_bundle, build_model_from_config
+from pbg.devices import resolve_execution_device, validate_workload_capabilities
 from pbg.inference import PokerInferenceSession
-from pbg.runtime import train
+from pbg.runtime import TrainingSession
 
 
 ROOT = Path(__file__).parents[1]
+CONFIG = ROOT / "configs/train/nlhe_hu_8bb_normal_queued_smoke.yaml"
 
 
 @pytest.mark.parametrize("value", ["cpu", "auto", torch.device("cpu")])
@@ -40,36 +39,32 @@ def test_inference_requires_an_explicit_device() -> None:
         PokerInferenceSession.from_checkpoint("unused.pt")
 
 
-def test_every_public_python_workflow_rejects_cpu_before_construction(tmp_path) -> None:
-    cfg = load_config(ROOT / "configs" / "train" / "nlhe6.yaml")
-    scientific = {"game": cfg.game.__dict__, "model": cfg.model}
-    with pytest.raises(ValueError, match="production execution device"):
-        build_bundle(cfg, torch.device("cpu"))
-    with pytest.raises(ValueError, match="production execution device"):
-        build_model_from_config(scientific, torch.device("cpu"))
-    with pytest.raises(ValueError, match="production execution device"):
-        benchmark_modes(cfg, ("normal",), warmup=0, repeats=1, device="cpu")
-    cfg.device = "cpu"
-    with pytest.raises(ValueError, match="production execution device"):
-        train(cfg)
-    with pytest.raises(ValueError, match="production execution device"):
-        PokerInferenceSession({}, device="cpu")
-    with pytest.raises(ValueError, match="production execution device"):
-        evaluate_br_probe(tmp_path / "absent.pt", n_hands=4, device="cpu")
+def test_public_training_rejects_cpu_before_construction() -> None:
+    config = load_config(CONFIG)
+    with pytest.raises(ValueError, match="training requires CUDA"):
+        replace(config.execution, device="cpu")
 
 
-def test_production_sources_cannot_reach_deleted_legacy_types() -> None:
-    banned = {"NLHEEngine", "PokerGame", "RangeState"}
-    for path in (ROOT / "pbg").rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-        assert not names & banned, f"{path} reaches {sorted(names & banned)}"
+def test_public_roots_do_not_import_old_core() -> None:
     for relative in (
-        "pbg/games/poker/engine.py",
-        "pbg/games/poker/ranges.py",
-        "pbg/eval/arena.py",
+        "pbg/config.py",
+        "pbg/runtime.py",
+        "pbg/benchmark.py",
+        "pbg/inference.py",
+        "pbg/inference_artifact.py",
+        "pbg/eval/br_probe.py",
     ):
-        assert not (ROOT / relative).exists()
+        path = ROOT / relative
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        imports = {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module is not None
+        }
+        assert not any(
+            value == "pbg.core" or value.startswith("pbg.core.")
+            for value in imports
+        ), relative
 
 
 def test_public_clis_do_not_advertise_cpu_or_auto_devices() -> None:
@@ -87,6 +82,7 @@ def test_public_clis_do_not_advertise_cpu_or_auto_devices() -> None:
                     advertised = {
                         item.value
                         for item in ast.walk(keyword.value)
-                        if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                        if isinstance(item, ast.Constant)
+                        and isinstance(item.value, str)
                     }
                     assert not advertised & {"cpu", "auto"}, (path, advertised)
