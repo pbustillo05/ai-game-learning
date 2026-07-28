@@ -3642,6 +3642,24 @@ class BranchedSampledPokerIteration:
         if "rank_boundary" in arguments:
             raise ValueError("rank agreement is owned by the iteration")
         self.arguments = MappingProxyType(dict(arguments))
+        required = {"mode", "model", "model_operation", "optimizer"}
+        if not required.issubset(self.arguments):
+            raise ValueError(
+                "branched iteration arguments omit replica ownership fields"
+            )
+        self.mode = self.arguments["mode"]
+        self.model = self.arguments["model"]
+        self.model_operation = self.arguments["model_operation"]
+        self.rollout_operation = self.arguments.get(
+            "rollout_operation", self.model_operation
+        )
+        self.optimizer = self.arguments["optimizer"]
+        if (
+            not isinstance(self.mode, ModeSchema)
+            or not isinstance(self.model, nn.Module)
+            or not isinstance(self.optimizer, DenseAdam)
+        ):
+            raise TypeError("branched iteration ownership fields are invalid")
         self.rank_agreement = (
             RankCommonFailureAgreement.from_runtime()
             if rank_agreement is None

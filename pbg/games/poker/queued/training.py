@@ -971,6 +971,7 @@ class RecoveringSequentialSampledPokerIteration:
         mode: ModeSchema,
         model: nn.Module,
         model_operation: ModelOperation,
+        rollout_operation: ModelOperation | None = None,
         optimizer: DenseAdam,
         loss: LossConfig,
         schedule: LearnerSchedule,
@@ -993,6 +994,11 @@ class RecoveringSequentialSampledPokerIteration:
             "mode": mode,
             "model": model,
             "model_operation": model_operation,
+            "rollout_operation": (
+                model_operation
+                if rollout_operation is None
+                else rollout_operation
+            ),
             "optimizer": optimizer,
             "loss": loss,
             "schedule": schedule,
@@ -1007,6 +1013,11 @@ class RecoveringSequentialSampledPokerIteration:
             "run_state": run_state,
             "reference_operation": reference_operation,
         }
+        self.mode = mode
+        self.model = model
+        self.model_operation = model_operation
+        self.rollout_operation = self.arguments["rollout_operation"]
+        self.optimizer = optimizer
         self.run_state = run_state
 
     def run(self, *, iteration: int) -> PokerIterationResult:
