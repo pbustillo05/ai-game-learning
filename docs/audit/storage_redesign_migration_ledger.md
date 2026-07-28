@@ -229,3 +229,18 @@ conversion mask dead at completion's last consumer. The final independent
 read-only audit found no remaining critical or high-severity issue. See
 `queued_phase6_report_20260727.md` and
 `../queued/sequential_modes.md`.
+
+Phase 7 candidate `0d035afc6c300c382d22f336f7ea3be52b138e70`
+passed 32 focused CUDA tests, 21 selected adversarial tests, 184 cumulative
+Phase 1–7 tests, bounded reference-cache probes, explicit alias-lifetime
+probes, targeted static/import checks, and exact-SHA GPU hygiene on explicitly
+selected GPU 0. Evidence covers all four sampled fixed/KKT modes, one shared
+controller and learned/frozen selector, keyed rounding, protected refill,
+inactive chance identity, shared tree profiles, duplicate labels, multiplayer
+folded summaries, additive deep CUDA log mass, deterministic linear alias
+sampling, ragged exact gathers, cost-aware allocation, bounded cache
+construction, exact controller/root compatibility, and whole-attempt
+rank-common recovery. The final independent read-only audit found no
+remaining critical/high or ownership/memory blocker and no parallel queued or
+legacy-core path. See `queued_phase7_report_20260727.md` and
+`../queued/branched_execution.md`.
