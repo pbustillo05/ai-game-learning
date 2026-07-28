@@ -136,17 +136,22 @@ def _play_one(
     decision_index = 0
     while not target.is_terminal(target_hand):
         if target.needs_chance(target_hand):
+            # Public cards belong to the trajectory/street deal, not to the
+            # number of policy decisions taken before reaching that street.
+            # Keeping this address fixed makes mixed and baseline replays use
+            # the same runout even when their action paths have different
+            # lengths.
             target.deal_keyed(
                 target_hand,
                 seed=seed,
                 trajectory_id=trajectory_id,
-                decision_index=decision_index,
+                decision_index=0,
             )
             probe.deal_keyed(
                 probe_hand,
                 seed=seed,
                 trajectory_id=trajectory_id,
-                decision_index=decision_index,
+                decision_index=0,
             )
             continue
         actor = target.actor(target_hand)

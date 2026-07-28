@@ -16,7 +16,7 @@ from pbg.inference_artifact import (
     export_inference_artifact,
     load_inference_source,
 )
-from pbg.eval.br_probe import evaluate_br_probe
+from pbg.eval.br_probe import _play_one, evaluate_br_probe
 from pbg.queued.persistence import (
     CHECKPOINT_SCHEMA,
     load_distributed_checkpoint_manifest,
@@ -343,3 +343,81 @@ def test_end_to_end_br_and_variance_consumers(tmp_path: Path) -> None:
     variance = estimate_update_variance(target_config, repeats=2)
     assert variance["schema"] == "pbg-queued-update-variance-v1"
     assert variance["lanes"][0]["total_update_variance"] >= 0
+
+
+def test_paired_br_chance_address_is_independent_of_action_path() -> None:
+    class Action:
+        event_id = 0
+
+    class Geometry:
+        players = 2
+
+    class Session:
+        geometry = Geometry()
+
+        def __init__(self) -> None:
+            self.deal_addresses: list[int] = []
+
+        def new_hand(self, _button: int) -> dict[str, int]:
+            return {"phase": 0}
+
+        def private_cards(
+            self, _hand: object, seat: int
+        ) -> tuple[int, int]:
+            return (seat, seat + 2)
+
+        def is_terminal(self, hand: dict[str, int]) -> bool:
+            return hand["phase"] == 2
+
+        def needs_chance(self, hand: dict[str, int]) -> bool:
+            return hand["phase"] == 1
+
+        def actor(self, _hand: object) -> int:
+            return 0
+
+        def policy_table(
+            self, _hand: object
+        ) -> tuple[tuple[Action], torch.Tensor]:
+            return (Action(),), torch.ones((4, 1))
+
+        def private_hand_id(self, _hand: object, _actor: int) -> int:
+            return 0
+
+        def advance(
+            self,
+            hand: dict[str, int],
+            _action: object,
+            *,
+            policy_probabilities: torch.Tensor,
+        ) -> None:
+            assert policy_probabilities.shape == (4, 1)
+            hand["phase"] = 1
+
+        def deal_keyed(
+            self,
+            hand: dict[str, int],
+            *,
+            seed: int,
+            trajectory_id: int,
+            decision_index: int,
+        ) -> None:
+            assert seed == 17
+            assert trajectory_id == 5
+            self.deal_addresses.append(decision_index)
+            hand["phase"] = 2
+
+        def terminal_payoffs(self, _hand: object) -> torch.Tensor:
+            return torch.zeros(2)
+
+    probe = Session()
+    target = Session()
+    assert _play_one(
+        probe,  # type: ignore[arg-type]
+        target,  # type: ignore[arg-type]
+        trajectory_id=5,
+        probe_seat=0,
+        seed=17,
+        mixed=True,
+    ) == 0.0
+    assert target.deal_addresses == [0]
+    assert probe.deal_addresses == [0]
