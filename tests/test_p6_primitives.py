@@ -5,6 +5,10 @@ import torch
 
 from pbg.games.poker.model.primitives import MHA
 
+CUDA = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is unavailable"
+)
+
 
 def _explicit_attention(
     mha: MHA,
@@ -36,18 +40,20 @@ def test_attention_rejects_cpu_before_projection() -> None:
         mha(query, query, None, None)
 
 
+@CUDA
 def test_key_bias_is_not_tempered() -> None:
     torch.manual_seed(61)
-    mha = MHA(16, 4)
+    device = torch.device("cuda", torch.cuda.current_device())
+    mha = MHA(16, 4).to(device)
     with torch.no_grad():
         mha.w_q.weight.zero_()
         mha.w_q.bias.zero_()
         mha.w_k.weight.zero_()
         mha.w_k.bias.zero_()
-    query = torch.randn(2, 3, 16)
-    context = torch.randn(2, 5, 16)
-    bias = torch.randn(2, 5, dtype=torch.float32)
-    mask = torch.ones(2, 5, dtype=torch.bool)
+    query = torch.randn(2, 3, 16, device=device)
+    context = torch.randn(2, 5, 16, device=device)
+    bias = torch.randn(2, 5, dtype=torch.float32, device=device)
+    mask = torch.ones(2, 5, dtype=torch.bool, device=device)
     q_head, k_head, v_head = mha._project(query, context)
     before = _explicit_attention(mha, q_head, k_head, v_head, bias, mask)
     with torch.no_grad():
@@ -56,18 +62,21 @@ def test_key_bias_is_not_tempered() -> None:
     torch.testing.assert_close(before, after, atol=1e-6, rtol=1e-6)
 
 
+@CUDA
 def test_query_chunk_attention_matches_explicit_forward_and_backward() -> None:
     torch.manual_seed(62)
-    explicit = MHA(24, 4)
-    chunked = MHA(24, 4)
+    device = torch.device("cuda", torch.cuda.current_device())
+    explicit = MHA(24, 4).to(device)
+    chunked = MHA(24, 4).to(device)
     chunked.load_state_dict(explicit.state_dict())
     chunked.configure_execution("chunked_dense", query_chunk_size=2)
     assert chunked.state_dict().keys() == explicit.state_dict().keys()
-    query_a = torch.randn(2, 5, 24, requires_grad=True)
+    query_a = torch.randn(2, 5, 24, device=device, requires_grad=True)
     query_b = query_a.detach().clone().requires_grad_()
-    bias = torch.randn(2, 5, dtype=torch.float32)
+    bias = torch.randn(2, 5, dtype=torch.float32, device=device)
     mask = torch.tensor(
-        [[True, True, False, True, True], [True, False, True, True, True]]
+        [[True, True, False, True, True], [True, False, True, True, True]],
+        device=device,
     )
     q_a, k_a, v_a = explicit._project(query_a, query_a)
     q_b, k_b, v_b = chunked._project(query_b, query_b)
@@ -82,16 +91,19 @@ def test_query_chunk_attention_matches_explicit_forward_and_backward() -> None:
             torch.testing.assert_close(right.grad, left.grad, atol=1e-5, rtol=1e-5)
 
 
+@CUDA
 def test_biased_sdpa_matches_explicit_forward_and_backward() -> None:
     torch.manual_seed(63)
-    explicit = MHA(24, 4)
-    sdpa = MHA(24, 4)
+    device = torch.device("cuda", torch.cuda.current_device())
+    explicit = MHA(24, 4).to(device)
+    sdpa = MHA(24, 4).to(device)
     sdpa.load_state_dict(explicit.state_dict())
-    query_a = torch.randn(2, 5, 24, requires_grad=True)
+    query_a = torch.randn(2, 5, 24, device=device, requires_grad=True)
     query_b = query_a.detach().clone().requires_grad_()
-    bias = torch.randn(2, 5, dtype=torch.float32)
+    bias = torch.randn(2, 5, dtype=torch.float32, device=device)
     mask = torch.tensor(
-        [[True, True, False, True, True], [True, False, True, True, True]]
+        [[True, True, False, True, True], [True, False, True, True, True]],
+        device=device,
     )
     q_a, k_a, v_a = explicit._project(query_a, query_a)
     q_b, k_b, v_b = sdpa._project(query_b, query_b)
