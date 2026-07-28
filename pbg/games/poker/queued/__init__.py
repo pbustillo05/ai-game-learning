@@ -63,6 +63,7 @@ from pbg.games.poker.queued.rb_sampling import (
     PosteriorSamplingError,
     RejectionObservation,
 )
+from pbg.games.poker.queued.replica import PokerReplicaInference
 
 __all__ = [
     "ActorSample",
@@ -90,6 +91,7 @@ __all__ = [
     "PokerModelError",
     "PokerPolicyError",
     "PokerPolicyOperator",
+    "PokerReplicaInference",
     "PosteriorSamplingError",
     "RejectionObservation",
     "PairedProbeStatistics",

@@ -494,6 +494,25 @@ class QueuedPokerModel(nn.Module):
     ) -> ModelEvaluation:
         return self.forward_natural_partition(input_type, model_input)
 
+    def forward(
+        self,
+        input_type: str,
+        model_input: Tensor,
+        _private_state: Tensor,
+        _owner: Tensor,
+        *,
+        natural_domain: bool = False,
+    ) -> ModelEvaluation:
+        """Functional-call entry shared by replica rollout/reference inference."""
+
+        if type(natural_domain) is not bool:
+            raise TypeError("natural_domain must be bool")
+        return (
+            self.forward_natural_partition(input_type, model_input)
+            if natural_domain
+            else self.forward_sequential_partition(input_type, model_input)
+        )
+
 
 def build_model_from_config(
     scientific: Mapping[str, object],

@@ -23,6 +23,7 @@ from pbg.queued.learner import ReferenceState
 from pbg.queued.optimization import DenseAdam, LossScaler
 
 CHECKPOINT_SCHEMA = "pbg-queued-checkpoint-v2"
+REPLICA_CHECKPOINT_SCHEMA = "pbg-queued-replica-checkpoint-v1"
 QUEUED_CHECKPOINT_V1 = "pbg-queued-checkpoint-v1"
 CONVERSION_SCHEMA = "pbg-queued-conversion-v1"
 LEGACY_SCHEMA = "pbg-checkpoint-v8"
@@ -279,6 +280,181 @@ def load_checkpoint(
     return scaler, reference, run, state["execution_config"]
 
 
+def save_replica_checkpoint(
+    path: str | os.PathLike[str],
+    *,
+    modules: object,
+    optimizers: object,
+    run_states: Sequence[RunState],
+    scientific_configs: Sequence[Mapping[str, object]],
+    execution_config: Mapping[str, object],
+    generators: Sequence[torch.Generator],
+    reference_modules: object | None = None,
+) -> str:
+    """Atomically preserve every independent lane at one optimizer boundary."""
+
+    from pbg.queued.replica import ReplicaModuleOwner, ReplicaOptimizerGroup
+
+    if not isinstance(modules, ReplicaModuleOwner) or not isinstance(
+        optimizers, ReplicaOptimizerGroup
+    ):
+        raise TypeError("replica checkpoint requires queued replica owners")
+    count = modules.n_replica
+    if (
+        optimizers.modules is not modules
+        or len(run_states) != count
+        or len(scientific_configs) != count
+        or len(generators) != count
+        or (
+            reference_modules is not None
+            and (
+                not isinstance(reference_modules, ReplicaModuleOwner)
+                or reference_modules.n_replica != count
+            )
+        )
+    ):
+        raise ValueError("replica checkpoint lane owners are not aligned")
+    if any(
+        generator.device.type != modules.device.type
+        or (
+            generator.device.index is not None
+            and modules.device.index is not None
+            and generator.device.index != modules.device.index
+        )
+        for generator in generators
+    ):
+        raise ValueError("replica checkpoint RNG must be lane-local on one device")
+    state = {
+        "checkpoint_schema": REPLICA_CHECKPOINT_SCHEMA,
+        "n_replica": count,
+        "scientific_config": tuple(dict(value) for value in scientific_configs),
+        "scientific_sha256": tuple(
+            _canonical_hash(value) for value in scientific_configs
+        ),
+        "execution_config": dict(execution_config),
+        "model": _clone_cpu(modules.state_dict()),
+        "optimizer": _clone_cpu(optimizers.state_dict()),
+        "reference_model": (
+            None
+            if reference_modules is None
+            else _clone_cpu(reference_modules.state_dict())
+        ),
+        "run_state": tuple(value.state_dict() for value in run_states),
+        "explicit_rng": tuple(generator.get_state().cpu() for generator in generators),
+        "ambient_cpu_rng": torch.get_rng_state(),
+        "ambient_cuda_rng": tuple(
+            value.cpu() for value in torch.cuda.get_rng_state_all()
+        ),
+    }
+    destination = Path(path)
+    _atomic_torch_save(state, destination)
+    return sha256_file(destination)
+
+
+_REPLICA_CHECKPOINT_FIELDS = {
+    "checkpoint_schema",
+    "n_replica",
+    "scientific_config",
+    "scientific_sha256",
+    "execution_config",
+    "model",
+    "optimizer",
+    "reference_model",
+    "run_state",
+    "explicit_rng",
+    "ambient_cpu_rng",
+    "ambient_cuda_rng",
+}
+
+
+def load_replica_checkpoint(
+    path: str | os.PathLike[str],
+    *,
+    modules: object,
+    optimizers: object,
+    expected_scientific_configs: Sequence[Mapping[str, object]],
+    generators: Sequence[torch.Generator],
+    reference_modules: object | None = None,
+    restore_ambient_rng: bool = True,
+) -> tuple[tuple[RunState, ...], Mapping[str, object]]:
+    """Strictly restore a queued replica checkpoint without compatibility."""
+
+    from pbg.queued.replica import ReplicaModuleOwner, ReplicaOptimizerGroup
+
+    if not isinstance(modules, ReplicaModuleOwner) or not isinstance(
+        optimizers, ReplicaOptimizerGroup
+    ):
+        raise TypeError("replica checkpoint requires queued replica owners")
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(state, dict) or set(state) != _REPLICA_CHECKPOINT_FIELDS:
+        raise PersistenceError(
+            "replica checkpoint has unknown or missing top-level fields"
+        )
+    if state["checkpoint_schema"] != REPLICA_CHECKPOINT_SCHEMA:
+        raise PersistenceError("runtime accepts only queued replica checkpoints")
+    count = modules.n_replica
+    if (
+        state["n_replica"] != count
+        or optimizers.modules is not modules
+        or len(expected_scientific_configs) != count
+        or len(generators) != count
+    ):
+        raise PersistenceError("replica checkpoint lane count differs")
+    expected = tuple(dict(value) for value in expected_scientific_configs)
+    if state["scientific_config"] != expected or state["scientific_sha256"] != tuple(
+        _canonical_hash(value) for value in expected
+    ):
+        raise PersistenceError("replica resume rejected scientific drift")
+    modules.load_state_dict(state["model"])
+    optimizers.load_state_dict(state["optimizer"])
+    stored_reference = state["reference_model"]
+    if (stored_reference is None) != (reference_modules is None):
+        raise PersistenceError("replica reference ownership differs")
+    if reference_modules is not None:
+        if (
+            not isinstance(reference_modules, ReplicaModuleOwner)
+            or reference_modules.n_replica != count
+        ):
+            raise PersistenceError("replica reference lanes are invalid")
+        reference_modules.load_state_dict(stored_reference)
+    run_fields = {
+        "run_id",
+        "iteration",
+        "root_count",
+        "retry_epoch",
+        "attempt_logical_base",
+        "logical_work",
+        "recovered_overflow",
+        "overflow_recoveries",
+        "metrics_prefix",
+        "branch_controller_state",
+        "cost_safeguard_state",
+    }
+    run_data = state["run_state"]
+    if (
+        not isinstance(run_data, (tuple, list))
+        or len(run_data) != count
+        or any(
+            not isinstance(value, dict) or set(value) != run_fields
+            for value in run_data
+        )
+    ):
+        raise PersistenceError("replica run-state lanes are invalid")
+    runs = tuple(RunState(**value) for value in run_data)
+    rng = state["explicit_rng"]
+    if not isinstance(rng, (tuple, list)) or len(rng) != count:
+        raise PersistenceError("replica RNG lanes are invalid")
+    for generator, value in zip(generators, rng, strict=True):
+        generator.set_state(value)
+    if restore_ambient_rng:
+        torch.set_rng_state(state["ambient_cpu_rng"])
+        cuda_states = state["ambient_cuda_rng"]
+        if len(cuda_states) != torch.cuda.device_count():
+            raise PersistenceError("checkpoint CUDA rank/device count differs")
+        torch.cuda.set_rng_state_all(list(cuda_states))
+    return runs, state["execution_config"]
+
+
 def convert_queued_checkpoint_v1(
     source_path: str | os.PathLike[str],
     destination_path: str | os.PathLike[str],
@@ -465,7 +641,11 @@ def convert_legacy_sequential(
         and branching_mode in ("fixed", "adaptive_kkt", "kkt")
         and completion_samples is not None
     )
-    if legacy_mode == "nor" + "mal" and completion_samples is None and branching_mode is None:
+    if (
+        legacy_mode == "nor" + "mal"
+        and completion_samples is None
+        and branching_mode is None
+    ):
         regime, estimator, rollout_mode = "self_play", "sampled", "sequential"
     elif (
         legacy_mode == "rao_blackwell"
@@ -484,11 +664,7 @@ def convert_legacy_sequential(
         )
     elif branched:
         regime, estimator = "self_play", "rao_blackwell"
-        rollout_mode = (
-            "branched.fixed"
-            if branching_mode == "fixed"
-            else "branched.KKT"
-        )
+        rollout_mode = "branched.fixed" if branching_mode == "fixed" else "branched.KKT"
     else:
         raise PersistenceError(
             "legacy artifact is not an approved sequential or branched-RB mode"
@@ -658,15 +834,9 @@ def convert_legacy_sequential(
                 "chance": min(chance_beta, beta_max),
             },
             "beta_max": beta_max,
-            "minimum_tree_size": int(
-                rollout.get("branching_min_nodes", 1)
-            ),
-            "minimum_scale": float(
-                rollout.get("fixed_beta_scale_min", 0.25)
-            ),
-            "backoff_factor": float(
-                rollout.get("branching_emergency_backoff", 0.5)
-            ),
+            "minimum_tree_size": int(rollout.get("branching_min_nodes", 1)),
+            "minimum_scale": float(rollout.get("fixed_beta_scale_min", 0.25)),
+            "backoff_factor": float(rollout.get("branching_emergency_backoff", 0.5)),
             "safe_tree_size": float(
                 safe_tree_size
                 if safe_tree_size is not None
@@ -677,63 +847,39 @@ def convert_legacy_sequential(
             adaptive = rollout.get("adaptive_kkt") or {}
             scientific["branching"].update(
                 {
-                    "warmup_iterations": int(
-                        adaptive.get("warmup_iterations", 0)
-                    ),
+                    "warmup_iterations": int(adaptive.get("warmup_iterations", 0)),
                     "target_tree_size": float(
                         adaptive.get(
                             "target_tree_size",
                             rollout.get("branching_ideal_nodes", 1),
                         )
                     ),
-                    "gamma_kappa": float(
-                        adaptive.get("gamma_kappa", 0.2)
-                    ),
-                    "eta_kappa": float(
-                        adaptive.get("eta_kappa", 0.2)
-                    ),
-                    "kappa_min": float(
-                        adaptive.get("kappa_min", 0.25)
-                    ),
-                    "kappa_max": float(
-                        adaptive.get("kappa_max", 4.0)
-                    ),
-                    "log_kappa": float(
-                        adaptive.get("log_kappa", 0.0)
-                    ),
+                    "gamma_kappa": float(adaptive.get("gamma_kappa", 0.2)),
+                    "eta_kappa": float(adaptive.get("eta_kappa", 0.2)),
+                    "kappa_min": float(adaptive.get("kappa_min", 0.25)),
+                    "kappa_max": float(adaptive.get("kappa_max", 4.0)),
+                    "log_kappa": float(adaptive.get("log_kappa", 0.0)),
                 }
             )
         scientific["cost_safeguard"] = {
             "gamma_deviance_max": float(
-                rollout.get(
-                    "safe_tree_activation_gamma_deviance_max", 0.2
-                )
+                rollout.get("safe_tree_activation_gamma_deviance_max", 0.2)
             ),
             "p95_underprediction_max": float(
-                rollout.get(
-                    "safe_tree_activation_p95_underprediction_max", 1.5
-                )
+                rollout.get("safe_tree_activation_p95_underprediction_max", 1.5)
             ),
             "consecutive_iterations": int(
-                rollout.get(
-                    "safe_tree_activation_consecutive_iters", 4
-                )
+                rollout.get("safe_tree_activation_consecutive_iters", 4)
             ),
         }
-        scientific = BranchedModeConfig.from_mapping(
-            scientific
-        ).scientific_mapping()
+        scientific = BranchedModeConfig.from_mapping(scientific).scientific_mapping()
     else:
         if source_schema == LEGACY_SCHEMA and (
             legacy["cost_safeguard_controller_schema_version"] is not None
             or legacy["cost_safeguard_controller_state"] is not None
         ):
-            raise PersistenceError(
-                "sequential artifact cannot carry a cost safeguard"
-            )
-        scientific = SequentialModeConfig.from_mapping(
-            scientific
-        ).scientific_mapping()
+            raise PersistenceError("sequential artifact cannot carry a cost safeguard")
+        scientific = SequentialModeConfig.from_mapping(scientific).scientific_mapping()
     execution = {
         "hardware_profile": dict(legacy["hardware_profile"]),
         "checkpoint_cadence": config["training"].get("checkpoint_every"),
@@ -881,6 +1027,62 @@ def convert_legacy_branched_rb(
     )
 
 
+def convert_legacy_lane_artifacts(
+    source_paths: Sequence[str | os.PathLike[str]],
+    destination_directory: str | os.PathLike[str],
+    *,
+    execution_kind: str,
+) -> dict[str, object]:
+    """Convert approved ordinary/distributed/replica lanes with one converter."""
+
+    if execution_kind not in ("distributed", "replica"):
+        raise ValueError("lane artifact execution_kind is invalid")
+    sources = tuple(Path(value) for value in source_paths)
+    if not sources:
+        raise ValueError("lane conversion requires at least one source")
+    destination = Path(destination_directory)
+    if destination.exists():
+        raise PersistenceError("lane conversion destination already exists")
+    destination.mkdir(parents=True)
+    try:
+        reports = []
+        for lane, source in enumerate(sources):
+            result = convert_legacy_sequential(
+                source,
+                destination / f"lane_{lane:03d}.pt",
+            )
+            reports.append(result)
+        manifest = {
+            "schema": "pbg-queued-lane-conversion-v1",
+            "execution_kind": execution_kind,
+            "lane_count": len(sources),
+            "lanes": tuple(
+                {
+                    "lane": lane,
+                    "source": str(source),
+                    "source_sha256": report["source_sha256"],
+                    "result_sha256": report["result_sha256"],
+                }
+                for lane, (source, report) in enumerate(
+                    zip(sources, reports, strict=True)
+                )
+            ),
+        }
+        _atomic_json_save(manifest, destination / "manifest.json")
+        return manifest
+    except Exception:
+        # Preserve any forensic output. A destination is exclusive and a
+        # failed conversion is never accepted as a runtime artifact.
+        _atomic_json_save(
+            {
+                "schema": "pbg-queued-lane-conversion-failed-v1",
+                "execution_kind": execution_kind,
+            },
+            destination / "FAILED.json",
+        )
+        raise
+
+
 def trim_metrics_after_checkpoint(
     metrics: Sequence[Mapping[str, object]], iteration: int
 ) -> list[dict[str, object]]:
@@ -899,14 +1101,18 @@ __all__ = [
     "LEGACY_SCHEMA",
     "LEGACY_SCHEMA_V7",
     "QUEUED_CHECKPOINT_V1",
+    "REPLICA_CHECKPOINT_SCHEMA",
     "PersistenceError",
     "RunState",
+    "convert_legacy_branched_rb",
+    "convert_legacy_lane_artifacts",
     "convert_legacy_sequential",
     "convert_legacy_sequential_sampled",
-    "convert_legacy_branched_rb",
     "convert_queued_checkpoint_v1",
     "load_checkpoint",
+    "load_replica_checkpoint",
     "save_checkpoint",
+    "save_replica_checkpoint",
     "sha256_file",
     "trim_metrics_after_checkpoint",
 ]

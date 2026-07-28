@@ -37,6 +37,33 @@ class LearnerError(RuntimeError):
     """A sealed learner input or loss contract was violated."""
 
 
+@dataclass(frozen=True)
+class LearnerDTypes:
+    """Explicit numerical boundaries shared by every learner lane."""
+
+    model: torch.dtype
+    control: torch.dtype = torch.float32
+    posterior: torch.dtype = torch.float32
+    gradient: torch.dtype = torch.float32
+    optimizer: torch.dtype = torch.float32
+
+    def __post_init__(self) -> None:
+        if self.model not in (torch.float32, torch.float16, torch.bfloat16):
+            raise ValueError("model dtype must be FP32, FP16, or BF16")
+        if any(
+            value != torch.float32
+            for value in (
+                self.control,
+                self.posterior,
+                self.gradient,
+                self.optimizer,
+            )
+        ):
+            raise ValueError(
+                "learner controls, posterior, gradients, and optimizer must be FP32"
+            )
+
+
 def allocate_statistical_counts(
     mass: Tensor,
     variance: Tensor,
@@ -293,9 +320,7 @@ def compact_best_response_evaluation(
     trained_row = torch.nonzero(trained, as_tuple=False).flatten()
     frozen_row = torch.nonzero(~trained, as_tuple=False).flatten()
 
-    def compact_call(
-        operation: ModelOperation, row: Tensor
-    ) -> ModelEvaluation | None:
+    def compact_call(operation: ModelOperation, row: Tensor) -> ModelEvaluation | None:
         if row.numel() == 0:
             return None
         return operation(
@@ -395,10 +420,13 @@ def build_reference_output_cache(
     }[precision]
 
     def evaluate(begin: int, end: int) -> Mapping[str, Tensor]:
-        with torch.no_grad(), torch.autocast(
-            device_type="cuda",
-            dtype=autocast_dtype,
-            enabled=precision != "fp32",
+        with (
+            torch.no_grad(),
+            torch.autocast(
+                device_type="cuda",
+                dtype=autocast_dtype,
+                enabled=precision != "fp32",
+            ),
         ):
             result = operation(
                 input_type,
@@ -410,15 +438,10 @@ def build_reference_output_cache(
 
     first_end = min(rows, pack_cap)
     first = evaluate(0, first_end)
-    if not first or any(
-        value.shape[0] != first_end for value in first.values()
-    ):
+    if not first or any(value.shape[0] != first_end for value in first.values()):
         raise LearnerError("reference operation returned invalid policy rows")
     payload_bytes = sum(
-        rows
-        * value[0].numel()
-        * value.element_size()
-        for value in first.values()
+        rows * value[0].numel() * value.element_size() for value in first.values()
     )
     if not ReferenceOutputCache.eligible(
         byte_budget=byte_budget,
@@ -429,15 +452,12 @@ def build_reference_output_cache(
         predicted_build_seconds=predicted_build_seconds,
     ):
         return None
-    pieces: dict[str, list[Tensor]] = {
-        name: [value] for name, value in first.items()
-    }
+    pieces: dict[str, list[Tensor]] = {name: [value] for name, value in first.items()}
     for begin in range(first_end, rows, pack_cap):
         end = min(rows, begin + pack_cap)
         current = evaluate(begin, end)
         if tuple(current) != tuple(pieces) or any(
-            value.shape[0] != end - begin
-            for value in current.values()
+            value.shape[0] != end - begin for value in current.values()
         ):
             raise LearnerError("reference operation policy schema changed")
         for name, value in current.items():
@@ -1061,16 +1081,11 @@ class SealedBranchedInputs:
         }
         if "sampled_private_state" in destination.columns:
             if "sampled_private_state" not in family.columns:
-                raise LearnerError(
-                    "sampled branched seal omitted private state"
-                )
-            values["sampled_private_state"] = family.columns[
-                "sampled_private_state"
-            ][lane, selected][None]
-        values = {
-            field.name: values[field.name]
-            for field in destination.schema.fields
-        }
+                raise LearnerError("sampled branched seal omitted private state")
+            values["sampled_private_state"] = family.columns["sampled_private_state"][
+                lane, selected
+            ][None]
+        values = {field.name: values[field.name] for field in destination.schema.fields}
         counts = torch.zeros(family.n_replica, dtype=torch.int64, device=device)
         counts[lane] = rows
         logical = torch.full_like(counts, torch.iinfo(torch.int64).max)
@@ -1245,13 +1260,9 @@ def _alias_table(log_weights: Tensor) -> tuple[Tensor, Tensor]:
     ):
         raise LearnerError("alias log weights must be a nonempty CUDA vector")
     work = log_weights.detach().double()
-    torch._assert_async(
-        torch.isfinite(work).all(), "alias log weights must be finite"
-    )
+    torch._assert_async(torch.isfinite(work).all(), "alias log weights must be finite")
     size = work.numel()
-    scaled = (
-        torch.exp(work - torch.logsumexp(work, 0)) * size
-    ).contiguous()
+    scaled = (torch.exp(work - torch.logsumexp(work, 0)) * size).contiguous()
     probability = torch.empty_like(scaled)
     alias = torch.empty(size, dtype=torch.int32, device=work.device)
     small = torch.empty(size, dtype=torch.int64, device=work.device)
@@ -1290,9 +1301,7 @@ class BranchedBatchSampler:
         log_z: dict[str, Tensor] = {}
         alias_tables: dict[str, tuple[Tensor, Tensor]] = {}
         for name, store in stores.items():
-            log_weight = store.sealed_inputs.columns[
-                "log_sampling_weight"
-            ].double()
+            log_weight = store.sealed_inputs.columns["log_sampling_weight"].double()
             log_z[name] = torch.logsumexp(log_weight, 0)
             alias_tables[name] = _alias_table(log_weight)
             del log_weight
@@ -1301,17 +1310,12 @@ class BranchedBatchSampler:
         log_mass = torch.stack(tuple(self.log_Z.values()))
         mass = torch.softmax(log_mass, 0)
         self.stratum_probability = MappingProxyType(
-            {
-                name: mass[index] / mass.sum()
-                for index, name in enumerate(stores)
-            }
+            {name: mass[index] / mass.sum() for index, name in enumerate(stores)}
         )
         if statistical_counts is None:
             stratum_count = mass.numel()
             if schedule.batch_size < stratum_count:
-                raise LearnerError(
-                    "branched batch size cannot cover every stratum"
-                )
+                raise LearnerError("branched batch size cannot cover every stratum")
             remaining = schedule.batch_size - stratum_count
             raw = mass * remaining
             extra = raw.floor().to(torch.int64)
@@ -1339,8 +1343,7 @@ class BranchedBatchSampler:
             while not ready.query():
                 time.sleep(0)
             statistical_counts = {
-                name: int(host_allocated[index])
-                for index, name in enumerate(stores)
+                name: int(host_allocated[index]) for index, name in enumerate(stores)
             }
         if set(statistical_counts) != set(stores) or any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
@@ -1544,6 +1547,13 @@ class LearnerOperation:
         if precision not in ("fp32", "fp16", "bf16"):
             raise ValueError("learner precision must be fp32, fp16, or bf16")
         self.precision = precision
+        self.dtypes = LearnerDTypes(
+            {
+                "fp32": torch.float32,
+                "fp16": torch.float16,
+                "bf16": torch.bfloat16,
+            }[precision]
+        )
 
     def forward_loss_backward(
         self,
@@ -1853,9 +1863,7 @@ class LearnerOperation:
                         sigma["sampled_private_state"],
                         sigma["owner"],
                     ).index_select(0, action_to_sigma)
-                    for name, value in reference_cache.gather(
-                        batch.sigma_index
-                    ).items()
+                    for name, value in reference_cache.gather(batch.sigma_index).items()
                 }
             elif reference_operation is not None:
                 reference_evaluation = reference_operation(
@@ -2014,10 +2022,7 @@ class LearnerOperation:
                 & objective_weight.le(1),
                 "physical objective weight must lie in (0,1]",
             )
-        elif (
-            not math.isfinite(objective_weight)
-            or not 0 < objective_weight <= 1
-        ):
+        elif not math.isfinite(objective_weight) or not 0 < objective_weight <= 1:
             raise LearnerError("physical objective weight must lie in (0,1]")
         (total * float(loss_scale) * objective_weight).backward()
         return LossResult(
@@ -2083,9 +2088,7 @@ class LearnerOperation:
                     )
                 reference = {
                     name: value.index_select(0, action_to_sigma)
-                    for name, value in reference_cache.gather(
-                        batch.sigma_index
-                    ).items()
+                    for name, value in reference_cache.gather(batch.sigma_index).items()
                 }
             elif reference_operation is not None:
                 reference_evaluation = reference_operation(
@@ -2124,9 +2127,7 @@ class LearnerOperation:
             == old_log.shape
             == advantage.shape
             == posterior.shape
-            and current_value.shape
-            == old_value.shape
-            == target_value.shape
+            and current_value.shape == old_value.shape == target_value.shape
             and current_log.shape[0] == batch.action_rows
             and current_value.shape[0] == batch.rows
             and current_log.shape[1:] == current_value.shape[1:]
@@ -2152,12 +2153,9 @@ class LearnerOperation:
         ).sum(-1)
         entropy_row = (posterior * entropy).sum(-1)
         reference_row = (posterior * reference_kl).sum(-1)
-        approximate_row = (
-            posterior * ((ratio - 1) - log_ratio)
-        ).sum(-1)
+        approximate_row = (posterior * ((ratio - 1) - log_ratio)).sum(-1)
         clipped_row = (
-            posterior
-            * ratio.sub(1).abs().gt(self.loss.clip_epsilon).float()
+            posterior * ratio.sub(1).abs().gt(self.loss.clip_epsilon).float()
         ).sum(-1)
         sigma_posterior = torch.zeros_like(current_value)
         sigma_posterior.scatter_add_(
@@ -2166,14 +2164,12 @@ class LearnerOperation:
             posterior,
         )
         sigma_posterior /= counts.float()[:, None]
-        sigma_posterior /= sigma_posterior.sum(
-            -1, keepdim=True
-        ).clamp_min(torch.finfo(torch.float32).tiny)
+        sigma_posterior /= sigma_posterior.sum(-1, keepdim=True).clamp_min(
+            torch.finfo(torch.float32).tiny
+        )
         value_error = (current_value - target_value).square()
         if self.loss.value_loss == "clipped":
-            clipped_value = old_value + (
-                current_value - old_value
-            ).clamp(
+            clipped_value = old_value + (current_value - old_value).clamp(
                 -self.loss.value_clip_epsilon,
                 self.loss.value_clip_epsilon,
             )
@@ -2184,9 +2180,7 @@ class LearnerOperation:
         value_row = (sigma_posterior * value_error).sum(-1)
 
         def mean_by_sigma(rows: Tensor) -> Tensor:
-            result = torch.zeros(
-                batch.rows, dtype=torch.float32, device=rows.device
-            )
+            result = torch.zeros(batch.rows, dtype=torch.float32, device=rows.device)
             result.scatter_add_(0, action_to_sigma, rows)
             return result / counts.float()
 
@@ -2197,17 +2191,14 @@ class LearnerOperation:
         sigma_clipped = mean_by_sigma(clipped_row)
         public = evaluation.public_heads
         if set(public) != {"trace", "cost"}:
-            raise LearnerError(
-                "branched model must expose public trace/cost heads"
-            )
+            raise LearnerError("branched model must expose public trace/cost heads")
         trace_prediction = public["trace"].float()
         cost_prediction = public["cost"].float()
         trace_target = sigma["trace_target"].float()
         cost_target = sigma["cost_target"].float()
         eps = self.loss.trace_epsilon
         trace_ratio = (trace_target + eps) / (
-            trace_prediction.clamp_min(torch.finfo(torch.float32).tiny)
-            + eps
+            trace_prediction.clamp_min(torch.finfo(torch.float32).tiny) + eps
         )
         trace_loss = torch.where(
             sigma["target_degree"].ge(2),
@@ -2243,13 +2234,8 @@ class LearnerOperation:
                 & objective_weight.le(1),
                 "physical objective weight must lie in (0,1]",
             )
-        elif (
-            not math.isfinite(objective_weight)
-            or not 0 < objective_weight <= 1
-        ):
-            raise LearnerError(
-                "physical objective weight must lie in (0,1]"
-            )
+        elif not math.isfinite(objective_weight) or not 0 < objective_weight <= 1:
+            raise LearnerError("physical objective weight must lie in (0,1]")
         (total * float(loss_scale) * objective_weight).backward()
         return LossResult(
             total,
@@ -2325,6 +2311,7 @@ __all__ = [
     "AlignedSequentialStore",
     "BranchedBatchSampler",
     "BranchedLearnerBatch",
+    "LearnerDTypes",
     "LearnerError",
     "LearnerOperation",
     "LearnerSchedule",

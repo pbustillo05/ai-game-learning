@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
-from typing import Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
@@ -90,7 +90,7 @@ class LossScaler:
         }
 
     @classmethod
-    def from_state_dict(cls, state: Mapping[str, object]) -> "LossScaler":
+    def from_state_dict(cls, state: Mapping[str, object]) -> LossScaler:
         expected = {
             "enabled",
             "scale",
@@ -107,7 +107,7 @@ class LossScaler:
 class DenseGradientOwner:
     """One FP32 allocation to which every trainable ``.grad`` is bound."""
 
-    def __init__(self, module: nn.Module) -> None:
+    def __init__(self, module: nn.Module, *, flat: Tensor | None = None) -> None:
         self.parameters = tuple(
             parameter for parameter in module.parameters() if parameter.requires_grad
         )
@@ -119,11 +119,24 @@ class DenseGradientOwner:
         if any(parameter.dtype != torch.float32 for parameter in self.parameters):
             raise TypeError("queued master parameters must be FP32")
         self.device = next(iter(devices))
-        self.flat = torch.zeros(
-            sum(parameter.numel() for parameter in self.parameters),
-            dtype=torch.float32,
-            device=self.device,
-        )
+        size = sum(parameter.numel() for parameter in self.parameters)
+        if flat is None:
+            flat = torch.zeros(
+                size,
+                dtype=torch.float32,
+                device=self.device,
+            )
+        elif (
+            flat.shape != (size,)
+            or flat.dtype != torch.float32
+            or flat.device != self.device
+            or not flat.is_contiguous()
+        ):
+            raise ValueError(
+                "external dense gradient storage must be contiguous FP32 [N] "
+                "on the module device"
+            )
+        self.flat = flat
         self.views: tuple[Tensor, ...] = self._views()
         self.bind()
 
@@ -176,14 +189,31 @@ class DenseAdam:
         config: OptimizerConfig,
         *,
         scaler: LossScaler | None = None,
+        gradient_flat: Tensor | None = None,
+        exp_avg: Tensor | None = None,
+        exp_avg_sq: Tensor | None = None,
     ) -> None:
         self.config = config
-        self.gradients = DenseGradientOwner(module)
+        self.gradients = DenseGradientOwner(module, flat=gradient_flat)
         self.parameters = self.gradients.parameters
-        self.exp_avg = torch.zeros_like(self.gradients.flat)
-        self.exp_avg_sq = torch.zeros_like(self.gradients.flat)
+        self.exp_avg = self._state_vector(exp_avg, "exp_avg")
+        self.exp_avg_sq = self._state_vector(exp_avg_sq, "exp_avg_sq")
         self.step_count = 0
         self.scaler = LossScaler() if scaler is None else scaler
+
+    def _state_vector(self, value: Tensor | None, name: str) -> Tensor:
+        if value is None:
+            return torch.zeros_like(self.gradients.flat)
+        if (
+            value.shape != self.gradients.flat.shape
+            or value.dtype != torch.float32
+            or value.device != self.gradients.device
+            or not value.is_contiguous()
+        ):
+            raise ValueError(
+                f"external optimizer {name} must match the dense FP32 gradient row"
+            )
+        return value
 
     def _flat_views(self, value: Tensor) -> tuple[Tensor, ...]:
         if value.ndim != 1 or value.numel() != self.gradients.flat.numel():
@@ -229,9 +259,7 @@ class DenseAdam:
                 alpha=self.config.weight_decay,
             )
         self.exp_avg.mul_(beta1).add_(gradient, alpha=1.0 - beta1)
-        self.exp_avg_sq.mul_(beta2).addcmul_(
-            gradient, gradient, value=1.0 - beta2
-        )
+        self.exp_avg_sq.mul_(beta2).addcmul_(gradient, gradient, value=1.0 - beta2)
         correction1 = 1.0 - beta1**self.step_count
         correction2 = 1.0 - beta2**self.step_count
         denominator = self.exp_avg_sq.sqrt().div_(math.sqrt(correction2))
