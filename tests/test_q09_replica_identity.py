@@ -12,6 +12,7 @@ from pbg.games.poker.queued import (
     NLHEGeometry,
     PokerReplicaInference,
     QueuedPokerModel,
+    ReplicaPokerIterationGroup,
 )
 from pbg.queued import (
     DistributedSUM,
@@ -30,9 +31,11 @@ from pbg.queued import (
     RunState,
     SequentialLearnerBatch,
     load_replica_checkpoint,
+    mode_schema,
     save_replica_checkpoint,
 )
 from pbg.queued.optimization import DenseAdam
+from pbg.queued.persistence import convert_legacy_lane_artifacts
 
 CUDA = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="queued replica execution is CUDA-only"
@@ -258,12 +261,76 @@ def test_poker_rollout_vmap_preserves_lane_weights_and_natural_labels() -> None:
     torch.testing.assert_close(actual.value, expected)
     assert actual.value.shape == (2, rows, geometry.private_hands)
     assert float(actual.value[0, 0, 0]) != float(actual.value[1, 0, 0])
+    lane_operation = inference.lane_operation(2)
+    lane_value = lane_operation("pre", model_input[0], private[0], owner[0]).value
+    torch.testing.assert_close(lane_value, expected[0])
+
+
+@CUDA
+def test_production_poker_group_binds_vmap_rollout_and_ordinary_learner_lanes() -> None:
+    geometry = NLHEGeometry(2, 8.0, 4)
+    source = [
+        QueuedPokerModel(
+            geometry,
+            _PokerPartition(geometry.rank_count**2, 0.3 + lane),
+            _PokerPartition(geometry.private_hands, 0.4 + lane),
+        ).cuda()
+        for lane in range(2)
+    ]
+    inference = PokerReplicaInference(source)
+    optimizers = ReplicaOptimizerGroup(
+        inference.modules,
+        OptimizerConfig(learning_rate=1.0e-3),
+    )
+    schemas = (
+        mode_schema("self_play", "branched.fixed", "sampled"),
+        mode_schema("self_play", "branched.KKT", "sampled"),
+    )
+
+    class _Iteration:
+        def __init__(self, lane: int) -> None:
+            self.model = inference.modules.lane_module(lane)
+            self.optimizer = optimizers.optimizers[lane]
+            self.mode = schemas[lane]
+            self.rollout_operation = inference.lane_operation(lane)
+            self.model_operation = self.model.learner_operation
+            self.calls = 0
+
+        def run(self, *, iteration: int) -> ModelEvaluation:
+            del iteration
+            self.calls += 1
+            rows = 2
+            model_input = torch.zeros(
+                (rows, geometry.direct_model_input_width), device="cuda"
+            )
+            private = torch.zeros(
+                (rows, geometry.players), dtype=torch.int32, device="cuda"
+            )
+            owner = torch.zeros(rows, dtype=torch.uint8, device="cuda")
+            rollout = self.rollout_operation("pre", model_input, private, owner)
+            self.optimizer.zero_grad()
+            learned = self.model_operation("pre", model_input, private, owner)
+            learned.value.mean().backward()
+            self.optimizer.step()
+            return rollout
+
+    iterations = (_Iteration(0), _Iteration(1))
+    group = ReplicaPokerIterationGroup(
+        iterations,
+        inference=inference,
+        optimizers=optimizers,
+    )
+    result = group.run(iteration=0, active_lanes=(1,))
+    assert result.failures == {}
+    assert result.results[0] is None
+    assert isinstance(result.results[1], ModelEvaluation)
+    assert iterations[0].calls == 0
+    assert iterations[1].calls == 1
+    assert result.versions == (0, 1)
 
 
 @CUDA
 def test_one_lane_uses_the_ordinary_learner_graph_for_complete_run_parity() -> None:
-    from pbg.queued import mode_schema
-
     source = _LearnerToy().cuda()
     oracle = copy.deepcopy(source)
     owner = ReplicaModuleOwner((source,))
@@ -317,6 +384,39 @@ def test_one_lane_uses_the_ordinary_learner_graph_for_complete_run_parity() -> N
                 atol=0,
                 rtol=0,
             )
+
+
+@CUDA
+def test_lane_local_loss_controls_preserve_independent_updates() -> None:
+    modules = (_LearnerToy().cuda(), _LearnerToy().cuda())
+    owner = ReplicaModuleOwner(modules)
+    group = ReplicaOptimizerGroup(owner, OptimizerConfig(learning_rate=3.0e-3))
+    scheduler = ReplicaLearnerScheduler(group)
+    mode = mode_schema("self_play", "sequential", "sampled")
+    batch = _learner_batch()
+    controls = (
+        LossConfig(value_coefficient=0, entropy_coefficient=0),
+        LossConfig(value_coefficient=2.0, entropy_coefficient=0),
+    )
+
+    def backward(lane: int, module: torch.nn.Module, optimizer: DenseAdam) -> None:
+        LearnerOperation(
+            mode,
+            controls[lane],
+            module,
+            _learner_policy,
+        ).forward_loss_backward(
+            batch,
+            iteration=0,
+            loss_scale=optimizer.scaler.scale,
+        )
+
+    result = scheduler.run_step((0, 1), backward)
+    assert result.failures == {}
+    assert not torch.equal(
+        owner.parameters["value_weight"][0],
+        owner.parameters["value_weight"][1],
+    )
 
 
 @CUDA
@@ -512,3 +612,39 @@ def test_learner_dtype_contract_is_explicit() -> None:
     assert contract.optimizer == torch.float32
     with pytest.raises(ValueError, match="posterior"):
         LearnerDTypes(torch.float32, posterior=torch.bfloat16)
+
+
+def test_distributed_and_replica_lane_artifacts_use_the_sole_converter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sources = (tmp_path / "source-0.pt", tmp_path / "source-1.pt")
+    for source in sources:
+        source.write_bytes(b"approved legacy lane")
+    calls: list[tuple[Path, Path]] = []
+
+    def convert(source: Path, destination: Path) -> dict[str, object]:
+        calls.append((Path(source), Path(destination)))
+        destination.write_bytes(b"queued lane")
+        return {
+            "source_sha256": f"{len(calls):064x}",
+            "result_sha256": f"{len(calls) + 10:064x}",
+        }
+
+    monkeypatch.setattr(
+        "pbg.queued.persistence.convert_legacy_sequential",
+        convert,
+    )
+    destination = tmp_path / "converted"
+    result = convert_legacy_lane_artifacts(
+        sources,
+        destination,
+        execution_kind="replica",
+    )
+    assert result["lane_count"] == 2
+    assert result["execution_kind"] == "replica"
+    assert calls == [
+        (sources[0], destination / "lane_000.pt"),
+        (sources[1], destination / "lane_001.pt"),
+    ]
+    assert (destination / "manifest.json").is_file()
