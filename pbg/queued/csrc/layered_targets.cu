@@ -188,30 +188,22 @@ __global__ void layered_target_kernel(
         const int edge = begin + a;
         const int source = child_source_type[edge];
         const int encoded = child_source_row[edge];
-        const float child0 = converted(
-            tables.work0, tables, source, output, lane, encoded, p, d, p_train,
-            output_count, max_width);
-        const float child1 = sampled ? 0.0f : converted(
-            tables.work1, tables, source, output, lane, encoded, p, d, p_train,
-            output_count, max_width);
+        const float child0 = ntgt == 1
+            ? mass_sum
+            : converted(
+                  tables.work0, tables, source, output, lane, encoded, p, d,
+                  p_train, output_count, max_width);
+        const float child1 = sampled
+            ? 0.0f
+            : (ntgt == 1
+                   ? moment_sum
+                   : converted(
+                         tables.work1, tables, source, output, lane, encoded,
+                         p, d, p_train, output_count, max_width));
         float baseline = old_v;
         if (ntgt > 1) {
-          float sibling0 = 0.0f;
-          float sibling1 = 0.0f;
-          for (int b = 0; b < ntgt; ++b) {
-            if (b == a) continue;
-            const int sibling_edge = begin + b;
-            const int sibling_source = child_source_type[sibling_edge];
-            const int sibling_encoded = child_source_row[sibling_edge];
-            sibling0 += converted(
-                tables.work0, tables, sibling_source, output, lane,
-                sibling_encoded, p, d, p_train, output_count, max_width);
-            if (!sampled) {
-              sibling1 += converted(
-                  tables.work1, tables, sibling_source, output, lane,
-                  sibling_encoded, p, d, p_train, output_count, max_width);
-            }
-          }
+          const float sibling0 = mass_sum - child0;
+          const float sibling1 = moment_sum - child1;
           const float continuation = sampled
               ? sibling0 / static_cast<float>(ntgt - 1)
               : (sibling0 > 0.0f ? sibling1 / sibling0 : 0.0f);
@@ -386,7 +378,7 @@ Tensor run_layers(
     const int first = ptr[layer];
     const int count = ptr[layer + 1] - first;
     if (!count) continue;
-    layered_target_kernel<<<count, 128, 0, stream>>>(
+    layered_target_kernel<<<count, 256, 0, stream>>>(
         first, count,
         nodes[0].data_ptr<int32_t>(), nodes[1].data_ptr<int32_t>(),
         nodes[2].data_ptr<int32_t>(), nodes[3].data_ptr<int32_t>(),

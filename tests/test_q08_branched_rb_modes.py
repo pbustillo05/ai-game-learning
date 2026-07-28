@@ -3,14 +3,19 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from pbg.games.poker.queued import (
+    BranchedBenchmarkTelemetry,
+    BranchedPosteriorExhaustion,
     BranchedPokerIteration,
     CollisionConditionedProfileSampler,
     NLHEGeometry,
+    RejectionObservation,
+    action_conditioned_log_reach,
     branched_rb_chance_frontier_row_bytes,
     rb_partitions,
 )
@@ -29,6 +34,7 @@ from pbg.queued import (
     build_storage_plan,
     convert_legacy_branched_rb,
     mode_schema,
+    run_phase8_benchmark,
 )
 from pbg.queued.targets import rb_conversion_library_workspace_bytes
 from tests.test_q07_branched_sampled_modes import (
@@ -93,6 +99,66 @@ def test_phase8_config_closes_all_four_rb_modes(
     del missing["completion"]
     with pytest.raises(ValueError, match="root.completion"):
         BranchedModeConfig.from_mapping(missing)
+
+
+def test_frozen_phase8_benchmark_surface_enforces_exact_identity() -> None:
+    geometry = NLHEGeometry(2, 32.0, 13)
+    mode = mode_schema(
+        "self_play", "branched.fixed", "rao_blackwell"
+    )
+
+    def factory(seed: int):
+        return SimpleNamespace(
+            plan=SimpleNamespace(
+                mode=mode,
+                manifest=SimpleNamespace(
+                    root_count=1,
+                    family_pack_cap=84,
+                ),
+            ),
+            controller=FixedBranchController(
+                {"player": 3.0, "chance": 3.0}, 3
+            ),
+            arguments={
+                "geometry": geometry,
+                "completion_samples": 1024,
+                "seed": seed,
+                "benchmark_telemetry": True,
+                "benchmark_rollout_only": True,
+                "benchmark_identity": {
+                    "checkpoint_sha256": "a" * 64,
+                    "scientific_config_sha256": "b" * 64,
+                    "evaluator_version": "contract-v2",
+                    "rng_version": "logical-rng-v1",
+                },
+            },
+            run=lambda **_ignored: SimpleNamespace(
+                player_nodes=100,
+                target_layers=4,
+                telemetry=BranchedBenchmarkTelemetry(
+                    rollout_seconds=0.5,
+                    routing_traffic_bytes=1_000,
+                    host_synchronizations=10,
+                    child_reservation_commit_seconds=0.1,
+                    target_propagation_seconds=0.01,
+                    peak_allocated_bytes=900,
+                    peak_reserved_bytes=1_000,
+                ),
+            ),
+        )
+
+    report = run_phase8_benchmark(
+        factory,
+        revision="phase8-test",
+        legacy_peak_allocated_bytes=1_000,
+        sequential_throughput_ratio=1.0,
+    )
+    assert report.passed
+    assert tuple(sample.seed for sample in report.samples) == (
+        104830,
+        209559,
+        314288,
+    )
 
 
 def test_offline_converter_accepts_approved_fixed_branched_rb(
@@ -274,6 +340,87 @@ def test_collision_sampler_matches_the_exact_conditioned_sparse_law() -> None:
 
 
 @CUDA
+def test_action_conditioned_folded_range_drives_chance_profiles() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    first = geometry.first_card
+    hands = geometry.combo_id(
+        torch.tensor(
+            (first, first + 2, first + 4),
+            dtype=torch.int64,
+            device=device,
+        ),
+        torch.tensor(
+            (first + 1, first + 3, first + 5),
+            dtype=torch.int64,
+            device=device,
+        ),
+    ).to(torch.int64)
+    log_reach = torch.full(
+        (1, 2, geometry.private_hands),
+        -torch.inf,
+        dtype=torch.float32,
+        device=device,
+    )
+    log_reach[0, 0, hands[:2]] = torch.log(
+        torch.tensor((0.25, 0.75), device=device)
+    )
+    log_reach[0, 1, hands[2]] = 0
+    selected_log = torch.full(
+        (1, geometry.private_hands),
+        -torch.inf,
+        dtype=torch.float32,
+        device=device,
+    )
+    selected_log[0, hands[:2]] = torch.log(
+        torch.tensor((0.9, 0.1), device=device)
+    )
+    conditioned = action_conditioned_log_reach(
+        log_reach,
+        selected_log,
+        torch.zeros(1, dtype=torch.int32, device=device),
+    )
+    torch.testing.assert_close(conditioned[:, 1], log_reach[:, 1])
+    weights = conditioned.exp()
+    weights /= weights.sum(-1, keepdim=True)
+    torch.testing.assert_close(
+        weights[0, 0, hands[:2]],
+        torch.tensor((0.75, 0.25), device=device),
+    )
+
+    samples = 2048
+    sampler = CollisionConditionedProfileSampler(
+        geometry, max_attempts=8
+    )
+    inherited = torch.tensor(
+        ((int(hands[0]), int(hands[2])),),
+        dtype=torch.int32,
+        device=device,
+    )
+    profile = sampler.sample_children(
+        range_weights=weights,
+        board_cards=torch.full(
+            (1, 5), 255, dtype=torch.uint8, device=device
+        ),
+        inherited_profile=inherited,
+        source=torch.zeros(samples, dtype=torch.int64, device=device),
+        ordinal=torch.ones(samples, dtype=torch.int64, device=device),
+        active=torch.ones(samples, dtype=torch.bool, device=device),
+        root=torch.zeros(samples, dtype=torch.int64, device=device),
+        path=torch.arange(
+            1, samples + 1, dtype=torch.int64, device=device
+        ),
+        seed=811,
+        iteration=2,
+        retry_epoch=0,
+    )
+    assert bool(profile[:, 1].eq(hands[2]).all())
+    assert float(profile[:, 0].eq(hands[0]).float().mean()) == (
+        pytest.approx(0.75, abs=0.04)
+    )
+
+
+@CUDA
 @pytest.mark.parametrize(
     ("players", "ranks"),
     ((2, 4), (3, 4), (4, 4), (5, 4), (6, 5)),
@@ -371,6 +518,93 @@ def test_rejection_tail_reports_minimum_address_and_full_attempt_count() -> None
 
 
 @CUDA
+def test_rejection_exhaustion_blocks_commit_and_publishes_device_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = mode_schema(
+        "self_play", "branched.fixed", "rao_blackwell"
+    )
+    plan = _plan(device, mode, geometry)
+
+    def exhaust(
+        sampler: CollisionConditionedProfileSampler,
+        **request,
+    ) -> torch.Tensor:
+        source = request["source"].to(torch.int64)
+        inherited = request["inherited_profile"].index_select(0, source)
+        fresh = request["active"] & request["ordinal"].gt(0)
+        attempts = torch.where(
+            fresh,
+            torch.full_like(
+                source, sampler.max_attempts, dtype=torch.int32
+            ),
+            torch.zeros_like(source, dtype=torch.int32),
+        )
+        maximum = torch.full_like(
+            request["path"], torch.iinfo(torch.int64).max
+        )
+        sampler.last_observation = RejectionObservation(
+            attempts,
+            fresh,
+            torch.where(
+                fresh, request["path"], maximum
+            ).amin(),
+        )
+        return inherited
+
+    monkeypatch.setattr(
+        CollisionConditionedProfileSampler,
+        "sample_children",
+        exhaust,
+    )
+    model = build_model_from_config(
+        _config("self_play", "branched.fixed"), device
+    )
+    with pytest.raises(BranchedPosteriorExhaustion) as raised:
+        BranchedPokerIteration(
+            owner_factory=lambda: GeneratedOwners(plan),
+            plan=plan,
+            controller=FixedBranchController(
+                {"player": 2.0, "chance": 1.0}, 2
+            ),
+            run_state=RunState("phase8-exhaustion", root_count=1),
+            arguments={
+                "geometry": geometry,
+                "mode": mode,
+                "model": model,
+                "model_operation": model.rb_learner_operation,
+                "rollout_operation": model.rollout_operation,
+                "optimizer": DenseAdam(
+                    model,
+                    OptimizerConfig(name="adamw", grad_clip=5),
+                ),
+                "loss": LossConfig(
+                    reference_kl_coefficient=0,
+                    trace_coefficient=0.1,
+                    cost_coefficient=0.1,
+                ),
+                "schedule": LearnerSchedule(
+                    batch_size=2, gradient_steps=1
+                ),
+                "generator": torch.Generator(
+                    device=device
+                ).manual_seed(31),
+                "seed": 31,
+                "lambda_": 0.95,
+                "completion_samples": 4,
+                "posterior_max_attempts": 7,
+            },
+        ).run(iteration=0)
+    failure = raised.value.failure
+    assert failure.failure_code == "rejection_exhausted"
+    assert failure.phase == "posterior_sample"
+    assert failure.sampler_attempt_count == 7
+    assert failure.logical_address >= 0
+
+
+@CUDA
 @pytest.mark.parametrize("regime", ("self_play", "best_response"))
 @pytest.mark.parametrize("rollout", ("branched.fixed", "branched.KKT"))
 def test_four_branched_rb_modes_complete_optimizer_step(
@@ -441,9 +675,21 @@ def test_four_branched_rb_modes_complete_optimizer_step(
             "lambda_": 0.95,
             "completion_samples": 4,
             "posterior_max_attempts": 16,
+            "benchmark_telemetry": (
+                regime == "self_play"
+                and rollout == "branched.fixed"
+            ),
         },
     ).run(iteration=0)
     assert result.player_nodes
     assert result.leaves
     assert result.learner.optimizer_steps
     assert result.learner.optimizer_steps[0].applied
+    if regime == "self_play" and rollout == "branched.fixed":
+        assert isinstance(result.telemetry, BranchedBenchmarkTelemetry)
+        assert result.telemetry.rollout_seconds > 0
+        assert result.telemetry.routing_traffic_bytes > 0
+        assert result.telemetry.host_synchronizations > 0
+        assert result.telemetry.child_reservation_commit_seconds > 0
+        assert result.telemetry.target_propagation_seconds > 0
+        assert result.telemetry.peak_allocated_bytes > 0

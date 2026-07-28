@@ -204,18 +204,26 @@ class CollisionConditionedProfileSampler:
         selected = selected.to(torch.int32)
 
         cards = combo_cards[selected.to(torch.int64)]
-        active_cards = torch.zeros(
-            (edges, self.max_attempts, self.geometry.deck_cards),
-            dtype=torch.int16,
+        # A profile has at most twelve private cards (six two-card seats).
+        # Pairwise hand comparisons are therefore both exact and materially
+        # smaller than an [edge, attempt, deck-card] collision histogram.
+        collision_free = torch.ones(
+            (edges, self.max_attempts),
+            dtype=torch.bool,
             device=device,
         )
-        relative = cards.to(torch.int64) - self.geometry.first_card
-        active_cards.scatter_add_(
-            2,
-            relative.flatten(2),
-            torch.ones_like(relative.flatten(2), dtype=torch.int16),
-        )
-        collision_free = active_cards.amax(-1).le(1)
+        for first_seat in range(players):
+            first_cards = cards[:, :, first_seat]
+            for second_seat in range(first_seat + 1, players):
+                second_cards = cards[:, :, second_seat]
+                collision_free &= ~(
+                    first_cards[:, :, 0, None]
+                    .eq(second_cards)
+                    .any(-1)
+                    | first_cards[:, :, 1, None]
+                    .eq(second_cards)
+                    .any(-1)
+                )
         accepted = collision_free & fresh[:, None]
         has_success = accepted.any(1)
         first = accepted.to(torch.int64).argmax(1)

@@ -71,13 +71,16 @@ from pbg.queued.rollout import (
     CommitPlan,
     CompletionFIFO,
     DeferredBranchedTopologyPublication,
+    DeviceCommitFailure,
     DrawPurpose,
     FamilyQueueState,
     FamilyScheduler,
+    RolloutCommit,
     RolloutOwnerRegistry,
     RolloutTransaction,
     SampleRequest,
     SampleWorkspace,
+    ScheduledFamily,
     SemanticFamilyFIFO,
     TransitionRequest,
     child_path_keys,
@@ -106,6 +109,18 @@ from pbg.queued.training import (
 
 class BranchedPokerError(RuntimeError):
     """The sampled branched poker composition violated its contract."""
+
+
+class BranchedPosteriorExhaustion(BranchedPokerError):
+    """A bounded posterior sampler exhausted before any publication."""
+
+    def __init__(self, failure: DeviceFailure) -> None:
+        super().__init__(
+            "branched RB posterior rejection exhausted at logical "
+            f"address {failure.logical_address} after "
+            f"{failure.sampler_attempt_count} attempts"
+        )
+        self.failure = failure
 
 
 class BranchedTopologyArenaOverflow(BranchedPokerError):
@@ -178,6 +193,47 @@ def sampled_branched_topology_packet_row_bytes(
     return BRANCHED_TOPOLOGY_PACKET_ROW_BYTES
 
 
+def action_conditioned_log_reach(
+    log_reach: Tensor,
+    selected_log_policy: Tensor,
+    actor: Tensor,
+) -> Tensor:
+    """Condition the acting seat's exact live/folded range on one action."""
+
+    if (
+        log_reach.ndim != 3
+        or selected_log_policy.shape
+        != (log_reach.shape[0], log_reach.shape[2])
+        or actor.shape != log_reach.shape[:1]
+        or actor.dtype not in (torch.int32, torch.int64)
+        or selected_log_policy.device != log_reach.device
+        or actor.device != log_reach.device
+    ):
+        raise BranchedPokerError(
+            "action conditioning requires [B,P,H], [B,H], and [B]"
+        )
+    actor64 = actor.to(torch.int64)
+    torch._assert_async(
+        actor64.ge(0).logical_and(
+            actor64.lt(log_reach.shape[1])
+        ).all(),
+        "action-conditioning actor is outside the seat axis",
+    )
+    selected = log_reach.gather(
+        1,
+        actor64[:, None, None].expand(
+            -1, 1, log_reach.shape[2]
+        ),
+    ).squeeze(1)
+    return log_reach.scatter(
+        1,
+        actor64[:, None, None].expand(
+            -1, 1, log_reach.shape[2]
+        ),
+        (selected + selected_log_policy.float())[:, None],
+    )
+
+
 @dataclass(frozen=True)
 class BranchedPokerResult:
     learner: object
@@ -189,6 +245,32 @@ class BranchedPokerResult:
     root_target_degree: tuple[int, ...]
     duplicate_child_labels: int
     sampled_tree_nodes: int
+    telemetry: BranchedBenchmarkTelemetry | None = None
+
+
+@dataclass(frozen=True)
+class BranchedBenchmarkTelemetry:
+    """Matched-work counters emitted only for explicit benchmark runs."""
+
+    rollout_seconds: float
+    routing_traffic_bytes: int
+    host_synchronizations: int
+    child_reservation_commit_seconds: float
+    target_propagation_seconds: float
+    peak_allocated_bytes: int
+    peak_reserved_bytes: int
+    model_inference_seconds: float = 0.0
+    posterior_and_action_sampling_seconds: float = 0.0
+    transition_seconds: float = 0.0
+    target_kernel_cuda_seconds: float = 0.0
+    rollout_peak_allocated_bytes: int = 0
+    completion_peak_allocated_bytes: int = 0
+    align_peak_allocated_bytes: int = 0
+    targets_peak_allocated_bytes: int = 0
+    model_stage_peak_allocated_bytes: int = 0
+    sampling_stage_peak_allocated_bytes: int = 0
+    transition_stage_peak_allocated_bytes: int = 0
+    target_setup_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -254,6 +336,8 @@ class _CompactNode:
 class BranchedTopologyRecorder:
     """Commit-visible logical expansions assembled into compact CPU topology."""
 
+    inflight_cap = 4
+
     def __init__(
         self,
         *,
@@ -292,13 +376,13 @@ class BranchedTopologyRecorder:
         packet_rows = topology_packet_cap + 1
         self._device_node_buffers = {
             "parent_key": torch.empty(
-                (packet_rows, 2),
+                (self.inflight_cap, packet_rows, 2),
                 dtype=torch.int64,
                 device=device,
             ),
             **{
                 name: torch.empty(
-                    packet_rows,
+                    (self.inflight_cap, packet_rows),
                     dtype=dtype,
                     device=device,
                 )
@@ -318,13 +402,13 @@ class BranchedTopologyRecorder:
         }
         self._device_edge_buffers = {
             "child_key": torch.empty(
-                (packet_rows, 2),
+                (self.inflight_cap, packet_rows, 2),
                 dtype=torch.int64,
                 device=device,
             ),
             **{
                 name: torch.empty(
-                    packet_rows,
+                    (self.inflight_cap, packet_rows),
                     dtype=dtype,
                     device=device,
                 )
@@ -340,7 +424,7 @@ class BranchedTopologyRecorder:
         }
         self._host_node_buffers = {
             name: torch.empty_like(
-                value[:topology_packet_cap],
+                value[:, :topology_packet_cap],
                 device="cpu",
                 pin_memory=True,
             )
@@ -348,28 +432,44 @@ class BranchedTopologyRecorder:
         }
         self._host_edge_buffers = {
             name: torch.empty_like(
-                value[:topology_packet_cap],
+                value[:, :topology_packet_cap],
                 device="cpu",
                 pin_memory=True,
             )
             for name, value in self._device_edge_buffers.items()
         }
         self._host_node_active = torch.ones(
-            topology_packet_cap, dtype=torch.bool, pin_memory=True
+            (self.inflight_cap, topology_packet_cap),
+            dtype=torch.bool,
+            pin_memory=True,
         )
         self._host_edge_active = torch.ones(
-            topology_packet_cap, dtype=torch.bool, pin_memory=True
+            (self.inflight_cap, topology_packet_cap),
+            dtype=torch.bool,
+            pin_memory=True,
         )
         self._produced = torch.empty(
-            len(input_names), dtype=torch.int64, pin_memory=True
+            (self.inflight_cap, len(input_names)),
+            dtype=torch.int64,
+            pin_memory=True,
         )
-        self._sampled_nodes = torch.empty((), dtype=torch.int64, pin_memory=True)
-        self._correction = torch.empty((), dtype=torch.float32, pin_memory=True)
-        self._node_count = torch.empty((), dtype=torch.int64, pin_memory=True)
-        self._edge_count = torch.empty((), dtype=torch.int64, pin_memory=True)
-        self._overflow = torch.empty((), dtype=torch.bool, pin_memory=True)
+        self._sampled_nodes = torch.empty(
+            self.inflight_cap, dtype=torch.int64, pin_memory=True
+        )
+        self._correction = torch.empty(
+            self.inflight_cap, dtype=torch.float32, pin_memory=True
+        )
+        self._node_count = torch.empty(
+            self.inflight_cap, dtype=torch.int64, pin_memory=True
+        )
+        self._edge_count = torch.empty(
+            self.inflight_cap, dtype=torch.int64, pin_memory=True
+        )
+        self._overflow = torch.empty(
+            self.inflight_cap, dtype=torch.bool, pin_memory=True
+        )
         self._observed_demand = torch.empty(
-            (), dtype=torch.int64, pin_memory=True
+            self.inflight_cap, dtype=torch.int64, pin_memory=True
         )
 
     def accept_payload(self, payload: _StagedBranchedPayload) -> None:
@@ -535,6 +635,7 @@ class BranchedTopologyRecorder:
         self,
         records: tuple[_ExpansionRecord, ...],
         *,
+        slot: int,
         produced: Tensor,
         sampled_nodes: Tensor,
         counterfactual_correction: Tensor,
@@ -545,6 +646,7 @@ class BranchedTopologyRecorder:
             not records
             or produced.device != self.device
             or produced.shape != (len(self.input_names),)
+            or not 0 <= slot < self.inflight_cap
         ):
             raise BranchedPokerError("branched topology payload is invalid")
         node_offset = torch.zeros((), dtype=torch.int64, device=self.device)
@@ -567,13 +669,15 @@ class BranchedTopologyRecorder:
                 edge_destination,
                 torch.full_like(edge_destination, dummy),
             )
-            for name, buffer in self._device_node_buffers.items():
+            for name, buffers in self._device_node_buffers.items():
+                buffer = buffers[slot]
                 buffer.index_copy_(
                     0,
                     node_destination,
                     getattr(record, name),
                 )
-            for name, buffer in self._device_edge_buffers.items():
+            for name, buffers in self._device_edge_buffers.items():
+                buffer = buffers[slot]
                 value = getattr(record, name)
                 if name == "source_ordinal":
                     value = node_destination.index_select(
@@ -582,30 +686,34 @@ class BranchedTopologyRecorder:
                 buffer.index_copy_(0, edge_destination, value)
             node_offset += record.node_active.sum(dtype=torch.int64)
             edge_offset += record.edge_active.sum(dtype=torch.int64)
-        for name, host in self._host_node_buffers.items():
+        for name, hosts in self._host_node_buffers.items():
+            host = hosts[slot]
             host.copy_(
-                self._device_node_buffers[name][:-1],
+                self._device_node_buffers[name][slot, :-1],
                 non_blocking=True,
             )
-        for name, host in self._host_edge_buffers.items():
+        for name, hosts in self._host_edge_buffers.items():
+            host = hosts[slot]
             host.copy_(
-                self._device_edge_buffers[name][:-1],
+                self._device_edge_buffers[name][slot, :-1],
                 non_blocking=True,
             )
-        self._produced.copy_(produced, non_blocking=True)
-        self._sampled_nodes.copy_(sampled_nodes.detach(), non_blocking=True)
-        self._correction.copy_(
+        self._produced[slot].copy_(produced, non_blocking=True)
+        self._sampled_nodes[slot].copy_(
+            sampled_nodes.detach(), non_blocking=True
+        )
+        self._correction[slot].copy_(
             counterfactual_correction.detach(), non_blocking=True
         )
-        self._node_count.copy_(node_offset, non_blocking=True)
-        self._edge_count.copy_(edge_offset, non_blocking=True)
-        self._overflow.copy_(
+        self._node_count[slot].copy_(node_offset, non_blocking=True)
+        self._edge_count[slot].copy_(edge_offset, non_blocking=True)
+        self._overflow[slot].copy_(
             node_offset.gt(self.topology_packet_cap)
             | edge_offset.gt(self.topology_packet_cap)
             | frontier_overflow,
             non_blocking=True,
         )
-        self._observed_demand.copy_(
+        self._observed_demand[slot].copy_(
             torch.maximum(
                 torch.maximum(node_offset, edge_offset),
                 frontier_demand,
@@ -613,20 +721,26 @@ class BranchedTopologyRecorder:
             non_blocking=True,
         )
         staged = _ExpansionRecord(
-            node_active=self._host_node_active,
-            edge_active=self._host_edge_active,
-            **self._host_node_buffers,
-            **self._host_edge_buffers,
+            node_active=self._host_node_active[slot],
+            edge_active=self._host_edge_active[slot],
+            **{
+                name: values[slot]
+                for name, values in self._host_node_buffers.items()
+            },
+            **{
+                name: values[slot]
+                for name, values in self._host_edge_buffers.items()
+            },
         )
         return _StagedBranchedPayload(
             (staged,),
-            self._produced,
-            self._sampled_nodes,
-            self._correction,
-            self._node_count,
-            self._edge_count,
-            self._overflow,
-            self._observed_demand,
+            self._produced[slot],
+            self._sampled_nodes[slot],
+            self._correction[slot],
+            self._node_count[slot],
+            self._edge_count[slot],
+            self._overflow[slot],
+            self._observed_demand[slot],
         )
 
     def materialize_cpu(self) -> None:
@@ -919,14 +1033,54 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         self.cost_safeguard = cost_safeguard
         self.child_model = child_model
         self.topology_recorder = topology_recorder
-        self.frontier_cost_forecast = torch.zeros(
+        self.realized_tree_size = torch.zeros(
             (), dtype=torch.float32, device=owners.device
         )
-        self.realized_tree_size = 0
         self.last_topology: DeferredBranchedTopologyPublication | None = None
         self._topology_sequence = 0
         self._refill = False
         self._refill_child_ordinal = 0
+        self.routing_traffic_bytes = 0
+        self._posterior_failed_slots = torch.zeros(
+            topology_recorder.inflight_cap,
+            dtype=torch.bool,
+            device=owners.device,
+        )
+        self._posterior_address_slots = torch.full(
+            (topology_recorder.inflight_cap,),
+            torch.iinfo(torch.int64).max,
+            dtype=torch.int64,
+            device=owners.device,
+        )
+        self._posterior_attempt_slots = torch.zeros(
+            topology_recorder.inflight_cap,
+            dtype=torch.int64,
+            device=owners.device,
+        )
+        self._posterior_failed = self._posterior_failed_slots[0]
+        self._posterior_address = self._posterior_address_slots[0]
+        self._posterior_attempts = self._posterior_attempt_slots[0]
+
+    def _observe_posterior(self) -> None:
+        assert self.posterior_sampler is not None
+        observation = self.posterior_sampler.last_observation
+        assert observation is not None
+        failed = observation.exhausted.any()
+        self._posterior_failed |= failed
+        self._posterior_address.copy_(
+            torch.minimum(
+                self._posterior_address,
+                observation.minimum_failing_address,
+            )
+        )
+        self._posterior_attempts.copy_(
+            torch.maximum(
+                self._posterior_attempts,
+                observation.attempt_count.masked_fill(
+                    ~observation.exhausted, 0
+                ).amax(),
+            )
+        )
 
     def begin_root_refill(self, child_ordinal: int) -> None:
         if self._refill or child_ordinal <= 0:
@@ -936,6 +1090,15 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
 
     def sample(self, request: SampleRequest) -> SampleWorkspace:
         batch = request.batch
+        # Each in-flight commit owns one preallocated sampler-status slot.
+        # The slot is not reused until the four-pack publication group drains.
+        slot = self._topology_sequence % self.topology_recorder.inflight_cap
+        self._posterior_failed = self._posterior_failed_slots[slot]
+        self._posterior_address = self._posterior_address_slots[slot]
+        self._posterior_attempts = self._posterior_attempt_slots[slot]
+        self._posterior_failed.zero_()
+        self._posterior_address.fill_(torch.iinfo(torch.int64).max)
+        self._posterior_attempts.zero_()
         if batch.lane_count != 1:
             raise BranchedPokerError("ordinary Phase 7 hooks require one lane")
         rows = batch.rows
@@ -960,10 +1123,22 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             log_player_ancestor_sum=batch.fields["log_player_ancestor_sum"][0],
             log_ancestor_product=batch.fields["log_ancestor_product"][0],
             frontier_cost=(
-                torch.full_like(values["cost"], self.realized_tree_size)
-                + self.frontier_cost_forecast
-                + missing_frontier_cost
-                if (self.cost_safeguard is not None and self.cost_safeguard.active)
+                self.realized_tree_size.to(values["cost"].dtype).expand_as(
+                    values["cost"]
+                )
+                + (
+                    torch.stack(
+                        tuple(
+                            queue.frontier_cost[0]
+                            for queue in self.queues.values()
+                        )
+                    ).sum()
+                    + missing_frontier_cost
+                    if self.cost_safeguard is not None
+                    and self.cost_safeguard.active
+                    else 0
+                )
+                if self.cost_safeguard is not None
                 else None
             ),
         )
@@ -1030,11 +1205,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 iteration=self.iteration,
                 retry_epoch=self.owners.retry_epoch()[0],
             )
-            assert self.posterior_sampler.last_observation is not None
-            torch._assert_async(
-                ~self.posterior_sampler.last_observation.exhausted.any(),
-                "branched RB posterior rejection exhausted its bounded tail",
-            )
+            self._observe_posterior()
         owner = batch.fields["owner"][0].index_select(0, source).to(torch.int64)
         state = self.machine.state_from_model_input(expanded_input, private)
         raw = {
@@ -1118,14 +1289,10 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             .float()
         )
         actor = state.to_act.to(torch.int64)
-        actor_reach = log_reach.gather(
-            1,
-            actor[:, None, None].expand(-1, 1, self.geometry.private_hands),
-        ).squeeze(1)
-        log_reach = log_reach.scatter(
-            1,
-            actor[:, None, None].expand(-1, 1, self.geometry.private_hands),
-            (actor_reach + selected_log)[:, None],
+        log_reach = action_conditioned_log_reach(
+            log_reach,
+            selected_log,
+            actor,
         )
         fold_log_reach = log_reach
         fold_parent_street = state.street
@@ -1151,39 +1318,36 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             raise BranchedPokerError(
                 "player expansion exceeds the admitted chance frontier"
             )
-        frontier_row = torch.arange(
-            chance_capacity, dtype=torch.int64, device=device
+        action_row = torch.arange(
+            action_total, dtype=torch.int64, device=device
         )
-        action_row = frontier_row.clamp_max(action_total - 1)
-        current_active = frontier_row.lt(action_total) & action_active.index_select(
-            0, action_row
-        )
-        current_key = first_child_key.index_select(0, action_row)
+        current_active = action_active
+        current_key = first_child_key
         current_state = replace(
             next_state,
             **{
-                name: value.index_select(0, action_row)
+                name: value
                 for name, value in next_state.__dict__.items()
                 if isinstance(value, Tensor)
             },
         )
-        current_private = private.index_select(0, action_row)
+        current_private = private
         current_history = replace(
             history,
             **{
-                name: value.index_select(0, action_row)
+                name: value
                 for name, value in history.__dict__.items()
             },
         )
-        current_log_reach = log_reach.index_select(0, action_row)
-        endpoint_source = initial_endpoint_source.index_select(0, action_row)
+        current_log_reach = log_reach
+        endpoint_source = initial_endpoint_source
         endpoint_action = action_row
-        endpoint_mass = initial_endpoint_mass.index_select(0, action_row)
-        endpoint_log_sum = initial_log_sum.index_select(0, action_row)
-        endpoint_log_product = initial_log_product.index_select(0, action_row)
+        endpoint_mass = initial_endpoint_mass
+        endpoint_log_sum = initial_log_sum
+        endpoint_log_product = initial_log_product
         chance_records: list[_ExpansionRecord] = []
         current_beta = torch.ones(
-            chance_capacity, dtype=torch.float32, device=device
+            action_total, dtype=torch.float32, device=device
         )
         sampled_nodes = action_active.sum(dtype=torch.int64)
         frontier_demand = sampled_nodes.clone()
@@ -1191,10 +1355,20 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             (), dtype=torch.bool, device=device
         )
         endpoint_record = torch.zeros(
-            chance_capacity, dtype=torch.int64, device=device
+            action_total, dtype=torch.int64, device=device
         )
         endpoint_record_edge = action_row
         for generation in range(3):
+            current_rows = current_active.numel()
+            generation_capacity = min(
+                chance_capacity,
+                current_rows * self.controller.beta_max,
+            )
+            frontier_row = torch.arange(
+                generation_capacity,
+                dtype=torch.int64,
+                device=device,
+            )
             chance = self.machine.needs_chance(current_state) & current_active
             chance_decision = self.controller.decide(
                 schema=self.mode,
@@ -1242,13 +1416,13 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             cumulative = degree.cumsum(0)
             chance_total = cumulative[-1]
             frontier_demand = torch.maximum(frontier_demand, chance_total)
-            frontier_overflow |= chance_total.gt(chance_capacity)
+            frontier_overflow |= chance_total.gt(generation_capacity)
             next_active = frontier_row < chance_total
             chance_source = torch.searchsorted(
                 cumulative,
                 frontier_row,
                 right=True,
-            ).clamp_max(chance_capacity - 1)
+            ).clamp_max(current_rows - 1)
             prefix = torch.cat(
                 (
                     torch.zeros(1, dtype=torch.int64, device=device),
@@ -1306,11 +1480,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                     iteration=self.iteration,
                     retry_epoch=retry,
                 )
-                assert self.posterior_sampler.last_observation is not None
-                torch._assert_async(
-                    ~self.posterior_sampler.last_observation.exhausted.any(),
-                    "branched RB posterior rejection exhausted its bounded tail",
-                )
+                self._observe_posterior()
             expanded_state = replace(expanded_state, combo_ids=expanded_private)
             appended_history = self.machine.append_chance_history(
                 current_state, chance, current_history
@@ -1381,38 +1551,38 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                     terminal=terminal_child,
                     child_input=self.machine.input_type(dealt_state),
                     child_leaf_row=torch.full(
-                        (chance_capacity,),
+                        (generation_capacity,),
                         -1,
                         dtype=torch.int64,
                         device=device,
                     ),
                     label=chance_label,
                     owner=torch.full(
-                        (chance_capacity,),
+                        (current_rows,),
                         -1,
                         dtype=torch.int32,
                         device=device,
                     ),
                     input_type=torch.full(
-                        (chance_capacity,),
+                        (current_rows,),
                         -1,
                         dtype=torch.int32,
                         device=device,
                     ),
                     familywork_row=torch.full(
-                        (chance_capacity,),
+                        (current_rows,),
                         -1,
                         dtype=torch.int32,
                         device=device,
                     ),
                     sigma_head_row=torch.full(
-                        (chance_capacity,),
+                        (current_rows,),
                         -1,
                         dtype=torch.int32,
                         device=device,
                     ),
                     action_begin=torch.full(
-                        (chance_capacity,),
+                        (current_rows,),
                         -1,
                         dtype=torch.int32,
                         device=device,
@@ -1421,17 +1591,17 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                     nominal_degree=chance_decision.nominal_degree,
                     target_degree=chance_decision.target_degree,
                     trained=torch.zeros(
-                        chance_capacity,
+                        current_rows,
                         dtype=torch.bool,
                         device=device,
                     ),
                     refill=torch.zeros(
-                        chance_capacity,
+                        current_rows,
                         dtype=torch.bool,
                         device=device,
                     ),
                     path_length=torch.ones(
-                        chance_capacity,
+                        generation_capacity,
                         dtype=torch.int32,
                         device=device,
                     ),
@@ -1451,7 +1621,9 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                     ~dealt_state.terminal & ~self.machine.needs_chance(dealt_state)
                     if final_generation
                     else torch.zeros(
-                        chance_capacity, dtype=torch.bool, device=device
+                        generation_capacity,
+                        dtype=torch.bool,
+                        device=device,
                     )
                 ),
             )
@@ -1470,7 +1642,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         log_reach = current_log_reach
         root = current_key[:, 0]
         child_path = current_key[:, 1]
-        total = chance_capacity
+        total = current_active.numel()
         board = next_state.board_cards
         cards = self.machine.combo_cards(
             torch.arange(
@@ -1824,7 +1996,10 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             cost_addition = torch.zeros(
                 1, dtype=torch.float32, device=device
             )
-            if self.cost_safeguard is not None:
+            if (
+                self.cost_safeguard is not None
+                and self.cost_safeguard.active
+            ):
                 selected_role = (
                     None
                     if "role_selector" not in family_source
@@ -1925,6 +2100,21 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             source_ordinal=source_descriptor[None],
             destination=destination_descriptor[None],
             destination_ordinal=ordinal_descriptor[None],
+        )
+        self.routing_traffic_bytes += sum(
+            value.numel() * value.element_size()
+            for value in (
+                route.source_row,
+                route.valid,
+                route.counts,
+                route.offsets,
+                route.family_values,
+                route.declared,
+                coverage.valid,
+                coverage.source_ordinal,
+                coverage.destination,
+                coverage.destination_ordinal,
+            )
         )
 
         trained_prefix = trained.to(torch.int64).cumsum(0) - 1
@@ -2040,12 +2230,17 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         ).sum()
         staged_payload = self.topology_recorder.stage_payload(
             device_records,
+            slot=(
+                self._topology_sequence
+                % self.topology_recorder.inflight_cap
+            ),
             produced=route.counts[0, 1:],
             sampled_nodes=sampled_nodes,
             counterfactual_correction=correction,
             frontier_overflow=frontier_overflow,
             frontier_demand=frontier_demand,
         )
+        self.realized_tree_size.add_(sampled_nodes.to(torch.float32))
         topology_publication = DeferredBranchedTopologyPublication(
             lane=0,
             sequence=self._topology_sequence,
@@ -2064,6 +2259,29 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             published_queues=tuple(published),
             deferred_branched_topology=(topology_publication,),
             queue_cost_additions=tuple(queue_cost_additions),
+            device_failure=(
+                DeviceCommitFailure(
+                    failed=self._posterior_failed.reshape(1),
+                    logical_address=self._posterior_address.reshape(1),
+                    requested_extent=(
+                        self._posterior_attempts + 1
+                    ).reshape(1),
+                    available_extent=torch.full(
+                        (1,),
+                        self.posterior_sampler.max_attempts,
+                        dtype=torch.int64,
+                        device=device,
+                    ),
+                    sampler_attempt_count=(
+                        self._posterior_attempts.reshape(1)
+                    ),
+                    phase="posterior_sample",
+                    failure_code="rejection_exhausted",
+                    input_type=batch.input_type,
+                )
+                if self.posterior_sampler is not None
+                else None
+            ),
         )
 
 
@@ -2098,6 +2316,9 @@ class _BranchedSampledPokerAttempt:
         rank_boundary: Callable[[], None] | None = None,
         completion_samples: int = 0,
         posterior_max_attempts: int = 256,
+        benchmark_telemetry: bool = False,
+        benchmark_identity: Mapping[str, str] | None = None,
+        benchmark_rollout_only: bool = False,
     ) -> None:
         if not mode.rollout_mode.is_branched:
             raise ValueError("branched poker requires a branched mode")
@@ -2253,6 +2474,17 @@ class _BranchedSampledPokerAttempt:
             else CollisionConditionedProfileSampler(
                 geometry, max_attempts=posterior_max_attempts
             )
+        )
+        self.benchmark_telemetry = bool(benchmark_telemetry)
+        self.benchmark_rollout_only = bool(benchmark_rollout_only)
+        if self.benchmark_rollout_only and not self.benchmark_telemetry:
+            raise ValueError(
+                "rollout-only execution is reserved for benchmark telemetry"
+            )
+        self.benchmark_identity = (
+            None
+            if benchmark_identity is None
+            else MappingProxyType(dict(benchmark_identity))
         )
         self._attempt_success = torch.empty(
             (), dtype=torch.bool, pin_memory=True
@@ -2480,10 +2712,10 @@ class _BranchedSampledPokerAttempt:
     def _bounded_mixed_model(
         self, forward: PokerForwardInput, lanes: Tensor
     ) -> Mapping[str, Tensor]:
-        """Run auxiliary T/C forwards in admitted family-pack subspans."""
+        """Run independent inference rows in bounded CUDA subspans."""
 
         rows = int(forward.owner.numel())
-        cap = self.owners.plan.manifest.family_pack_cap
+        cap = min(self.owners.plan.manifest.family_pack_cap, 64)
         if rows <= cap:
             return self._model(forward, lanes)
         pieces: dict[str, list[Tensor]] = {}
@@ -2511,6 +2743,20 @@ class _BranchedSampledPokerAttempt:
 
     def run(self, *, iteration: int) -> BranchedPokerResult:
         owners = self.owners
+        if self.benchmark_telemetry:
+            torch.cuda.synchronize(owners.plan.device)
+            torch.cuda.reset_peak_memory_stats(owners.plan.device)
+            rollout_started = time.perf_counter()
+        else:
+            rollout_started = 0.0
+        child_reservation_commit_seconds = 0.0
+        model_inference_seconds = 0.0
+        posterior_and_action_sampling_seconds = 0.0
+        transition_seconds = 0.0
+        model_stage_peak_allocated_bytes = 0
+        sampling_stage_peak_allocated_bytes = 0
+        transition_stage_peak_allocated_bytes = 0
+        host_synchronizations = 0
         owners.enter_phase(ExecutionPhase.ROLLOUT)
         registry = RolloutOwnerRegistry.from_generated(owners)
         input_names = tuple(
@@ -2529,6 +2775,7 @@ class _BranchedSampledPokerAttempt:
             queue.initialize()
         machine = PokerStateMachine(self.geometry)
         self._publish_roots(machine, queues["pre"], iteration)
+        host_synchronizations += 1
         publisher = AsyncTopologyPublisher(
             registry,
             p_train=(
@@ -2600,7 +2847,7 @@ class _BranchedSampledPokerAttempt:
         )
         depths = {name: 0 for name in input_names}
         depths["pre"] = roots
-        hooks.realized_tree_size = roots
+        hooks.realized_tree_size.fill_(roots)
         logical_time = 0
         last_event: torch.cuda.Event | None = None
         pre_refill_size: int | None = None
@@ -2610,56 +2857,116 @@ class _BranchedSampledPokerAttempt:
         )
         while True:
             while any(depths.values()):
-                states = tuple(
-                    FamilyQueueState(
-                        0,
-                        name,
-                        index,
-                        0,
-                        depths[name],
-                        logical_time,
-                        0,
-                        self.mode,
+                inflight: list[
+                    tuple[
+                        ScheduledFamily,
+                        RolloutCommit,
+                        DeferredBranchedTopologyPublication,
+                    ]
+                ] = []
+                while (
+                    len(inflight) < recorder.inflight_cap
+                    and any(depths.values())
+                ):
+                    states = tuple(
+                        FamilyQueueState(
+                            0,
+                            name,
+                            index,
+                            0,
+                            depths[name],
+                            logical_time,
+                            0,
+                            self.mode,
+                        )
+                        for index, name in enumerate(input_names)
                     )
-                    for index, name in enumerate(input_names)
-                )
-                scheduled = scheduler.select(states, allow_partial=True)
-                if scheduled is None:
-                    raise BranchedPokerError("branched scheduler lost queued work")
-                if logical_time >= owners.plan.manifest.topology_cap:
-                    recorder.release()
-                    raise RecoverableOverflow(
-                        DeviceFailure(
-                            lane=0,
-                            status=1,
-                            phase="branched_topology_sequence",
-                            failure_code="capacity_overflow",
-                            input_type=scheduled.input_type,
-                            logical_address=logical_base,
-                            requested_extent=logical_time + 1,
-                            available_extent=owners.plan.manifest.topology_cap,
-                        ),
-                        capacity=owners.plan.manifest.topology_cap,
-                        observed_demand=logical_time + 1,
+                    scheduled = scheduler.select(states, allow_partial=True)
+                    if scheduled is None:
+                        raise BranchedPokerError(
+                            "branched scheduler lost queued work"
+                        )
+                    if logical_time >= owners.plan.manifest.topology_cap:
+                        recorder.release()
+                        raise RecoverableOverflow(
+                            DeviceFailure(
+                                lane=0,
+                                status=1,
+                                phase="branched_topology_sequence",
+                                failure_code="capacity_overflow",
+                                input_type=scheduled.input_type,
+                                logical_address=logical_base,
+                                requested_extent=logical_time + 1,
+                                available_extent=(
+                                    owners.plan.manifest.topology_cap
+                                ),
+                            ),
+                            capacity=owners.plan.manifest.topology_cap,
+                            observed_demand=logical_time + 1,
+                        )
+                    commit = transaction.execute(
+                        queues[scheduled.input_type],
+                        scheduled,
+                        self._bounded_mixed_model,
+                        hooks,
+                        measure_commit=self.benchmark_telemetry,
                     )
-                hooks.frontier_cost_forecast = torch.stack(
-                    tuple(queue.frontier_cost[0] for queue in queues.values())
-                ).sum()
-                commit = transaction.execute(
-                    queues[scheduled.input_type],
-                    scheduled,
-                    self._model,
-                    hooks,
+                    publication = hooks.last_topology
+                    if publication is None:
+                        raise BranchedPokerError(
+                            "branched commit omitted topology"
+                        )
+                    hooks.last_topology = None
+                    inflight.append((scheduled, commit, publication))
+                    depths[scheduled.input_type] -= scheduled.rows
+                    logical_time += 1
+                last_publication = inflight[-1][2]
+                last_feedback = publisher.wait_branched_feedback(
+                    last_publication
                 )
-                publication = hooks.last_topology
-                if publication is None:
-                    raise BranchedPokerError("branched commit omitted topology")
-                failed, feedback = publisher.wait_branched_feedback(publication)
-                hooks.last_topology = None
-                if failed:
+                host_synchronizations += 1
+                feedback_rows: list[
+                    tuple[
+                        ScheduledFamily,
+                        RolloutCommit,
+                        bool,
+                        object | None,
+                    ]
+                ] = []
+                for scheduled, commit, publication in inflight:
+                    result = (
+                        last_feedback
+                        if publication is last_publication
+                        else publisher.branched_feedback(publication)
+                    )
+                    if result is None:
+                        raise BranchedPokerError(
+                            "ordered branched commit feedback was not visible"
+                        )
+                    failed, feedback = result
+                    feedback_rows.append(
+                        (scheduled, commit, failed, feedback)
+                    )
+                failed_rows = tuple(
+                    row for row in feedback_rows if row[2]
+                )
+                if failed_rows:
                     failure = owners.failure_state.snapshot(0)
-                    if failure is None or failure.failure_code != "capacity_overflow":
-                        raise BranchedPokerError("branched rollout failed terminally")
+                    if (
+                        failure is not None
+                        and failure.failure_code == "rejection_exhausted"
+                    ):
+                        recorder.release()
+                        del feedback, publication
+                        _discard_attempt(owners)
+                        raise BranchedPosteriorExhaustion(failure)
+                    if (
+                        failure is None
+                        or failure.failure_code != "capacity_overflow"
+                    ):
+                        raise BranchedPokerError(
+                            "branched rollout failed terminally"
+                        )
                     recorder.release()
                     del feedback, publication
                     raise RecoverableOverflow(
@@ -2667,39 +2974,92 @@ class _BranchedSampledPokerAttempt:
                         capacity=failure.available_extent,
                         observed_demand=failure.requested_extent,
                     )
-                if not isinstance(feedback, _StagedBranchedPayload):
-                    raise BranchedPokerError(
-                        "branched commit returned invalid pinned feedback"
+                for scheduled, commit, _failed, feedback in feedback_rows:
+                    if not isinstance(feedback, _StagedBranchedPayload):
+                        raise BranchedPokerError(
+                            "branched commit returned invalid pinned feedback"
+                        )
+                    if self.benchmark_telemetry:
+                        assert (
+                            commit.model_started is not None
+                            and commit.model_finished is not None
+                            and commit.sample_finished is not None
+                            and commit.commit_started is not None
+                        )
+                        model_inference_seconds += (
+                            commit.model_started.elapsed_time(
+                                commit.model_finished
+                            )
+                            / 1000.0
+                        )
+                        posterior_and_action_sampling_seconds += (
+                            commit.model_finished.elapsed_time(
+                                commit.sample_finished
+                            )
+                            / 1000.0
+                        )
+                        transition_seconds += (
+                            commit.sample_finished.elapsed_time(
+                                commit.commit_started
+                            )
+                            / 1000.0
+                        )
+                        if (
+                            commit.peak_after_model
+                            > commit.peak_before_model
+                        ):
+                            model_stage_peak_allocated_bytes = max(
+                                model_stage_peak_allocated_bytes,
+                                commit.peak_after_model,
+                            )
+                        if (
+                            commit.peak_after_sample
+                            > commit.peak_after_model
+                        ):
+                            sampling_stage_peak_allocated_bytes = max(
+                                sampling_stage_peak_allocated_bytes,
+                                commit.peak_after_sample,
+                            )
+                        if (
+                            commit.peak_after_transition
+                            > commit.peak_after_sample
+                        ):
+                            transition_stage_peak_allocated_bytes = max(
+                                transition_stage_peak_allocated_bytes,
+                                commit.peak_after_transition,
+                            )
+                        child_reservation_commit_seconds += (
+                            commit.commit_started.elapsed_time(commit.event)
+                            / 1000.0
+                        )
+                    try:
+                        recorder.accept_payload(feedback)
+                    except BranchedTopologyArenaOverflow as overflow:
+                        failure = DeviceFailure(
+                            lane=0,
+                            status=1,
+                            phase="branched_topology",
+                            failure_code="capacity_overflow",
+                            input_type=scheduled.input_type,
+                            logical_address=logical_base,
+                            requested_extent=overflow.observed_demand,
+                            available_extent=overflow.capacity,
+                        )
+                        recorder.release()
+                        raise RecoverableOverflow(
+                            failure,
+                            capacity=overflow.capacity,
+                            observed_demand=overflow.observed_demand,
+                        ) from None
+                    produced = tuple(
+                        int(value) for value in feedback.produced
                     )
-                try:
-                    recorder.accept_payload(feedback)
-                except BranchedTopologyArenaOverflow as overflow:
-                    failure = DeviceFailure(
-                        lane=0,
-                        status=1,
-                        phase="branched_topology",
-                        failure_code="capacity_overflow",
-                        input_type=scheduled.input_type,
-                        logical_address=logical_base,
-                        requested_extent=overflow.observed_demand,
-                        available_extent=overflow.capacity,
-                    )
-                    recorder.release()
-                    hooks.last_topology = None
-                    del feedback, publication
-                    raise RecoverableOverflow(
-                        failure,
-                        capacity=overflow.capacity,
-                        observed_demand=overflow.observed_demand,
-                    ) from None
-                hooks.realized_tree_size += int(feedback.sampled_nodes)
-                depths[scheduled.input_type] -= scheduled.rows
-                produced = tuple(int(value) for value in feedback.produced)
-                for name, count in zip(input_names, produced, strict=True):
-                    depths[name] += count
-                logical_time += 1
-                last_event = commit.event
-                del feedback, publication
+                    for name, count in zip(
+                        input_names, produced, strict=True
+                    ):
+                        depths[name] += count
+                    last_event = commit.event
+                del feedback_rows, inflight
             deficient = next(
                 (
                     root
@@ -2720,6 +3080,7 @@ class _BranchedSampledPokerAttempt:
                     original_row=deficient - logical_base,
                     logical_root=deficient,
                 )
+                host_synchronizations += 1
             except RecoverableOverflow:
                 recorder.release()
                 raise
@@ -2727,6 +3088,20 @@ class _BranchedSampledPokerAttempt:
         assert last_event is not None
         recorder.materialize_cpu()
         topology, bindings, leaf_count = recorder.seal()
+        if self.benchmark_telemetry:
+            torch.cuda.synchronize(owners.plan.device)
+            rollout_seconds = time.perf_counter() - rollout_started
+            rollout_peak_allocated_bytes = int(
+                torch.cuda.max_memory_allocated(owners.plan.device)
+            )
+            rollout_peak_reserved_bytes = int(
+                torch.cuda.max_memory_reserved(owners.plan.device)
+            )
+            torch.cuda.reset_peak_memory_stats(owners.plan.device)
+        else:
+            rollout_seconds = 0.0
+            rollout_peak_allocated_bytes = 0
+            rollout_peak_reserved_bytes = 0
         if pre_refill_size is None:
             pre_refill_size = recorder.sampled_tree_size()
             pre_refill_record_count = recorder.record_count
@@ -2750,6 +3125,7 @@ class _BranchedSampledPokerAttempt:
             ),
             manifest=owners.plan.manifest,
         )
+        hooks_routing_traffic_bytes = hooks.routing_traffic_bytes
         del transaction, publisher, registry, queues, hooks
         if self.rank_boundary is not None:
             self.rank_boundary()
@@ -2839,6 +3215,18 @@ class _BranchedSampledPokerAttempt:
                     "branched target arena padding failed",
                 )
         owners.release_after(ExecutionPhase.COMPLETION)
+        if self.benchmark_telemetry:
+            torch.cuda.synchronize(owners.plan.device)
+            completion_peak_allocated_bytes = int(
+                torch.cuda.max_memory_allocated(owners.plan.device)
+            )
+            completion_peak_reserved_bytes = int(
+                torch.cuda.max_memory_reserved(owners.plan.device)
+            )
+            torch.cuda.reset_peak_memory_stats(owners.plan.device)
+        else:
+            completion_peak_allocated_bytes = 0
+            completion_peak_reserved_bytes = 0
 
         owners.enter_phase(ExecutionPhase.ALIGN_AND_SEAL)
         decision_log_mass = decision_log_path_mass(
@@ -2868,13 +3256,48 @@ class _BranchedSampledPokerAttempt:
                 ),
             )
         owners.release_after(ExecutionPhase.ALIGN_AND_SEAL)
+        if self.benchmark_telemetry:
+            torch.cuda.synchronize(owners.plan.device)
+            align_peak_allocated_bytes = int(
+                torch.cuda.max_memory_allocated(owners.plan.device)
+            )
+            align_peak_reserved_bytes = int(
+                torch.cuda.max_memory_reserved(owners.plan.device)
+            )
+            torch.cuda.reset_peak_memory_stats(owners.plan.device)
+        else:
+            align_peak_allocated_bytes = 0
+            align_peak_reserved_bytes = 0
 
         owners.enter_phase(ExecutionPhase.TARGETS)
+        if self.benchmark_telemetry:
+            torch.cuda.synchronize(owners.plan.device)
+            target_started = time.perf_counter()
         result = LayeredTargetExecutor(
             self.mode,
             algebra,
             lambda_=self.lambda_,
         ).execute(owners, plan)
+        if self.benchmark_telemetry:
+            torch.cuda.synchronize(owners.plan.device)
+            target_propagation_seconds = (
+                time.perf_counter() - target_started
+            )
+        else:
+            target_propagation_seconds = 0.0
+        target_setup_seconds = target_propagation_seconds
+        target_kernel_cuda_seconds = result.counters.cuda_seconds
+        target_propagation_seconds = target_kernel_cuda_seconds
+        if self.benchmark_telemetry:
+            targets_peak_allocated_bytes = int(
+                torch.cuda.max_memory_allocated(owners.plan.device)
+            )
+            targets_peak_reserved_bytes = int(
+                torch.cuda.max_memory_reserved(owners.plan.device)
+            )
+        else:
+            targets_peak_allocated_bytes = 0
+            targets_peak_reserved_bytes = 0
         if result.failed_lanes:
             raise BranchedPokerError("branched layered targets failed")
         if self.cost_safeguard is not None:
@@ -2902,6 +3325,120 @@ class _BranchedSampledPokerAttempt:
                     int(ratio.numel()),
                 )
         owners.release_after(ExecutionPhase.TARGETS)
+
+        def finish(learner_result: object) -> BranchedPokerResult:
+            self.controller.observe(
+                counterfactual_tree_size,
+                iteration=iteration,
+            )
+            if self.run_state is not None:
+                self.run_state.branch_controller_state = (
+                    self.controller.state_dict()
+                )
+                self.run_state.cost_safeguard_state = (
+                    None
+                    if self.cost_safeguard is None
+                    else self.cost_safeguard.state_dict()
+                )
+            owners.close()
+            duplicate_labels = 0
+            for node in range(topology.node_count):
+                begin = int(topology.child_begin[node])
+                count = int(topology.executed_degree[node])
+                labels = topology.label[begin : begin + count]
+                duplicate_labels += count - int(
+                    labels.unique().numel()
+                )
+            telemetry = (
+                BranchedBenchmarkTelemetry(
+                    rollout_seconds=rollout_seconds,
+                    routing_traffic_bytes=hooks_routing_traffic_bytes,
+                    host_synchronizations=host_synchronizations,
+                    child_reservation_commit_seconds=(
+                        child_reservation_commit_seconds
+                    ),
+                    target_propagation_seconds=(
+                        target_propagation_seconds
+                    ),
+                    peak_allocated_bytes=int(
+                        max(
+                            rollout_peak_allocated_bytes,
+                            completion_peak_allocated_bytes,
+                            align_peak_allocated_bytes,
+                            targets_peak_allocated_bytes,
+                        )
+                    ),
+                    peak_reserved_bytes=int(
+                        max(
+                            rollout_peak_reserved_bytes,
+                            completion_peak_reserved_bytes,
+                            align_peak_reserved_bytes,
+                            targets_peak_reserved_bytes,
+                        )
+                    ),
+                    model_inference_seconds=model_inference_seconds,
+                    posterior_and_action_sampling_seconds=(
+                        posterior_and_action_sampling_seconds
+                    ),
+                    transition_seconds=transition_seconds,
+                    target_kernel_cuda_seconds=(
+                        target_kernel_cuda_seconds
+                    ),
+                    rollout_peak_allocated_bytes=(
+                        rollout_peak_allocated_bytes
+                    ),
+                    completion_peak_allocated_bytes=(
+                        completion_peak_allocated_bytes
+                    ),
+                    align_peak_allocated_bytes=(
+                        align_peak_allocated_bytes
+                    ),
+                    targets_peak_allocated_bytes=(
+                        targets_peak_allocated_bytes
+                    ),
+                    model_stage_peak_allocated_bytes=(
+                        model_stage_peak_allocated_bytes
+                    ),
+                    sampling_stage_peak_allocated_bytes=(
+                        sampling_stage_peak_allocated_bytes
+                    ),
+                    transition_stage_peak_allocated_bytes=(
+                        transition_stage_peak_allocated_bytes
+                    ),
+                    target_setup_seconds=target_setup_seconds,
+                )
+                if self.benchmark_telemetry
+                else None
+            )
+            return BranchedPokerResult(
+                learner_result,
+                player_nodes=int(topology.owner.ge(0).sum()),
+                leaves=leaf_count,
+                target_layers=plan.layer_count,
+                executed_edges=topology.edge_count,
+                root_executed_degree=tuple(
+                    int(value)
+                    for value in topology.executed_degree[
+                        topology.parent.eq(-1)
+                    ].tolist()
+                ),
+                root_target_degree=tuple(
+                    int(value)
+                    for value in topology.target_degree[
+                        topology.parent.eq(-1)
+                    ].tolist()
+                ),
+                duplicate_child_labels=duplicate_labels,
+                sampled_tree_nodes=sampled_tree_nodes,
+                telemetry=telemetry,
+            )
+
+        if self.benchmark_rollout_only:
+            owners.enter_phase(ExecutionPhase.LEARNER)
+            owners.release_after(ExecutionPhase.LEARNER)
+            owners.enter_phase(ExecutionPhase.FINAL_BACKWARD)
+            owners.release_after(ExecutionPhase.FINAL_BACKWARD)
+            return finish(None)
 
         owners.enter_phase(ExecutionPhase.LEARNER)
         stores = {
@@ -3027,41 +3564,7 @@ class _BranchedSampledPokerAttempt:
         owners.release_after(ExecutionPhase.LEARNER)
         owners.enter_phase(ExecutionPhase.FINAL_BACKWARD)
         owners.release_after(ExecutionPhase.FINAL_BACKWARD)
-        self.controller.observe(
-            counterfactual_tree_size,
-            iteration=iteration,
-        )
-        if self.run_state is not None:
-            self.run_state.branch_controller_state = self.controller.state_dict()
-            self.run_state.cost_safeguard_state = (
-                None
-                if self.cost_safeguard is None
-                else self.cost_safeguard.state_dict()
-            )
-        owners.close()
-        duplicate_labels = 0
-        for node in range(topology.node_count):
-            begin = int(topology.child_begin[node])
-            count = int(topology.executed_degree[node])
-            labels = topology.label[begin : begin + count]
-            duplicate_labels += count - int(labels.unique().numel())
-        return BranchedPokerResult(
-            optimized,
-            player_nodes=topology.node_count,
-            leaves=leaf_count,
-            target_layers=plan.layer_count,
-            executed_edges=topology.edge_count,
-            root_executed_degree=tuple(
-                int(value)
-                for value in topology.executed_degree[topology.parent.eq(-1)].tolist()
-            ),
-            root_target_degree=tuple(
-                int(value)
-                for value in topology.target_degree[topology.parent.eq(-1)].tolist()
-            ),
-            duplicate_child_labels=duplicate_labels,
-            sampled_tree_nodes=sampled_tree_nodes,
-        )
+        return finish(optimized)
 
     def _target_algebra(self) -> TargetAlgebra:
         if self.mode.private_estimator is PrivateEstimator.SAMPLED:
@@ -3200,13 +3703,16 @@ BranchedPokerIteration = BranchedSampledPokerIteration
 
 
 __all__ = [
+    "BranchedBenchmarkTelemetry",
     "BranchedPokerHooks",
     "BranchedPokerIteration",
     "BranchedPokerError",
+    "BranchedPosteriorExhaustion",
     "BranchedPokerResult",
     "BranchedSampledPokerHooks",
     "BranchedSampledPokerIteration",
     "BranchedTopologyRecorder",
+    "action_conditioned_log_reach",
     "branched_rb_chance_frontier_row_bytes",
     "sampled_branched_chance_frontier_row_bytes",
     "sampled_branched_topology_packet_row_bytes",

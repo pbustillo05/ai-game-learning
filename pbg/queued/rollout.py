@@ -2217,6 +2217,7 @@ class CommitPlan:
         DeferredBranchedTopologyPublication, ...
     ] = ()
     queue_cost_additions: tuple[Tensor, ...] = ()
+    device_failure: DeviceCommitFailure | None = None
 
     def __post_init__(self) -> None:
         if not self.destinations:
@@ -2269,6 +2270,41 @@ class CommitPlan:
             )
 
 
+@dataclass(frozen=True)
+class DeviceCommitFailure:
+    """Device-resident terminal failure that suppresses lane publication."""
+
+    failed: Tensor
+    logical_address: Tensor
+    requested_extent: Tensor
+    available_extent: Tensor
+    sampler_attempt_count: Tensor
+    phase: str
+    failure_code: str
+    input_type: str
+
+    def validate(self, owners: RolloutOwnerRegistry) -> None:
+        expected = (owners.n_replica,)
+        for name, value, dtype in (
+            ("failed", self.failed, torch.bool),
+            ("logical_address", self.logical_address, torch.int64),
+            ("requested_extent", self.requested_extent, torch.int64),
+            ("available_extent", self.available_extent, torch.int64),
+            ("sampler_attempt_count", self.sampler_attempt_count, torch.int64),
+        ):
+            if (
+                value.shape != expected
+                or value.dtype != dtype
+                or value.device != owners.device
+            ):
+                raise RolloutError(
+                    f"commit failure {name} must be {dtype} {expected} "
+                    f"on {owners.device}"
+                )
+        if not self.phase or not self.failure_code or not self.input_type:
+            raise RolloutError("commit failure labels must be nonempty")
+
+
 class RolloutHooks(Protocol):
     """Opaque synthetic/game boundary used by the rollout transaction."""
 
@@ -2293,6 +2329,14 @@ class RolloutCommit:
     failed: Tensor
     sequence: int
     draw_count: Tensor
+    model_started: torch.cuda.Event | None
+    model_finished: torch.cuda.Event | None
+    sample_finished: torch.cuda.Event | None
+    peak_before_model: int
+    peak_after_model: int
+    peak_after_sample: int
+    peak_after_transition: int
+    commit_started: torch.cuda.Event | None
     event: torch.cuda.Event
 
 
@@ -2348,6 +2392,7 @@ class RolloutTransaction:
         *,
         purpose: DrawPurpose = DrawPurpose.ACTION,
         sampler_attempt_count: Tensor | None = None,
+        measure_commit: bool = False,
         failure_injector: Callable[[], None] | None = None,
         post_publish_failure_injector: Callable[[], None] | None = None,
     ) -> RolloutCommit:
@@ -2355,6 +2400,8 @@ class RolloutTransaction:
             raise RolloutError(
                 f"rollout transaction cannot start from {self._state.value}"
             )
+        if type(measure_commit) is not bool:
+            raise TypeError("measure_commit must be bool")
         self._state = _MachineState.READY
         if scheduled.rows > self.owners.family_pack_cap:
             raise RolloutError("scheduled prefix exceeds manifest family_pack_cap")
@@ -2367,12 +2414,41 @@ class RolloutTransaction:
             )
         self.owners.require(source.family)
         self.owners.require(source.metadata)
+        peak_before_model = (
+            int(torch.cuda.max_memory_allocated(self.device))
+            if measure_commit
+            else 0
+        )
         with torch.cuda.stream(self.model_stream):
             batch = source.stable_prefix(scheduled)
             before = self.owners.guard()
             model_input = hooks.model_input(batch)
+            model_started = (
+                torch.cuda.Event(enable_timing=True, blocking=False)
+                if measure_commit
+                else None
+            )
+            model_finished = (
+                torch.cuda.Event(enable_timing=True, blocking=False)
+                if measure_commit
+                else None
+            )
+            sample_finished = (
+                torch.cuda.Event(enable_timing=True, blocking=False)
+                if measure_commit
+                else None
+            )
+            if model_started is not None:
+                model_started.record(self.model_stream)
             model_workspace = ModelWorkspace(
                 MappingProxyType(dict(model(model_input, batch.lanes)))
+            )
+            if model_finished is not None:
+                model_finished.record(self.model_stream)
+            peak_after_model = (
+                int(torch.cuda.max_memory_allocated(self.device))
+                if measure_commit
+                else 0
             )
             self._state = _MachineState.MODELED
             logical = batch.fields["logical_rng_key"]
@@ -2400,6 +2476,13 @@ class RolloutTransaction:
                     model_workspace,
                     rng_key,
                 )
+            )
+            if sample_finished is not None:
+                sample_finished.record(self.model_stream)
+            peak_after_sample = (
+                int(torch.cuda.max_memory_allocated(self.device))
+                if measure_commit
+                else 0
             )
             if (
                 sampled.draw_count.shape != (batch.lane_count,)
@@ -2506,6 +2589,14 @@ class RolloutTransaction:
             )
             sample_ready = torch.cuda.Event(blocking=False)
             sample_ready.record(self.model_stream)
+            device_failure = plan.device_failure
+            if device_failure is not None:
+                device_failure.validate(self.owners)
+            peak_after_transition = (
+                int(torch.cuda.max_memory_allocated(self.device))
+                if measure_commit
+                else 0
+            )
         for publication in plan.topology:
             if publication.lane >= self.n_replica:
                 raise RolloutError("topology publication lane is outside replicas")
@@ -2537,6 +2628,13 @@ class RolloutTransaction:
         try:
             with torch.cuda.stream(self.commit_stream):
                 self.commit_stream.wait_event(sample_ready)
+                commit_started = (
+                    torch.cuda.Event(enable_timing=True, blocking=False)
+                    if measure_commit
+                    else None
+                )
+                if commit_started is not None:
+                    commit_started.record(self.commit_stream)
                 for publication in plan.topology:
                     self.commit_stream.wait_event(
                         publication.draft.validation_event
@@ -2559,8 +2657,30 @@ class RolloutTransaction:
                     destinations,
                     phase="rollout_commit",
                     active=active_lanes,
-                    sampler_attempt_count=sampler_attempt_count,
+                    sampler_attempt_count=(
+                        device_failure.sampler_attempt_count
+                        if device_failure is not None
+                        else sampler_attempt_count
+                    ),
+                    blocked=(
+                        None
+                        if device_failure is None
+                        else device_failure.failed
+                    ),
                 )
+                if device_failure is not None:
+                    self.owners.failure_state.record_device(
+                        failed=device_failure.failed,
+                        logical_address=device_failure.logical_address,
+                        requested_extent=device_failure.requested_extent,
+                        available_extent=device_failure.available_extent,
+                        sampler_attempt_count=(
+                            device_failure.sampler_attempt_count
+                        ),
+                        phase=device_failure.phase,
+                        failure_code=device_failure.failure_code,
+                        input_type=device_failure.input_type,
+                    )
                 resolved_rows = tuple(
                     self.topology.resolve_rows(publication, transaction)
                     for publication in plan.topology
@@ -2707,7 +2827,9 @@ class RolloutTransaction:
                         marker,
                         stream=self.commit_stream,
                     )
-                commit_ready = torch.cuda.Event(blocking=False)
+                commit_ready = torch.cuda.Event(
+                    enable_timing=measure_commit, blocking=False
+                )
                 commit_ready.record(self.commit_stream)
                 for publication in plan.deferred_branched_topology:
                     self.topology.finalize_branched(
@@ -2753,6 +2875,14 @@ class RolloutTransaction:
             failed=active_lanes & ~success,
             sequence=sequence,
             draw_count=full_draw_count,
+            model_started=model_started,
+            model_finished=model_finished,
+            sample_finished=sample_finished,
+            peak_before_model=peak_before_model,
+            peak_after_model=peak_after_model,
+            peak_after_sample=peak_after_sample,
+            peak_after_transition=peak_after_transition,
+            commit_started=commit_started,
             event=commit_ready,
         )
 
@@ -3093,6 +3223,7 @@ __all__ = [
     "CompletionPlan",
     "DeferredBranchedTopologyPublication",
     "DeferredUnaryTopologyPublication",
+    "DeviceCommitFailure",
     "DeviceStableRoute",
     "DrawPurpose",
     "EndpointPatch",

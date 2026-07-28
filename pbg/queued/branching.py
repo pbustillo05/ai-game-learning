@@ -893,7 +893,8 @@ class BranchedOverflowRecovery(Generic[AttemptResult]):
             local_failure = None
             if self.controller.at_minimum:
                 raise TrainingError(
-                    "minimum branched control overflowed fixed capacity"
+                    "minimum branched control overflowed fixed capacity: "
+                    f"{failure.failure}"
                 ) from failure
             old = self.controller.state_dict()
             self.controller.backoff()

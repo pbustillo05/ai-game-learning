@@ -383,6 +383,81 @@ class DeviceFailureState:
             row[self._AVAILABLE].fill_(failure.available_extent)
             row[self._ATTEMPTS].fill_(failure.sampler_attempt_count)
 
+    def record_device(
+        self,
+        *,
+        failed: Tensor,
+        logical_address: Tensor,
+        requested_extent: Tensor,
+        available_extent: Tensor,
+        sampler_attempt_count: Tensor,
+        phase: str,
+        failure_code: str,
+        input_type: str,
+    ) -> None:
+        """Merge a fixed-label CUDA failure without synchronizing the host."""
+
+        self._check_live()
+        expected = (self.n_replica,)
+        for name, value, dtype in (
+            ("failed", failed, torch.bool),
+            ("logical_address", logical_address, torch.int64),
+            ("requested_extent", requested_extent, torch.int64),
+            ("available_extent", available_extent, torch.int64),
+            ("sampler_attempt_count", sampler_attempt_count, torch.int64),
+        ):
+            if (
+                value.shape != expected
+                or value.dtype != dtype
+                or value.device != self.device
+            ):
+                raise ValueError(
+                    f"device failure {name} must be {dtype} {expected} "
+                    f"on {self.device}"
+                )
+        if not phase or not failure_code or not input_type:
+            raise ValueError("device failure labels must be nonempty")
+        records = self._records
+        current_address = records[:, self._ADDRESS]
+        replace = failed & logical_address.ge(0) & (
+            logical_address < current_address
+        )
+        values = (
+            (
+                self._STATUS,
+                torch.ones_like(current_address),
+            ),
+            (
+                self._PHASE,
+                torch.full_like(
+                    current_address,
+                    self._id(self._phase_ids, phase),
+                ),
+            ),
+            (
+                self._CODE,
+                torch.full_like(
+                    current_address,
+                    self._id(self._code_ids, failure_code),
+                ),
+            ),
+            (
+                self._INPUT,
+                torch.full_like(
+                    current_address,
+                    self._id(self._input_ids, input_type),
+                ),
+            ),
+            (self._ADDRESS, logical_address),
+            (self._REQUESTED, requested_extent),
+            (self._AVAILABLE, available_extent),
+            (self._ATTEMPTS, sampler_attempt_count),
+        )
+        for column, value in values:
+            records[:, column].copy_(
+                torch.where(replace, value, records[:, column])
+            )
+
     def snapshot(self, lane: int) -> DeviceFailure | None:
         self._check_live()
         lane = _nonnegative_integer(lane, "lane")
@@ -904,6 +979,7 @@ class PublicationTransaction:
         phase: str,
         active: Tensor,
         sampler_attempt_count: Tensor | None = None,
+        blocked: Tensor | None = None,
     ) -> "_DevicePublicationTransaction":
         """Begin the sole device-counted form of a publication transaction."""
 
@@ -912,6 +988,7 @@ class PublicationTransaction:
             phase=phase,
             active=active,
             sampler_attempt_count=sampler_attempt_count,
+            blocked=blocked,
         )
 
     def fill(self, index: int, values: Mapping[str, Tensor]) -> None:
@@ -1009,6 +1086,7 @@ class _DevicePublicationTransaction:
         phase: str,
         active: Tensor,
         sampler_attempt_count: Tensor | None = None,
+        blocked: Tensor | None = None,
     ) -> None:
         if not requests:
             raise ValueError("a device publication requires destinations")
@@ -1027,6 +1105,17 @@ class _DevicePublicationTransaction:
         ):
             raise ValueError("active lanes must be CUDA bool [n_replica]")
         self.active = active
+        if blocked is None:
+            blocked = torch.zeros_like(active)
+        if (
+            blocked.shape != (self.n_replica,)
+            or blocked.dtype != torch.bool
+            or blocked.device != self.device
+        ):
+            raise ValueError(
+                "blocked lanes must be CUDA bool [n_replica]"
+            )
+        self.blocked = blocked
         if sampler_attempt_count is None:
             sampler_attempt_count = torch.zeros(
                 self.n_replica, dtype=torch.int64, device=self.device
@@ -1066,7 +1155,7 @@ class _DevicePublicationTransaction:
             for request, begin in zip(requests, self._begins)
         )
         fits = torch.stack(self._fits).all(0)
-        self.success = self.active & fits
+        self.success = self.active & fits & ~self.blocked
         self.failed = self.active & ~fits
         self._ends = tuple(
             begin + request.counts.clamp(0, request.max_rows)
@@ -1085,12 +1174,14 @@ class _DevicePublicationTransaction:
         phase: str,
         active: Tensor,
         sampler_attempt_count: Tensor | None = None,
+        blocked: Tensor | None = None,
     ) -> "_DevicePublicationTransaction":
         return cls(
             tuple(requests),
             phase=phase,
             active=active,
             sampler_attempt_count=sampler_attempt_count,
+            blocked=blocked,
         )
 
     @property
