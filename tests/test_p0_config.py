@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from pbg.config import ConfigError, load_config, load_config_mapping
-from pbg.core.config import SequentialModeConfig
+from pbg.games.poker.queued.config import SequentialModeConfig
 
 
 ROOT = Path(__file__).parents[1]
@@ -65,8 +65,10 @@ def test_legacy_root_shapes_are_rejected_with_dotted_paths(
 
 
 def test_runtime_hardware_overlay_is_rejected() -> None:
-    with pytest.raises(ConfigError, match="profile overlays"):
-        load_config(CONFIG, hardware_profile="local_3x2080ti")
+    with pytest.raises(TypeError, match="hardware_profile"):
+        load_config(  # type: ignore[call-arg]
+            CONFIG, hardware_profile="local_3x2080ti"
+        )
 
 
 @pytest.mark.parametrize(

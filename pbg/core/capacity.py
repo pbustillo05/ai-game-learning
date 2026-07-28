@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import IntEnum
@@ -81,49 +80,21 @@ class NamedShape:
 
 
 @dataclass(frozen=True)
-class GameGeometry:
-    """The active run's validated equal-stack compact-deck geometry."""
+class ExecutionGeometry:
+    """Game-supplied scalar bounds needed by generic capacity admission."""
 
-    players: int
-    stack_bb: float
-    rank_count: int
+    actor_count: int
+    occurrence_bound: int
     model_token_bound: int
     model_token_pair_bound: int
 
     def __post_init__(self) -> None:
-        if isinstance(self.players, bool) or not 2 <= self.players <= 6:
-            raise CapacityError("players must be an integer in [2, 6]")
-        if (
-            isinstance(self.stack_bb, bool)
-            or not isinstance(self.stack_bb, (int, float))
-            or not math.isfinite(float(self.stack_bb))
-            or not 8.0 <= float(self.stack_bb) <= 128.0
-            or not math.isclose(float(self.stack_bb) * 2.0, round(float(self.stack_bb) * 2.0))
-        ):
-            raise CapacityError(
-                "stack_bb must be in [8, 128] in 0.5 big-blind increments"
-            )
-        if (
-            isinstance(self.rank_count, bool)
-            or not isinstance(self.rank_count, int)
-            or not 4 <= self.rank_count <= 13
-        ):
-            raise CapacityError("rank_count must be an integer in [4, 13]")
-        if 2 * self.players + 5 >= 4 * self.rank_count:
-            raise CapacityError("geometry does not leave one undealt card")
+        _positive_int(self.actor_count, "actor_count")
+        _positive_int(self.occurrence_bound, "occurrence_bound")
         _positive_int(self.model_token_bound, "model_token_bound")
         _positive_int(self.model_token_pair_bound, "model_token_pair_bound")
         if self.model_token_pair_bound < self.model_token_bound:
             raise CapacityError("model token-pair bound is smaller than token bound")
-
-    @property
-    def player_node_bound(self) -> int:
-        return math.ceil(
-            float(self.stack_bb) * self.players
-            + 3 * self.players
-            - float(self.stack_bb)
-            + 1
-        )
 
 
 @dataclass(frozen=True)
@@ -181,6 +152,7 @@ class PhysicalLayout:
     reference_cache_bytes: int = 0
     field_alignment: int = 64
     model_dtype: torch.dtype = torch.float32
+    opaque_fields: tuple[SoAField, ...] = ()
 
     def __post_init__(self) -> None:
         shapes = tuple(self.model_input_shapes)
@@ -218,6 +190,10 @@ class PhysicalLayout:
             )
         if self.model_dtype not in (torch.float32, torch.float16, torch.bfloat16):
             raise CapacityError("model_dtype must be fp32, fp16, or bf16")
+        opaque = tuple(self.opaque_fields)
+        if len({item.name for item in opaque}) != len(opaque):
+            raise CapacityError("opaque field contracts contain duplicate names")
+        object.__setattr__(self, "opaque_fields", opaque)
 
     @property
     def input_shapes(self) -> Mapping[str, tuple[int, ...]]:
@@ -230,7 +206,7 @@ class PhysicalLayout:
 class CapacityManifest:
     """The sole immutable source for every fixed run capacity."""
 
-    geometry: GameGeometry
+    geometry: ExecutionGeometry
     root_count: int
     n_replica: int
     beta_max: int
@@ -443,7 +419,7 @@ def _field(
         "reservation_state",
         "publication_state",
         "role_selector",
-        "probe_cutoff",
+        "response_cutoff",
     ):
         return SoAField(field_name, torch.uint8, (), alignment)
     if field_name == "model_input":
@@ -461,7 +437,7 @@ def _field(
         "executed_degree",
         "target_degree",
         "action",
-        "selected_player",
+        "trained_actor",
         "head",
         "ready_tail",
         "reserved_tail",
@@ -471,14 +447,12 @@ def _field(
     ):
         fill = (
             integer_fill
-            if field_name in ("owner", "action", "selected_player", "action_begin")
+            if field_name in ("owner", "action", "trained_actor", "action_begin")
             else 0
         )
         shape = (4,) if field_name == "controller_state" else ()
         return SoAField(field_name, torch.int32, shape, alignment, fill)
-    if field_name == "board_cards":
-        return SoAField(field_name, torch.uint8, (5,), alignment, 255)
-    if field_name in ("combo_ids", "stratum_level"):
+    if field_name == "stratum_level":
         return SoAField(field_name, torch.int32, (players,), alignment, integer_fill)
     if field_name == "payoff_baseline":
         return SoAField(field_name, torch.float32, (players,), alignment)
@@ -538,6 +512,9 @@ def _field(
         return SoAField(field_name, torch.float32, (), alignment)
     if field_name in ("cost", "delta"):
         return SoAField(field_name, torch.float32, (2,), alignment)
+    for opaque in layout.opaque_fields:
+        if opaque.name == field_name:
+            return opaque
     raise CapacityError(f"no physical field contract for {owner_name}.{field_name}")
 
 
@@ -597,7 +574,7 @@ def _validate_manifest(
         raise CapacityError("queued storage manifests require CUDA")
     if not torch.cuda.is_available():
         raise CapacityError("CUDA is unavailable")
-    if layout.player_count != manifest.geometry.players:
+    if layout.player_count != manifest.geometry.actor_count:
         raise CapacityError("physical layout and game geometry player counts differ")
     if set(layout.input_shapes) != {item.name for item in partitions.inputs}:
         raise CapacityError(
@@ -642,7 +619,7 @@ def _validate_manifest(
     action_rows = sum(manifest.partition_rows("action_cap").values())
     folded_rows = sum(manifest.partition_rows("folded_range_cap").values())
     geometry = manifest.geometry
-    minimum_player_rows = manifest.root_count * geometry.player_node_bound
+    minimum_player_rows = manifest.root_count * geometry.occurrence_bound
     if player_rows < minimum_player_rows:
         raise CapacityError(
             f"player_node_cap={player_rows} does not cover geometry bound "
@@ -1100,7 +1077,7 @@ __all__ = [
     "CapacityManifest",
     "ExecutionPhase",
     "ExternalWorkspaceBounds",
-    "GameGeometry",
+    "ExecutionGeometry",
     "GeneratedOwners",
     "HardwareLimits",
     "MemoryReport",

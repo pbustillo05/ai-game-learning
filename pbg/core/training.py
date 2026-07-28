@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import signal
 import warnings
 from collections.abc import Callable, Mapping
@@ -572,43 +571,6 @@ class PreemptionNotice:
         return self.requested_signal is not None
 
 
-def convert_value_head_units(
-    state: Mapping[str, Tensor],
-    *,
-    stack_bb: float,
-    source: str,
-    destination: str,
-) -> dict[str, Tensor]:
-    """Convert only final pre/post value affine weights and biases."""
-
-    if (
-        not math.isfinite(stack_bb)
-        or stack_bb <= 0
-        or source not in ("raw_bb", "stack_normalized")
-        or destination not in ("raw_bb", "stack_normalized")
-    ):
-        raise ValueError("utility conversion arguments are invalid")
-    result = {name: value.detach().clone() for name, value in state.items()}
-    if source == destination:
-        return result
-    scale = stack_bb if source == "stack_normalized" else 1.0 / stack_bb
-    selected = tuple(
-        name
-        for name in result
-        if name.startswith(("preflop.", "postflop."))
-        and name.endswith(
-            ("value_head.affine.weight", "value_head.affine.bias")
-        )
-    )
-    if len(selected) != 4:
-        raise ValueError(
-            "utility conversion requires exactly two final value affine layers"
-        )
-    for name in selected:
-        result[name].mul_(scale)
-    return result
-
-
 __all__ = [
     "AttemptAddress",
     "BranchedSampledIteration",
@@ -619,5 +581,4 @@ __all__ = [
     "SequentialOverflowRecovery",
     "SequentialSampledIteration",
     "TrainingError",
-    "convert_value_head_units",
 ]

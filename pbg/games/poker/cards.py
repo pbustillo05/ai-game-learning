@@ -13,8 +13,6 @@ import math
 from types import MappingProxyType
 from typing import Mapping
 
-import torch
-from torch import Tensor
 
 CATEGORY_NAMES = (
     "high_card",
@@ -102,7 +100,6 @@ class DeckGeometry:
     class_of_combo: tuple[int, ...] = field(init=False)
     class_memberships: tuple[tuple[int, ...], ...] = field(init=False)
     categories: CategoryProfile = field(init=False)
-    _combo_index: Mapping[tuple[int, int], int] = field(init=False, repr=False)
 
     def __deepcopy__(self, memo: dict[int, object]) -> DeckGeometry:
         """Return this immutable value object during model snapshot copies."""
@@ -138,9 +135,6 @@ class DeckGeometry:
         object.__setattr__(self, "first_card", first)
         object.__setattr__(self, "active_cards", cards)
         object.__setattr__(self, "combo_cards", combos)
-        object.__setattr__(
-            self, "_combo_index", MappingProxyType({combo: i for i, combo in enumerate(combos)})
-        )
         object.__setattr__(self, "class_of_combo", classes)
         object.__setattr__(
             self,
@@ -148,52 +142,3 @@ class DeckGeometry:
             tuple(tuple(i for i, value in enumerate(classes) if value == k) for k in range(r * r)),
         )
         object.__setattr__(self, "categories", category_profile(r))
-
-    def hand_index(self, a: int, b: int) -> int:
-        """Return the compact ID of an unordered active-card pair."""
-
-        if a == b:
-            raise ValueError("a hand must contain two distinct cards")
-        key = (a, b) if a < b else (b, a)
-        try:
-            return self._combo_index[key]
-        except KeyError as exc:
-            raise ValueError("hand contains a card outside the active deck") from exc
-
-    def hand_cards(self, hand: int) -> tuple[int, int]:
-        if isinstance(hand, bool) or not isinstance(hand, int) or not 0 <= hand < self.n_hands:
-            raise ValueError(f"hand ids must be integers in [0,{self.n_hands})")
-        return self.combo_cards[hand]
-
-    def class_members(self, class_id: int) -> tuple[int, ...]:
-        if (
-            isinstance(class_id, bool)
-            or not isinstance(class_id, int)
-            or not 0 <= class_id < self.n_classes
-        ):
-            raise ValueError(f"class ids must be integers in [0,{self.n_classes})")
-        return self.class_memberships[class_id]
-
-    def board_conflict_mask(self, board: Tensor) -> Tensor:
-        """Return compact combo conflicts for ``[5]`` or ``[B,5]`` boards."""
-
-        if not isinstance(board, Tensor) or board.ndim not in (1, 2):
-            raise ValueError("board must be a tensor with shape [5] or [B,5]")
-        squeeze = board.ndim == 1
-        rows = board.unsqueeze(0) if squeeze else board
-        if rows.shape[-1] != 5:
-            raise ValueError("board must have exactly five slots")
-        real = (rows >= self.first_card) & (rows < 52)
-        padding = (rows == -1) | (rows == 255)
-        if not bool((real | padding).all()):
-            raise ValueError("board contains a card outside the active deck")
-        for row, valid in zip(rows, real, strict=True):
-            cards = row[valid]
-            if cards.numel() != torch.unique(cards).numel():
-                raise ValueError("board cards must be unique")
-        combos = torch.tensor(self.combo_cards, dtype=rows.dtype, device=rows.device)
-        conflict = (
-            (combos[None, :, :, None] == rows[:, None, None, :])
-            & real[:, None, None, :]
-        ).any(dim=-1).any(dim=-1)
-        return conflict[0] if squeeze else conflict

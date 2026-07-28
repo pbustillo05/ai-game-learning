@@ -474,15 +474,6 @@ class QueuedPokerModel(nn.Module):
     ) -> ModelEvaluation:
         return self.forward_sequential_partition(input_type, model_input)
 
-    def sequential_rollout_operation(
-        self,
-        input_type: str,
-        model_input: Tensor,
-        _private_state: Tensor,
-        _owner: Tensor,
-    ) -> ModelEvaluation:
-        return self.forward_sequential_partition(input_type, model_input)
-
     def rb_learner_operation(
         self,
         input_type: str,

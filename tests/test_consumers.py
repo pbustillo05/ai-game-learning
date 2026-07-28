@@ -22,7 +22,7 @@ from pbg.inference_artifact import (
     export_inference_artifact,
     load_inference_source,
 )
-from pbg.core import RunState, model_state_sha256, sha256_file
+from pbg.core.persistence import RunState, model_state_sha256, sha256_file
 from pbg.core.persistence import (
     CHECKPOINT_SCHEMA,
     load_distributed_checkpoint_manifest,
@@ -80,8 +80,8 @@ def test_run_state_requires_the_exact_nested_logical_work_schema() -> None:
 
 
 def test_public_config_rejects_legacy_aliases_and_profile_overlays() -> None:
-    with pytest.raises(ConfigError, match="profile overlays"):
-        load_config(CONFIG, hardware_profile="legacy")
+    with pytest.raises(TypeError, match="hardware_profile"):
+        load_config(CONFIG, hardware_profile="legacy")  # type: ignore[call-arg]
     import yaml
 
     raw = yaml.safe_load(CONFIG.read_text())

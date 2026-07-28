@@ -11,17 +11,22 @@ import torch
 from torch import Tensor
 
 from pbg.devices import assert_module_device, resolve_execution_device
-from pbg.games.poker.queued import (
-    CHECK_CALL,
-    FOLD,
+from pbg.games.poker.queued.hooks import (
+    FOLDED,
+    LIVE,
+    PAD_CARD,
+    RAISE_OFFSET,
     NLHEGeometry,
-    PokerPolicyOperator,
     PokerState,
     PokerStateMachine,
-    build_model_from_config,
+)
+from pbg.games.poker.queued.model import build_model_from_config
+from pbg.games.poker.queued.policy import (
+    CHECK_CALL,
+    FOLD,
+    PokerPolicyOperator,
 )
 from pbg.games.poker.queued.evaluator import bound_evaluator
-from pbg.games.poker.queued.hooks import FOLDED, LIVE, PAD_CARD, RAISE_OFFSET
 from pbg.inference_artifact import load_inference_source
 
 _RANKS = "23456789TJQKA"

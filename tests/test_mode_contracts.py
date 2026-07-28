@@ -4,9 +4,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
-import torch
-
-from pbg.core import (
+from pbg.core.contracts import (
     CAPACITY_VOCABULARY,
     MODE_SCHEMAS,
     ContractError,
@@ -19,7 +17,6 @@ from pbg.core import (
     TrainingRegime,
     mode_schema,
     validate_replica_group,
-    validate_schema_on_cuda,
 )
 from tests.static_gates import (
     accepted_root_violations,
@@ -118,10 +115,10 @@ def test_inapplicable_fields_are_absent() -> None:
 
         assert ("role_selector" in family) is is_response
         assert ("sampled_private_state" in family) is is_sampled
-        assert ("combo_ids" in leaf) is is_sampled
+        assert ("leaf_private_profile" in leaf) is is_sampled
         assert ("range_weights" in leaf) is (not is_sampled)
         assert ("seed" in leaf) is (not is_sampled)
-        assert ("selected_player" in leaf) is is_response
+        assert ("trained_actor" in leaf) is is_response
         assert ("old_trace" in sigma_head) is is_branched
         assert ("old_cost" in sigma_head) is is_branched
         assert ("trace_target" in sigma_target) is is_branched
@@ -232,23 +229,6 @@ def test_core_import_and_vocabulary_firewalls(tmp_path: Path) -> None:
     stale = tmp_path / "pbg" / "queued"
     stale.mkdir(parents=True)
     assert stale_cutover_violations(tmp_path) == ("pbg/queued",)
-
-
-def test_representative_schemas_validate_on_cuda() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for the repository acceptance run")
-    device = torch.device("cuda", torch.cuda.current_device())
-    for schema in (
-        mode_schema("self_play", "sequential", "sampled"),
-        mode_schema("best_response", "branched.fixed", "rao_blackwell"),
-        mode_schema("self_play", "branched.KKT", "sampled"),
-    ):
-        validate_schema_on_cuda(schema, device)
-
-
-def test_schema_validation_rejects_non_cuda_device() -> None:
-    with pytest.raises(ContractError, match="only on CUDA"):
-        validate_schema_on_cuda(MODE_SCHEMAS[0], "cpu")
 
 
 def test_cutover_deleted_legacy_core_and_poker_modules() -> None:

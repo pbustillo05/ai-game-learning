@@ -14,14 +14,6 @@ from torch import Tensor
 SHARED_RESPONSE_SEMANTICS = "shared_seat_approximate_response_v1"
 
 
-def training_probe_seats(keys: Tensor, players: int) -> Tensor:
-    if keys.dtype != torch.int64 or keys.ndim != 1:
-        raise TypeError("probe keys must be one-dimensional int64")
-    if isinstance(players, bool) or not isinstance(players, int) or players < 2:
-        raise ValueError("players must be an integer of at least two")
-    return keys.remainder(players).to(torch.int32)
-
-
 def balanced_evaluation_probe_seats(
     trajectory_ids: Tensor, players: int
 ) -> Tensor:
@@ -325,5 +317,4 @@ __all__ = [
     "balanced_evaluation_probe_seats",
     "paired_probe_statistics",
     "probe_evaluation_design",
-    "training_probe_seats",
 ]

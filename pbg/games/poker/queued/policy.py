@@ -298,37 +298,11 @@ class PokerPolicyOperator:
         return PolicyEvaluation(selected, entropy, reference_kl)
 
 
-class BoundPokerPolicy:
-    """Bind public legality once for the generic learner callback."""
-
-    def __init__(self, operator: PokerPolicyOperator, legality: PokerLegality) -> None:
-        self.operator = operator
-        self.legality = legality
-
-    def __call__(
-        self,
-        raw: Mapping[str, Tensor],
-        action: Tensor,
-        sampled_private_state: Tensor,
-        owner: Tensor,
-        reference_raw: Mapping[str, Tensor] | None,
-    ) -> PolicyEvaluation:
-        return self.operator.learner(
-            raw,
-            self.legality,
-            action,
-            sampled_private_state,
-            owner,
-            reference_raw,
-        )
-
-
 __all__ = [
     "CHECK_CALL",
     "FOLD",
     "RAISE_OFFSET",
     "ActorSample",
-    "BoundPokerPolicy",
     "PokerLegality",
     "PokerPolicyError",
     "PokerPolicyOperator",

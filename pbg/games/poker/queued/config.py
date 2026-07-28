@@ -1,4 +1,4 @@
-"""Closed Phase 5 configuration with dotted-path diagnostics."""
+"""Strict NLHE scientific configuration with dotted-path diagnostics."""
 
 from __future__ import annotations
 
@@ -28,21 +28,17 @@ def _is_sha256(value: object) -> bool:
     )
 
 
-def _closed(
-    cls: type[T], value: object, path: str, aliases: Mapping[str, str] | None = None
-) -> T:
+def _closed(cls: type[T], value: object, path: str) -> T:
     source = dict(_mapping(value, path))
-    aliases = {} if aliases is None else aliases
     translated: dict[str, object] = {}
     field_names = tuple(field.name for field in fields(cls))
     allowed = set(field_names)
     for key, item in source.items():
-        name = aliases.get(key, key)
-        if name not in allowed:
+        if key not in allowed:
             raise ValueError(f"{path}.{key}: unknown configuration field")
-        if name in translated:
+        if key in translated:
             raise ValueError(f"{path}.{key}: duplicate configuration field")
-        translated[name] = item
+        translated[key] = item
     try:
         return cls(**translated)
     except (TypeError, ValueError) as exc:
@@ -55,7 +51,7 @@ def _closed(
 
 
 @dataclass(frozen=True)
-class Phase5GameConfig:
+class PokerGameConfig:
     players: int
     stack_bb: float
     rank_count: int
@@ -86,7 +82,7 @@ class Phase5GameConfig:
 
 
 @dataclass(frozen=True)
-class Phase5Precision:
+class PrecisionConfig:
     name: str = "fp32"
 
     def __post_init__(self) -> None:
@@ -95,7 +91,7 @@ class Phase5Precision:
 
 
 @dataclass(frozen=True)
-class Phase5ModelConfig:
+class PokerModelConfig:
     d_model: int = 256
     n_heads: int = 8
     n_layers_pre: int = 4
@@ -184,15 +180,15 @@ class ReferenceConfig:
 
 
 @dataclass(frozen=True)
-class Phase5Config:
+class PokerScientificConfig:
     """Scientific Phase 5 values; capacities remain a separate manifest."""
 
-    game: Phase5GameConfig
-    model: Phase5ModelConfig
+    game: PokerGameConfig
+    model: PokerModelConfig
     loss: LossConfig
     optimizer: OptimizerConfig
     schedule: LearnerSchedule
-    precision: Phase5Precision
+    precision: PrecisionConfig
     reference: ReferenceConfig
     lambda_: float
     root_count: int
@@ -224,7 +220,7 @@ class Phase5Config:
             raise ValueError("folder_beta_rank exceeds the compact deck")
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, object]) -> Phase5Config:
+    def from_mapping(cls, value: Mapping[str, object]) -> PokerScientificConfig:
         source = dict(_mapping(value, "root"))
         allowed = {
             "mode",
@@ -281,12 +277,12 @@ class Phase5Config:
         if missing:
             raise ValueError(f"root.{missing[0]}: missing required field")
         return cls(
-            game=_closed(Phase5GameConfig, source["game"], "root.game"),
-            model=_closed(Phase5ModelConfig, source["model"], "root.model"),
+            game=_closed(PokerGameConfig, source["game"], "root.game"),
+            model=_closed(PokerModelConfig, source["model"], "root.model"),
             loss=_closed(LossConfig, source["loss"], "root.loss"),
             optimizer=_closed(OptimizerConfig, source["optimizer"], "root.optimizer"),
             schedule=_closed(LearnerSchedule, source["schedule"], "root.schedule"),
-            precision=_closed(Phase5Precision, source["precision"], "root.precision"),
+            precision=_closed(PrecisionConfig, source["precision"], "root.precision"),
             reference=_closed(ReferenceConfig, source["reference"], "root.reference"),
             lambda_=source["lambda"],
             root_count=source["root_count"],
@@ -327,7 +323,7 @@ class SequentialModeConfig:
     """Closed Phase 6 scientific configuration for all sequential rows."""
 
     mode: Mapping[str, str]
-    common: Phase5Config
+    common: PokerScientificConfig
     applicable: Mapping[str, object]
 
     @classmethod
@@ -360,7 +356,7 @@ class SequentialModeConfig:
             "rollout_mode": "sequential",
             "private_estimator": "sampled",
         }
-        common = Phase5Config.from_mapping(base_source)
+        common = PokerScientificConfig.from_mapping(base_source)
         applicable: dict[str, object] = {}
         if rb:
             completion = dict(_mapping(source.get("completion"), "root.completion"))
@@ -435,7 +431,7 @@ class BranchedModeConfig:
     """Closed scientific configuration for every branched mode."""
 
     mode: Mapping[str, str]
-    common: Phase5Config
+    common: PokerScientificConfig
     branching: Mapping[str, object]
     cost_safeguard: Mapping[str, object]
     applicable: Mapping[str, object]
@@ -474,7 +470,7 @@ class BranchedModeConfig:
             "rollout_mode": "sequential",
             "private_estimator": "sampled",
         }
-        common = Phase5Config.from_mapping(base_source)
+        common = PokerScientificConfig.from_mapping(base_source)
         branching = dict(_mapping(source.get("branching"), "root.branching"))
         shared = {
             "fixed_beta",
@@ -648,10 +644,10 @@ class BranchedModeConfig:
 
 __all__ = [
     "BranchedModeConfig",
-    "Phase5Config",
-    "Phase5GameConfig",
-    "Phase5ModelConfig",
-    "Phase5Precision",
+    "PokerGameConfig",
+    "PokerModelConfig",
+    "PokerScientificConfig",
+    "PrecisionConfig",
     "ReferenceConfig",
     "SequentialModeConfig",
 ]

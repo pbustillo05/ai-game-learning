@@ -6,32 +6,35 @@ from dataclasses import replace
 import pytest
 import torch
 
-from pbg.games.poker.queued import (
+from pbg.games.poker.queued.branching import (
     BranchedBenchmarkTelemetry,
-    BranchedPokerIteration,
+    BranchedSampledPokerIteration,
     BranchedPosteriorExhaustion,
-    CollisionConditionedProfileSampler,
-    NLHEGeometry,
-    RejectionObservation,
     action_conditioned_log_reach,
     branched_rb_chance_frontier_row_bytes,
+)
+from pbg.games.poker.queued.hooks import (
+    NLHEGeometry,
     rb_partitions,
 )
+from pbg.games.poker.queued.rb_sampling import (
+    CollisionConditionedProfileSampler,
+    RejectionObservation,
+)
 from pbg.games.poker.queued.model import build_model_from_config
-from pbg.core import (
-    BranchedModeConfig,
-    DenseAdam,
+from pbg.games.poker.queued.config import BranchedModeConfig
+from pbg.core.branching import (
     FixedBranchController,
-    GeneratedOwners,
     KKTBranchController,
+)
+from pbg.core.capacity import GeneratedOwners, PartitionRows, build_storage_plan
+from pbg.core.contracts import mode_schema
+from pbg.core.learner import (
     LearnerSchedule,
     LossConfig,
-    OptimizerConfig,
-    PartitionRows,
-    RunState,
-    build_storage_plan,
-    mode_schema,
 )
+from pbg.core.optimization import DenseAdam, OptimizerConfig
+from pbg.core.persistence import RunState
 from pbg.core.targets import rb_conversion_library_workspace_bytes
 from tests.test_branched_sampled_modes import (
     _manifest,
@@ -270,7 +273,7 @@ def test_root_refill_uses_fresh_posterior_ordinals(
     model = build_model_from_config(
         _config("self_play", "branched.fixed"), device
     )
-    result = BranchedPokerIteration(
+    result = BranchedSampledPokerIteration(
         owner_factory=lambda: GeneratedOwners(plan),
         plan=plan,
         controller=FixedBranchController(
@@ -600,7 +603,7 @@ def test_rejection_exhaustion_blocks_commit_and_publishes_device_failure(
         _config("self_play", "branched.fixed"), device
     )
     with pytest.raises(BranchedPosteriorExhaustion) as raised:
-        BranchedPokerIteration(
+        BranchedSampledPokerIteration(
             owner_factory=lambda: GeneratedOwners(plan),
             plan=plan,
             controller=FixedBranchController(
@@ -680,7 +683,7 @@ def test_four_branched_rb_modes_complete_optimizer_step(
             log_kappa=math.log(1.0),
         )
     )
-    result = BranchedPokerIteration(
+    result = BranchedSampledPokerIteration(
         owner_factory=lambda: GeneratedOwners(plan),
         plan=plan,
         controller=controller,

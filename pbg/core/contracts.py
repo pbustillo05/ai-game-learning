@@ -5,9 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from itertools import product
-from typing import Protocol
-
-import torch
 
 
 class ContractError(ValueError):
@@ -328,17 +325,17 @@ def _owners(
         sigma_head_fields.extend(("old_trace", "old_cost"))
 
     leaf_fields = [
-        "board_cards",
+        "leaf_public_state",
         "stratum_level",
         "payoff_baseline",
         "stratum_amount",
     ]
     if sampled:
-        leaf_fields.append("combo_ids")
+        leaf_fields.append("leaf_private_profile")
     else:
         leaf_fields.extend(("range_weights", "seed"))
     if response:
-        leaf_fields.extend(("selected_player", "probe_cutoff"))
+        leaf_fields.extend(("trained_actor", "response_cutoff"))
 
     layer_fields = ["return_value"] if sampled else ["mass", "moment"]
     if branched:
@@ -557,43 +554,3 @@ def validate_replica_group(schemas: tuple[ModeSchema, ...]) -> None:
                 f"replica lane {lane} ({schema.key}) is physically incompatible "
                 f"with lane 0 ({first.key})"
             )
-
-
-def validate_schema_on_cuda(schema: ModeSchema, device: torch.device | str) -> None:
-    """Validate representative immutable metadata on the requested CUDA device."""
-
-    resolved = torch.device(device)
-    if resolved.type != "cuda":
-        raise ContractError("queued training schemas validate only on CUDA")
-    if not torch.cuda.is_available():
-        raise ContractError("CUDA is unavailable")
-    marker = torch.tensor(
-        [len(schema.owners), len(schema.applicable_config)],
-        dtype=torch.int32,
-        device=resolved,
-    )
-    if tuple(marker.cpu().tolist()) != (
-        len(schema.owners),
-        len(schema.applicable_config),
-    ):
-        raise ContractError("CUDA schema validation marker did not round-trip")
-
-
-class GameHooks(Protocol):
-    """Minimal opaque boundary implemented by the active game."""
-
-    def partitions(self, schema: ModeSchema) -> PartitionContract: ...
-
-    def initial_roots(self, request: object) -> object: ...
-
-    def model_input(self, request: object) -> object: ...
-
-    def sample(self, request: object) -> object: ...
-
-    def transition(self, request: object) -> object: ...
-
-    def folded_summary(self, request: object) -> object: ...
-
-    def leaf_to_layer_work(self, request: object) -> object: ...
-
-    def role(self, request: object) -> object: ...

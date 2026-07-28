@@ -14,7 +14,8 @@ import torch
 
 from pbg.config import RootConfig
 from pbg.identity import accelerator_identity, code_identity
-from pbg.core import LOGICAL_RNG_VERSION, sha256_file
+from pbg.core.persistence import sha256_file
+from pbg.core.rollout import LOGICAL_RNG_VERSION
 from pbg.runtime import TrainingSession
 
 _REQUIRED_SAMPLE_METRICS = (

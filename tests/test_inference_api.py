@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from pbg.config import load_config
-from pbg.games.poker.queued import build_model_from_config
+from pbg.games.poker.queued.model import build_model_from_config
 from pbg.inference import PokerInferenceSession, parse_card
 from pbg.inference_artifact import (
     INFERENCE_ARTIFACT_SCHEMA_VERSION,

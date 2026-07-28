@@ -31,22 +31,20 @@ from pbg.games.poker.queued.model import (
     build_model_from_config,
 )
 from pbg.games.poker.queued.training import SequentialPokerIteration
-from pbg.games.poker.queued.training import SequentialSharedResponseProbe
 from pbg.games.poker.queued.response import (
     SequentialSharedResponseEvaluator,
     balanced_evaluation_probe_seats,
     paired_probe_statistics,
-    training_probe_seats,
 )
 from pbg.core.capacity import (
-    GameGeometry,
+    ExecutionGeometry,
     GeneratedOwners,
     NamedShape,
     PartitionRows,
     PhysicalLayout,
     build_storage_plan,
 )
-from pbg.core.config import SequentialModeConfig
+from pbg.games.poker.queued.config import SequentialModeConfig
 from pbg.core.contracts import mode_schema
 from pbg.core.learner import (
     LearnerSchedule,
@@ -68,6 +66,7 @@ from pbg.core.rollout import (
     RolloutOwnerRegistry,
     SemanticFamilyFIFO,
 )
+from pbg.core.storage import SoAField
 from pbg.core.capacity import ExecutionPhase
 from tests.test_sequential_sampled_training import (
     _PartitionNetwork,
@@ -269,7 +268,6 @@ def test_probe_is_the_ordinary_best_response_rb_schema() -> None:
         }
     ).key == "best_response/sequential/rao_blackwell"
     keys = torch.arange(12, dtype=torch.int64)
-    assert training_probe_seats(keys, 3).tolist() == [0, 1, 2] * 4
     seats = balanced_evaluation_probe_seats(keys, 3)
     assert seats.tolist() == [0, 0, 0, 1, 1, 1, 2, 2, 2, 0, 0, 0]
     # Use a complete P^2 design for the paired lower-bound report.
@@ -684,7 +682,7 @@ def test_evaluator_selected_completion_matches_the_selected_dense_slice() -> Non
         seed=torch.tensor([71], dtype=torch.int64, device=device),
     )
     common = {
-        "board_cards": leaf["board_cards"],
+        "board_cards": leaf["leaf_public_state"],
         "range_weights": leaf["range_weights"],
         "stratum_level": leaf["stratum_level"],
         "payoff_baseline": leaf["payoff_baseline"],
@@ -1081,9 +1079,9 @@ def test_all_four_sequential_modes_complete_an_optimizer_step(
         model_operation=(
             model.rb_learner_operation if rb else model.learner_operation
         ),
-        rollout_operation=model.sequential_rollout_operation,
+        rollout_operation=model.rollout_operation,
         frozen_operation=(
-            None if frozen is None else frozen.sequential_rollout_operation
+            None if frozen is None else frozen.rollout_operation
         ),
         optimizer=DenseAdam(
             model, OptimizerConfig(name="adamw", learning_rate=1.0e-3)
@@ -1094,18 +1092,9 @@ def test_all_four_sequential_modes_complete_an_optimizer_step(
         seed=17,
         lambda_=0.95,
         completion_samples=4 if rb else 0,
-        probe_cutoff=regime == "best_response" and rb,
+        response_cutoff=regime == "best_response" and rb,
     )
-    if regime == "best_response" and rb:
-        probe = SequentialSharedResponseProbe(
-            iteration_runner,
-            target_sha256="a" * 64,
-            initial_model_sha256="c" * 64,
-        )
-        assert probe.mode is mode
-        result = probe.run(iteration=0)
-    else:
-        result = iteration_runner.run(iteration=0)
+    result = iteration_runner.run(iteration=0)
     assert result.learner.optimizer_steps
     assert all(step.applied for step in result.learner.optimizer_steps)
     if rb:
@@ -1132,7 +1121,7 @@ def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
     base_manifest = _phase5_manifest(device)
     manifest = replace(
         base_manifest,
-        geometry=GameGeometry(3, 8.0, 4, 64, 4096),
+        geometry=ExecutionGeometry(3, 26, 64, 4096),
         player_node_cap=tuple(PartitionRows(name, 40) for name in inputs),
         trained_player_cap=tuple(PartitionRows(name, 40) for name in inputs),
         action_cap=tuple(PartitionRows(name, 40) for name in inputs),
@@ -1164,6 +1153,10 @@ def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
         learner_sigma_workspace_row_bytes=4096,
         learner_action_workspace_row_bytes=4096,
         topology_packet_row_bytes=88,
+        opaque_fields=(
+            SoAField("leaf_public_state", torch.uint8, (5,), fill=255),
+            SoAField("leaf_private_profile", torch.int32, (3,), fill=-1),
+        ),
     )
     owners = GeneratedOwners(
         build_storage_plan(mode, partitions, manifest, layout, device)
@@ -1198,8 +1191,8 @@ def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
             if estimator == "rao_blackwell"
             else model.learner_operation
         ),
-        rollout_operation=model.sequential_rollout_operation,
-        frozen_operation=frozen.sequential_rollout_operation,
+        rollout_operation=model.rollout_operation,
+        frozen_operation=frozen.rollout_operation,
         optimizer=DenseAdam(
             model, OptimizerConfig(name="adamw", learning_rate=1.0e-3)
         ),

@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from pbg.core.config import BranchedModeConfig, SequentialModeConfig
+from pbg.games.poker.queued.config import BranchedModeConfig, SequentialModeConfig
 from pbg.core.persistence import (
     CHECKPOINT_SCHEMA,
     DISTRIBUTED_CHECKPOINT_SCHEMA,

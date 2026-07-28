@@ -75,6 +75,7 @@ from pbg.core.replica import (
 )
 from pbg.core.rollout import (
     AsyncTopologyPublisher,
+    BoundedChanceClosure,
     CommitCoverage,
     CommitPlan,
     CompletionFIFO,
@@ -1026,7 +1027,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             and posterior_sampler is None
         ):
             raise ValueError("branched RB hooks require the posterior sampler")
-        self.probe_cutoff = False
+        self.response_cutoff = False
         self.input_index = {name: index for index, name in enumerate(self.queues)}
         self._route_family_values = (-1, *range(len(self.queues)))
         self._route_families = torch.tensor(
@@ -1380,7 +1381,10 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             action_total, dtype=torch.int64, device=device
         )
         endpoint_record_edge = action_row
-        for generation in range(3):
+        for generation in BoundedChanceClosure(
+            max_generations=3,
+            generation_bound=self.owners.chance_generation_cap,
+        ):
             current_rows = current_active.numel()
             generation_capacity = min(
                 chance_capacity,
@@ -1767,7 +1771,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             leaf_source = MappingProxyType(
                 {
                     **dict(leaf_source),
-                    "selected_player": selected_player.index_select(
+                    "trained_actor": selected_player.index_select(
                         0, endpoint_source
                     ).to(torch.int32),
                 }
@@ -4923,15 +4927,9 @@ class BranchedSampledPokerIteration:
         )
 
 
-BranchedPokerHooks = BranchedSampledPokerHooks
-BranchedPokerIteration = BranchedSampledPokerIteration
-
-
 __all__ = [
     "BranchedBenchmarkTelemetry",
     "BranchedPokerError",
-    "BranchedPokerHooks",
-    "BranchedPokerIteration",
     "BranchedPokerResult",
     "BranchedPosteriorExhaustion",
     "BranchedSampledPokerHooks",

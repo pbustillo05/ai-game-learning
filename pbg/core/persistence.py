@@ -601,20 +601,6 @@ def load_distributed_checkpoint_manifest(
 
 
 
-def trim_metrics_after_checkpoint(
-    metrics: Sequence[Mapping[str, object]], iteration: int
-) -> list[dict[str, object]]:
-    """Back up externally if desired, then retain the exact completed prefix."""
-
-    retained = [dict(item) for item in metrics if int(item["iteration"]) < iteration]
-    values = [int(item["iteration"]) for item in retained]
-    if values != list(range(iteration)):
-        raise PersistenceError(
-            "metrics before the checkpoint are not the exact completed prefix"
-        )
-    return retained
-
-
 __all__ = [
     "CHECKPOINT_SCHEMA",
     "DISTRIBUTED_CHECKPOINT_SCHEMA",
@@ -629,6 +615,5 @@ __all__ = [
     "save_distributed_checkpoint_manifest",
     "save_replica_checkpoint",
     "sha256_file",
-    "trim_metrics_after_checkpoint",
     "validate_checkpoint_payload",
 ]

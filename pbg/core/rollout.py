@@ -79,7 +79,7 @@ class DrawPurpose(IntEnum):
     CHANCE = 5
     COMPLETION = 6
     LEARNER = 7
-    PROBE_SEAT = 8
+    ROLE_SELECTION = 8
 
 
 LOGICAL_RNG_VERSION = "counter_hash_v4"
@@ -106,12 +106,15 @@ def _mix63(value: Tensor) -> Tensor:
     )
 
 
-def _mix63_scalar(value: int) -> int:
+def _scalar_counter_hash(value: int) -> int:
+    """Scalar form of the versioned counter hash used for namespaces."""
+
     value &= _MASK63
-    value ^= value >> 30
-    value = (value * 0x3C79AC492BA7B653) & _MASK63
-    value ^= value >> 27
-    value = (value * 0x1C69B3F74AC4AE35) & _MASK63
+    for shift, multiplier in (
+        (30, 0x3C79AC492BA7B653),
+        (27, 0x1C69B3F74AC4AE35),
+    ):
+        value = ((value ^ (value >> shift)) * multiplier) & _MASK63
     return (value ^ (value >> 31)) & _MASK63
 
 
@@ -119,8 +122,7 @@ def logical_rng_keys(
     *,
     seed: int,
     iteration: int,
-    root: Tensor | None = None,
-    trajectory: Tensor | None = None,
+    root: Tensor,
     path: Tensor,
     draw: Tensor | int,
     purpose: DrawPurpose | int,
@@ -130,20 +132,14 @@ def logical_rng_keys(
 ) -> Tensor:
     """Return placement-, subdivision-, and schedule-independent CUDA keys.
 
-    ``trajectory`` is retained as an explicit alias for callers whose logical
-    root vocabulary predates the queued package.  It cannot be supplied with
-    ``root``.  Inactive addresses receive the sentinel zero and therefore do
-    not consume a logical draw.
+    Inactive addresses receive the sentinel zero and therefore do not consume
+    a logical draw.
     """
 
-    if (root is None) == (trajectory is None):
-        raise ValueError("provide exactly one of root or trajectory")
-    root_address = trajectory if root is None else root
-    assert root_address is not None
-    if root_address.device != path.device:
+    if root.device != path.device:
         raise ValueError("root and path addresses must share a device")
     root_address, path = torch.broadcast_tensors(
-        root_address.to(torch.int64), path.to(torch.int64)
+        root.to(torch.int64), path.to(torch.int64)
     )
     draw_tensor = _int64_like(root_address, draw)
     lane_tensor = _int64_like(root_address, lane)
@@ -160,11 +156,11 @@ def logical_rng_keys(
     purpose_value = int(purpose)
     if purpose_value <= 0:
         raise ValueError("draw purpose must be a positive namespace identifier")
-    namespace = _mix63_scalar(
+    namespace = _scalar_counter_hash(
         (int(seed) & _MASK63)
         ^ ((int(iteration) + 0x6A09E667F3BCC909) & _MASK63)
     )
-    namespace = _mix63_scalar(
+    namespace = _scalar_counter_hash(
         namespace ^ ((purpose_value + 0x5BE0CD19137E2179) & _MASK63)
     )
     counter = (
@@ -696,29 +692,6 @@ class SemanticFamilyFIFO:
         )
         return FamilyBatch(self.input_type, lanes, row, fields)
 
-    def consume(self, lanes: Tensor, rows: int, success: Tensor) -> None:
-        if rows <= 0:
-            raise ValueError("queue consumption rows must be positive")
-        if (
-            lanes.ndim != 1
-            or lanes.dtype != torch.int64
-            or lanes.device != self.device
-            or success.shape != (self.n_replica,)
-            or success.dtype != torch.bool
-            or success.device != self.device
-        ):
-            raise ValueError("queue consumption tensors have invalid contracts")
-        selected = success[lanes]
-        old = self.head[lanes]
-        new = old + rows
-        torch._assert_async(
-            (~selected | (new <= self.ready_tail[lanes])).all(),
-            "queue consumption exceeds its stable prefix",
-        )
-        self.head[lanes] = torch.where(selected, new, old)
-        self._record_ready()
-
-
 @dataclass(frozen=True)
 class ModelWorkspace:
     """Raw model outputs owned only until transition materialization."""
@@ -936,9 +909,7 @@ class RolloutOwnerRegistry:
         _token: object | None = None,
     ) -> None:
         if _token is not _OWNER_REGISTRY_TOKEN:
-            raise ValueError(
-                "use from_generated; only synthetic tests may use for_testing"
-            )
+            raise ValueError("rollout owners must come from a generated plan")
         self.slabs = tuple(slabs)
         if not self.slabs or len({id(slab) for slab in self.slabs}) != len(
             self.slabs
@@ -1000,7 +971,7 @@ class RolloutOwnerRegistry:
             topology_packet_cap=manifest.topology_packet_cap,
             topology_cap=manifest.topology_cap,
             topology_edge_cap=manifest.topology_edge_cap,
-            chance_generation_cap=manifest.geometry.player_node_bound,
+            chance_generation_cap=manifest.geometry.occurrence_bound,
             descriptor_cap=sum(slab.capacity for slab in slabs),
             workspace_byte_cap=plan.admission(
                 ExecutionPhase.ROLLOUT
@@ -1008,46 +979,6 @@ class RolloutOwnerRegistry:
             completion_workspace_byte_cap=plan.admission(
                 ExecutionPhase.COMPLETION
             ).bounded_workspace_bytes,
-            _token=_OWNER_REGISTRY_TOKEN,
-        )
-
-    @classmethod
-    def for_testing(
-        cls,
-        slabs: Sequence[MonotoneSlab],
-        *,
-        family_pack_cap: int,
-        chance_frontier_cap: int,
-        completion_pack_cap: int,
-        topology_packet_cap: int,
-        topology_cap: int,
-        topology_edge_cap: int,
-        chance_generation_cap: int | None = None,
-    ) -> RolloutOwnerRegistry:
-        """Create an explicitly closed synthetic owner set for contract tests."""
-
-        replica = slabs[0].n_replica if slabs else 1
-        descriptor_cap = sum(slab.capacity for slab in slabs)
-        return cls(
-            slabs,
-            family_pack_cap=family_pack_cap,
-            chance_frontier_cap=chance_frontier_cap,
-            completion_pack_cap=completion_pack_cap,
-            topology_packet_cap=topology_packet_cap,
-            topology_cap=topology_cap,
-            topology_edge_cap=topology_edge_cap,
-            chance_generation_cap=(
-                family_pack_cap
-                if chance_generation_cap is None
-                else chance_generation_cap
-            ),
-            descriptor_cap=descriptor_cap,
-            workspace_byte_cap=max(
-                1, replica * descriptor_cap * 64
-            ),
-            completion_workspace_byte_cap=max(
-                1, replica * descriptor_cap * 64
-            ),
             _token=_OWNER_REGISTRY_TOKEN,
         )
 
@@ -1552,15 +1483,6 @@ class AsyncTopologyPublisher:
                 return result
             time.sleep(0)
 
-    def drain_branched(self, *, block: bool = False) -> tuple[object, ...]:
-        self._accept_branched_ready(block=block)
-        accepted = tuple(
-            payload
-            for _key, payload in sorted(self._branched_accepted.items())
-        )
-        self._branched_accepted.clear()
-        return accepted
-
     def preflight_deferred(
         self,
         publication: DeferredUnaryTopologyPublication,
@@ -2028,51 +1950,6 @@ class AsyncTopologyPublisher:
         self._packets.append(retained)
         return retained
 
-    def drain(self, *, block: bool = False) -> tuple[ReplicaTopologyPacket, ...]:
-        """Poll without blocking, or synchronize once at the sealing boundary."""
-
-        accepted: list[ReplicaTopologyPacket] = []
-        if block and self._pending:
-            with torch.cuda.stream(self._accept_stream):
-                for item in self._pending:
-                    self._accept_stream.wait_event(item.event)
-                    for publication in item.publications:
-                        self._accept_stream.wait_event(
-                            publication.draft.ready_event
-                        )
-                all_ready = torch.cuda.Event(blocking=False)
-                all_ready.record(self._accept_stream)
-            all_ready.synchronize()
-            ready = self._pending
-            self._pending = []
-        else:
-            ready = []
-            waiting = []
-            for item in self._pending:
-                draft_ready = all(
-                    publication.draft.ready_event.query()
-                    for publication in item.publications
-                )
-                if item.armed and item.event.query() and draft_ready:
-                    ready.append(item)
-                else:
-                    waiting.append(item)
-            self._pending = waiting
-        for item in ready:
-            if not item.armed:
-                raise TopologyError("topology transfer was never commit-armed")
-            for publication, row_slice in zip(
-                item.publications, item.row_slices
-            ):
-                marker = int(item.marker[publication.lane])
-                if marker == publication.draft.sequence:
-                    accepted.append(
-                        self._commit(publication, item.rows[row_slice])
-                    )
-                else:
-                    self.abort(publication.lane, publication.draft.sequence)
-        return tuple(accepted)
-
     def abort(self, lane: int, sequence: int) -> None:
         key = (lane, sequence)
         if key not in self._drafts:
@@ -2243,15 +2120,6 @@ class AsyncTopologyPublisher:
         topology.validate(bindings, p_train=self.p_train)
         topology, bindings = topology.compact(bindings, p_train=self.p_train)
         return topology, bindings, leaves
-
-    @property
-    def committed_packets(self) -> tuple[ReplicaTopologyPacket, ...]:
-        return tuple(
-            sorted(
-                self._packets,
-                key=lambda item: (item.packet.sequence, item.lane),
-            )
-        )
 
     def assert_drained(self) -> None:
         if (
@@ -2949,134 +2817,27 @@ class RolloutTransaction:
         )
 
 
-@dataclass(frozen=True)
-class ChanceFrontier:
-    """One fixed-capacity chance frontier with device-resident validity."""
-
-    active: Tensor
-    root: Tensor
-    path: Tensor
-    payload: Mapping[str, Tensor]
-
-    def validate(self, capacity: int) -> None:
-        if (
-            self.active.device.type != "cuda"
-            or self.active.dtype != torch.bool
-            or self.active.ndim != 2
-            or self.active.shape[1] != capacity
-        ):
-            raise RolloutError(
-                "chance active mask must be CUDA bool [n_replica, capacity]"
-            )
-        if (
-            self.root.shape != self.active.shape
-            or self.path.shape != self.active.shape
-            or self.root.dtype != torch.int64
-            or self.path.dtype != torch.int64
-            or self.root.device != self.active.device
-            or self.path.device != self.active.device
-        ):
-            raise RolloutError("chance logical addresses must match its frontier")
-        for name, value in self.payload.items():
-            if (
-                not name
-                or value.shape[:2] != self.active.shape
-                or value.device != self.active.device
-            ):
-                raise RolloutError("chance payload violates its fixed frontier")
-
-
-class ChanceSampler(Protocol):
-    def __call__(
-        self,
-        frontier: ChanceFrontier,
-        rng_key: Tensor,
-        generation: int,
-    ) -> object: ...
-
-
-class ChanceCommitter(Protocol):
-    def __call__(
-        self,
-        frontier: ChanceFrontier,
-        sampled: object,
-        generation: int,
-    ) -> ChanceFrontier: ...
-
-
-@dataclass(frozen=True)
-class ChanceClosureResult:
-    frontier: ChanceFrontier
-    generation_draws: Tensor
-
-
 class BoundedChanceClosure:
-    """Run a fixed launch envelope without synchronizing between generations."""
+    """Own the immutable generation envelope for all public chance closure."""
 
     def __init__(
         self,
         *,
-        seed: int,
-        iteration: int,
-        owners: RolloutOwnerRegistry,
         max_generations: int,
+        generation_bound: int,
     ) -> None:
         if (
             max_generations <= 0
-            or max_generations > owners.chance_generation_cap
+            or generation_bound <= 0
+            or max_generations > generation_bound
         ):
             raise ValueError(
                 "chance generations must fit the geometry-derived bound"
             )
-        self.seed = int(seed)
-        self.iteration = int(iteration)
-        self.owners = owners
-        self.capacity = owners.chance_frontier_cap
         self.max_generations = int(max_generations)
 
-    def run(
-        self,
-        frontier: ChanceFrontier,
-        sample: ChanceSampler,
-        commit: ChanceCommitter,
-    ) -> ChanceClosureResult:
-        frontier.validate(self.capacity)
-        if frontier.active.shape[0] != self.owners.n_replica:
-            raise RolloutError("chance frontier replica axis differs from owners")
-        draws: list[Tensor] = []
-        lanes = torch.arange(
-            frontier.active.shape[0],
-            dtype=torch.int64,
-            device=frontier.active.device,
-        )[:, None]
-        retry_epoch = self.owners.retry_epoch()[:, None]
-        for generation in range(self.max_generations):
-            key = logical_rng_keys(
-                seed=self.seed,
-                iteration=self.iteration,
-                root=frontier.root,
-                path=frontier.path,
-                draw=generation,
-                purpose=DrawPurpose.CHANCE,
-                lane=lanes,
-                retry_epoch=retry_epoch,
-                active=frontier.active,
-            )
-            before = self.owners.guard()
-            sampled = sample(frontier, key, generation)
-            self.owners.assert_unchanged(before, "chance sample")
-            draws.append(frontier.active.sum(dtype=torch.int64))
-            frontier = commit(frontier, sampled, generation)
-            self.owners.assert_unchanged(before, "chance transition")
-            frontier.validate(self.capacity)
-        torch._assert_async(
-            (~frontier.active).all(),
-            "bounded chance closure exhausted its generation cap",
-        )
-        return ChanceClosureResult(
-            frontier=frontier,
-            generation_draws=torch.stack(draws),
-        )
+    def __iter__(self):
+        return iter(range(self.max_generations))
 
 
 @dataclass(frozen=True)
@@ -3277,8 +3038,6 @@ __all__ = [
     "LOGICAL_RNG_VERSION",
     "AsyncTopologyPublisher",
     "BoundedChanceClosure",
-    "ChanceClosureResult",
-    "ChanceFrontier",
     "CommitCoverage",
     "CommitPlan",
     "CompletionBatch",

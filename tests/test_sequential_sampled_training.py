@@ -9,71 +9,75 @@ import pytest
 import torch
 from torch import nn
 
-from pbg.games.poker.queued import (
+from pbg.games.poker.queued.hooks import (
+    NLHEGeometry,
+    PokerStateMachine,
+    SampledShowdownBinding,
+    sampled_partitions,
+)
+from pbg.games.poker.queued.model import QueuedPokerModel, build_model_from_config
+from pbg.games.poker.queued.policy import (
     CHECK_CALL,
     FOLD,
-    NLHEGeometry,
-    Phase5TrainingSession,
-    PokerIterationError,
     PokerLegality,
     PokerPolicyOperator,
-    PokerStateMachine,
-    QueuedPokerModel,
-    SampledShowdownBinding,
-    build_model_from_config,
-    sampled_partitions,
 )
 from pbg.games.poker.queued.folded import (
     sequential_family_workspace_row_bytes,
 )
 from pbg.games.poker.queued.training import (
-    RecoveringSequentialSampledPokerIteration,
-    SequentialSampledPokerIteration,
+    PokerIterationError,
+    RecoveringSequentialPokerIteration,
+    SequentialPokerIteration,
 )
-from pbg.core import (
-    AlignedSequentialStore,
-    AttemptAddress,
+from pbg.games.poker.queued.config import PokerScientificConfig
+from pbg.core.capacity import (
     CapacityManifest,
-    CompletionBatch,
-    DenseAdam,
-    DestinationRequest,
-    DeviceFailureState,
+    ExecutionGeometry,
     ExecutionPhase,
     ExternalWorkspaceBounds,
-    GameGeometry,
     GeneratedOwners,
     HardwareLimits,
+    NamedShape,
+    PartitionRows,
+    PhysicalLayout,
+    build_storage_plan,
+)
+from pbg.core.contracts import MODE_SCHEMAS
+from pbg.core.learner import (
+    AlignedSequentialStore,
     LearnerOperation,
     LearnerSchedule,
     LossConfig,
-    LossScaler,
-    MODE_SCHEMAS,
     ModelEvaluation,
-    NamedShape,
-    OptimizerConfig,
-    PartitionRows,
-    Phase5Config,
-    PhysicalLayout,
-    PreemptionNotice,
-    PublicationTransaction,
     ReferenceOutputCache,
-    RecoverableOverflow,
     ReferenceState,
-    RunState,
     SealedSequentialInputs,
     SequentialBatchSampler,
     SequentialLearnerBatch,
-    SequentialOverflowRecovery,
-    SequentialSampledIteration,
-    SoAField,
-    SoASchema,
-    TrainingError,
     allocate_statistical_counts,
-    build_storage_plan,
-    convert_value_head_units,
+)
+from pbg.core.optimization import DenseAdam, LossScaler, OptimizerConfig
+from pbg.core.persistence import (
+    RunState,
     load_checkpoint,
     save_checkpoint,
     sha256_file,
+)
+from pbg.core.rollout import CompletionBatch
+from pbg.core.storage import (
+    DestinationRequest,
+    DeviceFailureState,
+    PublicationTransaction,
+    SoAField,
+    SoASchema,
+)
+from pbg.core.training import (
+    AttemptAddress,
+    RecoverableOverflow,
+    SequentialOverflowRecovery,
+    SequentialSampledIteration,
+    TrainingError,
 )
 from pbg.core.storage import DeviceFailure
 from pbg.core.storage import MonotoneSlab
@@ -432,7 +436,13 @@ def test_root_profiles_are_collision_free_and_public_transition_is_conservative(
 
         evaluator_payoff = poker.bind(
             rank_count=geometry.rank_count
-        ).evaluate_showdowns(**leaf)
+        ).evaluate_showdowns(
+            board_cards=leaf["leaf_public_state"],
+            combo_ids=leaf["leaf_private_profile"],
+            stratum_level=leaf["stratum_level"],
+            payoff_baseline=leaf["payoff_baseline"],
+            stratum_amount=leaf["stratum_amount"],
+        )
         torch.testing.assert_close(
             evaluator_payoff, leaf["payoff_baseline"], atol=0, rtol=0
         )
@@ -488,7 +498,13 @@ def test_sampled_leaf_matches_exact_evaluator_rows_and_binding() -> None:
         ),
     )
     plan = binding.leaf_to_layer_work(batch)
-    expected = binding.evaluator.evaluate_showdowns(**leaf)
+    expected = binding.evaluator.evaluate_showdowns(
+        board_cards=leaf["leaf_public_state"],
+        combo_ids=leaf["leaf_private_profile"],
+        stratum_level=leaf["stratum_level"],
+        payoff_baseline=leaf["payoff_baseline"],
+        stratum_amount=leaf["stratum_amount"],
+    )
     actual = plan.destinations[0].values["return_value"][0, :2, 0, :, 0]
     torch.testing.assert_close(actual, expected)
     normalized = SampledShowdownBinding(
@@ -635,7 +651,7 @@ def test_phase5_postflop_fails_before_silent_folded_summary_omission() -> None:
 
 def _phase5_manifest(device: torch.device) -> CapacityManifest:
     return CapacityManifest(
-        geometry=GameGeometry(2, 8.0, 4, 64, 4096),
+        geometry=ExecutionGeometry(2, 15, 64, 4096),
         root_count=1,
         n_replica=1,
         beta_max=1,
@@ -703,6 +719,15 @@ def _phase5_layout(
         learner_sigma_workspace_row_bytes=64,
         learner_action_workspace_row_bytes=64,
         topology_packet_row_bytes=88,
+        opaque_fields=(
+            SoAField("leaf_public_state", torch.uint8, (5,), fill=255),
+            SoAField(
+                "leaf_private_profile",
+                torch.int32,
+                (geometry.players,),
+                fill=-1,
+            ),
+        ),
     )
 
 
@@ -878,7 +903,7 @@ def test_complete_poker_iteration_runs_roots_to_optimizer() -> None:
         model, OptimizerConfig(name="adamw", grad_clip=5.0)
     )
     run_state = RunState("phase5-e2e", root_count=1)
-    result = SequentialSampledPokerIteration(
+    result = SequentialPokerIteration(
         geometry=geometry,
         owners=owners,
         mode=mode,
@@ -902,126 +927,6 @@ def test_complete_poker_iteration_runs_roots_to_optimizer() -> None:
     assert run_state.iteration == 1
     assert run_state.logical_work["trajectories"] == 1
     assert set(model.seen_input_types) == {"pre", "post_2"}
-
-
-@CUDA
-def test_public_config_composes_checkpoint_preemption_and_exact_resume(
-    tmp_path: Path,
-) -> None:
-    device = torch.device("cuda", torch.cuda.current_device())
-    geometry = NLHEGeometry(2, 8.0, 4)
-    mode = next(
-        schema
-        for schema in MODE_SCHEMAS
-        if schema.key == "self_play/sequential/sampled"
-    )
-    config = Phase5Config.from_mapping(
-        {
-            "mode": {
-                "training_regime": "self_play",
-                "rollout_mode": "sequential",
-                "private_estimator": "sampled",
-            },
-            "game": {"players": 2, "stack_bb": 8.0, "rank_count": 4},
-            "model": {
-                "d_model": 4,
-                "n_heads": 1,
-                "n_layers_pre": 1,
-                "n_layers_post": 1,
-                "m_raise": 2,
-                "max_players": 2,
-                "class_embedding_dim": 2,
-                "ffn_hidden": 8,
-                "folder_beta_rank": 0,
-                "folder_line_dim": 2,
-            },
-            "loss": {"reference_kl_coefficient": 0.0},
-            "optimizer": {"name": "adamw", "grad_clip": 5.0},
-            "schedule": {"batch_size": 1},
-            "precision": {"name": "fp32"},
-            "reference": {
-                "interval_iterations": 1,
-                "interval_effective_hands": None,
-                "cache_outputs": True,
-            },
-            "lambda": 0.95,
-            "root_count": 1,
-            "root_count_minimum": 1,
-            "seed": 991,
-            "utility": "stack_normalized",
-        }
-    )
-    required_workspace = sequential_family_workspace_row_bytes(
-        geometry, config.model.m_raise
-    )
-    layout = replace(
-        _phase5_layout(geometry),
-        family_workspace_row_bytes=required_workspace,
-    )
-    plan = build_storage_plan(
-        mode,
-        sampled_partitions(2),
-        _phase5_manifest(device),
-        layout,
-        device,
-    )
-    model = _EndToEndPokerModel(
-        device, geometry.private_hands, check_down=True
-    )
-    reference = _EndToEndPokerModel(
-        device, geometry.private_hands, check_down=True
-    )
-    initial_model_state = {
-        name: value.detach().clone()
-        for name, value in model.state_dict().items()
-    }
-    notice = PreemptionNotice()
-    notice.requested_signal = 15
-    checkpoint = tmp_path / "preempted.pt"
-    session = Phase5TrainingSession.fresh(
-        config=config,
-        plan=plan,
-        owner_factory=lambda: GeneratedOwners(plan),
-        model=model,
-        reference_model=reference,
-        model_operation=model.evaluate,
-        reference_operation=reference.evaluate,
-        generator=torch.Generator(device=device).manual_seed(config.seed),
-        run_id="phase5-session",
-        execution_config={"capacity_sha": "test"},
-        preemption=notice,
-        preemption_checkpoint=checkpoint,
-    )
-    result = session.run()
-    assert result.player_nodes == 8
-    assert checkpoint.is_file()
-    assert session.reference_state.reference_iteration == 0
-    for name, value in reference.state_dict().items():
-        torch.testing.assert_close(value, initial_model_state[name])
-
-    resumed_model = _EndToEndPokerModel(
-        device, geometry.private_hands, check_down=True
-    )
-    resumed_reference = _EndToEndPokerModel(
-        device, geometry.private_hands, check_down=True
-    )
-    resumed = Phase5TrainingSession.resume(
-        checkpoint,
-        config=config,
-        plan=plan,
-        owner_factory=lambda: GeneratedOwners(plan),
-        model=resumed_model,
-        reference_model=resumed_reference,
-        model_operation=resumed_model.evaluate,
-        reference_operation=resumed_reference.evaluate,
-        generator=torch.Generator(device=device),
-    )
-    assert resumed.run_state.iteration == 1
-    assert resumed.run_state.logical_work == session.run_state.logical_work
-    assert resumed.optimizer.step_count == session.optimizer.step_count
-    torch.testing.assert_close(
-        resumed.optimizer.exp_avg, session.optimizer.exp_avg
-    )
 
 
 @CUDA
@@ -1087,8 +992,8 @@ def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
     )
     manifest = replace(
         _phase5_manifest(device),
-        geometry=GameGeometry(
-            2, 8.0, 13, token_bound, token_bound * token_bound
+        geometry=ExecutionGeometry(
+            2, 15, token_bound, token_bound * token_bound
         ),
         hardware=replace(
             _phase5_manifest(device).hardware,
@@ -1109,7 +1014,7 @@ def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
             device,
         )
     )
-    result = SequentialSampledPokerIteration(
+    result = SequentialPokerIteration(
         geometry=geometry,
         owners=owners,
         mode=mode,
@@ -1159,7 +1064,7 @@ def test_end_to_end_overflow_exposes_no_failed_attempt_rows() -> None:
     )
     run_state = RunState("phase5-overflow", root_count=1)
     with pytest.raises(RecoverableOverflow) as raised:
-        SequentialSampledPokerIteration(
+        SequentialPokerIteration(
             geometry=geometry,
             owners=owners,
             mode=mode,
@@ -1219,7 +1124,7 @@ def test_end_to_end_overflow_rebuilds_and_retries_at_lower_roots() -> None:
     )
     run_state = RunState("phase5-retry", root_count=2)
     with pytest.warns(RuntimeWarning, match="RECOVERED_SEQUENTIAL_OVERFLOW"):
-        result = RecoveringSequentialSampledPokerIteration(
+        result = RecoveringSequentialPokerIteration(
             owner_factory=lambda: GeneratedOwners(plan),
             plan=plan,
             minimum_root_count=1,
@@ -1294,7 +1199,7 @@ def test_end_to_end_overflow_rejects_retry_capacity_drift() -> None:
     run_state = RunState("phase5-cap-drift", root_count=2)
     with pytest.warns(RuntimeWarning, match="RECOVERED_SEQUENTIAL_OVERFLOW"):
         with pytest.raises(PokerIterationError, match="immutable storage plan"):
-            RecoveringSequentialSampledPokerIteration(
+            RecoveringSequentialPokerIteration(
                 owner_factory=lambda: GeneratedOwners(next(attempts)),
                 plan=plan,
                 minimum_root_count=1,
@@ -1817,28 +1722,9 @@ def test_strict_phase5_config_reports_dotted_unknown_path() -> None:
         "root_count_minimum": 2,
         "seed": 7,
     }
-    config = Phase5Config.from_mapping(value)
+    config = PokerScientificConfig.from_mapping(value)
     assert config.root_count == 8
     with pytest.raises(ValueError, match=r"root\.game\.ranks"):
-        Phase5Config.from_mapping(
+        PokerScientificConfig.from_mapping(
             {**value, "game": {**value["game"], "ranks": 13}}
         )
-
-
-def test_utility_conversion_touches_only_final_value_affines() -> None:
-    state = {
-        "preflop.value_head.affine.weight": torch.ones(2),
-        "preflop.value_head.affine.bias": torch.ones(1),
-        "postflop.value_head.affine.weight": torch.ones(3),
-        "postflop.value_head.affine.bias": torch.ones(1),
-        "preflop.type_head.affine.weight": torch.ones(2),
-    }
-    converted = convert_value_head_units(
-        state,
-        stack_bb=8.0,
-        source="stack_normalized",
-        destination="raw_bb",
-    )
-    for name, value in converted.items():
-        expected = 1.0 if "type_head" in name else 8.0
-        torch.testing.assert_close(value, torch.full_like(value, expected))

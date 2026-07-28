@@ -6,38 +6,42 @@ from pathlib import Path
 import pytest
 import torch
 
-from pbg.core import (
-    CAPACITY_VOCABULARY,
-    MODE_SCHEMAS,
+from pbg.core.capacity import (
     AdmissionError,
     CapacityError,
     CapacityManifest,
+    ExecutionGeometry,
+    ExecutionPhase,
+    ExternalWorkspaceBounds,
+    GeneratedOwners,
+    HardwareLimits,
+    NamedShape,
+    PartitionRows,
+    PhysicalLayout,
+    build_storage_plan,
+)
+from pbg.core.contracts import (
+    CAPACITY_VOCABULARY,
+    MODE_SCHEMAS,
     ConversionSpec,
+    Partition,
+    PartitionContract,
+    PartitionMap,
+    PrivateEstimator,
+    RolloutMode,
+)
+from pbg.core.storage import (
     DestinationRequest,
     DeviceDestinationRequest,
     DeviceFailure,
     DeviceFailureState,
     ExactBlock,
-    ExecutionPhase,
-    ExternalWorkspaceBounds,
-    GameGeometry,
-    GeneratedOwners,
-    HardwareLimits,
     MonotoneSlab,
-    NamedShape,
-    Partition,
-    PartitionContract,
-    PartitionMap,
-    PartitionRows,
-    PhysicalLayout,
-    PrivateEstimator,
     PublicationTransaction,
-    RolloutMode,
     SoAField,
     SoASchema,
     StorageError,
     StorageOverflow,
-    build_storage_plan,
 )
 from tests.static_gates import core_firewall_violations
 
@@ -94,6 +98,10 @@ def _layout() -> PhysicalLayout:
         learner_sigma_workspace_row_bytes=64,
         learner_action_workspace_row_bytes=48,
         topology_packet_row_bytes=32,
+        opaque_fields=(
+            SoAField("leaf_public_state", torch.uint8, (5,), fill=255),
+            SoAField("leaf_private_profile", torch.int32, (2,), fill=-1),
+        ),
     )
 
 
@@ -111,10 +119,9 @@ def _manifest(
     beta = 1 if mode.rollout_mode is RolloutMode.SEQUENTIAL else 2
     action_rows = 32 if beta == 1 else 96
     return CapacityManifest(
-        geometry=GameGeometry(
-            players=2,
-            stack_bb=8.0,
-            rank_count=4,
+        geometry=ExecutionGeometry(
+            actor_count=2,
+            occurrence_bound=15,
             model_token_bound=100,
             model_token_pair_bound=10_000,
         ),

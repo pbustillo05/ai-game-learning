@@ -5,7 +5,6 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from types import MappingProxyType
 
 import torch
@@ -26,19 +25,12 @@ from pbg.games.poker.queued.hooks import (
 from pbg.games.poker.queued.observability import topology_diagnostics
 from pbg.games.poker.queued.policy import PokerPolicyOperator
 from pbg.games.poker.queued.replica import PokerReplicaInference
-from pbg.games.poker.queued.response import (
-    PairedProbeStatistics,
-    SequentialSharedResponseEvaluator,
-    paired_probe_statistics,
-    probe_evaluation_design,
-)
 from pbg.core.branching import RankCommonFailureAgreement
 from pbg.core.capacity import (
     ExecutionPhase,
     GeneratedOwners,
     StoragePlan,
 )
-from pbg.core.config import Phase5Config
 from pbg.core.contracts import (
     ModeSchema,
     PrivateEstimator,
@@ -53,18 +45,14 @@ from pbg.core.learner import (
     ModelEvaluation,
     ModelOperation,
     ReferenceOutputCache,
-    ReferenceState,
     SealedSequentialInputs,
     SequentialBatchSampler,
     build_reference_output_cache,
     compact_best_response_evaluation,
 )
-from pbg.core.optimization import DenseAdam, LossScaler, OptimizerStep
+from pbg.core.optimization import DenseAdam, OptimizerStep
 from pbg.core.persistence import (
     RunState,
-    load_checkpoint,
-    save_checkpoint,
-    trim_metrics_after_checkpoint,
 )
 from pbg.core.replica import (
     DistributedSUM,
@@ -91,7 +79,6 @@ from pbg.core.topology import (
 from pbg.core.training import (
     AttemptAddress,
     IterationResult,
-    PreemptionNotice,
     RecoverableOverflow,
     SequentialOverflowRecovery,
     SequentialSampledIteration,
@@ -173,7 +160,7 @@ class SequentialPokerIteration:
         reference_operation: ModelOperation | None = None,
         frozen_operation: ModelOperation | None = None,
         completion_samples: int = 0,
-        probe_cutoff: bool = False,
+        response_cutoff: bool = False,
         benchmark_rollout_only: bool = False,
         replica_inference: PokerReplicaInference | None = None,
         replica_optimizers: ReplicaOptimizerGroup | None = None,
@@ -190,7 +177,7 @@ class SequentialPokerIteration:
         if owners.plan.mode != mode:
             raise ValueError("poker iteration mode differs from generated owners")
         n_replica = owners.plan.manifest.n_replica
-        if owners.plan.manifest.geometry.players != geometry.players:
+        if owners.plan.manifest.geometry.actor_count != geometry.players:
             raise ValueError("poker iteration geometry differs from its manifest")
         generators = (
             (generator,)
@@ -357,14 +344,14 @@ class SequentialPokerIteration:
         self.reference_operation = reference_operations[0]
         self.frozen_operation = frozen_operation
         self.completion_samples = int(completion_samples)
-        if type(probe_cutoff) is not bool:
-            raise TypeError("probe_cutoff must be bool")
-        if probe_cutoff and (
+        if type(response_cutoff) is not bool:
+            raise TypeError("response_cutoff must be bool")
+        if response_cutoff and (
             mode.training_regime is not TrainingRegime.BEST_RESPONSE
             or mode.private_estimator is not PrivateEstimator.RAO_BLACKWELL
         ):
             raise ValueError("probe cutoff requires sequential BR/RB")
-        self.probe_cutoff = probe_cutoff
+        self.response_cutoff = response_cutoff
         self.optimizer = optimizers[0]
         self.loss = losses[0]
         self.schedule = schedule
@@ -820,7 +807,7 @@ class SequentialPokerIteration:
             iteration=iteration,
             mode=self.mode,
             policy=self.policy,
-            probe_cutoff=self.probe_cutoff,
+            response_cutoff=self.response_cutoff,
         )
         topology_publisher = AsyncTopologyPublisher(
             registry,
@@ -1406,78 +1393,6 @@ class SequentialPokerIteration:
         )
 
 
-# Phase 5 public imports continue to name the shared implementation.
-SequentialSampledPokerIteration = SequentialPokerIteration
-
-
-@dataclass(frozen=True)
-class SequentialSharedResponseProbe:
-    """Shared-seat probe consumer using the ordinary sequential BR/RB path."""
-
-    iteration: SequentialPokerIteration
-    target_sha256: str
-    initial_model_sha256: str
-    initialization: str = "random"
-
-    def __post_init__(self) -> None:
-        mode = self.iteration.mode
-        if (
-            mode.training_regime is not TrainingRegime.BEST_RESPONSE
-            or mode.rollout_mode is not RolloutMode.SEQUENTIAL
-            or mode.private_estimator is not PrivateEstimator.RAO_BLACKWELL
-        ):
-            raise ValueError("shared-response probe requires sequential BR/RB")
-        if not self.iteration.probe_cutoff:
-            raise ValueError(
-                "shared-response probe requires selected-seat fold cutoff"
-            )
-        if (
-            len(self.target_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in self.target_sha256
-            )
-        ):
-            raise ValueError("probe target_sha256 must be lowercase SHA-256")
-        if (
-            len(self.initial_model_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in self.initial_model_sha256
-            )
-        ):
-            raise ValueError(
-                "probe initial_model_sha256 must be lowercase SHA-256"
-            )
-        if self.initialization not in ("random", "target"):
-            raise ValueError("probe initialization must be random or target")
-
-    @property
-    def mode(self) -> ModeSchema:
-        return self.iteration.mode
-
-    def run(self, *, iteration: int) -> PokerIterationResult:
-        return self.iteration.run(iteration=iteration)
-
-    def summarize_paired_gain(
-        self, differences: Tensor, trajectory_ids: Tensor
-    ) -> PairedProbeStatistics:
-        seats = probe_evaluation_design(
-            trajectory_ids, self.iteration.geometry.players
-        )
-        return paired_probe_statistics(
-            differences, seats, self.iteration.geometry.players
-        )
-
-    def evaluator(self) -> SequentialSharedResponseEvaluator:
-        return SequentialSharedResponseEvaluator(
-            self.iteration.geometry.players,
-            self.target_sha256,
-            self.initial_model_sha256,
-            self.initialization,
-        )
-
-
 def discard_unpublished_attempt(
     owners: GeneratedOwners, failure_lane: int
 ) -> None:
@@ -1499,7 +1414,7 @@ def discard_unpublished_attempt(
     owners.close()
 
 
-class RecoveringSequentialSampledPokerIteration:
+class RecoveringSequentialPokerIteration:
     """Own attempt allocation and automatic lower-root disjoint retries."""
 
     def __init__(
@@ -1528,7 +1443,7 @@ class RecoveringSequentialSampledPokerIteration:
         reference_operation: ModelOperation | None = None,
         frozen_operation: ModelOperation | None = None,
         completion_samples: int = 0,
-        probe_cutoff: bool = False,
+        response_cutoff: bool = False,
     ) -> None:
         self.owner_factory = owner_factory
         self.plan = plan
@@ -1558,7 +1473,7 @@ class RecoveringSequentialSampledPokerIteration:
             "reference_operation": reference_operation,
             "frozen_operation": frozen_operation,
             "completion_samples": completion_samples,
-            "probe_cutoff": probe_cutoff,
+            "response_cutoff": response_cutoff,
         }
         self.mode = mode
         self.model = model
@@ -1609,7 +1524,7 @@ class RecoveringSequentialSampledPokerIteration:
                     "overflow retry changed the immutable storage plan"
                 )
             active[:] = [owners]
-            return SequentialSampledPokerIteration(
+            return SequentialPokerIteration(
                 owners=owners, rank_boundary=rank_boundary, **self.arguments
             ).run(iteration=iteration)
 
@@ -1621,288 +1536,9 @@ class RecoveringSequentialSampledPokerIteration:
         return controller.run(attempt, discard)
 
 
-class Phase5TrainingSession:
-    """Public config-driven Phase 5 composition and strict resume boundary."""
-
-    def __init__(
-        self,
-        *,
-        config: Phase5Config,
-        plan: StoragePlan,
-        owner_factory: Callable[[], GeneratedOwners],
-        model: nn.Module,
-        reference_model: nn.Module,
-        model_operation: ModelOperation,
-        reference_operation: ModelOperation | None,
-        optimizer: DenseAdam,
-        generator: torch.Generator,
-        run_state: RunState,
-        reference_state: ReferenceState,
-        execution_config: Mapping[str, object] | None = None,
-        preemption: PreemptionNotice | None = None,
-        preemption_checkpoint: str | Path | None = None,
-        allocation_inputs: tuple[Tensor, Tensor, Tensor, int] | None = None,
-    ) -> None:
-        geometry = NLHEGeometry(
-            config.game.players,
-            config.game.stack_bb,
-            config.game.rank_count,
-        )
-        expected_mode = "self_play/sequential/sampled"
-        if plan.mode.key != expected_mode:
-            raise ValueError("Phase 5 session plan has the wrong mode")
-        if (
-            plan.manifest.geometry.players != geometry.players
-            or plan.manifest.geometry.stack_bb != geometry.stack_bb
-            or plan.manifest.geometry.rank_count != geometry.rank_count
-            or plan.manifest.root_count != config.root_count
-        ):
-            raise ValueError("Phase 5 public config differs from the storage plan")
-        if not config.root_count_minimum <= run_state.root_count <= config.root_count:
-            raise ValueError("run root_count is outside the public config")
-        if generator.device != plan.device:
-            raise ValueError("session RNG differs from the admitted CUDA device")
-        if optimizer.config != config.optimizer:
-            raise ValueError("session optimizer differs from the public config")
-        if optimizer.scaler.enabled != (config.precision.name == "fp16"):
-            raise ValueError("loss scaler enablement differs from precision")
-        if (
-            reference_state.interval_iterations
-            != config.reference.interval_iterations
-            or reference_state.interval_effective_hands
-            != config.reference.interval_effective_hands
-        ):
-            raise ValueError("reference cadence differs from the public config")
-        from pbg.games.poker.queued.folded import (
-            sequential_family_workspace_row_bytes,
-        )
-
-        required_model_workspace = sequential_family_workspace_row_bytes(
-            geometry, config.model.m_raise
-        )
-        if plan.layout.family_workspace_row_bytes < required_model_workspace:
-            raise ValueError(
-                "family model workspace is below the derived Phase 5 geometry"
-            )
-        if plan.layout.topology_packet_row_bytes < 11 * 8:
-            raise ValueError(
-                "topology packet workspace is below the atomic trace width"
-            )
-        self.config = config
-        self.geometry = geometry
-        self.plan = plan
-        self.owner_factory = owner_factory
-        self.model = model
-        self.reference_model = reference_model
-        self.model_operation = model_operation
-        self.reference_operation = reference_operation
-        self.optimizer = optimizer
-        self.generator = generator
-        self.run_state = run_state
-        self.reference_state = reference_state
-        self.execution_config = MappingProxyType(
-            {} if execution_config is None else dict(execution_config)
-        )
-        configurable = tuple(
-            configure
-            for configure in (
-                getattr(model, "configure_execution", None),
-                getattr(reference_model, "configure_execution", None),
-            )
-            if callable(configure)
-        )
-        if configurable:
-            hardware_profile = self.execution_config.get("hardware_profile")
-            if not isinstance(hardware_profile, Mapping):
-                raise ValueError(
-                    "queued poker model requires an execution hardware profile"
-                )
-            try:
-                for configure_execution in configurable:
-                    configure_execution(
-                        str(hardware_profile["attention_backend"]),
-                        int(hardware_profile["query_chunk_size"]),
-                    )
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(
-                    "execution hardware profile has no valid attention plan"
-                ) from exc
-        self.preemption = preemption
-        self.preemption_checkpoint = (
-            None
-            if preemption_checkpoint is None
-            else Path(preemption_checkpoint)
-        )
-        self.allocation_inputs = allocation_inputs
-
-    @classmethod
-    def fresh(
-        cls,
-        *,
-        config: Phase5Config,
-        plan: StoragePlan,
-        owner_factory: Callable[[], GeneratedOwners],
-        model: nn.Module,
-        reference_model: nn.Module,
-        model_operation: ModelOperation,
-        reference_operation: ModelOperation | None,
-        generator: torch.Generator,
-        run_id: str,
-        execution_config: Mapping[str, object] | None = None,
-        preemption: PreemptionNotice | None = None,
-        preemption_checkpoint: str | Path | None = None,
-        allocation_inputs: tuple[Tensor, Tensor, Tensor, int] | None = None,
-    ) -> Phase5TrainingSession:
-        reference_model.load_state_dict(model.state_dict(), strict=True)
-        scaler = LossScaler(enabled=config.precision.name == "fp16")
-        return cls(
-            config=config,
-            plan=plan,
-            owner_factory=owner_factory,
-            model=model,
-            reference_model=reference_model,
-            model_operation=model_operation,
-            reference_operation=reference_operation,
-            optimizer=DenseAdam(model, config.optimizer, scaler=scaler),
-            generator=generator,
-            run_state=RunState(
-                run_id,
-                root_count=config.root_count,
-            ),
-            reference_state=ReferenceState(
-                interval_iterations=config.reference.interval_iterations,
-                interval_effective_hands=(
-                    config.reference.interval_effective_hands
-                ),
-            ),
-            execution_config=execution_config,
-            preemption=preemption,
-            preemption_checkpoint=preemption_checkpoint,
-            allocation_inputs=allocation_inputs,
-        )
-
-    @classmethod
-    def resume(
-        cls,
-        checkpoint: str | Path,
-        *,
-        config: Phase5Config,
-        plan: StoragePlan,
-        owner_factory: Callable[[], GeneratedOwners],
-        model: nn.Module,
-        reference_model: nn.Module,
-        model_operation: ModelOperation,
-        reference_operation: ModelOperation | None,
-        generator: torch.Generator,
-        external_metrics: tuple[Mapping[str, object], ...] = (),
-        preemption: PreemptionNotice | None = None,
-        preemption_checkpoint: str | Path | None = None,
-        allocation_inputs: tuple[Tensor, Tensor, Tensor, int] | None = None,
-    ) -> Phase5TrainingSession:
-        optimizer = DenseAdam(
-            model,
-            config.optimizer,
-            scaler=LossScaler(enabled=config.precision.name == "fp16"),
-        )
-        scaler, reference_state, run_state, execution = load_checkpoint(
-            checkpoint,
-            model=model,
-            optimizer=optimizer,
-            reference_model=reference_model,
-            expected_scientific_config=config.scientific_mapping(),
-            generator=generator,
-        )
-        optimizer.scaler = scaler
-        if external_metrics:
-            run_state.metrics_prefix = trim_metrics_after_checkpoint(
-                external_metrics, run_state.iteration - 1
-            )
-        return cls(
-            config=config,
-            plan=plan,
-            owner_factory=owner_factory,
-            model=model,
-            reference_model=reference_model,
-            model_operation=model_operation,
-            reference_operation=reference_operation,
-            optimizer=optimizer,
-            generator=generator,
-            run_state=run_state,
-            reference_state=reference_state,
-            execution_config=execution,
-            preemption=preemption,
-            preemption_checkpoint=preemption_checkpoint,
-            allocation_inputs=allocation_inputs,
-        )
-
-    def checkpoint(self, path: str | Path) -> str:
-        return save_checkpoint(
-            path,
-            model=self.model,
-            optimizer=self.optimizer,
-            scaler=self.optimizer.scaler,
-            reference_model=self.reference_model,
-            reference_state=self.reference_state,
-            run_state=self.run_state,
-            scientific_config=self.config.scientific_mapping(),
-            execution_config=self.execution_config,
-            generator=self.generator,
-        )
-
-    def run(self, *, iteration: int | None = None) -> PokerIterationResult:
-        selected_iteration = (
-            self.run_state.iteration if iteration is None else int(iteration)
-        )
-        if selected_iteration != self.run_state.iteration:
-            raise ValueError("session may run only the next checkpointed iteration")
-        if self.reference_state.refresh_before_iteration(selected_iteration):
-            self.reference_model.load_state_dict(
-                self.model.state_dict(), strict=True
-            )
-        result = RecoveringSequentialSampledPokerIteration(
-            owner_factory=self.owner_factory,
-            plan=self.plan,
-            minimum_root_count=self.config.root_count_minimum,
-            geometry=self.geometry,
-            mode=self.plan.mode,
-            model=self.model,
-            model_operation=self.model_operation,
-            optimizer=self.optimizer,
-            loss=self.config.loss,
-            schedule=self.config.schedule,
-            generator=self.generator,
-            seed=self.config.seed,
-            lambda_=self.config.lambda_,
-            precision=self.config.precision.name,
-            utility=self.config.utility,
-            cache_reference_outputs=self.config.reference.cache_outputs,
-            allocation_inputs=self.allocation_inputs,
-            reproducibility=self.config.reproducibility,
-            run_state=self.run_state,
-            reference_operation=self.reference_operation,
-        ).run(iteration=selected_iteration)
-        if self.reference_state.observe(
-            iteration=self.run_state.iteration,
-            effective_hands=float(result.player_nodes),
-        ):
-            self.reference_model.load_state_dict(
-                self.model.state_dict(), strict=True
-            )
-        if self.preemption is not None and self.preemption.requested:
-            if self.preemption_checkpoint is None:
-                raise PokerIterationError(
-                    "preemption requested without a checkpoint destination"
-                )
-            self.checkpoint(self.preemption_checkpoint)
-        return result
-
-
 __all__ = [
-    "Phase5TrainingSession",
     "PokerIterationError",
     "PokerIterationResult",
-    "RecoveringSequentialSampledPokerIteration",
+    "RecoveringSequentialPokerIteration",
     "SequentialPokerIteration",
-    "SequentialSampledPokerIteration",
-    "SequentialSharedResponseProbe",
 ]

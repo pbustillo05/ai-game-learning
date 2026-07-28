@@ -11,46 +11,48 @@ from types import MappingProxyType
 import pytest
 import torch
 
-from pbg.core import (
+from pbg.core.contracts import (
+    Partition,
+    PartitionContract,
+    PartitionMap,
+    mode_schema,
+)
+from pbg.core.rollout import (
+    _OWNER_REGISTRY_TOKEN,
     AsyncTopologyPublisher,
     BoundedChanceClosure,
-    ChanceFrontier,
     CommitCoverage,
     CommitPlan,
     CompletionFIFO,
     CompletionPlan,
-    DeviceDestinationRequest,
-    DeviceFailureState,
-    PublicationTransaction,
     DrawPurpose,
     EndpointPatch,
     FamilyQueueState,
     FamilyScheduler,
     LOGICAL_RNG_VERSION,
-    MonotoneSlab,
-    Partition,
-    PartitionContract,
-    PartitionMap,
     RolloutTransaction,
     RolloutOwnerRegistry,
     SampleWorkspace,
     SemanticFamilyFIFO,
-    SoAField,
-    SoASchema,
-    StorageError,
-    Topology,
-    TopologyBindings,
     TopologyDraftPacket,
-    TopologyError,
     TopologyPublication,
     child_path_keys,
     device_exclusive_scan,
     logical_categorical,
     logical_rng_keys,
     logical_uniform,
-    mode_schema,
     stable_route,
 )
+from pbg.core.storage import (
+    DeviceDestinationRequest,
+    DeviceFailureState,
+    MonotoneSlab,
+    PublicationTransaction,
+    SoAField,
+    SoASchema,
+    StorageError,
+)
+from pbg.core.topology import Topology, TopologyBindings, TopologyError
 
 
 CUDA = pytest.mark.skipif(
@@ -161,7 +163,8 @@ def _registry(
     topology_cap: int = 32,
     topology_edge_cap: int = 32,
 ) -> RolloutOwnerRegistry:
-    return RolloutOwnerRegistry.for_testing(
+    descriptor_cap = sum(slab.capacity for slab in slabs)
+    return RolloutOwnerRegistry(
         slabs,
         family_pack_cap=family_pack_cap,
         chance_frontier_cap=chance_frontier_cap,
@@ -169,6 +172,11 @@ def _registry(
         topology_packet_cap=topology_packet_cap,
         topology_cap=topology_cap,
         topology_edge_cap=topology_edge_cap,
+        chance_generation_cap=family_pack_cap,
+        descriptor_cap=descriptor_cap,
+        workspace_byte_cap=max(1, descriptor_cap * 64),
+        completion_workspace_byte_cap=max(1, descriptor_cap * 64),
+        _token=_OWNER_REGISTRY_TOKEN,
     )
 
 
@@ -512,7 +520,7 @@ def test_device_materialization_has_no_hidden_nonzero_or_scalar_sync() -> None:
 def test_undeclared_device_route_fails_terminally_without_skipping() -> None:
     script = """
 import torch
-from pbg.core import stable_route
+from pbg.core.rollout import stable_route
 family = torch.tensor([[1, 99, 2]], dtype=torch.int32, device="cuda")
 active = torch.ones_like(family, dtype=torch.bool)
 stable_route(family, active, (1, 2))
@@ -537,7 +545,8 @@ torch.cuda.synchronize()
             """
 from types import MappingProxyType
 import torch
-from pbg.core import CommitCoverage, DeviceDestinationRequest, DeviceFailureState, FamilyBatch, MonotoneSlab, SoAField, SoASchema
+from pbg.core.rollout import CommitCoverage, FamilyBatch
+from pbg.core.storage import DeviceDestinationRequest, DeviceFailureState, MonotoneSlab, SoAField, SoASchema
 device = torch.device("cuda")
 failure = DeviceFailureState(1, device)
 slab = MonotoneSlab(SoASchema("Leaf", (SoAField("x", torch.int32),), "test"), 2, 1, device, failure_state=failure)
@@ -549,21 +558,6 @@ coverage.validate(batch, (request,), torch.ones(1, dtype=torch.bool, device=devi
 torch.cuda.synchronize()
 """,
             "skipped a scheduled source row",
-        ),
-        (
-            """
-from types import MappingProxyType
-import torch
-from pbg.core import BoundedChanceClosure, ChanceFrontier, DeviceFailureState, MonotoneSlab, RolloutOwnerRegistry, SoAField, SoASchema
-device = torch.device("cuda")
-failure = DeviceFailureState(1, device)
-slab = MonotoneSlab(SoASchema("Leaf", (SoAField("x", torch.int32),), "test"), 1, 1, device, failure_state=failure)
-owners = RolloutOwnerRegistry.for_testing((slab,), family_pack_cap=1, chance_frontier_cap=1, completion_pack_cap=1, topology_packet_cap=1, topology_cap=1, topology_edge_cap=1)
-frontier = ChanceFrontier(torch.ones((1,1), dtype=torch.bool, device=device), torch.zeros((1,1), dtype=torch.int64, device=device), torch.zeros((1,1), dtype=torch.int64, device=device), MappingProxyType({}))
-BoundedChanceClosure(seed=1, iteration=1, owners=owners, max_generations=1).run(frontier, lambda current, key, generation: key, lambda current, sampled, generation: current)
-torch.cuda.synchronize()
-""",
-            "exhausted its generation cap",
         ),
     ),
 )
@@ -804,7 +798,6 @@ def test_one_model_sample_commit_path_serves_sequential_and_branched(
                     ),
                 ),
                 _coverage(counts, 2),
-                topology=(TopologyPublication(0, draft, patch),),
             )
 
     def model(value, lanes):
@@ -830,13 +823,7 @@ def test_one_model_sample_commit_path_serves_sequential_and_branched(
     expected = (seen["keys"] & 7).to(torch.int32)
     assert torch.equal(leaf.published(0, "result"), expected[0])
     assert torch.equal(leaf.published(2, "result"), expected[1])
-    assert publisher.committed_packets == ()
-    committed = publisher.drain(block=True)
-    assert len(committed) == 1
-    assert committed[0].lane == 0
-    committed[0].packet.topology.validate(
-        committed[0].packet.bindings, p_train=1
-    )
+    publisher.assert_drained()
 
     family.release()
     metadata.release()
@@ -1116,69 +1103,6 @@ def test_post_publish_exception_rolls_back_destination_and_source_visibility() -
 
 
 @CUDA
-def test_topology_endpoints_bind_divergent_reservations_and_keep_replica_identity() -> None:
-    device = torch.device("cuda", 0)
-    failures = DeviceFailureState(2, device)
-    leaf = _slab(
-        _schema("Leaf", (SoAField("terminal", torch.int32),)),
-        4,
-        failures,
-    )
-    owners = _registry((leaf,))
-    publisher = AsyncTopologyPublisher(owners, p_train=1)
-    one = torch.ones(2, dtype=torch.int64, device=device)
-    prior = PublicationTransaction.begin_device(
-        (_request(leaf, one, max_rows=1),),
-        phase="prior",
-        active=torch.tensor([False, True], device=device),
-    )
-    prior.fill_all()
-    prior.publish()
-    request = _request(leaf, one, max_rows=1, base=7)
-    transaction = PublicationTransaction.begin_device(
-        (request,),
-        phase="rollout",
-        active=torch.ones(2, dtype=torch.bool, device=device),
-    )
-    publications = tuple(
-        TopologyPublication(
-            lane,
-            *_draft(0, device=device),
-        )
-        for lane in (0, 1)
-    )
-    for publication in publications:
-        publisher.preflight(publication, (request,))
-        publisher.stage(publication)
-    resolved = tuple(
-        publisher.resolve_rows(publication, transaction)
-        for publication in publications
-    )
-    marker = torch.full((2,), -1, dtype=torch.int64, device=device)
-    stream = torch.cuda.current_stream(device)
-    pending = publisher.prepare_defer(
-        publications, resolved, marker, stream=stream
-    )
-    transaction.fill_all()
-    transaction.publish(
-        commit_marker=marker,
-        sequence=torch.zeros_like(marker),
-    )
-    publisher.finalize_defer(pending, marker, stream=stream)
-    accepted = publisher.drain()
-    if not accepted:
-        accepted = publisher.drain(block=True)
-    assert tuple(item.lane for item in accepted) == (0, 1)
-    assert tuple(
-        item.packet.topology.target_row.item() for item in accepted
-    ) == (0, 1)
-    assert tuple(item.packet.sequence for item in accepted) == (0, 0)
-    publisher.assert_drained()
-    leaf.release()
-    failures.release()
-
-
-@CUDA
 def test_topology_staging_enforces_cumulative_manifest_caps() -> None:
     device = torch.device("cuda", 0)
     failures = DeviceFailureState(2, device)
@@ -1202,84 +1126,6 @@ def test_topology_staging_enforces_cumulative_manifest_caps() -> None:
     publisher.abort(0, 0)
     publisher.assert_drained()
     leaf.release()
-    failures.release()
-
-
-@CUDA
-def test_bounded_chance_closure_uses_fixed_launches_and_inactive_draws_nothing() -> None:
-    device = torch.device("cuda", 0)
-    failures = DeviceFailureState(2, device)
-    owner = _slab(
-        _schema("Leaf", (SoAField("terminal", torch.int32),)),
-        4,
-        failures,
-    )
-    owners = _registry((owner,), chance_frontier_cap=4)
-    active = torch.tensor(
-        [[True, True, False, False], [True, False, False, False]],
-        dtype=torch.bool,
-        device=device,
-    )
-    frontier = ChanceFrontier(
-        active=active,
-        root=torch.tensor(
-            [[0, 1, 0, 0], [2, 0, 0, 0]],
-            dtype=torch.int64,
-            device=device,
-        ),
-        path=torch.zeros((2, 4), dtype=torch.int64, device=device),
-        payload=MappingProxyType(
-            {"generation": torch.zeros((2, 4), device=device)}
-        ),
-    )
-    calls: list[int] = []
-
-    def sample(current, key, generation):
-        calls.append(generation)
-        torch._assert_async(
-            (key[~current.active] == 0).all(),
-            "inactive chance row received a draw",
-        )
-        return key
-
-    def commit(current, sampled, generation):
-        del sampled
-        next_active = current.active & (generation < 1)
-        payload = {
-            "generation": torch.full_like(
-                current.payload["generation"], generation + 1
-            )
-        }
-        return ChanceFrontier(
-            next_active,
-            current.root,
-            child_path_keys(
-                current.path,
-                torch.full_like(current.path, generation + 1),
-            ),
-            MappingProxyType(payload),
-        )
-
-    result = BoundedChanceClosure(
-        seed=17,
-        iteration=3,
-        owners=owners,
-        max_generations=4,
-    ).run(frontier, sample, commit)
-    torch.cuda.synchronize(device)
-    assert calls == [0, 1, 2, 3]
-    assert result.generation_draws.tolist() == [3, 3, 0, 0]
-    assert not result.frontier.active.any()
-
-    source = inspect.getsource(BoundedChanceClosure.run)
-    tree = ast.parse(textwrap.dedent(source))
-    calls_in_source = {
-        node.func.attr
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    }
-    assert not {"item", "cpu", "tolist", "numpy"}.intersection(calls_in_source)
-    owner.release()
     failures.release()
 
 
@@ -1396,9 +1242,8 @@ def test_rollout_hot_paths_do_not_read_cuda_scalars_on_host() -> None:
         CommitCoverage.validate,
         SemanticFamilyFIFO.publish_family_tail,
         SemanticFamilyFIFO.stable_prefix,
-        SemanticFamilyFIFO.consume,
         RolloutTransaction.execute,
-        BoundedChanceClosure.run,
+        BoundedChanceClosure.__iter__,
         stable_route,
     )
     forbidden = {"item", "cpu", "tolist", "numpy"}

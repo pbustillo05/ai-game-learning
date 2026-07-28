@@ -85,16 +85,6 @@ def _lambda(value: float) -> float:
     return result
 
 
-def conditionalize(moment: Tensor, mass: Tensor) -> Tensor:
-    """Return an FP32 conditional value with exact zeros at zero mass."""
-
-    if moment.dtype != torch.float32 or mass.dtype != torch.float32:
-        raise TargetError("target conditionalization requires FP32")
-    valid = mass > 0
-    safe = torch.where(valid, mass, torch.ones_like(mass))
-    return torch.where(valid, moment / safe, torch.zeros_like(moment))
-
-
 @dataclass(frozen=True, order=True)
 class ConversionMap:
     """Deterministic component map for one declared class-sum conversion."""
@@ -205,24 +195,6 @@ class RBLeafWork:
 
 
 LeafWork = SampledLeafWork | RBLeafWork
-
-
-def sampled_completion(
-    payoff: Tensor, *, branched: bool
-) -> SampledLeafWork:
-    """Create sampled leaf work from selected FP32 payoff components."""
-
-    if (
-        payoff.device.type != "cuda"
-        or payoff.dtype != torch.float32
-        or payoff.ndim != 2
-        or not payoff.is_contiguous()
-    ):
-        raise TargetError("sampled payoff must be CUDA FP32 [leaf, P_train]")
-    return SampledLeafWork(
-        return_value=payoff.unsqueeze(-1),
-        trace_vector=payoff if branched else None,
-    )
 
 
 def rb_completion(
@@ -371,213 +343,6 @@ class DeviceLayerPlan:
         self._released = True
 
 
-def initialize_work_arenas(
-    owners: GeneratedOwners,
-    plan: LayerPlan,
-    completion: Mapping[tuple[int, str], LeafWork],
-) -> None:
-    """Apply the exact leaf movement plan and atomically publish work arenas."""
-
-    n_replica = owners.plan.manifest.n_replica
-    expected_inputs = tuple(
-        item.name for item in owners.plan.partitions.inputs
-    )
-    expected_outputs = tuple(
-        item.name for item in owners.plan.partitions.outputs
-    )
-    if plan.input_names != expected_inputs or plan.output_names != expected_outputs:
-        raise TargetError("LayerPlan partitions differ from generated owners")
-    if plan.branched != owners.plan.mode.rollout_mode.is_branched:
-        raise TargetError("LayerPlan rollout family differs from generated owners")
-    if len(plan.arena_rows) != n_replica:
-        raise TargetError("LayerPlan replica count differs from generated owners")
-    plan.assert_admitted(owners.plan.manifest)
-    p_train = (
-        owners.plan.layout.player_count
-        if owners.plan.mode.training_regime is TrainingRegime.SELF_PLAY
-        else 1
-    )
-    required_completion: set[tuple[int, str]] = set()
-    for movement in range(plan.movement_count):
-        lane = int(plan.movement_replica[movement])
-        output = int(plan.movement_output_type[movement])
-        required_completion.add((lane, plan.output_names[output]))
-    if set(completion) != required_completion:
-        raise TargetError("completion payload keys differ from movement plan")
-    for lane in range(n_replica):
-        requests: list[DestinationRequest] = []
-        operations: list[
-            tuple[int, str, Tensor, Tensor, LeafWork | None]
-        ] = []
-        for output, name in enumerate(plan.output_names):
-            count = plan.arena_rows[lane][output]
-            if count == 0:
-                continue
-            slab = owners.slab("LayerWork", name)
-            requests.append(
-                DestinationRequest(
-                    slab=slab,
-                    lane=lane,
-                    count=count,
-                    input_type=name,
-                    logical_address=output,
-                )
-            )
-            selected = (
-                (plan.movement_replica == lane)
-                & (plan.movement_output_type == output)
-            )
-            destinations = plan.movement_destination_work_row[selected].long()
-            sources = plan.movement_source_leaf_row[selected].long()
-            payload: LeafWork | None = None
-            if destinations.numel():
-                try:
-                    payload = completion[(lane, name)]
-                except KeyError as exc:
-                    raise TargetError(
-                        f"missing completion payload for lane {lane}, {name}"
-                    ) from exc
-                if not isinstance(payload, (SampledLeafWork, RBLeafWork)):
-                    raise TargetError("completion payload type is not supported")
-                expects_sampled = (
-                    owners.plan.mode.private_estimator
-                    is PrivateEstimator.SAMPLED
-                )
-                if expects_sampled != isinstance(payload, SampledLeafWork):
-                    raise TargetError(
-                        "completion payload estimator differs from LayerWork schema"
-                    )
-                leaf_rows = plan.leaf_rows[lane]
-                width = plan.output_widths[output]
-                work_shape = (leaf_rows, p_train, width)
-                trace_shape = (leaf_rows, p_train)
-                tensors = (
-                    (("return_value", payload.return_value),)
-                    if isinstance(payload, SampledLeafWork)
-                    else (
-                        ("mass", payload.mass),
-                        ("moment", payload.moment),
-                    )
-                )
-                for field, tensor in tensors:
-                    if (
-                        tensor.device != owners.plan.device
-                        or tensor.dtype != torch.float32
-                        or tuple(tensor.shape) != work_shape
-                        or not tensor.is_contiguous()
-                    ):
-                        raise TargetError(
-                            f"completion {field} must be contiguous CUDA FP32 "
-                            f"{work_shape} on {owners.plan.device}"
-                        )
-                trace = payload.trace_vector
-                if plan.branched:
-                    if (
-                        trace is None
-                        or trace.device != owners.plan.device
-                        or trace.dtype != torch.float32
-                        or tuple(trace.shape) != trace_shape
-                        or not trace.is_contiguous()
-                    ):
-                        raise TargetError(
-                            "branched completion trace must match its closed "
-                            "CUDA FP32 leaf/player extent"
-                        )
-                elif trace is not None:
-                    raise TargetError("sequential completion must omit trace_vector")
-                finite = all(bool(torch.isfinite(tensor).all()) for _, tensor in tensors)
-                if trace is not None:
-                    finite = finite and bool(torch.isfinite(trace).all())
-                if not finite:
-                    raise TargetError("completion payload must be finite")
-                if isinstance(payload, RBLeafWork):
-                    invalid_mass = bool((payload.mass < 0).any())
-                    invalid_zero = bool(
-                        (
-                            (payload.mass == 0)
-                            & (payload.moment.abs() > 1.0e-7)
-                        ).any()
-                    )
-                    if invalid_mass or invalid_zero:
-                        raise TargetError("RB completion violates mass/moment laws")
-            operations.append((output, name, destinations, sources, payload))
-        if not requests:
-            continue
-        transaction = PublicationTransaction.begin(
-            requests, phase="completion_movement"
-        )
-        try:
-            for index, (_, _, destinations, sources, payload) in enumerate(
-                operations
-            ):
-                transaction.fill_defaults(index)
-                if payload is None:
-                    continue
-                reservation = transaction.reservations[index]
-                fields = tuple(
-                    field.name for field in reservation._slab.schema.fields
-                )
-                if isinstance(payload, SampledLeafWork):
-                    if "return_value" not in fields:
-                        raise TargetError("sampled completion used with RB work schema")
-                    sources_device = sources.to(
-                        device=owners.plan.device, dtype=torch.int64
-                    )
-                    torch.index_select(
-                        payload.return_value,
-                        0,
-                        sources_device,
-                        out=reservation.view("return_value")[
-                            : destinations.numel(), 0
-                        ],
-                    )
-                    if "trace_vector" in fields:
-                        if payload.trace_vector is None:
-                            raise TargetError("branched completion lacks trace vector")
-                        torch.index_select(
-                            payload.trace_vector,
-                            0,
-                            sources_device,
-                            out=reservation.view("trace_vector")[
-                                : destinations.numel(), 0
-                            ],
-                        )
-                else:
-                    if "mass" not in fields:
-                        raise TargetError("RB completion used with sampled work schema")
-                    sources_device = sources.to(
-                        device=owners.plan.device, dtype=torch.int64
-                    )
-                    torch.index_select(
-                        payload.mass,
-                        0,
-                        sources_device,
-                        out=reservation.view("mass")[: destinations.numel(), 0],
-                    )
-                    torch.index_select(
-                        payload.moment,
-                        0,
-                        sources_device,
-                        out=reservation.view("moment")[: destinations.numel(), 0],
-                    )
-                    if "trace_vector" in fields:
-                        if payload.trace_vector is None:
-                            raise TargetError("branched completion lacks trace vector")
-                        torch.index_select(
-                            payload.trace_vector,
-                            0,
-                            sources_device,
-                            out=reservation.view("trace_vector")[
-                                : destinations.numel(), 0
-                            ],
-                        )
-                del sources_device
-            transaction.publish()
-        except BaseException:
-            transaction.abort()
-            raise
-
-
 @dataclass(frozen=True)
 class TargetCounters:
     layer_count: int
@@ -693,8 +458,6 @@ class LayeredTargetExecutor:
             ).any()
         ):
             raise TargetError("LayerPlan owner slot is outside P_train")
-        output_count = len(plan.output_names)
-        input_count = len(plan.input_names)
         max_width = max(self.algebra.widths)
         required_scratch = self.required_scratch_bytes(plan, n_replica)
         if required_scratch > owners.plan.manifest.movement_scratch_bytes:
@@ -985,8 +748,5 @@ __all__ = [
     "TargetCounters",
     "TargetError",
     "TargetResult",
-    "conditionalize",
-    "initialize_work_arenas",
     "rb_completion",
-    "sampled_completion",
 ]

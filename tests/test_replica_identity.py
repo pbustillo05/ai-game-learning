@@ -4,62 +4,68 @@ import copy
 import math
 from dataclasses import replace
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from pbg.games.poker.queued import (
+from pbg.games.poker.queued.branching import (
+    ReplicaBranchedPokerIteration,
+)
+from pbg.games.poker.queued.hooks import (
     NLHEGeometry,
     PokerForwardInput,
-    PokerReplicaInference,
-    QueuedPokerModel,
-    ReplicaBranchedPokerIteration,
-    ReplicaPokerIterationResult,
-    build_model_from_config,
     sampled_partitions,
 )
+from pbg.games.poker.queued.model import QueuedPokerModel, build_model_from_config
+from pbg.games.poker.queued.replica import PokerReplicaInference
+from pbg.games.poker.queued.training import ReplicaPokerIterationResult
 from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
-from pbg.games.poker.queued.training import SequentialSampledPokerIteration
-from pbg.core import (
-    CapacityManifest,
+from pbg.games.poker.queued.training import SequentialPokerIteration
+from pbg.core.branching import (
     CostSafeguardController,
-    DistributedSUM,
-    ExternalWorkspaceBounds,
     FixedBranchController,
-    FunctionalReplicaInference,
-    GameGeometry,
+    KKTBranchController,
+)
+from pbg.core.capacity import (
+    CapacityManifest,
+    ExecutionGeometry,
+    ExternalWorkspaceBounds,
     GeneratedOwners,
     HardwareLimits,
-    KKTBranchController,
+    NamedShape,
+    PartitionRows,
+    PhysicalLayout,
+    build_storage_plan,
+)
+from pbg.core.contracts import mode_schema
+from pbg.core.learner import (
     LearnerDTypes,
     LearnerOperation,
     LearnerSchedule,
     LossConfig,
     LossResult,
-    LossScaler,
     ModelEvaluation,
-    NamedShape,
-    OptimizerConfig,
-    PartitionRows,
-    PhysicalLayout,
     PolicyEvaluation,
-    ReplicaLearnerScheduler,
+    SequentialLearnerBatch,
+)
+from pbg.core.optimization import DenseAdam, LossScaler, OptimizerConfig
+from pbg.core.persistence import (
+    RunState,
+    load_replica_checkpoint,
+    save_replica_checkpoint,
+)
+from pbg.core.replica import (
+    DistributedSUM,
+    FunctionalReplicaInference,
     ReplicaMemoryReport,
     ReplicaModuleOwner,
     ReplicaOptimizerGroup,
-    RunState,
-    SequentialLearnerBatch,
-    SequentialSampledIteration,
-    TrainingError,
-    build_storage_plan,
-    load_replica_checkpoint,
-    mode_schema,
-    save_replica_checkpoint,
 )
-from pbg.core.optimization import DenseAdam
+from pbg.core.storage import SoAField
+from pbg.core.training import SequentialSampledIteration, TrainingError
 from tests.test_branched_sampled_modes import (
     _manifest as _branched_manifest,
 )
@@ -78,6 +84,61 @@ MULTI_CUDA = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
     reason="distributed queued learner validation requires two CUDA devices",
 )
+
+
+class ReplicaLearnerScheduler:
+    """Test driver for the production lane optimizer group."""
+
+    def __init__(
+        self,
+        optimizers: ReplicaOptimizerGroup,
+        *,
+        distributed: DistributedSUM | None = None,
+    ) -> None:
+        self.optimizers = optimizers
+        self.distributed = distributed
+
+    def run_step(self, active_lanes, forward_loss_backward):
+        lanes = tuple(sorted(int(lane) for lane in active_lanes))
+        self.optimizers._mask(lanes)
+        self.optimizers.zero_grad(lanes)
+        failures: dict[int, str] = {}
+        for lane in lanes:
+            try:
+                forward_loss_backward(
+                    lane,
+                    self.optimizers.modules.lane_module(lane),
+                    self.optimizers.optimizers[lane],
+                )
+            except Exception as exc:  # noqa: BLE001
+                failures[lane] = f"{type(exc).__name__}: {exc}"
+                self.optimizers.gradients[lane].zero_()
+        if self.distributed is not None:
+            local = torch.zeros(
+                self.optimizers.modules.n_replica,
+                dtype=torch.bool,
+                device=self.optimizers.modules.device,
+            )
+            for lane in failures:
+                local[lane] = True
+            common = self.distributed.agree_failures(local)
+            for lane in lanes:
+                if bool(common[lane]) and lane not in failures:
+                    failures[lane] = "failure on another distributed rank"
+                    self.optimizers.gradients[lane].zero_()
+        successful = tuple(lane for lane in lanes if lane not in failures)
+        steps = self.optimizers.step(
+            successful,
+            distributed=self.distributed,
+        )
+        return SimpleNamespace(
+            active_lanes=lanes,
+            optimizer_steps=steps,
+            failures=MappingProxyType(failures),
+            versions=tuple(
+                int(value) for value in self.optimizers.versions.tolist()
+            ),
+        )
 
 
 class _Toy(torch.nn.Module):
@@ -267,7 +328,7 @@ def _poker_manifest(
     device: torch.device, *, n_replica: int
 ) -> CapacityManifest:
     return CapacityManifest(
-        geometry=GameGeometry(2, 8.0, 4, 64, 4096),
+        geometry=ExecutionGeometry(2, 15, 64, 4096),
         root_count=1,
         n_replica=n_replica,
         beta_max=1,
@@ -330,6 +391,10 @@ def _poker_layout(geometry: NLHEGeometry) -> PhysicalLayout:
         learner_sigma_workspace_row_bytes=64,
         learner_action_workspace_row_bytes=64,
         topology_packet_row_bytes=88,
+        opaque_fields=(
+            SoAField("leaf_public_state", torch.uint8, (5,), fill=255),
+            SoAField("leaf_private_profile", torch.int32, (2,), fill=-1),
+        ),
     )
 
 
@@ -515,7 +580,7 @@ def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
         ordinary_model,
         OptimizerConfig(name="adamw", grad_clip=5.0),
     )
-    ordinary = SequentialSampledPokerIteration(
+    ordinary = SequentialPokerIteration(
         geometry=geometry,
         owners=GeneratedOwners(
             build_storage_plan(
@@ -562,7 +627,7 @@ def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
         RunState(f"real-replica-{lane}", root_count=1)
         for lane in range(2)
     )
-    result = SequentialSampledPokerIteration(
+    result = SequentialPokerIteration(
         geometry=geometry,
         owners=owners,
         mode=mode,
@@ -642,7 +707,7 @@ def test_complete_sequential_transactions_isolate_every_replica_lane(
         RunState(f"complete-isolation-{count}-{lane}", root_count=1)
         for lane in range(count)
     )
-    result = SequentialSampledPokerIteration(
+    result = SequentialPokerIteration(
         geometry=geometry,
         owners=GeneratedOwners(
             build_storage_plan(
@@ -896,7 +961,7 @@ def test_replica_best_response_groups_compact_learned_and_frozen_rows() -> None:
         OptimizerConfig(name="adamw"),
     )
     modules = tuple(learned.modules.lane_module(lane) for lane in range(2))
-    iteration = SequentialSampledPokerIteration(
+    iteration = SequentialPokerIteration(
         geometry=geometry,
         owners=GeneratedOwners(
             build_storage_plan(

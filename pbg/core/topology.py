@@ -395,62 +395,6 @@ class TopologyPacket:
         self.bindings.validate(self.topology.node_count, self.topology.edge_count)
 
 
-def assemble_topology_packets(
-    packets: Sequence[TopologyPacket], *, p_train: int
-) -> tuple[Topology, TopologyBindings]:
-    """Assemble stable packet order without accepting a partial transfer."""
-
-    if not packets:
-        raise TopologyError("at least one topology packet is required")
-    ordered = sorted(packets, key=lambda packet: packet.sequence)
-    node_cursor = 0
-    edge_cursor = 0
-    for sequence, packet in enumerate(ordered):
-        if packet.sequence != sequence:
-            raise TopologyError("topology packet sequence has a gap")
-        if packet.node_begin != node_cursor or packet.edge_begin != edge_cursor:
-            raise TopologyError("topology packet extents are not contiguous")
-        node_cursor += packet.topology.node_count
-        edge_cursor += packet.topology.edge_count
-
-    def join(name: str) -> Tensor:
-        return torch.cat(
-            tuple(getattr(packet.topology, name) for packet in ordered)
-        ).contiguous()
-
-    topology = Topology(
-        parent=join("parent"),
-        child_begin=join("child_begin"),
-        executed_degree=join("executed_degree"),
-        nominal_degree=join("nominal_degree"),
-        target_degree=join("target_degree"),
-        owner=join("owner"),
-        familywork_row=join("familywork_row"),
-        sigma_head_row=join("sigma_head_row"),
-        action_begin=join("action_begin"),
-        label=join("label"),
-        path_length=join("path_length"),
-        target_kind=join("target_kind"),
-        target_row=join("target_row"),
-    )
-    bindings = TopologyBindings(
-        input_type=torch.cat(
-            tuple(packet.bindings.input_type for packet in ordered)
-        ).contiguous(),
-        output_type=torch.cat(
-            tuple(packet.bindings.output_type for packet in ordered)
-        ).contiguous(),
-        sigma_target_row=torch.cat(
-            tuple(packet.bindings.sigma_target_row for packet in ordered)
-        ).contiguous(),
-        child_output_type=torch.cat(
-            tuple(packet.bindings.child_output_type for packet in ordered)
-        ).contiguous(),
-    )
-    topology.validate(bindings, p_train=p_train)
-    return topology.compact(bindings, p_train=p_train)
-
-
 @dataclass(frozen=True)
 class LayerPlan:
     """Exact CPU movement and reverse-layer execution plan."""
@@ -695,7 +639,7 @@ class LayerPlan:
                 ):
                     raise TopologyError("LayerPlan structural row addresses targets")
                 continue
-            if input_type >= input_count or owner >= manifest.geometry.players:
+            if input_type >= input_count or owner >= manifest.geometry.actor_count:
                 raise TopologyError("LayerPlan input type is out of bounds")
             input_name = self.input_names[input_type]
             if not 0 <= int(self.sigma_head_row[row]) < trained_caps[input_name]:
@@ -1278,6 +1222,5 @@ __all__ = [
     "TopologyBindings",
     "TopologyError",
     "TopologyPacket",
-    "assemble_topology_packets",
     "build_layer_plan",
 ]

@@ -16,51 +16,62 @@ import torch.distributed as dist
 
 from pbg.config import RootConfig
 from pbg.devices import resolve_execution_device, validate_workload_capabilities
-from pbg.games.poker.queued import (
+from pbg.games.poker.queued.branching import (
     BranchedSampledPokerIteration,
-    NLHEGeometry,
-    PokerReplicaInference,
-    RecoveringSequentialSampledPokerIteration,
     ReplicaBranchedPokerIteration,
-    SequentialPokerIteration,
-    build_model_from_config,
-    discard_unpublished_attempt,
+)
+from pbg.games.poker.queued.hooks import (
+    NLHEGeometry,
     poker_partitions,
 )
+from pbg.games.poker.queued.model import build_model_from_config
+from pbg.games.poker.queued.replica import (
+    PokerReplicaInference,
+)
+from pbg.games.poker.queued.training import (
+    RecoveringSequentialPokerIteration,
+    SequentialPokerIteration,
+    discard_unpublished_attempt,
+)
 from pbg.identity import accelerator_identity, code_identity
-from pbg.core import (
-    CHECKPOINT_SCHEMA,
-    REPLICA_CHECKPOINT_SCHEMA,
-    AttemptAddress,
-    BranchedModeConfig,
+from pbg.core.branching import (
     BranchedRecoveryRecord,
     CostSafeguardController,
-    DistributedSUM,
     FixedBranchController,
-    GeneratedOwners,
     KKTBranchController,
-    LossScaler,
-    OverflowRecoveryRecord,
-    PreemptionNotice,
     RankCommonFailureAgreement,
-    RecoverableOverflow,
-    ReferenceState,
-    ReplicaModuleOwner,
-    ReplicaOptimizerGroup,
+    controller_from_state_dict,
+)
+from pbg.core.capacity import GeneratedOwners, build_storage_plan
+from pbg.games.poker.queued.config import BranchedModeConfig, SequentialModeConfig
+from pbg.core.contracts import mode_schema
+from pbg.core.learner import ReferenceState
+from pbg.core.optimization import LossScaler
+from pbg.core.persistence import (
+    CHECKPOINT_SCHEMA,
+    REPLICA_CHECKPOINT_SCHEMA,
+    LOGICAL_WORK_KEYS,
     RunState,
-    SequentialModeConfig,
-    build_storage_plan,
     load_checkpoint,
     load_distributed_checkpoint_manifest,
     load_replica_checkpoint,
-    mode_schema,
     model_state_sha256,
     save_checkpoint,
     save_distributed_checkpoint_manifest,
     save_replica_checkpoint,
     sha256_file,
 )
-from pbg.core.persistence import LOGICAL_WORK_KEYS
+from pbg.core.replica import (
+    DistributedSUM,
+    ReplicaModuleOwner,
+    ReplicaOptimizerGroup,
+)
+from pbg.core.training import (
+    AttemptAddress,
+    OverflowRecoveryRecord,
+    PreemptionNotice,
+    RecoverableOverflow,
+)
 
 
 class RuntimeError(RuntimeError):
@@ -396,13 +407,9 @@ class TrainingSession:
         if self.controllers:
             restored = []
             restored_safeguards = []
-            for state, fallback in zip(
-                self.run_states, self.controllers, strict=True
-            ):
+            for state in self.run_states:
                 if state.branch_controller_state is None:
                     raise RuntimeError("branched resume omitted controller state")
-                from pbg.core import controller_from_state_dict
-
                 restored.append(
                     controller_from_state_dict(state.branch_controller_state)
                 )
@@ -506,7 +513,7 @@ class TrainingSession:
                 else self.frozen_inference.modules.lane_module(0).rollout_operation
             ),
             completion_samples=int(completion.get("n_samples", 0)),
-            probe_cutoff="probe" in self.config.scientific.applicable,
+            response_cutoff="probe" in self.config.scientific.applicable,
             replica_inference=self.inference if count > 1 else None,
             replica_optimizers=(
                 self.optimizers
@@ -532,7 +539,7 @@ class TrainingSession:
                 if not name.startswith("replica_")
                 and name != "distributed"
             }
-            return RecoveringSequentialSampledPokerIteration(
+            return RecoveringSequentialPokerIteration(
                 owner_factory=lambda: GeneratedOwners(self.plan),
                 plan=self.plan,
                 minimum_root_count=(

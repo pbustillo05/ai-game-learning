@@ -38,6 +38,7 @@ from pbg.core.contracts import (
 )
 from pbg.core.learner import PolicyEvaluation
 from pbg.core.rollout import (
+    BoundedChanceClosure,
     CommitCoverage,
     CommitPlan,
     CompletionBatch,
@@ -1069,8 +1070,8 @@ class PokerStateMachine:
             )
         return MappingProxyType(
             {
-                "board_cards": board,
-                "combo_ids": combo,
+                "leaf_public_state": board,
+                "leaf_private_profile": combo,
                 "stratum_level": level,
                 "payoff_baseline": baseline,
                 "stratum_amount": amount,
@@ -1106,7 +1107,7 @@ class PokerStateMachine:
             # RB completion retains the public pre-terminal board.  Unlike
             # sampled showdown, an early fold must not be padded with invented
             # cards because that would change its pre/post output partition.
-            "board_cards": state.board_cards.contiguous(),
+            "leaf_public_state": state.board_cards.contiguous(),
             "stratum_level": sampled["stratum_level"],
             "payoff_baseline": sampled["payoff_baseline"],
             "stratum_amount": sampled["stratum_amount"],
@@ -1114,7 +1115,7 @@ class PokerStateMachine:
             "seed": seed.to(dtype=torch.int64, device=state.device).contiguous(),
         }
         if selected_player is not None:
-            result["selected_player"] = selected_player.to(
+            result["trained_actor"] = selected_player.to(
                 dtype=torch.int32, device=state.device
             ).contiguous()
         return MappingProxyType(result)
@@ -1149,7 +1150,7 @@ class SequentialPokerHooks:
         iteration: int,
         mode: ModeSchema | None = None,
         policy: PokerPolicyOperator | None = None,
-        probe_cutoff: bool = False,
+        response_cutoff: bool = False,
     ) -> None:
         self.mode = (
             mode_schema("self_play", "sequential", "sampled") if mode is None else mode
@@ -1168,14 +1169,14 @@ class SequentialPokerHooks:
         self.seed = int(seed)
         self.iteration = int(iteration)
         self.policy = PokerPolicyOperator() if policy is None else policy
-        if type(probe_cutoff) is not bool:
-            raise TypeError("probe_cutoff must be bool")
-        if probe_cutoff and (
+        if type(response_cutoff) is not bool:
+            raise TypeError("response_cutoff must be bool")
+        if response_cutoff and (
             self.mode.training_regime is not TrainingRegime.BEST_RESPONSE
             or self.mode.private_estimator is not PrivateEstimator.RAO_BLACKWELL
         ):
             raise ValueError("probe cutoff requires sequential BR/RB")
-        self.probe_cutoff = probe_cutoff
+        self.response_cutoff = response_cutoff
         self.input_index = {name: index for index, name in enumerate(expected)}
         self._route_family_values = (-1, *range(len(self.queues)))
         self._route_families = torch.tensor(
@@ -1514,7 +1515,10 @@ class SequentialPokerHooks:
         rng_lane = (
             batch.lanes[:, None].expand(lane_count, rows).reshape(-1)
         )
-        for generation in range(3):
+        for generation in BoundedChanceClosure(
+            max_generations=3,
+            generation_bound=self.owners.chance_generation_cap,
+        ):
             chance_active = self.machine.needs_chance(next_state)
             history = self.machine.append_chance_history(
                 next_state, chance_active, history
@@ -1554,8 +1558,10 @@ class SequentialPokerHooks:
             if response
             else owner
         )
-        probe_cutoff = action.eq(FOLD) & actor.eq(selected_player) & self.probe_cutoff
-        terminal = (next_state.terminal | probe_cutoff).reshape(lane_count, rows)
+        response_cutoff = (
+            action.eq(FOLD) & actor.eq(selected_player) & self.response_cutoff
+        )
+        terminal = (next_state.terminal | response_cutoff).reshape(lane_count, rows)
         next_family = self.machine.input_type(next_state).reshape(lane_count, rows)
         route_family = torch.where(
             terminal,
@@ -1618,18 +1624,18 @@ class SequentialPokerHooks:
             leaf_source = MappingProxyType(
                 {
                     **dict(leaf_source),
-                    "selected_player": selected_player.to(torch.int32),
+                    "trained_actor": selected_player.to(torch.int32),
                 }
             )
         if response:
             leaf_values_source = dict(leaf_source)
-            leaf_values_source["probe_cutoff"] = probe_cutoff.to(torch.uint8)
-            if self.probe_cutoff:
+            leaf_values_source["response_cutoff"] = response_cutoff.to(torch.uint8)
+            if self.response_cutoff:
                 baseline = leaf_values_source["payoff_baseline"].clone()
                 row_index = torch.arange(baseline.shape[0], device=baseline.device)
                 selected_committed = next_state.committed[row_index, selected_player]
                 baseline[row_index, selected_player] = torch.where(
-                    probe_cutoff,
+                    response_cutoff,
                     -selected_committed,
                     baseline[row_index, selected_player],
                 )
@@ -1977,9 +1983,6 @@ class SequentialPokerHooks:
 
 
 # Phase 5 imports retain their public spelling while using the shared engine.
-SequentialSampledPokerHooks = SequentialPokerHooks
-
-
 class PokerLearnerPolicy:
     """Reconstruct public legality and invoke the canonical policy operation."""
 
@@ -2051,8 +2054,8 @@ class SampledShowdownBinding:
         fields = batch.fields
         payoff = (
             self.evaluator.evaluate_showdowns(
-                board_cards=fields["board_cards"].reshape(-1, 5).contiguous(),
-                combo_ids=fields["combo_ids"]
+                board_cards=fields["leaf_public_state"].reshape(-1, 5).contiguous(),
+                combo_ids=fields["leaf_private_profile"]
                 .reshape(-1, self.geometry.players)
                 .contiguous(),
                 stratum_level=fields["stratum_level"]
@@ -2070,12 +2073,12 @@ class SampledShowdownBinding:
         )
         p_train = self.layer_work.schema.by_name["return_value"].shape[1]
         if p_train == 1:
-            if "selected_player" not in fields:
+            if "trained_actor" not in fields:
                 raise QueuedPokerError(
                     "best-response sampled leaf omitted selected_player"
                 )
             selected = (
-                fields["selected_player"]
+                fields["trained_actor"]
                 .reshape(batch.lanes.numel(), batch.rows)
                 .to(torch.int64)
             )
@@ -2203,7 +2206,7 @@ class RBCompletionBinding:
         fields = batch.fields
         flat = batch.lanes.numel() * batch.rows
         common = {
-            "board_cards": fields["board_cards"].reshape(flat, 5).contiguous(),
+            "board_cards": fields["leaf_public_state"].reshape(flat, 5).contiguous(),
             "range_weights": fields["range_weights"]
             .reshape(flat, self.geometry.players, self.geometry.private_hands)
             .contiguous(),
@@ -2220,8 +2223,8 @@ class RBCompletionBinding:
         response = self.mode.training_regime is TrainingRegime.BEST_RESPONSE
         p_train = 1 if response else self.geometry.players
         if response:
-            selected = fields["selected_player"].reshape(flat).to(torch.int64)
-            cutoff = fields["probe_cutoff"].reshape(flat).bool()
+            selected = fields["trained_actor"].reshape(flat).to(torch.int64)
+            cutoff = fields["response_cutoff"].reshape(flat).bool()
             ordinary_row = torch.nonzero(~cutoff, as_tuple=False).flatten()
             n_eff = torch.full(
                 (flat,),
@@ -2308,7 +2311,7 @@ class RBCompletionBinding:
         v_hat.mul_(self.utility_scale)
         lane_count = batch.lanes.numel()
         pre = (
-            fields["board_cards"]
+            fields["leaf_public_state"]
             .reshape(lane_count, batch.rows, 5)[:, :, 0]
             .eq(PAD_CARD)
         )
@@ -2403,15 +2406,6 @@ class RBCompletionBinding:
         )
 
 
-def validate_phase5_mode(schema: ModeSchema) -> None:
-    if (
-        schema.training_regime is not TrainingRegime.SELF_PLAY
-        or schema.rollout_mode is not RolloutMode.SEQUENTIAL
-        or schema.private_estimator is not PrivateEstimator.SAMPLED
-    ):
-        raise ValueError("Phase 5 poker hooks require self-play sequential sampled")
-
-
 __all__ = [
     "ALL_IN",
     "FOLDED",
@@ -2427,9 +2421,7 @@ __all__ = [
     "RBCompletionBinding",
     "SampledShowdownBinding",
     "SequentialPokerHooks",
-    "SequentialSampledPokerHooks",
     "poker_partitions",
     "rb_partitions",
     "sampled_partitions",
-    "validate_phase5_mode",
 ]

@@ -9,10 +9,10 @@ import pytest
 import torch
 from torch import nn
 
-from pbg.games.poker.queued import (
+from pbg.games.poker.queued.branching import (
     BranchedSampledPokerIteration as PublicBranchedSampledPokerIteration,
 )
-from pbg.games.poker.queued import (
+from pbg.games.poker.queued.hooks import (
     NLHEGeometry,
     PokerStateMachine,
     sampled_partitions,
@@ -28,45 +28,45 @@ from pbg.games.poker.queued.branching import (
 from pbg.games.poker.queued.branching import (
     _BranchedSampledPokerAttempt as BranchedSampledPokerIteration,
 )
-from pbg.core import (
-    BranchedModeConfig,
+from pbg.games.poker.queued.config import BranchedModeConfig
+from pbg.core.branching import (
     BranchedOverflowRecovery,
-    CapacityManifest,
     CostSafeguardController,
-    DenseAdam,
-    ExecutionPhase,
-    ExternalWorkspaceBounds,
     FixedBranchController,
-    GameGeometry,
-    GeneratedOwners,
-    HardwareLimits,
     KKTBranchController,
-    LearnerSchedule,
-    LossConfig,
-    ModelEvaluation,
-    NamedShape,
-    OptimizerConfig,
-    PartitionRows,
     RankCommonFailureAgreement,
-    ReferenceState,
-    RunState,
-    build_storage_plan,
     child_path_factors,
     controller_from_state_dict,
     decision_log_path_mass,
-    load_checkpoint,
     log_kkt_intensity,
-    mode_schema,
     randomized_round,
+)
+from pbg.core.capacity import (
+    CapacityManifest,
+    ExecutionGeometry,
+    ExecutionPhase,
+    ExternalWorkspaceBounds,
+    GeneratedOwners,
+    HardwareLimits,
+    NamedShape,
+    PartitionRows,
+    build_storage_plan,
+)
+from pbg.core.contracts import mode_schema
+from pbg.core.learner import (
+    LearnerSchedule,
+    LossConfig,
+    ModelEvaluation,
+    ReferenceState,
+)
+from pbg.core.optimization import DenseAdam, OptimizerConfig
+from pbg.core.persistence import (
+    RunState,
+    load_checkpoint,
     save_checkpoint,
 )
 from pbg.core.capacity import BRANCHED_ALIAS_PEAK_ROW_BYTES
 from pbg.core.learner import _alias_table
-from pbg.core.rollout import (
-    AsyncTopologyPublisher,
-    DeferredBranchedTopologyPublication,
-    RolloutOwnerRegistry,
-)
 from pbg.core.storage import DeviceFailure, StorageError
 from pbg.core.training import RecoverableOverflow
 from tests.test_sequential_sampled_training import (
@@ -115,10 +115,9 @@ def _manifest(
         item.name for item in sampled_partitions(geometry.players).inputs
     )
     return CapacityManifest(
-        geometry=GameGeometry(
+        geometry=ExecutionGeometry(
             geometry.players,
-            geometry.stack_bb,
-            geometry.rank_count,
+            geometry.player_node_bound,
             64,
             4096,
         ),
@@ -918,57 +917,6 @@ def test_untrained_unary_root_refill_restores_one_structural_root() -> None:
     assert topology.parent.tolist() == [-1]
     assert leaf_count == 2
     recorder.release()
-
-
-@CUDA
-def test_branched_topology_publication_accepts_only_committed_payloads() -> None:
-    device = torch.device("cuda", torch.cuda.current_device())
-    geometry = NLHEGeometry(2, 8.0, 4)
-    mode = mode_schema("self_play", "branched.fixed", "sampled")
-    plan = build_storage_plan(
-        mode,
-        sampled_partitions(2),
-        _manifest(device),
-        replace(_phase7_layout(geometry), player_count=2),
-        device,
-    )
-    owners = GeneratedOwners(plan)
-    owners.enter_phase(ExecutionPhase.ROLLOUT)
-    publisher = AsyncTopologyPublisher(
-        RolloutOwnerRegistry.from_generated(owners),
-        p_train=2,
-    )
-    for sequence, committed in enumerate((False, True)):
-        payload = f"payload-{sequence}"
-        publication = DeferredBranchedTopologyPublication(
-            lane=0,
-            sequence=sequence,
-            declared_nodes=1,
-            declared_edges=1,
-            payload=payload,
-        )
-        publisher.stage_branched(publication)
-        success = torch.tensor([committed], dtype=torch.bool, device=device)
-        publisher.finalize_branched(
-            publication,
-            success,
-            stream=torch.cuda.current_stream(device),
-        )
-        accepted = publisher.drain_branched(block=True)
-        assert accepted == ((payload,) if committed else ())
-    publisher.assert_drained()
-    owners.release_after(ExecutionPhase.ROLLOUT)
-    for phase in (
-        ExecutionPhase.QUEUE_DRAIN,
-        ExecutionPhase.COMPLETION,
-        ExecutionPhase.ALIGN_AND_SEAL,
-        ExecutionPhase.TARGETS,
-        ExecutionPhase.LEARNER,
-        ExecutionPhase.FINAL_BACKWARD,
-    ):
-        owners.enter_phase(phase)
-        owners.release_after(phase)
-    owners.close()
 
 
 @CUDA

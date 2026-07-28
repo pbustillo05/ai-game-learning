@@ -333,14 +333,6 @@ class DistributedSUM:
 
 
 @dataclass(frozen=True)
-class ReplicaStepResult:
-    lanes: tuple[int, ...]
-    optimizer_steps: tuple[OptimizerStep | None, ...]
-    failures: Mapping[int, str]
-    versions: tuple[int, ...]
-
-
-@dataclass(frozen=True)
 class ReplicaMemoryReport:
     """Exact named resident bytes for stacked model and learner state."""
 
@@ -559,71 +551,12 @@ class ReplicaLaneOptimizer:
         return result
 
 
-class ReplicaLearnerScheduler:
-    """Schedule the existing lane learner operation without padding."""
-
-    def __init__(
-        self,
-        optimizers: ReplicaOptimizerGroup,
-        *,
-        distributed: DistributedSUM | None = None,
-    ) -> None:
-        self.optimizers = optimizers
-        self.distributed = distributed
-
-    def run_step(
-        self,
-        active_lanes: Sequence[int],
-        forward_loss_backward: Callable[[int, nn.Module, DenseAdam], Any],
-    ) -> ReplicaStepResult:
-        lanes = tuple(sorted(int(lane) for lane in active_lanes))
-        self.optimizers._mask(lanes)
-        self.optimizers.zero_grad(lanes)
-        failures: dict[int, str] = {}
-        for lane in lanes:
-            try:
-                forward_loss_backward(
-                    lane,
-                    self.optimizers.modules.lane_module(lane),
-                    self.optimizers.optimizers[lane],
-                )
-            except Exception as exc:  # noqa: BLE001 - lane-local disposition
-                failures[lane] = f"{type(exc).__name__}: {exc}"
-                self.optimizers.gradients[lane].zero_()
-        if self.distributed is not None:
-            local = torch.zeros(
-                self.optimizers.modules.n_replica,
-                dtype=torch.bool,
-                device=self.optimizers.modules.device,
-            )
-            for lane in failures:
-                local[lane] = True
-            common = self.distributed.agree_failures(local)
-            for lane in lanes:
-                if bool(common[lane]) and lane not in failures:
-                    failures[lane] = "failure on another distributed rank"
-                    self.optimizers.gradients[lane].zero_()
-        successful = tuple(lane for lane in lanes if lane not in failures)
-        steps = self.optimizers.step(
-            successful,
-            distributed=self.distributed,
-        )
-        return ReplicaStepResult(
-            lanes,
-            steps,
-            MappingProxyType(failures),
-            tuple(int(value) for value in self.optimizers.versions.tolist()),
-        )
-
-
 __all__ = [
     "DistributedSUM",
     "FunctionalReplicaInference",
     "ReplicaError",
     "ReplicaLaneOptimizer",
-    "ReplicaLearnerScheduler",
     "ReplicaMemoryReport",
     "ReplicaModuleOwner",
     "ReplicaOptimizerGroup",
-    "ReplicaStepResult",
 ]

@@ -13,13 +13,15 @@ import yaml
 from pbg.core.capacity import (
     CapacityManifest,
     ExternalWorkspaceBounds,
-    GameGeometry,
+    ExecutionGeometry,
     HardwareLimits,
     NamedShape,
     PartitionRows,
     PhysicalLayout,
 )
-from pbg.core.config import BranchedModeConfig, SequentialModeConfig
+from pbg.games.poker.queued.config import BranchedModeConfig, SequentialModeConfig
+from pbg.games.poker.queued.hooks import NLHEGeometry
+from pbg.core.storage import SoAField
 
 
 class ConfigError(ValueError):
@@ -307,11 +309,15 @@ def _parse_execution(
         )
     common = scientific.common
     try:
+        game_geometry = NLHEGeometry(
+            common.game.players,
+            common.game.stack_bb,
+            common.game.rank_count,
+        )
         manifest = CapacityManifest(
-            geometry=GameGeometry(
-                common.game.players,
-                common.game.stack_bb,
-                common.game.rank_count,
+            geometry=ExecutionGeometry(
+                game_geometry.players,
+                game_geometry.player_node_bound,
                 manifest_raw["model_token_bound"],
                 manifest_raw["model_token_pair_bound"],
             ),
@@ -411,6 +417,22 @@ def _parse_execution(
             reference_cache_bytes=layout_raw.get("reference_cache_bytes", 0),
             field_alignment=layout_raw.get("field_alignment", 64),
             model_dtype=dtypes[str(dtype_name)],
+            opaque_fields=(
+                SoAField(
+                    "leaf_public_state",
+                    torch.uint8,
+                    (5,),
+                    layout_raw.get("field_alignment", 64),
+                    255,
+                ),
+                SoAField(
+                    "leaf_private_profile",
+                    torch.int32,
+                    (common.game.players,),
+                    layout_raw.get("field_alignment", 64),
+                    -1,
+                ),
+            ),
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"root.execution.layout: {exc}") from exc
@@ -502,14 +524,7 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
     return RootConfig(scientific, execution)
 
 
-def load_config(
-    path: str | Path, *, hardware_profile: str | Path | None = None
-) -> RootConfig:
-    if hardware_profile is not None:
-        raise ConfigError(
-            "hardware profiles are part of the strict execution manifest; "
-            "runtime profile overlays are not supported"
-        )
+def load_config(path: str | Path) -> RootConfig:
     source = Path(path)
     try:
         raw: Any = yaml.safe_load(source.read_text(encoding="utf-8"))
