@@ -1035,6 +1035,8 @@ class BranchedBatchSampler:
         schedule: LearnerSchedule,
         *,
         generator: torch.Generator,
+        sigma_pack_cap: int,
+        action_pack_cap: int,
         statistical_counts: Mapping[str, int] | None = None,
     ) -> None:
         if not stores:
@@ -1083,6 +1085,17 @@ class BranchedBatchSampler:
                 "branched statistical counts must positively cover every stratum"
             )
         self.statistical_counts = MappingProxyType(dict(statistical_counts))
+        if (
+            isinstance(sigma_pack_cap, bool)
+            or not isinstance(sigma_pack_cap, int)
+            or isinstance(action_pack_cap, bool)
+            or not isinstance(action_pack_cap, int)
+            or sigma_pack_cap <= 0
+            or action_pack_cap <= 0
+        ):
+            raise LearnerError("branched physical pack caps must be positive")
+        self.sigma_pack_cap = sigma_pack_cap
+        self.action_pack_cap = action_pack_cap
 
     def _draw(self, name: str, count: int) -> Tensor:
         threshold, alias = self.alias[name]
@@ -1124,9 +1137,33 @@ class BranchedBatchSampler:
         for logical_step in range(steps):
             for name, requested in self.statistical_counts.items():
                 draw = self._draw(name, requested)
+                action_counts = (
+                    self.stores[name]
+                    .sealed_inputs.columns["action_count"]
+                    .index_select(0, draw)
+                    .to(torch.int64)
+                    .cpu()
+                    .tolist()
+                )
                 emitted = 0
                 while emitted < requested:
-                    take = min(self.schedule.batch_size, requested - emitted)
+                    take = 0
+                    actions = 0
+                    sigma_limit = min(
+                        self.schedule.batch_size,
+                        self.sigma_pack_cap,
+                        requested - emitted,
+                    )
+                    while take < sigma_limit:
+                        next_actions = int(action_counts[emitted + take])
+                        if next_actions > self.action_pack_cap:
+                            raise LearnerError(
+                                "one ragged decision exceeds action pack capacity"
+                            )
+                        if take and actions + next_actions > self.action_pack_cap:
+                            break
+                        actions += next_actions
+                        take += 1
                     gathered = self.stores[name].gather(
                         draw[emitted : emitted + take]
                     )

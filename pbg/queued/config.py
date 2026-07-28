@@ -530,6 +530,7 @@ class BranchedModeConfig:
             isinstance(branching["warmup_iterations"], bool)
             or not isinstance(branching["warmup_iterations"], int)
             or branching["warmup_iterations"] < 0
+            or branching["target_tree_size"] <= 0
             or not 0 < branching["gamma_kappa"] <= 1
             or not 0 < branching["eta_kappa"] <= 1
             or not 0 < branching["kappa_min"] <= branching["kappa_max"]

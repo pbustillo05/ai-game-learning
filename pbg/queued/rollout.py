@@ -1356,6 +1356,7 @@ class AsyncTopologyPublisher:
             tuple[int, int], DeferredBranchedTopologyPublication
         ] = {}
         self._branched_pending: list[_PendingDeferredBranched] = []
+        self._branched_accepted: dict[tuple[int, int], object] = {}
         self._branched_reserved_nodes = 0
         self._branched_reserved_edges = 0
 
@@ -1397,14 +1398,11 @@ class AsyncTopologyPublisher:
         key = (publication.lane, publication.sequence)
         if key in self._branched_staged:
             raise TopologyError("duplicate deferred branched topology sequence")
-        descriptor_cap = (
-            self.owners.topology_cap * self.owners.chance_frontier_cap
-        )
         if (
             self._branched_reserved_nodes + publication.declared_nodes
-            > descriptor_cap
+            > self.owners.topology_cap + self.owners.topology_edge_cap
             or self._branched_reserved_edges + publication.declared_edges
-            > descriptor_cap
+            > self.owners.topology_edge_cap
         ):
             raise TopologyError(
                 "deferred branched topology exceeds its fixed cumulative cap"
@@ -1417,13 +1415,18 @@ class AsyncTopologyPublisher:
         self,
         publication: DeferredBranchedTopologyPublication,
         success: Tensor,
-        event: torch.cuda.Event,
+        *,
+        stream: torch.cuda.Stream,
     ) -> None:
         key = (publication.lane, publication.sequence)
         if self._branched_staged.get(key) is not publication:
             raise TopologyError("deferred branched topology was not staged")
+        host_success = torch.empty((), dtype=torch.bool, pin_memory=True)
+        host_success.copy_(success[publication.lane], non_blocking=True)
+        event = torch.cuda.Event(blocking=False)
+        event.record(stream)
         self._branched_pending.append(
-            _PendingDeferredBranched(publication, success, event)
+            _PendingDeferredBranched(publication, host_success, event)
         )
 
     def cancel_branched(
@@ -1442,8 +1445,9 @@ class AsyncTopologyPublisher:
         ]
         for key in keys:
             self._branched_staged.pop(key, None)
+            self._branched_accepted.pop(key, None)
 
-    def drain_branched(self, *, block: bool = False) -> tuple[object, ...]:
+    def _accept_branched_ready(self, *, block: bool = False) -> None:
         ready: list[_PendingDeferredBranched] = []
         waiting: list[_PendingDeferredBranched] = []
         if block and self._branched_pending:
@@ -1458,14 +1462,45 @@ class AsyncTopologyPublisher:
             for pending in self._branched_pending:
                 (ready if pending.event.query() else waiting).append(pending)
         self._branched_pending = waiting
-        accepted: list[object] = []
         for pending in ready:
             publication = pending.publication
             key = (publication.lane, publication.sequence)
-            if bool(pending.success[publication.lane]):
-                accepted.append(publication.payload)
+            if bool(pending.success):
+                self._branched_accepted[key] = publication.payload
             self._branched_staged.pop(key, None)
-        return tuple(accepted)
+
+    def branched_feedback(
+        self,
+        publication: DeferredBranchedTopologyPublication,
+    ) -> tuple[bool, object | None] | None:
+        """Poll one pinned commit result without reading a device scalar."""
+
+        self._accept_branched_ready()
+        key = (publication.lane, publication.sequence)
+        if key in self._branched_accepted:
+            return False, self._branched_accepted[key]
+        if key not in self._branched_staged:
+            return True, None
+        return None
+
+    def wait_branched_feedback(
+        self,
+        publication: DeferredBranchedTopologyPublication,
+    ) -> tuple[bool, object | None]:
+        while True:
+            result = self.branched_feedback(publication)
+            if result is not None:
+                return result
+            time.sleep(0)
+
+    def drain_branched(self, *, block: bool = False) -> tuple[object, ...]:
+        self._accept_branched_ready(block=block)
+        accepted = tuple(
+            payload
+            for _key, payload in sorted(self._branched_accepted.items())
+        )
+        self._branched_accepted.clear()
+        return accepted
 
     def preflight_deferred(
         self,
@@ -2161,6 +2196,7 @@ class AsyncTopologyPublisher:
             or self._deferred_pending
             or self._branched_staged
             or self._branched_pending
+            or self._branched_accepted
         ):
             raise TopologyError("uncommitted topology packets remain staged")
 
@@ -2674,7 +2710,7 @@ class RolloutTransaction:
                     self.topology.finalize_branched(
                         publication,
                         success,
-                        commit_ready,
+                        stream=self.commit_stream,
                     )
         except BaseException:
             if transaction is not None:

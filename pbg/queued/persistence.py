@@ -17,7 +17,8 @@ from pbg.queued.config import Phase5Config, SequentialModeConfig
 from pbg.queued.learner import ReferenceState
 from pbg.queued.optimization import DenseAdam, LossScaler
 
-CHECKPOINT_SCHEMA = "pbg-queued-checkpoint-v1"
+CHECKPOINT_SCHEMA = "pbg-queued-checkpoint-v2"
+QUEUED_CHECKPOINT_V1 = "pbg-queued-checkpoint-v1"
 CONVERSION_SCHEMA = "pbg-queued-conversion-v1"
 LEGACY_SCHEMA = "pbg-checkpoint-v8"
 LEGACY_SCHEMA_V7 = "pbg-checkpoint-v7"
@@ -260,16 +261,6 @@ def load_checkpoint(
         "branch_controller_state",
         "cost_safeguard_state",
     }
-    prior_run = expected_run - {
-        "branch_controller_state",
-        "cost_safeguard_state",
-    }
-    if isinstance(run_data, dict) and set(run_data) == prior_run:
-        run_data = {
-            **run_data,
-            "branch_controller_state": None,
-            "cost_safeguard_state": None,
-        }
     if not isinstance(run_data, dict) or set(run_data) != expected_run:
         raise PersistenceError("run state has unknown or missing fields")
     run = RunState(**run_data)
@@ -281,6 +272,63 @@ def load_checkpoint(
             raise PersistenceError("checkpoint CUDA RNG rank/device count differs")
         torch.cuda.set_rng_state_all(list(cuda_states))
     return scaler, reference, run, state["execution_config"]
+
+
+def convert_queued_checkpoint_v1(
+    source_path: str | os.PathLike[str],
+    destination_path: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Convert one exact queued-v1 checkpoint into strict queued-v2."""
+
+    source = Path(source_path)
+    destination = Path(destination_path)
+    if not source.is_file():
+        raise PersistenceError("queued-v1 checkpoint source does not exist")
+    if destination.exists():
+        raise PersistenceError("queued-v2 conversion destination already exists")
+    state = torch.load(source, map_location="cpu", weights_only=False)
+    if not isinstance(state, dict) or set(state) != _CHECKPOINT_FIELDS:
+        raise PersistenceError("queued-v1 checkpoint fields are invalid")
+    if state["checkpoint_schema"] != QUEUED_CHECKPOINT_V1:
+        raise PersistenceError("offline conversion requires queued checkpoint v1")
+    prior_run_fields = {
+        "run_id",
+        "iteration",
+        "root_count",
+        "retry_epoch",
+        "attempt_logical_base",
+        "logical_work",
+        "recovered_overflow",
+        "overflow_recoveries",
+        "metrics_prefix",
+    }
+    run_data = state["run_state"]
+    if not isinstance(run_data, dict) or set(run_data) != prior_run_fields:
+        raise PersistenceError("queued-v1 run state is not exact")
+    converted = {
+        **state,
+        "checkpoint_schema": CHECKPOINT_SCHEMA,
+        "run_state": {
+            **run_data,
+            "branch_controller_state": None,
+            "cost_safeguard_state": None,
+        },
+    }
+    source_sha256 = sha256_file(source)
+    _atomic_torch_save(converted, destination)
+    result = {
+        "schema": CONVERSION_SCHEMA,
+        "source_schema": QUEUED_CHECKPOINT_V1,
+        "result_schema": CHECKPOINT_SCHEMA,
+        "source_sha256": source_sha256,
+        "result_sha256": sha256_file(destination),
+        "destination": str(destination),
+    }
+    _atomic_json_save(
+        result,
+        destination.with_suffix(destination.suffix + ".conversion.json"),
+    )
+    return result
 
 
 _LEGACY_FIELDS_V7 = {
@@ -705,10 +753,12 @@ __all__ = [
     "CONVERSION_SCHEMA",
     "LEGACY_SCHEMA",
     "LEGACY_SCHEMA_V7",
+    "QUEUED_CHECKPOINT_V1",
     "PersistenceError",
     "RunState",
     "convert_legacy_sequential",
     "convert_legacy_sequential_sampled",
+    "convert_queued_checkpoint_v1",
     "load_checkpoint",
     "save_checkpoint",
     "sha256_file",

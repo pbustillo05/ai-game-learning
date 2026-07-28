@@ -468,6 +468,7 @@ class LayerPlan:
     sigma_head_row: Tensor
     sigma_target_row: Tensor
     action_begin: Tensor
+    root_node: Tensor
     child_source_work_row: Tensor
     child_source_output_type: Tensor
     child_path_length: Tensor
@@ -556,6 +557,9 @@ class LayerPlan:
         )
         for name in i32_node_fields:
             _cpu_vector(name, getattr(self, name), self.node_count, torch.int32)
+        _cpu_vector(
+            "root_node", self.root_node, self.node_count, torch.bool
+        )
         for name in i32_edge_fields:
             _cpu_vector(name, getattr(self, name), self.edge_count, torch.int32)
         _cpu_vector(
@@ -654,12 +658,16 @@ class LayerPlan:
             target_count = int(self.target_degree[row])
             nominal = int(self.nominal_degree[row])
             refilled_root = target_count < count
+            root_node = bool(self.root_node[row])
             if (
                 begin < 0
                 or begin + count > self.edge_count
                 or not 1 <= target_count <= count
                 or target_count > manifest.beta_max
-                or (count > manifest.beta_max and not refilled_root)
+                or (
+                    (count > manifest.beta_max or refilled_root)
+                    and not root_node
+                )
                 or not 1 <= nominal <= manifest.beta_max
                 or (
                     not self.branched
@@ -897,17 +905,6 @@ def build_layer_plan(
         topology.compact(binding, p_train=p_train)
         for topology, binding in zip(topologies, bindings, strict=True)
     ]
-    if manifest is not None:
-        for topology, _ in compacted:
-            for node in range(topology.node_count):
-                count = int(topology.executed_degree[node])
-                target = int(topology.target_degree[node])
-                if count > manifest.beta_max and not (
-                    int(topology.parent[node]) == -1 and target < count
-                ):
-                    raise TopologyError(
-                        "only a protected refilled root may exceed beta_max"
-                    )
     input_names = tuple(item.name for item in partitions.inputs)
     output_names = tuple(item.name for item in partitions.outputs)
     input_count = len(input_names)
@@ -1107,6 +1104,7 @@ def build_layer_plan(
                     int(topology.sigma_head_row[node]),
                     int(binding.sigma_target_row[node]),
                     int(topology.action_begin[node]),
+                    int(topology.parent[node]) == -1,
                 )
             )
             if int(topology.parent[node]) >= 0:
@@ -1149,6 +1147,11 @@ def build_layer_plan(
             [float(record[index]) for record in records], dtype=torch.float32
         )
 
+    def bool_column(records: Sequence[tuple], index: int) -> Tensor:
+        return torch.tensor(
+            [bool(record[index]) for record in records], dtype=torch.bool
+        )
+
     sigma_rows = [[0] * input_count for _ in compacted]
     action_rows = [
         [0] * (input_count if not mode.rollout_mode.is_branched else output_count)
@@ -1163,9 +1166,21 @@ def build_layer_plan(
     sigma_seen: dict[tuple[int, int], set[int]] = {}
     action_seen: dict[tuple[int, int], set[int]] = {}
     for record in node_records:
-        lane, _, _, _, input_type, output, owner, _, target_degree, _, sigma, action = (
-            record
-        )
+        (
+            lane,
+            _,
+            _,
+            _,
+            input_type,
+            output,
+            owner,
+            _,
+            target_degree,
+            _,
+            sigma,
+            action,
+            _,
+        ) = record
         if owner < 0:
             continue
         sigma_key = (lane, input_type)
@@ -1227,6 +1242,7 @@ def build_layer_plan(
         sigma_head_row=i32_column(node_records, 9),
         sigma_target_row=i32_column(node_records, 10),
         action_begin=i32_column(node_records, 11),
+        root_node=bool_column(node_records, 12),
         child_source_work_row=i32_column(child_records, 0),
         child_source_output_type=i32_column(child_records, 1),
         child_path_length=i32_column(child_records, 2),

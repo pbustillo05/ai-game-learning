@@ -11,7 +11,7 @@ import json
 import logging
 import math
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Generic, Protocol, TypeVar
@@ -700,6 +700,48 @@ class BranchedRecoveryRecord:
         }
 
 
+@dataclass(frozen=True)
+class RankCommonFailureAgreement:
+    """Choose one deterministic overflow on every participating rank."""
+
+    world_size: int = 1
+    collect: (
+        Callable[[RecoverableOverflow], Sequence[RecoverableOverflow]] | None
+    ) = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.world_size, bool)
+            or not isinstance(self.world_size, int)
+            or self.world_size <= 0
+            or (self.world_size == 1) != (self.collect is None)
+        ):
+            raise ValueError("rank failure agreement ownership is invalid")
+
+    def agree(self, local: RecoverableOverflow) -> RecoverableOverflow:
+        failures = (
+            (local,)
+            if self.world_size == 1
+            else tuple(self.collect(local))  # type: ignore[misc]
+        )
+        if len(failures) != self.world_size or any(
+            not isinstance(item, RecoverableOverflow) for item in failures
+        ):
+            raise BranchingError(
+                "rank failure agreement returned an invalid rank set"
+            )
+        return min(
+            failures,
+            key=lambda item: (
+                item.failure.logical_address,
+                item.failure.phase,
+                item.failure.failure_code,
+                item.failure.input_type,
+                item.failure.lane,
+            ),
+        )
+
+
 class BranchedOverflowRecovery(Generic[AttemptResult]):
     """Discard a failed tree and retry at a disjoint address with less work."""
 
@@ -711,7 +753,7 @@ class BranchedOverflowRecovery(Generic[AttemptResult]):
         controller: BranchController,
         run_state: RunState,
         logger: logging.Logger | None = None,
-        rank_common: Callable[[RecoverableOverflow], RecoverableOverflow] | None = None,
+        rank_agreement: RankCommonFailureAgreement | None = None,
     ) -> None:
         if iteration < 0 or replica < 0:
             raise ValueError("iteration and replica must be nonnegative")
@@ -720,7 +762,11 @@ class BranchedOverflowRecovery(Generic[AttemptResult]):
         self.controller = controller
         self.run_state = run_state
         self.logger = logging.getLogger(__name__) if logger is None else logger
-        self.rank_common = rank_common
+        self.rank_agreement = (
+            RankCommonFailureAgreement()
+            if rank_agreement is None
+            else rank_agreement
+        )
 
     def run(
         self,
@@ -734,7 +780,7 @@ class BranchedOverflowRecovery(Generic[AttemptResult]):
             try:
                 return attempt(address)
             except RecoverableOverflow as local:
-                failure = local if self.rank_common is None else self.rank_common(local)
+                failure = self.rank_agreement.agree(local)
                 discard(failure)
                 if self.controller.at_minimum:
                     raise TrainingError(
@@ -788,6 +834,7 @@ __all__ = [
     "CostSafeguardController",
     "FixedBranchController",
     "KKTBranchController",
+    "RankCommonFailureAgreement",
     "child_path_factors",
     "controller_from_state_dict",
     "decision_path_mass",

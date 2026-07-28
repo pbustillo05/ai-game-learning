@@ -33,11 +33,13 @@ from pbg.queued import (
     ModelEvaluation,
     OptimizerConfig,
     PartitionRows,
+    RankCommonFailureAgreement,
     ReferenceState,
     RunState,
     build_storage_plan,
     child_path_factors,
     controller_from_state_dict,
+    convert_queued_checkpoint_v1,
     decision_path_mass,
     load_checkpoint,
     log_kkt_intensity,
@@ -212,6 +214,16 @@ def test_phase7_config_is_closed_for_exactly_four_sampled_modes(
     bad["completion"] = {"n_samples": 2, "strata": {}}
     with pytest.raises(ValueError, match="root.completion"):
         BranchedModeConfig.from_mapping(bad)
+    if rollout == "branched.KKT":
+        bad_kkt = {
+            **value,
+            "branching": {
+                **value["branching"],
+                "target_tree_size": 0,
+            },
+        }
+        with pytest.raises(ValueError, match="KKT controller bounds"):
+            BranchedModeConfig.from_mapping(bad_kkt)
 
 
 @CUDA
@@ -383,7 +395,6 @@ def test_whole_attempt_backoff_is_disjoint_and_other_failures_terminate() -> Non
     run = RunState("phase7-recovery", root_count=3)
     calls = []
     discarded = []
-    rank_agreements = []
     failure = DeviceFailure(
         lane=0,
         status=1,
@@ -401,19 +412,29 @@ def test_whole_attempt_backoff_is_disjoint_and_other_failures_terminate() -> Non
             raise RecoverableOverflow(failure, capacity=4, observed_demand=9)
         return "committed"
 
+    local = RecoverableOverflow(failure, capacity=4, observed_demand=9)
+    remote = RecoverableOverflow(
+        replace(failure, logical_address=7),
+        capacity=4,
+        observed_demand=9,
+    )
+    agreement = RankCommonFailureAgreement(
+        world_size=2,
+        collect=lambda _local: (local, remote),
+    )
+    assert agreement.agree(local) is remote
+    assert agreement.agree(remote) is remote
     recovery = BranchedOverflowRecovery(
         iteration=5,
         replica=0,
         controller=controller,
         run_state=run,
-        rank_common=lambda failure: (
-            rank_agreements.append(failure) or failure
-        ),
+        rank_agreement=agreement,
     )
     with pytest.warns(RuntimeWarning, match="RECOVERED_BRANCHED_OVERFLOW"):
         assert recovery.run(attempt, discarded.append) == "committed"
     assert len(discarded) == 1
-    assert rank_agreements == discarded
+    assert discarded[0].failure.logical_address == 7
     assert calls[1].retry_epoch == calls[0].retry_epoch + 1
     assert calls[1].logical_base == calls[0].logical_base + 3
     assert run.branch_controller_state == controller.state_dict()
@@ -493,10 +514,28 @@ def test_branched_checkpoint_round_trip_preserves_controllers(
     prior_state = torch.load(path, map_location="cpu", weights_only=False)
     prior_state["run_state"].pop("branch_controller_state")
     prior_state["run_state"].pop("cost_safeguard_state")
+    prior_state["checkpoint_schema"] = "pbg-queued-checkpoint-v1"
     prior_path = tmp_path / "phase6-compatible.pt"
     torch.save(prior_state, prior_path)
-    _, _, migrated, _ = load_checkpoint(
+    with pytest.raises(Exception, match="offline converter"):
+        load_checkpoint(
+            prior_path,
+            model=model,
+            optimizer=optimizer,
+            reference_model=reference,
+            expected_scientific_config=scientific,
+            generator=generator,
+        )
+    converted_path = tmp_path / "phase6-converted.pt"
+    report = convert_queued_checkpoint_v1(
         prior_path,
+        converted_path,
+    )
+    assert report["source_schema"] == "pbg-queued-checkpoint-v1"
+    assert report["result_schema"] == "pbg-queued-checkpoint-v2"
+    assert (tmp_path / "phase6-converted.pt.conversion.json").is_file()
+    _, _, migrated, _ = load_checkpoint(
+        converted_path,
         model=model,
         optimizer=optimizer,
         reference_model=reference,
@@ -570,9 +609,11 @@ def test_branched_topology_publication_accepts_only_committed_payloads() -> None
         )
         publisher.stage_branched(publication)
         success = torch.tensor([committed], dtype=torch.bool, device=device)
-        event = torch.cuda.Event(blocking=False)
-        event.record(torch.cuda.current_stream(device))
-        publisher.finalize_branched(publication, success, event)
+        publisher.finalize_branched(
+            publication,
+            success,
+            stream=torch.cuda.current_stream(device),
+        )
         accepted = publisher.drain_branched(block=True)
         assert accepted == ((payload,) if committed else ())
     publisher.assert_drained()
@@ -655,6 +696,179 @@ def test_full_branched_iteration_is_family_pack_invariant() -> None:
             wide_state[name],
             atol=0,
             rtol=0,
+        )
+
+
+@CUDA
+def test_multi_pack_roots_use_complete_frontier_cost_forecast() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = mode_schema("self_play", "branched.fixed", "sampled")
+    plan = build_storage_plan(
+        mode,
+        sampled_partitions(2),
+        replace(
+            _manifest(device),
+            root_count=3,
+            family_pack_cap=1,
+        ),
+        replace(_phase5_layout(geometry), player_count=2),
+        device,
+    )
+    model = _BranchedModel(device, geometry.private_hands)
+    safeguard = CostSafeguardController(1, 2, 1)
+    safeguard.observe(0.1, 1.1, 3)
+    result = BranchedSampledPokerIteration(
+        geometry=geometry,
+        owners=GeneratedOwners(plan),
+        mode=mode,
+        controller=FixedBranchController(
+            {"player": 2.0, "chance": 1.0},
+            2,
+            safe_tree_size=6,
+        ),
+        model=model,
+        model_operation=model.evaluate,
+        optimizer=DenseAdam(
+            model,
+            OptimizerConfig(name="adamw", grad_clip=5),
+        ),
+        loss=LossConfig(
+            reference_kl_coefficient=0,
+            trace_coefficient=0.1,
+            cost_coefficient=0.1,
+        ),
+        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        generator=torch.Generator(device=device).manual_seed(991),
+        seed=991,
+        lambda_=0.95,
+        cost_safeguard=safeguard,
+    ).run(iteration=0)
+    assert result.root_executed_degree == (1, 1, 1)
+
+
+@CUDA
+def test_kkt_feedback_is_invariant_to_root_batching() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = mode_schema("self_play", "branched.KKT", "sampled")
+
+    def execute(root_count: int) -> KKTBranchController:
+        torch.cuda.manual_seed(313)
+        plan = build_storage_plan(
+            mode,
+            sampled_partitions(2),
+            replace(
+                _manifest(device),
+                root_count=root_count,
+                family_pack_cap=1,
+            ),
+            replace(_phase5_layout(geometry), player_count=2),
+            device,
+        )
+        model = _BranchedModel(device, geometry.private_hands)
+        controller = KKTBranchController(
+            {"player": 1.0, "chance": 1.0},
+            1,
+            warmup_iterations=0,
+            target_tree_size=64,
+            gamma_kappa=0.5,
+            eta_kappa=0.2,
+            kappa_min=1,
+            kappa_max=1,
+            log_kappa=0,
+        )
+        BranchedSampledPokerIteration(
+            geometry=geometry,
+            owners=GeneratedOwners(plan),
+            mode=mode,
+            controller=controller,
+            model=model,
+            model_operation=model.evaluate,
+            optimizer=DenseAdam(
+                model,
+                OptimizerConfig(name="adamw", grad_clip=5),
+            ),
+            loss=LossConfig(
+                reference_kl_coefficient=0,
+                trace_coefficient=0.1,
+                cost_coefficient=0.1,
+            ),
+            schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+            generator=torch.Generator(device=device).manual_seed(991),
+            seed=991,
+            lambda_=0.95,
+        ).run(iteration=0)
+        return controller
+
+    single = execute(1)
+    batched = execute(3)
+    assert single.ema_tree_size == pytest.approx(batched.ema_tree_size)
+    assert single.log_kappa == pytest.approx(batched.log_kappa)
+    assert single.updates == batched.updates == 1
+
+
+@CUDA
+def test_ragged_statistical_work_subdivides_by_action_cap() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = mode_schema("self_play", "branched.fixed", "sampled")
+
+    def execute(action_cap: int) -> tuple[object, dict[str, torch.Tensor]]:
+        torch.cuda.manual_seed(431)
+        plan = build_storage_plan(
+            mode,
+            sampled_partitions(2),
+            replace(
+                _manifest(device),
+                learner_sigma_pack_cap=8,
+                learner_action_pack_cap=action_cap,
+            ),
+            replace(_phase5_layout(geometry), player_count=2),
+            device,
+        )
+        model = _BranchedModel(device, geometry.private_hands)
+        result = BranchedSampledPokerIteration(
+            geometry=geometry,
+            owners=GeneratedOwners(plan),
+            mode=mode,
+            controller=FixedBranchController(
+                {"player": 2.0, "chance": 1.0},
+                2,
+            ),
+            model=model,
+            model_operation=model.evaluate,
+            optimizer=DenseAdam(
+                model,
+                OptimizerConfig(name="adamw", grad_clip=5),
+            ),
+            loss=LossConfig(
+                reference_kl_coefficient=0,
+                trace_coefficient=0.1,
+                cost_coefficient=0.1,
+            ),
+            schedule=LearnerSchedule(batch_size=8, gradient_steps=1),
+            generator=torch.Generator(device=device).manual_seed(991),
+            seed=991,
+            lambda_=0.95,
+        ).run(iteration=0)
+        return result, {
+            name: value.detach().clone()
+            for name, value in model.state_dict().items()
+        }
+
+    narrow, narrow_state = execute(2)
+    wide, wide_state = execute(16)
+    assert narrow.learner.statistical_presentations == 8
+    assert wide.learner.statistical_presentations == 8
+    assert narrow.learner.optimizer_steps[0].applied
+    assert wide.learner.optimizer_steps[0].applied
+    for name in narrow_state:
+        torch.testing.assert_close(
+            narrow_state[name],
+            wide_state[name],
+            atol=1.0e-6,
+            rtol=1.0e-6,
         )
 
 
