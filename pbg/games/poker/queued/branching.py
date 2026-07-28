@@ -2657,7 +2657,7 @@ class _BranchedSampledPokerAttempt:
         )
         if self.cost_safeguard is not None:
             with torch.no_grad():
-                root_cost = self._bounded_mixed_model(
+                root_cost = self._model(
                     PokerForwardInput(
                         "pre",
                         values["model_input"][0],
@@ -2827,38 +2827,6 @@ class _BranchedSampledPokerAttempt:
             )
         return self._model_output(evaluation)
 
-    def _bounded_mixed_model(
-        self, forward: PokerForwardInput, lanes: Tensor
-    ) -> Mapping[str, Tensor]:
-        """Run independent inference rows in bounded CUDA subspans."""
-
-        rows = int(forward.owner.numel())
-        cap = min(self.owners.plan.manifest.family_pack_cap, 64)
-        if rows <= cap:
-            return self._model(forward, lanes)
-        pieces: dict[str, list[Tensor]] = {}
-        for begin in range(0, rows, cap):
-            end = min(begin + cap, rows)
-            item = self._model(
-                PokerForwardInput(
-                    forward.input_type,
-                    forward.model_input[begin:end],
-                    forward.sampled_private_state[begin:end],
-                    forward.owner[begin:end],
-                    (
-                        None
-                        if forward.role_selector is None
-                        else forward.role_selector[begin:end]
-                    ),
-                ),
-                lanes,
-            )
-            for name, value in item.items():
-                pieces.setdefault(name, []).append(value)
-        return MappingProxyType(
-            {name: torch.cat(values) for name, values in pieces.items()}
-        )
-
     def run(self, *, iteration: int) -> BranchedPokerResult:
         owners = self.owners
         if self.benchmark_telemetry:
@@ -2939,7 +2907,7 @@ class _BranchedSampledPokerAttempt:
             mode=self.mode,
             controller=self.controller,
             cost_safeguard=self.cost_safeguard,
-            child_model=self._bounded_mixed_model,
+            child_model=self._model,
             topology_recorder=recorder,
             policy=self.policy,
             posterior_sampler=self.posterior_sampler,
@@ -3025,7 +2993,7 @@ class _BranchedSampledPokerAttempt:
                     commit = transaction.execute(
                         queues[scheduled.input_type],
                         scheduled,
-                        self._bounded_mixed_model,
+                        self._model,
                         hooks,
                         measure_commit=self.benchmark_telemetry,
                     )
