@@ -319,6 +319,7 @@ def _owners(
                 "nominal_degree",
                 "executed_degree",
                 "target_degree",
+                "frontier_cost_contribution",
             )
         )
 

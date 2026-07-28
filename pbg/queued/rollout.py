@@ -590,6 +590,14 @@ class SemanticFamilyFIFO:
     def depth(self) -> Tensor:
         return self.ready_tail - self.head
 
+    @property
+    def frontier_cost(self) -> Tensor:
+        if "frontier_cost" not in self.metadata.columns:
+            return torch.zeros(
+                self.n_replica, dtype=torch.float32, device=self.device
+            )
+        return self.metadata.columns["frontier_cost"][:, 0]
+
     def publish_family_tail(self, active: Tensor) -> None:
         """Expose newly committed family rows without reading a host scalar."""
 
@@ -1245,7 +1253,34 @@ class DeferredUnaryTopologyPublication:
             ):
                 raise TopologyError(
                     f"deferred topology {name} must be CUDA int64 [rows,2]"
-                )
+            )
+
+
+@dataclass(frozen=True)
+class DeferredBranchedTopologyPublication:
+    """Opaque branched descriptors accepted only after their commit marker."""
+
+    lane: int
+    sequence: int
+    declared_nodes: int
+    declared_edges: int
+    payload: object
+
+    def __post_init__(self) -> None:
+        if (
+            self.lane < 0
+            or self.sequence < 0
+            or self.declared_nodes <= 0
+            or self.declared_edges < 0
+        ):
+            raise TopologyError("deferred branched topology address is invalid")
+
+
+@dataclass
+class _PendingDeferredBranched:
+    publication: DeferredBranchedTopologyPublication
+    success: Tensor
+    event: torch.cuda.Event
 
 
 @dataclass
@@ -1317,6 +1352,12 @@ class AsyncTopologyPublisher:
         ] = {}
         self._deferred_accepted: list[tuple[int, Tensor]] = []
         self._deferred_reserved_rows = 0
+        self._branched_staged: dict[
+            tuple[int, int], DeferredBranchedTopologyPublication
+        ] = {}
+        self._branched_pending: list[_PendingDeferredBranched] = []
+        self._branched_reserved_nodes = 0
+        self._branched_reserved_edges = 0
 
     @staticmethod
     def _key(publication: TopologyPublication) -> tuple[int, int]:
@@ -1349,6 +1390,82 @@ class AsyncTopologyPublisher:
         self._reserved_packets += 1
         self._reserved_nodes += draft.declared_node_count
         self._reserved_edges += draft.declared_edge_count
+
+    def stage_branched(
+        self, publication: DeferredBranchedTopologyPublication
+    ) -> None:
+        key = (publication.lane, publication.sequence)
+        if key in self._branched_staged:
+            raise TopologyError("duplicate deferred branched topology sequence")
+        descriptor_cap = (
+            self.owners.topology_cap * self.owners.chance_frontier_cap
+        )
+        if (
+            self._branched_reserved_nodes + publication.declared_nodes
+            > descriptor_cap
+            or self._branched_reserved_edges + publication.declared_edges
+            > descriptor_cap
+        ):
+            raise TopologyError(
+                "deferred branched topology exceeds its fixed cumulative cap"
+            )
+        self._branched_staged[key] = publication
+        self._branched_reserved_nodes += publication.declared_nodes
+        self._branched_reserved_edges += publication.declared_edges
+
+    def finalize_branched(
+        self,
+        publication: DeferredBranchedTopologyPublication,
+        success: Tensor,
+        event: torch.cuda.Event,
+    ) -> None:
+        key = (publication.lane, publication.sequence)
+        if self._branched_staged.get(key) is not publication:
+            raise TopologyError("deferred branched topology was not staged")
+        self._branched_pending.append(
+            _PendingDeferredBranched(publication, success, event)
+        )
+
+    def cancel_branched(
+        self,
+        publications: Sequence[DeferredBranchedTopologyPublication],
+    ) -> None:
+        keys = {(item.lane, item.sequence) for item in publications}
+        self._branched_pending = [
+            pending
+            for pending in self._branched_pending
+            if (
+                pending.publication.lane,
+                pending.publication.sequence,
+            )
+            not in keys
+        ]
+        for key in keys:
+            self._branched_staged.pop(key, None)
+
+    def drain_branched(self, *, block: bool = False) -> tuple[object, ...]:
+        ready: list[_PendingDeferredBranched] = []
+        waiting: list[_PendingDeferredBranched] = []
+        if block and self._branched_pending:
+            with torch.cuda.stream(self._accept_stream):
+                for pending in self._branched_pending:
+                    self._accept_stream.wait_event(pending.event)
+                all_ready = torch.cuda.Event(blocking=False)
+                all_ready.record(self._accept_stream)
+            all_ready.synchronize()
+            ready = self._branched_pending
+        else:
+            for pending in self._branched_pending:
+                (ready if pending.event.query() else waiting).append(pending)
+        self._branched_pending = waiting
+        accepted: list[object] = []
+        for pending in ready:
+            publication = pending.publication
+            key = (publication.lane, publication.sequence)
+            if bool(pending.success[publication.lane]):
+                accepted.append(publication.payload)
+            self._branched_staged.pop(key, None)
+        return tuple(accepted)
 
     def preflight_deferred(
         self,
@@ -2042,6 +2159,8 @@ class AsyncTopologyPublisher:
             or self._pending
             or self._deferred_staged
             or self._deferred_pending
+            or self._branched_staged
+            or self._branched_pending
         ):
             raise TopologyError("uncommitted topology packets remain staged")
 
@@ -2055,6 +2174,10 @@ class CommitPlan:
     published_queues: tuple[SemanticFamilyFIFO, ...] = ()
     topology: tuple[TopologyPublication, ...] = ()
     deferred_topology: tuple[DeferredUnaryTopologyPublication, ...] = ()
+    deferred_branched_topology: tuple[
+        DeferredBranchedTopologyPublication, ...
+    ] = ()
+    queue_cost_additions: tuple[Tensor, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.destinations:
@@ -2077,9 +2200,34 @@ class CommitPlan:
             raise ValueError(
                 "a family commit may stage only one deferred packet per lane"
             )
+        branched_keys = tuple(
+            (item.lane, item.sequence)
+            for item in self.deferred_branched_topology
+        )
+        if len(set(branched_keys)) != len(branched_keys):
+            raise ValueError(
+                "a commit plan repeats a deferred branched topology sequence"
+            )
+        branched_lanes = tuple(
+            item.lane for item in self.deferred_branched_topology
+        )
+        if len(set(branched_lanes)) != len(branched_lanes):
+            raise ValueError(
+                "a family commit may stage only one branched packet per lane"
+            )
         queue_ids = tuple(id(queue) for queue in self.published_queues)
         if len(set(queue_ids)) != len(queue_ids):
             raise ValueError("a commit plan repeats a published queue")
+        if self.queue_cost_additions and (
+            len(self.queue_cost_additions) != len(self.published_queues)
+            or any(
+                value.dtype != torch.float32 or value.ndim != 1
+                for value in self.queue_cost_additions
+            )
+        ):
+            raise ValueError(
+                "queue cost additions must align with published queues"
+            )
 
 
 class RolloutHooks(Protocol):
@@ -2331,12 +2479,22 @@ class RolloutTransaction:
                     "deferred topology lane was not scheduled"
                 )
             self.topology.preflight_deferred(publication, destinations)
+        for publication in plan.deferred_branched_topology:
+            if publication.lane >= self.n_replica:
+                raise RolloutError(
+                    "deferred branched topology lane is outside replicas"
+                )
+            if publication.lane not in scheduled.lanes:
+                raise RolloutError(
+                    "deferred branched topology lane was not scheduled"
+                )
         transaction = None
         pending_topology = None
         pending_deferred: list[_PendingDeferredUnary] = []
         published = False
         source_head_before: Tensor | None = None
         queue_before: list[tuple[SemanticFamilyFIFO, Tensor, Tensor]] = []
+        frontier_before: list[tuple[SemanticFamilyFIFO, Tensor]] = []
         try:
             with torch.cuda.stream(self.commit_stream):
                 self.commit_stream.wait_event(sample_ready)
@@ -2356,6 +2514,8 @@ class RolloutTransaction:
                     self.topology.stage(publication)
                 for publication in plan.deferred_topology:
                     self.topology.stage_deferred(publication)
+                for publication in plan.deferred_branched_topology:
+                    self.topology.stage_branched(publication)
                 transaction = PublicationTransaction.begin_device(
                     destinations,
                     phase="rollout_commit",
@@ -2455,6 +2615,43 @@ class RolloutTransaction:
                     sequence=marker_sequence,
                 )
                 published = True
+                if "frontier_cost_contribution" in batch.fields:
+                    frontier_before.append(
+                        (source, source.frontier_cost.clone())
+                    )
+                    removed = batch.fields[
+                        "frontier_cost_contribution"
+                    ].sum(1)
+                    source.frontier_cost.copy_(
+                        torch.where(
+                            success,
+                            (source.frontier_cost - removed).clamp_min(0),
+                            source.frontier_cost,
+                        )
+                    )
+                if plan.queue_cost_additions:
+                    for queue, addition in zip(
+                        plan.published_queues,
+                        plan.queue_cost_additions,
+                        strict=True,
+                    ):
+                        if (
+                            addition.device != self.device
+                            or addition.shape != (self.n_replica,)
+                        ):
+                            raise RolloutError(
+                                "queue cost addition has an invalid device contract"
+                            )
+                        frontier_before.append(
+                            (queue, queue.frontier_cost.clone())
+                        )
+                        queue.frontier_cost.copy_(
+                            torch.where(
+                                success,
+                                queue.frontier_cost + addition,
+                                queue.frontier_cost,
+                            )
+                        )
                 if post_publish_failure_injector is not None:
                     post_publish_failure_injector()
                 source._record_ready(self.commit_stream)
@@ -2473,6 +2670,12 @@ class RolloutTransaction:
                     )
                 commit_ready = torch.cuda.Event(blocking=False)
                 commit_ready.record(self.commit_stream)
+                for publication in plan.deferred_branched_topology:
+                    self.topology.finalize_branched(
+                        publication,
+                        success,
+                        commit_ready,
+                    )
         except BaseException:
             if transaction is not None:
                 with torch.cuda.stream(self.commit_stream):
@@ -2485,17 +2688,24 @@ class RolloutTransaction:
                     for queue, ready, reserved in queue_before:
                         queue.ready_tail.copy_(ready)
                         queue.reserved_tail.copy_(reserved)
+                    for queue, frontier in reversed(frontier_before):
+                        queue.frontier_cost.copy_(frontier)
             self.topology.cancel(plan.topology)
             self.topology.cancel_deferred(plan.deferred_topology)
+            self.topology.cancel_branched(plan.deferred_branched_topology)
             self._state = _MachineState.FAILED
             raise
         sequence = (
-            plan.deferred_topology[-1].sequence
-            if plan.deferred_topology
+            plan.deferred_branched_topology[-1].sequence
+            if plan.deferred_branched_topology
             else (
-                0
-                if not plan.topology
-                else plan.topology[-1].draft.sequence
+                plan.deferred_topology[-1].sequence
+                if plan.deferred_topology
+                else (
+                    0
+                    if not plan.topology
+                    else plan.topology[-1].draft.sequence
+                )
             )
         )
         self._state = _MachineState.COMMITTED
@@ -2842,6 +3052,7 @@ __all__ = [
     "CompletionBatch",
     "CompletionFIFO",
     "CompletionPlan",
+    "DeferredBranchedTopologyPublication",
     "DeferredUnaryTopologyPublication",
     "DeviceStableRoute",
     "DrawPurpose",

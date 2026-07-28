@@ -191,6 +191,13 @@ class BranchController(Protocol):
         frontier_cost: Tensor | None = None,
     ) -> BranchDecision: ...
 
+    def observe(
+        self,
+        counterfactual_tree_size: float,
+        *,
+        iteration: int,
+    ) -> Mapping[str, float]: ...
+
     def backoff(self) -> Mapping[str, float]: ...
 
     @property
@@ -298,6 +305,17 @@ class FixedBranchController:
             executed = torch.where(suppressed, torch.ones_like(executed), executed)
         return BranchDecision(beta, nominal, executed, executed.clone())
 
+    def observe(
+        self,
+        counterfactual_tree_size: float,
+        *,
+        iteration: int,
+    ) -> Mapping[str, float]:
+        size = float(counterfactual_tree_size)
+        if not math.isfinite(size) or size <= 0 or iteration < 0:
+            raise ValueError("fixed controller observation is invalid")
+        return MappingProxyType({"counterfactual_tree_size": size})
+
     @property
     def at_minimum(self) -> bool:
         return self.scale <= self.minimum_scale
@@ -341,11 +359,14 @@ class KKTBranchController:
     kappa_min: float
     kappa_max: float
     log_kappa: float
+    emergency_scale: float = 1.0
+    minimum_scale: float = 0.25
     backoff_factor: float = 0.5
     safe_tree_size: float | None = None
     ema_tree_size: float | None = None
     updates: int = 0
     emergency_backoffs: int = 0
+    pending_emergency: bool = False
     mode: RolloutMode = RolloutMode.BRANCHED_KKT
 
     def __post_init__(self) -> None:
@@ -364,6 +385,8 @@ class KKTBranchController:
             self.eta_kappa,
             self.kappa_min,
             self.kappa_max,
+            self.emergency_scale,
+            self.minimum_scale,
         )
         if any(not math.isfinite(value) or value <= 0 for value in positive):
             raise ValueError("KKT controller values must be finite and positive")
@@ -372,6 +395,7 @@ class KKTBranchController:
             or self.gamma_kappa > 1
             or self.eta_kappa > 1
             or self.kappa_min > self.kappa_max
+            or not self.minimum_scale <= self.emergency_scale <= 1
             or not math.log(self.kappa_min)
             <= self.log_kappa
             <= math.log(self.kappa_max)
@@ -400,7 +424,9 @@ class KKTBranchController:
             raise BranchingError("KKT controller received a different mode")
         if iteration < self.warmup_iterations:
             player_beta = torch.full_like(
-                root, self.fixed_beta["player"], dtype=torch.float32
+                root,
+                max(1.0, self.fixed_beta["player"] * self.emergency_scale),
+                dtype=torch.float32,
             )
         else:
             has_player = bool(owner_is_player.any())
@@ -418,9 +444,13 @@ class KKTBranchController:
                 if has_player
                 else torch.ones_like(root, dtype=torch.float32)
             )
+            player_beta = (player_beta * self.emergency_scale).clamp_min(1)
         chance = torch.full_like(
             player_beta,
-            min(self.beta_max, self.fixed_beta["chance"]),
+            min(
+                self.beta_max,
+                max(1.0, self.fixed_beta["chance"] * self.emergency_scale),
+            ),
         )
         beta = torch.where(owner_is_player, player_beta, chance)
         uniform = logical_uniform(
@@ -441,13 +471,34 @@ class KKTBranchController:
             executed = torch.where(suppressed, torch.ones_like(executed), executed)
         return BranchDecision(beta, nominal, executed, executed.clone())
 
-    def observe(self, counterfactual_tree_size: float) -> Mapping[str, float]:
+    def observe(
+        self,
+        counterfactual_tree_size: float,
+        *,
+        iteration: int,
+    ) -> Mapping[str, float]:
         size = float(counterfactual_tree_size)
-        if not math.isfinite(size) or size <= 0:
+        if not math.isfinite(size) or size <= 0 or iteration < 0:
             raise ValueError("counterfactual tree size must be positive")
-        previous = size if self.ema_tree_size is None else self.ema_tree_size
+        if iteration < self.warmup_iterations:
+            return MappingProxyType(
+                {
+                    "counterfactual_tree_size": size,
+                    "ema_tree_size": (
+                        self.target_tree_size
+                        if self.ema_tree_size is None
+                        else self.ema_tree_size
+                    ),
+                    "log_kappa": self.log_kappa,
+                }
+            )
+        previous = (
+            self.target_tree_size
+            if self.ema_tree_size is None
+            else self.ema_tree_size
+        )
         self.ema_tree_size = (1 - self.gamma_kappa) * previous + self.gamma_kappa * size
-        self.log_kappa = min(
+        updated = min(
             math.log(self.kappa_max),
             max(
                 math.log(self.kappa_min),
@@ -455,6 +506,12 @@ class KKTBranchController:
                 + self.eta_kappa * math.log(self.target_tree_size / self.ema_tree_size),
             ),
         )
+        self.log_kappa = (
+            min(self.log_kappa, updated)
+            if self.pending_emergency
+            else updated
+        )
+        self.pending_emergency = False
         self.updates += 1
         return MappingProxyType(
             {
@@ -466,19 +523,27 @@ class KKTBranchController:
 
     @property
     def at_minimum(self) -> bool:
-        return self.log_kappa <= math.log(self.kappa_min)
+        return self.emergency_scale <= self.minimum_scale
 
     def backoff(self) -> Mapping[str, float]:
         before = self.log_kappa
+        scale_before = self.emergency_scale
+        self.emergency_scale = max(
+            self.minimum_scale,
+            self.emergency_scale * self.backoff_factor,
+        )
         self.log_kappa = max(
             math.log(self.kappa_min),
             self.log_kappa + math.log(self.backoff_factor),
         )
         self.emergency_backoffs += 1
+        self.pending_emergency = True
         return MappingProxyType(
             {
                 "log_kappa_before": before,
                 "log_kappa_after": self.log_kappa,
+                "emergency_scale_before": scale_before,
+                "emergency_scale_after": self.emergency_scale,
                 "emergency_backoffs": float(self.emergency_backoffs),
             }
         )
@@ -496,11 +561,14 @@ class KKTBranchController:
             "kappa_min": self.kappa_min,
             "kappa_max": self.kappa_max,
             "log_kappa": self.log_kappa,
+            "emergency_scale": self.emergency_scale,
+            "minimum_scale": self.minimum_scale,
             "backoff_factor": self.backoff_factor,
             "safe_tree_size": self.safe_tree_size,
             "ema_tree_size": self.ema_tree_size,
             "updates": self.updates,
             "emergency_backoffs": self.emergency_backoffs,
+            "pending_emergency": self.pending_emergency,
         }
 
 

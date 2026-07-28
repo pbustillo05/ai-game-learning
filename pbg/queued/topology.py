@@ -897,6 +897,17 @@ def build_layer_plan(
         topology.compact(binding, p_train=p_train)
         for topology, binding in zip(topologies, bindings, strict=True)
     ]
+    if manifest is not None:
+        for topology, _ in compacted:
+            for node in range(topology.node_count):
+                count = int(topology.executed_degree[node])
+                target = int(topology.target_degree[node])
+                if count > manifest.beta_max and not (
+                    int(topology.parent[node]) == -1 and target < count
+                ):
+                    raise TopologyError(
+                        "only a protected refilled root may exceed beta_max"
+                    )
     input_names = tuple(item.name for item in partitions.inputs)
     output_names = tuple(item.name for item in partitions.outputs)
     input_count = len(input_names)

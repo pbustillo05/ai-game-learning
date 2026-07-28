@@ -728,6 +728,7 @@ class BranchedLearnerBatch:
     action_fields: Mapping[str, Tensor]
     logical_step: int = 0
     logical_rows: int | None = None
+    statistical_weight: float | None = None
 
     def __post_init__(self) -> None:
         device = self.sigma_index.device
@@ -764,6 +765,14 @@ class BranchedLearnerBatch:
     @property
     def objective_rows(self) -> int:
         return self.rows if self.logical_rows is None else self.logical_rows
+
+    @property
+    def objective_weight(self) -> float:
+        return (
+            self.rows / self.objective_rows
+            if self.statistical_weight is None
+            else self.statistical_weight
+        )
 
 
 class SealedBranchedInputs:
@@ -1036,16 +1045,36 @@ class BranchedBatchSampler:
         devices = {store.device for store in stores.values()}
         if len(devices) != 1 or generator.device != next(iter(devices)):
             raise LearnerError("branched sampler must remain on one CUDA device")
+        weights = {
+            name: store.sealed_inputs.columns[
+                "log_sampling_weight"
+            ].double().exp()
+            for name, store in stores.items()
+        }
+        self.log_Z = MappingProxyType(
+            {name: value.sum().log() for name, value in weights.items()}
+        )
         self.alias = MappingProxyType(
+            {name: _alias_table(value) for name, value in weights.items()}
+        )
+        mass = torch.stack(tuple(value.exp() for value in self.log_Z.values()))
+        self.stratum_probability = MappingProxyType(
             {
-                name: _alias_table(
-                    store.sealed_inputs.columns["log_sampling_weight"].double().exp()
-                )
-                for name, store in stores.items()
+                name: mass[index] / mass.sum()
+                for index, name in enumerate(stores)
             }
         )
         if statistical_counts is None:
-            statistical_counts = {name: store.rows for name, store in stores.items()}
+            allocated = allocate_statistical_counts(
+                mass.cpu(),
+                torch.ones(mass.numel(), dtype=torch.float64),
+                torch.ones(mass.numel(), dtype=torch.float64),
+                schedule.batch_size,
+            )
+            statistical_counts = {
+                name: int(allocated[index])
+                for index, name in enumerate(stores)
+            }
         if set(statistical_counts) != set(stores) or any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
             for value in statistical_counts.values()
@@ -1094,10 +1123,13 @@ class BranchedBatchSampler:
         logical_rows = sum(self.statistical_counts.values())
         for logical_step in range(steps):
             for name, requested in self.statistical_counts.items():
+                draw = self._draw(name, requested)
                 emitted = 0
                 while emitted < requested:
                     take = min(self.schedule.batch_size, requested - emitted)
-                    gathered = self.stores[name].gather(self._draw(name, take))
+                    gathered = self.stores[name].gather(
+                        draw[emitted : emitted + take]
+                    )
                     yield BranchedLearnerBatch(
                         gathered.input_type,
                         gathered.sigma_index,
@@ -1107,6 +1139,11 @@ class BranchedBatchSampler:
                         gathered.action_fields,
                         logical_step=logical_step,
                         logical_rows=logical_rows,
+                        statistical_weight=(
+                            float(self.stratum_probability[name])
+                            * take
+                            / requested
+                        ),
                     )
                     emitted += take
 

@@ -465,6 +465,7 @@ class BranchedModeConfig:
             "fixed_beta",
             "beta_max",
             "minimum_tree_size",
+            "minimum_scale",
             "backoff_factor",
             "safe_tree_size",
         }
@@ -478,7 +479,7 @@ class BranchedModeConfig:
             "log_kappa",
         }
         expected = (
-            shared | {"minimum_scale"}
+            shared
             if mode["rollout_mode"] == "branched.fixed"
             else shared | adaptive
         )
@@ -525,6 +526,18 @@ class BranchedModeConfig:
             or branching["safe_tree_size"] < 1
         ):
             raise ValueError("root.branching: controller bounds are invalid")
+        if mode["rollout_mode"] == "branched.KKT" and (
+            isinstance(branching["warmup_iterations"], bool)
+            or not isinstance(branching["warmup_iterations"], int)
+            or branching["warmup_iterations"] < 0
+            or not 0 < branching["gamma_kappa"] <= 1
+            or not 0 < branching["eta_kappa"] <= 1
+            or not 0 < branching["kappa_min"] <= branching["kappa_max"]
+            or not math.log(branching["kappa_min"])
+            <= branching["log_kappa"]
+            <= math.log(branching["kappa_max"])
+        ):
+            raise ValueError("root.branching: KKT controller bounds are invalid")
         safeguard = dict(_mapping(source.get("cost_safeguard"), "root.cost_safeguard"))
         if set(safeguard) != {
             "gamma_deviance_max",
@@ -532,10 +545,20 @@ class BranchedModeConfig:
             "consecutive_iterations",
         }:
             raise ValueError("root.cost_safeguard: calibration fields are incomplete")
+        safeguard_numeric = (
+            safeguard["gamma_deviance_max"],
+            safeguard["p95_underprediction_max"],
+        )
         if (
             not isinstance(safeguard["consecutive_iterations"], int)
             or isinstance(safeguard["consecutive_iterations"], bool)
             or safeguard["consecutive_iterations"] <= 0
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for value in safeguard_numeric
+            )
             or safeguard["gamma_deviance_max"] < 0
             or safeguard["p95_underprediction_max"] < 1
         ):

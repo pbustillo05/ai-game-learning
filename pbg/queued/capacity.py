@@ -522,6 +522,7 @@ def _field(
         "log_player_ancestor_sum",
         "log_ancestor_product",
         "branch_beta",
+        "frontier_cost_contribution",
         "old_trace",
         "old_cost",
         "frontier_cost",

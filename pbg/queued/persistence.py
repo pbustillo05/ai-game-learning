@@ -260,6 +260,16 @@ def load_checkpoint(
         "branch_controller_state",
         "cost_safeguard_state",
     }
+    prior_run = expected_run - {
+        "branch_controller_state",
+        "cost_safeguard_state",
+    }
+    if isinstance(run_data, dict) and set(run_data) == prior_run:
+        run_data = {
+            **run_data,
+            "branch_controller_state": None,
+            "cost_safeguard_state": None,
+        }
     if not isinstance(run_data, dict) or set(run_data) != expected_run:
         raise PersistenceError("run state has unknown or missing fields")
     run = RunState(**run_data)

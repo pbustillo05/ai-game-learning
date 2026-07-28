@@ -402,7 +402,7 @@ class BranchedSampledIteration:
                 raise TrainingError(
                     "ragged learner batch exceeds an admitted physical pack"
                 )
-            weight = batch.rows / batch.objective_rows
+            weight = batch.objective_weight
             result = self.learner.forward_loss_backward(
                 batch,
                 iteration=iteration,
