@@ -1,14 +1,13 @@
 # Queued runtime and consumers
 
-Status: Phase 10 accepted contract.
+Status: final accepted contract after Phase 11 cutover.
 
 Accepted executable revision:
 `944d097e221b90a075c5c813de9f604bfa38dfae`.
 
-This document describes the public product boundary after consumer migration.
-It does not perform the Phase 11 directory cutover: legacy source may remain in
-the repository until that deletion phase, but no accepted production root may
-reach it.
+This document describes the public product boundary after consumer migration
+and final directory cutover. The legacy engine and isolated replacement
+namespace are deleted.
 
 ## Public composition
 
@@ -38,8 +37,8 @@ distributed, and replica entry points all construct that same session:
 
 There is no runtime engine selector, compatibility adapter, or fallback
 composition. Accepted training, evaluation, inference, export, variance, and
-benchmark roots reach `pbg.queued` or `pbg.games.poker.queued` and do not reach
-`pbg.core`.
+benchmark roots reach `pbg.core` and the NLHE implementation under
+`pbg.games.poker.queued`.
 
 ## Accelerator boundary
 
@@ -198,16 +197,15 @@ bounded by the immutable manifest and release at their declared final
 consumer. The completion effective-hand accumulator is binding-owned and
 releases immediately after completion.
 
-## Reachability and remaining cutover
+## Reachability and final cutover
 
 The accepted production roots are training, replica training and selection,
 best-response evaluation, inference/export/benchmark, training/replica
-benchmarks, and variance. Static import reachability reports no accepted root
-that reaches the legacy core, no missing accepted root, and no migrated
-implementation-body duplicate.
+benchmarks, and variance. Final static reachability reports all 441 production
+definitions reachable from 31 accepted roots, with no review candidate,
+missing root, stale engine path, or migrated implementation-body duplicate.
 
-Phase 10 closes public consumer migration and artifact runtime compatibility.
-Phase 11 still owns the atomic directory cutover, deletion of the unreachable
-legacy engine and migration scaffolding, package relocation, and final
-repository-wide deletion/similarity audit. This document does not authorize
-retaining a legacy definition after that cutover.
+Phase 11 atomically replaced the old core, deleted the isolated replacement
+namespace and migration scaffolding, and removed all compatibility, fallback,
+prototype, comparison, and test-only production paths. Recovery is Git
+history; no rollback engine remains in the repository.

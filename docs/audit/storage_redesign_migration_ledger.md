@@ -3,29 +3,35 @@
 Status: opened in Phase 1. A row closes only when the old definition and all
 callers, tests, configuration, and stale documentation are deleted.
 
+Phase 11 closes every row against validated and audited executable candidate
+`71a92378cf89a81ed5724ba61515fa6c9f441706`. The old definitions, isolated
+replacement namespace, callers, compatibility paths, comparison scaffolding,
+test-only production objects, and stale executable documentation are deleted.
+Final evidence is in `queued_phase11_report_20260728.md` and
+`../queued/core_pipeline.md`.
+
 Phase 1 contract/inventory rows closed against candidate
 `7e371b8daf9f978ad2e479edfda6ae87fdaadb6b`: twelve-mode vocabulary,
 partitions/conversions, owner fields, replica rules, capacity vocabulary,
 opaque hooks, old-module/root/config/persistence/artifact inventories, and
-static firewall gates. All replacement and deletion rows for later phases
-remain open.
+static firewall gates. Later replacement and deletion rows were subsequently
+closed by their owning phases and the Phase 11 cutover.
 
 Phase 2 replacement evidence passed against candidate
 `5bd7d0ebb900ec4dddc6a951646d6e1e62622a3b`: immutable aligned schemas,
 fixed monotone slabs, exact blocks, lane-local failure/retry, atomic
 multi-destination publication, generated owners, immutable capacity admission,
-exact byte reports, and last-consumer release. The corresponding old-definition
-rows remain open until their legacy callers and definitions are deleted at
-cutover; isolated replacement does not weaken that closure rule.
+exact byte reports, and last-consumer release. Phase 11 deleted the
+corresponding old definitions and legacy callers.
 
 Phase 3 replacement evidence passed against candidate
 `ec9ef6f725a8f986c4b2910b348b1c2a09b804ea`: compact CPU topology and
 packets, one immutable exact movement/layer plan, two last-consumer work
 arenas, one schema-generated compiled CUDA layer executor, sampled and RB
 carriers, deterministic post-to-pre conversion, branched trace/cost/delta,
-headless structural rows, and atomic target publication. Physical carries and
-total-minus-child are deleted. Legacy topology and target definitions remain
-open until their callers and owners are deleted at cutover.
+headless structural rows, and atomic target publication. Physical carries,
+total-minus-child, and the legacy topology/target definitions and callers are
+deleted.
 
 Phase 4 replacement evidence passed against candidate
 `de6b429ce5c174df1af21e5709bfd9d51e007429`: semantic FIFOs, stable
@@ -33,17 +39,16 @@ compatible-cohort scheduling, lane-local mode identity, authoritative logical
 RNG, descriptor-derived device routing and exact coverage, one rollback-safe
 `model -> sample -> commit` transaction, declared cross-family fan-out,
 reservation-bound asynchronous topology, bounded chance closure, and strict
-`Leaf -> LayerWork` completion. Legacy rollout, queue, RNG, and completion
-definitions remain open until their consumer phases land and cutover deletes
-their old callers.
+`Leaf -> LayerWork` completion. Phase 11 deleted the legacy rollout, queue,
+RNG, completion definitions, and old callers.
 
 Phase 6 replacement evidence passed against candidate
 `df25d020284c16f4600ae90603ba3de594d7e98c`: all four sequential modes,
 K/H RB domains and selected completion, compact trained/frozen roles, retained
 signed folded summaries with raw mass and U/C semantics, event refresh/copy
 and exact release, shared-response cutoff and paired evaluation, exact probe
-identity, and approved RB/probe conversion. Legacy folded, completion, and
-probe definitions remain open until cutover deletes their old callers.
+identity, and approved RB/probe conversion. Phase 11 deleted the legacy
+folded, completion, probe definitions, and old callers.
 
 Phase 10 consumer evidence passed against candidate
 `944d097e221b90a075c5c813de9f604bfa38dfae`: one closed three-axis public
@@ -51,10 +56,10 @@ configuration, one ordinary/distributed/replica runtime composition, queued
 BR/inference/variance/benchmark consumers, strict queued persistence and
 model-only artifacts, actual posterior effective hands, preserved reference
 cadence, exact rank/lane/global work, accelerator gates, and operational
-checkpoint selection. Every accepted production root now reaches the queued
-replacement and none reaches `pbg.core`. Public-consumer and artifact-runtime
-rows close here; unreachable legacy definitions remain open for atomic Phase
-11 deletion.
+checkpoint selection. Every accepted production root reached the isolated
+replacement and none reached the old `pbg.core`. Public-consumer and
+artifact-runtime rows closed here; Phase 11 then relocated the replacement to
+`pbg.core` and deleted every unreachable legacy definition.
 
 Disposition meanings:
 
@@ -130,7 +135,7 @@ No row means reuse in place, adaptation, or indefinite compatibility.
 | `pbg.eval.br_probe`, BR CLI | rewrite, closed | ordinary response consumer, Phases 6/10 | balanced paired lower-bound production report |
 | `pbg.inference`, artifact/export/benchmark CLIs | rewrite, closed | queued model-only inference, Phase 10 | strict artifact and CUDA/MPS contract |
 | RunPod/replica benchmark CLIs | rewrite, closed | queued experiment consumers, Phases 9/10 | same runtime/benchmark composition |
-| package `__init__` modules | rewrite now; delete stale exports at cutover | final public surface, Phases 10/11 | accepted-root reachability closed; physical cutover open |
+| package `__init__` modules | rewrite/delete, closed | final public surface, Phases 10/11 | empty compatibility boundaries; physical cutover closed |
 
 The accepted root list is frozen in
 `queued_phase1_inventory_20260726.md`. Static tests fail if a production root
@@ -159,9 +164,9 @@ every family: update/loss/reference/controller behavior reaches public
 training; poker/model/precision/utility behavior reaches training and
 inference; probe behavior reaches BR evaluation; and configuration,
 persistence, inference, performance, distributed, and observability behavior
-reaches its named public consumer. The final deletion half of rows backed by a
-legacy definition remains open for Phase 11. The default is rewrite/preserve;
-deletion or semantic change still requires explicit user approval.
+reaches its named public consumer. Phase 11 closes the final deletion half of
+every row backed by a legacy definition. No unapproved semantic deletion was
+introduced.
 
 ## Artifact/converter ledger
 
@@ -277,3 +282,19 @@ blocker, no missing accepted root, no accepted path to `pbg.core`, and no
 migrated implementation duplicate. See
 `queued_phase10_report_20260728.md` and
 `../queued/runtime_and_consumers.md`.
+
+Phase 11 candidate `71a92378cf89a81ed5724ba61515fa6c9f441706`
+passed all 312 collected tests on the required accelerator matrix: 310 passed
+with two expected one-GPU environment skips, followed by the separately
+executed two-GPU NCCL gate. Static reachability found all 441 indexed
+production definitions reachable from 31 accepted roots with zero review
+candidates. The public matched-work benchmark was deterministic at about
+16 nodes/s with 30,920,192 bytes peak allocated and 52,428,800 bytes peak
+reserved. Adversarial checks closed implicit/test-only attention execution,
+CPU neural fallback, stale scientific/artifact aliases, compatibility exports,
+test-only production helpers, and all old/migrated implementation bodies.
+Initial and final GPU baselines matched at 6/6/16 MiB with no compute
+processes. Independent validation and a different read-only authority audit
+both passed the exact SHA. Every migration, preservation, artifact, product,
+and test-only row is now closed. See
+`queued_phase11_report_20260728.md` and `../queued/core_pipeline.md`.

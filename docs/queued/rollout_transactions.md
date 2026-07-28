@@ -5,7 +5,7 @@ Status: Phase 4 executable contract, validated and audited at
 
 ## Scope
 
-`pbg.queued.rollout` owns the game-opaque queued path:
+`pbg.core.rollout` owns the game-opaque queued path:
 
 ```text
 stable FamilyWork prefix

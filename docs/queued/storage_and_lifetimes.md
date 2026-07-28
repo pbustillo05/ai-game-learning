@@ -1,8 +1,8 @@
 # Queued storage and lifetime contract
 
-Status: Phase 2 verified behavior. The executable authority is
-`pbg.queued.storage` and `pbg.queued.capacity` at candidate
-`5bd7d0ebb900ec4dddc6a951646d6e1e62622a3b`.
+Status: final verified behavior. The executable authority is
+`pbg.core.storage` and `pbg.core.capacity`; the final cutover candidate is
+`71a92378cf89a81ed5724ba61515fa6c9f441706`.
 
 ## Allocation vocabulary
 

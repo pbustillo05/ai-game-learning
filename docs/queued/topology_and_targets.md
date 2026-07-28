@@ -18,7 +18,7 @@ physical widths, estimator, rollout family, or conversion vocabulary before a
 CUDA layer launch.
 
 There is no carry representation, counter, upload, kernel, or mode-specific
-target builder in `pbg.queued`.
+target builder in `pbg.core`.
 
 ## 2. Topology contract
 
