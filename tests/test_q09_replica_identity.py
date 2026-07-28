@@ -387,6 +387,8 @@ def _distributed_sum_worker(
         module = module_owner.lane_module(0)
 
         class _OneBatch:
+            optimizer_steps = 1
+
             @staticmethod
             def batches():
                 yield SequentialLearnerBatch(
