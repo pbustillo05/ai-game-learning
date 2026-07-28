@@ -7,16 +7,16 @@ field while rollout avoids materializing a private-hand by action tensor.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping
 
 import torch
 from torch import Tensor
 
+from pbg.games.poker.model.primitives import accelerator_assert
 from pbg.queued.learner import PolicyEvaluation
 from pbg.queued.rollout import logical_categorical
-
 
 FOLD = 0
 CHECK_CALL = 1
@@ -48,12 +48,9 @@ class PokerLegality:
             raise PokerPolicyError(
                 "legality requires accelerator integer ids and bool mask [B,E]"
             )
-        if self.event_ids.device.type == "cuda":
-            torch._assert_async(
-                self.mask.any(-1).all(), "every poker row needs a legal action"
-            )
-        elif not bool(self.mask.any(-1).all()):
-            raise PokerPolicyError("every poker row needs a legal action")
+        accelerator_assert(
+            self.mask.any(-1).all(), "every poker row needs a legal action"
+        )
 
     @property
     def raise_ticks(self) -> int:
@@ -108,12 +105,9 @@ def _validate_raw(raw: Mapping[str, Tensor], legality: PokerLegality) -> None:
         & ((raw["mu"] >= 0) & (raw["mu"] <= 1)).all()
         & ((raw["iota"] >= 0) & (raw["iota"] <= 1)).all()
     )
-    if logits.device.type == "cuda":
-        torch._assert_async(finite.all(), "raw poker policy must be finite")
-        torch._assert_async(positive, "raise scales must be positive")
-        torch._assert_async(mixture_law, "raw raise mixture law is invalid")
-    elif not bool(finite.all() & positive & mixture_law):
-        raise PokerPolicyError("raw poker policy or raise mixture law is invalid")
+    accelerator_assert(finite.all(), "raw poker policy must be finite")
+    accelerator_assert(positive, "raise scales must be positive")
+    accelerator_assert(mixture_law, "raw raise mixture law is invalid")
 
 
 def _discretized_logistic(ticks: int, location: Tensor, scale: Tensor) -> Tensor:
@@ -201,12 +195,9 @@ class PokerPolicyOperator:
         )
         ids = legality.event_ids.to(torch.int64).reshape(event_shape).expand_as(mask)
         in_range = (ids >= 0) & (ids < full_logits.shape[-1])
-        if logits.device.type == "cuda":
-            torch._assert_async(
-                (~mask | in_range).all(), "legal poker event id is out of range"
-            )
-        elif not bool((~mask | in_range).all()):
-            raise PokerPolicyError("legal poker event id is out of range")
+        accelerator_assert(
+            (~mask | in_range).all(), "legal poker event id is out of range"
+        )
         selected_logits = full_logits.gather(-1, ids.clamp(0, full_logits.shape[-1] - 1))
         selected_logits = selected_logits.masked_fill(~mask, -torch.inf)
         probability = torch.softmax(selected_logits, -1).masked_fill(~mask, 0.0)
@@ -221,18 +212,12 @@ class PokerPolicyOperator:
         probability = self.probabilities(raw, legality)
         if action.shape != (probability.shape[0],):
             raise PokerPolicyError("selected action must have shape [B]")
-        event_shape = (probability.shape[0],) + (1,) * (probability.ndim - 2) + (
-            probability.shape[-1],
-        )
         matches = legality.event_ids.eq(action[:, None].to(legality.event_ids))
         matches &= legality.mask
-        if probability.device.type == "cuda":
-            torch._assert_async(
-                matches.sum(-1).eq(1).all(),
-                "selected action must occur exactly once in legal events",
-            )
-        elif not bool(matches.sum(-1).eq(1).all()):
-            raise PokerPolicyError("selected action must occur once in legal events")
+        accelerator_assert(
+            matches.sum(-1).eq(1).all(),
+            "selected action must occur exactly once in legal events",
+        )
         column = matches.to(torch.int64).argmax(-1)
         column = column.reshape((probability.shape[0],) + (1,) * (probability.ndim - 2) + (1,))
         column = column.expand(probability.shape[:-1] + (1,))
@@ -277,7 +262,7 @@ class PokerPolicyOperator:
                 "actor sampling requires policy [B,H,E] and aligned hands/keys"
             )
         hand = actor_hand.to(torch.int64)
-        torch._assert_async(
+        accelerator_assert(
             ((hand >= 0) & (hand < raw["type_logits"].shape[1])).all(),
             "actor hand is outside the policy domain",
         )
@@ -339,12 +324,12 @@ class BoundPokerPolicy:
 
 
 __all__ = [
-    "ActorSample",
-    "BoundPokerPolicy",
     "CHECK_CALL",
     "FOLD",
+    "RAISE_OFFSET",
+    "ActorSample",
+    "BoundPokerPolicy",
     "PokerLegality",
     "PokerPolicyError",
     "PokerPolicyOperator",
-    "RAISE_OFFSET",
 ]

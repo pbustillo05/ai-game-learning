@@ -107,7 +107,6 @@ class _BranchedModel(_EndToEndPokerModel):
             ),
         )
 
-
 def _manifest(
     device: torch.device,
     geometry: NLHEGeometry | None = None,

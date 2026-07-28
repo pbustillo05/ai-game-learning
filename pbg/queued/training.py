@@ -260,6 +260,10 @@ class SequentialSampledIteration:
                     raise TrainingError(
                         "learner step failed on another distributed rank"
                     )
+                if getattr(self.optimizer, "distributed", None) is None:
+                    raise TrainingError(
+                        "learner step failed before optimizer transition"
+                    ) from error
                 raise TrainingError(
                     "learner step failed before distributed SUM"
                 ) from error
@@ -423,6 +427,10 @@ class BranchedSampledIteration:
                     raise TrainingError(
                         "branched learner step failed on another distributed rank"
                     )
+                if getattr(self.optimizer, "distributed", None) is None:
+                    raise TrainingError(
+                        "branched learner step failed before optimizer transition"
+                    ) from error
                 raise TrainingError(
                     "branched learner step failed before distributed SUM"
                 ) from error

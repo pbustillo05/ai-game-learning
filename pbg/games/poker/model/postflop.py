@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 import torch
 from torch import Tensor, nn
 
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.folded import PartitionSummaryBatch
-from pbg.games.poker.model.heads import PublicBranchingHeads, RaiseMixtureHead, TypeHead, ValueHead
+from pbg.games.poker.model.heads import (
+    PublicBranchingHeads,
+    RaiseMixtureHead,
+    TypeHead,
+    ValueHead,
+)
 from pbg.games.poker.model.incidence import (
     CompactMap,
     IncidenceResidual,
@@ -18,8 +23,17 @@ from pbg.games.poker.model.incidence import (
     compact_gather,
     compact_scatter,
 )
-from pbg.games.poker.model.preflop import PokerModelConfig, PokerPublicBatch, PolicyOutput
-from pbg.games.poker.model.primitives import FFN, LN, MHA
+from pbg.games.poker.model.preflop import (
+    PokerModelConfig,
+    PokerPublicBatch,
+    PolicyOutput,
+)
+from pbg.games.poker.model.primitives import (
+    FFN,
+    LN,
+    MHA,
+    accelerator_assert,
+)
 
 
 @dataclass
@@ -46,10 +60,7 @@ class PostflopMasks:
 def _require_device(condition: Tensor, message: str) -> None:
     """Validate a scalar condition without synchronizing CUDA to the host."""
 
-    if condition.device.type == "cuda":
-        torch._assert_async(condition, message)
-    elif not bool(condition):
-        raise ValueError(message)
+    accelerator_assert(condition, message)
 
 
 class PostflopNet(nn.Module):
@@ -322,7 +333,7 @@ class PostflopNet(nn.Module):
         return self.rank_embedding(safe // 4) + self.suit_embedding(safe % 4)
 
     def _combo_embedding(self, ids: Tensor, supplied: Tensor | None, dtype: torch.dtype) -> Tensor:
-        batch, compact = ids.shape
+        batch, _compact = ids.shape
         if supplied is not None:
             expected = (self.n_hands, self.cfg.class_embedding_dim)
             if supplied.shape == expected:

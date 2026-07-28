@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from pbg.games.poker.model.primitives import LN
+from pbg.games.poker.model.primitives import LN, accelerator_assert
 
 
 class IncidenceResidual(nn.Module):
@@ -126,18 +126,15 @@ def build_compact_map(
     if isinstance(compact_size, bool) or not 0 <= compact_size <= full_size:
         raise ValueError("compact_size must be in [0,H]")
     enough_space = (counts <= compact_size).all()
-    if compatibility.device.type == "cuda":
-        torch._assert_async(enough_space, "compact_size omits compatible rows")
-    elif not bool(enough_space):
-        raise ValueError("compact_size omits compatible rows")
-    compact_to_full = torch.zeros(
-        (batch, compact_size), dtype=torch.long, device=compatibility.device
+    accelerator_assert(enough_space, "compact_size omits compatible rows")
+    compact_to_full = (
+        compatibility[:, :compact_size].to(torch.long).clone().zero_()
     )
     rank = compatibility.long().cumsum(dim=1) - 1
     full_to_compact = torch.where(compatibility, rank, -torch.ones_like(rank))
     if compact_size:
         full_ids = torch.arange(full_size, device=compatibility.device)[None].expand(batch, -1)
-        compact_to_full.scatter_add_(
+        compact_to_full = compact_to_full.scatter_add(
             1,
             rank.clamp(0, compact_size - 1),
             torch.where(compatibility, full_ids, torch.zeros_like(full_ids)),
@@ -182,7 +179,7 @@ def compact_scatter(
     mapping: CompactMap,
     dim: int = 1,
     *,
-    fill_value: float | int | bool = 0,
+    fill_value: float | bool = 0,
 ) -> Tensor:
     """Scatter padded compact rows back to the map's fixed row width."""
 

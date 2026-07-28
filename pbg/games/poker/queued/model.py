@@ -19,7 +19,7 @@ from pbg.games.poker.model.preflop import (
     PreflopMasks,
     PreflopNet,
 )
-from pbg.games.poker.model.primitives import MHA
+from pbg.games.poker.model.primitives import MHA, accelerator_assert
 from pbg.games.poker.queued.folded import unpack_folded_statistics
 from pbg.games.poker.queued.hooks import (
     FOLD,
@@ -47,19 +47,15 @@ def _fold_line_metadata(
 ) -> Tensor:
     """Encode each folded seat's retained action line at its fold event."""
 
-    batch, tokens = history.mask.shape
+    _batch, tokens = history.mask.shape
     players = status.shape[1]
-    result = torch.zeros(
-        (batch, players, line_dim),
-        dtype=torch.float32,
-        device=status.device,
-    )
     position = torch.arange(tokens, device=status.device)[None]
+    seat_rows: list[Tensor] = []
     for seat in range(players):
         folder = status[:, seat].eq(FOLDED)
         owned = history.mask & history.actor.eq(seat)
         fold = owned & history.action.eq(FOLD)
-        torch._assert_async(
+        accelerator_assert(
             (~folder | fold.any(-1)).all(),
             "folded seat has no retained fold-line event",
         )
@@ -78,11 +74,18 @@ def _fold_line_metadata(
             history.pot_before.gather(1, gather).squeeze(1) / float(stack_bb),
             history.call_amount.gather(1, gather).squeeze(1) / float(stack_bb),
         )
-        for column, value in enumerate(fields[:line_dim]):
-            result[:, seat, column] = torch.where(
-                folder, value, torch.zeros_like(value)
+        seat_rows.append(
+            torch.stack(
+                tuple(
+                    torch.where(folder, value, torch.zeros_like(value))
+                    for value in fields[:line_dim]
+                ),
+                -1,
             )
-    return result
+            if line_dim
+            else history.amount[:, :0]
+        )
+    return torch.stack(tuple(seat_rows), 1)
 
 
 def _combo_class(geometry: NLHEGeometry) -> Tensor:
@@ -287,17 +290,10 @@ class QueuedPokerModel(nn.Module):
         finite = torch.isfinite(log_reach)
         gauge = log_reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
         weights = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
-        class_ranges = torch.zeros(
-            (
-                state.rows,
-                self.geometry.players,
-                self.geometry.rank_count**2,
-            ),
-            dtype=torch.float32,
-            device=state.device,
-        )
         classes = self.combo_class[None, None, :].expand_as(weights)
-        class_ranges.scatter_add_(2, classes, weights)
+        class_ranges = weights[
+            ..., : self.geometry.rank_count**2
+        ].clone().zero_().scatter_add(2, classes, weights)
         return self._evaluation(
             self.preflop(
                 public,
@@ -324,7 +320,7 @@ class QueuedPokerModel(nn.Module):
             .values
         )
         live_ids = ordered[:, :live]
-        torch._assert_async(
+        accelerator_assert(
             live_ids.lt(self.geometry.players).all(),
             "postflop family disagrees with live-seat state",
         )
@@ -528,7 +524,9 @@ def build_model_from_config(
 
     mode = scientific.get("mode")
     if not isinstance(mode, Mapping):
-        raise ValueError("scientific.mode must select a sequential mode")
+        raise ValueError(  # noqa: TRY004 - stable configuration error contract
+            "scientific.mode must select a sequential mode"
+        )
     try:
         schema = mode_schema(**dict(mode))
     except (TypeError, ValueError) as exc:
@@ -536,7 +534,9 @@ def build_model_from_config(
     game = scientific.get("game")
     model = scientific.get("model")
     if not isinstance(game, Mapping) or not isinstance(model, Mapping):
-        raise ValueError("scientific configuration must contain game and model objects")
+        raise ValueError(  # noqa: TRY004 - stable configuration error contract
+            "scientific configuration must contain game and model objects"
+        )
     game_values = dict(game)
     if "players" in game_values:
         players = game_values["players"]

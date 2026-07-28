@@ -951,7 +951,15 @@ class SequentialPokerIteration:
                 binding.leaf_to_layer_work,
                 wait_for=last_event,
             )
-            torch._assert_async(success.all(), "poker completion failed")
+            lane_index = torch.tensor(
+                active_lanes,
+                dtype=torch.int64,
+                device=owners.plan.device,
+            )
+            torch._assert_async(
+                success.index_select(0, lane_index).all(),
+                "poker completion failed",
+            )
             for lane in active_lanes:
                 remaining_leaves[lane] -= rows
         completion.release()

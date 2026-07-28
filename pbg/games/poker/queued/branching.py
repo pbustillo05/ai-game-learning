@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 
@@ -28,6 +28,7 @@ from pbg.games.poker.queued.policy import PokerPolicyOperator
 from pbg.games.poker.queued.rb_sampling import (
     CollisionConditionedProfileSampler,
 )
+from pbg.games.poker.queued.replica import PokerReplicaInference
 from pbg.queued.branching import (
     BranchController,
     BranchDecision,
@@ -48,6 +49,7 @@ from pbg.queued.contracts import (
     ModeSchema,
     PrivateEstimator,
     TrainingRegime,
+    validate_replica_group,
 )
 from pbg.queued.learner import (
     BranchedBatchSampler,
@@ -65,6 +67,10 @@ from pbg.queued.learner import (
 )
 from pbg.queued.optimization import DenseAdam
 from pbg.queued.persistence import RunState
+from pbg.queued.replica import (
+    DistributedSUM,
+    ReplicaOptimizerGroup,
+)
 from pbg.queued.rollout import (
     AsyncTopologyPublisher,
     CommitCoverage,
@@ -1100,7 +1106,10 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         self._posterior_address.fill_(torch.iinfo(torch.int64).max)
         self._posterior_attempts.zero_()
         if batch.lane_count != 1:
-            raise BranchedPokerError("ordinary Phase 7 hooks require one lane")
+            raise BranchedPokerError(
+                "branched sampling requires one active lane"
+            )
+        lane = int(batch.lanes[0])
         rows = batch.rows
         root = batch.fields["logical_rng_key"][0, :, 0]
         path = batch.fields["logical_rng_key"][0, :, 1]
@@ -1117,7 +1126,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             owner_is_player=torch.ones(rows, dtype=torch.bool, device=root.device),
             iteration=self.iteration,
             seed=self.seed,
-            retry_epoch=self.owners.retry_epoch()[0],
+            retry_epoch=self.owners.retry_epoch()[lane],
             trace=values["trace"],
             cost=values["cost"],
             log_player_ancestor_sum=batch.fields["log_player_ancestor_sum"][0],
@@ -1129,7 +1138,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 + (
                     torch.stack(
                         tuple(
-                            queue.frontier_cost[0]
+                            queue.frontier_cost[lane]
                             for queue in self.queues.values()
                         )
                     ).sum()
@@ -1206,7 +1215,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 path=child_path,
                 seed=self.seed,
                 iteration=self.iteration,
-                retry_epoch=self.owners.retry_epoch()[0],
+                retry_epoch=self.owners.retry_epoch()[lane],
             )
             self._observe_posterior()
         owner = batch.fields["owner"][0].index_select(0, source).to(torch.int64)
@@ -1224,7 +1233,8 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             path=child_path,
             draw=0,
             purpose=DrawPurpose.ACTION,
-            retry_epoch=self.owners.retry_epoch()[0],
+            lane=lane,
+            retry_epoch=self.owners.retry_epoch()[lane],
             active=active,
         )
         sampled = self.policy.sample_actor(
@@ -1254,6 +1264,9 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
 
     def transition(self, request: TransitionRequest) -> CommitPlan:
         batch = request.batch
+        if batch.lane_count != 1:
+            raise BranchedPokerError("branched transition requires one active lane")
+        lane = int(batch.lanes[0])
         rows = batch.rows
         device = self.owners.device
         sample = request.sample.values
@@ -1303,7 +1316,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         next_state = self.machine.step_player(state, action)
         root = batch.fields["logical_rng_key"][0, :, 0].index_select(0, action_source)
         child_path = sample["child_path"]
-        retry = self.owners.retry_epoch()[0]
+        retry = self.owners.retry_epoch()[lane]
         first_child_key = torch.stack((root, child_path), -1)
         initial_endpoint_source = action_source
         initial_endpoint_mass = (
@@ -1683,7 +1696,24 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             self._route_family_values,
             declared_values=self._route_families,
         )
-        address = batch.fields["logical_rng_key"][:, :, 0].amin(1)
+        local_address = batch.fields["logical_rng_key"][:, :, 0].amin(1)
+        address = torch.full(
+            (self.owners.n_replica,),
+            torch.iinfo(torch.int64).max,
+            dtype=torch.int64,
+            device=device,
+        )
+        address[lane] = local_address[0]
+
+        def lane_count(value: Tensor) -> Tensor:
+            result = torch.zeros(
+                self.owners.n_replica,
+                dtype=torch.int64,
+                device=device,
+            )
+            result[lane] = value.to(torch.int64)
+            return result
+
         destinations: list[DeviceDestinationRequest] = []
         owner = batch.fields["owner"][0].to(torch.int64)
         selected_player = (
@@ -1692,7 +1722,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             else owner
         )
         leaf = next(slab for slab in self.owners.slabs if slab.schema.name == "Leaf")
-        leaf_old_tail = leaf.reserved_tails_device()[0]
+        leaf_old_tail = leaf.reserved_tails_device()[lane]
         leaf_values = self._defaults(leaf, total)
         terminal_state = replace(
             next_state,
@@ -1712,6 +1742,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                     path=child_path,
                     draw=0,
                     purpose=DrawPurpose.COMPLETION,
+                    lane=lane,
                     retry_epoch=retry,
                     active=current_active,
                 ),
@@ -1737,8 +1768,8 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         )
         terminal_rows = route.source_row[0, 0]
         for name, value in leaf_source.items():
-            leaf_values[name][0].copy_(value.index_select(0, terminal_rows))
-        leaf_count = route.counts[0, 0].reshape(1)
+            leaf_values[name][lane].copy_(value.index_select(0, terminal_rows))
+        leaf_count = lane_count(route.counts[0, 0])
         destinations.append(
             DeviceDestinationRequest(
                 leaf, leaf_count, leaf_values, batch.input_type, address
@@ -1754,13 +1785,13 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             trained = torch.zeros_like(trained)
         trained_row = torch.argsort(~trained, stable=True)
         trained_valid = trained.index_select(0, trained_row)
-        trained_count = trained.sum(dtype=torch.int64).reshape(1)
+        trained_count = lane_count(trained.sum(dtype=torch.int64))
         sigma = next(
             slab
             for slab in self.owners.slabs
             if slab.schema.name == f"SigmaHead.{batch.input_type}"
         )
-        sigma_old_tail = sigma.reserved_tails_device()[0]
+        sigma_old_tail = sigma.reserved_tails_device()[lane]
         sigma_values = self._defaults(sigma, rows)
         model_value = request.model.values["value"]
         selected_value = (
@@ -1771,13 +1802,13 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             if sampled_mode
             else self._natural_rows(model_value, batch.input_type)
         )
-        sigma_values["old_value"][0].copy_(
+        sigma_values["old_value"][lane].copy_(
             selected_value.index_select(0, trained_row)
         )
-        sigma_values["old_trace"][0].copy_(
+        sigma_values["old_trace"][lane].copy_(
             request.model.values["trace"].index_select(0, trained_row)
         )
-        sigma_values["old_cost"][0].copy_(
+        sigma_values["old_cost"][lane].copy_(
             request.model.values["cost"].index_select(0, trained_row)
         )
         destinations.append(
@@ -1796,15 +1827,17 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             for slab in self.owners.slabs
             if slab.schema.name == f"ActionHead.{output_type}"
         )
-        action_old_tail = action_head.reserved_tails_device()[0]
+        action_old_tail = action_head.reserved_tails_device()[lane]
         trained_child = trained.index_select(0, action_source) & action_active
         trained_action_row = torch.argsort(~trained_child, stable=True)
         trained_action_valid = trained_child.index_select(
             0, trained_action_row
         )
-        trained_action_count = trained_child.sum(dtype=torch.int64).reshape(1)
+        trained_action_count = lane_count(
+            trained_child.sum(dtype=torch.int64)
+        )
         action_values = self._defaults(action_head, action_total)
-        action_values["action"][0].copy_(
+        action_values["action"][lane].copy_(
             action.index_select(0, trained_action_row)
         )
         retained_log = (
@@ -1812,7 +1845,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             if sampled_mode
             else self._natural_rows(selected_log, batch.input_type)
         )
-        action_values["old_log_policy"][0].copy_(
+        action_values["old_log_policy"][lane].copy_(
             retained_log.index_select(0, trained_action_row)
         )
         destinations.append(
@@ -1874,7 +1907,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             folded_rows = folded_rows.sum(-1, keepdim=True)
         fold_order = torch.argsort(~stored_fold, stable=True)
         folded_values = self._defaults(folded_slab, action_total)
-        folded_values["range"][0].copy_(
+        folded_values["range"][lane].copy_(
             folded_rows.index_select(0, fold_order)
         )
         actor_log_mass = torch.logsumexp(
@@ -1886,11 +1919,11 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             ).squeeze(1),
             -1,
         )
-        folded_values["log_mass"][0].copy_(
+        folded_values["log_mass"][lane].copy_(
             actor_log_mass.index_select(0, fold_order)
         )
-        fold_count = stored_fold.sum(dtype=torch.int64).reshape(1)
-        fold_base = folded_slab.reserved_tails_device()[0]
+        fold_count = lane_count(stored_fold.sum(dtype=torch.int64))
+        fold_base = folded_slab.reserved_tails_device()[lane]
         fold_ordinal = stored_fold.cumsum(0, dtype=torch.int64) - 1
         encoded_reference = (
             fold_base + fold_ordinal
@@ -1993,11 +2026,13 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             values = self._defaults(queue.family, total)
             for field, value in family_source.items():
                 if field in values:
-                    values[field][0].copy_(
+                    values[field][lane].copy_(
                         value.index_select(0, selected_rows)
                     )
             cost_addition = torch.zeros(
-                1, dtype=torch.float32, device=device
+                self.owners.n_replica,
+                dtype=torch.float32,
+                device=device,
             )
             if (
                 self.cost_safeguard is not None
@@ -2019,15 +2054,15 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                             next_state.to_act.index_select(0, selected_rows),
                             selected_role,
                         ),
-                        torch.zeros(
-                            1, dtype=torch.int64, device=device
+                        torch.tensor(
+                            [lane], dtype=torch.int64, device=device
                         ),
                     )
                 child_cost = child_evaluation["cost"].detach().float()
                 child_cost = child_cost.masked_fill(~selected_valid, 0)
-                values["frontier_cost_contribution"][0].copy_(child_cost)
-                cost_addition[0] = child_cost.sum()
-            count = route.counts[0, family_index + 1].reshape(1)
+                values["frontier_cost_contribution"][lane].copy_(child_cost)
+                cost_addition[lane] = child_cost.sum()
+            count = lane_count(route.counts[0, family_index + 1])
             destinations.append(
                 DeviceDestinationRequest(queue.family, count, values, name, address)
             )
@@ -2098,11 +2133,27 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         ordinal_descriptor = torch.cat(descriptor_ordinal)
         valid_descriptor = torch.cat(descriptor_valid)
         extent = int(source_descriptor.numel())
+        coverage_valid = torch.zeros(
+            (self.owners.n_replica, extent),
+            dtype=torch.bool,
+            device=device,
+        )
+        coverage_source = torch.zeros(
+            (self.owners.n_replica, extent),
+            dtype=torch.int64,
+            device=device,
+        )
+        coverage_destination = torch.zeros_like(coverage_source)
+        coverage_ordinal = torch.zeros_like(coverage_source)
+        coverage_valid[lane].copy_(valid_descriptor)
+        coverage_source[lane].copy_(source_descriptor)
+        coverage_destination[lane].copy_(destination_descriptor)
+        coverage_ordinal[lane].copy_(ordinal_descriptor)
         coverage = CommitCoverage(
-            valid=valid_descriptor.reshape(1, extent),
-            source_ordinal=source_descriptor[None],
-            destination=destination_descriptor[None],
-            destination_ordinal=ordinal_descriptor[None],
+            valid=coverage_valid,
+            source_ordinal=coverage_source,
+            destination=coverage_destination,
+            destination_ordinal=coverage_ordinal,
         )
         self.routing_traffic_bytes += sum(
             value.numel() * value.element_size()
@@ -2245,7 +2296,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         )
         self.realized_tree_size.add_(sampled_nodes.to(torch.float32))
         topology_publication = DeferredBranchedTopologyPublication(
-            lane=0,
+            lane=lane,
             sequence=self._topology_sequence,
             declared_nodes=self.topology_recorder.topology_packet_cap,
             declared_edges=0,
@@ -2264,19 +2315,43 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             queue_cost_additions=tuple(queue_cost_additions),
             device_failure=(
                 DeviceCommitFailure(
-                    failed=self._posterior_failed.reshape(1),
-                    logical_address=self._posterior_address.reshape(1),
-                    requested_extent=(
-                        self._posterior_attempts + 1
-                    ).reshape(1),
-                    available_extent=torch.full(
-                        (1,),
-                        self.posterior_sampler.max_attempts,
+                    failed=torch.zeros(
+                        self.owners.n_replica,
+                        dtype=torch.bool,
+                        device=device,
+                    ).index_copy(
+                        0, batch.lanes, self._posterior_failed.reshape(1)
+                    ),
+                    logical_address=torch.full(
+                        (self.owners.n_replica,),
+                        torch.iinfo(torch.int64).max,
                         dtype=torch.int64,
                         device=device,
+                    ).index_copy(
+                        0, batch.lanes, self._posterior_address.reshape(1)
                     ),
-                    sampler_attempt_count=(
-                        self._posterior_attempts.reshape(1)
+                    requested_extent=torch.zeros(
+                        self.owners.n_replica,
+                        dtype=torch.int64,
+                        device=device,
+                    ).index_copy(
+                        0,
+                        batch.lanes,
+                        (self._posterior_attempts + 1).reshape(1),
+                    ),
+                    available_extent=torch.zeros(
+                        self.owners.n_replica,
+                        dtype=torch.int64,
+                        device=device,
+                    ).index_fill_(
+                        0, batch.lanes, self.posterior_sampler.max_attempts
+                    ),
+                    sampler_attempt_count=torch.zeros(
+                        self.owners.n_replica,
+                        dtype=torch.int64,
+                        device=device,
+                    ).index_copy(
+                        0, batch.lanes, self._posterior_attempts.reshape(1)
                     ),
                     phase="posterior_sample",
                     failure_code="rejection_exhausted",
@@ -3599,6 +3674,848 @@ class _BranchedSampledPokerAttempt:
         )
 
 
+@dataclass(frozen=True)
+class ReplicaBranchedPokerResult:
+    """Lane-owned results from one shared branched storage transaction."""
+
+    results: tuple[BranchedPokerResult | None, ...]
+    failures: Mapping[int, str]
+    versions: tuple[int, ...]
+
+
+class ReplicaBranchedPokerIteration:
+    """Schedule compatible fixed/KKT lanes over one generated owner set."""
+
+    def __init__(
+        self,
+        *,
+        geometry: NLHEGeometry,
+        owners: GeneratedOwners,
+        modes: Sequence[ModeSchema],
+        controllers: Sequence[BranchController],
+        inference: PokerReplicaInference,
+        optimizers: ReplicaOptimizerGroup,
+        losses: Sequence[LossConfig],
+        schedule: LearnerSchedule,
+        generators: Sequence[torch.Generator],
+        run_states: Sequence[RunState | None],
+        seed: int,
+        lambda_: float,
+        precision: str = "fp32",
+        utility: str = "raw_bb",
+        completion_samples: int = 0,
+        posterior_max_attempts: int = 256,
+        frozen_inference: PokerReplicaInference | None = None,
+        distributed: DistributedSUM | None = None,
+    ) -> None:
+        count = owners.plan.manifest.n_replica
+        self.modes = tuple(modes)
+        self.controllers = tuple(controllers)
+        self.losses = tuple(losses)
+        self.generators = tuple(generators)
+        self.run_states = tuple(run_states)
+        if any(
+            len(values) != count
+            for values in (
+                self.modes,
+                self.controllers,
+                self.losses,
+                self.generators,
+                self.run_states,
+            )
+        ):
+            raise ValueError("branched replica lane owners are not aligned")
+        validate_replica_group(self.modes)
+        if (
+            not all(mode.rollout_mode.is_branched for mode in self.modes)
+            or owners.plan.mode != self.modes[0]
+            or inference.modules.n_replica != count
+            or optimizers.modules is not inference.modules
+        ):
+            raise ValueError("branched replica physical owners are incompatible")
+        if any(
+            controller.mode is not mode.rollout_mode
+            or controller.beta_max != owners.plan.manifest.beta_max
+            for mode, controller in zip(
+                self.modes, self.controllers, strict=True
+            )
+        ):
+            raise ValueError("branched replica controllers differ from their lanes")
+        if any(
+            generator.device != owners.plan.device
+            for generator in self.generators
+        ):
+            raise ValueError("branched replica RNGs must use the selected CUDA device")
+        if any(
+            state is not None
+            and state.root_count != owners.plan.manifest.root_count
+            for state in self.run_states
+        ):
+            raise ValueError("branched replica root counts differ from admission")
+        if (
+            any(
+                mode.training_regime is TrainingRegime.BEST_RESPONSE
+                for mode in self.modes
+            )
+            and (
+                frozen_inference is None
+                or frozen_inference.modules.n_replica != count
+            )
+        ):
+            raise ValueError(
+                "branched replica best response requires frozen lane ownership"
+            )
+        if precision not in ("fp32", "fp16", "bf16"):
+            raise ValueError("branched replica precision is invalid")
+        if utility not in ("raw_bb", "stack_normalized"):
+            raise ValueError("branched replica utility is invalid")
+        if any(
+            mode.private_estimator is PrivateEstimator.RAO_BLACKWELL
+            for mode in self.modes
+        ) and completion_samples <= 0:
+            raise ValueError("branched replica RB requires completion samples")
+        self.geometry = geometry
+        self.owners = owners
+        self.inference = inference
+        self.frozen_inference = frozen_inference
+        self.optimizers = optimizers
+        self.schedule = schedule
+        self.seed = int(seed)
+        self.lambda_ = float(lambda_)
+        self.precision = precision
+        self.utility = utility
+        self.completion_samples = int(completion_samples)
+        self.posterior_max_attempts = int(posterior_max_attempts)
+        self.distributed = distributed
+        self.policy = PokerPolicyOperator()
+
+    @staticmethod
+    def _defaults(slab: MonotoneSlab, rows: int) -> dict[str, Tensor]:
+        return {
+            field.name: torch.full(
+                (slab.n_replica, rows, *field.shape),
+                field.fill,
+                dtype=field.dtype,
+                device=slab.device,
+            )
+            for field in slab.schema.fields
+        }
+
+    def _publish_root(
+        self,
+        lane: int,
+        machine: PokerStateMachine,
+        queue: SemanticFamilyFIFO,
+        *,
+        iteration: int,
+    ) -> None:
+        state_owner = self.run_states[lane]
+        roots = (
+            self.owners.plan.manifest.root_count
+            if state_owner is None
+            else state_owner.root_count
+        )
+        epoch = 0 if state_owner is None else state_owner.retry_epoch
+        logical_base = (
+            0 if state_owner is None else state_owner.attempt_logical_base
+        )
+        state = machine.initial_roots(
+            roots,
+            seed=self.seed,
+            iteration=iteration,
+            retry_epoch=epoch,
+            logical_base=logical_base,
+            lane=lane,
+            device=self.owners.plan.device,
+        )
+        values = self._defaults(queue.family, roots)
+        logical = torch.arange(
+            logical_base,
+            logical_base + roots,
+            dtype=torch.int64,
+            device=state.device,
+        )
+        values["logical_rng_key"][lane, :, 0] = logical
+        values["logical_rng_key"][lane, :, 1] = 0
+        values["true_profile"][lane] = state.combo_ids
+        if "sampled_private_state" in values:
+            values["sampled_private_state"][lane] = state.combo_ids
+        values["model_input"][lane] = machine.direct_model_input(state)
+        values["owner"][lane] = state.to_act
+        values["path_mass"][lane].fill_(1)
+        values["log_player_ancestor_sum"][lane].zero_()
+        values["log_ancestor_product"][lane].zero_()
+        values["branch_beta"][lane].fill_(1)
+        if "role_selector" in values:
+            values["role_selector"][lane] = logical.remainder(
+                self.geometry.players
+            ).to(torch.uint8)
+        counts = torch.zeros(
+            self.owners.plan.manifest.n_replica,
+            dtype=torch.int64,
+            device=state.device,
+        )
+        counts[lane] = roots
+        address = torch.full_like(counts, torch.iinfo(torch.int64).max)
+        address[lane] = logical_base
+        active = torch.arange(
+            counts.numel(), dtype=torch.int64, device=state.device
+        ).eq(lane)
+        transaction = PublicationTransaction.begin_device(
+            (
+                DeviceDestinationRequest(
+                    queue.family,
+                    counts,
+                    values,
+                    "pre",
+                    address,
+                ),
+            ),
+            phase="replica_branched_root_commit",
+            active=active,
+        )
+        transaction.fill_all()
+        torch._assert_async(
+            transaction.publish()[lane],
+            "branched replica root publication failed",
+        )
+        queue.publish_family_tail(active)
+
+    def _inference(
+        self,
+        lane: int,
+        forward: PokerForwardInput,
+    ) -> Mapping[str, Tensor]:
+        lanes = torch.tensor(
+            [lane], dtype=torch.int64, device=self.owners.plan.device
+        )
+
+        def evaluate(
+            operation: PokerReplicaInference,
+            selected: Tensor | None = None,
+        ) -> ModelEvaluation | None:
+            if selected is None:
+                selected = torch.arange(
+                    forward.owner.numel(),
+                    dtype=torch.int64,
+                    device=forward.owner.device,
+                )
+            if selected.numel() == 0:
+                return None
+            return operation(
+                forward.input_type,
+                forward.model_input.index_select(0, selected)[None],
+                forward.sampled_private_state.index_select(0, selected)[None],
+                forward.owner.index_select(0, selected)[None],
+                active_lanes=lanes,
+            )
+
+        mode = self.modes[lane]
+        if mode.training_regime is TrainingRegime.SELF_PLAY:
+            result = evaluate(self.inference)
+            assert result is not None
+            evaluation = result
+        else:
+            assert self.frozen_inference is not None
+            assert forward.role_selector is not None
+            trained = forward.owner.eq(forward.role_selector)
+            learned_row = torch.nonzero(trained, as_tuple=False).flatten()
+            frozen_row = torch.nonzero(~trained, as_tuple=False).flatten()
+            learned = evaluate(self.inference, learned_row)
+            frozen = evaluate(self.frozen_inference, frozen_row)
+            prototype = learned if learned is not None else frozen
+            assert prototype is not None
+
+            def restore(
+                learned_value: Tensor | None,
+                frozen_value: Tensor | None,
+            ) -> Tensor:
+                source = (
+                    learned_value
+                    if learned_value is not None
+                    else frozen_value
+                )
+                assert source is not None
+                output = source.new_empty(
+                    (1, forward.owner.numel(), *source.shape[2:])
+                )
+                if learned_value is not None:
+                    output[0, learned_row] = learned_value[0]
+                if frozen_value is not None:
+                    output[0, frozen_row] = frozen_value[0]
+                return output
+
+            evaluation = ModelEvaluation(
+                MappingProxyType(
+                    {
+                        name: restore(
+                            None
+                            if learned is None
+                            else learned.policy_raw[name],
+                            None
+                            if frozen is None
+                            else frozen.policy_raw[name],
+                        )
+                        for name in prototype.policy_raw
+                    }
+                ),
+                restore(
+                    None if learned is None else learned.value,
+                    None if frozen is None else frozen.value,
+                ),
+                MappingProxyType(
+                    {
+                        name: restore(
+                            None
+                            if learned is None
+                            else learned.public_heads[name],
+                            None
+                            if frozen is None
+                            else frozen.public_heads[name],
+                        )
+                        for name in prototype.public_heads
+                    }
+                ),
+            )
+        if set(evaluation.public_heads) != {"trace", "cost"}:
+            raise BranchedPokerError("branched replica model omitted T/C heads")
+        return MappingProxyType(
+            {
+                **{
+                    name: value.squeeze(0).detach().float()
+                    for name, value in evaluation.policy_raw.items()
+                },
+                "value": evaluation.value.squeeze(0).detach().float(),
+                "trace": evaluation.public_heads["trace"]
+                .squeeze(0)
+                .detach()
+                .float(),
+                "cost": evaluation.public_heads["cost"]
+                .squeeze(0)
+                .detach()
+                .float(),
+            }
+        )
+
+    def _target_algebra(self) -> TargetAlgebra:
+        if self.modes[0].private_estimator is PrivateEstimator.SAMPLED:
+            return TargetAlgebra(self.owners.plan.partitions, ())
+        from pbg.queued.targets import ConversionMap
+
+        cards = PokerStateMachine(self.geometry).combo_cards(
+            torch.arange(self.geometry.private_hands, dtype=torch.int32)
+        )
+        ranks = self.geometry.rank_count
+        rank = cards.long() // 4 - (13 - ranks)
+        high, low = rank.max(1).values, rank.min(1).values
+        hp, lp = ranks - 1 - high, ranks - 1 - low
+        suited_or_pair = rank[:, 0].eq(rank[:, 1]) | cards[
+            :, 0
+        ].remainder(4).eq(cards[:, 1].remainder(4))
+        classes = torch.where(
+            suited_or_pair, hp * ranks + lp, lp * ranks + hp
+        )
+        return TargetAlgebra(
+            self.owners.plan.partitions,
+            (
+                ConversionMap(
+                    "post",
+                    "pre",
+                    tuple(int(value) for value in classes.tolist()),
+                ),
+            ),
+        )
+
+    def run(self, *, iteration: int) -> ReplicaBranchedPokerResult:
+        owners = self.owners
+        count = owners.plan.manifest.n_replica
+        owners.enter_phase(ExecutionPhase.ROLLOUT)
+        registry = RolloutOwnerRegistry.from_generated(owners)
+        input_names = tuple(
+            partition.name for partition in owners.plan.partitions.inputs
+        )
+        queues = {
+            name: SemanticFamilyFIFO(
+                name,
+                owners.plan.partitions,
+                owners.slab("FamilyWork", name),
+                owners.slab("QueueMetadata", name),
+            )
+            for name in input_names
+        }
+        for queue in queues.values():
+            queue.initialize()
+        machine = PokerStateMachine(self.geometry)
+        topologies: list[Topology] = []
+        bindings: list[TopologyBindings] = []
+        leaf_counts: list[int] = []
+        sampled_nodes: list[int] = []
+        counterfactual_sizes: list[float] = []
+        last_events: list[torch.cuda.Event] = []
+        failures: dict[int, str] = {}
+        input_to_output = tuple(
+            tuple(
+                output.name for output in owners.plan.partitions.outputs
+            ).index(owners.plan.partitions.output_for(name).name)
+            for name in input_names
+        )
+        lane_schemas = self.modes
+        for lane in range(count):
+            try:
+                self._publish_root(
+                    lane, machine, queues["pre"], iteration=iteration
+                )
+                mode = self.modes[lane]
+                publisher = AsyncTopologyPublisher(
+                    registry,
+                    p_train=(
+                        self.geometry.players
+                        if mode.training_regime is TrainingRegime.SELF_PLAY
+                        else 1
+                    ),
+                )
+                transaction = RolloutTransaction(
+                    lane_schemas,
+                    seed=self.seed,
+                    iteration=iteration,
+                    topology=publisher,
+                    owners=registry,
+                )
+                recorder = BranchedTopologyRecorder(
+                    input_names=input_names,
+                    input_to_output=input_to_output,
+                    p_train=(
+                        self.geometry.players
+                        if mode.training_regime is TrainingRegime.SELF_PLAY
+                        else 1
+                    ),
+                    topology_cap=owners.plan.manifest.topology_cap,
+                    topology_edge_cap=owners.plan.manifest.topology_edge_cap,
+                    topology_packet_cap=(
+                        owners.plan.manifest.topology_packet_cap
+                    ),
+                    device=owners.plan.device,
+                )
+                posterior = (
+                    None
+                    if mode.private_estimator is PrivateEstimator.SAMPLED
+                    else CollisionConditionedProfileSampler(
+                        self.geometry,
+                        max_attempts=self.posterior_max_attempts,
+                    )
+                )
+                hooks = BranchedSampledPokerHooks(
+                    self.geometry,
+                    registry,
+                    queues,
+                    seed=self.seed,
+                    iteration=iteration,
+                    mode=mode,
+                    controller=self.controllers[lane],
+                    cost_safeguard=None,
+                    child_model=lambda forward, _lanes, selected=lane: (
+                        self._inference(selected, forward)
+                    ),
+                    topology_recorder=recorder,
+                    policy=self.policy,
+                    posterior_sampler=posterior,
+                )
+                roots = (
+                    owners.plan.manifest.root_count
+                    if self.run_states[lane] is None
+                    else self.run_states[lane].root_count
+                )
+                depths = {name: 0 for name in input_names}
+                depths["pre"] = roots
+                hooks.realized_tree_size.fill_(roots)
+                topology_rows_per_root = sum(
+                    owners.plan.manifest.beta_max**generation
+                    for generation in range(1, 5)
+                )
+                if (
+                    topology_rows_per_root
+                    > owners.plan.manifest.topology_packet_cap
+                ):
+                    raise ValueError(
+                        "topology packet cannot cover one maximal branched root"
+                    )
+                scheduler = FamilyScheduler(
+                    input_names,
+                    min(
+                        owners.plan.manifest.family_pack_cap,
+                        owners.plan.manifest.topology_packet_cap
+                        // topology_rows_per_root,
+                    ),
+                )
+                logical_time = 0
+                while any(depths.values()):
+                    states = tuple(
+                        FamilyQueueState(
+                            lane,
+                            name,
+                            index,
+                            0,
+                            depths[name],
+                            logical_time,
+                            0,
+                            mode,
+                        )
+                        for index, name in enumerate(input_names)
+                    )
+                    scheduled = scheduler.select(states, allow_partial=True)
+                    if scheduled is None:
+                        raise BranchedPokerError(
+                            "branched replica scheduler lost work"
+                        )
+                    commit = transaction.execute(
+                        queues[scheduled.input_type],
+                        scheduled,
+                        lambda forward, _lanes, selected=lane: self._inference(
+                            selected, forward
+                        ),
+                        hooks,
+                    )
+                    publication = hooks.last_topology
+                    hooks.last_topology = None
+                    if publication is None:
+                        raise BranchedPokerError(
+                            "branched replica commit omitted topology"
+                        )
+                    failed, feedback = publisher.wait_branched_feedback(
+                        publication
+                    )
+                    if failed or not isinstance(
+                        feedback, _StagedBranchedPayload
+                    ):
+                        raise BranchedPokerError(
+                            "branched replica commit failed"
+                        )
+                    recorder.accept_payload(feedback)
+                    depths[scheduled.input_type] -= scheduled.rows
+                    for name, produced in zip(
+                        input_names, feedback.produced, strict=True
+                    ):
+                        depths[name] += int(produced)
+                    last_events.append(commit.event)
+                    logical_time += 1
+                recorder.materialize_cpu()
+                topology, binding, leaves = recorder.seal()
+                sampled = recorder.sampled_tree_size()
+                sampled_nodes.append(sampled)
+                counterfactual_sizes.append(
+                    (
+                        float(sampled)
+                        + recorder.counterfactual_correction(
+                            recorder.record_count
+                        )
+                    )
+                    / roots
+                )
+                recorder.release()
+                publisher.assert_drained()
+                topologies.append(topology)
+                bindings.append(binding)
+                leaf_counts.append(leaves)
+            except Exception as exc:
+                failures[lane] = f"{type(exc).__name__}: {exc}"
+                raise
+        plan = build_layer_plan(
+            self.modes[0],
+            owners.plan.partitions,
+            tuple(topologies),
+            tuple(bindings),
+            p_train=(
+                self.geometry.players
+                if self.modes[0].training_regime
+                is TrainingRegime.SELF_PLAY
+                else 1
+            ),
+            manifest=owners.plan.manifest,
+        )
+        owners.release_after(ExecutionPhase.ROLLOUT)
+        del registry, queues
+        owners.enter_phase(ExecutionPhase.QUEUE_DRAIN)
+        owners.release_after(ExecutionPhase.QUEUE_DRAIN)
+
+        owners.enter_phase(ExecutionPhase.COMPLETION)
+        completion = CompletionFIFO(
+            owners.slab("Leaf"),
+            RolloutOwnerRegistry.from_generated(owners),
+            head=torch.zeros(
+                count, dtype=torch.int64, device=owners.plan.device
+            ),
+            observed_epoch=torch.zeros(
+                count, dtype=torch.int64, device=owners.plan.device
+            ),
+        )
+        algebra = self._target_algebra()
+        completion_binding = (
+            SampledShowdownBinding(
+                self.geometry,
+                owners.slab("LayerWork", "all"),
+                n_replica=count,
+                pack_cap=owners.plan.manifest.completion_pack_cap,
+                utility=self.utility,
+            )
+            if self.modes[0].private_estimator
+            is PrivateEstimator.SAMPLED
+            else RBCompletionBinding(
+                self.geometry,
+                {
+                    name: owners.slab("LayerWork", name)
+                    for name in ("pre", "post")
+                },
+                algebra,
+                mode=self.modes[0],
+                n_replica=count,
+                pack_cap=owners.plan.manifest.completion_pack_cap,
+                n_samples=self.completion_samples,
+                utility=self.utility,
+            )
+        )
+        remaining = list(leaf_counts)
+        while any(remaining):
+            active = tuple(
+                lane for lane, value in enumerate(remaining) if value
+            )
+            rows = min(
+                owners.plan.manifest.completion_pack_cap,
+                *(remaining[lane] for lane in active),
+            )
+            success = completion.complete(
+                active,
+                rows,
+                completion_binding.leaf_to_layer_work,
+                wait_for=last_events[-1],
+            )
+            lane_index = torch.tensor(
+                active,
+                dtype=torch.int64,
+                device=owners.plan.device,
+            )
+            torch._assert_async(
+                success.index_select(0, lane_index).all(),
+                "branched replica completion failed",
+            )
+            for lane in active:
+                remaining[lane] -= rows
+        completion.release()
+        del completion_binding
+        for output, name in enumerate(plan.output_names):
+            work = owners.slab("LayerWork", name)
+            for lane in range(count):
+                missing = plan.arena_rows[lane][output] - work.tail(lane)
+                if missing < 0:
+                    raise BranchedPokerError(
+                        "branched replica completion exceeded its arena"
+                    )
+                if missing:
+                    values = self._defaults(work, missing)
+                    counts = torch.zeros(
+                        count,
+                        dtype=torch.int64,
+                        device=owners.plan.device,
+                    )
+                    counts[lane] = missing
+                    address = torch.full_like(
+                        counts, torch.iinfo(torch.int64).max
+                    )
+                    address[lane] = leaf_counts[lane]
+                    active = torch.arange(
+                        count, device=owners.plan.device
+                    ).eq(lane)
+                    padding = PublicationTransaction.begin_device(
+                        (
+                            DeviceDestinationRequest(
+                                work, counts, values, name, address
+                            ),
+                        ),
+                        phase="branched_replica_target_padding",
+                        active=active,
+                    )
+                    padding.fill_all()
+                    torch._assert_async(
+                        padding.publish()[lane],
+                        "branched replica target padding failed",
+                    )
+        owners.release_after(ExecutionPhase.COMPLETION)
+
+        owners.enter_phase(ExecutionPhase.ALIGN_AND_SEAL)
+        sealed: dict[tuple[int, str], SealedBranchedInputs] = {}
+        for lane, (topology, binding) in enumerate(
+            zip(topologies, bindings, strict=True)
+        ):
+            log_mass = decision_log_path_mass(
+                topology.parent,
+                topology.executed_degree,
+                device=owners.plan.device,
+            )
+            for input_index, name in enumerate(input_names):
+                selected = (
+                    (
+                        binding.input_type.eq(input_index)
+                        & topology.owner.ge(0)
+                    )
+                    .nonzero()
+                    .flatten()
+                )
+                sealed[(lane, name)] = SealedBranchedInputs.seal(
+                    owners.slab("FamilyWork", name),
+                    owners.slab("LearnerIndex", name),
+                    input_type=name,
+                    family_row=topology.familywork_row[selected].to(
+                        owners.plan.device
+                    ),
+                    action_begin=topology.action_begin[selected].to(
+                        owners.plan.device
+                    ),
+                    action_count=topology.target_degree[selected].to(
+                        owners.plan.device
+                    ),
+                    target_degree=topology.target_degree[selected].to(
+                        owners.plan.device
+                    ),
+                    log_sampling_weight=log_mass.index_select(
+                        0,
+                        selected.to(
+                            device=owners.plan.device,
+                            dtype=torch.int64,
+                        ),
+                    ),
+                    lane=lane,
+                )
+        owners.release_after(ExecutionPhase.ALIGN_AND_SEAL)
+        owners.enter_phase(ExecutionPhase.TARGETS)
+        target_result = LayeredTargetExecutor(
+            self.modes[0], algebra, lambda_=self.lambda_
+        ).execute(owners, plan)
+        if target_result.failed_lanes:
+            raise BranchedPokerError("branched replica targets failed")
+        owners.release_after(ExecutionPhase.TARGETS)
+
+        owners.enter_phase(ExecutionPhase.LEARNER)
+        learner_results: list[object | None] = []
+        for lane in range(count):
+            try:
+                stores = {
+                    name: RaggedBranchedStore(
+                        owners,
+                        name,
+                        sealed_inputs=sealed[(lane, name)],
+                        lane=lane,
+                    )
+                    for name in input_names
+                    if sealed[(lane, name)].rows
+                }
+                sampler = BranchedBatchSampler(
+                    stores,
+                    self.schedule,
+                    generator=self.generators[lane],
+                    sigma_pack_cap=(
+                        owners.plan.manifest.learner_sigma_pack_cap
+                    ),
+                    action_pack_cap=(
+                        owners.plan.manifest.learner_action_pack_cap
+                    ),
+                )
+                module = self.inference.modules.lane_module(lane)
+                model_operation = (
+                    module.learner_operation
+                    if self.modes[lane].private_estimator
+                    is PrivateEstimator.SAMPLED
+                    else module.rb_learner_operation
+                )
+                learner = LearnerOperation(
+                    self.modes[lane],
+                    self.losses[lane],
+                    model_operation,
+                    PokerLearnerPolicy(self.geometry, self.policy),
+                    precision=self.precision,
+                )
+                try:
+                    optimized = BranchedSampledIteration(
+                        model=module,
+                        learner=learner,
+                        optimizer=self.optimizers.lane_stepper(
+                            lane, distributed=self.distributed
+                        ),  # type: ignore[arg-type]
+                        sigma_pack_cap=(
+                            owners.plan.manifest.learner_sigma_pack_cap
+                        ),
+                        action_pack_cap=(
+                            owners.plan.manifest.learner_action_pack_cap
+                        ),
+                        run_state=self.run_states[lane],
+                    ).optimize(sampler, iteration=iteration)
+                finally:
+                    sampler.release()
+                learner_results.append(optimized)
+            except (BranchedPokerError, RuntimeError, ValueError) as exc:
+                failures[lane] = f"{type(exc).__name__}: {exc}"
+                learner_results.append(None)
+                self.optimizers.gradients[lane].zero_()
+        for value in sealed.values():
+            value.release()
+        owners.release_after(ExecutionPhase.LEARNER)
+        for lane, optimized in enumerate(learner_results):
+            if optimized is None:
+                continue
+            self.controllers[lane].observe(
+                counterfactual_sizes[lane],
+                iteration=iteration,
+            )
+            state = self.run_states[lane]
+            if state is not None:
+                state.branch_controller_state = self.controllers[
+                    lane
+                ].state_dict()
+        owners.enter_phase(ExecutionPhase.FINAL_BACKWARD)
+        owners.release_after(ExecutionPhase.FINAL_BACKWARD)
+        owners.close()
+        results: list[BranchedPokerResult | None] = []
+        for lane, topology in enumerate(topologies):
+            optimized = learner_results[lane]
+            if optimized is None:
+                results.append(None)
+                continue
+            duplicate_labels = 0
+            for node in range(topology.node_count):
+                begin = int(topology.child_begin[node])
+                degree = int(topology.executed_degree[node])
+                labels = topology.label[begin : begin + degree]
+                duplicate_labels += degree - int(labels.unique().numel())
+            results.append(
+                BranchedPokerResult(
+                    optimized,
+                    player_nodes=int(topology.owner.ge(0).sum()),
+                    leaves=leaf_counts[lane],
+                    target_layers=plan.layer_count,
+                    executed_edges=topology.edge_count,
+                    root_executed_degree=tuple(
+                        int(value)
+                        for value in topology.executed_degree[
+                            topology.parent.eq(-1)
+                        ].tolist()
+                    ),
+                    root_target_degree=tuple(
+                        int(value)
+                        for value in topology.target_degree[
+                            topology.parent.eq(-1)
+                        ].tolist()
+                    ),
+                    duplicate_child_labels=duplicate_labels,
+                    sampled_tree_nodes=sampled_nodes[lane],
+                )
+            )
+        return ReplicaBranchedPokerResult(
+            tuple(results),
+            MappingProxyType(failures),
+            tuple(
+                int(value) for value in self.optimizers.versions.tolist()
+            ),
+        )
+
+
 def _discard_attempt(owners: GeneratedOwners) -> None:
     if owners.failure_state.snapshot(0) is not None:
         owners.abort_failed_lane(0)
@@ -3725,14 +4642,16 @@ BranchedPokerIteration = BranchedSampledPokerIteration
 
 __all__ = [
     "BranchedBenchmarkTelemetry",
+    "BranchedPokerError",
     "BranchedPokerHooks",
     "BranchedPokerIteration",
-    "BranchedPokerError",
-    "BranchedPosteriorExhaustion",
     "BranchedPokerResult",
+    "BranchedPosteriorExhaustion",
     "BranchedSampledPokerHooks",
     "BranchedSampledPokerIteration",
     "BranchedTopologyRecorder",
+    "ReplicaBranchedPokerIteration",
+    "ReplicaBranchedPokerResult",
     "action_conditioned_log_reach",
     "branched_rb_chance_frontier_row_bytes",
     "sampled_branched_chance_frontier_row_bytes",

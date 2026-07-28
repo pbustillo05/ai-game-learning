@@ -2,26 +2,34 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
 import math
-from typing import Any, Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
+from typing import Any
 
 import torch
 from torch import Tensor, nn
 
 from pbg.games.poker.cards import DeckGeometry
-from pbg.games.poker.model.heads import PublicBranchingHeads, RaiseMixtureHead, TypeHead, ValueHead
+from pbg.games.poker.model.heads import (
+    PublicBranchingHeads,
+    RaiseMixtureHead,
+    TypeHead,
+    ValueHead,
+)
 from pbg.games.poker.model.incidence import IncidenceResidual
-from pbg.games.poker.model.primitives import FFN, LN, MHA
+from pbg.games.poker.model.primitives import (
+    FFN,
+    LN,
+    MHA,
+    accelerator_assert,
+)
 
 
 def _require_device(condition: Tensor, message: str) -> None:
     """Validate a scalar condition without synchronizing CUDA to the host."""
 
-    if condition.device.type == "cuda":
-        torch._assert_async(condition, message)
-    elif not bool(condition):
-        raise ValueError(message)
+    accelerator_assert(condition, message)
 
 
 @dataclass(frozen=True)
@@ -323,12 +331,15 @@ class PreflopNet(nn.Module):
             value = getattr(pub, name)
             if value is not None and value.shape != shape:
                 raise ValueError(f"pub.{name} must have shape {shape}")
-        if pub.legal_action_mask is not None:
-            if pub.legal_action_mask.ndim != 2 or pub.legal_action_mask.shape[0] != batch:
-                raise ValueError("pub.legal_action_mask must have shape [B,E]")
-        if pub.raise_ticks is not None:
-            if pub.raise_ticks.ndim != 2 or pub.raise_ticks.shape[0] != batch:
-                raise ValueError("pub.raise_ticks must have shape [B,N]")
+        if pub.legal_action_mask is not None and (
+            pub.legal_action_mask.ndim != 2
+            or pub.legal_action_mask.shape[0] != batch
+        ):
+            raise ValueError("pub.legal_action_mask must have shape [B,E]")
+        if pub.raise_ticks is not None and (
+            pub.raise_ticks.ndim != 2 or pub.raise_ticks.shape[0] != batch
+        ):
+            raise ValueError("pub.raise_ticks must have shape [B,N]")
         if pub.history is not None:
             history_shape = pub.history.mask.shape
             for name in pub.history.__dataclass_fields__:
@@ -557,8 +568,6 @@ class PreflopNet(nn.Module):
         actor, seat_mask, class_mask, status, class_ids, relative_seats = prepared
         c = self.cfg
         d = c.d_model
-        dc = c.class_embedding_dim
-
         supplied_embedding = _mask_value(masks, "class_embeddings")
         if supplied_embedding is None:
             class_emb = self.class_embedding(class_ids)
@@ -694,7 +703,6 @@ class PreflopNet(nn.Module):
         seat_summary = seat_summary.masked_fill(~seat_mask[..., None], 0.0)
         relative_index = relative_seats[..., None].expand(-1, -1, d)
         ordered_seats = torch.zeros_like(seat_summary).scatter(1, relative_index, seat_summary)
-        ordered_mask = torch.zeros_like(seat_mask).scatter(1, relative_seats, seat_mask)
         padded_seats = torch.cat(
             (
                 ordered_seats,

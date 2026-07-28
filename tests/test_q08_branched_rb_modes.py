@@ -57,10 +57,17 @@ def _config(regime: str, rollout: str) -> dict[str, object]:
     return result
 
 
-def _plan(device: torch.device, mode, geometry: NLHEGeometry):
+def _plan(
+    device: torch.device,
+    mode,
+    geometry: NLHEGeometry,
+    *,
+    n_replica: int = 1,
+):
     partitions = rb_partitions(geometry)
     manifest = replace(
         _manifest(device, geometry),
+        n_replica=n_replica,
         action_cap=(
             PartitionRows("pre", 2048),
             PartitionRows("post", 2048),

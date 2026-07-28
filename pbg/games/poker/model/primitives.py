@@ -10,8 +10,18 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-
 _FLEX_CACHE: dict[int, object] = {}
+
+
+def accelerator_assert(condition: Tensor, message: str) -> None:
+    """Issue an asynchronous check unless an enclosing transform owns it."""
+
+    if torch._C._functorch.is_batchedtensor(condition):
+        return
+    if condition.device.type == "cuda":
+        torch._assert_async(condition, message)
+    elif not bool(condition):
+        raise ValueError(message)
 
 
 def _compiled_flex(d_head: int):

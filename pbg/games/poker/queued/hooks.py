@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 
 from pbg.games.poker.model.capacity import max_public_history_tokens
+from pbg.games.poker.model.primitives import accelerator_assert
 from pbg.games.poker.queued.policy import (
     CHECK_CALL,
     FOLD,
@@ -265,23 +266,24 @@ class PokerState:
                 raise QueuedPokerError(
                     f"{name} must be CUDA {dtype} with shape {shape}"
                 )
-        torch._assert_async(
+        accelerator_assert(
             ((self.button >= 0) & (self.button < players)).all(),
             "button is outside the table",
         )
-        torch._assert_async(
+        accelerator_assert(
             ((self.street >= 0) & (self.street <= 3)).all(),
             "street is outside NLHE",
         )
-        torch._assert_async((self.stacks >= 0).all(), "poker stacks cannot be negative")
+        accelerator_assert(
+            (self.stacks >= 0).all(), "poker stacks cannot be negative"
+        )
         total = self.stacks + self.committed
-        torch._assert_async(
-            torch.isclose(
-                total.sum(-1),
-                torch.full_like(total.sum(-1), geometry.players * geometry.stack_bb),
-                atol=1.0e-5,
-                rtol=0.0,
-            ).all(),
+        accelerator_assert(
+            total.sum(-1)
+            .sub(geometry.players * geometry.stack_bb)
+            .abs()
+            .le(1.0e-5)
+            .all(),
             "public chip accounting is not conserved",
         )
 
@@ -415,14 +417,11 @@ class PokerStateMachine:
             dtype=torch.int32,
             device=state.device,
         )[None, :].expand(rows, -1)
-        mask = torch.zeros_like(events, dtype=torch.bool)
         row = torch.arange(rows, device=state.device)
         actor = state.to_act.to(torch.int64)
         actor_stack = state.stacks[row, actor]
         actor_street = state.committed_street[row, actor]
         call = (state.current_bet - actor_street).clamp_min(0.0)
-        mask[:, FOLD] = call > 0
-        mask[:, CHECK_CALL].fill_(True)
         target = (
             torch.arange(
                 1,
@@ -442,10 +441,17 @@ class PokerStateMachine:
         )
         multiple_actors = state.status.eq(LIVE).sum(-1).gt(1)
         can_raise = state.can_raise.gather(1, actor[:, None]).squeeze(1)
-        mask[:, RAISE_OFFSET:] = (
+        raises = (
             (full_raise | short_all_in) & multiple_actors[:, None] & can_raise[:, None]
         )
-        mask &= ~state.terminal[:, None]
+        mask = torch.cat(
+            (
+                call.gt(0)[:, None],
+                torch.ones_like(call, dtype=torch.bool)[:, None],
+                raises,
+            ),
+            1,
+        ) & ~state.terminal[:, None]
         return PokerLegality(events.contiguous(), mask.contiguous())
 
     def empty_history(self, rows: int, device: torch.device) -> PokerHistory:
@@ -567,7 +573,7 @@ class PokerStateMachine:
         values: Mapping[str, Tensor],
     ) -> PokerHistory:
         length = history.mask.sum(1, dtype=torch.int64)
-        torch._assert_async(
+        accelerator_assert(
             (~active | length.lt(history.mask.shape[1])).all(),
             "poker public history capacity exceeded",
         )
@@ -740,7 +746,7 @@ class PokerStateMachine:
         if action.shape != (state.rows,):
             raise QueuedPokerError("player action must have shape [B]")
         matches = legality.event_ids.eq(action[:, None].to(legality.event_ids))
-        torch._assert_async(
+        accelerator_assert(
             (matches & legality.mask).sum(-1).eq(1).all(),
             "player transition received an illegal action",
         )
@@ -998,7 +1004,7 @@ class PokerStateMachine:
         )
 
     def sampled_leaf(self, state: PokerState) -> Mapping[str, Tensor]:
-        torch._assert_async(
+        accelerator_assert(
             state.terminal.all(),
             "sampled leaves require terminal poker states",
         )
@@ -1442,7 +1448,7 @@ class SequentialPokerHooks:
         # Reverse assignment leaves the smallest exact-hand row in each class.
         for combo in range(self.geometry.private_hands - 1, -1, -1):
             representatives[classes[combo]] = combo
-        torch._assert_async(
+        accelerator_assert(
             representatives.ge(0).all(), "preflop class map is incomplete"
         )
         return value.index_select(1, representatives).float()

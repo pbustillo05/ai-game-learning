@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from pbg.games.poker.model.primitives import FFN
+from pbg.games.poker.model.primitives import FFN, accelerator_assert
 
 
 class TypeHead(nn.Module):
@@ -73,10 +71,7 @@ def dlogistic_tick(
         raise TypeError("mu and s must be floating point")
     if validate:
         positive = (s > 0).all()
-        if s.device.type == "cuda":
-            torch._assert_async(positive, "logistic scales must be positive")
-        elif not bool(positive):
-            raise ValueError("logistic scales must be positive")
+        accelerator_assert(positive, "logistic scales must be positive")
     # fp32 accumulation is important for wide mixtures under fp16 autocast.
     work_dtype = torch.float64 if mu.dtype == torch.float64 or s.dtype == torch.float64 else torch.float32
     location = mu.to(work_dtype)[..., None]

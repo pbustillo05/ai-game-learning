@@ -1071,21 +1071,31 @@ class SealedBranchedInputs:
             "branched seal metadata is invalid",
         )
         selected = family_row.to(torch.int64)
-        values = {
-            "model_input": family.columns["model_input"][lane, selected][None],
-            "owner": family.columns["owner"][lane, selected][None],
-            "target_degree": target_degree.to(torch.int32)[None],
-            "action_begin": action_begin.to(torch.int32)[None],
-            "action_count": action_count.to(torch.int32)[None],
-            "log_sampling_weight": log_sampling_weight.float()[None],
+        lane_values = {
+            "model_input": family.columns["model_input"][lane, selected],
+            "owner": family.columns["owner"][lane, selected],
+            "target_degree": target_degree.to(torch.int32),
+            "action_begin": action_begin.to(torch.int32),
+            "action_count": action_count.to(torch.int32),
+            "log_sampling_weight": log_sampling_weight.float(),
         }
         if "sampled_private_state" in destination.columns:
             if "sampled_private_state" not in family.columns:
                 raise LearnerError("sampled branched seal omitted private state")
-            values["sampled_private_state"] = family.columns["sampled_private_state"][
-                lane, selected
-            ][None]
-        values = {field.name: values[field.name] for field in destination.schema.fields}
+            lane_values["sampled_private_state"] = family.columns[
+                "sampled_private_state"
+            ][lane, selected]
+        values = {
+            field.name: torch.full(
+                (destination.n_replica, rows, *field.shape),
+                field.fill,
+                dtype=field.dtype,
+                device=device,
+            )
+            for field in destination.schema.fields
+        }
+        for name, value in lane_values.items():
+            values[name][lane].copy_(value)
         counts = torch.zeros(family.n_replica, dtype=torch.int64, device=device)
         counts[lane] = rows
         logical = torch.full_like(counts, torch.iinfo(torch.int64).max)

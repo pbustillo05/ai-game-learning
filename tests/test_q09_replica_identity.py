@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import math
 import runpy
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -15,7 +17,9 @@ from pbg.games.poker.queued import (
     PokerForwardInput,
     PokerReplicaInference,
     QueuedPokerModel,
+    ReplicaBranchedPokerIteration,
     ReplicaPokerIterationResult,
+    build_model_from_config,
     sampled_partitions,
 )
 from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
@@ -24,10 +28,12 @@ from pbg.queued import (
     CapacityManifest,
     DistributedSUM,
     ExternalWorkspaceBounds,
+    FixedBranchController,
     FunctionalReplicaInference,
     GameGeometry,
     GeneratedOwners,
     HardwareLimits,
+    KKTBranchController,
     LearnerDTypes,
     LearnerOperation,
     LearnerSchedule,
@@ -55,6 +61,16 @@ from pbg.queued import (
 )
 from pbg.queued.optimization import DenseAdam
 from pbg.queued.persistence import convert_legacy_lane_artifacts
+from tests.test_q07_branched_sampled_modes import (
+    _manifest as _branched_manifest,
+)
+from tests.test_q07_branched_sampled_modes import _phase7_layout
+from tests.test_q08_branched_rb_modes import (
+    _config as _branched_rb_config,
+)
+from tests.test_q08_branched_rb_modes import (
+    _plan as _branched_rb_plan,
+)
 
 CUDA = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="queued replica execution is CUDA-only"
@@ -155,6 +171,38 @@ class _CheckDownPartition(torch.nn.Module):
             ),
             self.value_bias[None] + base,
         )
+
+
+class _BranchedCheckDownPartition(_CheckDownPartition):
+    def forward(self, value: torch.Tensor) -> ModelEvaluation:
+        ordinary = super().forward(value)
+        rows = value.shape[0]
+        return ModelEvaluation(
+            ordinary.policy_raw,
+            ordinary.value,
+            MappingProxyType(
+                {
+                    "trace": torch.sigmoid(self.value_bias.mean()).expand(rows),
+                    "cost": self.value_bias.mean().exp().expand(rows),
+                }
+            ),
+        )
+
+
+def _branched_check_down_model(geometry: NLHEGeometry) -> QueuedPokerModel:
+    return QueuedPokerModel(
+        geometry,
+        _BranchedCheckDownPartition(
+            geometry.direct_model_input_width,
+            geometry.rank_count**2,
+        ),
+        _BranchedCheckDownPartition(
+            geometry.direct_model_input_width,
+            geometry.private_hands,
+        ),
+    ).cuda()
+
+
 class _LearnerToy(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -562,6 +610,268 @@ def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
             atol=3.0e-7,
             rtol=0,
         )
+
+
+@CUDA
+@pytest.mark.parametrize("count", (2, 4, 8))
+def test_complete_sequential_transactions_isolate_every_replica_lane(
+    count: int,
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = mode_schema("self_play", "sequential", "sampled")
+    source = tuple(_check_down_model(geometry) for _ in range(count))
+    with torch.no_grad():
+        for lane, model in enumerate(source):
+            model.preflop.value_bias.add_(lane * 0.01)
+    inference = PokerReplicaInference(source)
+    optimizers = ReplicaOptimizerGroup(
+        inference.modules,
+        OptimizerConfig(name="adamw", grad_clip=5.0),
+    )
+    modules = tuple(
+        inference.modules.lane_module(lane) for lane in range(count)
+    )
+    generators = tuple(
+        torch.Generator(device=device).manual_seed(730 + lane)
+        for lane in range(count)
+    )
+    initial_rng = tuple(generator.get_state() for generator in generators)
+    run_states = tuple(
+        RunState(f"complete-isolation-{count}-{lane}", root_count=1)
+        for lane in range(count)
+    )
+    result = SequentialSampledPokerIteration(
+        geometry=geometry,
+        owners=GeneratedOwners(
+            build_storage_plan(
+                mode,
+                sampled_partitions(geometry.players),
+                _poker_manifest(device, n_replica=count),
+                _poker_layout(geometry),
+                device,
+            )
+        ),
+        mode=mode,
+        model=modules[0],
+        model_operation=modules[0].learner_operation,
+        optimizer=optimizers.optimizers[0],
+        loss=LossConfig(reference_kl_coefficient=0),
+        schedule=LearnerSchedule(batch_size=1),
+        generator=generators[0],
+        seed=730,
+        lambda_=0.95,
+        replica_inference=inference,
+        replica_optimizers=optimizers,
+        replica_generators=generators,
+        replica_run_states=run_states,
+        replica_model_operations=tuple(
+            module.learner_operation for module in modules
+        ),
+    ).run(iteration=0)
+    assert isinstance(result, ReplicaPokerIterationResult)
+    assert result.failures == {}
+    assert result.versions == (8,) * count
+    assert all(value is not None for value in result.results)
+    assert tuple(state.iteration for state in run_states) == (1,) * count
+    final_rng = tuple(generator.get_state() for generator in generators)
+    assert all(
+        not torch.equal(before, after)
+        for before, after in zip(initial_rng, final_rng, strict=True)
+    )
+    assert len({bytes(value.cpu().tolist()) for value in final_rng}) == count
+    assert all(
+        optimizers.gradients[lane].data_ptr()
+        != optimizers.gradients[other].data_ptr()
+        for lane in range(count)
+        for other in range(lane)
+    )
+    inference.modules.assert_zero_copy()
+
+
+@CUDA
+@pytest.mark.parametrize("regime", ("self_play", "best_response"))
+@pytest.mark.parametrize("estimator", ("sampled", "rao_blackwell"))
+def test_shared_owner_branched_poker_preserves_fixed_kkt_lane_identity(
+    regime: str,
+    estimator: str,
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    fixed = mode_schema(regime, "branched.fixed", estimator)
+    kkt = mode_schema(regime, "branched.KKT", estimator)
+
+    def models(selected_regime: str) -> tuple[torch.nn.Module, ...]:
+        if estimator == "rao_blackwell":
+            return (
+                build_model_from_config(
+                    _branched_rb_config(selected_regime, "branched.fixed"),
+                    device,
+                ),
+                build_model_from_config(
+                    _branched_rb_config(selected_regime, "branched.KKT"),
+                    device,
+                ),
+            )
+        return (
+            _branched_check_down_model(geometry),
+            _branched_check_down_model(geometry),
+        )
+
+    inference = PokerReplicaInference(models(regime))
+    frozen = (
+        PokerReplicaInference(models("self_play"))
+        if regime == "best_response"
+        else None
+    )
+    plan = (
+        build_storage_plan(
+            fixed,
+            sampled_partitions(geometry.players),
+            replace(_branched_manifest(device), n_replica=2),
+            replace(_phase7_layout(geometry), player_count=2),
+            device,
+        )
+        if estimator == "sampled"
+        else _branched_rb_plan(
+            device,
+            fixed,
+            geometry,
+            n_replica=2,
+        )
+    )
+    optimizers = ReplicaOptimizerGroup(
+        inference.modules,
+        OptimizerConfig(name="adamw", grad_clip=5.0),
+    )
+    run_states = (
+        RunState(f"branched-fixed-{regime}-{estimator}", root_count=1),
+        RunState(f"branched-kkt-{regime}-{estimator}", root_count=1),
+    )
+    controllers = (
+        FixedBranchController(
+            {"player": 1.0, "chance": 1.0},
+            2,
+        ),
+        KKTBranchController(
+            {"player": 1.0, "chance": 1.0},
+            2,
+            warmup_iterations=0,
+            target_tree_size=256,
+            gamma_kappa=0.2,
+            eta_kappa=0.2,
+            kappa_min=1.0e-6,
+            kappa_max=1.0e-6,
+            log_kappa=math.log(1.0e-6),
+        ),
+    )
+    result = ReplicaBranchedPokerIteration(
+        geometry=geometry,
+        owners=GeneratedOwners(plan),
+        modes=(fixed, kkt),
+        controllers=controllers,
+        inference=inference,
+        frozen_inference=frozen,
+        optimizers=optimizers,
+        losses=(
+            LossConfig(
+                reference_kl_coefficient=0,
+                trace_coefficient=0.1,
+                cost_coefficient=0.1,
+            ),
+        )
+        * 2,
+        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        generators=tuple(
+            torch.Generator(device=device).manual_seed(919 + lane)
+            for lane in range(2)
+        ),
+        run_states=run_states,
+        seed=919,
+        lambda_=0.95,
+        completion_samples=4 if estimator == "rao_blackwell" else 0,
+        posterior_max_attempts=16,
+    ).run(iteration=0)
+    assert result.failures == {}
+    assert result.versions == (1, 1)
+    assert all(value is not None for value in result.results)
+    fixed_result, kkt_result = result.results
+    assert fixed_result is not None
+    assert kkt_result is not None
+    assert fixed_result.root_executed_degree == (1,)
+    assert all(value in (1, 2) for value in kkt_result.root_executed_degree)
+    assert tuple(state.branch_controller_state["mode"] for state in run_states) == (
+        "branched.fixed",
+        "branched.KKT",
+    )
+    assert "updates" not in run_states[0].branch_controller_state
+    assert run_states[1].branch_controller_state["updates"] == 1
+    inference.modules.assert_zero_copy()
+
+
+@CUDA
+def test_branched_replica_learner_failure_stays_lane_local() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = mode_schema("self_play", "branched.fixed", "sampled")
+    inference = PokerReplicaInference(
+        tuple(_branched_check_down_model(geometry) for _ in range(2))
+    )
+    optimizers = ReplicaOptimizerGroup(
+        inference.modules,
+        OptimizerConfig(name="adamw", grad_clip=5.0),
+    )
+    failed_module = inference.modules.lane_module(1)
+
+    def fail_learner(*_args, **_kwargs):
+        raise RuntimeError("injected branched lane failure")
+
+    failed_module.learner_operation = fail_learner  # type: ignore[method-assign]
+    run_states = (
+        RunState("branched-healthy-lane", root_count=1),
+        RunState("branched-failed-lane", root_count=1),
+    )
+    result = ReplicaBranchedPokerIteration(
+        geometry=geometry,
+        owners=GeneratedOwners(
+            build_storage_plan(
+                mode,
+                sampled_partitions(geometry.players),
+                replace(_branched_manifest(device), n_replica=2),
+                replace(_phase7_layout(geometry), player_count=2),
+                device,
+            )
+        ),
+        modes=(mode, mode),
+        controllers=(
+            FixedBranchController(
+                {"player": 1.0, "chance": 1.0},
+                2,
+            ),
+            FixedBranchController(
+                {"player": 1.0, "chance": 1.0},
+                2,
+            ),
+        ),
+        inference=inference,
+        optimizers=optimizers,
+        losses=(LossConfig(reference_kl_coefficient=0),) * 2,
+        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        generators=tuple(
+            torch.Generator(device=device).manual_seed(950 + lane)
+            for lane in range(2)
+        ),
+        run_states=run_states,
+        seed=950,
+        lambda_=0.95,
+    ).run(iteration=0)
+    assert set(result.failures) == {1}
+    assert "failed before optimizer transition" in result.failures[1]
+    assert result.versions == (1, 0)
+    assert result.results[0] is not None
+    assert result.results[1] is None
+    assert tuple(state.iteration for state in run_states) == (1, 0)
+    assert bool(optimizers.gradients[1].eq(0).all())
 
 
 @CUDA

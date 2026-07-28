@@ -8,11 +8,12 @@ the device-counted publication transaction owned by :mod:`pbg.queued.storage`.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-import time
 from types import MappingProxyType
-from typing import Callable, Mapping, Protocol, Sequence
+from typing import Protocol
 
 import torch
 from torch import Tensor
@@ -955,12 +956,12 @@ class RolloutOwnerRegistry:
         self._ids = frozenset(id(slab) for slab in self.slabs)
 
     @classmethod
-    def from_generated(cls, owners: object) -> "RolloutOwnerRegistry":
+    def from_generated(cls, owners: object) -> RolloutOwnerRegistry:
         """Bind to the complete live set and its immutable CapacityManifest."""
 
-        plan = getattr(owners, "plan")
+        plan = owners.plan
         manifest = plan.manifest
-        slabs = getattr(owners, "live_slabs")
+        slabs = owners.live_slabs
         return cls(
             slabs,
             family_pack_cap=manifest.family_pack_cap,
@@ -992,7 +993,7 @@ class RolloutOwnerRegistry:
         topology_cap: int,
         topology_edge_cap: int,
         chance_generation_cap: int | None = None,
-    ) -> "RolloutOwnerRegistry":
+    ) -> RolloutOwnerRegistry:
         """Create an explicitly closed synthetic owner set for contract tests."""
 
         replica = slabs[0].n_replica if slabs else 1
@@ -1328,6 +1329,10 @@ class AsyncTopologyPublisher:
         self.owners = owners
         self.p_train = int(p_train)
         self.max_inflight_batches = 2
+        self.max_inflight_deferred = max(
+            self.max_inflight_batches,
+            owners.n_replica,
+        )
         self._drafts: dict[tuple[int, int], TopologyDraftPacket] = {}
         self._packets: list[ReplicaTopologyPacket] = []
         self._pending: list[_PendingTopologyBatch] = []
@@ -1349,6 +1354,14 @@ class AsyncTopologyPublisher:
                 pin_memory=True,
             )
             for _ in range(self.max_inflight_batches)
+        )
+        self._deferred_marker_buffers = tuple(
+            torch.empty(
+                owners.n_replica,
+                dtype=torch.int64,
+                pin_memory=True,
+            )
+            for _ in range(self.max_inflight_deferred)
         )
         self._accept_stream = torch.cuda.Stream(device=owners.device)
         self._deferred_buffer = torch.empty(
@@ -1569,7 +1582,7 @@ class AsyncTopologyPublisher:
         *,
         stream: torch.cuda.Stream,
     ) -> _PendingDeferredUnary:
-        if len(self._deferred_pending) >= self.max_inflight_batches:
+        if len(self._deferred_pending) >= self.max_inflight_deferred:
             raise TopologyError("deferred topology exceeds in-flight batch cap")
         key = (publication.lane, publication.sequence)
         if self._deferred_staged.get(key) is not publication:
@@ -1638,14 +1651,14 @@ class AsyncTopologyPublisher:
         used = {item.slot for item in self._deferred_pending}
         slot = next(
             candidate
-            for candidate in range(self.max_inflight_batches)
+            for candidate in range(self.max_inflight_deferred)
             if candidate not in used
         )
         pending = _PendingDeferredUnary(
             slot,
             publication,
             slice(begin, end),
-            self._marker_buffers[slot],
+            self._deferred_marker_buffers[slot],
             torch.cuda.Event(blocking=False),
         )
         self._deferred_pending.append(pending)
@@ -3050,7 +3063,7 @@ class CompletionBatch:
 class CompletionHook(Protocol):
     def __call__(
         self, batch: CompletionBatch
-    ) -> "CompletionPlan": ...
+    ) -> CompletionPlan: ...
 
 
 @dataclass(frozen=True)
@@ -3231,6 +3244,7 @@ class CompletionFIFO:
 
 
 __all__ = [
+    "LOGICAL_RNG_VERSION",
     "AsyncTopologyPublisher",
     "BoundedChanceClosure",
     "ChanceClosureResult",
@@ -3249,8 +3263,8 @@ __all__ = [
     "FamilyBatch",
     "FamilyQueueState",
     "FamilyScheduler",
-    "LOGICAL_RNG_VERSION",
     "ModelWorkspace",
+    "ReplicaTopologyPacket",
     "RolloutCommit",
     "RolloutError",
     "RolloutHooks",
@@ -3262,7 +3276,6 @@ __all__ = [
     "SemanticFamilyFIFO",
     "TopologyDraftPacket",
     "TopologyPublication",
-    "ReplicaTopologyPacket",
     "TransitionRequest",
     "child_path_keys",
     "device_exclusive_scan",

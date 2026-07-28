@@ -715,18 +715,25 @@ def _bounded_workspace(
             mode.rollout_mode.is_branched
         )
         return (
-            family_multiplier
+            manifest.n_replica
+            * family_multiplier
             * manifest.family_pack_cap
             * layout.family_workspace_row_bytes
-            + manifest.chance_frontier_cap * layout.chance_frontier_row_bytes
-            + topology_rows * layout.topology_packet_row_bytes
+            + manifest.n_replica
+            * manifest.chance_frontier_cap
+            * layout.chance_frontier_row_bytes
+            + manifest.n_replica
+            * topology_rows
+            * layout.topology_packet_row_bytes
             + manifest.library_workspace_bytes
         )
     if phase is ExecutionPhase.QUEUE_DRAIN:
         return manifest.library_workspace_bytes
     if phase is ExecutionPhase.COMPLETION:
         return (
-            manifest.completion_pack_cap * layout.completion_workspace_row_bytes
+            manifest.n_replica
+            * manifest.completion_pack_cap
+            * layout.completion_workspace_row_bytes
             + manifest.evaluator_workspace_bytes
             + manifest.library_workspace_bytes
         )
