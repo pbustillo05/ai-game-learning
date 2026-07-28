@@ -24,12 +24,13 @@ from pbg.games.poker.queued.hooks import (
     SampledShowdownBinding,
     SequentialPokerHooks,
 )
-from pbg.games.poker.queued.policy import PokerPolicyOperator
 from pbg.games.poker.queued.observability import topology_diagnostics
+from pbg.games.poker.queued.policy import PokerPolicyOperator
 from pbg.games.poker.queued.rb_sampling import (
     CollisionConditionedProfileSampler,
 )
 from pbg.games.poker.queued.replica import PokerReplicaInference
+from pbg.games.poker.queued.training import LearnerPreflightOptimizer
 from pbg.queued.branching import (
     BranchController,
     BranchDecision,
@@ -2540,6 +2541,9 @@ class _BranchedSampledPokerAttempt:
         self.frozen_operation = frozen_operation
         self.reference_operation = reference_operation
         self.rank_boundary = rank_boundary
+        self._model_events: dict[
+            str, list[tuple[torch.cuda.Event, torch.cuda.Event, int]]
+        ] = {}
         if (
             mode.private_estimator is PrivateEstimator.RAO_BLACKWELL
             and (
@@ -2736,6 +2740,9 @@ class _BranchedSampledPokerAttempt:
     def _model(
         self, forward: PokerForwardInput, lanes: Tensor
     ) -> Mapping[str, Tensor]:
+        started = torch.cuda.Event(enable_timing=True)
+        finished = torch.cuda.Event(enable_timing=True)
+        started.record()
         autocast_dtype = {
             "fp32": torch.float32,
             "fp16": torch.float16,
@@ -2748,7 +2755,31 @@ class _BranchedSampledPokerAttempt:
             dtype=autocast_dtype,
             enabled=self.precision != "fp32",
         ):
-            return self._model_inference(forward, lanes)
+            result = self._model_inference(forward, lanes)
+        finished.record()
+        events = getattr(self, "_model_events", None)
+        if events is None:
+            events = {}
+            self._model_events = events
+        events.setdefault(forward.input_type, []).append(
+            (started, finished, int(forward.owner.numel()))
+        )
+        return result
+
+    def _model_timing(self) -> Mapping[str, object]:
+        result: dict[str, object] = {}
+        for family, values in getattr(self, "_model_events", {}).items():
+            if values:
+                values[-1][1].synchronize()
+            result[family] = {
+                "batches": len(values),
+                "rows": sum(value[2] for value in values),
+                "seconds": sum(
+                    value[0].elapsed_time(value[1]) for value in values
+                )
+                / 1000.0,
+            }
+        return MappingProxyType(result)
 
     @staticmethod
     def _model_output(evaluation: ModelEvaluation) -> Mapping[str, Tensor]:
@@ -3414,6 +3445,9 @@ class _BranchedSampledPokerAttempt:
                 iteration=iteration,
             )
             if self.run_state is not None:
+                self.run_state.logical_work["trajectories"] += (
+                    self.run_state.root_count
+                )
                 self.run_state.branch_controller_state = (
                     self.controller.state_dict()
                 )
@@ -3513,8 +3547,15 @@ class _BranchedSampledPokerAttempt:
                 duplicate_child_labels=duplicate_labels,
                 sampled_tree_nodes=sampled_tree_nodes,
                 telemetry=telemetry,
-                observability=topology_diagnostics(
-                    topology, bindings, owners.plan.partitions
+                observability=MappingProxyType(
+                    {
+                        **topology_diagnostics(
+                            topology, bindings, owners.plan.partitions
+                        ),
+                        "model_timing_by_family": dict(
+                            self._model_timing()
+                        ),
+                    }
                 ),
             )
 
@@ -3700,7 +3741,9 @@ class ReplicaBranchedPokerIteration:
         owners: GeneratedOwners,
         modes: Sequence[ModeSchema],
         controllers: Sequence[BranchController],
+        safeguards: Sequence[CostSafeguardController],
         inference: PokerReplicaInference,
+        reference_operations: Sequence[ModelOperation | None],
         optimizers: ReplicaOptimizerGroup,
         losses: Sequence[LossConfig],
         schedule: LearnerSchedule,
@@ -3712,12 +3755,16 @@ class ReplicaBranchedPokerIteration:
         utility: str = "raw_bb",
         completion_samples: int = 0,
         posterior_max_attempts: int = 256,
+        cache_reference_outputs: bool = False,
         frozen_inference: PokerReplicaInference | None = None,
         distributed: DistributedSUM | None = None,
+        rank_boundary: Callable[[], None] | None = None,
     ) -> None:
         count = owners.plan.manifest.n_replica
         self.modes = tuple(modes)
         self.controllers = tuple(controllers)
+        self.safeguards = tuple(safeguards)
+        self.reference_operations = tuple(reference_operations)
         self.losses = tuple(losses)
         self.generators = tuple(generators)
         self.run_states = tuple(run_states)
@@ -3726,6 +3773,8 @@ class ReplicaBranchedPokerIteration:
             for values in (
                 self.modes,
                 self.controllers,
+                self.safeguards,
+                self.reference_operations,
                 self.losses,
                 self.generators,
                 self.run_states,
@@ -3793,8 +3842,16 @@ class ReplicaBranchedPokerIteration:
         self.utility = utility
         self.completion_samples = int(completion_samples)
         self.posterior_max_attempts = int(posterior_max_attempts)
+        if type(cache_reference_outputs) is not bool:
+            raise TypeError("cache_reference_outputs must be bool")
+        self.cache_reference_outputs = cache_reference_outputs
         self.distributed = distributed
+        self.rank_boundary = rank_boundary
         self.policy = PokerPolicyOperator()
+        self._model_events: dict[
+            tuple[int, str],
+            list[tuple[torch.cuda.Event, torch.cuda.Event, int]],
+        ] = {}
 
     @staticmethod
     def _defaults(slab: MonotoneSlab, rows: int) -> dict[str, Tensor]:
@@ -3893,6 +3950,9 @@ class ReplicaBranchedPokerIteration:
         lane: int,
         forward: PokerForwardInput,
     ) -> Mapping[str, Tensor]:
+        started = torch.cuda.Event(enable_timing=True)
+        finished = torch.cuda.Event(enable_timing=True)
+        started.record()
         lanes = torch.tensor(
             [lane], dtype=torch.int64, device=self.owners.plan.device
         )
@@ -3986,7 +4046,7 @@ class ReplicaBranchedPokerIteration:
             )
         if set(evaluation.public_heads) != {"trace", "cost"}:
             raise BranchedPokerError("branched replica model omitted T/C heads")
-        return MappingProxyType(
+        result = MappingProxyType(
             {
                 **{
                     name: value.squeeze(0).detach().float()
@@ -4003,6 +4063,28 @@ class ReplicaBranchedPokerIteration:
                 .float(),
             }
         )
+        finished.record()
+        self._model_events.setdefault((lane, forward.input_type), []).append(
+            (started, finished, int(forward.owner.numel()))
+        )
+        return result
+
+    def _model_timing(self, lane: int) -> Mapping[str, object]:
+        result: dict[str, object] = {}
+        for (event_lane, family), values in self._model_events.items():
+            if event_lane != lane:
+                continue
+            if values:
+                values[-1][1].synchronize()
+            result[family] = {
+                "batches": len(values),
+                "rows": sum(value[2] for value in values),
+                "seconds": sum(
+                    value[0].elapsed_time(value[1]) for value in values
+                )
+                / 1000.0,
+            }
+        return MappingProxyType(result)
 
     def _target_algebra(self) -> TargetAlgebra:
         if self.modes[0].private_estimator is PrivateEstimator.SAMPLED:
@@ -4119,7 +4201,7 @@ class ReplicaBranchedPokerIteration:
                     iteration=iteration,
                     mode=mode,
                     controller=self.controllers[lane],
-                    cost_safeguard=None,
+                    cost_safeguard=self.safeguards[lane],
                     child_model=lambda forward, _lanes, selected=lane: (
                         self._inference(selected, forward)
                     ),
@@ -4226,6 +4308,8 @@ class ReplicaBranchedPokerIteration:
             except Exception as exc:
                 failures[lane] = f"{type(exc).__name__}: {exc}"
                 raise
+        if self.rank_boundary is not None:
+            self.rank_boundary()
         plan = build_layer_plan(
             self.modes[0],
             owners.plan.partitions,
@@ -4398,9 +4482,109 @@ class ReplicaBranchedPokerIteration:
         ).execute(owners, plan)
         if target_result.failed_lanes:
             raise BranchedPokerError("branched replica targets failed")
+        for lane, safeguard in enumerate(self.safeguards):
+            predicted_cost: list[Tensor] = []
+            target_cost: list[Tensor] = []
+            for name in input_names:
+                head = owners.slab("SigmaHead", name)
+                target_slab = owners.slab("SigmaTarget", name)
+                rows = head.tail(lane)
+                if rows:
+                    predicted_cost.append(
+                        head.columns["old_cost"][lane, :rows]
+                    )
+                    target_cost.append(
+                        target_slab.columns["cost_target"][lane, :rows]
+                    )
+            if predicted_cost:
+                predicted = torch.cat(predicted_cost).float().clamp_min(
+                    torch.finfo(torch.float32).tiny
+                )
+                target = torch.cat(target_cost).float()
+                ratio = target / predicted
+                deviance = ratio - ratio.log() - 1
+                safeguard.observe(
+                    float(deviance.mean()),
+                    float(torch.quantile(ratio, 0.95)),
+                    int(ratio.numel()),
+                )
         owners.release_after(ExecutionPhase.TARGETS)
 
         owners.enter_phase(ExecutionPhase.LEARNER)
+        generator_states = tuple(
+            generator.get_state() for generator in self.generators
+        )
+        preflight_error: Exception | None = None
+        try:
+            for lane in range(count):
+                stores = {
+                    name: RaggedBranchedStore(
+                        owners,
+                        name,
+                        sealed_inputs=sealed[(lane, name)],
+                        lane=lane,
+                    )
+                    for name in input_names
+                    if sealed[(lane, name)].rows
+                }
+                sampler = BranchedBatchSampler(
+                    stores,
+                    self.schedule,
+                    generator=self.generators[lane],
+                    sigma_pack_cap=owners.plan.manifest.learner_sigma_pack_cap,
+                    action_pack_cap=owners.plan.manifest.learner_action_pack_cap,
+                )
+                module = self.inference.modules.lane_module(lane)
+                operation = (
+                    module.learner_operation
+                    if self.modes[lane].private_estimator
+                    is PrivateEstimator.SAMPLED
+                    else module.rb_learner_operation
+                )
+                try:
+                    BranchedSampledIteration(
+                        model=module,
+                        learner=LearnerOperation(
+                            self.modes[lane],
+                            self.losses[lane],
+                            operation,
+                            PokerLearnerPolicy(self.geometry, self.policy),
+                            precision=self.precision,
+                        ),
+                        optimizer=LearnerPreflightOptimizer(
+                            self.optimizers.optimizers[lane]
+                        ),  # type: ignore[arg-type]
+                        sigma_pack_cap=(
+                            owners.plan.manifest.learner_sigma_pack_cap
+                        ),
+                        action_pack_cap=(
+                            owners.plan.manifest.learner_action_pack_cap
+                        ),
+                    ).optimize(
+                        sampler,
+                        iteration=iteration,
+                        reference_operation=self.reference_operations[lane],
+                    )
+                finally:
+                    sampler.release()
+        except Exception as exc:  # noqa: BLE001 - transaction-wide abort
+            preflight_error = exc
+        finally:
+            for generator, state in zip(
+                self.generators, generator_states, strict=True
+            ):
+                generator.set_state(state)
+            self.optimizers.zero_grad(range(count))
+        if preflight_error is not None:
+            for value in sealed.values():
+                value.release()
+            owners.release_after(ExecutionPhase.LEARNER)
+            owners.enter_phase(ExecutionPhase.FINAL_BACKWARD)
+            owners.release_after(ExecutionPhase.FINAL_BACKWARD)
+            owners.close()
+            raise BranchedPokerError(
+                "replica learner preflight failed before optimizer transition"
+            ) from preflight_error
         learner_results: list[object | None] = []
         for lane in range(count):
             try:
@@ -4439,6 +4623,43 @@ class ReplicaBranchedPokerIteration:
                     PokerLearnerPolicy(self.geometry, self.policy),
                     precision=self.precision,
                 )
+                reference_operation = self.reference_operations[lane]
+                reference_caches: dict[str, ReferenceOutputCache] | None = None
+                if (
+                    self.cache_reference_outputs
+                    and reference_operation is not None
+                ):
+                    admitted: dict[str, ReferenceOutputCache] = {}
+                    resident = 0
+                    budget = owners.plan.layout.reference_cache_bytes
+                    for name, store in stores.items():
+                        columns = store.sealed_inputs.columns
+                        candidate = build_reference_output_cache(
+                            reference_operation,
+                            input_type=name,
+                            model_input=columns["model_input"],
+                            sampled_private_state=columns[
+                                "sampled_private_state"
+                            ],
+                            owner=columns["owner"],
+                            pack_cap=(
+                                owners.plan.manifest.learner_sigma_pack_cap
+                            ),
+                            precision=self.precision,
+                            byte_budget=budget,
+                            resident_bytes=resident,
+                            predicted_saved_seconds=1.0,
+                            predicted_build_seconds=0.5,
+                        )
+                        if candidate is None:
+                            for cache in admitted.values():
+                                cache.release()
+                            admitted = {}
+                            break
+                        admitted[name] = candidate
+                        resident += candidate.allocated_bytes
+                    if admitted:
+                        reference_caches = admitted
                 try:
                     optimized = BranchedSampledIteration(
                         model=module,
@@ -4453,14 +4674,22 @@ class ReplicaBranchedPokerIteration:
                             owners.plan.manifest.learner_action_pack_cap
                         ),
                         run_state=self.run_states[lane],
-                    ).optimize(sampler, iteration=iteration)
+                    ).optimize(
+                        sampler,
+                        iteration=iteration,
+                        reference_operation=reference_operation,
+                        reference_caches=reference_caches,
+                    )
                 finally:
+                    if reference_caches is not None:
+                        for cache in reference_caches.values():
+                            cache.release()
                     sampler.release()
-                learner_results.append(optimized)
-            except (BranchedPokerError, RuntimeError, ValueError) as exc:
-                failures[lane] = f"{type(exc).__name__}: {exc}"
-                learner_results.append(None)
-                self.optimizers.gradients[lane].zero_()
+            except Exception as exc:
+                raise BranchedPokerError(
+                    "replica learner failed after successful preflight"
+                ) from exc
+            learner_results.append(optimized)
         for value in sealed.values():
             value.release()
         owners.release_after(ExecutionPhase.LEARNER)
@@ -4473,7 +4702,11 @@ class ReplicaBranchedPokerIteration:
             )
             state = self.run_states[lane]
             if state is not None:
+                state.logical_work["trajectories"] += state.root_count
                 state.branch_controller_state = self.controllers[
+                    lane
+                ].state_dict()
+                state.cost_safeguard_state = self.safeguards[
                     lane
                 ].state_dict()
         owners.enter_phase(ExecutionPhase.FINAL_BACKWARD)
@@ -4512,10 +4745,17 @@ class ReplicaBranchedPokerIteration:
                     ),
                     duplicate_child_labels=duplicate_labels,
                     sampled_tree_nodes=sampled_nodes[lane],
-                    observability=topology_diagnostics(
-                        topology,
-                        bindings[lane],
-                        owners.plan.partitions,
+                    observability=MappingProxyType(
+                        {
+                            **topology_diagnostics(
+                                topology,
+                                bindings[lane],
+                                owners.plan.partitions,
+                            ),
+                            "model_timing_by_family": dict(
+                                self._model_timing(lane)
+                            ),
+                        }
                     ),
                 )
             )

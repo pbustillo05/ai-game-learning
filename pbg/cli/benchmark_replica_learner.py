@@ -1,6 +1,10 @@
-"""Replica benchmark alias for the production queued benchmark consumer."""
+"""Replica-only production queued benchmark consumer."""
 
-from pbg.cli.benchmark import main
+from pbg.cli.benchmark import run_cli
+
+
+def main() -> None:
+    run_cli(require_replica=True)
 
 
 if __name__ == "__main__":

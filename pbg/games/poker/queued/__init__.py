@@ -66,6 +66,8 @@ from pbg.games.poker.queued.training import (
     PokerIterationError,
     PokerIterationResult,
     ReplicaPokerIterationResult,
+    RecoveringSequentialSampledPokerIteration,
+    discard_unpublished_attempt,
     SequentialPokerIteration,
     SequentialSharedResponseProbe,
 )
@@ -109,6 +111,8 @@ __all__ = [
     "ReplicaBranchedPokerIteration",
     "ReplicaBranchedPokerResult",
     "ReplicaPokerIterationResult",
+    "RecoveringSequentialSampledPokerIteration",
+    "discard_unpublished_attempt",
     "SampledShowdownBinding",
     "SequentialPokerHooks",
     "SequentialPokerIteration",

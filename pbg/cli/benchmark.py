@@ -10,7 +10,7 @@ from pbg.benchmark import benchmark_training, compare_benchmark
 from pbg.config import load_config
 
 
-def main() -> None:
+def run_cli(*, require_replica: bool = False) -> None:
     parser = argparse.ArgumentParser(description="Benchmark queued PBG training")
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", default=None)
@@ -21,8 +21,11 @@ def main() -> None:
     parser.add_argument("--max-regression", type=float, default=0.10)
     parser.add_argument("--allow-environment-mismatch", action="store_true")
     args = parser.parse_args()
+    config = load_config(args.config)
+    if require_replica and config.execution.manifest.n_replica <= 1:
+        parser.error("replica benchmark requires manifest.n_replica greater than one")
     result = benchmark_training(
-        load_config(args.config),
+        config,
         warmup=args.warmup,
         repeats=args.repeats,
         checkpoint=args.checkpoint,
@@ -42,6 +45,10 @@ def main() -> None:
         )
         if failures:
             parser.exit(1, "performance gate failed:\n- " + "\n- ".join(failures))
+
+
+def main() -> None:
+    run_cli()
 
 
 if __name__ == "__main__":

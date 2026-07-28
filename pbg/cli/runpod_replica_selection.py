@@ -26,22 +26,27 @@ def main() -> None:
         parser.error("replica count must match the strict manifest and exceed one")
     started = time.monotonic()
     session = TrainingSession(cfg, resume_from=args.resume)
-    deadline = started + args.deadline_minutes * 60
-    completed = session.run(deadline_monotonic=deadline)
-    checkpoint = cfg.execution.output_dir / "selection_final.pt"
-    digest = session.checkpoint(checkpoint)
-    report = {
-        "schema": "pbg-queued-runpod-selection-v1",
-        "replicas": args.replicas,
-        "completed_iterations": completed,
-        "elapsed_seconds": time.monotonic() - started,
-        "deadline_exhausted": (
-            time.monotonic() - started >= args.deadline_minutes * 60
-        ),
-        "checkpoint": str(checkpoint),
-        "checkpoint_sha256": digest,
-        "lane_iterations": [state.iteration for state in session.run_states],
-    }
+    try:
+        deadline = started + args.deadline_minutes * 60
+        completed = session.run(deadline_monotonic=deadline)
+        checkpoint = cfg.execution.output_dir / "selection_final.pt"
+        digest = session.checkpoint(checkpoint)
+        report = {
+            "schema": "pbg-queued-runpod-selection-v1",
+            "replicas": args.replicas,
+            "completed_iterations": completed,
+            "elapsed_seconds": time.monotonic() - started,
+            "deadline_exhausted": (
+                time.monotonic() - started >= args.deadline_minutes * 60
+            ),
+            "checkpoint": str(checkpoint),
+            "checkpoint_sha256": digest,
+            "lane_iterations": [
+                state.iteration for state in session.run_states
+            ],
+        }
+    finally:
+        session.close()
     target = Path(args.report)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")

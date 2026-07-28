@@ -97,7 +97,10 @@ class SequentialOverflowRecovery(Generic[AttemptResult]):
         minimum_root_count: int,
         run_state: RunState,
         logger: logging.Logger | None = None,
-        rank_common: Callable[[RecoverableOverflow], RecoverableOverflow] | None = None,
+        rank_common: Callable[
+            [RecoverableOverflow | None], RecoverableOverflow | None
+        ]
+        | None = None,
     ) -> None:
         if iteration < 0 or replica < 0:
             raise ValueError("iteration and replica must be nonnegative")
@@ -127,14 +130,37 @@ class SequentialOverflowRecovery(Generic[AttemptResult]):
         logical_base = self.run_state.attempt_logical_base
         while True:
             address = AttemptAddress(epoch, logical_base)
+            result: AttemptResult | None = None
+            local_failure: RecoverableOverflow | None = None
+            rank_agreed = False
             try:
-                return attempt(self.root_count, address)
-            except RecoverableOverflow as local:
-                failure = local if self.rank_common is None else self.rank_common(local)
-                # The callback must reset every live attempt-owned owner before
-                # another address is exposed. Completed replica lanes are not
-                # passed to this callback.
+                result = attempt(self.root_count, address)
+            except RecoverableOverflow as caught:
+                local_failure = RecoverableOverflow(
+                    caught.failure,
+                    capacity=caught.capacity,
+                    observed_demand=caught.observed_demand,
+                )
+                rank_agreed = bool(getattr(caught, "_rank_agreed", False))
+                discard(local_failure)
+            failure = (
+                local_failure
+                if self.rank_common is None or rank_agreed
+                else self.rank_common(local_failure)
+            )
+            if failure is None:
+                if result is None:
+                    raise TrainingError(
+                        "rank agreement lost a sequential overflow"
+                    )
+                return result
+            if local_failure is None:
                 discard(failure)
+            result = None
+            local_failure = None
+            # The callback resets every live attempt owner before another
+            # address is exposed.
+            if failure is not None:
                 if self.root_count == self.minimum_root_count:
                     raise TrainingError(
                         "minimum sequential root_count overflowed fixed capacity"

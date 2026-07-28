@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Literal
 
@@ -211,22 +211,45 @@ class PokerInferenceSession:
         )
 
     def _evaluate(self, item: _Hand):
-        family = self._family(item.state)
+        return self._evaluate_items((item,))
+
+    def _evaluate_items(self, items: Sequence[_Hand]):
+        if not items:
+            raise ValueError("inference batch cannot be empty")
+        family = self._family(items[0].state)
+        if any(self._family(item.state) != family for item in items[1:]):
+            raise ValueError("one inference batch must share a model family")
         if self.device.type == "mps" and family != "pre":
             raise RuntimeError(
                 "postflop MPS inference is unsupported because evaluator contract "
                 "v2 does not provide folded-summary operations on MPS"
             )
-        model_input = self.machine.direct_model_input(
-            item.state, item.log_reach, item.history
+        state = PokerState(
+            **{
+                field.name: torch.cat(
+                    [getattr(item.state, field.name) for item in items], dim=0
+                )
+                for field in fields(PokerState)
+            }
         )
+        history_type = type(items[0].history)
+        history = history_type(
+            **{
+                field.name: torch.cat(
+                    [getattr(item.history, field.name) for item in items], dim=0
+                )
+                for field in fields(history_type)
+            }
+        )
+        log_reach = torch.cat([item.log_reach for item in items], dim=0)
+        model_input = self.machine.direct_model_input(state, log_reach, history)
         with torch.inference_mode(), torch.autocast(
             device_type=self.device.type,
             dtype=torch.float16,
             enabled=self.precision == "fp16",
         ):
             evaluation = self.model.forward_partition(family, model_input)
-            legality = self.machine.legality(item.state)
+            legality = self.machine.legality(state)
             probabilities = self.policy.probabilities(
                 evaluation.policy_raw, legality
             ).float()
@@ -307,15 +330,74 @@ class PokerInferenceSession:
     ) -> list[Decision]:
         if len(hands) != len(private_hands):
             raise ValueError("hands and private_hands differ in length")
-        return [
-            self.predict(
-                hand,
-                private,
-                action_mode=action_mode,
-                generator=generator,
+        if action_mode not in ("none", "argmax", "sample"):
+            raise ValueError("action_mode must be none, argmax, or sample")
+        indexed = [
+            (index, hand, private, self._hand(hand))
+            for index, (hand, private) in enumerate(
+                zip(hands, private_hands, strict=True)
             )
-            for hand, private in zip(hands, private_hands, strict=True)
         ]
+        decisions: list[Decision | None] = [None] * len(indexed)
+        families: dict[str, list[tuple[int, HandHandle, Sequence[str | int], _Hand]]] = {}
+        for entry in indexed:
+            families.setdefault(self._family(entry[3].state), []).append(entry)
+        default_cap = 1 if self.mode == "latency" else max(1, len(indexed))
+        cap = self.max_batch_rows or default_cap
+        if self.mode == "latency":
+            cap = 1
+        for entries in families.values():
+            for offset in range(0, len(entries), cap):
+                chunk = entries[offset : offset + cap]
+                evaluation, legality, all_probability = self._evaluate_items(
+                    tuple(entry[3] for entry in chunk)
+                )
+                for row, (index, hand, private_cards, item) in enumerate(chunk):
+                    private = self._private_id(private_cards)
+                    board = item.state.board_cards[0]
+                    cards = self._combo_cards[private]
+                    if (
+                        (cards[:, None] == board[None])
+                        & board[None].ne(PAD_CARD)
+                    ).any():
+                        raise ValueError(
+                            "private hand conflicts with the public board"
+                        )
+                    row_legality = replace(
+                        legality,
+                        event_ids=legality.event_ids[row : row + 1],
+                        mask=legality.mask[row : row + 1],
+                    )
+                    actions = self._actions(row_legality)
+                    columns = torch.nonzero(
+                        legality.mask[row], as_tuple=False
+                    ).flatten()
+                    probability = all_probability[
+                        row, private
+                    ].index_select(0, columns).cpu()
+                    selected = None
+                    if action_mode == "argmax":
+                        selected = actions[int(probability.argmax())]
+                    elif action_mode == "sample":
+                        selected = actions[
+                            int(
+                                torch.multinomial(
+                                    probability, 1, generator=generator
+                                )
+                            )
+                        ]
+                    decisions[index] = Decision(
+                        hand,
+                        private,
+                        actions,
+                        probability,
+                        float(evaluation.value[row, private].float().cpu()),
+                        None,
+                        selected,
+                    )
+        if any(value is None for value in decisions):
+            raise RuntimeError("inference batching omitted a requested hand")
+        return [value for value in decisions if value is not None]
 
     def full_strategy(self, hands: Sequence[HandHandle]) -> FullStrategy:
         evaluations = [self._evaluate(self._hand(hand)) for hand in hands]

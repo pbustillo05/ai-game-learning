@@ -33,7 +33,7 @@ from pbg.queued import (
     RunState,
     SequentialBenchmarkSample,
     build_storage_plan,
-    convert_legacy_branched_rb,
+    convert_legacy_sequential,
     mode_schema,
     run_phase8_benchmark,
 )
@@ -202,7 +202,12 @@ def test_offline_converter_accepts_approved_fixed_branched_rb(
     source = tmp_path / "legacy.pt"
     destination = tmp_path / "queued.pt"
     torch.save(legacy, source)
-    result = convert_legacy_branched_rb(source, destination)
+    result = convert_legacy_sequential(
+        source,
+        destination,
+        expected_training_regime="self_play",
+        expected_estimator="rao_blackwell",
+    )
     assert result["mode"] == (
         "self_play/branched.fixed/rao_blackwell"
     )

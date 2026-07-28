@@ -72,7 +72,7 @@ from pbg.queued import (
     TrainingError,
     allocate_statistical_counts,
     build_storage_plan,
-    convert_legacy_sequential_sampled,
+    convert_legacy_sequential,
     convert_value_head_units,
     load_checkpoint,
     save_checkpoint,
@@ -1670,7 +1670,7 @@ def test_checkpoint_resume_is_strict_and_execution_drift_is_allowed(
         iteration=6,
         recovered_overflow=True,
         overflow_recoveries=[{"iteration": 2}],
-        metrics_prefix=[{"iteration": value} for value in range(7)],
+        metrics_prefix=[{"iteration": value} for value in range(6)],
     )
     scientific = {"mode": "self_play/sequential/sampled", "seed": 41}
     path = tmp_path / "checkpoint.pt"
@@ -1839,7 +1839,12 @@ def test_offline_converter_records_hash_and_refuses_repeat(
     source = tmp_path / "legacy.pt"
     destination = tmp_path / "queued.pt"
     torch.save(_legacy_checkpoint(version), source)
-    result = convert_legacy_sequential_sampled(source, destination)
+    result = convert_legacy_sequential(
+        source,
+        destination,
+        expected_training_regime="self_play",
+        expected_estimator="sampled",
+    )
     assert result["source_sha256"] == sha256_file(source)
     assert result["result_sha256"] == sha256_file(destination)
     metadata = json.loads(
@@ -1857,7 +1862,12 @@ def test_offline_converter_records_hash_and_refuses_repeat(
     assert converted["reference_state"]["interval_iterations"] == 5
     assert converted["reference_state"]["interval_effective_hands"] is None
     with pytest.raises(Exception, match="already exists"):
-        convert_legacy_sequential_sampled(source, destination)
+        convert_legacy_sequential(
+            source,
+            destination,
+            expected_training_regime="self_play",
+            expected_estimator="sampled",
+        )
 
 
 @CUDA
@@ -1886,7 +1896,12 @@ def test_converted_checkpoint_reconstructs_derived_model_exactly(
     source = tmp_path / "legacy.pt"
     destination = tmp_path / "queued.pt"
     torch.save(legacy, source)
-    convert_legacy_sequential_sampled(source, destination)
+    convert_legacy_sequential(
+        source,
+        destination,
+        expected_training_regime="self_play",
+        expected_estimator="sampled",
+    )
     converted = torch.load(destination, map_location="cpu", weights_only=False)
 
     resumed = build_model_from_config(converted["scientific_config"], "cuda")

@@ -4,9 +4,8 @@ set -uo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  tools/run-training.sh --config CONFIG --hardware-profile PROFILE \
-    --run-dir RUN_DIR --gpus GPU_IDS [--nproc-per-node N]
-    [--resume CHECKPOINT] [--init-checkpoint CHECKPOINT] [--tmux]
+  tools/run-training.sh --config CONFIG --gpus GPU_IDS [--nproc-per-node N]
+    [--resume CHECKPOINT] [--tmux]
 
 The launcher writes stdout.log, stderr.log, combined.log, status.json,
 gpu_start.csv, and gpu_end.csv under RUN_DIR. With --tmux it starts a detached
@@ -15,12 +14,10 @@ EOF
 }
 
 config=""
-hardware_profile=""
 run_dir=""
 gpus=""
 nproc_per_node=2
 resume=""
-init_checkpoint=""
 use_tmux=0
 tmux_child=0
 session=""
@@ -28,12 +25,9 @@ session=""
 while (($#)); do
   case "$1" in
     --config) config=$2; shift 2 ;;
-    --hardware-profile) hardware_profile=$2; shift 2 ;;
-    --run-dir) run_dir=$2; shift 2 ;;
     --gpus) gpus=$2; shift 2 ;;
     --nproc-per-node) nproc_per_node=$2; shift 2 ;;
     --resume) resume=$2; shift 2 ;;
-    --init-checkpoint) init_checkpoint=$2; shift 2 ;;
     --tmux) use_tmux=1; shift ;;
     --session) session=$2; shift 2 ;;
     --_tmux-child) tmux_child=1; shift ;;
@@ -42,12 +36,19 @@ while (($#)); do
   esac
 done
 
-if [[ -z "$config" || -z "$hardware_profile" || -z "$run_dir" || -z "$gpus" ]]; then
+if [[ -z "$config" || -z "$gpus" ]]; then
   usage >&2
   exit 2
 fi
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+config=$(cd "$repo_root" && realpath "$config")
+run_dir=$(/home/pablob/.venvs/poker/bin/python - "$config" <<'PY'
+import sys
+from pbg.config import load_config
+print(load_config(sys.argv[1]).execution.output_dir)
+PY
+)
 run_dir=$(cd "$repo_root" && mkdir -p "$run_dir" && cd "$run_dir" && pwd)
 launcher_name=$(basename "$0")
 if [[ -z "$session" ]]; then
@@ -63,9 +64,8 @@ if ((use_tmux && !tmux_child)); then
     echo "tmux session already exists: $session" >&2
     exit 2
   fi
-  args=(--config "$config" --hardware-profile "$hardware_profile" --run-dir "$run_dir" --gpus "$gpus" --nproc-per-node "$nproc_per_node" --session "$session" --_tmux-child)
+  args=(--config "$config" --gpus "$gpus" --nproc-per-node "$nproc_per_node" --session "$session" --_tmux-child)
   [[ -n "$resume" ]] && args+=(--resume "$resume")
-  [[ -n "$init_checkpoint" ]] && args+=(--init-checkpoint "$init_checkpoint")
   tmux new-session -d -s "$session" "$repo_root/tools/$launcher_name" "${args[@]}"
   echo "started tmux session: $session"
   echo "inspect with: tmux attach -t $session"
@@ -107,13 +107,13 @@ write_status() {
     --arg stdout "$(basename "$stdout_log")" --arg stderr "$(basename "$stderr_log")" \
     --arg combined "$(basename "$combined_log")" --arg command "$(basename "$command_log")" \
     --arg telemetry "$(basename "$telemetry_log")" \
-    --arg config "$config" --arg profile "$hardware_profile" \
+    --arg config "$config" \
     --arg gpus "$gpus" --arg resume "$resume" --arg checkpoint "$checkpoint" \
     --arg metrics "$metrics" --arg exit_code "$exit_code" \
     '{state:$state,started_at:$started,updated_at:$updated,ended_at:$ended,
       host:$host,pid:$pid,tmux_session:$session,termination_signal:$signal,
       nproc_per_node:($nproc|tonumber),config:$config,
-      hardware_profile:$profile,gpus:$gpus,resume:$resume,
+      gpus:$gpus,resume:$resume,
       stdout_log:$stdout,stderr_log:$stderr,combined_log:$combined,command_log:$command,
       telemetry_log:$telemetry,
       latest_checkpoint:$checkpoint,metrics_lines:($metrics|tonumber),
@@ -148,9 +148,8 @@ export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-INFO}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
 cmd=(/home/pablob/.venvs/poker/bin/torchrun --standalone --nproc-per-node="$nproc_per_node" -m pbg.cli.train
-  --config "$repo_root/$config" --hardware-profile "$repo_root/$hardware_profile")
-[[ -n "$resume" ]] && cmd+=(--resume "$repo_root/$resume")
-[[ -n "$init_checkpoint" ]] && cmd+=(--init-checkpoint "$repo_root/$init_checkpoint")
+  --config "$config")
+[[ -n "$resume" ]] && cmd+=(--resume "$resume")
 printf 'start: %s\ncommand:' "$started_at" > "$command_log"
 printf ' %q' "${cmd[@]}" >> "$command_log"
 printf '\n' >> "$command_log"

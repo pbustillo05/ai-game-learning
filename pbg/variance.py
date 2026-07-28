@@ -10,9 +10,9 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from pbg.benchmark import _code_identity
 from pbg.config import RootConfig, load_config_mapping
-from pbg.queued import sha256_file
+from pbg.identity import accelerator_identity, code_identity
+from pbg.queued import model_state_sha256, sha256_file
 from pbg.runtime import TrainingSession
 
 
@@ -37,6 +37,16 @@ def _parameters(module: nn.Module) -> Tensor:
     )
 
 
+def _tensor_bytes(value: object) -> int:
+    if isinstance(value, Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, dict):
+        return sum(_tensor_bytes(item) for item in value.values())
+    if isinstance(value, (tuple, list)):
+        return sum(_tensor_bytes(item) for item in value)
+    return 0
+
+
 def estimate_update_variance(
     cfg: RootConfig,
     *,
@@ -56,12 +66,36 @@ def estimate_update_variance(
     optimizer_state = _device_state(base.optimizers.state_dict())
     run_states = copy.deepcopy(base.run_states)
     reference_states = copy.deepcopy(base.reference_states)
+    controllers = copy.deepcopy(base.controllers)
+    safeguards = copy.deepcopy(base.safeguards)
     initial = tuple(
         _parameters(base.modules.lane_module(lane))
         for lane in range(base.plan.manifest.n_replica)
     )
     means = tuple(torch.zeros_like(value) for value in initial)
     m2 = tuple(torch.zeros_like(value) for value in initial)
+    budget = base.plan.manifest.hardware.memory_budget_bytes
+    admitted_peak = max(
+        admission.required_bytes for admission in base.plan.admissions
+    )
+    variance_bytes = sum(
+        value.numel() * value.element_size()
+        for values in (initial, means, m2)
+        for value in values
+    ) + sum(
+        _tensor_bytes(value)
+        for value in (model_state, reference_model_state, optimizer_state)
+    )
+    if admitted_peak + variance_bytes > budget:
+        base.close()
+        raise RuntimeError(
+            "variance statistics exceed the immutable CUDA memory budget"
+        )
+    torch.cuda.reset_peak_memory_stats(base.device)
+    memory_start = torch.cuda.memory_allocated(base.device)
+    variance_device = base.device
+    base.close()
+    del base
     samples: list[dict[str, object]] = []
     base_scientific = cfg.scientific_mapping()
     for repeat in range(repeats):
@@ -81,6 +115,12 @@ def estimate_update_variance(
         session.optimizers.load_state_dict(optimizer_state)
         session.run_states = copy.deepcopy(run_states)
         session.reference_states = copy.deepcopy(reference_states)
+        session.controllers = copy.deepcopy(controllers)
+        session.safeguards = copy.deepcopy(safeguards)
+        session.initial_model_sha256 = tuple(
+            model_state_sha256(session.modules.lane_module(lane))
+            for lane in range(session.plan.manifest.n_replica)
+        )
         result = session.step()
         lane_results = TrainingSession._lane_results(result)
         lane_rows = []
@@ -106,9 +146,18 @@ def estimate_update_variance(
                 "repeat": repeat,
                 "scientific_seed": scientific["seed"],
                 "lanes": lane_rows,
+                "logical_work": tuple(
+                    dict(state.logical_work) for state in session.run_states
+                ),
+                "allocated_bytes": torch.cuda.memory_allocated(session.device),
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(
+                    session.device
+                ),
             }
         )
-        del result, session
+        del result
+        session.close()
+        del session
     lanes = []
     for lane in range(len(initial)):
         total_variance = float(m2[lane].sum() / (repeats - 1))
@@ -128,7 +177,10 @@ def estimate_update_variance(
         "scientific_config": base_scientific,
         "execution": cfg.execution.mapping(),
         "identity": {
-            "code": _code_identity(),
+            "code": code_identity(),
+            "accelerator": accelerator_identity(
+                cfg.scientific.common.game.rank_count
+            ),
             "checkpoint_sha256": (
                 None if checkpoint is None else sha256_file(checkpoint)
             ),
@@ -137,6 +189,18 @@ def estimate_update_variance(
         "repeats": repeats,
         "lanes": lanes,
         "samples": samples,
+        "memory": {
+            "configured_budget_bytes": budget,
+            "admitted_peak_bytes": admitted_peak,
+            "variance_statistics_bytes": variance_bytes,
+            "start_allocated_bytes": memory_start,
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(
+                variance_device
+            ),
+            "end_allocated_bytes": torch.cuda.memory_allocated(
+                variance_device
+            ),
+        },
     }
 
 

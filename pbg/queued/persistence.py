@@ -158,9 +158,14 @@ class RunState:
             for value in self.logical_work.values()
         ):
             raise ValueError("logical work counters must be nonnegative integers")
-        iterations = [int(item["iteration"]) for item in self.metrics_prefix]
-        if iterations and iterations != list(range(iterations[0], iterations[-1] + 1)):
-            raise ValueError("metrics prefix must be gap-free")
+        try:
+            iterations = [int(item["iteration"]) for item in self.metrics_prefix]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("metrics prefix entries require an iteration") from exc
+        if iterations != list(range(self.iteration)):
+            raise ValueError(
+                "metrics prefix must be the exact completed-iteration prefix"
+            )
 
     def state_dict(self) -> dict[str, object]:
         return {
@@ -239,6 +244,72 @@ _CHECKPOINT_FIELDS = {
     "ambient_cuda_rng",
 }
 
+_RUN_STATE_FIELDS = {
+    "run_id",
+    "iteration",
+    "root_count",
+    "retry_epoch",
+    "attempt_logical_base",
+    "logical_work",
+    "recovered_overflow",
+    "overflow_recoveries",
+    "metrics_prefix",
+    "branch_controller_state",
+    "cost_safeguard_state",
+}
+
+
+def _validate_run_state_mapping(value: object) -> RunState:
+    if not isinstance(value, dict) or set(value) != _RUN_STATE_FIELDS:
+        raise PersistenceError("run state has unknown or missing fields")
+    try:
+        return RunState(**value)
+    except (TypeError, ValueError) as exc:
+        raise PersistenceError(f"run state is invalid: {exc}") from exc
+
+
+def validate_checkpoint_payload(state: object) -> dict[str, object]:
+    """Validate one loaded queued checkpoint without mutating runtime owners."""
+
+    if not isinstance(state, dict):
+        raise PersistenceError("checkpoint payload must be a mapping")
+    schema = state.get("checkpoint_schema")
+    if schema == CHECKPOINT_SCHEMA:
+        if set(state) != _CHECKPOINT_FIELDS:
+            raise PersistenceError("checkpoint has unknown or missing top-level fields")
+        configs = (state["scientific_config"],)
+        hashes = (state["scientific_sha256"],)
+        runs = (state["run_state"],)
+    elif schema == REPLICA_CHECKPOINT_SCHEMA:
+        if set(state) != _REPLICA_CHECKPOINT_FIELDS:
+            raise PersistenceError(
+                "replica checkpoint has unknown or missing top-level fields"
+            )
+        count = state.get("n_replica")
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise PersistenceError("replica checkpoint lane count is invalid")
+        configs = state["scientific_config"]
+        hashes = state["scientific_sha256"]
+        runs = state["run_state"]
+        if any(
+            not isinstance(value, (tuple, list)) or len(value) != count
+            for value in (configs, hashes, runs, state["explicit_rng"])
+        ):
+            raise PersistenceError("replica checkpoint lanes are not aligned")
+    else:
+        raise PersistenceError(
+            "runtime accepts only queued checkpoints; use the offline converter"
+        )
+    if any(
+        not isinstance(config, Mapping)
+        or digest != _canonical_hash(config)
+        for config, digest in zip(configs, hashes, strict=True)
+    ):
+        raise PersistenceError("checkpoint scientific configuration hash is invalid")
+    for run in runs:
+        _validate_run_state_mapping(run)
+    return state
+
 
 def load_checkpoint(
     path: str | os.PathLike[str],
@@ -252,9 +323,9 @@ def load_checkpoint(
 ) -> tuple[LossScaler, ReferenceState, RunState, Mapping[str, object]]:
     """Strictly resume queued state; legacy schemas are never loaded here."""
 
-    state = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(state, dict) or set(state) != _CHECKPOINT_FIELDS:
-        raise PersistenceError("checkpoint has unknown or missing top-level fields")
+    state = validate_checkpoint_payload(
+        torch.load(path, map_location="cpu", weights_only=False)
+    )
     if state["checkpoint_schema"] != CHECKPOINT_SCHEMA:
         raise PersistenceError(
             "runtime accepts only queued checkpoints; use the offline converter"
@@ -271,22 +342,7 @@ def load_checkpoint(
     optimizer.scaler = scaler
     reference = ReferenceState.from_state_dict(state["reference_state"])
     run_data = state["run_state"]
-    expected_run = {
-        "run_id",
-        "iteration",
-        "root_count",
-        "retry_epoch",
-        "attempt_logical_base",
-        "logical_work",
-        "recovered_overflow",
-        "overflow_recoveries",
-        "metrics_prefix",
-        "branch_controller_state",
-        "cost_safeguard_state",
-    }
-    if not isinstance(run_data, dict) or set(run_data) != expected_run:
-        raise PersistenceError("run state has unknown or missing fields")
-    run = RunState(**run_data)
+    run = _validate_run_state_mapping(run_data)
     generator.set_state(state["explicit_rng"])
     if restore_ambient_rng:
         torch.set_rng_state(state["ambient_cpu_rng"])
@@ -418,11 +474,9 @@ def load_replica_checkpoint(
         optimizers, ReplicaOptimizerGroup
     ):
         raise TypeError("replica checkpoint requires queued replica owners")
-    state = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(state, dict) or set(state) != _REPLICA_CHECKPOINT_FIELDS:
-        raise PersistenceError(
-            "replica checkpoint has unknown or missing top-level fields"
-        )
+    state = validate_checkpoint_payload(
+        torch.load(path, map_location="cpu", weights_only=False)
+    )
     if state["checkpoint_schema"] != REPLICA_CHECKPOINT_SCHEMA:
         raise PersistenceError("runtime accepts only queued replica checkpoints")
     count = modules.n_replica
@@ -467,30 +521,8 @@ def load_replica_checkpoint(
             )
         except (TypeError, ValueError) as exc:
             raise PersistenceError("replica reference-state lanes are invalid") from exc
-    run_fields = {
-        "run_id",
-        "iteration",
-        "root_count",
-        "retry_epoch",
-        "attempt_logical_base",
-        "logical_work",
-        "recovered_overflow",
-        "overflow_recoveries",
-        "metrics_prefix",
-        "branch_controller_state",
-        "cost_safeguard_state",
-    }
     run_data = state["run_state"]
-    if (
-        not isinstance(run_data, (tuple, list))
-        or len(run_data) != count
-        or any(
-            not isinstance(value, dict) or set(value) != run_fields
-            for value in run_data
-        )
-    ):
-        raise PersistenceError("replica run-state lanes are invalid")
-    runs = tuple(RunState(**value) for value in run_data)
+    runs = tuple(_validate_run_state_mapping(value) for value in run_data)
     rng = state["explicit_rng"]
     if not isinstance(rng, (tuple, list)) or len(rng) != count:
         raise PersistenceError("replica RNG lanes are invalid")
@@ -1045,6 +1077,27 @@ def convert_legacy_sequential(
                         ),
                     }
                 )
+    expected_iterations = int(legacy["iteration"])
+    by_iteration = {
+        int(item["iteration"]): item for item in metrics_prefix
+    }
+    if len(by_iteration) != len(metrics_prefix) or any(
+        value < 0 or value >= expected_iterations for value in by_iteration
+    ):
+        raise PersistenceError("legacy metrics are duplicated or out of range")
+    metrics_prefix = [
+        by_iteration.get(
+            value,
+            {
+                "iteration": value,
+                "statistical_presentations": 0,
+                "minibatches": 0,
+                "optimizer_steps": 0,
+                "converted_missing_legacy_metrics": True,
+            },
+        )
+        for value in range(expected_iterations)
+    ]
     adaptive_state = legacy["adaptive_work_state"]
     legacy_root_count = (
         int(adaptive_state["current_roots_per_gpu"])
@@ -1134,34 +1187,6 @@ def convert_legacy_sequential(
     return result
 
 
-def convert_legacy_sequential_sampled(
-    source_path: str | os.PathLike[str],
-    destination_path: str | os.PathLike[str],
-) -> dict[str, object]:
-    """Phase 5 compatibility spelling for the sole offline converter."""
-
-    return convert_legacy_sequential(
-        source_path,
-        destination_path,
-        expected_training_regime="self_play",
-        expected_estimator="sampled",
-    )
-
-
-def convert_legacy_branched_rb(
-    source_path: str | os.PathLike[str],
-    destination_path: str | os.PathLike[str],
-) -> dict[str, object]:
-    """Phase 8 spelling for the sole offline poker converter."""
-
-    return convert_legacy_sequential(
-        source_path,
-        destination_path,
-        expected_training_regime="self_play",
-        expected_estimator="rao_blackwell",
-    )
-
-
 def convert_legacy_lane_artifacts(
     source_paths: Sequence[str | os.PathLike[str]],
     destination_directory: str | os.PathLike[str],
@@ -1223,10 +1248,12 @@ def trim_metrics_after_checkpoint(
 ) -> list[dict[str, object]]:
     """Back up externally if desired, then retain the exact completed prefix."""
 
-    retained = [dict(item) for item in metrics if int(item["iteration"]) <= iteration]
+    retained = [dict(item) for item in metrics if int(item["iteration"]) < iteration]
     values = [int(item["iteration"]) for item in retained]
-    if values and values != list(range(values[0], values[-1] + 1)):
-        raise PersistenceError("metrics before the checkpoint are not gap-free")
+    if values != list(range(iteration)):
+        raise PersistenceError(
+            "metrics before the checkpoint are not the exact completed prefix"
+        )
     return retained
 
 
@@ -1240,10 +1267,8 @@ __all__ = [
     "REPLICA_CHECKPOINT_SCHEMA",
     "PersistenceError",
     "RunState",
-    "convert_legacy_branched_rb",
     "convert_legacy_lane_artifacts",
     "convert_legacy_sequential",
-    "convert_legacy_sequential_sampled",
     "convert_queued_checkpoint_v1",
     "load_checkpoint",
     "load_distributed_checkpoint_manifest",
@@ -1254,4 +1279,5 @@ __all__ = [
     "save_replica_checkpoint",
     "sha256_file",
     "trim_metrics_after_checkpoint",
+    "validate_checkpoint_payload",
 ]

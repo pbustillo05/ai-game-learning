@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -120,12 +121,43 @@ def test_accelerator_contract_has_no_cpu_auto_or_mps_training_fallback(
 def test_inference_export_accepts_only_queued_schema(tmp_path: Path) -> None:
     config = load_config(CONFIG)
     checkpoint = tmp_path / "checkpoint.pt"
+    scientific = config.scientific_mapping()
     torch.save(
         {
             "checkpoint_schema": CHECKPOINT_SCHEMA,
-            "scientific_config": config.scientific_mapping(),
+            "scientific_config": scientific,
+            "scientific_sha256": hashlib.sha256(
+                json.dumps(
+                    scientific,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode()
+            ).hexdigest(),
+            "execution_config": config.execution.mapping(),
             "model": {"weight": torch.ones(2)},
-            "run_state": {"iteration": 3},
+            "optimizer": {},
+            "scaler": {},
+            "reference_model": {},
+            "reference_state": {},
+            "run_state": {
+                "run_id": "strict-export",
+                "iteration": 3,
+                "root_count": 1,
+                "retry_epoch": 0,
+                "attempt_logical_base": 0,
+                "logical_work": {},
+                "recovered_overflow": False,
+                "overflow_recoveries": [],
+                "metrics_prefix": [
+                    {"iteration": value} for value in range(3)
+                ],
+                "branch_controller_state": None,
+                "cost_safeguard_state": None,
+            },
+            "explicit_rng": torch.get_rng_state(),
+            "ambient_cpu_rng": torch.get_rng_state(),
+            "ambient_cuda_rng": (),
         },
         checkpoint,
     )
@@ -158,7 +190,7 @@ def test_legacy_inference_conversion_is_offline_and_hash_audited(
     model["eps"] = model.pop("epsilon")
     model["k_act"] = 3 + int(model["m_raise"])
     model["use_branching_heads"] = False
-    model["max_history_tokens"] = 0  # derived legacy value is ignored
+    model["max_history_tokens"] = 18
     source = tmp_path / "legacy_inference.pt"
     torch.save(
         {

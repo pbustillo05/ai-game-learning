@@ -26,6 +26,7 @@ from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
 from pbg.games.poker.queued.training import SequentialSampledPokerIteration
 from pbg.queued import (
     CapacityManifest,
+    CostSafeguardController,
     DistributedSUM,
     ExternalWorkspaceBounds,
     FixedBranchController,
@@ -770,6 +771,11 @@ def test_shared_owner_branched_poker_preserves_fixed_kkt_lane_identity(
         owners=GeneratedOwners(plan),
         modes=(fixed, kkt),
         controllers=controllers,
+        safeguards=(
+            CostSafeguardController(1.0, 10.0, 1),
+            CostSafeguardController(1.0, 10.0, 1),
+        ),
+        reference_operations=(None, None),
         inference=inference,
         frozen_inference=frozen,
         optimizers=optimizers,
@@ -810,7 +816,7 @@ def test_shared_owner_branched_poker_preserves_fixed_kkt_lane_identity(
 
 
 @CUDA
-def test_branched_replica_learner_failure_stays_lane_local() -> None:
+def test_branched_replica_learner_failure_aborts_before_any_lane_commit() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 4)
     mode = mode_schema("self_play", "branched.fixed", "sampled")
@@ -831,7 +837,8 @@ def test_branched_replica_learner_failure_stays_lane_local() -> None:
         RunState("branched-healthy-lane", root_count=1),
         RunState("branched-failed-lane", root_count=1),
     )
-    result = ReplicaBranchedPokerIteration(
+    with pytest.raises(RuntimeError, match="before optimizer transition"):
+        ReplicaBranchedPokerIteration(
         geometry=geometry,
         owners=GeneratedOwners(
             build_storage_plan(
@@ -853,6 +860,11 @@ def test_branched_replica_learner_failure_stays_lane_local() -> None:
                 2,
             ),
         ),
+        safeguards=(
+            CostSafeguardController(1.0, 10.0, 1),
+            CostSafeguardController(1.0, 10.0, 1),
+        ),
+        reference_operations=(None, None),
         inference=inference,
         optimizers=optimizers,
         losses=(LossConfig(reference_kl_coefficient=0),) * 2,
@@ -864,13 +876,9 @@ def test_branched_replica_learner_failure_stays_lane_local() -> None:
         run_states=run_states,
         seed=950,
         lambda_=0.95,
-    ).run(iteration=0)
-    assert set(result.failures) == {1}
-    assert "failed before optimizer transition" in result.failures[1]
-    assert result.versions == (1, 0)
-    assert result.results[0] is not None
-    assert result.results[1] is None
-    assert tuple(state.iteration for state in run_states) == (1, 0)
+        ).run(iteration=0)
+    assert tuple(int(value) for value in optimizers.versions.tolist()) == (0, 0)
+    assert tuple(state.iteration for state in run_states) == (0, 0)
     assert bool(optimizers.gradients[1].eq(0).all())
 
 
@@ -1211,8 +1219,16 @@ def test_replica_checkpoint_round_trip_preserves_every_lane(tmp_path: Path) -> N
         torch.Generator(device="cuda").manual_seed(900 + lane) for lane in range(2)
     )
     runs = (
-        RunState("replica-lane-0", iteration=3),
-        RunState("replica-lane-1", iteration=3),
+        RunState(
+            "replica-lane-0",
+            iteration=3,
+            metrics_prefix=[{"iteration": value} for value in range(3)],
+        ),
+        RunState(
+            "replica-lane-1",
+            iteration=3,
+            metrics_prefix=[{"iteration": value} for value in range(3)],
+        ),
     )
     scientific = ({"lane": 0, "mode": "a"}, {"lane": 1, "mode": "b"})
     model_before = copy.deepcopy(modules.state_dict())

@@ -20,21 +20,30 @@ from pbg.games.poker.queued import (
     BranchedSampledPokerIteration,
     NLHEGeometry,
     PokerReplicaInference,
+    RecoveringSequentialSampledPokerIteration,
     ReplicaBranchedPokerIteration,
     SequentialPokerIteration,
     build_model_from_config,
+    discard_unpublished_attempt,
     poker_partitions,
 )
+from pbg.identity import accelerator_identity, code_identity
 from pbg.queued import (
     CHECKPOINT_SCHEMA,
     REPLICA_CHECKPOINT_SCHEMA,
+    AttemptAddress,
     BranchedModeConfig,
+    BranchedRecoveryRecord,
     CostSafeguardController,
     DistributedSUM,
     FixedBranchController,
     GeneratedOwners,
     KKTBranchController,
     LossScaler,
+    OverflowRecoveryRecord,
+    PreemptionNotice,
+    RankCommonFailureAgreement,
+    RecoverableOverflow,
     ReferenceState,
     ReplicaModuleOwner,
     ReplicaOptimizerGroup,
@@ -50,9 +59,7 @@ from pbg.queued import (
     save_distributed_checkpoint_manifest,
     save_replica_checkpoint,
     sha256_file,
-    PreemptionNotice,
 )
-from pbg.queued.optimization import DenseAdam
 
 
 class RuntimeError(RuntimeError):
@@ -122,9 +129,11 @@ class TrainingSession:
         config: RootConfig,
         *,
         resume_from: str | Path | None = None,
+        benchmark_telemetry: bool = False,
     ) -> None:
         self.config = config
         self.resume_from = None if resume_from is None else Path(resume_from)
+        self.benchmark_telemetry = bool(benchmark_telemetry)
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         workload = (
             "distributed training" if config.execution.distributed else "training"
@@ -144,6 +153,11 @@ class TrainingSession:
         else:
             self._owns_process_group = False
             self.distributed = None
+        self.rank = dist.get_rank() if self.distributed is not None else 0
+        rank_stride = 60 << 40
+        if self.rank * rank_stride >= torch.iinfo(torch.int64).max:
+            raise RuntimeError("distributed rank exceeds the logical address domain")
+        self.rank_logical_base = self.rank * rank_stride
         scientific = config.scientific_mapping()
         self.scientific_sha256 = hashlib.sha256(
             json.dumps(
@@ -159,6 +173,10 @@ class TrainingSession:
             config.scientific.common.game.stack_bb,
             config.scientific.common.game.rank_count,
         )
+        self.runtime_identity = {
+            "code": code_identity(),
+            "accelerator": accelerator_identity(self.geometry.rank_count),
+        }
         self.plan = build_storage_plan(
             self.mode,
             poker_partitions(self.geometry, self.mode),
@@ -190,7 +208,9 @@ class TrainingSession:
         )
         self.generators = tuple(
             torch.Generator(device=self.device).manual_seed(
-                config.scientific.common.seed + lane
+                config.scientific.common.seed
+                + lane
+                + self.rank * 1_000_003
             )
             for lane in range(count)
         )
@@ -198,6 +218,7 @@ class TrainingSession:
             RunState(
                 f"{config.execution.run_id}-lane-{lane}",
                 root_count=config.scientific.common.root_count,
+                attempt_logical_base=self.rank_logical_base,
             )
             for lane in range(count)
         )
@@ -273,6 +294,15 @@ class TrainingSession:
             if isinstance(config.scientific, BranchedModeConfig)
             else ()
         )
+        if self.controllers:
+            for state, controller, safeguard in zip(
+                self.run_states,
+                self.controllers,
+                self.safeguards,
+                strict=True,
+            ):
+                state.branch_controller_state = controller.state_dict()
+                state.cost_safeguard_state = safeguard.state_dict()
         if resume_from is not None:
             self._resume(Path(resume_from))
 
@@ -364,6 +394,7 @@ class TrainingSession:
             self.run_states = states
         if self.controllers:
             restored = []
+            restored_safeguards = []
             for state, fallback in zip(
                 self.run_states, self.controllers, strict=True
             ):
@@ -374,7 +405,17 @@ class TrainingSession:
                 restored.append(
                     controller_from_state_dict(state.branch_controller_state)
                 )
+                if state.cost_safeguard_state is None:
+                    raise RuntimeError(
+                        "branched resume omitted cost-safeguard state"
+                    )
+                restored_safeguards.append(
+                    CostSafeguardController.from_state_dict(
+                        state.cost_safeguard_state
+                    )
+                )
             self.controllers = tuple(restored)
+            self.safeguards = tuple(restored_safeguards)
 
     def checkpoint(self, path: str | Path) -> str:
         scientific = self.config.scientific_mapping()
@@ -439,9 +480,8 @@ class TrainingSession:
         count = self.plan.manifest.n_replica
         models = tuple(self.modules.lane_module(lane) for lane in range(count))
         completion = self.config.scientific.applicable.get("completion", {})
-        return SequentialPokerIteration(
+        arguments = dict(
             geometry=self.geometry,
-            owners=GeneratedOwners(self.plan),
             mode=self.mode,
             model=models[0],
             model_operation=models[0].learner_operation,
@@ -480,36 +520,163 @@ class TrainingSession:
             replica_model_operations=tuple(
                 model.learner_operation for model in models
             ),
+            replica_reference_operations=self.reference_operations,
             replica_frozen_inference=self.frozen_inference,
             distributed=self.distributed,
-        ).run(iteration=iteration)
+        )
+        if count == 1 and self.distributed is None:
+            ordinary = {
+                name: value
+                for name, value in arguments.items()
+                if not name.startswith("replica_")
+                and name != "distributed"
+            }
+            return RecoveringSequentialSampledPokerIteration(
+                owner_factory=lambda: GeneratedOwners(self.plan),
+                plan=self.plan,
+                minimum_root_count=(
+                    self.config.scientific.common.root_count_minimum
+                ),
+                **ordinary,
+            ).run(iteration=iteration)
+        return self._run_recovering_replica(
+            iteration,
+            branched=False,
+            build=lambda owners, boundary: SequentialPokerIteration(
+                owners=owners,
+                rank_boundary=boundary,
+                **arguments,
+            ).run(iteration=iteration),
+        )
+
+    def _run_recovering_replica(self, iteration, *, branched, build):
+        """Retry one shared-owner replica attempt before any learner commit."""
+
+        agreement = RankCommonFailureAgreement.from_runtime()
+        while True:
+            owners = GeneratedOwners(self.plan)
+
+            def rank_boundary() -> None:
+                failure = agreement.agree(None)
+                if failure is None:
+                    return
+                agreed = RecoverableOverflow(
+                    failure.failure,
+                    capacity=failure.capacity,
+                    observed_demand=failure.observed_demand,
+                )
+                agreed._rank_agreed = True  # type: ignore[attr-defined]
+                raise agreed
+
+            try:
+                return build(owners, rank_boundary)
+            except RecoverableOverflow as caught:
+                local = RecoverableOverflow(
+                    caught.failure,
+                    capacity=caught.capacity,
+                    observed_demand=caught.observed_demand,
+                )
+                failure = (
+                    local
+                    if bool(getattr(caught, "_rank_agreed", False))
+                    else agreement.agree(local)
+                )
+                lane = int(failure.failure.lane)
+                discard_unpublished_attempt(owners, lane)
+                state = self.run_states[lane]
+                replacement = AttemptAddress(
+                    state.retry_epoch + 1,
+                    state.attempt_logical_base + state.root_count,
+                )
+                if branched:
+                    controller = self.controllers[lane]
+                    if controller.at_minimum:
+                        raise RuntimeError(
+                            "minimum branched control overflowed fixed capacity"
+                        ) from failure
+                    old_control = controller.state_dict()
+                    controller.backoff()
+                    new_control = controller.state_dict()
+                    record = BranchedRecoveryRecord(
+                        severity="critical",
+                        iteration=iteration,
+                        replica=lane,
+                        failed_phase=failure.failure.phase,
+                        failed_address=AttemptAddress(
+                            state.retry_epoch,
+                            failure.failure.logical_address,
+                        ).as_text(),
+                        replacement_address=replacement.as_text(),
+                        old_control=old_control,
+                        new_control=new_control,
+                        capacity=failure.capacity,
+                        observed_demand=failure.observed_demand,
+                    )
+                    state.branch_controller_state = new_control
+                else:
+                    minimum = self.config.scientific.common.root_count_minimum
+                    if state.root_count == minimum:
+                        raise RuntimeError(
+                            "minimum sequential root_count overflowed fixed capacity"
+                        ) from failure
+                    old_root = state.root_count
+                    state.root_count = max(minimum, old_root // 2)
+                    record = OverflowRecoveryRecord(
+                        severity="critical",
+                        iteration=iteration,
+                        replica=lane,
+                        failed_phase=failure.failure.phase,
+                        failed_address=AttemptAddress(
+                            state.retry_epoch,
+                            failure.failure.logical_address,
+                        ).as_text(),
+                        replacement_address=replacement.as_text(),
+                        old_root_count=old_root,
+                        new_root_count=state.root_count,
+                        capacity=failure.capacity,
+                        observed_demand=failure.observed_demand,
+                    )
+                state.recovered_overflow = True
+                state.retry_epoch = replacement.retry_epoch
+                state.attempt_logical_base = replacement.logical_base
+                state.overflow_recoveries.append(record.as_dict())
 
     def _run_branched(self, iteration: int):
         assert isinstance(self.config.scientific, BranchedModeConfig)
         count = self.plan.manifest.n_replica
         completion = self.config.scientific.applicable.get("completion", {})
         if count > 1 or self.distributed is not None:
-            return ReplicaBranchedPokerIteration(
-                geometry=self.geometry,
-                owners=GeneratedOwners(self.plan),
-                modes=tuple(self.mode for _ in range(count)),
-                controllers=self.controllers,
-                inference=self.inference,
-                optimizers=self.optimizers,
-                losses=tuple(
-                    self.config.scientific.common.loss for _ in range(count)
-                ),
-                schedule=self.config.scientific.common.schedule,
-                generators=self.generators,
-                run_states=self.run_states,
-                seed=self.config.scientific.common.seed,
-                lambda_=self.config.scientific.common.lambda_,
-                precision=self.config.scientific.common.precision.name,
-                utility=self.config.scientific.common.utility,
-                completion_samples=int(completion.get("n_samples", 0)),
-                frozen_inference=self.frozen_inference,
-                distributed=self.distributed,
-            ).run(iteration=iteration)
+            return self._run_recovering_replica(
+                iteration,
+                branched=True,
+                build=lambda owners, boundary: ReplicaBranchedPokerIteration(
+                    geometry=self.geometry,
+                    owners=owners,
+                    modes=tuple(self.mode for _ in range(count)),
+                    controllers=self.controllers,
+                    safeguards=self.safeguards,
+                    inference=self.inference,
+                    reference_operations=self.reference_operations,
+                    optimizers=self.optimizers,
+                    losses=tuple(
+                        self.config.scientific.common.loss for _ in range(count)
+                    ),
+                    schedule=self.config.scientific.common.schedule,
+                    generators=self.generators,
+                    run_states=self.run_states,
+                    seed=self.config.scientific.common.seed,
+                    lambda_=self.config.scientific.common.lambda_,
+                    precision=self.config.scientific.common.precision.name,
+                    utility=self.config.scientific.common.utility,
+                    completion_samples=int(completion.get("n_samples", 0)),
+                    cache_reference_outputs=(
+                        self.config.scientific.common.reference.cache_outputs
+                    ),
+                    frozen_inference=self.frozen_inference,
+                    distributed=self.distributed,
+                    rank_boundary=boundary,
+                ).run(iteration=iteration),
+            )
         model = self.modules.lane_module(0)
         arguments = {
             "geometry": self.geometry,
@@ -543,6 +710,7 @@ class TrainingSession:
                 else self.frozen_inference.modules.lane_module(0).rollout_operation
             ),
             "completion_samples": int(completion.get("n_samples", 0)),
+            "benchmark_telemetry": self.benchmark_telemetry,
         }
         return BranchedSampledPokerIteration(
             owner_factory=lambda: GeneratedOwners(self.plan),
@@ -554,6 +722,11 @@ class TrainingSession:
 
     @staticmethod
     def _lane_results(result: object) -> tuple[object | None, ...]:
+        failures = getattr(result, "failures", {})
+        if failures:
+            raise RuntimeError(
+                f"replica iteration returned uncommitted lane failures: {dict(failures)}"
+            )
         values = getattr(result, "results", ())
         return tuple(values) if values else (result,)
 
@@ -581,16 +754,56 @@ class TrainingSession:
             for lane in range(len(self.run_states))
         ]
         local_total = sum(local_nodes)
-        if self.distributed is not None:
-            total = torch.tensor(
-                [local_total], dtype=torch.int64, device=self.device
+        samples_per_leaf = int(
+            self.config.scientific.applicable.get("completion", {}).get(
+                "n_samples", 0
             )
-            gathered = [torch.empty_like(total) for _ in range(dist.get_world_size())]
-            dist.all_gather(gathered, total)
-            per_rank_nodes = [int(value.item()) for value in gathered]
+        )
+        local_effective = [
+            int(
+                getattr(
+                    lane_results[lane] if lane < len(lane_results) else None,
+                    "leaves",
+                    0,
+                )
+            )
+            * samples_per_leaf
+            for lane in range(len(self.run_states))
+        ]
+        if self.distributed is not None:
+            lane_totals = torch.tensor(
+                [*local_nodes, *local_effective],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            gathered = [
+                torch.empty_like(lane_totals)
+                for _ in range(dist.get_world_size())
+            ]
+            dist.all_gather(gathered, lane_totals)
+            split = len(self.run_states)
+            per_rank_lane_nodes = [
+                [int(item) for item in value[:split].tolist()]
+                for value in gathered
+            ]
+            per_rank_lane_effective = [
+                [int(item) for item in value[split:].tolist()]
+                for value in gathered
+            ]
+            per_rank_nodes = [sum(value) for value in per_rank_lane_nodes]
         else:
+            per_rank_lane_nodes = [local_nodes]
+            per_rank_lane_effective = [local_effective]
             per_rank_nodes = [local_total]
         global_nodes = sum(per_rank_nodes)
+        global_lane_nodes = [
+            sum(rank_nodes[lane] for rank_nodes in per_rank_lane_nodes)
+            for lane in range(len(self.run_states))
+        ]
+        global_lane_effective = [
+            sum(rank_values[lane] for rank_values in per_rank_lane_effective)
+            for lane in range(len(self.run_states))
+        ]
         for lane, (state, reference) in enumerate(
             zip(self.run_states, self.reference_states, strict=True)
         ):
@@ -604,7 +817,11 @@ class TrainingSession:
             )
             if reference.observe(
                 iteration=state.iteration,
-                effective_hands=float(player_nodes),
+                effective_hands=float(
+                    global_lane_effective[lane]
+                    if samples_per_leaf
+                    else global_lane_nodes[lane]
+                ),
             ):
                 self.reference_modules.lane_module(lane).load_state_dict(
                     self.modules.lane_module(lane).state_dict(),
@@ -635,7 +852,11 @@ class TrainingSession:
                         else 1
                     ),
                     "per_rank_player_nodes": per_rank_nodes,
+                    "per_rank_lane_player_nodes": per_rank_lane_nodes,
                     "global_player_nodes": global_nodes,
+                    "global_lane_player_nodes": global_lane_nodes,
+                    "per_rank_lane_effective_hands": per_rank_lane_effective,
+                    "global_lane_effective_hands": global_lane_effective,
                     "logical_work": dict(state.logical_work),
                     "reference": reference.state_dict(),
                     "structure": dict(
@@ -651,12 +872,42 @@ class TrainingSession:
                         "logical_samples": int(
                             state.logical_work["completion_samples"]
                         ),
+                        "posterior_effective_hands": (
+                            global_lane_effective[lane]
+                            if samples_per_leaf
+                            else None
+                        ),
+                    },
+                    "memory": {
+                        "configured_budget_bytes": (
+                            self.plan.manifest.hardware.memory_budget_bytes
+                        ),
+                        "admitted_phase_required_bytes": {
+                            admission.phase.name: admission.required_bytes
+                            for admission in self.plan.admissions
+                        },
+                        "allocated_bytes": torch.cuda.memory_allocated(
+                            self.device
+                        ),
+                        "reserved_bytes": torch.cuda.memory_reserved(
+                            self.device
+                        ),
+                        "peak_allocated_bytes": (
+                            torch.cuda.max_memory_allocated(self.device)
+                        ),
+                        "peak_reserved_bytes": (
+                            torch.cuda.max_memory_reserved(self.device)
+                        ),
+                        "replica_resident_bytes": (
+                            self.optimizers.memory_report().total_bytes
+                        ),
                     },
                     "identity": {
                         "run_id": state.run_id,
                         "scientific_sha256": self.scientific_sha256,
                         "initial_model_sha256": self.initial_model_sha256[lane],
                         "mode": self.mode.key,
+                        **self.runtime_identity,
                     },
                 }
             )
@@ -708,23 +959,40 @@ class TrainingSession:
         completed = 0
         try:
             for iteration in range(start, self.config.execution.iterations):
-                if (
+                local_stop = (
                     deadline_monotonic is not None
                     and time.monotonic() >= deadline_monotonic
-                ):
+                )
+                if self._agree_flag(local_stop):
                     break
+                local_error: Exception | None = None
                 try:
                     result = self.step()
-                except Exception:
-                    if all(
-                        state.iteration == iteration
-                        for state in self.run_states
-                    ):
+                except Exception as exc:  # noqa: BLE001 - rank-common below
+                    local_error = exc
+                    result = None
+                if self._agree_flag(local_error is not None):
+                    checkpointable = all(
+                        state.iteration == iteration for state in self.run_states
+                    )
+                    if self._agree_flag(not checkpointable):
+                        if local_error is not None:
+                            raise local_error
+                        raise RuntimeError(
+                            "another rank failed after leaving the common "
+                            "optimizer boundary"
+                        )
+                    if checkpointable:
                         self.checkpoint(
                             output
                             / f"failure_checkpoint_{iteration:08d}.pt"
                         )
-                    raise
+                    if local_error is not None:
+                        raise local_error
+                    raise RuntimeError(
+                        "another distributed rank failed during the iteration"
+                    )
+                assert result is not None
                 completed += 1
                 if write_rank:
                     metrics = output / "metrics.jsonl"
@@ -742,36 +1010,49 @@ class TrainingSession:
                             )
                             + "\n"
                         )
+                stop_requested = self._agree_flag(notice.requested)
                 checkpoint_due = (
                     (iteration + 1) % self.config.execution.checkpoint_every == 0
-                    or notice.requested
+                    or stop_requested
                 )
                 if checkpoint_due:
                     self.checkpoint(
                         output / f"checkpoint_{iteration + 1:08d}.pt"
                     )
                 del result
-                if notice.requested:
+                if stop_requested:
                     break
         finally:
             notice.restore()
-            if self._owns_process_group and dist.is_initialized():
-                dist.destroy_process_group()
         return completed
+
+    def _agree_flag(self, value: bool) -> bool:
+        if self.distributed is None:
+            return bool(value)
+        flag = torch.tensor(
+            [int(value)], dtype=torch.int32, device=self.device
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(flag.item())
+
+    def close(self) -> None:
+        """Release a process group only after all collective consumers finish."""
+
+        if self._owns_process_group and dist.is_initialized():
+            dist.destroy_process_group()
+            self._owns_process_group = False
 
 
 def train(
     cfg: RootConfig,
     *,
     resume_from: str | Path | None = None,
-    init_checkpoint: str | Path | None = None,
 ) -> None:
-    if init_checkpoint is not None:
-        raise RuntimeError(
-            "runtime weight-only initialization is not supported; "
-            "use the explicit offline artifact converter"
-        )
-    TrainingSession(cfg, resume_from=resume_from).run()
+    session = TrainingSession(cfg, resume_from=resume_from)
+    try:
+        session.run()
+    finally:
+        session.close()
 
 
 __all__ = ["RuntimeError", "TrainingSession", "train"]

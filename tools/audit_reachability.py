@@ -26,7 +26,6 @@ from typing import Iterable, Iterator
 # Keep this short: an obsolete root hides everything below it from this audit.
 DECLARED_PUBLIC_ROOTS = (
     "pbg.runtime.train",
-    "pbg.runtime.build_game_bundle",
     "pbg.config.load_config",
     "pbg.config.load_config_mapping",
     "pbg.eval.br_probe.evaluate_br_probe",
@@ -34,7 +33,7 @@ DECLARED_PUBLIC_ROOTS = (
     "pbg.inference.parse_card",
     "pbg.inference_artifact.load_inference_source",
     "pbg.inference_artifact.export_inference_artifact",
-    "pbg.benchmark.benchmark_modes",
+    "pbg.benchmark.benchmark_training",
     "pbg.benchmark.compare_benchmark",
 )
 

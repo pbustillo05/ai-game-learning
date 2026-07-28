@@ -753,6 +753,7 @@ def test_branched_checkpoint_round_trip_preserves_controllers(
     run = RunState(
         "phase7-checkpoint",
         iteration=2,
+        metrics_prefix=[{"iteration": value} for value in range(2)],
         branch_controller_state=controller.state_dict(),
         cost_safeguard_state=safeguard.state_dict(),
     )

@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import platform
 import statistics
-import hashlib
-import subprocess
 import time
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from pbg.config import RootConfig
+from pbg.identity import accelerator_identity, code_identity
 from pbg.queued import LOGICAL_RNG_VERSION, sha256_file
 from pbg.runtime import TrainingSession
-
 
 _REQUIRED_SAMPLE_METRICS = (
     "seconds",
@@ -27,27 +26,9 @@ _REQUIRED_SAMPLE_METRICS = (
     "peak_reserved_bytes",
     "logical_work_before",
     "logical_work_after",
+    "structure",
+    "telemetry",
 )
-
-
-def _code_identity() -> dict[str, str]:
-    try:
-        revision = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-        diff = subprocess.check_output(
-            ["git", "diff", "--binary", "HEAD", "--", "pbg"],
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError):
-        revision = "unavailable"
-        diff = b""
-    return {
-        "git_revision": revision,
-        "working_tree_sha256": hashlib.sha256(diff).hexdigest(),
-    }
 
 
 def benchmark_training(
@@ -60,10 +41,14 @@ def benchmark_training(
     if warmup < 0 or repeats <= 0:
         raise ValueError("warmup must be nonnegative and repeats positive")
     samples = []
+    benchmark_device: torch.device | None = None
     for index in range(warmup + repeats):
         # Every repeat starts from the identical model/optimizer/RNG/run state.
         # Warmup compiles the same production path but is never a measured row.
-        session = TrainingSession(cfg, resume_from=checkpoint)
+        session = TrainingSession(
+            cfg, resume_from=checkpoint, benchmark_telemetry=True
+        )
+        benchmark_device = session.device
         iteration = session.run_states[0].iteration
         logical_before = tuple(
             dict(state.logical_work) for state in session.run_states
@@ -82,6 +67,21 @@ def benchmark_training(
                     getattr(result, "results", ()) or (result,)
                 )
                 if value is not None
+            )
+            lane_values = tuple(
+                value
+                for value in (
+                    getattr(result, "results", ()) or (result,)
+                )
+                if value is not None
+            )
+            telemetry = tuple(
+                (
+                    asdict(value.telemetry)
+                    if is_dataclass(getattr(value, "telemetry", None))
+                    else None
+                )
+                for value in lane_values
             )
             samples.append(
                 {
@@ -103,9 +103,16 @@ def benchmark_training(
                     "peak_reserved_bytes": torch.cuda.max_memory_reserved(
                         session.device
                     ),
+                    "structure": tuple(
+                        dict(getattr(value, "observability", {}))
+                        for value in lane_values
+                    ),
+                    "telemetry": telemetry,
                 }
             )
         del result
+        session.close()
+        del session
     numeric = {
         key
         for key in set.intersection(*(set(sample) for sample in samples))
@@ -119,7 +126,8 @@ def benchmark_training(
         key: float(statistics.median(sample[key] for sample in samples))
         for key in sorted(numeric)
     }
-    properties = torch.cuda.get_device_properties(session.device)
+    assert benchmark_device is not None
+    properties = torch.cuda.get_device_properties(benchmark_device)
     return {
         "schema": "pbg-queued-benchmark-v1",
         "mode": dict(cfg.mode),
@@ -130,11 +138,14 @@ def benchmark_training(
             "checkpoint_sha256": (
                 None if checkpoint is None else sha256_file(Path(checkpoint))
             ),
-            "code": _code_identity(),
+            "code": code_identity(),
+            "accelerator": accelerator_identity(
+                cfg.scientific.common.game.rank_count
+            ),
             "required_sample_metrics": _REQUIRED_SAMPLE_METRICS,
         },
         "environment": {
-            "device": str(session.device),
+            "device": str(benchmark_device),
             "device_name": properties.name,
             "compute_capability": [properties.major, properties.minor],
             "torch": torch.__version__,

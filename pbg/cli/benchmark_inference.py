@@ -17,21 +17,16 @@ def _prepare_hands(
     session: PokerInferenceSession, batch: int, street: str
 ) -> tuple[list, list[list[int]]]:
     hands = session.new_hands(
-        [index % session.game_config.n_players for index in range(batch)]
+        [index % session.geometry.players for index in range(batch)]
     )
-    active = list(session.game_config.geometry.active_cards)
+    active = list(range(session.geometry.first_card, 52))
     private = [active[-2:] for _ in hands]
     if street == "preflop":
         return hands, private
     for hand in hands:
-        while not bool(session.machine.needs_chance(session._hand(hand).state)[0]):
-            state = session._hand(hand).state
-            actor = state.to_act.long()
-            to_call = float((
-                state.current_bet
-                - state.committed_street.gather(1, actor[:, None]).squeeze(1)
-            ).clamp_min(0).cpu()[0])
-            session.advance(hand, "call" if to_call > 0 else "check")
+        while not session.needs_chance(hand):
+            session.actor(hand)
+            session.advance(hand, "check_call")
         session.deal(hand, active[:3])
     return hands, private
 
@@ -50,6 +45,7 @@ def main() -> None:
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 2, 8, 32])
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument("--max-batch-rows", type=int)
     args = parser.parse_args()
     if (
         args.warmup < 0
@@ -63,6 +59,7 @@ def main() -> None:
         device=args.device,
         precision=args.precision,
         mode=args.mode,
+        max_batch_rows=args.max_batch_rows,
     )
     reports = []
     for batch in args.batches:
@@ -71,12 +68,16 @@ def main() -> None:
             session.predict_many(hands, private)
         if session.device.type == "mps":
             torch.mps.synchronize()
+        else:
+            torch.cuda.synchronize(session.device)
         samples = []
         for _ in range(args.repeats):
             started = time.perf_counter()
             session.predict_many(hands, private)
             if session.device.type == "mps":
                 torch.mps.synchronize()
+            else:
+                torch.cuda.synchronize(session.device)
             samples.append(time.perf_counter() - started)
         ordered = sorted(samples)
         p95_index = min(
