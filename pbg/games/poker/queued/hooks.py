@@ -1251,9 +1251,16 @@ class SequentialPokerHooks:
             .any(1)
             .any(-1)
         )
+        batch_lanes = getattr(
+            batch,
+            "lanes",
+            torch.zeros(1, dtype=torch.int64, device=refreshed.device),
+        )
+        lane_count = int(batch_lanes.numel())
+        lane_rows = refreshed.shape[0] // lane_count
         lane = (
-            batch.lanes[:, None]
-            .expand(batch.lane_count, batch.rows)
+            batch_lanes[:, None]
+            .expand(lane_count, lane_rows)
             .reshape(-1)
         )
         pre = self._owner_slab("FoldedRanges", "pre").columns["range"]

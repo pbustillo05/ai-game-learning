@@ -32,6 +32,7 @@ from pbg.queued import (
     LearnerOperation,
     LearnerSchedule,
     LossConfig,
+    LossResult,
     LossScaler,
     ModelEvaluation,
     NamedShape,
@@ -45,6 +46,8 @@ from pbg.queued import (
     ReplicaOptimizerGroup,
     RunState,
     SequentialLearnerBatch,
+    SequentialSampledIteration,
+    TrainingError,
     build_storage_plan,
     load_replica_checkpoint,
     mode_schema,
@@ -326,6 +329,48 @@ def _distributed_sum_worker(
             failed[1] = True
         common = synchronizer.agree_failures(failed)
         assert common.tolist() == [False, True]
+
+        module_owner = ReplicaModuleOwner((_LearnerToy().cuda(),))
+        optimizer_group = ReplicaOptimizerGroup(
+            module_owner,
+            OptimizerConfig(learning_rate=1.0e-3),
+        )
+        module = module_owner.lane_module(0)
+
+        class _OneBatch:
+            @staticmethod
+            def batches():
+                yield SequentialLearnerBatch(
+                    "pre",
+                    torch.tensor([0], dtype=torch.int64, device=gradients.device),
+                    {
+                        "model_input": torch.ones(
+                            (1, 1), device=gradients.device
+                        )
+                    },
+                )
+
+        class _AsymmetricLearner:
+            @staticmethod
+            def forward_loss_backward(*_args, **_kwargs) -> LossResult:
+                if rank == 1:
+                    raise RuntimeError("injected pre-SUM learner failure")
+                value = module.logit.square() + module.value_weight.square()
+                value.backward()
+                zero = value.detach() * 0
+                return LossResult(value.detach(), zero, zero, zero, zero, zero, zero)
+
+        with pytest.raises(
+            TrainingError, match="failed .* distributed SUM|another distributed"
+        ):
+            SequentialSampledIteration(
+                model=module,
+                learner=_AsymmetricLearner(),  # type: ignore[arg-type]
+                optimizer=optimizer_group.lane_stepper(
+                    0, distributed=synchronizer
+                ),  # type: ignore[arg-type]
+            ).optimize(_OneBatch(), iteration=0)  # type: ignore[arg-type]
+        assert optimizer_group.versions.tolist() == [0]
     finally:
         dist.destroy_process_group()
 

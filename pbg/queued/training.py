@@ -245,12 +245,27 @@ class SequentialSampledIteration:
         presentations = 0
         active_logical_step: int | None = None
         weighted_metrics: dict[str, Tensor] = {}
+        step_error: Exception | None = None
+        agree_failure = getattr(self.optimizer, "agree_failure", None)
 
         def finish_logical_step() -> None:
+            nonlocal step_error
             if active_logical_step is None:
                 return
+            if agree_failure is not None and agree_failure(step_error is not None):
+                self.optimizer.zero_grad()
+                error = step_error
+                step_error = None
+                if error is None:
+                    raise TrainingError(
+                        "learner step failed on another distributed rank"
+                    )
+                raise TrainingError(
+                    "learner step failed before distributed SUM"
+                ) from error
             steps.append(self.optimizer.step())
             loss_tensors.append(dict(weighted_metrics))
+            step_error = None
 
         for batch in sampler.batches():
             if batch.logical_step != active_logical_step:
@@ -270,35 +285,47 @@ class SequentialSampledIteration:
                 if configured_cap is None
                 else min(batch.rows, configured_cap)
             )
-            for begin in range(0, batch.rows, cap):
-                end = min(begin + cap, batch.rows)
-                physical = SequentialLearnerBatch(
-                    batch.input_type,
-                    batch.indices[begin:end],
-                    MappingProxyType(
-                        {name: value[begin:end] for name, value in batch.fields.items()}
-                    ),
-                )
-                weight = physical.rows / batch.objective_rows
-                result: LossResult = self.learner.forward_loss_backward(
-                    physical,
-                    iteration=iteration,
-                    reference_operation=(
-                        reference_operation if reference_caches is None else None
-                    ),
-                    reference_cache=(
-                        None
-                        if reference_caches is None
-                        else reference_caches.get(batch.input_type)
-                    ),
-                    loss_scale=self.optimizer.scaler.scale,
-                    objective_weight=weight,
-                )
-                for name in metric_names:
-                    value = getattr(result, name).detach()
-                    weighted_metrics[name] = (
-                        weighted_metrics.get(name, 0.0) + weight * value
-                    )
+            if step_error is None:
+                try:
+                    for begin in range(0, batch.rows, cap):
+                        end = min(begin + cap, batch.rows)
+                        physical = SequentialLearnerBatch(
+                            batch.input_type,
+                            batch.indices[begin:end],
+                            MappingProxyType(
+                                {
+                                    name: value[begin:end]
+                                    for name, value in batch.fields.items()
+                                }
+                            ),
+                        )
+                        weight = physical.rows / batch.objective_rows
+                        result: LossResult = self.learner.forward_loss_backward(
+                            physical,
+                            iteration=iteration,
+                            reference_operation=(
+                                reference_operation
+                                if reference_caches is None
+                                else None
+                            ),
+                            reference_cache=(
+                                None
+                                if reference_caches is None
+                                else reference_caches.get(batch.input_type)
+                            ),
+                            loss_scale=self.optimizer.scaler.scale,
+                            objective_weight=weight,
+                        )
+                        for name in metric_names:
+                            value = getattr(result, name).detach()
+                            weighted_metrics[name] = (
+                                weighted_metrics.get(name, 0.0)
+                                + weight * value
+                            )
+                except Exception as exc:
+                    if agree_failure is None:
+                        raise
+                    step_error = exc
             presentations += batch.rows
         finish_logical_step()
         if loss_tensors:
@@ -381,14 +408,29 @@ class BranchedSampledIteration:
         presentations = 0
         active_logical_step: int | None = None
         weighted: dict[str, Tensor] = {}
+        step_error: Exception | None = None
+        agree_failure = getattr(self.optimizer, "agree_failure", None)
 
         def finish_step() -> None:
+            nonlocal step_error
             if active_logical_step is None:
                 return
+            if agree_failure is not None and agree_failure(step_error is not None):
+                self.optimizer.zero_grad()
+                error = step_error
+                step_error = None
+                if error is None:
+                    raise TrainingError(
+                        "branched learner step failed on another distributed rank"
+                    )
+                raise TrainingError(
+                    "branched learner step failed before distributed SUM"
+                ) from error
             steps.append(self.optimizer.step())
             metric_tensors.append(
                 torch.stack(tuple(weighted[name] for name in metric_names))
             )
+            step_error = None
 
         for batch in sampler.batches():
             if batch.logical_step != active_logical_step:
@@ -403,23 +445,30 @@ class BranchedSampledIteration:
                 raise TrainingError(
                     "ragged learner batch exceeds an admitted physical pack"
                 )
-            weight = batch.objective_weight
-            result = self.learner.forward_loss_backward(
-                batch,
-                iteration=iteration,
-                reference_operation=reference_operation,
-                reference_cache=(
-                    None
-                    if reference_caches is None
-                    else reference_caches[batch.input_type]
-                ),
-                loss_scale=self.optimizer.scaler.scale,
-                objective_weight=weight,
-            )
-            for name in metric_names:
-                weighted[name] = (
-                    weighted.get(name, 0.0) + weight * getattr(result, name).detach()
-                )
+            if step_error is None:
+                try:
+                    weight = batch.objective_weight
+                    result = self.learner.forward_loss_backward(
+                        batch,
+                        iteration=iteration,
+                        reference_operation=reference_operation,
+                        reference_cache=(
+                            None
+                            if reference_caches is None
+                            else reference_caches[batch.input_type]
+                        ),
+                        loss_scale=self.optimizer.scaler.scale,
+                        objective_weight=weight,
+                    )
+                    for name in metric_names:
+                        weighted[name] = (
+                            weighted.get(name, 0.0)
+                            + weight * getattr(result, name).detach()
+                        )
+                except Exception as exc:
+                    if agree_failure is None:
+                        raise
+                    step_error = exc
             presentations += batch.rows
         finish_step()
         losses = (

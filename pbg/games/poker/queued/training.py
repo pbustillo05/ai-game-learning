@@ -496,6 +496,7 @@ class SequentialPokerIteration:
     def _model(
         self, forward: PokerForwardInput, lanes: Tensor
     ) -> Mapping[str, Tensor]:
+        n_replica = getattr(self, "n_replica", 1)
         autocast_dtype = {
             "fp32": torch.float32,
             "fp16": torch.float16,
@@ -507,7 +508,7 @@ class SequentialPokerIteration:
             enabled=self.precision != "fp32",
         ):
             if self.mode.training_regime is TrainingRegime.SELF_PLAY:
-                if self.n_replica == 1:
+                if n_replica == 1:
                     evaluation = self.rollout_operation(
                         forward.input_type,
                         forward.model_input,
@@ -532,7 +533,7 @@ class SequentialPokerIteration:
                     raise PokerIterationError(
                         "best-response forward omitted selected roles"
                     )
-                if self.n_replica == 1:
+                if n_replica == 1:
                     assert self.frozen_operation is not None
                     evaluation = compact_best_response_evaluation(
                         self.rollout_operation,
@@ -625,7 +626,7 @@ class SequentialPokerIteration:
                     name: value.reshape(
                         -1, *value.shape[2:]
                     ).float()
-                    if self.n_replica > 1
+                    if n_replica > 1
                     else value.float()
                     for name, value in evaluation.policy_raw.items()
                 },
@@ -633,7 +634,7 @@ class SequentialPokerIteration:
                     evaluation.value.reshape(
                         -1, *evaluation.value.shape[2:]
                     ).float()
-                    if self.n_replica > 1
+                    if n_replica > 1
                     else evaluation.value.float()
                 ),
             }

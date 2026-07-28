@@ -511,6 +511,17 @@ class ReplicaLaneOptimizer:
     def zero_grad(self) -> None:
         self.group.zero_grad((self.lane,))
 
+    def agree_failure(self, failed: bool) -> bool:
+        if self.distributed is None:
+            return bool(failed)
+        local = torch.zeros(
+            self.group.modules.n_replica,
+            dtype=torch.bool,
+            device=self.group.modules.device,
+        )
+        local[self.lane] = bool(failed)
+        return bool(self.distributed.agree_failures(local)[self.lane])
+
     def step(self) -> OptimizerStep:
         result = self.group.step(
             (self.lane,),
