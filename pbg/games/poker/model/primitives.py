@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 import math
-import warnings
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
-
-_FLEX_CACHE: dict[int, object] = {}
-
 
 def accelerator_assert(condition: Tensor, message: str) -> None:
     """Issue an asynchronous check unless an enclosing transform owns it."""
@@ -22,52 +18,6 @@ def accelerator_assert(condition: Tensor, message: str) -> None:
         torch._assert_async(condition, message)
     elif not bool(condition):
         raise ValueError(message)
-
-
-def _compiled_flex(d_head: int):
-    """Return a compiled exact biased-attention callable for one head width."""
-
-    cached = _FLEX_CACHE.get(d_head)
-    if cached is not None:
-        return cached
-    try:
-        from torch.nn.attention.flex_attention import flex_attention
-    except ImportError as exc:  # pragma: no cover - depends on installed Torch
-        raise RuntimeError("this Torch build does not provide FlexAttention") from exc
-
-    scale = 1.0 / math.sqrt(d_head)
-
-    def call(
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        key_bias: Tensor,
-        key_mask: Tensor,
-    ) -> Tensor:
-        def score_mod(
-            score: Tensor,
-            batch: Tensor,
-            head: Tensor,
-            query_index: Tensor,
-            key_index: Tensor,
-        ) -> Tensor:
-            del head, query_index
-            biased = score + key_bias[batch, key_index]
-            return torch.where(
-                key_mask[batch, key_index], biased, biased.new_full((), -torch.inf)
-            )
-
-        return flex_attention(
-            query,
-            key,
-            value,
-            score_mod=score_mod,
-            scale=scale,
-        )
-
-    compiled = torch.compile(call, fullgraph=True, dynamic=True)
-    _FLEX_CACHE[d_head] = compiled
-    return compiled
 
 
 class LN(nn.LayerNorm):
@@ -127,7 +77,7 @@ class MHA(nn.Module):
         self.w_v = nn.Linear(d_model, d_model)
         self.w_o = nn.Linear(d_model, d_model)
         # Execution-only attributes are deliberately absent from state_dict.
-        self.attention_backend = "auto"
+        self.attention_backend = "sdpa"
         self.query_chunk_size = 128
         # softplus(theta) + .5 == 1 at initialization.
         initial_theta = math.log(math.expm1(0.5))
@@ -228,7 +178,7 @@ class MHA(nn.Module):
     def configure_execution(self, backend: str, query_chunk_size: int) -> None:
         """Select a mathematically exact bounded-memory execution strategy."""
 
-        if backend not in {"auto", "flex", "sdpa", "chunked_dense"}:
+        if backend not in {"sdpa", "chunked_dense"}:
             raise ValueError("unknown attention backend")
         if isinstance(query_chunk_size, bool) or query_chunk_size <= 0:
             raise ValueError("query_chunk_size must be positive")
@@ -275,19 +225,6 @@ class MHA(nn.Module):
                 chunks.append(attend(query_chunk, k_head, v_head))
         return torch.cat(chunks, dim=2)
 
-    def _flex_attention(
-        self,
-        q_head: Tensor,
-        k_head: Tensor,
-        v_head: Tensor,
-        key_bias: Tensor,
-        key_mask: Tensor,
-    ) -> Tensor:
-        temperature = self.temperature.to(dtype=q_head.dtype)[None, :, None, None]
-        return _compiled_flex(self.d_head)(
-            q_head / temperature, k_head, v_head, key_bias, key_mask
-        )
-
     def forward(
         self,
         q: Tensor,
@@ -316,29 +253,10 @@ class MHA(nn.Module):
             attended = self._sdpa_biased_attention(
                 q_head, k_head, v_head, key_bias, key_mask
             )
-        elif self.attention_backend == "chunked_dense" or (
-            self.attention_backend == "auto" and self.d_head < 16
-        ):
+        else:
             attended = self._chunked_attention(
                 q_head, k_head, v_head, key_bias, key_mask
             )
-        else:
-            try:
-                attended = self._flex_attention(
-                    q_head, k_head, v_head, key_bias, key_mask
-                )
-            except Exception as exc:
-                if self.attention_backend == "flex":
-                    raise RuntimeError("configured FlexAttention execution failed") from exc
-                warnings.warn(
-                    f"FlexAttention unavailable ({type(exc).__name__}); using exact "
-                    "checkpointed query-chunk attention",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                attended = self._chunked_attention(
-                    q_head, k_head, v_head, key_bias, key_mask
-                )
         merged = attended.transpose(1, 2).reshape(q.shape[0], q.shape[1], self.d_model)
         return self.w_o(merged)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -56,6 +57,32 @@ def _artifact(path: Path, device: str) -> Path:
     ).hexdigest()
     torch.save(artifact, path)
     return path
+
+
+@pytest.mark.parametrize(
+    ("scope", "legacy_key", "current_key", "value"),
+    (
+        ("game", "n_players", "players", 2),
+        ("model", "eps", "epsilon", 1.0e-8),
+        ("model", "k_act", None, 7),
+        ("model", "use_branching_heads", None, False),
+        ("model", "max_history_tokens", None, 32),
+    ),
+)
+def test_model_factory_rejects_legacy_and_derived_scientific_fields(
+    scope: str,
+    legacy_key: str,
+    current_key: str | None,
+    value: object,
+) -> None:
+    scientific = copy.deepcopy(load_config(CONFIG).scientific_mapping())
+    section = scientific[scope]
+    assert isinstance(section, dict)
+    if current_key is not None:
+        section.pop(current_key)
+    section[legacy_key] = value
+    with pytest.raises(ValueError, match=legacy_key):
+        build_model_from_config(scientific, "cpu")
 
 
 def test_inference_artifact_rejects_legacy_and_invalid_hash(tmp_path: Path) -> None:

@@ -962,7 +962,7 @@ def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
                 "ffn_hidden": 8,
                 "folder_beta_rank": 0,
                 "folder_line_dim": 2,
-                "eps": 1.0e-8,
+                "epsilon": 1.0e-8,
             },
         },
         device,

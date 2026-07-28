@@ -4,6 +4,12 @@ import torch
 from pbg.games.poker.model.primitives import MHA
 
 
+@pytest.mark.parametrize("backend", ("auto", "flex"))
+def test_attention_rejects_implicit_or_unpublished_backends(backend: str) -> None:
+    with pytest.raises(ValueError, match="unknown attention backend"):
+        MHA(16, 4).configure_execution(backend, query_chunk_size=8)
+
+
 def test_key_bias_is_not_tempered() -> None:
     torch.manual_seed(61)
     mha = MHA(16, 4)
@@ -71,27 +77,3 @@ def test_biased_sdpa_matches_explicit_forward_and_backward() -> None:
     for left, right in zip(explicit.parameters(), sdpa.parameters(), strict=True):
         if left.grad is not None:
             torch.testing.assert_close(right.grad, left.grad, atol=1e-5, rtol=1e-5)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-def test_cuda_biased_sdpa_matches_flex_throughput_precision() -> None:
-    torch.manual_seed(64)
-    flex = MHA(128, 4).cuda().train()
-    sdpa = MHA(128, 4).cuda().train()
-    sdpa.load_state_dict(flex.state_dict())
-    flex.configure_execution("flex", query_chunk_size=128)
-    sdpa.configure_execution("sdpa", query_chunk_size=128)
-    query_a = torch.randn(2, 128, 128, device="cuda", requires_grad=True)
-    query_b = query_a.detach().clone().requires_grad_()
-    bias = 3 * torch.randn(2, 128, device="cuda", dtype=torch.float32)
-    mask = torch.rand(2, 128, device="cuda") > 0.05
-    with torch.autocast("cuda", dtype=torch.float16):
-        output_a = flex.forward_biased(query_a, query_a, bias, mask)
-        output_b = sdpa.forward_biased(query_b, query_b, bias, mask)
-    torch.testing.assert_close(output_b, output_a, atol=2e-3, rtol=2e-2)
-    output_a.float().square().mean().backward()
-    output_b.float().square().mean().backward()
-    torch.testing.assert_close(query_b.grad, query_a.grad, atol=1e-5, rtol=5e-2)
-    for left, right in zip(flex.parameters(), sdpa.parameters(), strict=True):
-        if left.grad is not None:
-            torch.testing.assert_close(right.grad, left.grad, atol=1e-4, rtol=5e-2)

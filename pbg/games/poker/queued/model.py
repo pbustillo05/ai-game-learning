@@ -531,15 +531,11 @@ def build_model_from_config(
             "scientific configuration must contain game and model objects"
         )
     game_values = dict(game)
-    if "players" in game_values:
-        players = game_values["players"]
-        if "n_players" in game_values:
-            raise ValueError("scientific.game contains duplicate player counts")
-    else:
-        players = game_values.get("n_players")
+    if "n_players" in game_values:
+        raise ValueError("scientific.game.n_players is not supported")
     try:
         geometry = NLHEGeometry(
-            players=int(players),
+            players=int(game_values["players"]),
             stack_bb=float(game_values["stack_bb"]),
             rank_count=int(game_values["rank_count"]),
         )
@@ -547,31 +543,24 @@ def build_model_from_config(
         raise ValueError("scientific.game is not a valid NLHE geometry") from exc
 
     model_values = dict(model)
-    if "epsilon" in model_values:
-        if "eps" in model_values:
-            raise ValueError("scientific.model contains duplicate epsilon values")
+    forbidden_derived = (
+        "eps",
+        "k_act",
+        "use_branching_heads",
+        "max_history_tokens",
+    )
+    stale = next((name for name in forbidden_derived if name in model_values), None)
+    if stale is not None:
+        raise ValueError(f"scientific.model.{stale} is not supported")
+    try:
         model_values["eps"] = model_values.pop("epsilon")
+    except KeyError as exc:
+        raise ValueError("scientific.model.epsilon is required") from exc
     derived_action_width = 3 + int(model_values.get("m_raise", 4))
-    if "k_act" in model_values and model_values["k_act"] != derived_action_width:
-        raise ValueError("scientific.model.k_act disagrees with m_raise")
     model_values["k_act"] = derived_action_width
     expected_branching_heads = schema.rollout_mode.is_branched
-    if (
-        "use_branching_heads" in model_values
-        and model_values["use_branching_heads"] is not expected_branching_heads
-    ):
-        raise ValueError(
-            "scientific.model.use_branching_heads disagrees with rollout mode"
-        )
     model_values["use_branching_heads"] = expected_branching_heads
     required_history = max_public_history_tokens(geometry.players, geometry.stack_bb)
-    if (
-        "max_history_tokens" in model_values
-        and int(model_values["max_history_tokens"]) != required_history
-    ):
-        raise ValueError(
-            "scientific.model.max_history_tokens is not the derived exact bound"
-        )
     model_values["max_history_tokens"] = required_history
     model_config = PokerModelConfig.from_dict(model_values)
     if model_config.max_players < geometry.players:

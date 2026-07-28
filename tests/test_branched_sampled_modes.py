@@ -193,6 +193,7 @@ def _scientific_config(regime: str, rollout: str) -> dict[str, object]:
             "ffn_hidden": 8,
             "folder_beta_rank": 0,
             "folder_line_dim": 2,
+            "epsilon": 1.0e-8,
         },
         "loss": {
             "reference_kl_coefficient": 0.0,

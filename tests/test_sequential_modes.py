@@ -96,7 +96,12 @@ def _config(regime: str, estimator: str) -> dict[str, object]:
             "private_estimator": estimator,
         },
         "game": {"players": 2, "stack_bb": 8.0, "rank_count": 4},
-        "model": {"d_model": 4, "n_heads": 1, "max_players": 2},
+        "model": {
+            "d_model": 4,
+            "n_heads": 1,
+            "max_players": 2,
+            "epsilon": 1.0e-8,
+        },
         "loss": {},
         "optimizer": {},
         "schedule": {"batch_size": 2},
@@ -154,6 +159,7 @@ def test_native_postflop_model_consumes_signed_folded_summary() -> None:
         "ffn_hidden": 16,
         "folder_beta_rank": 4,
         "folder_line_dim": 4,
+        "epsilon": 1.0e-8,
     }
     model = build_model_from_config(scientific, device)
     geometry = model.geometry
