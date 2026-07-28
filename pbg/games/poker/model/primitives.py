@@ -60,9 +60,9 @@ class FFN(nn.Module):
 class MHA(nn.Module):
     """Multi-head attention with learned content temperatures and key priors.
 
-    ``key_bias`` is added after the temperature-scaled content score. A zero
-    bias uses PyTorch SDPA; a nonzero bias uses the explicit implementation.
-    Both paths use the same projections and output affine map.
+    ``key_bias`` is added after the temperature-scaled content score. The
+    configured execution is either native SDPA or exact query-chunked dense
+    attention; both use the same projections and output affine map.
     """
 
     def __init__(self, d_model: int, n_heads: int) -> None:
