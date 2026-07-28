@@ -837,6 +837,8 @@ def test_four_branched_rb_modes_complete_optimizer_step(
     ).run(iteration=0)
     assert result.player_nodes
     assert result.leaves
+    assert result.posterior_effective_hands is not None
+    assert 0 < result.posterior_effective_hands <= result.leaves * 4
     assert result.learner.optimizer_steps
     assert result.learner.optimizer_steps[0].applied
     if regime == "self_play" and rollout == "branched.fixed":

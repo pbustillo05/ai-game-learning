@@ -97,7 +97,14 @@ trap 'forward_signal INT' INT
 write_status() {
   local state=$1 exit_code=${2:-} now checkpoint metrics
   now=$(date --iso-8601=seconds)
-  checkpoint=$(find "$run_dir" -maxdepth 1 -name 'ckpt_*.pt' -printf '%f\n' | sort | tail -n 1)
+  checkpoint=$(
+    find "$run_dir" -maxdepth 1 \
+      \( -name 'checkpoint_????????.pt' -o -name 'failure_checkpoint_????????.pt' \) \
+      -printf '%T@ %f\n' |
+      sort -n |
+      tail -n 1 |
+      cut -d' ' -f2-
+  )
   metrics=$(wc -l < "$run_dir/metrics.jsonl" 2>/dev/null || echo 0)
   jq -n \
     --arg state "$state" --arg started "$started_at" --arg updated "$now" \

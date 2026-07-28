@@ -1211,6 +1211,11 @@ def test_all_four_sequential_modes_complete_an_optimizer_step(
         result = iteration_runner.run(iteration=0)
     assert result.learner.optimizer_steps
     assert all(step.applied for step in result.learner.optimizer_steps)
+    if rb:
+        assert result.posterior_effective_hands is not None
+        assert 0 < result.posterior_effective_hands <= result.leaves * 4
+    else:
+        assert result.posterior_effective_hands is None
 
 
 @CUDA
@@ -1311,3 +1316,8 @@ def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
     result = runner.run(iteration=0)
     assert result.learner.optimizer_steps
     assert all(step.applied for step in result.learner.optimizer_steps)
+    if estimator == "rao_blackwell":
+        assert result.posterior_effective_hands is not None
+        assert 0 < result.posterior_effective_hands <= result.leaves * 4
+    else:
+        assert result.posterior_effective_hands is None

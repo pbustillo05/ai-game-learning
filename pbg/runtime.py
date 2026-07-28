@@ -60,6 +60,7 @@ from pbg.queued import (
     save_replica_checkpoint,
     sha256_file,
 )
+from pbg.queued.persistence import LOGICAL_WORK_KEYS
 
 
 class RuntimeError(RuntimeError):
@@ -737,6 +738,15 @@ class TrainingSession:
         if len(iterations) != 1:
             raise RuntimeError("all active lanes must enter an iteration together")
         iteration = iterations.pop()
+        reference_refresh_before = []
+        for lane, reference in enumerate(self.reference_states):
+            refresh = reference.refresh_before_iteration(iteration)
+            reference_refresh_before.append(refresh)
+            if refresh:
+                self.reference_modules.lane_module(lane).load_state_dict(
+                    self.modules.lane_module(lane).state_dict(),
+                    strict=True,
+                )
         result = (
             self._run_sequential(iteration)
             if isinstance(self.config.scientific, SequentialModeConfig)
@@ -760,20 +770,33 @@ class TrainingSession:
             )
         )
         local_effective = [
-            int(
+            float(
                 getattr(
                     lane_results[lane] if lane < len(lane_results) else None,
-                    "leaves",
-                    0,
+                    "posterior_effective_hands",
+                    0.0,
                 )
+                or 0.0
             )
-            * samples_per_leaf
             for lane in range(len(self.run_states))
         ]
+        if samples_per_leaf and any(value <= 0.0 for value in local_effective):
+            raise RuntimeError(
+                "RB completion omitted positive posterior effective hands"
+            )
+        if self.mode.private_estimator.value == "rao_blackwell":
+            for lane, state in enumerate(self.run_states):
+                lane_result = (
+                    lane_results[lane] if lane < len(lane_results) else None
+                )
+                leaves = int(getattr(lane_result, "leaves", 0))
+                state.logical_work["completion_samples"] += (
+                    leaves * samples_per_leaf
+                )
         if self.distributed is not None:
             lane_totals = torch.tensor(
                 [*local_nodes, *local_effective],
-                dtype=torch.int64,
+                dtype=torch.float64,
                 device=self.device,
             )
             gathered = [
@@ -787,14 +810,80 @@ class TrainingSession:
                 for value in gathered
             ]
             per_rank_lane_effective = [
-                [int(item) for item in value[split:].tolist()]
+                [float(item) for item in value[split:].tolist()]
                 for value in gathered
             ]
             per_rank_nodes = [sum(value) for value in per_rank_lane_nodes]
+            logical_values = torch.tensor(
+                [
+                    state.logical_work[name]
+                    for state in self.run_states
+                    for name in LOGICAL_WORK_KEYS
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            gathered_logical = [
+                torch.empty_like(logical_values)
+                for _ in range(dist.get_world_size())
+            ]
+            dist.all_gather(gathered_logical, logical_values)
         else:
             per_rank_lane_nodes = [local_nodes]
             per_rank_lane_effective = [local_effective]
             per_rank_nodes = [local_total]
+            gathered_logical = [
+                torch.tensor(
+                    [
+                        state.logical_work[name]
+                        for state in self.run_states
+                        for name in LOGICAL_WORK_KEYS
+                    ],
+                    dtype=torch.int64,
+                )
+            ]
+        per_rank_lane_logical_work = []
+        for rank_values in gathered_logical:
+            flat = [int(value) for value in rank_values.tolist()]
+            per_rank_lane_logical_work.append(
+                [
+                    {
+                        name: flat[
+                            lane * len(LOGICAL_WORK_KEYS) + index
+                        ]
+                        for index, name in enumerate(LOGICAL_WORK_KEYS)
+                    }
+                    for lane in range(len(self.run_states))
+                ]
+            )
+        per_rank_logical_work = [
+            {
+                name: sum(lane[name] for lane in rank_lanes)
+                for name in LOGICAL_WORK_KEYS
+            }
+            for rank_lanes in per_rank_lane_logical_work
+        ]
+        global_lane_logical_work = [
+            {
+                name: (
+                    max(
+                        rank_lanes[lane][name]
+                        for rank_lanes in per_rank_lane_logical_work
+                    )
+                    if name == "optimizer_steps"
+                    else sum(
+                        rank_lanes[lane][name]
+                        for rank_lanes in per_rank_lane_logical_work
+                    )
+                )
+                for name in LOGICAL_WORK_KEYS
+            }
+            for lane in range(len(self.run_states))
+        ]
+        global_logical_work = {
+            name: sum(lane[name] for lane in global_lane_logical_work)
+            for name in LOGICAL_WORK_KEYS
+        }
         global_nodes = sum(per_rank_nodes)
         global_lane_nodes = [
             sum(rank_nodes[lane] for rank_nodes in per_rank_lane_nodes)
@@ -815,23 +904,29 @@ class TrainingSession:
                     getattr(lane_result, "nodes", 0),
                 )
             )
-            if reference.observe(
-                iteration=state.iteration,
-                effective_hands=float(
-                    global_lane_effective[lane]
-                    if samples_per_leaf
-                    else global_lane_nodes[lane]
-                ),
-            ):
+            exposure = float(
+                global_lane_effective[lane]
+                if samples_per_leaf
+                else global_lane_nodes[lane]
+            )
+            reference_before = reference.effective_hands_rollout
+            reference_threshold = reference.interval_effective_hands
+            reference_overshoot = (
+                max(
+                    reference_before + exposure - reference_threshold,
+                    0.0,
+                )
+                if reference_threshold is not None
+                else 0.0
+            )
+            reference_refresh_after = reference.observe(
+                iteration=iteration + 1,
+                effective_hands=exposure,
+            )
+            if reference_refresh_after:
                 self.reference_modules.lane_module(lane).load_state_dict(
                     self.modules.lane_module(lane).state_dict(),
                     strict=True,
-                )
-            if self.mode.private_estimator.value == "rao_blackwell":
-                completion = self.config.scientific.applicable["completion"]
-                leaves = int(getattr(lane_result, "leaves", 0))
-                state.logical_work["completion_samples"] += (
-                    leaves * int(completion["n_samples"])
                 )
             state.iteration = iteration + 1
             if not state.metrics_prefix:
@@ -858,7 +953,36 @@ class TrainingSession:
                     "per_rank_lane_effective_hands": per_rank_lane_effective,
                     "global_lane_effective_hands": global_lane_effective,
                     "logical_work": dict(state.logical_work),
+                    "per_rank_lane_logical_work": (
+                        per_rank_lane_logical_work
+                    ),
+                    "per_rank_logical_work": per_rank_logical_work,
+                    "global_lane_logical_work": global_lane_logical_work,
+                    "global_logical_work": global_logical_work,
                     "reference": reference.state_dict(),
+                    "kl_ref_refresh_before_iteration": (
+                        reference_refresh_before[lane]
+                    ),
+                    "kl_ref_effective_hands_rollout_before": (
+                        reference_before
+                    ),
+                    "kl_ref_effective_hands_rollout_threshold": (
+                        reference_threshold
+                    ),
+                    "kl_ref_refresh_after_iteration": (
+                        reference_refresh_after
+                    ),
+                    "kl_ref_effective_hands_rollout_overshoot": (
+                        reference_overshoot
+                        if reference_refresh_after
+                        else 0.0
+                    ),
+                    "kl_ref_effective_hands_rollout_after": (
+                        reference.effective_hands_rollout
+                    ),
+                    "reference_iteration_next": (
+                        reference.reference_iteration
+                    ),
                     "structure": dict(
                         getattr(lane_result, "observability", {})
                     ),

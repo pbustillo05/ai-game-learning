@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import platform
 import statistics
 import time
@@ -142,7 +143,7 @@ def benchmark_training(
             "accelerator": accelerator_identity(
                 cfg.scientific.common.game.rank_count
             ),
-            "required_sample_metrics": _REQUIRED_SAMPLE_METRICS,
+            "required_sample_metrics": list(_REQUIRED_SAMPLE_METRICS),
         },
         "environment": {
             "device": str(benchmark_device),
@@ -169,8 +170,21 @@ def compare_benchmark(
     if not 0 <= max_regression < 1:
         raise ValueError("max_regression must be in [0,1)")
     failures = []
+
+    def canonical(value: object) -> object:
+        return json.loads(
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+
     for identity in ("mode", "scientific_config", "execution", "identity"):
-        if current.get(identity) != baseline.get(identity):
+        if canonical(current.get(identity)) != canonical(
+            baseline.get(identity)
+        ):
             failures.append(f"{identity} identity differs")
     for report_name, report in (("current", current), ("baseline", baseline)):
         for index, sample in enumerate(report.get("samples", ())):
@@ -179,6 +193,40 @@ def compare_benchmark(
                 failures.append(
                     f"{report_name} sample {index} misses {sorted(missing)}"
                 )
+    current_work = {
+        json.dumps(
+            canonical(
+                (
+                    sample["logical_work_before"],
+                    sample["logical_work_after"],
+                )
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for sample in current.get("samples", ())
+        if {"logical_work_before", "logical_work_after"} <= set(sample)
+    }
+    baseline_work = {
+        json.dumps(
+            canonical(
+                (
+                    sample["logical_work_before"],
+                    sample["logical_work_after"],
+                )
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for sample in baseline.get("samples", ())
+        if {"logical_work_before", "logical_work_after"} <= set(sample)
+    }
+    if len(current_work) != 1:
+        failures.append("current samples do not share one logical-work identity")
+    if len(baseline_work) != 1:
+        failures.append("baseline samples do not share one logical-work identity")
+    if current_work != baseline_work:
+        failures.append("logical work differs")
     if (
         not allow_environment_mismatch
         and current.get("environment") != baseline.get("environment")

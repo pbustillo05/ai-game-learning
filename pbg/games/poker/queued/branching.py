@@ -253,6 +253,7 @@ class BranchedPokerResult:
     root_target_degree: tuple[int, ...]
     duplicate_child_labels: int
     sampled_tree_nodes: int
+    posterior_effective_hands: float | None = None
     telemetry: BranchedBenchmarkTelemetry | None = None
     observability: Mapping[str, object] = field(
         default_factory=lambda: MappingProxyType({})
@@ -3290,6 +3291,11 @@ class _BranchedSampledPokerAttempt:
             torch._assert_async(success.all(), "branched completion failed")
             remaining -= count
         completion.release()
+        posterior_effective_hands = (
+            None
+            if not isinstance(binding, RBCompletionBinding)
+            else float(binding.effective_hands[0].detach().cpu())
+        )
         del binding
         for output, name in enumerate(plan.output_names):
             work = owners.slab("LayerWork", name)
@@ -3546,6 +3552,7 @@ class _BranchedSampledPokerAttempt:
                 ),
                 duplicate_child_labels=duplicate_labels,
                 sampled_tree_nodes=sampled_tree_nodes,
+                posterior_effective_hands=posterior_effective_hands,
                 telemetry=telemetry,
                 observability=MappingProxyType(
                     {
@@ -4391,6 +4398,14 @@ class ReplicaBranchedPokerIteration:
             for lane in active:
                 remaining[lane] -= rows
         completion.release()
+        posterior_effective_hands = (
+            None
+            if not isinstance(completion_binding, RBCompletionBinding)
+            else tuple(
+                float(value)
+                for value in completion_binding.effective_hands.detach().cpu().tolist()
+            )
+        )
         del completion_binding
         for output, name in enumerate(plan.output_names):
             work = owners.slab("LayerWork", name)
@@ -4760,6 +4775,11 @@ class ReplicaBranchedPokerIteration:
                     ),
                     duplicate_child_labels=duplicate_labels,
                     sampled_tree_nodes=sampled_nodes[lane],
+                    posterior_effective_hands=(
+                        None
+                        if posterior_effective_hands is None
+                        else posterior_effective_hands[lane]
+                    ),
                     observability=MappingProxyType(
                         {
                             **topology_diagnostics(

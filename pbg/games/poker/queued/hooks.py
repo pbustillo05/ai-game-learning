@@ -2188,6 +2188,11 @@ class RBCompletionBinding:
         self.n_replica = int(n_replica)
         self.pack_cap = int(pack_cap)
         self.n_samples = int(n_samples)
+        self.effective_hands = torch.zeros(
+            self.n_replica,
+            dtype=torch.float32,
+            device=next(iter(self.layer_work.values())).device,
+        )
         if utility not in ("raw_bb", "stack_normalized"):
             raise ValueError("completion utility must be raw_bb or stack_normalized")
         self.utility_scale = 1.0 if utility == "raw_bb" else 1.0 / geometry.stack_bb
@@ -2218,6 +2223,12 @@ class RBCompletionBinding:
             selected = fields["selected_player"].reshape(flat).to(torch.int64)
             cutoff = fields["probe_cutoff"].reshape(flat).bool()
             ordinary_row = torch.nonzero(~cutoff, as_tuple=False).flatten()
+            n_eff = torch.full(
+                (flat,),
+                float(self.n_samples),
+                dtype=torch.float32,
+                device=selected.device,
+            )
             p_hat = torch.zeros(
                 (flat, 1, self.geometry.private_hands),
                 dtype=torch.float32,
@@ -2249,6 +2260,11 @@ class RBCompletionBinding:
                     ordinary_row,
                     completed.v_hat.reshape(-1, 1, self.geometry.private_hands).float(),
                 )
+                n_eff.index_copy_(
+                    0,
+                    ordinary_row,
+                    completed.n_eff.reshape(-1).float(),
+                )
             cutoff_row = torch.nonzero(cutoff, as_tuple=False).flatten()
             if cutoff_row.numel():
                 cutoff_selected = selected.index_select(0, cutoff_row)
@@ -2269,12 +2285,26 @@ class RBCompletionBinding:
                 )
         else:
             completed = self.evaluator.complete(**common)
+            n_eff = completed.n_eff.reshape(flat).float()
             p_hat = (
                 completed.p_hat.reshape(flat, p_train, self.geometry.private_hands)
                 .float()
                 .contiguous()
             )
             v_hat = completed.v_hat.reshape_as(p_hat).float()
+        torch._assert_async(
+            (
+                torch.isfinite(n_eff)
+                & n_eff.gt(0)
+                & n_eff.le(float(self.n_samples) + 1.0e-4)
+            ).all(),
+            "completion n_eff must be finite, positive, and sample-bounded",
+        )
+        self.effective_hands.index_add_(
+            0,
+            batch.lanes,
+            n_eff.reshape(batch.lanes.numel(), batch.rows).sum(1),
+        )
         v_hat.mul_(self.utility_scale)
         lane_count = batch.lanes.numel()
         pre = (

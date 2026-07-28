@@ -119,6 +119,14 @@ def _atomic_json_save(value: object, destination: Path) -> None:
             os.unlink(temporary_name)
 
 
+LOGICAL_WORK_KEYS = (
+    "trajectories",
+    "completion_samples",
+    "minibatches",
+    "optimizer_steps",
+)
+
+
 @dataclass
 class RunState:
     run_id: str
@@ -143,21 +151,18 @@ class RunState:
         ):
             raise ValueError("run identity and iteration are invalid")
         if self.logical_work is None:
-            self.logical_work = {
-                "trajectories": 0,
-                "completion_samples": 0,
-                "minibatches": 0,
-                "optimizer_steps": 0,
-            }
+            self.logical_work = {name: 0 for name in LOGICAL_WORK_KEYS}
         if self.overflow_recoveries is None:
             self.overflow_recoveries = []
         if self.metrics_prefix is None:
             self.metrics_prefix = []
-        if any(
+        if set(self.logical_work) != set(LOGICAL_WORK_KEYS) or any(
             isinstance(value, bool) or not isinstance(value, int) or value < 0
             for value in self.logical_work.values()
         ):
-            raise ValueError("logical work counters must be nonnegative integers")
+            raise ValueError(
+                "logical work requires the exact nonnegative integer counters"
+            )
         try:
             iterations = [int(item["iteration"]) for item in self.metrics_prefix]
         except (KeyError, TypeError, ValueError) as exc:
@@ -1114,6 +1119,7 @@ def convert_legacy_sequential(
             if isinstance(logical_work, Mapping)
             else {
                 "trajectories": 0,
+                "completion_samples": 0,
                 "minibatches": 0,
                 "optimizer_steps": 0,
             }

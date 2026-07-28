@@ -900,6 +900,10 @@ def test_public_config_composes_checkpoint_preemption_and_exact_resume(
     reference = _EndToEndPokerModel(
         device, geometry.private_hands, check_down=True
     )
+    initial_model_state = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+    }
     notice = PreemptionNotice()
     notice.requested_signal = 15
     checkpoint = tmp_path / "preempted.pt"
@@ -920,9 +924,9 @@ def test_public_config_composes_checkpoint_preemption_and_exact_resume(
     result = session.run()
     assert result.player_nodes == 8
     assert checkpoint.is_file()
-    assert session.reference_state.reference_iteration == 1
-    for name, value in model.state_dict().items():
-        torch.testing.assert_close(reference.state_dict()[name], value)
+    assert session.reference_state.reference_iteration == 0
+    for name, value in reference.state_dict().items():
+        torch.testing.assert_close(value, initial_model_state[name])
 
     resumed_model = _EndToEndPokerModel(
         device, geometry.private_hands, check_down=True

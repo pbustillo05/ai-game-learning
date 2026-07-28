@@ -2307,15 +2307,30 @@ class ReferenceState:
         ):
             raise ValueError("reference effective-hand cadence must be positive")
 
+    def refresh_before_iteration(self, iteration: int) -> bool:
+        """Apply the preserved interval cadence at the iteration boundary."""
+
+        if iteration < 0:
+            raise ValueError("reference iteration must be nonnegative")
+        if self.interval_iterations is None:
+            return False
+        due = iteration % self.interval_iterations == 0
+        if due:
+            self.reference_iteration = iteration
+            self.effective_hands_rollout = 0.0
+        return due
+
     def observe(self, *, iteration: int, effective_hands: float) -> bool:
+        """Observe one completed boundary for the effective-hand cadence."""
+
         if effective_hands < 0 or not math.isfinite(effective_hands):
             raise ValueError("effective hands must be finite and nonnegative")
+        if iteration < 0:
+            raise ValueError("reference iteration must be nonnegative")
+        if self.interval_effective_hands is None:
+            return False
         self.effective_hands_rollout += effective_hands
-        if self.interval_iterations is not None:
-            due = iteration - self.reference_iteration >= self.interval_iterations
-        else:
-            assert self.interval_effective_hands is not None
-            due = self.effective_hands_rollout >= self.interval_effective_hands
+        due = self.effective_hands_rollout >= self.interval_effective_hands
         if due:
             self.reference_iteration = iteration
             self.effective_hands_rollout = 0.0

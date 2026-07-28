@@ -108,6 +108,7 @@ class PokerIterationResult:
     player_nodes: int
     leaves: int
     target_layers: int
+    posterior_effective_hands: float | None = None
     telemetry: SequentialBenchmarkTelemetry | None = None
     observability: Mapping[str, object] = field(
         default_factory=lambda: MappingProxyType({})
@@ -1037,6 +1038,14 @@ class SequentialPokerIteration:
             for lane in active_lanes:
                 remaining_leaves[lane] -= rows
         completion.release()
+        posterior_effective_hands = (
+            None
+            if not isinstance(binding, RBCompletionBinding)
+            else tuple(
+                float(value)
+                for value in binding.effective_hands.detach().cpu().tolist()
+            )
+        )
         # RBCompletionBinding owns the resident H-to-K CUDA mask. Completion
         # is its exact last consumer; do not carry library workspace into
         # align/targets/learner or the zero-workspace final-backward phase.
@@ -1162,6 +1171,11 @@ class SequentialPokerIteration:
                 player_nodes=topologies[lane].node_count,
                 leaves=leaf_counts[lane],
                 target_layers=plan.layer_count,
+                posterior_effective_hands=(
+                    None
+                    if posterior_effective_hands is None
+                    else posterior_effective_hands[lane]
+                ),
                 observability=MappingProxyType(
                     {
                         **topology_diagnostics(
@@ -1841,6 +1855,10 @@ class Phase5TrainingSession:
         )
         if selected_iteration != self.run_state.iteration:
             raise ValueError("session may run only the next checkpointed iteration")
+        if self.reference_state.refresh_before_iteration(selected_iteration):
+            self.reference_model.load_state_dict(
+                self.model.state_dict(), strict=True
+            )
         result = RecoveringSequentialSampledPokerIteration(
             owner_factory=self.owner_factory,
             plan=self.plan,

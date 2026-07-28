@@ -23,7 +23,7 @@ from pbg.inference_artifact import (
     export_inference_artifact,
     load_inference_source,
 )
-from pbg.queued import model_state_sha256, sha256_file
+from pbg.queued import RunState, model_state_sha256, sha256_file
 from pbg.queued.persistence import (
     CHECKPOINT_SCHEMA,
     load_distributed_checkpoint_manifest,
@@ -74,6 +74,11 @@ def test_public_config_is_one_closed_three_axis_composition() -> None:
     assert load_config_mapping(raw) == config
 
 
+def test_run_state_requires_the_exact_nested_logical_work_schema() -> None:
+    with pytest.raises(ValueError, match="exact nonnegative integer counters"):
+        RunState("malformed-logical-work", logical_work={})
+
+
 def test_public_config_rejects_legacy_aliases_and_profile_overlays() -> None:
     with pytest.raises(ConfigError, match="profile overlays"):
         load_config(CONFIG, hardware_profile="legacy")
@@ -99,6 +104,13 @@ def test_every_accepted_root_reaches_only_the_queued_replacement() -> None:
             or module.startswith("pbg.games.poker.queued")
             for module in reached
         ), root
+
+
+def test_operational_status_finds_current_checkpoint_names() -> None:
+    launcher = (ROOT / "tools/run-training.sh").read_text(encoding="utf-8")
+    assert "ckpt_*.pt" not in launcher
+    assert "checkpoint_????????.pt" in launcher
+    assert "failure_checkpoint_????????.pt" in launcher
 
 
 def test_migrated_consumers_share_no_legacy_implementation_body() -> None:
@@ -146,7 +158,12 @@ def test_inference_export_accepts_only_queued_schema(tmp_path: Path) -> None:
                 "root_count": 1,
                 "retry_epoch": 0,
                 "attempt_logical_base": 0,
-                "logical_work": {},
+                "logical_work": {
+                    "trajectories": 0,
+                    "completion_samples": 0,
+                    "minibatches": 0,
+                    "optimizer_steps": 0,
+                },
                 "recovered_overflow": False,
                 "overflow_recoveries": [],
                 "metrics_prefix": [
@@ -257,11 +274,29 @@ def test_real_replica_consumer_and_reference_cadence_resume(
     raw["execution"]["manifest"]["n_replica"] = 2
     raw["execution"]["output_dir"] = str(tmp_path / "replica")
     raw["execution"]["run_id"] = "nlhe_hu_8bb_normal_replica_test"
+    raw["scientific"]["reference"]["interval_iterations"] = None
+    raw["scientific"]["reference"]["interval_effective_hands"] = 0.5
     config = load_config_mapping(raw)
     session = TrainingSession(config)
     result = session.step()
     assert len(result.results) == 2
     assert tuple(state.iteration for state in session.run_states) == (1, 1)
+    for lane, state in enumerate(session.run_states):
+        metrics = state.metrics_prefix[-1]
+        assert metrics["kl_ref_refresh_before_iteration"] is False
+        assert metrics["kl_ref_refresh_after_iteration"] is True
+        assert metrics["kl_ref_effective_hands_rollout_before"] == 0.0
+        assert metrics["kl_ref_effective_hands_rollout_threshold"] == 0.5
+        assert metrics["kl_ref_effective_hands_rollout_overshoot"] > 0.0
+        assert metrics["kl_ref_effective_hands_rollout_after"] == 0.0
+        assert metrics["reference_iteration_next"] == 1
+        assert metrics["per_rank_lane_logical_work"][0][lane] == (
+            state.logical_work
+        )
+        assert metrics["global_lane_logical_work"][lane] == (
+            state.logical_work
+        )
+        assert metrics["global_logical_work"]["trajectories"] == 2
     session.reference_states[0].reference_iteration = 7
     session.reference_states[0].effective_hands_rollout = 13.5
     session.reference_states[1].reference_iteration = 9
