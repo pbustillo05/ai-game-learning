@@ -22,7 +22,7 @@ from pbg.queued.persistence import (
     load_distributed_checkpoint_manifest,
     save_distributed_checkpoint_manifest,
 )
-from pbg.queued import sha256_file
+from pbg.queued import model_state_sha256, sha256_file
 from pbg.queued.static_gates import local_import_graph, reachable_modules
 from pbg.queued.static_gates import migrated_similarity_violations
 from pbg.runtime import TrainingSession
@@ -299,11 +299,13 @@ def test_end_to_end_br_and_variance_consumers(tmp_path: Path) -> None:
     raw["execution"]["run_id"] = "nlhe_hu_8bb_normal_br_target"
     target_config = load_config_mapping(raw)
     target_checkpoint = tmp_path / "target.pt"
-    TrainingSession(target_config).checkpoint(target_checkpoint)
+    target_session = TrainingSession(target_config)
+    target_session.checkpoint(target_checkpoint)
     target_artifact = tmp_path / "target_inference.pt"
     export_inference_artifact(target_checkpoint, target_artifact)
 
     target_hash = sha256_file(target_checkpoint)
+    initial_hash = model_state_sha256(target_session.modules.lane_module(0))
     probe_raw = copy.deepcopy(raw)
     probe_raw["scientific"]["mode"] = {
         "training_regime": "best_response",
@@ -318,7 +320,7 @@ def test_end_to_end_br_and_variance_consumers(tmp_path: Path) -> None:
     probe_raw["scientific"]["response_initialization"] = "target"
     probe_raw["scientific"]["probe"] = {
         "target_sha256": target_hash,
-        "initial_model_sha256": target_hash,
+        "initial_model_sha256": initial_hash,
     }
     probe_raw["execution"]["frozen_checkpoint"] = str(target_checkpoint)
     probe_raw["execution"]["output_dir"] = str(tmp_path / "probe")

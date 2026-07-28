@@ -45,6 +45,22 @@ def sha256_file(path: str | os.PathLike[str]) -> str:
             digest.update(block)
 
 
+def model_state_sha256(model: nn.Module | Mapping[str, Tensor]) -> str:
+    """Hash one model state independent of device and checkpoint container."""
+
+    state = model.state_dict() if isinstance(model, nn.Module) else model
+    digest = hashlib.sha256()
+    for name, value in sorted(state.items()):
+        if not isinstance(value, Tensor):
+            raise TypeError("model state hash requires tensor values")
+        tensor = value.detach().to(device="cpu").contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
 def _canonical_hash(value: object) -> str:
     encoded = json.dumps(
         value, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -1232,6 +1248,7 @@ __all__ = [
     "load_checkpoint",
     "load_distributed_checkpoint_manifest",
     "load_replica_checkpoint",
+    "model_state_sha256",
     "save_checkpoint",
     "save_distributed_checkpoint_manifest",
     "save_replica_checkpoint",

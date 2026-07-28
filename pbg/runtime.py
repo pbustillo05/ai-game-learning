@@ -45,6 +45,7 @@ from pbg.queued import (
     load_distributed_checkpoint_manifest,
     load_replica_checkpoint,
     mode_schema,
+    model_state_sha256,
     save_checkpoint,
     save_distributed_checkpoint_manifest,
     save_replica_checkpoint,
@@ -241,6 +242,24 @@ class TrainingSession:
                     self.reference_modules.lane_module(lane).load_state_dict(
                         frozen, strict=True
                     )
+        if self.distributed is not None:
+            for owner in (self.modules, self.reference_modules):
+                for lane in range(count):
+                    for value in owner.lane_module(lane).state_dict().values():
+                        dist.broadcast(value, src=0)
+        self.initial_model_sha256 = tuple(
+            model_state_sha256(self.modules.lane_module(lane))
+            for lane in range(count)
+        )
+        probe = config.scientific.applicable.get("probe")
+        if (
+            isinstance(probe, dict)
+            and self.initial_model_sha256[0]
+            != probe["initial_model_sha256"]
+        ):
+            raise RuntimeError(
+                "probe initial model content hash differs from configuration"
+            )
         self.controllers = (
             tuple(_controller(config.scientific) for _ in range(count))
             if isinstance(config.scientific, BranchedModeConfig)
@@ -636,6 +655,7 @@ class TrainingSession:
                     "identity": {
                         "run_id": state.run_id,
                         "scientific_sha256": self.scientific_sha256,
+                        "initial_model_sha256": self.initial_model_sha256[lane],
                         "mode": self.mode.key,
                     },
                 }
