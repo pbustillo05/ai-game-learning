@@ -1,79 +1,132 @@
-"""Schema-derived paged, sealed, rollout, and training storage.
+"""Fixed-capacity storage and lifetime ownership for the queued engine.
 
-One :class:`TensorSchema` drives allocation, capacity accounting, sealing,
-validation, and diagnostics.  Growing stores expose only logical integer row
-ids; tensor addresses are never identities.
+The public allocation mechanisms in this module are deliberately small:
+
+``SoASchema``
+    The immutable physical description and byte authority for one owner.
+``MonotoneSlab``
+    One fixed CUDA allocation with lane-local monotone tails.
+``ExactBlock``
+    One fixed CUDA allocation whose realized row extent is immutable.
+
+There is no growth, paging, recycling, wrapping, schema inference, or legacy
+storage conversion in this module.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping
+from typing import Callable, Mapping, Sequence
 
 import torch
 from torch import Tensor
 
-from pbg.core.execution import ByteAccountant
+
+class StorageError(RuntimeError):
+    """Base error for queued storage contract violations."""
 
 
-ROLLOUT_STORAGE_SCHEMA_VERSION = "pbg-rollout-storage-v2"
-TRAINING_STORAGE_SCHEMA_VERSION = "pbg-training-storage-v2"
+class StorageOverflow(MemoryError):
+    """A fixed-capacity reservation failed before any tail advanced."""
+
+    def __init__(self, failure: "DeviceFailure") -> None:
+        self.failure = failure
+        super().__init__(
+            f"{failure.phase} overflow at logical address "
+            f"{failure.logical_address}: requested={failure.requested_extent}, "
+            f"available={failure.available_extent}"
+        )
 
 
-def _dtype_size(dtype: torch.dtype) -> int:
-    return torch.empty((), dtype=dtype).element_size()
+class TransactionError(StorageError):
+    """A multi-destination transaction could not publish."""
+
+
+def _positive_integer(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{label} must be a positive integer")
+    return int(value)
+
+
+def _nonnegative_integer(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{label} must be a nonnegative integer")
+    return int(value)
 
 
 def _align(value: int, alignment: int) -> int:
-    return ((value + alignment - 1) // alignment) * alignment
+    quotient, remainder = divmod(value, alignment)
+    return (quotient + int(remainder != 0)) * alignment
 
 
-@dataclass(frozen=True)
-class TensorFieldSchema:
-    """One structure-of-arrays column with a fixed trailing shape."""
+def _dtype_size(dtype: torch.dtype) -> int:
+    try:
+        return torch.empty((), dtype=dtype).element_size()
+    except (RuntimeError, TypeError) as exc:
+        raise ValueError(f"unsupported storage dtype {dtype}") from exc
+
+
+@dataclass(frozen=True, order=True)
+class SoAField:
+    """One contiguous field in an aligned structure-of-arrays allocation."""
 
     name: str
     dtype: torch.dtype
     shape: tuple[int, ...] = ()
+    alignment: int = 64
     fill: int | float | bool = 0
-    alignment: int = 1
 
     def __post_init__(self) -> None:
-        if not self.name:
-            raise ValueError("tensor field name must be nonempty")
-        shape = tuple(int(value) for value in self.shape)
-        if any(value <= 0 for value in shape):
-            raise ValueError("tensor field dimensions must be positive")
+        if not self.name or not self.name.isidentifier():
+            raise ValueError(f"invalid field name {self.name!r}")
+        shape = tuple(self.shape)
+        if any(
+            isinstance(size, bool) or not isinstance(size, int) or size <= 0
+            for size in shape
+        ):
+            raise ValueError(f"{self.name} has an invalid trailing shape")
         object.__setattr__(self, "shape", shape)
-        if self.alignment <= 0 or self.alignment & (self.alignment - 1):
-            raise ValueError("field alignment must be a positive power of two")
-        _dtype_size(self.dtype)
+        if (
+            isinstance(self.alignment, bool)
+            or not isinstance(self.alignment, int)
+            or self.alignment <= 0
+            or self.alignment & (self.alignment - 1)
+        ):
+            raise ValueError(f"{self.name} alignment must be a positive power of two")
+        element_size = _dtype_size(self.dtype)
+        if self.alignment < element_size or self.alignment % element_size:
+            raise ValueError(
+                f"{self.name} alignment must be a multiple of its dtype size"
+            )
 
     @property
     def elements_per_row(self) -> int:
         return math.prod(self.shape) if self.shape else 1
 
     @property
-    def row_payload_bytes(self) -> int:
+    def row_bytes(self) -> int:
         return self.elements_per_row * _dtype_size(self.dtype)
 
-    def payload_bytes(self, rows: int) -> int:
-        return int(rows) * self.row_payload_bytes
 
-    def capacity_bytes(self, rows: int) -> int:
-        return _align(self.payload_bytes(rows), self.alignment)
+@dataclass(frozen=True, order=True)
+class FieldExtent:
+    """One field's exact byte extent within a backing allocation."""
+
+    name: str
+    offset_bytes: int
+    size_bytes: int
 
 
 @dataclass(frozen=True)
-class TensorSchema:
-    """Immutable allocation and byte-accounting source of truth."""
+class SoASchema:
+    """Immutable fields, dtype, shape, alignment, and lifetime authority."""
 
     name: str
-    fields: tuple[TensorFieldSchema, ...]
-    chunk_header_bytes: int = 0
-    allocator_slack_bytes: int = 0
+    fields: tuple[SoAField, ...]
+    lifetime: str
+    alignment: int = 256
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -82,2219 +135,1636 @@ class TensorSchema:
         if not fields or len({field.name for field in fields}) != len(fields):
             raise ValueError("schema fields must be nonempty and uniquely named")
         object.__setattr__(self, "fields", fields)
-        if any(
-            isinstance(value, bool) or value < 0
-            for value in (self.chunk_header_bytes, self.allocator_slack_bytes)
+        if not self.lifetime:
+            raise ValueError("schema lifetime must be nonempty")
+        if (
+            isinstance(self.alignment, bool)
+            or not isinstance(self.alignment, int)
+            or self.alignment <= 0
+            or self.alignment & (self.alignment - 1)
         ):
-            raise ValueError("schema overhead byte counts must be nonnegative")
+            raise ValueError("schema alignment must be a positive power of two")
+        if any(field.alignment > self.alignment for field in fields):
+            raise ValueError("field alignment exceeds schema alignment")
 
     @property
-    def by_name(self) -> Mapping[str, TensorFieldSchema]:
-        return MappingProxyType({field.name: field for field in self.fields})
+    def by_name(self) -> Mapping[str, SoAField]:
+        indexed: dict[str, SoAField] = {}
+        for field in self.fields:
+            indexed[field.name] = field
+        return MappingProxyType(indexed)
 
-    @property
-    def row_payload_bytes(self) -> int:
-        return sum(field.row_payload_bytes for field in self.fields)
+    def field_extents(self, rows: int, n_replica: int = 1) -> tuple[FieldExtent, ...]:
+        rows = _nonnegative_integer(rows, "rows")
+        n_replica = _positive_integer(n_replica, "n_replica")
+        cursor = 0
+        extents: list[FieldExtent] = []
+        for field in self.fields:
+            cursor = _align(cursor, field.alignment)
+            size = n_replica * rows * field.row_bytes
+            extents.append(FieldExtent(field.name, cursor, size))
+            cursor += size
+        return tuple(extents)
 
-    def payload_bytes(self, rows: int) -> int:
-        if isinstance(rows, bool) or rows < 0:
-            raise ValueError("row count must be nonnegative")
-        return sum(field.payload_bytes(rows) for field in self.fields)
+    def allocation_bytes(self, rows: int, n_replica: int = 1) -> int:
+        extents = self.field_extents(rows, n_replica)
+        if not extents:
+            return 0
+        final = extents[-1].offset_bytes + extents[-1].size_bytes
+        return _align(final, self.alignment) if final else 0
 
-    def capacity_bytes(self, rows: int, *, chunks: int = 1) -> int:
-        if isinstance(rows, bool) or rows < 0 or isinstance(chunks, bool) or chunks < 0:
-            raise ValueError("capacity rows/chunks must be nonnegative")
-        if rows == 0 and chunks:
-            raise ValueError("an empty allocation cannot own chunks")
-        if rows and chunks == 0:
-            raise ValueError("a nonempty allocation must own at least one chunk")
-        return (
-            sum(field.capacity_bytes(rows) for field in self.fields)
-            + chunks * (self.chunk_header_bytes + self.allocator_slack_bytes)
-        )
+    def payload_bytes(self, rows: int, n_replica: int = 1) -> int:
+        rows = _nonnegative_integer(rows, "rows")
+        n_replica = _positive_integer(n_replica, "n_replica")
+        return n_replica * rows * sum(field.row_bytes for field in self.fields)
 
-    def allocate(self, rows: int, device: torch.device | str) -> dict[str, Tensor]:
-        if isinstance(rows, bool) or rows < 0:
-            raise ValueError("allocation rows must be nonnegative")
-        target = torch.device(device)
-        return {
-            spec.name: torch.full(
-                (rows, *spec.shape), spec.fill, dtype=spec.dtype, device=target
+    def allocate(
+        self,
+        rows: int,
+        n_replica: int,
+        device: torch.device | str,
+    ) -> tuple[Tensor, Mapping[str, Tensor]]:
+        """Allocate one backing arena and typed contiguous field views."""
+
+        rows = _nonnegative_integer(rows, "rows")
+        n_replica = _positive_integer(n_replica, "n_replica")
+        resolved = torch.device(device)
+        if resolved.type != "cuda":
+            raise StorageError("queued rollout storage requires CUDA")
+        if not torch.cuda.is_available():
+            raise StorageError("CUDA is unavailable")
+        total = self.allocation_bytes(rows, n_replica)
+        backing = torch.empty(total, dtype=torch.uint8, device=resolved)
+        if total and backing.data_ptr() % self.alignment:
+            raise StorageError(
+                f"allocator did not satisfy {self.alignment}-byte schema alignment"
             )
-            for spec in self.fields
-        }
-
-    def validate(self, columns: Mapping[str, Tensor], rows: int) -> None:
-        if set(columns) != {field.name for field in self.fields}:
-            raise ValueError(f"{self.name} columns do not match the immutable schema")
-        devices = set()
-        for spec in self.fields:
-            value = columns[spec.name]
-            expected = (rows, *spec.shape)
-            if tuple(value.shape) != expected or value.dtype != spec.dtype:
-                raise ValueError(
-                    f"{self.name}.{spec.name} must have shape {expected} and "
-                    f"dtype {spec.dtype}, got {tuple(value.shape)} {value.dtype}"
+        columns: dict[str, Tensor] = {}
+        extents = {extent.name: extent for extent in self.field_extents(rows, n_replica)}
+        for field in self.fields:
+            extent = extents[field.name]
+            if extent.size_bytes == 0:
+                typed = torch.empty(
+                    (n_replica, rows, *field.shape),
+                    dtype=field.dtype,
+                    device=resolved,
                 )
-            devices.add(value.device)
-        if len(devices) > 1:
-            raise ValueError(f"{self.name} columns must share one device")
+            else:
+                byte_view = backing.narrow(
+                    0, extent.offset_bytes, extent.size_bytes
+                )
+                typed = byte_view.view(field.dtype).view(
+                    n_replica, rows, *field.shape
+                )
+                if typed.data_ptr() % field.alignment:
+                    raise StorageError(
+                        f"{self.name}.{field.name} is not aligned to "
+                        f"{field.alignment} bytes"
+                    )
+            typed.fill_(field.fill)
+            columns[field.name] = typed
+        return backing, MappingProxyType(columns)
+
+    def validate_columns(
+        self,
+        columns: Mapping[str, Tensor],
+        rows: int,
+        n_replica: int,
+        device: torch.device | str,
+    ) -> None:
+        if tuple(columns) != tuple(field.name for field in self.fields):
+            raise StorageError(f"{self.name} columns do not match its schema")
+        resolved = torch.device(device)
+        for field in self.fields:
+            value = columns[field.name]
+            expected = (n_replica, rows, *field.shape)
+            if (
+                tuple(value.shape) != expected
+                or value.dtype != field.dtype
+                or value.device != resolved
+                or not value.is_contiguous()
+            ):
+                raise StorageError(
+                    f"{self.name}.{field.name} must be contiguous {expected} "
+                    f"{field.dtype} on {resolved}"
+                )
 
 
-def paged_capacity_bytes(schema: TensorSchema, rows: int, page_rows: int) -> int:
-    """Return the exact capacity of the pages needed for ``rows``.
+@dataclass(frozen=True, order=True)
+class DeviceFailure:
+    """One lane-local failure selected by minimum logical address."""
 
-    Alignment and per-page overhead apply independently to every allocation,
-    exactly as they do in :class:`PagedTensorArena`.  Treating several pages as
-    one large allocation can undercount field alignment and is therefore not a
-    valid admission forecast.
-    """
-
-    if isinstance(rows, bool) or rows < 0:
-        raise ValueError("row count must be nonnegative")
-    if isinstance(page_rows, bool) or page_rows <= 0:
-        raise ValueError("page_rows must be positive")
-    full, remainder = divmod(int(rows), int(page_rows))
-    total = full * schema.capacity_bytes(int(page_rows), chunks=1)
-    if remainder:
-        # Arenas allocate a full final page unless a separate maximum_rows
-        # truncates it. Production rollout owners have no count capacity.
-        total += schema.capacity_bytes(int(page_rows), chunks=1)
-    return total
-
-@dataclass(frozen=True)
-class SealedTensorBlock:
-    """Exact contiguous destination columns with no spare logical rows."""
-
-    schema: TensorSchema
-    columns: Mapping[str, Tensor]
-    rows: int
-    allocated_capacity_bytes: int
+    lane: int
+    status: int
+    phase: str
+    failure_code: str
+    input_type: str
+    logical_address: int
+    requested_extent: int
+    available_extent: int
+    sampler_attempt_count: int = 0
 
     def __post_init__(self) -> None:
-        columns = MappingProxyType(dict(self.columns))
-        object.__setattr__(self, "columns", columns)
-        self.schema.validate(columns, self.rows)
-        expected = self.schema.capacity_bytes(self.rows, chunks=int(self.rows > 0))
-        if self.allocated_capacity_bytes != expected:
-            raise ValueError(
-                f"sealed block accounting mismatch: declared={self.allocated_capacity_bytes}, "
-                f"schema={expected}"
-            )
-
-    def __getitem__(self, name: str) -> Tensor:
-        return self.columns[name]
-
-    @property
-    def logical_payload_bytes(self) -> int:
-        return self.schema.payload_bytes(self.rows)
-
-    @property
-    def tensor_storage_bytes(self) -> int:
-        return sum(
-            value.numel() * value.element_size() for value in self.columns.values()
-        )
-
-    def assert_exact_payload(self) -> None:
-        if self.tensor_storage_bytes != self.logical_payload_bytes:
-            raise RuntimeError(
-                f"{self.schema.name} destination payload is not exact: "
-                f"tensors={self.tensor_storage_bytes}, schema={self.logical_payload_bytes}"
-            )
+        _nonnegative_integer(self.lane, "failure lane")
+        _positive_integer(self.status, "failure status")
+        if not self.phase or not self.failure_code:
+            raise ValueError("failure phase and code must be nonempty")
+        _nonnegative_integer(self.logical_address, "logical address")
+        _nonnegative_integer(self.requested_extent, "requested extent")
+        _nonnegative_integer(self.available_extent, "available extent")
+        _nonnegative_integer(self.sampler_attempt_count, "sampler attempt count")
 
 
-class PagedTensorArena:
-    """Append-only schema allocation with stable logical integer row ids.
+class DeviceFailureState:
+    """One fixed CUDA failure record per replica lane.
 
-    A page is the indivisible allocation/admission unit.  Reserving rows first
-    admits every newly required page as one transaction and publishes neither
-    page nor cursor movement unless all allocations succeed.
+    The tensor is authoritative. Python dictionaries only decode diagnostic
+    string IDs when a quiescent snapshot is requested.
     """
 
-    def __init__(
-        self,
-        schema: TensorSchema,
-        page_rows: int,
-        device: torch.device | str,
-        *,
-        accountant: ByteAccountant | None = None,
-        label: str | None = None,
-        maximum_rows: int | None = None,
-        access_metrics: Any | None = None,
-    ) -> None:
-        if isinstance(page_rows, bool) or page_rows <= 0:
-            raise ValueError("page_rows must be a positive integer")
-        if maximum_rows is not None and (
-            isinstance(maximum_rows, bool) or maximum_rows <= 0
-        ):
-            raise ValueError("maximum_rows must be positive or None")
-        self.schema = schema
-        self.page_rows = int(page_rows)
+    _WIDTH = 8
+    _STATUS = 0
+    _PHASE = 1
+    _CODE = 2
+    _INPUT = 3
+    _ADDRESS = 4
+    _REQUESTED = 5
+    _AVAILABLE = 6
+    _ATTEMPTS = 7
+    _IMMUTABLE_ATTRIBUTES = frozenset(("n_replica", "device"))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in self._IMMUTABLE_ATTRIBUTES and hasattr(self, name):
+            raise AttributeError(f"{name} is immutable")
+        super().__setattr__(name, value)
+
+    def __init__(self, n_replica: int, device: torch.device | str) -> None:
+        self.n_replica = _positive_integer(n_replica, "n_replica")
         self.device = torch.device(device)
-        self.accountant = accountant
-        self.label = schema.name if label is None else str(label)
-        if not self.label:
-            raise ValueError("arena label must be nonempty")
-        self.maximum_rows = maximum_rows
-        self.access_metrics = access_metrics
-        self._pages: list[dict[str, Tensor]] = []
-        self._lengths: list[int] = []
-        self._reservation_labels: list[str] = []
-        self._size = 0
+        if self.device.type != "cuda":
+            raise StorageError("device failures require CUDA")
+        self._records = torch.zeros(
+            (self.n_replica, self._WIDTH), dtype=torch.int64, device=self.device
+        )
+        self._records[:, self._ADDRESS].fill_(torch.iinfo(torch.int64).max)
+        self._phase_ids: dict[str, int] = {}
+        self._code_ids: dict[str, int] = {}
+        self._input_ids: dict[str, int] = {}
         self._released = False
 
     @property
-    def size(self) -> int:
-        return self._size
+    def allocated_bytes(self) -> int:
+        self._check_live()
+        return int(self._records.untyped_storage().nbytes())
 
-    @property
-    def page_count(self) -> int:
-        return len(self._pages)
+    @staticmethod
+    def analytical_bytes(n_replica: int) -> int:
+        return _positive_integer(n_replica, "n_replica") * DeviceFailureState._WIDTH * 8
 
-    @property
-    def capacity_rows(self) -> int:
-        return sum(self._lengths)
+    @staticmethod
+    def _id(table: dict[str, int], value: str) -> int:
+        if not value:
+            raise ValueError("failure labels must be nonempty")
+        if value not in table:
+            table[value] = len(table) + 1
+        return table[value]
 
-    @property
-    def allocated_capacity_bytes(self) -> int:
-        return sum(
-            self.schema.capacity_bytes(length, chunks=1) for length in self._lengths
-        )
-
-    @property
-    def logical_payload_bytes(self) -> int:
-        return self.schema.payload_bytes(self._size)
-
-    @property
-    def page_slack_bytes(self) -> int:
-        return self.allocated_capacity_bytes - self.schema.payload_bytes(
-            self.capacity_rows
-        ) + self.schema.payload_bytes(self.capacity_rows - self._size)
+    @staticmethod
+    def _decode(table: Mapping[str, int], value: int) -> str:
+        for label, identifier in table.items():
+            if identifier == value:
+                return label
+        raise StorageError(f"unknown device failure label id {value}")
 
     def _check_live(self) -> None:
         if self._released:
-            raise RuntimeError("paged arena has been released")
+            raise StorageError("device failure state has been released")
 
-    def _record_access(
-        self,
-        operation: str,
-        path: str,
-        *,
-        segments_visited: int,
-        rows_requested: int,
-        rows_moved: int,
-        candidate_rows: int = 0,
-        routing_bytes: int = 0,
-        tensor_operations: int = 0,
-    ) -> None:
-        recorder = getattr(self.access_metrics, "record_storage_access", None)
-        if callable(recorder):
-            recorder(
-                self.label,
-                "page",
-                operation,
-                path,
-                segments_visited=segments_visited,
-                rows_requested=rows_requested,
-                rows_moved=rows_moved,
-                candidate_rows=candidate_rows,
-                routing_bytes=routing_bytes,
-                tensor_operations=tensor_operations,
-            )
+    def record(self, failure: DeviceFailure) -> None:
+        self.record_many((failure,))
 
-    def reset(self, *, release_pages: bool = False) -> None:
-        """Return the logical cursor to zero, optionally dropping admitted pages.
-
-        Retaining pages makes repeated iterations reuse the same byte-admitted
-        allocation.  Dropping them releases the ledger reservations but keeps
-        the arena live so a later iteration can admit a different realized
-        extent.
-        """
+    def record_many(self, failures: Sequence[DeviceFailure]) -> None:
+        """Merge failures deterministically, retaining each lane's minimum."""
 
         self._check_live()
-        self._size = 0
-        if not release_pages:
-            return
-        self._pages.clear()
-        self._lengths.clear()
-        if self.accountant is not None:
-            self.accountant.release_many(self._reservation_labels)
-        self._reservation_labels.clear()
-
-    def lookup_rows(self, name: str, keys: Tensor) -> Tensor:
-        """Return logical rows for unique scalar keys, or ``-1`` when absent.
-
-        The search is page-bounded: it never builds a capacity-wide validity
-        map or a contiguous copy of every stored key.  The named schema field
-        must be scalar and every stored key must be unique.
-        """
-
-        self._check_live()
-        spec = self.schema.by_name[name]
-        if spec.shape:
-            raise ValueError("lookup key field must be scalar")
-        keys = keys.to(device=self.device, dtype=spec.dtype)
-        if keys.ndim != 1:
-            raise ValueError("lookup keys must be one-dimensional")
-        result = torch.full(
-            (keys.numel(),), -1, dtype=torch.int64, device=self.device
-        )
-        cursor = 0
-        for columns, capacity in zip(self._pages, self._lengths, strict=True):
-            used = min(capacity, self._size - cursor)
-            if used <= 0:
-                break
-            matches = keys[:, None] == columns[name][None, :used]
-            hit = matches.any(1)
-            candidate = cursor + matches.to(torch.int64).argmax(1)
-            result = torch.where(hit & (result < 0), candidate, result)
-            cursor += used
-        return result
-
-    def _next_page_lengths(self, stop: int) -> list[int]:
-        lengths: list[int] = []
-        capacity = self.capacity_rows
-        while stop > capacity:
-            if self.maximum_rows is not None and capacity >= self.maximum_rows:
-                raise MemoryError(f"{self.label} maximum row capacity exhausted")
-            length = self.page_rows
-            if self.maximum_rows is not None:
-                length = min(length, self.maximum_rows - capacity)
-            lengths.append(length)
-            capacity += length
-        return lengths
-
-    def _allocate_pages(self, lengths: Iterable[int]) -> None:
-        self._check_live()
-        selected = tuple(int(length) for length in lengths)
-        if not selected:
-            return
-        first = len(self._pages)
-        labels = tuple(
-            f"{self.label}.page.{first + offset}" for offset in range(len(selected))
-        )
-        reservations = {
-            label: self.schema.capacity_bytes(length, chunks=1)
-            for label, length in zip(labels, selected, strict=True)
-        }
-        if self.accountant is not None:
-            self.accountant.reserve_many(reservations)
-        try:
-            pages = [self.schema.allocate(length, self.device) for length in selected]
-        except BaseException:
-            if self.accountant is not None:
-                self.accountant.release_many(labels)
-            raise
-        self._pages.extend(pages)
-        self._lengths.extend(selected)
-        self._reservation_labels.extend(labels)
-
-    def reserve_rows(self, count: int) -> Tensor:
-        """Reserve stable ids before their payload is populated."""
-
-        self._check_live()
-        if isinstance(count, bool) or count < 0:
-            raise ValueError("reserved row count must be nonnegative")
-        stop = self._size + int(count)
-        if self.maximum_rows is not None and stop > self.maximum_rows:
-            raise MemoryError(
-                f"{self.label} overflow: requested_stop={stop}, maximum={self.maximum_rows}"
+        selected: dict[int, DeviceFailure] = {}
+        for failure in failures:
+            if failure.lane >= self.n_replica:
+                raise ValueError("failure lane is outside the replica axis")
+            current = selected.get(failure.lane)
+            key = (
+                failure.logical_address,
+                failure.phase,
+                failure.failure_code,
+                failure.input_type,
             )
-        self._allocate_pages(self._next_page_lengths(stop))
-        start = self._size
-        self._size = stop
-        return torch.arange(start, stop, dtype=torch.int64, device=self.device)
-
-    def append(self, values: Mapping[str, Tensor]) -> Tensor:
-        """Append matching schema rows and return their stable logical ids."""
-
-        if set(values) != {field.name for field in self.schema.fields}:
-            raise ValueError("append columns do not match schema")
-        counts = {int(value.shape[0]) for value in values.values() if value.ndim >= 1}
-        if len(counts) != 1:
-            raise ValueError("append columns must have one matching leading extent")
-        count = counts.pop()
-        for spec in self.schema.fields:
-            value = values[spec.name]
-            if tuple(value.shape) != (count, *spec.shape) or value.dtype != spec.dtype:
-                raise ValueError(f"append value for {spec.name!r} violates its schema")
-            if value.device != self.device:
-                raise ValueError("append tensors must already be on the arena device")
-        start = self._size
-        ids = self.reserve_rows(count)
-        self.write_contiguous(start, values)
-        return ids
-
-    def write_contiguous(self, start: int, values: Mapping[str, Tensor]) -> None:
-        """Commit one host-known contiguous span without device page routing.
-
-        Append-only rollout owners reserve monotone logical addresses.  Their
-        page intersections are therefore fully determined by immutable schema
-        metadata and the host cursor; building a CUDA ``[rows, page_rows]``
-        match matrix for those writes is unnecessary.  Arbitrary recyclable or
-        update rows continue to use :meth:`write`.
-        """
-
-        self._check_live()
-        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
-            raise ValueError("contiguous write start must be a nonnegative integer")
-        counts = {int(value.shape[0]) for value in values.values() if value.ndim >= 1}
-        if len(counts) != 1:
-            raise ValueError("contiguous write columns must have one leading extent")
-        count = counts.pop()
-        stop = start + count
-        if stop > self._size:
-            raise ValueError("contiguous write exceeds reserved logical rows")
-        for name, value in values.items():
-            try:
-                spec = self.schema.by_name[name]
-            except KeyError as exc:
-                raise KeyError(f"unknown schema field {name!r}") from exc
-            if tuple(value.shape) != (count, *spec.shape) or value.dtype != spec.dtype:
-                raise ValueError(f"contiguous write value for {name!r} violates its schema")
-            if value.device != self.device:
-                raise ValueError("contiguous write tensors must already be on the arena device")
-        source_start = 0
-        page_start = 0
-        pages_visited = 0
-        for columns, length in zip(self._pages, self._lengths, strict=True):
-            page_stop = page_start + length
-            write_start = max(start, page_start)
-            write_stop = min(stop, page_stop)
-            if write_start < write_stop:
-                pages_visited += 1
-                rows = write_stop - write_start
-                local_start = write_start - page_start
-                for name, value in values.items():
-                    columns[name][local_start : local_start + rows].copy_(
-                        value[source_start : source_start + rows]
-                    )
-                source_start += rows
-            page_start = page_stop
-            if page_start >= stop:
-                break
-        if source_start != count:
-            raise RuntimeError("contiguous write did not cover its reserved span")
-        self._record_access(
-            "write",
-            "contiguous",
-            segments_visited=pages_visited,
-            rows_requested=count,
-            rows_moved=count * len(values),
-            tensor_operations=pages_visited * len(values),
-        )
-
-    def write(self, rows: Tensor, values: Mapping[str, Tensor]) -> None:
-        """Populate already-reserved unique logical rows."""
-
-        self._check_live()
-        rows = rows.to(device=self.device, dtype=torch.int64)
-        if rows.ndim != 1:
-            raise ValueError("logical row ids must be one-dimensional")
-        if rows.numel():
-            torch._assert_async(
-                ((rows >= 0) & (rows < self._size)).all(),
-                "logical row ids must be allocated rows",
-            )
-            if self.device.type == "cpu" and rows.unique().numel() != rows.numel():
-                raise ValueError("logical row ids must be unique")
-        for name, value in values.items():
-            try:
-                spec = self.schema.by_name[name]
-            except KeyError as exc:
-                raise KeyError(f"unknown schema field {name!r}") from exc
-            if tuple(value.shape) != (rows.numel(), *spec.shape) or value.dtype != spec.dtype:
-                raise ValueError(f"write value for {name!r} violates its schema")
-            if value.device != self.device:
-                raise ValueError("write tensors must already be on the arena device")
-        if rows.numel() == 0:
-            return
-        if len(self._pages) == 1:
-            # The hot live-frontier arena is deliberately sized so a physical
-            # rollout pack normally resides in one admitted slab.  Resolving
-            # that slab through the generic page-match matrix turned every
-            # ordinary state write into O(B * page_rows) comparison and where
-            # work.  Page ownership and byte admission remain unchanged; only
-            # the compute boundary uses the already-resolved sole slab.
-            columns = self._pages[0]
-            for name, value in values.items():
-                columns[name].index_copy_(0, rows, value)
-            self._record_access(
-                "write",
-                "direct",
-                segments_visited=1,
-                rows_requested=rows.numel(),
-                rows_moved=rows.numel() * len(values),
-                tensor_operations=len(values),
-            )
-            return
-        page_id = torch.div(rows, self.page_rows, rounding_mode="floor")
-        offset = torch.remainder(rows, self.page_rows)
-        # Each page update uses a fixed, admitted page-width match matrix.
-        # This avoids CUDA ``nonzero`` shape discovery and its host sync.
-        for index, (columns, length) in enumerate(
-            zip(self._pages, self._lengths, strict=True)
-        ):
-            positions = torch.arange(length, device=self.device)
-            matches = (page_id[:, None] == index) & (
-                offset[:, None] == positions[None, :]
-            )
-            present = matches.any(0)
-            source = matches.to(torch.int64).argmax(0)
-            for name, value in values.items():
-                candidate = value[source]
-                mask = present.reshape(
-                    (length,) + (1,) * (candidate.ndim - 1)
-                )
-                columns[name].copy_(torch.where(mask, candidate, columns[name]))
-        total_page_rows = sum(self._lengths)
-        field_payload = sum(
-            self.schema.by_name[name].row_payload_bytes for name in values
-        )
-        routing_bytes = (
-            rows.numel() * 16
-            + sum(
-                length * 17 + rows.numel() * length
-                for length in self._lengths
-            )
-            + 2 * total_page_rows * field_payload
-        )
-        self._record_access(
-            "write",
-            "generic",
-            segments_visited=len(self._pages),
-            rows_requested=rows.numel(),
-            rows_moved=total_page_rows * len(values),
-            candidate_rows=total_page_rows * len(values),
-            routing_bytes=routing_bytes,
-            tensor_operations=(
-                2 + len(self._pages) * (7 + 3 * len(values))
-            ),
-        )
-
-    def gather(self, name: str, rows: Tensor) -> Tensor:
-        self._check_live()
-        spec = self.schema.by_name[name]
-        rows = rows.to(device=self.device, dtype=torch.int64)
-        if rows.ndim != 1:
-            raise ValueError("gather row ids must be one-dimensional")
-        if rows.numel():
-            torch._assert_async(
-                ((rows >= 0) & (rows < self._size)).all(),
-                "gather row ids are outside the logical arena",
-            )
-        if len(self._pages) == 1:
-            # See the matching write fast path.  index_select is the explicit
-            # dense-pack read for a single resolved live-state slab and avoids
-            # allocating/merging one candidate tensor per page.
-            result = self._pages[0][name].index_select(0, rows)
-            self._record_access(
-                "read",
-                "direct",
-                segments_visited=1,
-                rows_requested=rows.numel(),
-                rows_moved=rows.numel(),
-                tensor_operations=1,
-            )
-            return result
-        if rows.numel() == 0:
-            return torch.empty(
-                (0, *spec.shape), dtype=spec.dtype, device=self.device
-            )
-        page_id = torch.div(rows, self.page_rows, rounding_mode="floor")
-        offset = torch.remainder(rows, self.page_rows)
-        first_columns = self._pages[0]
-        first_length = self._lengths[0]
-        output = first_columns[name][offset.clamp_max(first_length - 1)]
-        for index, (columns, length) in enumerate(
-            zip(self._pages[1:], self._lengths[1:], strict=True), start=1
-        ):
-            local = offset.clamp_max(length - 1)
-            candidate = columns[name][local]
-            mask = (page_id == index).reshape(
-                (rows.numel(),) + (1,) * len(spec.shape)
-            )
-            output = torch.where(mask, candidate, output)
-        payload = spec.row_payload_bytes
-        page_count = len(self._pages)
-        routing_bytes = (
-            rows.numel() * 16
-            + rows.numel() * payload
-            + max(page_count - 1, 0)
-            * rows.numel()
-            * (8 + 1 + 2 * payload)
-        )
-        self._record_access(
-            "read",
-            "generic",
-            segments_visited=page_count,
-            rows_requested=rows.numel(),
-            rows_moved=rows.numel(),
-            candidate_rows=rows.numel() * page_count,
-            routing_bytes=routing_bytes,
-            tensor_operations=4 + max(page_count - 1, 0) * 4,
-        )
-        return output
-
-    def require_rows(self, additional_rows: int) -> None:
-        """Admit future rows without advancing the logical row cursor."""
-
-        if isinstance(additional_rows, bool) or additional_rows < 0:
-            raise ValueError("required rows must be nonnegative")
-        stop = self._size + int(additional_rows)
-        if self.maximum_rows is not None and stop > self.maximum_rows:
-            raise MemoryError(
-                f"{self.label} overflow: requested_stop={stop}, maximum={self.maximum_rows}"
-            )
-        self._allocate_pages(self._next_page_lengths(stop))
-
-    def rollback_page_growth(self, page_count: int) -> None:
-        """Remove empty pages published after a failed grouped admission."""
-
-        if not 0 <= page_count <= self.page_count:
-            raise ValueError("invalid page-growth rollback checkpoint")
-        if self._size > sum(self._lengths[:page_count]):
-            raise RuntimeError("cannot roll back pages containing logical rows")
-        labels = self._reservation_labels[page_count:]
-        del self._pages[page_count:]
-        del self._lengths[page_count:]
-        del self._reservation_labels[page_count:]
-        if self.accountant is not None:
-            self.accountant.release_many(labels)
-
-
-
-    def seal(
-        self,
-        *,
-        accountant: ByteAccountant | None = None,
-        label: str | None = None,
-        scratch_rows: int = 1,
-        release_source: bool = True,
-        row_order: Tensor | None = None,
-    ) -> tuple[SealedTensorBlock, "SealMetrics"]:
-        """Copy stable chunks once into an exact contiguous destination.
-
-        ``row_order`` optionally gives the source row for each destination row.
-        It is topology-sized metadata, not payload scratch, and lets schedulers
-        seal their out-of-order family packs without first concatenating and
-        permuting every wide input column.
-        """
-
-        self._check_live()
-        if isinstance(scratch_rows, bool) or scratch_rows <= 0:
-            raise ValueError("scratch_rows must be positive")
-        if row_order is not None:
-            row_order = row_order.to(device=self.device, dtype=torch.int64)
-            if row_order.shape != (self._size,):
-                raise ValueError("seal row_order must contain every logical row")
-            if self._size and not torch.equal(
-                row_order.sort().values,
-                torch.arange(self._size, dtype=torch.int64, device=self.device),
+            if current is None or key < (
+                current.logical_address,
+                current.phase,
+                current.failure_code,
+                current.input_type,
             ):
-                raise ValueError("seal row_order must be a permutation")
-        ledger = self.accountant if accountant is None else accountant
-        if ledger is not None and self.accountant is None:
-            raise ValueError("accounted sealing requires source chunks on the same ledger")
-        if (
-            ledger is not None
-            and self.accountant is not None
-            and ledger is not self.accountant
+                selected[failure.lane] = failure
+        for lane, failure in selected.items():
+            current_address = int(self._records[lane, self._ADDRESS].item())
+            if failure.logical_address > current_address:
+                continue
+            if failure.logical_address == current_address:
+                current = self.snapshot(lane)
+                if current is not None and (
+                    failure.phase,
+                    failure.failure_code,
+                    failure.input_type,
+                ) >= (current.phase, current.failure_code, current.input_type):
+                    continue
+            row = self._records[lane]
+            row[self._STATUS].fill_(failure.status)
+            row[self._PHASE].fill_(self._id(self._phase_ids, failure.phase))
+            row[self._CODE].fill_(self._id(self._code_ids, failure.failure_code))
+            row[self._INPUT].fill_(self._id(self._input_ids, failure.input_type))
+            row[self._ADDRESS].fill_(failure.logical_address)
+            row[self._REQUESTED].fill_(failure.requested_extent)
+            row[self._AVAILABLE].fill_(failure.available_extent)
+            row[self._ATTEMPTS].fill_(failure.sampler_attempt_count)
+
+    def record_device(
+        self,
+        *,
+        failed: Tensor,
+        logical_address: Tensor,
+        requested_extent: Tensor,
+        available_extent: Tensor,
+        sampler_attempt_count: Tensor,
+        phase: str,
+        failure_code: str,
+        input_type: str,
+    ) -> None:
+        """Merge a fixed-label CUDA failure without synchronizing the host."""
+
+        self._check_live()
+        expected = (self.n_replica,)
+        for name, value, dtype in (
+            ("failed", failed, torch.bool),
+            ("logical_address", logical_address, torch.int64),
+            ("requested_extent", requested_extent, torch.int64),
+            ("available_extent", available_extent, torch.int64),
+            ("sampler_attempt_count", sampler_attempt_count, torch.int64),
         ):
-            raise ValueError("source and seal reservations must use one byte ledger")
-        if ledger is not None and sum(
-            ledger.reservation(label) for label in self._reservation_labels
-        ) != self.allocated_capacity_bytes:
-            raise RuntimeError("source chunk ledger does not match schema capacity")
-        destination_bytes = self.schema.capacity_bytes(
-            self._size, chunks=int(self._size > 0)
+            if (
+                value.shape != expected
+                or value.dtype != dtype
+                or value.device != self.device
+            ):
+                raise ValueError(
+                    f"device failure {name} must be {dtype} {expected} "
+                    f"on {self.device}"
+                )
+        if not phase or not failure_code or not input_type:
+            raise ValueError("device failure labels must be nonempty")
+        records = self._records
+        current_address = records[:, self._ADDRESS]
+        replace = failed & logical_address.ge(0) & (
+            logical_address < current_address
         )
-        bounded_rows = min(scratch_rows, max(self._size, 1))
-        scratch_bytes = self.schema.payload_bytes(bounded_rows)
-        destination_label = f"{self.label}.sealed" if label is None else str(label)
-        scratch_label = f"{destination_label}.scratch"
-        reservations = {
-            destination_label: destination_bytes,
-            scratch_label: scratch_bytes,
-        }
-        if ledger is not None:
-            ledger.reserve_many(reservations)
-        try:
-            destination = self.schema.allocate(self._size, self.device)
-            # One reusable bounded scratch column set.  It deliberately has no
-            # payload proportional to total rows and replaces repeated cat.
-            scratch = self.schema.allocate(bounded_rows, self.device)
-            cursor = 0
-            if row_order is None:
-                for columns, capacity in zip(self._pages, self._lengths, strict=True):
-                    used = min(capacity, self._size - cursor)
-                    copied = 0
-                    while copied < used:
-                        count = min(bounded_rows, used - copied)
-                        for spec in self.schema.fields:
-                            scratch[spec.name][:count].copy_(
-                                columns[spec.name][copied : copied + count]
-                            )
-                            destination[spec.name][
-                                cursor + copied : cursor + copied + count
-                            ].copy_(scratch[spec.name][:count])
-                        copied += count
-                    cursor += used
-            else:
-                while cursor < self._size:
-                    count = min(bounded_rows, self._size - cursor)
-                    selected = row_order[cursor : cursor + count]
-                    page_id = torch.div(
-                        selected, self.page_rows, rounding_mode="floor"
-                    )
-                    offset = torch.remainder(selected, self.page_rows)
-                    for spec in self.schema.fields:
-                        target = scratch[spec.name][:count]
-                        target.zero_()
-                        for page_index, (columns, capacity) in enumerate(
-                            zip(self._pages, self._lengths, strict=True)
-                        ):
-                            local = offset.clamp_max(capacity - 1)
-                            candidate = columns[spec.name][local]
-                            mask = (page_id == page_index).reshape(
-                                (count,) + (1,) * len(spec.shape)
-                            )
-                            target.copy_(torch.where(mask, candidate, target))
-                        destination[spec.name][cursor : cursor + count].copy_(target)
-                    cursor += count
-            if cursor != self._size:
-                raise RuntimeError("seal copy extent does not match logical row count")
-            if self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
-            block = SealedTensorBlock(
-                schema=self.schema,
-                columns=destination,
-                rows=self._size,
-                allocated_capacity_bytes=destination_bytes,
-            )
-            block.assert_exact_payload()
-        except BaseException:
-            if ledger is not None:
-                ledger.release_many(reservations)
-            raise
-        del scratch
-        if ledger is not None:
-            ledger.release(scratch_label)
-        metrics = SealMetrics(
-            source_capacity_bytes=self.allocated_capacity_bytes,
-            destination_capacity_bytes=destination_bytes,
-            scratch_capacity_bytes=scratch_bytes,
-            peak_accounted_bytes=(
-                self.allocated_capacity_bytes + destination_bytes + scratch_bytes
+        values = (
+            (
+                self._STATUS,
+                torch.ones_like(current_address),
             ),
-            logical_payload_bytes=block.logical_payload_bytes,
-            source_pages=self.page_count,
+            (
+                self._PHASE,
+                torch.full_like(
+                    current_address,
+                    self._id(self._phase_ids, phase),
+                ),
+            ),
+            (
+                self._CODE,
+                torch.full_like(
+                    current_address,
+                    self._id(self._code_ids, failure_code),
+                ),
+            ),
+            (
+                self._INPUT,
+                torch.full_like(
+                    current_address,
+                    self._id(self._input_ids, input_type),
+                ),
+            ),
+            (self._ADDRESS, logical_address),
+            (self._REQUESTED, requested_extent),
+            (self._AVAILABLE, available_extent),
+            (self._ATTEMPTS, sampler_attempt_count),
         )
-        if release_source:
-            self.release()
-        return block, metrics
+        for column, value in values:
+            records[:, column].copy_(
+                torch.where(replace, value, records[:, column])
+            )
+
+    def snapshot(self, lane: int) -> DeviceFailure | None:
+        self._check_live()
+        lane = _nonnegative_integer(lane, "lane")
+        if lane >= self.n_replica:
+            raise ValueError("lane is outside the replica axis")
+        row = self._records[lane].cpu().tolist()
+        if not row[self._STATUS]:
+            return None
+        return DeviceFailure(
+            lane=lane,
+            status=int(row[self._STATUS]),
+            phase=self._decode(self._phase_ids, int(row[self._PHASE])),
+            failure_code=self._decode(self._code_ids, int(row[self._CODE])),
+            input_type=self._decode(self._input_ids, int(row[self._INPUT])),
+            logical_address=int(row[self._ADDRESS]),
+            requested_extent=int(row[self._REQUESTED]),
+            available_extent=int(row[self._AVAILABLE]),
+            sampler_attempt_count=int(row[self._ATTEMPTS]),
+        )
+
+    def clear_lane(self, lane: int) -> None:
+        self._check_live()
+        lane = _nonnegative_integer(lane, "lane")
+        if lane >= self.n_replica:
+            raise ValueError("lane is outside the replica axis")
+        self._records[lane].zero_()
+        self._records[lane, self._ADDRESS].fill_(torch.iinfo(torch.int64).max)
 
     def release(self) -> None:
-        """Idempotently drop source chunks and their accounting reservations."""
-
-        if self._released:
-            return
-        self._pages.clear()
-        self._lengths.clear()
-        if self.accountant is not None:
-            self.accountant.release_many(self._reservation_labels)
-        self._reservation_labels.clear()
+        self._check_live()
+        self._records = torch.empty(0, dtype=torch.int64, device=self.device)
         self._released = True
 
 
-def admit_arena_growth(requests: Mapping[PagedTensorArena, int]) -> None:
-    """Admit and allocate several arena extents as one publication transaction.
+@dataclass(frozen=True, order=True)
+class ReservationAddress:
+    """A row span whose epoch makes retry addresses disjoint."""
 
-    This is the child-wave primitive: every newly required page is reserved
-    before any allocation, all tensor pages are built off-owner, and arena page
-    lists are updated only after the entire group succeeds.
-    """
-
-    selected = tuple(requests.items())
-    if not selected:
-        return
-    accountants = {arena.accountant for arena, _ in selected}
-    if len(accountants) != 1:
-        raise ValueError("grouped arena growth requires one shared byte accountant")
-    accountant = next(iter(accountants))
-    plans: list[tuple[PagedTensorArena, tuple[int, ...], tuple[str, ...]]] = []
-    reservations: dict[str, int] = {}
-    for arena, additional_rows in selected:
-        arena._check_live()
-        if isinstance(additional_rows, bool) or additional_rows < 0:
-            raise ValueError("grouped arena row counts must be nonnegative")
-        stop = arena.size + int(additional_rows)
-        if arena.maximum_rows is not None and stop > arena.maximum_rows:
-            raise MemoryError(
-                f"{arena.label} overflow: requested_stop={stop}, "
-                f"maximum={arena.maximum_rows}"
-            )
-        lengths = tuple(arena._next_page_lengths(stop))
-        first = arena.page_count
-        labels = tuple(
-            f"{arena.label}.page.{first + offset}"
-            for offset in range(len(lengths))
-        )
-        plans.append((arena, lengths, labels))
-        reservations.update(
-            {
-                label: arena.schema.capacity_bytes(length, chunks=1)
-                for label, length in zip(labels, lengths, strict=True)
-            }
-        )
-    labels = tuple(reservations)
-    if not labels:
-        return
-    if accountant is not None:
-        accountant.reserve_many(reservations)
-    pending: list[tuple[PagedTensorArena, tuple[int, ...], tuple[str, ...], list[dict[str, Tensor]]]] = []
-    try:
-        for arena, lengths, arena_labels in plans:
-            pages = [arena.schema.allocate(length, arena.device) for length in lengths]
-            pending.append((arena, lengths, arena_labels, pages))
-    except BaseException:
-        if accountant is not None:
-            accountant.release_many(labels)
-        raise
-    for arena, lengths, arena_labels, pages in pending:
-        arena._pages.extend(pages)
-        arena._lengths.extend(lengths)
-        arena._reservation_labels.extend(arena_labels)
+    epoch: int
+    begin: int
+    end: int
 
 
-class PagedTensorColumn:
-    """Tensor-style row indexing over one field of a paged arena."""
-
-    def __init__(self, arena: PagedTensorArena, name: str) -> None:
-        self.arena = arena
-        self.name = name
-        self.spec = arena.schema.by_name[name]
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        return (self.arena.size, *self.spec.shape)
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.spec.dtype
-
-    @property
-    def device(self) -> torch.device:
-        return self.arena.device
-
-    def numel(self) -> int:
-        return self.arena.size * self.spec.elements_per_row
-
-    def _rows(self, selector: Any) -> tuple[Tensor, tuple[int, ...], bool]:
-        if isinstance(selector, slice):
-            start, stop, step = selector.indices(self.arena.size)
-            rows = torch.arange(start, stop, step, device=self.device)
-            return rows, (rows.numel(),), False
-        if isinstance(selector, int):
-            row = selector if selector >= 0 else self.arena.size + selector
-            return torch.tensor([row], dtype=torch.int64, device=self.device), (), True
-        rows = torch.as_tensor(selector, device=self.device)
-        if rows.dtype == torch.bool:
-            if rows.ndim != 1 or rows.numel() != self.arena.size:
-                raise IndexError("paged boolean row selector has the wrong extent")
-            rows = rows.nonzero(as_tuple=False).squeeze(1)
-        else:
-            rows = rows.to(torch.int64)
-        return rows.reshape(-1), tuple(rows.shape), False
-
-    @staticmethod
-    def _select(full: Tensor, row_shape: tuple[int, ...], rest: tuple[Any, ...]) -> Tensor:
-        if not rest:
-            return full
-        first = rest[0]
-        if isinstance(first, Tensor) and tuple(first.shape) == row_shape:
-            flat = full.reshape(-1, *full.shape[len(row_shape) :])
-            selected = flat[
-                torch.arange(flat.shape[0], device=flat.device),
-                first.to(device=flat.device, dtype=torch.int64).reshape(-1),
-            ]
-            selected = selected.reshape(*row_shape, *selected.shape[1:])
-            return selected[(slice(None),) * len(row_shape) + rest[1:]]
-        return full[(slice(None),) * len(row_shape) + rest]
-
-    @staticmethod
-    def _assign(
-        full: Tensor,
-        row_shape: tuple[int, ...],
-        rest: tuple[Any, ...],
-        value: Any,
-    ) -> None:
-        if not rest:
-            full[...] = value
-            return
-        first = rest[0]
-        if isinstance(first, Tensor) and tuple(first.shape) == row_shape:
-            flat = full.reshape(-1, *full.shape[len(row_shape) :])
-            positions = torch.arange(flat.shape[0], device=flat.device)
-            columns = first.to(device=flat.device, dtype=torch.int64).reshape(-1)
-            if len(rest) == 1:
-                flat[positions, columns] = value
-            else:
-                selected = flat[positions, columns]
-                selected[(slice(None),) * len(row_shape) + rest[1:]] = value
-                flat[positions, columns] = selected
-            return
-        full[(slice(None),) * len(row_shape) + rest] = value
-
-    def __getitem__(self, key: Any) -> Tensor:
-        parts = key if isinstance(key, tuple) else (key,)
-        rows, row_shape, scalar = self._rows(parts[0])
-        full = self.arena.gather(self.name, rows)
-        if scalar:
-            full = full[0]
-            row_shape = ()
-        else:
-            full = full.reshape(*row_shape, *self.spec.shape)
-        return self._select(full, row_shape, parts[1:])
-
-    def __setitem__(self, key: Any, value: Any) -> None:
-        parts = key if isinstance(key, tuple) else (key,)
-        rows, row_shape, scalar = self._rows(parts[0])
-        if len(parts) == 1:
-            # A whole-row assignment has no dependency on the previous field
-            # value.  The former tensor-compatible implementation gathered the
-            # complete field merely to overwrite it, doubling hot-path state
-            # traffic and page resolution.
-            target_shape = (rows.numel(), *self.spec.shape)
-            assigned = torch.as_tensor(
-                value, dtype=self.spec.dtype, device=self.device
-            )
-            try:
-                assigned = torch.broadcast_to(assigned, target_shape)
-            except RuntimeError as exc:
-                raise ValueError(
-                    f"assignment to {self.name!r} cannot broadcast to {target_shape}"
-                ) from exc
-            self.arena.write(rows, {self.name: assigned})
-            return
-        full = self.arena.gather(self.name, rows)
-        if scalar:
-            shaped = full[0]
-            self._assign(shaped, (), parts[1:], value)
-            full = shaped.reshape(1, *self.spec.shape)
-        else:
-            shaped = full.reshape(*row_shape, *self.spec.shape)
-            self._assign(shaped, row_shape, parts[1:], value)
-            full = shaped.reshape(rows.numel(), *self.spec.shape)
-        self.arena.write(rows, {self.name: full})
-
-
-class RecyclableTensorPool:
-    """Page-backed mutable slot owner with explicit last-consumer release.
-
-    Logical rollout/topology ids must not use these handles as identities.
-    Handles are physical live-slot addresses and may be reused only after the
-    caller releases their last mutable-state consumer.  The append-only arena
-    remains the sole page allocator and byte ledger owner.
-    """
+class SlabReservation:
+    """One unpublished fixed span in a :class:`MonotoneSlab`."""
 
     def __init__(
         self,
-        schema: TensorSchema,
-        page_rows: int,
-        device: torch.device | str,
-        *,
-        accountant: ByteAccountant | None = None,
-        label: str | None = None,
-        maximum_rows: int | None = None,
-        access_metrics: Any | None = None,
+        slab: "MonotoneSlab",
+        lane: int,
+        address: ReservationAddress,
+        token: int,
     ) -> None:
-        self.arena = PagedTensorArena(
-            schema,
-            page_rows,
-            device,
-            accountant=accountant,
-            label=label,
-            maximum_rows=maximum_rows,
-            access_metrics=access_metrics,
-        )
-        self._free: list[Tensor] = []
-        self._live_rows = 0
-        self.high_water_live_rows = 0
+        self._slab = slab
+        self.lane = lane
+        self.address = address
+        self._token = token
+        self._filled = False
+        self._closed = False
 
     @property
-    def schema(self) -> TensorSchema:
-        return self.arena.schema
+    def rows(self) -> int:
+        return self.address.end - self.address.begin
 
     @property
-    def device(self) -> torch.device:
-        return self.arena.device
+    def filled(self) -> bool:
+        return self._filled
 
-    @property
-    def capacity_rows(self) -> int:
-        return self.arena.capacity_rows
+    def fill(self, values: Mapping[str, Tensor]) -> None:
+        if self._closed:
+            raise StorageError("reservation is closed")
+        self._slab._fill(self, values)
+        self._filled = True
 
-    @property
-    def live_rows(self) -> int:
-        return self._live_rows
+    def fill_defaults(self) -> None:
+        """Initialize the reservation in place without staging another tensor."""
 
-    @property
-    def allocated_capacity_bytes(self) -> int:
-        return self.arena.allocated_capacity_bytes
+        if self._closed:
+            raise StorageError("reservation is closed")
+        self._slab._fill_defaults(self)
+        self._filled = True
 
-    @property
-    def live_payload_bytes(self) -> int:
-        return self.schema.payload_bytes(self.live_rows)
-
-    @property
-    def slack_bytes(self) -> int:
-        return self.allocated_capacity_bytes - self.live_payload_bytes
-
-    def allocate(self, count: int) -> Tensor:
-        if isinstance(count, bool) or count < 0:
-            raise ValueError("pool allocation count must be nonnegative")
-        requested = int(count)
-        available = sum(batch.numel() for batch in self._free)
-        reused_count = min(requested, available)
-        fresh_count = requested - reused_count
-        fresh_start = self.arena.size
-        fresh = self.arena.reserve_rows(fresh_count)
-        pieces: list[Tensor] = []
-        remaining = reused_count
-        while remaining:
-            batch = self._free.pop()
-            take = min(remaining, batch.numel())
-            pieces.append(batch[:take])
-            if take < batch.numel():
-                self._free.append(batch[take:])
-            remaining -= take
-        if fresh_count:
-            pieces.append(fresh)
-        handles = (
-            torch.cat(pieces)
-            if len(pieces) > 1
-            else (
-                pieces[0]
-                if pieces
-                else torch.empty(0, dtype=torch.int64, device=self.device)
-            )
-        )
-        self._live_rows += requested
-        self.high_water_live_rows = max(self.high_water_live_rows, self.live_rows)
-        return handles
-
-    def required_fresh_rows(self, count: int) -> int:
-        """Return rows not satisfiable from already released handles."""
-
-        if isinstance(count, bool) or count < 0:
-            raise ValueError("pool allocation count must be nonnegative")
-        available = sum(batch.numel() for batch in self._free)
-        return max(0, int(count) - available)
-
-    def require_capacity(self, count: int) -> None:
-        """Admit pages for a future allocation without consuming handles."""
-
-        self.arena.require_rows(self.required_fresh_rows(count))
-
-    def _device_handles(self, rows: Tensor | Iterable[int]) -> Tensor:
-        handles = torch.as_tensor(rows, dtype=torch.int64, device=self.device)
-        if handles.ndim != 1:
-            raise ValueError("pool handles must be one-dimensional")
-        if handles.numel():
-            torch._assert_async(
-                ((handles >= 0) & (handles < self.arena.size)).all(),
-                "pool handle is outside admitted storage",
-            )
-        return handles
-
-    def _assert_not_free(self, handles: Tensor) -> None:
-        for free in self._free:
-            torch._assert_async(
-                ~(handles[:, None] == free[None, :]).any(),
-                "pool handle has already reached its last consumer",
-            )
-
-    def release_rows(self, rows: Tensor | Iterable[int]) -> None:
-        handles = self._device_handles(rows)
-        if handles.numel() > 1:
-            ordered = handles.sort().values
-            torch._assert_async(
-                (ordered[1:] != ordered[:-1]).all(),
-                "released pool handles must be unique",
-            )
-        self._assert_not_free(handles)
-        if handles.numel():
-            self._free.append(handles.clone())
-        self._live_rows -= handles.numel()
-        if self._live_rows < 0:
-            raise RuntimeError("pool live-row accounting underflow")
-
-    def write(self, rows: Tensor, values: Mapping[str, Tensor]) -> None:
-        handles = self._device_handles(rows)
-        self._assert_not_free(handles)
-        self.arena.write(handles, values)
-
-    def gather(self, name: str, rows: Tensor) -> Tensor:
-        handles = self._device_handles(rows)
-        self._assert_not_free(handles)
-        return self.arena.gather(name, handles)
-
-    def reset(self, *, release_pages: bool = False) -> None:
-        """Release every iteration-local consumer and optionally its pages."""
-
-        self._free.clear()
-        self._live_rows = 0
-        self.high_water_live_rows = 0
-        self.arena.reset(release_pages=release_pages)
-
-    def release(self) -> None:
-        if self.arena._released:
-            return
-        self._free.clear()
-        self._live_rows = 0
-        self.high_water_live_rows = 0
-        self.arena.release()
+    def view(self, field: str) -> Tensor:
+        if self._closed:
+            raise StorageError("reservation is closed")
+        return self._slab._reservation_view(self, field)
 
 
-class DenseRecyclableTensorPool:
-    """Dense mutable slots whose capacity follows the live-frontier high water.
+class MonotoneSlab:
+    """Fixed-capacity ``reserve -> fill -> publish`` CUDA storage.
 
-    Physical handles remain recyclable integer slots, but every field has one
-    directly indexable compute slab instead of an accumulated page list.
-    Growth is transactional and geometric: the old and replacement slabs are
-    charged together until the stable handle prefix has been copied.  Capacity
-    therefore depends on realized simultaneous ownership, never total
-    generated rows.
+    Tails and failures are lane-local. A failed transaction poisons only its
+    lane until the complete attempt is discarded with :meth:`reset_failed_lane`.
+    Published row addresses never move, wrap, or repeat within an attempt; an
+    incremented epoch makes retry addresses disjoint.
     """
+
+    _PUBLISHED = 0
+    _RESERVED = 1
+    _ATTEMPT_HIGH_WATER = 2
+    _LIFETIME_HIGH_WATER = 3
+    _EPOCH = 4
+    _OPEN_BEGIN = 5
+    _OPEN_END = 6
+    _POISONED = 7
+    _STATE_WIDTH = 8
+    _IMMUTABLE_ATTRIBUTES = frozenset(
+        ("schema", "capacity", "n_replica", "device", "failure_state", "label")
+    )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in self._IMMUTABLE_ATTRIBUTES and hasattr(self, name):
+            raise AttributeError(f"{name} is immutable")
+        super().__setattr__(name, value)
 
     def __init__(
         self,
-        schema: TensorSchema,
-        allocation_quantum_rows: int,
+        schema: SoASchema,
+        capacity: int,
+        n_replica: int,
         device: torch.device | str,
         *,
-        accountant: ByteAccountant | None = None,
+        failure_state: DeviceFailureState,
         label: str | None = None,
-        maximum_rows: int | None = None,
-        access_metrics: Any | None = None,
     ) -> None:
-        if (
-            isinstance(allocation_quantum_rows, bool)
-            or allocation_quantum_rows <= 0
-        ):
-            raise ValueError("allocation_quantum_rows must be positive")
-        if maximum_rows is not None and (
-            isinstance(maximum_rows, bool) or maximum_rows <= 0
-        ):
-            raise ValueError("maximum_rows must be positive or None")
         self.schema = schema
-        self.allocation_quantum_rows = int(allocation_quantum_rows)
+        self.capacity = _positive_integer(capacity, "slab capacity")
+        self.n_replica = _positive_integer(n_replica, "n_replica")
         self.device = torch.device(device)
-        self.accountant = accountant
+        if failure_state.n_replica != self.n_replica:
+            raise ValueError("slab and failure state replica axes differ")
+        if failure_state.device != self.device:
+            raise ValueError("slab and failure state devices differ")
+        self.failure_state = failure_state
         self.label = schema.name if label is None else str(label)
         if not self.label:
-            raise ValueError("pool label must be nonempty")
-        self.maximum_rows = maximum_rows
-        self.access_metrics = access_metrics
-        self._columns: dict[str, Tensor] = {}
-        self._reservation_label: str | None = None
-        self._generation = 0
-        self._size = 0
-        self._free: list[Tensor] = []
-        self._live_rows = 0
-        self.high_water_live_rows = 0
+            raise ValueError("slab label must be nonempty")
+        self._backing, self._columns = schema.allocate(
+            self.capacity, self.n_replica, self.device
+        )
+        self._state = torch.zeros(
+            (self.n_replica, self._STATE_WIDTH),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._state[:, self._OPEN_BEGIN : self._OPEN_END + 1].fill_(-1)
+        self._next_token = 1
+        self._tokens: dict[int, SlabReservation] = {}
         self._released = False
 
-    @property
-    def capacity_rows(self) -> int:
-        if not self._columns:
-            return 0
-        return int(next(iter(self._columns.values())).shape[0])
+    @staticmethod
+    def state_bytes(n_replica: int) -> int:
+        return _positive_integer(n_replica, "n_replica") * MonotoneSlab._STATE_WIDTH * 8
+
+    @classmethod
+    def analytical_bytes(
+        cls, schema: SoASchema, capacity: int, n_replica: int
+    ) -> int:
+        return schema.allocation_bytes(capacity, n_replica) + cls.state_bytes(n_replica)
 
     @property
-    def size(self) -> int:
-        return self._size
+    def allocated_bytes(self) -> int:
+        self._check_live()
+        return int(self._backing.untyped_storage().nbytes()) + int(
+            self._state.untyped_storage().nbytes()
+        )
 
     @property
-    def live_rows(self) -> int:
-        return self._live_rows
-
-    @property
-    def allocated_capacity_bytes(self) -> int:
-        rows = self.capacity_rows
-        return self.schema.capacity_bytes(rows, chunks=int(rows > 0))
-
-    @property
-    def live_payload_bytes(self) -> int:
-        return self.schema.payload_bytes(self.live_rows)
-
-    @property
-    def slack_bytes(self) -> int:
-        return self.allocated_capacity_bytes - self.live_payload_bytes
+    def columns(self) -> Mapping[str, Tensor]:
+        self._check_live()
+        return self._columns
 
     def _check_live(self) -> None:
         if self._released:
-            raise RuntimeError("dense recyclable pool has been released")
+            raise StorageError(f"{self.label} has been released")
 
-    def _next_capacity(self, required: int) -> int:
-        capacity = self.capacity_rows
-        candidate = max(capacity, self.allocation_quantum_rows)
-        while candidate < required:
-            growth = max(self.allocation_quantum_rows, (candidate + 1) // 2)
-            candidate = _align(
-                candidate + growth, self.allocation_quantum_rows
-            )
-        if self.maximum_rows is not None:
-            if required > self.maximum_rows:
-                raise MemoryError(f"{self.label} maximum row capacity exhausted")
-            candidate = min(candidate, self.maximum_rows)
-        return candidate
-
-    def required_fresh_rows(self, count: int) -> int:
-        if isinstance(count, bool) or count < 0:
-            raise ValueError("pool allocation count must be nonnegative")
-        available = sum(batch.numel() for batch in self._free)
-        return max(0, int(count) - available)
-
-    def require_capacity(self, count: int) -> None:
-        """Admit a future allocation without consuming recyclable handles."""
-
-        admit_dense_pool_growth({self: count})
-
-    def allocate(self, count: int) -> Tensor:
+    def _lane_state(self, lane: int) -> list[int]:
         self._check_live()
-        if isinstance(count, bool) or count < 0:
-            raise ValueError("pool allocation count must be nonnegative")
-        requested = int(count)
-        available = sum(batch.numel() for batch in self._free)
-        reused_count = min(requested, available)
-        fresh_count = requested - reused_count
-        admit_dense_pool_growth({self: count})
-        pieces: list[Tensor] = []
-        remaining = reused_count
-        while remaining:
-            batch = self._free.pop()
-            take = min(remaining, batch.numel())
-            pieces.append(batch[:take])
-            if take < batch.numel():
-                self._free.append(batch[take:])
-            remaining -= take
-        if fresh_count:
-            pieces.append(
-                torch.arange(
-                    self._size,
-                    self._size + fresh_count,
+        lane = _nonnegative_integer(lane, "lane")
+        if lane >= self.n_replica:
+            raise ValueError("lane is outside the replica axis")
+        return [int(value) for value in self._state[lane].cpu().tolist()]
+
+    def tail(self, lane: int) -> int:
+        return self._lane_state(lane)[self._PUBLISHED]
+
+    def reserved_tail(self, lane: int) -> int:
+        return self._lane_state(lane)[self._RESERVED]
+
+    def reserved_tails_device(self) -> Tensor:
+        """Return current reservation beginnings without a host synchronization."""
+
+        self._check_live()
+        return self._state[:, self._RESERVED].clone()
+
+    def high_water(self, lane: int, *, lifetime: bool = False) -> int:
+        index = self._LIFETIME_HIGH_WATER if lifetime else self._ATTEMPT_HIGH_WATER
+        return self._lane_state(lane)[index]
+
+    def epoch(self, lane: int) -> int:
+        return self._lane_state(lane)[self._EPOCH]
+
+    def preflight(self, lane: int, count: int) -> tuple[int, int]:
+        count = _positive_integer(count, "reservation count")
+        state = self._lane_state(lane)
+        if state[self._POISONED]:
+            raise StorageError(f"{self.label} lane {lane} is poisoned")
+        if state[self._OPEN_BEGIN] != -1:
+            raise StorageError(f"{self.label} lane {lane} already has a reservation")
+        begin = state[self._RESERVED]
+        return begin, self.capacity - begin
+
+    def reserve(
+        self,
+        lane: int,
+        count: int,
+        *,
+        phase: str,
+        input_type: str,
+        logical_address: int,
+        sampler_attempt_count: int = 0,
+    ) -> SlabReservation:
+        count = _positive_integer(count, "reservation count")
+        logical_address = _nonnegative_integer(
+            logical_address, "logical address"
+        )
+        sampler_attempt_count = _nonnegative_integer(
+            sampler_attempt_count, "sampler attempt count"
+        )
+        if not phase or not input_type:
+            raise ValueError("reservation phase and input type must be nonempty")
+        begin, available = self.preflight(lane, count)
+        if count > available:
+            failure = DeviceFailure(
+                lane=lane,
+                status=1,
+                phase=phase,
+                failure_code="capacity_overflow",
+                input_type=input_type,
+                logical_address=logical_address,
+                requested_extent=count,
+                available_extent=available,
+                sampler_attempt_count=sampler_attempt_count,
+            )
+            self.failure_state.record(failure)
+            raise StorageOverflow(self.failure_state.snapshot(lane) or failure)
+        end = begin + count
+        state = self._state[lane]
+        state[self._RESERVED].fill_(end)
+        state[self._ATTEMPT_HIGH_WATER].fill_(
+            max(int(state[self._ATTEMPT_HIGH_WATER].item()), end)
+        )
+        state[self._LIFETIME_HIGH_WATER].fill_(
+            max(int(state[self._LIFETIME_HIGH_WATER].item()), end)
+        )
+        state[self._OPEN_BEGIN].fill_(begin)
+        state[self._OPEN_END].fill_(end)
+        token = self._next_token
+        self._next_token += 1
+        reservation = SlabReservation(
+            self,
+            lane,
+            ReservationAddress(self.epoch(lane), begin, end),
+            token,
+        )
+        self._tokens[token] = reservation
+        return reservation
+
+    def _require_reservation(self, reservation: SlabReservation) -> None:
+        self._check_live()
+        if (
+            reservation._slab is not self
+            or reservation._closed
+            or self._tokens.get(reservation._token) is not reservation
+        ):
+            raise StorageError("reservation does not belong to this live slab")
+        state = self._lane_state(reservation.lane)
+        if (
+            state[self._OPEN_BEGIN] != reservation.address.begin
+            or state[self._OPEN_END] != reservation.address.end
+            or state[self._EPOCH] != reservation.address.epoch
+        ):
+            raise StorageError("reservation address no longer matches slab state")
+
+    def _reservation_view(self, reservation: SlabReservation, field: str) -> Tensor:
+        self._require_reservation(reservation)
+        if field not in self._columns:
+            raise KeyError(f"{self.schema.name} has no field {field!r}")
+        return self._columns[field][
+            reservation.lane, reservation.address.begin : reservation.address.end
+        ]
+
+    def _fill(self, reservation: SlabReservation, values: Mapping[str, Tensor]) -> None:
+        self._require_reservation(reservation)
+        expected_names = tuple(field.name for field in self.schema.fields)
+        if tuple(values) != expected_names:
+            raise StorageError(
+                f"{self.label} fill fields must exactly match {expected_names}"
+            )
+        for field in self.schema.fields:
+            value = values[field.name]
+            expected = (reservation.rows, *field.shape)
+            if (
+                tuple(value.shape) != expected
+                or value.dtype != field.dtype
+                or value.device != self.device
+            ):
+                raise StorageError(
+                    f"{self.label}.{field.name} fill must be {expected} "
+                    f"{field.dtype} on {self.device}"
+                )
+        for field in self.schema.fields:
+            self._reservation_view(reservation, field.name).copy_(values[field.name])
+
+    def _fill_defaults(self, reservation: SlabReservation) -> None:
+        self._require_reservation(reservation)
+        for field in self.schema.fields:
+            self._reservation_view(reservation, field.name).fill_(field.fill)
+
+    def _prepare_publish(self, reservation: SlabReservation) -> None:
+        self._require_reservation(reservation)
+        if not reservation.filled:
+            raise TransactionError(f"{self.label} reservation is not filled")
+        state = self._lane_state(reservation.lane)
+        if state[self._PUBLISHED] != reservation.address.begin:
+            raise TransactionError("publication would create a row-address gap")
+
+    def _publish(self, reservation: SlabReservation) -> None:
+        self._state[reservation.lane, self._PUBLISHED].fill_(
+            reservation.address.end
+        )
+        self._state[
+            reservation.lane, self._OPEN_BEGIN : self._OPEN_END + 1
+        ].fill_(-1)
+        reservation._closed = True
+        del self._tokens[reservation._token]
+
+    def _rollback_publication(self, reservation: SlabReservation) -> None:
+        self._state[reservation.lane, self._PUBLISHED].fill_(
+            reservation.address.begin
+        )
+        self._state[reservation.lane, self._POISONED].fill_(1)
+
+    def _abort(self, reservation: SlabReservation) -> None:
+        if reservation._closed:
+            return
+        self._require_reservation(reservation)
+        self._state[reservation.lane, self._POISONED].fill_(1)
+        self._state[
+            reservation.lane, self._OPEN_BEGIN : self._OPEN_END + 1
+        ].fill_(-1)
+        reservation._closed = True
+        del self._tokens[reservation._token]
+
+    def published(self, lane: int, field: str) -> Tensor:
+        tail = self.tail(lane)
+        if field not in self._columns:
+            raise KeyError(f"{self.schema.name} has no field {field!r}")
+        return self._columns[field][lane, :tail]
+
+    def _prepare_reset_failed_lane(self, lane: int) -> list[int]:
+        state = self._lane_state(lane)
+        if not state[self._POISONED] and self.failure_state.snapshot(lane) is None:
+            raise StorageError("only a failed lane may start a retry epoch")
+        open_tokens = [
+            token
+            for token, reservation in self._tokens.items()
+            if reservation.lane == lane
+        ]
+        if open_tokens:
+            raise StorageError("failed lane still owns an open reservation")
+        return state
+
+    def reset_failed_lane(self, lane: int) -> int:
+        """Discard one complete failed attempt without touching other lanes."""
+
+        state = self._prepare_reset_failed_lane(lane)
+        for field in self.schema.fields:
+            self._columns[field.name][lane].fill_(field.fill)
+        lifetime_high_water = state[self._LIFETIME_HIGH_WATER]
+        new_epoch = state[self._EPOCH] + 1
+        self._state[lane].zero_()
+        self._state[lane, self._LIFETIME_HIGH_WATER].fill_(lifetime_high_water)
+        self._state[lane, self._EPOCH].fill_(new_epoch)
+        self._state[lane, self._OPEN_BEGIN : self._OPEN_END + 1].fill_(-1)
+        return new_epoch
+
+    def release(self) -> None:
+        self._check_live()
+        if self._tokens:
+            raise StorageError(f"{self.label} has open reservations")
+        self._columns = MappingProxyType({})
+        self._backing = torch.empty(0, dtype=torch.uint8, device=self.device)
+        self._state = torch.empty(0, dtype=torch.int64, device=self.device)
+        self._released = True
+
+
+@dataclass(frozen=True)
+class DestinationRequest:
+    """One destination extent in an atomic publication transaction."""
+
+    slab: MonotoneSlab
+    lane: int
+    count: int
+    input_type: str
+    logical_address: int
+
+
+class PublicationTransaction:
+    """Atomic multi-destination reservation, fill, and publication."""
+
+    def __init__(self, reservations: tuple[SlabReservation, ...]) -> None:
+        if not reservations:
+            raise ValueError("a publication transaction requires destinations")
+        lanes = {reservation.lane for reservation in reservations}
+        failures = {
+            id(reservation._slab.failure_state) for reservation in reservations
+        }
+        if len(lanes) != 1 or len(failures) != 1:
+            raise ValueError(
+                "transaction destinations must share one lane and failure state"
+            )
+        identities = tuple(
+            (id(reservation._slab), reservation.lane)
+            for reservation in reservations
+        )
+        if len(set(identities)) != len(identities):
+            raise ValueError("a transaction may publish a slab lane only once")
+        self.reservations = reservations
+        self._closed = False
+
+    @classmethod
+    def begin(
+        cls,
+        requests: Sequence[DestinationRequest],
+        *,
+        phase: str,
+        sampler_attempt_count: int = 0,
+    ) -> "PublicationTransaction":
+        if not requests:
+            raise ValueError("a publication transaction requires destinations")
+        if not phase:
+            raise ValueError("transaction phase must be nonempty")
+        sampler_attempt_count = _nonnegative_integer(
+            sampler_attempt_count, "sampler attempt count"
+        )
+        identities = tuple((id(item.slab), item.lane) for item in requests)
+        if len(set(identities)) != len(identities):
+            raise ValueError("a transaction may reserve a slab lane only once")
+        if len({item.lane for item in requests}) != 1 or len(
+            {id(item.slab.failure_state) for item in requests}
+        ) != 1:
+            raise ValueError(
+                "transaction destinations must share one lane and failure state"
+            )
+
+        failures: list[DeviceFailure] = []
+        for request in requests:
+            count = _positive_integer(request.count, "reservation count")
+            logical_address = _nonnegative_integer(
+                request.logical_address, "logical address"
+            )
+            if not request.input_type:
+                raise ValueError("destination input type must be nonempty")
+            begin, available = request.slab.preflight(request.lane, count)
+            del begin
+            if count > available:
+                failures.append(
+                    DeviceFailure(
+                        lane=request.lane,
+                        status=1,
+                        phase=phase,
+                        failure_code="capacity_overflow",
+                        input_type=request.input_type,
+                        logical_address=logical_address,
+                        requested_extent=count,
+                        available_extent=available,
+                        sampler_attempt_count=sampler_attempt_count,
+                    )
+                )
+        if failures:
+            registry = requests[0].slab.failure_state
+            registry.record_many(failures)
+            minimum = min(
+                failures,
+                key=lambda item: (
+                    item.logical_address,
+                    item.lane,
+                    item.input_type,
+                ),
+            )
+            recorded = registry.snapshot(minimum.lane)
+            raise StorageOverflow(recorded or minimum)
+
+        reservations: list[SlabReservation] = []
+        try:
+            for request in requests:
+                reservations.append(
+                    request.slab.reserve(
+                        request.lane,
+                        request.count,
+                        phase=phase,
+                        input_type=request.input_type,
+                        logical_address=request.logical_address,
+                        sampler_attempt_count=sampler_attempt_count,
+                    )
+                )
+        except BaseException:
+            for reservation in reservations:
+                reservation._slab._abort(reservation)
+            raise
+        return cls(tuple(reservations))
+
+    @classmethod
+    def begin_device(
+        cls,
+        requests: Sequence["DeviceDestinationRequest"],
+        *,
+        phase: str,
+        active: Tensor,
+        sampler_attempt_count: Tensor | None = None,
+        blocked: Tensor | None = None,
+    ) -> "_DevicePublicationTransaction":
+        """Begin the sole device-counted form of a publication transaction."""
+
+        return _DevicePublicationTransaction(
+            tuple(requests),
+            phase=phase,
+            active=active,
+            sampler_attempt_count=sampler_attempt_count,
+            blocked=blocked,
+        )
+
+    def fill(self, index: int, values: Mapping[str, Tensor]) -> None:
+        if self._closed:
+            raise TransactionError("transaction is closed")
+        try:
+            self.reservations[index].fill(values)
+        except BaseException:
+            self.abort()
+            raise
+
+    def fill_defaults(self, index: int) -> None:
+        if self._closed:
+            raise TransactionError("transaction is closed")
+        try:
+            self.reservations[index].fill_defaults()
+        except BaseException:
+            self.abort()
+            raise
+
+    def publish(
+        self,
+        *,
+        failure_injector: Callable[[], None] | None = None,
+    ) -> None:
+        if self._closed:
+            raise TransactionError("transaction is closed")
+        try:
+            for reservation in self.reservations:
+                reservation._slab._prepare_publish(reservation)
+            if failure_injector is not None:
+                failure_injector()
+        except BaseException:
+            self.abort()
+            raise
+
+        published: list[SlabReservation] = []
+        try:
+            for reservation in self.reservations:
+                reservation._slab._publish(reservation)
+                published.append(reservation)
+        except BaseException as exc:
+            for reservation in published:
+                reservation._slab._rollback_publication(reservation)
+            for reservation in self.reservations:
+                if not reservation._closed:
+                    reservation._slab._abort(reservation)
+            self._closed = True
+            raise TransactionError("atomic publication failed") from exc
+        self._closed = True
+
+    def abort(self) -> None:
+        if self._closed:
+            return
+        for reservation in self.reservations:
+            if not reservation._closed:
+                reservation._slab._abort(reservation)
+        self._closed = True
+
+
+@dataclass(frozen=True)
+class DeviceDestinationRequest:
+    """One fixed-shape destination whose realized extents stay on CUDA.
+
+    ``values`` has shape ``[n_replica, max_rows, *field.shape]`` for every
+    field.  Only the stable prefix selected by ``counts`` is materialized.
+    A zero count is valid and leaves that lane's destination unchanged.
+    """
+
+    slab: MonotoneSlab
+    counts: Tensor
+    values: Mapping[str, Tensor]
+    input_type: str
+    logical_address: Tensor
+
+    @property
+    def max_rows(self) -> int:
+        first = next(iter(self.values.values()))
+        return int(first.shape[1])
+
+
+class _DevicePublicationTransaction:
+    """Device-counted multi-destination publication with lane isolation.
+
+    Counts, scans, capacity decisions, reservations, and publication remain
+    on the destination CUDA stream.  The host supplies only fixed schemas and
+    launch bounds.  Failed lanes publish no destination; successful lanes in
+    the same replica group commit normally.
+    """
+
+    def __init__(
+        self,
+        requests: tuple[DeviceDestinationRequest, ...],
+        *,
+        phase: str,
+        active: Tensor,
+        sampler_attempt_count: Tensor | None = None,
+        blocked: Tensor | None = None,
+    ) -> None:
+        if not requests:
+            raise ValueError("a device publication requires destinations")
+        if not phase:
+            raise ValueError("device publication phase must be nonempty")
+        first = requests[0].slab
+        self.requests = requests
+        self.phase = phase
+        self.device = first.device
+        self.n_replica = first.n_replica
+        self.failure_state = first.failure_state
+        if (
+            active.shape != (self.n_replica,)
+            or active.dtype != torch.bool
+            or active.device != self.device
+        ):
+            raise ValueError("active lanes must be CUDA bool [n_replica]")
+        self.active = active
+        if blocked is None:
+            blocked = torch.zeros_like(active)
+        if (
+            blocked.shape != (self.n_replica,)
+            or blocked.dtype != torch.bool
+            or blocked.device != self.device
+        ):
+            raise ValueError(
+                "blocked lanes must be CUDA bool [n_replica]"
+            )
+        self.blocked = blocked
+        if sampler_attempt_count is None:
+            sampler_attempt_count = torch.zeros(
+                self.n_replica, dtype=torch.int64, device=self.device
+            )
+        if (
+            sampler_attempt_count.shape != (self.n_replica,)
+            or sampler_attempt_count.dtype != torch.int64
+            or sampler_attempt_count.device != self.device
+        ):
+            raise ValueError(
+                "sampler attempt counts must be CUDA int64 [n_replica]"
+            )
+        self.sampler_attempt_count = sampler_attempt_count
+        self._validate_requests()
+        self._begins = tuple(
+            request.slab._state[:, MonotoneSlab._RESERVED].clone()
+            for request in requests
+        )
+        self._fits = tuple(
+            (
+                (request.counts >= 0)
+                & (request.counts <= request.max_rows)
+                & (request.logical_address >= 0)
+                & (
+                    request.counts
+                    <= request.slab.capacity - begin
+                )
+                & (
+                    request.slab._state[:, MonotoneSlab._OPEN_BEGIN]
+                    == -1
+                )
+                & (
+                    request.slab._state[:, MonotoneSlab._POISONED]
+                    == 0
+                )
+            )
+            for request, begin in zip(requests, self._begins)
+        )
+        fits = torch.stack(self._fits).all(0)
+        self.success = self.active & fits & ~self.blocked
+        self.failed = self.active & ~fits
+        self._ends = tuple(
+            begin + request.counts.clamp(0, request.max_rows)
+            for request, begin in zip(requests, self._begins)
+        )
+        self._record_failures()
+        self._reserve_successful_lanes()
+        self._filled = [False] * len(requests)
+        self._closed = False
+
+    @classmethod
+    def begin(
+        cls,
+        requests: Sequence[DeviceDestinationRequest],
+        *,
+        phase: str,
+        active: Tensor,
+        sampler_attempt_count: Tensor | None = None,
+        blocked: Tensor | None = None,
+    ) -> "_DevicePublicationTransaction":
+        return cls(
+            tuple(requests),
+            phase=phase,
+            active=active,
+            sampler_attempt_count=sampler_attempt_count,
+            blocked=blocked,
+        )
+
+    @property
+    def begins(self) -> tuple[Tensor, ...]:
+        """Device-resident reservation beginnings, one per request."""
+
+        return self._begins
+
+    @property
+    def ends(self) -> tuple[Tensor, ...]:
+        """Device-resident realized reservation ends, one per request."""
+
+        return self._ends
+
+    def _validate_requests(self) -> None:
+        identities: set[int] = set()
+        for request in self.requests:
+            slab = request.slab
+            if id(slab) in identities:
+                raise ValueError(
+                    "a device transaction may publish each slab only once"
+                )
+            identities.add(id(slab))
+            if (
+                slab.device != self.device
+                or slab.n_replica != self.n_replica
+                or slab.failure_state is not self.failure_state
+            ):
+                raise ValueError(
+                    "device destinations must share device, replica axis, "
+                    "and failure state"
+                )
+            if not request.input_type:
+                raise ValueError("destination input type must be nonempty")
+            if (
+                request.counts.shape != (self.n_replica,)
+                or request.counts.dtype != torch.int64
+                or request.counts.device != self.device
+            ):
+                raise ValueError(
+                    "destination counts must be CUDA int64 [n_replica]"
+                )
+            if (
+                request.logical_address.shape != (self.n_replica,)
+                or request.logical_address.dtype != torch.int64
+                or request.logical_address.device != self.device
+            ):
+                raise ValueError(
+                    "logical addresses must be CUDA int64 [n_replica]"
+                )
+            expected_names = tuple(field.name for field in slab.schema.fields)
+            if tuple(request.values) != expected_names:
+                raise StorageError(
+                    f"{slab.label} device fields must exactly match "
+                    f"{expected_names}"
+                )
+            max_rows: int | None = None
+            for field in slab.schema.fields:
+                value = request.values[field.name]
+                if value.ndim < 2:
+                    raise StorageError(
+                        f"{slab.label}.{field.name} needs replica and row axes"
+                    )
+                if max_rows is None:
+                    max_rows = int(value.shape[1])
+                expected = (
+                    self.n_replica,
+                    max_rows,
+                    *field.shape,
+                )
+                if (
+                    tuple(value.shape) != expected
+                    or value.dtype != field.dtype
+                    or value.device != self.device
+                ):
+                    raise StorageError(
+                        f"{slab.label}.{field.name} device fill must be "
+                        f"{expected} {field.dtype} on {self.device}"
+                    )
+            if max_rows is None or max_rows <= 0:
+                raise ValueError("device destinations need a positive pack bound")
+            if max_rows > slab.capacity:
+                raise ValueError(
+                    f"{slab.label} device pack exceeds destination capacity"
+                )
+
+    def _record_failures(self) -> None:
+        if len(self.requests) == 1:
+            selected = torch.zeros(
+                self.n_replica, dtype=torch.int64, device=self.device
+            )
+        else:
+            addresses = torch.stack(
+                tuple(request.logical_address for request in self.requests)
+            )
+            failing = ~torch.stack(self._fits)
+            maximum = torch.iinfo(torch.int64).max
+            selected = torch.where(
+                failing,
+                addresses,
+                torch.full_like(addresses, maximum),
+            ).argmin(0)
+        request_counts = torch.stack(
+            tuple(request.counts.clamp_min(0) for request in self.requests)
+        )
+        available = torch.stack(
+            tuple(
+                torch.minimum(
+                    request.slab.capacity - begin,
+                    torch.full_like(begin, request.max_rows),
+                )
+                for request, begin in zip(self.requests, self._begins)
+            )
+        )
+        addresses = torch.stack(
+            tuple(
+                request.logical_address.clamp_min(0)
+                for request in self.requests
+            )
+        )
+        gather = selected.unsqueeze(0)
+        chosen_count = request_counts.gather(0, gather).squeeze(0)
+        chosen_available = available.gather(0, gather).squeeze(0)
+        chosen_address = addresses.gather(0, gather).squeeze(0)
+        phase_id = self.failure_state._id(
+            self.failure_state._phase_ids, self.phase
+        )
+        records = self.failure_state._records
+        current_address = records[:, DeviceFailureState._ADDRESS]
+        code_ids: list[Tensor] = []
+        for request, begin in zip(self.requests, self._begins):
+            count_invalid = (request.counts < 0) | (
+                request.counts > request.max_rows
+            )
+            address_invalid = request.logical_address < 0
+            capacity_invalid = request.counts > request.slab.capacity - begin
+            order_invalid = (
+                request.slab._state[:, MonotoneSlab._OPEN_BEGIN] != -1
+            ) | (request.slab._state[:, MonotoneSlab._POISONED] != 0)
+            code = torch.full_like(
+                current_address,
+                self.failure_state._id(
+                    self.failure_state._code_ids, "capacity_overflow"
+                ),
+            )
+            for selected_failure, name in (
+                (capacity_invalid, "capacity_overflow"),
+                (count_invalid, "invalid_extent"),
+                (address_invalid, "invalid_logical_address"),
+                (order_invalid, "reservation_order"),
+            ):
+                code = torch.where(
+                    selected_failure,
+                    torch.full_like(
+                        code,
+                        self.failure_state._id(
+                            self.failure_state._code_ids, name
+                        ),
+                    ),
+                    code,
+                )
+            code_ids.append(code)
+        chosen_code = torch.stack(code_ids).gather(
+            0, selected.unsqueeze(0)
+        ).squeeze(0)
+        input_ids = torch.stack(
+            tuple(
+                torch.full_like(
+                    current_address,
+                    self.failure_state._id(
+                        self.failure_state._input_ids, request.input_type
+                    ),
+                )
+                for request in self.requests
+            ),
+        )
+        chosen_input = input_ids.gather(
+            0, selected.unsqueeze(0)
+        ).squeeze(0)
+        replace = self.failed & (chosen_address < current_address)
+        records[:, DeviceFailureState._STATUS].copy_(
+            torch.where(
+                replace,
+                torch.ones_like(current_address),
+                records[:, DeviceFailureState._STATUS],
+            )
+        )
+        for column, value in (
+            (
+                DeviceFailureState._PHASE,
+                torch.full_like(current_address, phase_id),
+            ),
+            (
+                DeviceFailureState._CODE,
+                chosen_code,
+            ),
+            (DeviceFailureState._INPUT, chosen_input),
+            (DeviceFailureState._ADDRESS, chosen_address),
+            (DeviceFailureState._REQUESTED, chosen_count),
+            (DeviceFailureState._AVAILABLE, chosen_available),
+            (DeviceFailureState._ATTEMPTS, self.sampler_attempt_count),
+        ):
+            records[:, column].copy_(
+                torch.where(replace, value, records[:, column])
+            )
+
+    def _reserve_successful_lanes(self) -> None:
+        for request, begin, end in zip(
+            self.requests, self._begins, self._ends
+        ):
+            slab = request.slab
+            state = slab._state
+            positive = self.success & (request.counts > 0)
+            state[:, MonotoneSlab._RESERVED].copy_(
+                torch.where(positive, end, state[:, MonotoneSlab._RESERVED])
+            )
+            state[:, MonotoneSlab._ATTEMPT_HIGH_WATER].copy_(
+                torch.where(
+                    positive,
+                    torch.maximum(
+                        state[:, MonotoneSlab._ATTEMPT_HIGH_WATER], end
+                    ),
+                    state[:, MonotoneSlab._ATTEMPT_HIGH_WATER],
+                )
+            )
+            state[:, MonotoneSlab._LIFETIME_HIGH_WATER].copy_(
+                torch.where(
+                    positive,
+                    torch.maximum(
+                        state[:, MonotoneSlab._LIFETIME_HIGH_WATER], end
+                    ),
+                    state[:, MonotoneSlab._LIFETIME_HIGH_WATER],
+                )
+            )
+            state[:, MonotoneSlab._OPEN_BEGIN].copy_(
+                torch.where(
+                    positive,
+                    begin,
+                    state[:, MonotoneSlab._OPEN_BEGIN],
+                )
+            )
+            state[:, MonotoneSlab._OPEN_END].copy_(
+                torch.where(
+                    positive,
+                    end,
+                    state[:, MonotoneSlab._OPEN_END],
+                )
+            )
+
+    def fill(self, index: int) -> None:
+        if self._closed:
+            raise TransactionError("device transaction is closed")
+        if not 0 <= index < len(self.requests):
+            raise IndexError("device destination index is outside transaction")
+        request = self.requests[index]
+        begin = self._begins[index]
+        max_rows = request.max_rows
+        ordinal = torch.arange(
+            max_rows, dtype=torch.int64, device=self.device
+        )
+        row = begin[:, None] + ordinal[None, :]
+        safe_row = row.clamp(0, request.slab.capacity - 1)
+        valid = self.success[:, None] & (
+            ordinal[None, :] < request.counts[:, None]
+        )
+        valid_last = (
+            self.success
+            & (request.counts > 0)
+            & (begin + request.counts - 1 == request.slab.capacity - 1)
+        )
+        collision = (
+            ~valid
+            & valid_last[:, None]
+            & (safe_row == request.slab.capacity - 1)
+        )
+        last_ordinal = request.counts.clamp(1, max_rows) - 1
+        for field in request.slab.schema.fields:
+            destination = request.slab._columns[field.name]
+            source = request.values[field.name]
+            trailing = tuple(1 for _ in field.shape)
+            scatter_index = safe_row.reshape(
+                self.n_replica, max_rows, *trailing
+            ).expand(self.n_replica, max_rows, *field.shape)
+            current = destination.gather(1, scatter_index)
+            payload = torch.where(
+                valid.reshape(self.n_replica, max_rows, *trailing),
+                source,
+                current,
+            )
+            last_index = last_ordinal.reshape(
+                self.n_replica, 1, *trailing
+            ).expand(self.n_replica, 1, *field.shape)
+            last_value = source.gather(1, last_index).expand_as(source)
+            payload = torch.where(
+                collision.reshape(
+                    self.n_replica, max_rows, *trailing
+                ),
+                last_value,
+                payload,
+            )
+            destination.scatter_(
+                1,
+                scatter_index,
+                payload,
+            )
+        self._filled[index] = True
+
+    def fill_all(self) -> None:
+        for index in range(len(self.requests)):
+            self.fill(index)
+
+    def publish(
+        self,
+        *,
+        commit_marker: Tensor | None = None,
+        sequence: int | Tensor | None = None,
+        failure_injector: Callable[[], None] | None = None,
+    ) -> Tensor:
+        if self._closed:
+            raise TransactionError("device transaction is closed")
+        if not all(self._filled):
+            raise TransactionError("every device destination must be filled")
+        if commit_marker is not None:
+            if (
+                commit_marker.shape != (self.n_replica,)
+                or commit_marker.dtype != torch.int64
+                or commit_marker.device != self.device
+                or sequence is None
+            ):
+                raise ValueError(
+                    "commit marker must be CUDA int64 [n_replica] with sequence"
+                )
+        try:
+            if failure_injector is not None:
+                failure_injector()
+        except BaseException:
+            self.abort()
+            raise
+        for request, end in zip(self.requests, self._ends):
+            slab = request.slab
+            positive = self.success & (request.counts > 0)
+            state = slab._state
+            state[:, MonotoneSlab._PUBLISHED].copy_(
+                torch.where(positive, end, state[:, MonotoneSlab._PUBLISHED])
+            )
+            state[:, MonotoneSlab._OPEN_BEGIN].copy_(
+                torch.where(
+                    positive,
+                    torch.full_like(end, -1),
+                    state[:, MonotoneSlab._OPEN_BEGIN],
+                )
+            )
+            state[:, MonotoneSlab._OPEN_END].copy_(
+                torch.where(
+                    positive,
+                    torch.full_like(end, -1),
+                    state[:, MonotoneSlab._OPEN_END],
+                )
+            )
+        if commit_marker is not None:
+            marker = torch.as_tensor(
+                sequence, dtype=torch.int64, device=self.device
+            ).expand_as(commit_marker)
+            commit_marker.copy_(
+                torch.where(self.success, marker, commit_marker)
+            )
+        self._closed = True
+        return self.success
+
+    def abort(self) -> None:
+        if self._closed:
+            return
+        for request, begin in zip(self.requests, self._begins):
+            slab = request.slab
+            positive = self.success & (request.counts > 0)
+            state = slab._state
+            state[:, MonotoneSlab._RESERVED].copy_(
+                torch.where(positive, begin, state[:, MonotoneSlab._RESERVED])
+            )
+            state[:, MonotoneSlab._OPEN_BEGIN].copy_(
+                torch.where(
+                    positive,
+                    torch.full_like(begin, -1),
+                    state[:, MonotoneSlab._OPEN_BEGIN],
+                )
+            )
+            state[:, MonotoneSlab._OPEN_END].copy_(
+                torch.where(
+                    positive,
+                    torch.full_like(begin, -1),
+                    state[:, MonotoneSlab._OPEN_END],
+                )
+            )
+            state[:, MonotoneSlab._POISONED].copy_(
+                torch.where(
+                    positive,
+                    torch.ones_like(begin),
+                    state[:, MonotoneSlab._POISONED],
+                )
+            )
+        self._closed = True
+
+    def rollback_published(self) -> None:
+        """Roll back a just-published transaction before visibility escapes.
+
+        This is reserved for the generic commit coordinator's exception path.
+        It restores every successful lane to its pre-reservation tail and
+        poisons that lane so it must pass through the ordinary retry reset.
+        """
+
+        if not self._closed:
+            self.abort()
+            return
+        addresses = torch.stack(
+            tuple(
+                torch.where(
+                    request.counts > 0,
+                    request.logical_address,
+                    torch.full_like(
+                        request.logical_address, torch.iinfo(torch.int64).max
+                    ),
+                )
+                for request in self.requests
+            )
+        )
+        selected = addresses.argmin(0)
+        gather = selected.unsqueeze(0)
+        chosen_address = addresses.gather(0, gather).squeeze(0)
+        counts = torch.stack(
+            tuple(request.counts for request in self.requests)
+        )
+        chosen_count = counts.gather(0, gather).squeeze(0)
+        available = torch.stack(
+            tuple(
+                request.slab.capacity - begin
+                for request, begin in zip(self.requests, self._begins)
+            )
+        )
+        chosen_available = available.gather(0, gather).squeeze(0)
+        records = self.failure_state._records
+        phase_id = self.failure_state._id(
+            self.failure_state._phase_ids, self.phase
+        )
+        code_id = self.failure_state._id(
+            self.failure_state._code_ids, "transaction_rollback"
+        )
+        input_ids = torch.stack(
+            tuple(
+                torch.full(
+                    (self.n_replica,),
+                    self.failure_state._id(
+                        self.failure_state._input_ids, request.input_type
+                    ),
                     dtype=torch.int64,
                     device=self.device,
                 )
-            )
-            self._size += fresh_count
-        handles = (
-            torch.cat(pieces)
-            if len(pieces) > 1
-            else (
-                pieces[0]
-                if pieces
-                else torch.empty(0, dtype=torch.int64, device=self.device)
+                for request in self.requests
             )
         )
-        self._live_rows += requested
-        self.high_water_live_rows = max(
-            self.high_water_live_rows, self.live_rows
-        )
-        return handles
-
-    def _device_handles(self, rows: Tensor | Iterable[int]) -> Tensor:
-        handles = torch.as_tensor(rows, dtype=torch.int64, device=self.device)
-        if handles.ndim != 1:
-            raise ValueError("pool handles must be one-dimensional")
-        if handles.numel():
-            torch._assert_async(
-                ((handles >= 0) & (handles < self._size)).all(),
-                "pool handle is outside admitted storage",
+        chosen_input = input_ids.gather(0, gather).squeeze(0)
+        replace = self.success
+        for column, value in (
+            (
+                DeviceFailureState._STATUS,
+                torch.ones_like(chosen_address),
+            ),
+            (
+                DeviceFailureState._PHASE,
+                torch.full_like(chosen_address, phase_id),
+            ),
+            (
+                DeviceFailureState._CODE,
+                torch.full_like(chosen_address, code_id),
+            ),
+            (DeviceFailureState._INPUT, chosen_input),
+            (DeviceFailureState._ADDRESS, chosen_address),
+            (DeviceFailureState._REQUESTED, chosen_count),
+            (DeviceFailureState._AVAILABLE, chosen_available),
+            (DeviceFailureState._ATTEMPTS, self.sampler_attempt_count),
+        ):
+            records[:, column].copy_(
+                torch.where(replace, value, records[:, column])
             )
-        return handles
-
-    def _assert_not_free(self, handles: Tensor) -> None:
-        for free in self._free:
-            torch._assert_async(
-                ~(handles[:, None] == free[None, :]).any(),
-                "pool handle has already reached its last consumer",
-            )
-
-    def release_rows(self, rows: Tensor | Iterable[int]) -> None:
-        handles = self._device_handles(rows)
-        if handles.numel() > 1:
-            ordered = handles.sort().values
-            torch._assert_async(
-                (ordered[1:] != ordered[:-1]).all(),
-                "released pool handles must be unique",
-            )
-        self._assert_not_free(handles)
-        if handles.numel():
-            self._free.append(handles.clone())
-        self._live_rows -= handles.numel()
-        if self._live_rows < 0:
-            raise RuntimeError("pool live-row accounting underflow")
-
-    def _record_access(
-        self, operation: str, *, rows: int, fields: int
-    ) -> None:
-        recorder = getattr(self.access_metrics, "record_storage_access", None)
-        if callable(recorder):
-            recorder(
-                self.label,
-                "slab",
-                operation,
-                "direct",
-                segments_visited=int(self.capacity_rows > 0),
-                rows_requested=rows,
-                rows_moved=rows * fields,
-                candidate_rows=0,
-                routing_bytes=0,
-                tensor_operations=fields,
-            )
-
-    def write(self, rows: Tensor, values: Mapping[str, Tensor]) -> None:
-        handles = self._device_handles(rows)
-        self._assert_not_free(handles)
-        for name, value in values.items():
-            try:
-                spec = self.schema.by_name[name]
-            except KeyError as exc:
-                raise KeyError(f"unknown schema field {name!r}") from exc
-            if (
-                tuple(value.shape) != (handles.numel(), *spec.shape)
-                or value.dtype != spec.dtype
+        for request, begin in zip(self.requests, self._begins):
+            slab = request.slab
+            positive = self.success & (request.counts > 0)
+            state = slab._state
+            for column in (
+                MonotoneSlab._PUBLISHED,
+                MonotoneSlab._RESERVED,
             ):
-                raise ValueError(f"write value for {name!r} violates its schema")
-            if value.device != self.device:
-                raise ValueError("write tensors must already be on the pool device")
-        if not handles.numel():
-            return
-        for name, value in values.items():
-            self._columns[name].index_copy_(0, handles, value)
-        self._record_access(
-            "write", rows=handles.numel(), fields=len(values)
+                state[:, column].copy_(
+                    torch.where(positive, begin, state[:, column])
+                )
+            for column in (
+                MonotoneSlab._OPEN_BEGIN,
+                MonotoneSlab._OPEN_END,
+            ):
+                state[:, column].copy_(
+                    torch.where(
+                        positive,
+                        torch.full_like(begin, -1),
+                        state[:, column],
+                    )
+                )
+            state[:, MonotoneSlab._POISONED].copy_(
+                torch.where(
+                    positive,
+                    torch.ones_like(begin),
+                    state[:, MonotoneSlab._POISONED],
+                )
+            )
+
+
+class ExactBlock:
+    """One explicitly released CUDA block with an immutable realized extent."""
+
+    _IMMUTABLE_ATTRIBUTES = frozenset(("schema", "rows", "device"))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in self._IMMUTABLE_ATTRIBUTES and hasattr(self, name):
+            raise AttributeError(f"{name} is immutable")
+        super().__setattr__(name, value)
+
+    def __init__(
+        self,
+        schema: SoASchema,
+        rows: int,
+        device: torch.device | str,
+    ) -> None:
+        self.schema = schema
+        self.rows = _nonnegative_integer(rows, "exact rows")
+        self.device = torch.device(device)
+        backing, columns = schema.allocate(self.rows, 1, self.device)
+        self._backing = backing
+        self._columns = MappingProxyType(
+            {name: value[0] for name, value in columns.items()}
         )
+        self._released = False
 
-    def gather(self, name: str, rows: Tensor) -> Tensor:
-        handles = self._device_handles(rows)
-        self._assert_not_free(handles)
-        try:
-            result = self._columns[name].index_select(0, handles)
-        except KeyError as exc:
-            raise KeyError(f"unknown schema field {name!r}") from exc
-        self._record_access("read", rows=handles.numel(), fields=1)
-        return result
-
-    def reset(self, *, release_storage: bool = False) -> None:
-        """Release all live handles and optionally drop the admitted slab."""
-
+    @property
+    def columns(self) -> Mapping[str, Tensor]:
         self._check_live()
-        self._free.clear()
-        self._size = 0
-        self._live_rows = 0
-        self.high_water_live_rows = 0
-        if not release_storage:
-            return
-        self._columns.clear()
-        if self.accountant is not None and self._reservation_label is not None:
-            self.accountant.release(self._reservation_label)
-        self._reservation_label = None
+        return self._columns
+
+    @property
+    def allocated_bytes(self) -> int:
+        self._check_live()
+        return int(self._backing.untyped_storage().nbytes())
+
+    @property
+    def payload_bytes(self) -> int:
+        return self.schema.payload_bytes(self.rows)
+
+    def _check_live(self) -> None:
+        if self._released:
+            raise StorageError(f"{self.schema.name} exact block has been released")
 
     def release(self) -> None:
-        if self._released:
-            return
-        self._columns.clear()
-        self._free.clear()
-        self._size = 0
-        self._live_rows = 0
-        self.high_water_live_rows = 0
-        if self.accountant is not None and self._reservation_label is not None:
-            self.accountant.release(self._reservation_label)
-        self._reservation_label = None
+        self._check_live()
+        self._columns = MappingProxyType({})
+        self._backing = torch.empty(0, dtype=torch.uint8, device=self.device)
         self._released = True
 
 
-def admit_dense_pool_growth(
-    requests: Mapping[DenseRecyclableTensorPool, int],
-) -> None:
-    """Grow several dense live-frontier owners as one unpublished transaction."""
-
-    selected = tuple(requests.items())
-    if not selected:
-        return
-    plans: list[
-        tuple[DenseRecyclableTensorPool, int, int, str]
-    ] = []
-    for pool, requested in selected:
-        pool._check_live()
-        fresh = pool.required_fresh_rows(requested)
-        required = pool.size + fresh
-        if required <= pool.capacity_rows:
-            continue
-        capacity = pool._next_capacity(required)
-        generation = pool._generation + 1
-        plans.append(
-            (pool, capacity, generation, f"{pool.label}.slab.{generation}")
-        )
-    if not plans:
-        return
-    accountants = {pool.accountant for pool, _, _, _ in plans}
-    if len(accountants) != 1:
-        raise ValueError("grouped dense growth requires one shared byte accountant")
-    accountant = next(iter(accountants))
-    reservations = {
-        label: pool.schema.capacity_bytes(capacity, chunks=1)
-        for pool, capacity, _, label in plans
-    }
-    if accountant is not None:
-        accountant.reserve_many(reservations)
-    pending: list[
-        tuple[DenseRecyclableTensorPool, int, str, dict[str, Tensor]]
-    ] = []
-    try:
-        for pool, capacity, generation, label in plans:
-            replacement = pool.schema.allocate(capacity, pool.device)
-            if pool.size:
-                for spec in pool.schema.fields:
-                    replacement[spec.name][: pool.size].copy_(
-                        pool._columns[spec.name][: pool.size]
-                    )
-            pending.append((pool, generation, label, replacement))
-    except BaseException:
-        if accountant is not None:
-            accountant.release_many(reservations)
-        raise
-    previous_columns: list[dict[str, Tensor]] = []
-    previous_labels: list[str] = []
-    for pool, generation, label, replacement in pending:
-        previous_columns.append(pool._columns)
-        if pool._reservation_label is not None:
-            previous_labels.append(pool._reservation_label)
-        pool._columns = replacement
-        pool._reservation_label = label
-        pool._generation = generation
-    for columns in previous_columns:
-        columns.clear()
-    if accountant is not None and previous_labels:
-        accountant.release_many(previous_labels)
-
-
-class DenseRecyclableTensorColumn:
-    """Tensor-style direct indexing over a dynamically grown dense slab."""
-
-    def __init__(self, pool: DenseRecyclableTensorPool, name: str) -> None:
-        self.pool = pool
-        self.name = name
-        self.spec = pool.schema.by_name[name]
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        return (self.pool.size, *self.spec.shape)
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.spec.dtype
-
-    @property
-    def device(self) -> torch.device:
-        return self.pool.device
-
-    def numel(self) -> int:
-        return self.pool.size * self.spec.elements_per_row
-
-    def _row_count(self, key: Any) -> int:
-        selector = key[0] if isinstance(key, tuple) else key
-        if isinstance(selector, int):
-            return 1
-        if isinstance(selector, slice):
-            start, stop, step = selector.indices(self.pool.size)
-            return len(range(start, stop, step))
-        if isinstance(selector, Tensor):
-            return selector.numel()
-        return torch.as_tensor(selector).numel()
-
-    def __getitem__(self, key: Any) -> Tensor:
-        self.pool._check_live()
-        result = self.pool._columns[self.name][key]
-        self.pool._record_access("read", rows=self._row_count(key), fields=1)
-        return result
-
-    def __setitem__(self, key: Any, value: Any) -> None:
-        self.pool._check_live()
-        self.pool._columns[self.name][key] = value
-        self.pool._record_access("write", rows=self._row_count(key), fields=1)
-
-
-@dataclass(frozen=True)
-class SealMetrics:
-    source_capacity_bytes: int
-    destination_capacity_bytes: int
-    scratch_capacity_bytes: int
-    peak_accounted_bytes: int
-    logical_payload_bytes: int
-    source_pages: int
-
-
-@dataclass(frozen=True)
-class PartitionRolloutBlock:
-    """Aligned natural input/decision/action columns for one partition."""
-
-    partition_id: int
-    inputs: SealedTensorBlock
-    decisions: SealedTensorBlock
-    actions: SealedTensorBlock | None = None
-    action_ptr: Tensor | None = None
-    input_pools: Mapping[str, SealedTensorBlock] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if self.inputs.rows != self.decisions.rows:
-            raise ValueError("partition input and decision rows must align")
-        if self.actions is None:
-            if self.action_ptr is not None:
-                raise ValueError("sequential partitions cannot own an action pointer")
-        else:
-            if (
-                self.action_ptr is None
-                or self.action_ptr.dtype != torch.int32
-                or self.action_ptr.shape != (self.decisions.rows + 1,)
-            ):
-                raise ValueError("branched action_ptr must be int32 [D+1]")
-            ptr = self.action_ptr.to(torch.int64)
-            if int(ptr[0]) != 0 or int(ptr[-1]) != self.actions.rows or bool(
-                (ptr[1:] < ptr[:-1]).any()
-            ):
-                raise ValueError("branched action_ptr is not valid CSR")
-        pools = MappingProxyType(dict(self.input_pools))
-        for name, block in pools.items():
-            ref_name = f"{name}_ref"
-            if ref_name not in self.inputs.columns:
-                raise ValueError(f"rollout input pool {name!r} lacks {ref_name!r}")
-            refs = self.inputs.columns[ref_name]
-            if refs.dtype != torch.int32 or refs.shape != (self.inputs.rows,):
-                raise ValueError("rollout input-pool references must be int32 [D]")
-            if refs.numel():
-                torch._assert_async(
-                    ((refs >= 0) & (refs < block.rows)).all(),
-                    "rollout input-pool reference is out of range",
-                )
-        object.__setattr__(self, "input_pools", pools)
-
-
-@dataclass(frozen=True)
-class RolloutStorage:
-    """Sealed pre-target store; topology and leaves have explicit lifetimes."""
-
-    mode: str
-    partitions: Mapping[int, PartitionRolloutBlock]
-    topology: Any
-    leaves: SealedTensorBlock
-    seal_metrics: Mapping[str, SealMetrics] = field(default_factory=dict)
-    schema_version: str = ROLLOUT_STORAGE_SCHEMA_VERSION
-
-    def __post_init__(self) -> None:
-        if self.mode not in {"normal", "sequential_rb", "branched_rb"}:
-            raise ValueError("unknown rollout storage mode")
-        if self.schema_version != ROLLOUT_STORAGE_SCHEMA_VERSION:
-            raise ValueError("unsupported rollout storage schema version")
-        partitions = {int(key): value for key, value in self.partitions.items()}
-        if any(key != value.partition_id for key, value in partitions.items()):
-            raise ValueError("partition block keys must equal stable partition ids")
-        object.__setattr__(self, "partitions", MappingProxyType(partitions))
-        object.__setattr__(self, "seal_metrics", MappingProxyType(dict(self.seal_metrics)))
-
-
-@dataclass(frozen=True)
-class SealedDecisionInputs:
-    """Exact natural decision rows emitted by a rollout scheduler."""
-
-    node_ids: Tensor
-    partition_id: Tensor
-    partition_row: Tensor
-    inputs: Mapping[int, SealedTensorBlock]
-    decision_sources: Mapping[int, SealedTensorBlock] = field(default_factory=dict)
-    action_sources: Mapping[int, SealedTensorBlock] = field(default_factory=dict)
-    action_ptrs: Mapping[int, Tensor] = field(default_factory=dict)
-    input_pools: Mapping[int, Mapping[str, SealedTensorBlock]] = field(
-        default_factory=dict
-    )
-    seal_metrics: Mapping[str, SealMetrics] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        count = self.node_ids.numel()
-        for name, value in (
-            ("node_ids", self.node_ids),
-            ("partition_id", self.partition_id),
-            ("partition_row", self.partition_row),
-        ):
-            if value.dtype != torch.int32 or value.shape != (count,):
-                raise ValueError(f"sealed decision {name} must be int32 [D]")
-        inputs = MappingProxyType({int(key): value for key, value in self.inputs.items()})
-        decisions = MappingProxyType(
-            {int(key): value for key, value in self.decision_sources.items()}
-        )
-        actions = MappingProxyType(
-            {int(key): value for key, value in self.action_sources.items()}
-        )
-        action_ptrs = MappingProxyType(
-            {int(key): value for key, value in self.action_ptrs.items()}
-        )
-        pools = MappingProxyType(
-            {
-                int(key): MappingProxyType(dict(value))
-                for key, value in self.input_pools.items()
-            }
-        )
-        for partition, block in inputs.items():
-            selected = self.partition_id == partition
-            rows = self.partition_row[selected].to(torch.int64)
-            if rows.numel() != block.rows or (
-                rows.numel()
-                and not torch.equal(
-                    rows.sort().values,
-                    torch.arange(block.rows, device=rows.device),
-                )
-            ):
-                raise ValueError("sealed decision partition rows are not exact")
-            decision = decisions.get(partition)
-            if decision is None or decision.rows != block.rows:
-                raise ValueError("natural inputs and policy sources must align")
-            action = actions.get(partition)
-            ptr = action_ptrs.get(partition)
-            if (action is None) != (ptr is None):
-                raise ValueError("partition actions and action pointers must coexist")
-            if ptr is not None and (
-                ptr.dtype != torch.int32
-                or ptr.shape != (block.rows + 1,)
-                or int(ptr[-1]) != action.rows
-            ):
-                raise ValueError("partition action CSR does not match its decisions")
-        object.__setattr__(self, "inputs", inputs)
-        object.__setattr__(self, "decision_sources", decisions)
-        object.__setattr__(self, "action_sources", actions)
-        object.__setattr__(self, "action_ptrs", action_ptrs)
-        object.__setattr__(self, "input_pools", pools)
-        object.__setattr__(self, "seal_metrics", MappingProxyType(dict(self.seal_metrics)))
-
-    def gather_partition_inputs(
-        self, partition_id: int, partition_rows: Tensor
-    ) -> Mapping[str, Tensor]:
-        """Gather bounded natural rows and resolve their immutable pools."""
-
-        partition_id = int(partition_id)
-        block = self.inputs[partition_id]
-        device = next(iter(block.columns.values())).device
-        rows = partition_rows.to(device=device, dtype=torch.int64)
-        gathered = {name: value[rows] for name, value in block.columns.items()}
-        for name, pool in self.input_pools.get(partition_id, {}).items():
-            refs = gathered.pop(f"{name}_ref").to(torch.int64)
-            for field_name, value in pool.columns.items():
-                resolved = f"{name}.{field_name}"
-                if resolved in gathered:
-                    raise ValueError(f"resolved input name collision: {resolved!r}")
-                gathered[resolved] = value[refs]
-        return MappingProxyType(gathered)
-
-
-@dataclass(frozen=True)
-class SealedRolloutSample:
-    """Direct compact-seal result returned by a rollout scheduler.
-
-    The decision and leaf sources are exact contiguous copies of paged
-    last-consumer rows. No all-node compatibility tree or reach/policy wrapper
-    exists between those sources and the compact topology.
-    """
-
-    mode: str
-    topology: Any
-    leaf_source: SealedTensorBlock
-    decision_inputs: SealedDecisionInputs
-    node_count: int
-    root_profiles: Tensor | None = None
-    probe_seats: Tensor | None = None
-    trajectory_node_count: Tensor | None = None
-    decision_node: Tensor | None = None
-    decision_aux: Mapping[str, Tensor] = field(default_factory=dict)
-    branching_beta: Tensor | None = None
-    branching_diagnostics: Mapping[str, int | float] = field(default_factory=dict)
-    seal_metrics: Mapping[str, SealMetrics] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if self.mode not in {"normal", "sequential_rb", "branched_rb", "probe"}:
-            raise ValueError("unknown directly sealed rollout mode")
-        if isinstance(self.node_count, bool) or self.node_count < 0:
-            raise ValueError("sealed rollout node_count must be nonnegative")
-        if sum(
-            block.rows for block in self.decision_inputs.decision_sources.values()
-        ) != self.decision_inputs.node_ids.numel():
-            raise ValueError("partition policy sources and natural inputs must align")
-        object.__setattr__(
-            self,
-            "branching_diagnostics",
-            MappingProxyType(dict(self.branching_diagnostics)),
-        )
-        object.__setattr__(self, "decision_aux", MappingProxyType(dict(self.decision_aux)))
-        object.__setattr__(self, "seal_metrics", MappingProxyType(dict(self.seal_metrics)))
-
-
-@dataclass(frozen=True)
-class TrainingPartition:
-    """One immutable aligned partition block consumed by optimization."""
-
-    partition_id: int
-    inputs: SealedTensorBlock
-    columns: Mapping[str, Tensor]
-    action_columns: Mapping[str, Tensor] | None = None
-    max_actions_per_decision: int | None = None
-    input_pools: Mapping[str, SealedTensorBlock] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        columns = MappingProxyType(dict(self.columns))
-        object.__setattr__(self, "columns", columns)
-        rows = self.inputs.rows
-        for name, value in columns.items():
-            if value.ndim == 0 or value.shape[0] != rows:
-                raise ValueError(f"training decision column {name!r} is not row aligned")
-            if value.requires_grad:
-                raise ValueError("training storage tensors must be detached")
-        if self.action_columns is not None:
-            action_columns = MappingProxyType(dict(self.action_columns))
-            action_rows = {
-                int(value.shape[0])
-                for name, value in action_columns.items()
-                if name != "action_ptr"
-                if value.ndim > 0
-            }
-            if len(action_rows) > 1 or any(
-                value.ndim == 0 or value.requires_grad
-                for value in action_columns.values()
-            ):
-                raise ValueError("training action columns must be aligned and detached")
-            if "action_ptr" in action_columns:
-                ptr = action_columns["action_ptr"]
-                count = next(iter(action_rows), 0)
-                if (
-                    ptr.dtype != torch.int32
-                    or ptr.shape != (rows + 1,)
-                    or int(ptr[0]) != 0
-                    or int(ptr[-1]) != count
-                    or bool((ptr[1:] < ptr[:-1]).any())
-                ):
-                    raise ValueError("training action_ptr is not valid CSR")
-                maximum = self.max_actions_per_decision
-                if maximum is None:
-                    maximum = (
-                        int((ptr[1:] - ptr[:-1]).max()) if rows else 0
-                    )
-                if (
-                    isinstance(maximum, bool)
-                    or not isinstance(maximum, int)
-                    or maximum < 0
-                    or (rows > 0 and maximum <= 0)
-                ):
-                    raise ValueError(
-                        "max_actions_per_decision must bound every branched row"
-                    )
-                torch._assert_async(
-                    ((ptr[1:] - ptr[:-1]) <= maximum).all(),
-                    "branched action span exceeds its immutable maximum",
-                )
-                object.__setattr__(self, "max_actions_per_decision", maximum)
-            object.__setattr__(self, "action_columns", action_columns)
-        else:
-            if self.max_actions_per_decision not in (None, 0):
-                raise ValueError("sequential partitions cannot declare action spans")
-            object.__setattr__(self, "max_actions_per_decision", 0)
-        pools = MappingProxyType(dict(self.input_pools))
-        for name, block in pools.items():
-            if not name or not isinstance(block, SealedTensorBlock):
-                raise TypeError("input pools require nonempty names and sealed blocks")
-            ref_name = f"{name}_ref"
-            if ref_name not in self.inputs.columns:
-                raise ValueError(f"input pool {name!r} has no aligned {ref_name!r}")
-            refs = self.inputs.columns[ref_name]
-            if refs.dtype != torch.int32 or refs.shape != (rows,):
-                raise ValueError(f"input pool reference {ref_name!r} must be int32 [D]")
-            if refs.numel():
-                torch._assert_async(
-                    ((refs >= 0) & (refs < block.rows)).all(),
-                    f"input pool reference {ref_name!r} is out of range",
-                )
-        object.__setattr__(self, "input_pools", pools)
-
-    def gather_inputs(self, rows: Tensor) -> Mapping[str, Tensor]:
-        """Gather one bounded subspan and resolve exact immutable input pools."""
-
-        rows = rows.to(
-            dtype=torch.int64,
-            device=next(iter(self.inputs.columns.values())).device,
-        )
-        gathered = {name: value[rows] for name, value in self.inputs.columns.items()}
-        for name, block in self.input_pools.items():
-            refs = gathered.pop(f"{name}_ref").to(torch.int64)
-            for field_name, value in block.columns.items():
-                resolved = f"{name}.{field_name}"
-                if resolved in gathered:
-                    raise ValueError(f"resolved input name collision: {resolved!r}")
-                gathered[resolved] = value[refs]
-        return MappingProxyType(gathered)
-
-
-@dataclass(frozen=True)
-class SequentialPosteriorPool:
-    """Deduplicated exact posterior rows and trajectory/player addresses."""
-
-    posterior: Tensor
-    trajectory: Tensor
-    player: Tensor
-
-    def __post_init__(self) -> None:
-        count = self.posterior.shape[0]
-        if self.posterior.ndim != 2 or self.posterior.dtype != torch.float32:
-            raise ValueError("posterior pool must be fp32 [U,X]")
-        if self.trajectory.shape != (count,) or self.player.shape != (count,):
-            raise ValueError("posterior pool addresses must align with rows")
-        if self.trajectory.dtype != torch.int32 or self.player.dtype != torch.int32:
-            raise ValueError("posterior pool addresses must be int32")
-        pairs = torch.stack((self.trajectory, self.player), 1)
-        if count and pairs.unique(dim=0).shape[0] != count:
-            raise ValueError("posterior pool contains a duplicate trajectory/player pair")
-
-
-@dataclass(frozen=True)
-class SamplingMetadata:
-    log_z: Mapping[int, Tensor]
-    alias_probability: Mapping[int, Tensor] = field(default_factory=dict)
-    alias_index: Mapping[int, Tensor] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "log_z", MappingProxyType(dict(self.log_z)))
-        object.__setattr__(
-            self, "alias_probability", MappingProxyType(dict(self.alias_probability))
-        )
-        object.__setattr__(self, "alias_index", MappingProxyType(dict(self.alias_index)))
-        for value in self.log_z.values():
-            if value.numel() != 1 or value.dtype != torch.float64:
-                raise ValueError("each partition log Z must be one fp64 scalar")
-            if bool(torch.isnan(value)) or bool(torch.isposinf(value)):
-                raise ValueError("partition log Z must be finite or negative infinity")
-        if set(self.alias_probability) != set(self.alias_index):
-            raise ValueError("alias probability/index tables must have identical keys")
-        for key in self.alias_probability:
-            probability = self.alias_probability[key]
-            alias = self.alias_index[key]
-            if (
-                probability.ndim != 1
-                or probability.dtype != torch.float64
-                or alias.shape != probability.shape
-                or alias.dtype != torch.int32
-            ):
-                raise ValueError("Walker alias tables must be fp64/int32 aligned vectors")
-
-
-@dataclass(frozen=True)
-class TrainingStorage:
-    """Only immutable natural inputs, exact targets, and sampling metadata."""
-
-    mode: str
-    partitions: Mapping[int, TrainingPartition]
-    sampling: SamplingMetadata
-    posterior_pool: SequentialPosteriorPool | None = None
-    schema_version: str = TRAINING_STORAGE_SCHEMA_VERSION
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "partitions",
-            MappingProxyType({int(key): value for key, value in self.partitions.items()}),
-        )
-        if self.schema_version != TRAINING_STORAGE_SCHEMA_VERSION:
-            raise ValueError("unsupported training storage schema version")
-        if self.mode == "sequential_rb" and self.posterior_pool is None:
-            raise ValueError("sequential RB training storage requires a posterior pool")
-        if self.mode != "sequential_rb" and self.posterior_pool is not None:
-            raise ValueError("only sequential RB owns a posterior pool")
-        for partition in self.partitions.values():
-            columns = partition.columns
-            rows = partition.inputs.rows
-            event_count = int(columns["legal_event_ids"].shape[1])
-            model_width = (
-                1 if self.mode == "normal" else int(columns["old_value"].shape[1])
-            )
-            base = rollout_decision_schema(
-                self.mode,
-                model_width=model_width,
-                event_count=event_count,
-                dynamic_heads=False,
-            )
-            base.validate({name: columns[name] for name in base.by_name}, rows)
-            exact_width = (
-                1
-                if self.mode == "normal"
-                else int(
-                    columns[
-                        "lambda_return"
-                        if self.mode == "sequential_rb"
-                        else "value_hat"
-                    ].shape[1]
-                )
-            )
-            dynamic_targets = "trace_variance_hat" in columns
-            target = target_decision_schema(
-                self.mode,
-                exact_width=exact_width,
-                dynamic_heads=dynamic_targets,
-            )
-            if set(columns) != set(base.by_name) | set(target.by_name):
-                raise ValueError("training decision columns do not match declared schemas")
-            target.validate({name: columns[name] for name in target.by_name}, rows)
-            if self.mode == "branched_rb":
-                if partition.action_columns is None:
-                    raise ValueError("branched training partition omitted ragged actions")
-                actions = partition.action_columns
-                action_base = rollout_action_schema(model_width)
-                action_rows = int(actions["event"].shape[0])
-                action_base.validate(
-                    {name: actions[name] for name in action_base.by_name}, action_rows
-                )
-                action_target = target_action_schema(exact_width)
-                action_target.validate(
-                    {name: actions[name] for name in action_target.by_name}, action_rows
-                )
-                if set(actions) != (
-                    set(action_base.by_name) | set(action_target.by_name) | {"action_ptr"}
-                ):
-                    raise ValueError("training action columns do not match declared schemas")
-
-    def tensor_storage_bytes(self) -> int:
-        """Return unique retained tensor storage bytes (views count once)."""
-
-        from pbg.core.memory_control import unique_tensor_bytes
-
-        return unique_tensor_bytes(self)
-
-
-def occurrence_schema(*, n_players: int, mode: str) -> TensorSchema:
-    """Normative compact occurrence source schema for one rollout mode."""
-
-    if n_players <= 0:
-        raise ValueError("n_players must be positive")
-    fields = [
-        TensorFieldSchema("parent", torch.int32, fill=-1, alignment=4),
-        TensorFieldSchema("state_ref", torch.int32, fill=-1, alignment=4),
-        TensorFieldSchema("owner", torch.int32, fill=-1, alignment=4),
-        TensorFieldSchema("status", torch.uint8),
-        TensorFieldSchema("rng_root", torch.int64, alignment=8),
-        TensorFieldSchema("rng_path", torch.int64, alignment=8),
-        TensorFieldSchema("child_begin", torch.int32, fill=-1, alignment=4),
-        TensorFieldSchema("degree", torch.int32, alignment=4),
-        TensorFieldSchema("decision_partition", torch.int32, fill=-1, alignment=4),
-        TensorFieldSchema("decision_row", torch.int32, fill=-1, alignment=4),
-        TensorFieldSchema("leaf_row", torch.int32, fill=-1, alignment=4),
-    ]
-    if mode != "branched_rb":
-        fields.extend(
-            (
-                TensorFieldSchema("root_id", torch.int32, fill=-1, alignment=4),
-                TensorFieldSchema("decision_ordinal", torch.int32, fill=-1, alignment=4),
-            )
-        )
-    else:
-        fields.extend(
-            (
-                TensorFieldSchema("log_weight", torch.float32, alignment=4),
-                TensorFieldSchema("nominal_count", torch.int32, alignment=4),
-                TensorFieldSchema("executed_count", torch.int32, alignment=4),
-                TensorFieldSchema("log_player_sum", torch.float32, alignment=4),
-                TensorFieldSchema("log_ancestor_product", torch.float32, alignment=4),
-                TensorFieldSchema("queue_cost", torch.float32, alignment=4),
-            )
-        )
-    return TensorSchema(
-        "occurrence",
-        tuple(fields),
-        chunk_header_bytes=64,
-        allocator_slack_bytes=64,
-    )
-
-
-def topology_schema(mode: str) -> TensorSchema:
-    if mode == "branched_rb":
-        names = (
-            "parent",
-            "child_begin",
-            "degree",
-            "decision_partition",
-            "decision_row",
-            "leaf_row",
-        )
-    elif mode in {"normal", "sequential_rb"}:
-        names = ("decision_partition", "decision_row")
-    else:
-        raise ValueError("unknown topology mode")
-    return TensorSchema(
-        f"{mode}_topology",
-        tuple(TensorFieldSchema(name, torch.int32, fill=-1, alignment=4) for name in names),
-    )
-
-
-def rollout_policy_source_schema(
-    mode: str, *, model_width: int, dynamic_heads: bool = True
-) -> TensorSchema:
-    """Paged scheduler policy rows before partition-aware sealing."""
-
-    fields = [TensorFieldSchema("node_id", torch.int32, alignment=4)]
-    if mode in {"normal", "sequential_rb"}:
-        fields.extend(
-            (
-                TensorFieldSchema("root_id", torch.int32, alignment=4),
-                TensorFieldSchema("decision_ordinal", torch.int32, alignment=4),
-                TensorFieldSchema("owner", torch.int32, alignment=4),
-                TensorFieldSchema("event", torch.int32, alignment=4),
-                TensorFieldSchema(
-                    "old_logp", torch.float32, (model_width,), alignment=16
-                ),
-                TensorFieldSchema(
-                    "old_v", torch.float32, (model_width,), alignment=16
-                ),
-            )
-        )
-    elif mode == "branched_rb":
-        fields.extend(
-            (
-                TensorFieldSchema("old_v", torch.float32, (model_width,), alignment=16),
-                TensorFieldSchema("action_begin", torch.int64, fill=-1, alignment=8),
-                TensorFieldSchema("action_count", torch.int32, alignment=4),
-            )
-        )
-        if dynamic_heads:
-            fields.extend(
-                (
-                    TensorFieldSchema("old_t", torch.float32, alignment=4),
-                    TensorFieldSchema("old_c", torch.float32, alignment=4),
-                )
-            )
-    else:
-        raise ValueError("unknown rollout mode")
-    return TensorSchema("rollout_policy_source", tuple(fields))
-
-
-def rollout_decision_schema(
-    mode: str,
-    *,
-    model_width: int,
-    event_count: int,
-    dynamic_heads: bool = True,
-) -> TensorSchema:
-    """Exact retained decision columns on one partition's natural width."""
-
-    rb = mode != "normal"
-    fields = [
-        TensorFieldSchema("owner", torch.int32, alignment=4),
-        TensorFieldSchema(
-            "old_value",
-            torch.float32,
-            (() if not rb else (model_width,)),
-            alignment=16,
-        ),
-        TensorFieldSchema(
-            "legal_event_ids", torch.int32, (event_count,), alignment=16
-        ),
-        TensorFieldSchema("legal_event_mask", torch.bool, (event_count,)),
-    ]
-    if mode in {"normal", "sequential_rb"}:
-        fields.extend(
-            (
-                TensorFieldSchema("event", torch.int32, alignment=4),
-                TensorFieldSchema(
-                    "old_log_prob",
-                    torch.float32,
-                    (() if not rb else (model_width,)),
-                    alignment=16,
-                ),
-            )
-        )
-        if mode == "normal":
-            fields.append(
-                TensorFieldSchema("realized_type", torch.int32, alignment=4)
-            )
-    elif mode == "branched_rb":
-        fields.extend(
-            (
-                TensorFieldSchema("log_weight", torch.float64, alignment=8),
-                TensorFieldSchema("nominal_child_count", torch.int32, alignment=4),
-                TensorFieldSchema("executed_child_count", torch.int32, alignment=4),
-            )
-        )
-        if dynamic_heads:
-            fields.extend(
-                (
-                    TensorFieldSchema(
-                        "frozen_trace_variance", torch.float32, alignment=4
-                    ),
-                    TensorFieldSchema("frozen_cost", torch.float32, alignment=4),
-                )
-            )
-    else:
-        raise ValueError("unknown rollout mode")
-    return TensorSchema(f"{mode}_decision", tuple(fields))
-
-
-def rollout_action_schema(model_width: int) -> TensorSchema:
-    """Exact ragged branched action rows."""
-
-    return TensorSchema(
-        "branched_rb_action",
-        (
-            TensorFieldSchema("event", torch.int32, alignment=4),
-            TensorFieldSchema(
-                "old_log_prob", torch.float32, (model_width,), alignment=16
-            ),
-        ),
-    )
-
-
-def rollout_action_source_schema(model_width: int) -> TensorSchema:
-    """Paged scheduler edge-policy rows before ragged action sealing."""
-
-    return TensorSchema(
-        "branched_rb_action_source",
-        (
-            TensorFieldSchema("event", torch.int32, alignment=4),
-            TensorFieldSchema(
-                "old_logp", torch.float32, (model_width,), alignment=16
-            ),
-        ),
-    )
-
-
-def stopped_leaf_source_schema(mode: str, *, players: int, exact_width: int) -> TensorSchema:
-    """Paged last-consumer leaf capture, including its sole log-reach owner."""
-
-    fields = [
-        TensorFieldSchema("node_id", torch.int32, alignment=4),
-        TensorFieldSchema("root_id", torch.int32, alignment=4),
-        TensorFieldSchema("path_key", torch.int64, alignment=8),
-        TensorFieldSchema(
-            "log_reach", torch.float32, (players, exact_width), alignment=16
-        ),
-    ]
-    if mode == "generic":
-        pass
-    elif mode == "normal":
-        fields.append(
-            TensorFieldSchema("reward", torch.float32, (players,), alignment=16)
-        )
-    elif mode in {"sequential_rb", "branched_rb", "probe"}:
-        fields.extend(_rb_completion_public_fields(players))
-        if mode == "probe":
-            fields.append(
-                TensorFieldSchema("selected_owner", torch.int32, alignment=4)
-            )
-    else:
-        raise ValueError("unknown rollout mode")
-    return TensorSchema(f"{mode}_stopped_leaf_source", tuple(fields))
-
-
-def _rb_completion_public_fields(players: int) -> tuple[TensorFieldSchema, ...]:
-    return (
-        TensorFieldSchema("owner", torch.int32, alignment=4),
-        TensorFieldSchema("fold_payoff", torch.float32, (players,), alignment=16),
-        TensorFieldSchema("board_cards", torch.uint8, (5,)),
-        TensorFieldSchema("stratum_level", torch.int32, (players,), alignment=16),
-        TensorFieldSchema(
-            "payoff_baseline", torch.float32, (players,), alignment=16
-        ),
-        TensorFieldSchema("stratum_amount", torch.float32, (players,), alignment=16),
-    )
-
-
-def rollout_leaf_schema(mode: str, *, players: int, exact_width: int) -> TensorSchema:
-    """Exact post-seal leaf fields; RB reach is represented once as weights."""
-
-    if mode == "normal":
-        fields = (
-            TensorFieldSchema("reward", torch.float32, (players,), alignment=16),
-        )
-    elif mode in {"sequential_rb", "branched_rb", "probe"}:
-        fields = (
-            *_rb_completion_public_fields(players),
-            TensorFieldSchema("completion_key", torch.int64, alignment=8),
-            TensorFieldSchema(
-                "range_weights",
-                torch.float32,
-                (players, exact_width),
-                alignment=16,
-            ),
-        )
-        if mode == "probe":
-            fields = (
-                *fields,
-                TensorFieldSchema("selected_owner", torch.int32, alignment=4),
-            )
-    else:
-        raise ValueError("unknown rollout mode")
-    return TensorSchema(f"{mode}_leaf", fields)
-
-
-def target_decision_schema(
-    mode: str, *, exact_width: int, dynamic_heads: bool = True
-) -> TensorSchema:
-    """Target-only decision columns appended to immutable training storage."""
-
-    if mode == "normal":
-        fields = (TensorFieldSchema("lambda_return", torch.float32),)
-    elif mode == "sequential_rb":
-        fields = (
-            TensorFieldSchema("posterior_ref", torch.int32, alignment=4),
-            TensorFieldSchema(
-                "lambda_return", torch.float32, (exact_width,), alignment=16
-            ),
-        )
-    elif mode == "branched_rb":
-        fields = [
-            TensorFieldSchema(
-                "value_hat", torch.float32, (exact_width,), alignment=16
-            )
-        ]
-        if dynamic_heads:
-            fields.extend(
-                (
-                    TensorFieldSchema("trace_variance_hat", torch.float32),
-                    TensorFieldSchema("trace_variance_mask", torch.bool),
-                    TensorFieldSchema("cost_hat", torch.float32),
-                )
-            )
-        fields = tuple(fields)
-    else:
-        raise ValueError("unknown rollout mode")
-    return TensorSchema(f"{mode}_decision_target", fields)
-
-
-def target_action_schema(exact_width: int) -> TensorSchema:
-    return TensorSchema(
-        "branched_rb_action_target",
-        (
-            TensorFieldSchema(
-                "child_posterior", torch.float32, (exact_width,), alignment=16
-            ),
-            TensorFieldSchema(
-                "advantage_hat", torch.float32, (exact_width,), alignment=16
-            ),
-        ),
-    )
-
-
-def sequential_posterior_schema(exact_width: int) -> TensorSchema:
-    return TensorSchema(
-        "sequential_posterior_pool",
-        (
-            TensorFieldSchema(
-                "posterior", torch.float32, (exact_width,), alignment=16
-            ),
-            TensorFieldSchema("trajectory", torch.int32, alignment=4),
-            TensorFieldSchema("player", torch.int32, alignment=4),
-        ),
-    )
+__all__ = [
+    "DestinationRequest",
+    "DeviceDestinationRequest",
+    "DeviceFailure",
+    "DeviceFailureState",
+    "ExactBlock",
+    "FieldExtent",
+    "MonotoneSlab",
+    "PublicationTransaction",
+    "ReservationAddress",
+    "SlabReservation",
+    "SoAField",
+    "SoASchema",
+    "StorageError",
+    "StorageOverflow",
+    "TransactionError",
+]

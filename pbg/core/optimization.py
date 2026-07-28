@@ -1,205 +1,336 @@
-"""Direct flat-gradient storage and finite-gated distributed updates.
-
-The flat buffer is the owning storage for every trainable ``.grad``.  Backward
-therefore accumulates directly into the buffer that is SUM-reduced; there is no
-post-backward flatten/copy pass and no DDP bucket averaging.
-"""
+"""Dense FP32 gradient ownership and Adam/AdamW transitions."""
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
-import time
-from typing import Any
 
 import torch
-import torch.distributed as dist
-from torch import nn
+from torch import Tensor, nn
 
 
-class FlatGradientBuffer:
-    """One fp32 SUM buffer with parameter gradients bound as stable views."""
+class OptimizationError(RuntimeError):
+    """The dense optimizer contract was violated."""
 
-    def __init__(self, model: nn.Module) -> None:
-        source = model.module if hasattr(model, "module") else model
+
+@dataclass(frozen=True)
+class OptimizerConfig:
+    name: str = "adamw"
+    learning_rate: float = 3.0e-4
+    beta1: float = 0.9
+    beta2: float = 0.999
+    epsilon: float = 1.0e-8
+    weight_decay: float = 0.0
+    grad_clip: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.name not in ("adam", "adamw"):
+            raise ValueError("name must be 'adam' or 'adamw'")
+        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
+            raise ValueError("learning_rate must be positive")
+        if not math.isfinite(self.epsilon) or self.epsilon <= 0:
+            raise ValueError("epsilon must be positive")
+        if not math.isfinite(self.grad_clip) or self.grad_clip <= 0:
+            raise ValueError("grad_clip must be positive")
+        if not math.isfinite(self.beta1) or not 0 <= self.beta1 < 1:
+            raise ValueError("beta1 must be finite in [0,1)")
+        if not math.isfinite(self.beta2) or not 0 <= self.beta2 < 1:
+            raise ValueError("beta2 must be finite in [0,1)")
+        if not math.isfinite(self.weight_decay) or self.weight_decay < 0:
+            raise ValueError("weight_decay must be finite and nonnegative")
+
+
+@dataclass
+class LossScaler:
+    """One explicit scaler state for FP16; FP32/BF16 use unit scale."""
+
+    enabled: bool = False
+    scale: float = 65536.0
+    growth_factor: float = 2.0
+    backoff_factor: float = 0.5
+    growth_interval: int = 2000
+    growth_tracker: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.enabled:
+            self.scale = 1.0
+        if (
+            self.scale <= 0
+            or self.growth_factor <= 1
+            or not 0 < self.backoff_factor < 1
+            or self.growth_interval <= 0
+        ):
+            raise ValueError("loss scaler configuration is invalid")
+
+    def update(self, finite: bool) -> None:
+        if not self.enabled:
+            self.scale = 1.0
+            self.growth_tracker = 0
+            return
+        if not finite:
+            self.scale *= self.backoff_factor
+            self.growth_tracker = 0
+            return
+        self.growth_tracker += 1
+        if self.growth_tracker == self.growth_interval:
+            self.scale *= self.growth_factor
+            self.growth_tracker = 0
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "scale": self.scale,
+            "growth_factor": self.growth_factor,
+            "backoff_factor": self.backoff_factor,
+            "growth_interval": self.growth_interval,
+            "growth_tracker": self.growth_tracker,
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping[str, object]) -> LossScaler:
+        expected = {
+            "enabled",
+            "scale",
+            "growth_factor",
+            "backoff_factor",
+            "growth_interval",
+            "growth_tracker",
+        }
+        if set(state) != expected:
+            raise ValueError("loss scaler state has unknown or missing fields")
+        return cls(**dict(state))
+
+
+class DenseGradientOwner:
+    """One FP32 allocation to which every trainable ``.grad`` is bound."""
+
+    def __init__(self, module: nn.Module, *, flat: Tensor | None = None) -> None:
         self.parameters = tuple(
-            parameter for parameter in source.parameters() if parameter.requires_grad
+            parameter for parameter in module.parameters() if parameter.requires_grad
         )
-        if any(parameter.dtype != torch.float32 for parameter in self.parameters):
-            raise TypeError(
-                "direct fp32 gradient views require fp32 master parameters; use "
-                "autocast for reduced-precision forwards"
-            )
+        if not self.parameters:
+            raise ValueError("dense gradients require trainable parameters")
         devices = {parameter.device for parameter in self.parameters}
-        if len(devices) > 1:
-            raise ValueError("one flat gradient buffer cannot span devices")
-        device = next(iter(devices), torch.device("cpu"))
-        self.flat = torch.zeros(
-            sum(parameter.numel() for parameter in self.parameters),
-            dtype=torch.float32,
-            device=device,
-        )
-        self._views: tuple[Tensor, ...] = self._make_views()
+        if len(devices) != 1 or next(iter(devices)).type != "cuda":
+            raise ValueError("queued dense gradients require one CUDA device")
+        if any(parameter.dtype != torch.float32 for parameter in self.parameters):
+            raise TypeError("queued master parameters must be FP32")
+        self.device = next(iter(devices))
+        size = sum(parameter.numel() for parameter in self.parameters)
+        if flat is None:
+            flat = torch.zeros(
+                size,
+                dtype=torch.float32,
+                device=self.device,
+            )
+        elif (
+            flat.shape != (size,)
+            or flat.dtype != torch.float32
+            or flat.device != self.device
+            or not flat.is_contiguous()
+        ):
+            raise ValueError(
+                "external dense gradient storage must be contiguous FP32 [N] "
+                "on the module device"
+            )
+        self.flat = flat
+        self.views: tuple[Tensor, ...] = self._views()
         self.bind()
 
-    def _make_views(self) -> tuple[Tensor, ...]:
-        views: list[Tensor] = []
+    def _views(self) -> tuple[Tensor, ...]:
         offset = 0
+        result = []
         for parameter in self.parameters:
-            stop = offset + parameter.numel()
-            views.append(self.flat[offset:stop].view_as(parameter))
-            offset = stop
-        if offset != self.flat.numel():
-            raise RuntimeError("flat gradient layout does not cover its buffer")
-        return tuple(views)
-
-    @property
-    def nbytes(self) -> int:
-        return self.flat.numel() * self.flat.element_size()
+            end = offset + parameter.numel()
+            result.append(self.flat[offset:end].view_as(parameter))
+            offset = end
+        return tuple(result)
 
     def bind(self) -> None:
-        """Restore every ``.grad`` alias (optimizers may have cleared it)."""
-
-        for parameter, view in zip(self.parameters, self._views, strict=True):
+        for parameter, view in zip(self.parameters, self.views, strict=True):
             parameter.grad = view
-        self.assert_aliasing()
+        self.assert_bound()
+
+    def assert_bound(self) -> None:
+        base = self.flat.untyped_storage().data_ptr()
+        for parameter, view in zip(self.parameters, self.views, strict=True):
+            if (
+                parameter.grad is None
+                or parameter.grad.untyped_storage().data_ptr() != base
+                or parameter.grad.data_ptr() != view.data_ptr()
+            ):
+                raise OptimizationError("a parameter lost its dense gradient view")
 
     def zero_(self) -> None:
         self.flat.zero_()
         self.bind()
 
-    def assert_aliasing(self) -> None:
-        base = self.flat.untyped_storage().data_ptr()
-        for parameter, view in zip(self.parameters, self._views, strict=True):
-            if parameter.grad is None:
-                raise RuntimeError("a trainable parameter lost its flat gradient view")
-            if parameter.grad.untyped_storage().data_ptr() != base:
-                raise RuntimeError("parameter gradient does not alias the flat buffer")
-            if parameter.grad.data_ptr() != view.data_ptr():
-                raise RuntimeError("parameter gradient has the wrong flat-buffer offset")
-
-    def state_dict(self) -> dict[str, int]:
-        """Layout metadata only; gradients are step-transient, not checkpointed."""
-
-        return {
-            "num_parameters": len(self.parameters),
-            "numel": self.flat.numel(),
-            "nbytes": self.nbytes,
-        }
-
 
 @dataclass(frozen=True)
-class OptimizerStepResult:
-    """Observable result of one common finite-gradient decision."""
-
+class OptimizerStep:
+    applied: bool
     gradients_finite: bool
-    optimizer_step_applied: bool
-    grad_norm_pre_clip: float
-    grad_clip_scale: float
+    grad_norm: float
+    clip_scale: float
     loss_scale_before: float
     loss_scale_after: float
-
-    def metrics(self) -> dict[str, float]:
-        return {
-            "reduced_gradients_finite": float(self.gradients_finite),
-            "optimizer_step_applied": float(self.optimizer_step_applied),
-            "optimizer_step_skipped_nonfinite": float(not self.gradients_finite),
-            "grad_norm_pre_clip": self.grad_norm_pre_clip,
-            "grad_clip_scale": self.grad_clip_scale,
-            "loss_scale_before": self.loss_scale_before,
-            "loss_scale_after": self.loss_scale_after,
-        }
+    step: int
 
 
-def sync_scaled_gradients(
-    world: int,
-    *,
-    metrics: Any | None = None,
-    flat_buffer: FlatGradientBuffer,
-) -> bool:
-    """SUM the owning fp32 gradient buffer and return the common finite decision.
+class DenseAdam:
+    """Selected Adam/AdamW over the owning FP32 parameter/gradient vectors."""
 
-    Callers bind ``flat_buffer`` before backward; no copy-flatten fallback is
-    part of the learner boundary.
-    """
+    def __init__(
+        self,
+        module: nn.Module,
+        config: OptimizerConfig,
+        *,
+        scaler: LossScaler | None = None,
+        gradient_flat: Tensor | None = None,
+        exp_avg: Tensor | None = None,
+        exp_avg_sq: Tensor | None = None,
+    ) -> None:
+        self.config = config
+        self.gradients = DenseGradientOwner(module, flat=gradient_flat)
+        self.parameters = self.gradients.parameters
+        self.exp_avg = self._state_vector(exp_avg, "exp_avg")
+        self.exp_avg_sq = self._state_vector(exp_avg_sq, "exp_avg_sq")
+        self.step_count = 0
+        self.scaler = LossScaler() if scaler is None else scaler
 
-    if not isinstance(flat_buffer, FlatGradientBuffer):
-        raise TypeError("flat_buffer must be a FlatGradientBuffer")
-    flat_buffer.assert_aliasing()
-    flat = flat_buffer.flat
-    if flat.numel() == 0:
-        return True
-    if world > 1:
-        started = time.perf_counter()
-        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-        if metrics is not None:
-            metrics.record_collective(
-                nbytes=flat.numel() * flat.element_size(),
-                seconds=time.perf_counter() - started,
+    def _state_vector(self, value: Tensor | None, name: str) -> Tensor:
+        if value is None:
+            return torch.zeros_like(self.gradients.flat)
+        if (
+            value.shape != self.gradients.flat.shape
+            or value.dtype != torch.float32
+            or value.device != self.gradients.device
+            or not value.is_contiguous()
+        ):
+            raise ValueError(
+                f"external optimizer {name} must match the dense FP32 gradient row"
             )
-    return bool(torch.isfinite(flat).all())
+        return value
 
+    def _flat_views(self, value: Tensor) -> tuple[Tensor, ...]:
+        if value.ndim != 1 or value.numel() != self.gradients.flat.numel():
+            raise OptimizationError("optimizer vector has the wrong shape")
+        offset = 0
+        result = []
+        for parameter in self.parameters:
+            end = offset + parameter.numel()
+            result.append(value[offset:end].view_as(parameter))
+            offset = end
+        return tuple(result)
 
-def _loss_scale(scaler: Any) -> float:
-    return float(scaler.get_scale()) if scaler.is_enabled() else 1.0
-
-
-def _backoff_loss_scale(scaler: Any, current: float) -> float:
-    """Apply the explicit common nonfinite transition to an enabled scaler."""
-
-    if not scaler.is_enabled():
-        return current
-    get_backoff = getattr(scaler, "get_backoff_factor", None)
-    backoff = float(get_backoff()) if callable(get_backoff) else 0.5
-    updated = current * backoff
-    scaler.update(new_scale=updated)
-    return _loss_scale(scaler)
-
-
-def finite_gated_optimizer_step(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler: Any,
-    *,
-    gradients_finite: bool,
-    grad_clip: float,
-) -> OptimizerStepResult:
-    """Unscale, clip, and step only when the reduced gradients are finite.
-
-    A false common decision clears the unusable gradients and, for FP16, backs
-    the shared loss scale off once without invoking local scaler inf checks.
-    Disabled scalers (FP32/BF16/no-AMP) retain their unit scale.
-    """
-
-    scale_before = _loss_scale(scaler)
-    if not gradients_finite:
-        scale_after = _backoff_loss_scale(scaler, scale_before)
-        # Keep direct gradient views alive.  The owner is zeroed once at the
-        # next optimizer step; clearing to None would destroy the layout.
-        for group in optimizer.param_groups:
-            for parameter in group["params"]:
-                if parameter.grad is not None:
-                    parameter.grad.zero_()
-        return OptimizerStepResult(
-            gradients_finite=False,
-            optimizer_step_applied=False,
-            grad_norm_pre_clip=float("inf"),
-            grad_clip_scale=0.0,
-            loss_scale_before=scale_before,
-            loss_scale_after=scale_after,
+    @torch.no_grad()
+    def step(self) -> OptimizerStep:
+        self.gradients.assert_bound()
+        before = float(self.scaler.scale)
+        if self.scaler.enabled:
+            self.gradients.flat.div_(before)
+        finite = bool(torch.isfinite(self.gradients.flat).all())
+        if not finite:
+            self.gradients.flat.zero_()
+            self.scaler.update(False)
+            return OptimizerStep(
+                False,
+                False,
+                float("inf"),
+                0.0,
+                before,
+                float(self.scaler.scale),
+                self.step_count,
+            )
+        norm_tensor = torch.linalg.vector_norm(self.gradients.flat)
+        norm = float(norm_tensor)
+        clip_scale = min(1.0, self.config.grad_clip / max(norm, 1.0e-12))
+        self.gradients.flat.mul_(clip_scale)
+        self.step_count += 1
+        beta1, beta2 = self.config.beta1, self.config.beta2
+        gradient = self.gradients.flat
+        if self.config.name == "adam" and self.config.weight_decay:
+            torch._foreach_add_(
+                self.gradients.views,
+                self.parameters,
+                alpha=self.config.weight_decay,
+            )
+        self.exp_avg.mul_(beta1).add_(gradient, alpha=1.0 - beta1)
+        self.exp_avg_sq.mul_(beta2).addcmul_(gradient, gradient, value=1.0 - beta2)
+        correction1 = 1.0 - beta1**self.step_count
+        correction2 = 1.0 - beta2**self.step_count
+        denominator = self.exp_avg_sq.sqrt().div_(math.sqrt(correction2))
+        denominator.add_(self.config.epsilon)
+        direction = self.exp_avg / correction1 / denominator
+        if self.config.name == "adamw" and self.config.weight_decay:
+            torch._foreach_mul_(
+                self.parameters,
+                1.0 - self.config.learning_rate * self.config.weight_decay,
+            )
+        torch._foreach_add_(
+            self.parameters,
+            self._flat_views(direction),
+            alpha=-self.config.learning_rate,
+        )
+        self.scaler.update(True)
+        return OptimizerStep(
+            True,
+            True,
+            norm,
+            clip_scale,
+            before,
+            float(self.scaler.scale),
+            self.step_count,
         )
 
-    scaler.unscale_(optimizer)
-    grad_norm = torch.nn.utils.clip_grad_norm_(
-        model.parameters(), grad_clip, error_if_nonfinite=True
-    )
-    grad_norm_value = float(grad_norm)
-    scaler.step(optimizer)
-    scaler.update()
-    return OptimizerStepResult(
-        gradients_finite=True,
-        optimizer_step_applied=True,
-        grad_norm_pre_clip=grad_norm_value,
-        grad_clip_scale=min(1.0, float(grad_clip) / max(grad_norm_value, 1.0e-12)),
-        loss_scale_before=scale_before,
-        loss_scale_after=_loss_scale(scaler),
-    )
+    def zero_grad(self) -> None:
+        self.gradients.zero_()
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "schema": "queued-dense-adam-v1",
+            "config": {
+                name: getattr(self.config, name)
+                for name in self.config.__dataclass_fields__
+            },
+            "step": self.step_count,
+            "exp_avg": self.exp_avg.detach().clone(),
+            "exp_avg_sq": self.exp_avg_sq.detach().clone(),
+        }
+
+    def load_state_dict(self, state: Mapping[str, object]) -> None:
+        expected = {"schema", "config", "step", "exp_avg", "exp_avg_sq"}
+        if set(state) != expected or state["schema"] != "queued-dense-adam-v1":
+            raise ValueError("queued optimizer state schema is invalid")
+        if state["config"] != {
+            name: getattr(self.config, name)
+            for name in self.config.__dataclass_fields__
+        }:
+            raise ValueError("optimizer scientific configuration drifted")
+        step = state["step"]
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("optimizer step is invalid")
+        for name, destination in (
+            ("exp_avg", self.exp_avg),
+            ("exp_avg_sq", self.exp_avg_sq),
+        ):
+            source = state[name]
+            if (
+                not isinstance(source, Tensor)
+                or source.shape != destination.shape
+                or source.dtype != torch.float32
+            ):
+                raise ValueError(f"optimizer {name} has the wrong contract")
+            destination.copy_(source.to(destination.device))
+        self.step_count = step
+
+
+__all__ = [
+    "DenseAdam",
+    "DenseGradientOwner",
+    "LossScaler",
+    "OptimizationError",
+    "OptimizerConfig",
+    "OptimizerStep",
+]

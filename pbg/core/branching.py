@@ -1,1426 +1,954 @@
-"""Fixed or post-warmup dynamic duplicate-preserving labeled branching."""
+"""Branching controls and whole-attempt recovery for the queued engine.
+
+This module is game-opaque.  It owns the one fixed/KKT controller contract,
+ordinary randomized rounding, queue-pressure correction, lower-size root
+refill metadata, and the only recoverable transition for a branched attempt.
+"""
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-from dataclasses import dataclass, fields, is_dataclass
+import json
+import logging
 import math
-from typing import Any, Mapping
+import warnings
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Generic, Protocol, TypeVar
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 
-from pbg.core.game import CHANCE, PRETERM, TERMINAL, GameBundle
-from pbg.core.adaptive_branching import (
-    branched_attempt_address,
-    child_path_factors,
-    log_kkt_intensity,
-    randomized_round,
-)
-from pbg.core.tree import PagedRolloutTopology
-from pbg.core.storage import SealedRolloutSample
-from pbg.core.topology import BranchedTreeSpan
+from pbg.core.contracts import ModeSchema, RolloutMode
+from pbg.core.cuda_branching import branching_cuda
+from pbg.core.persistence import RunState
+from pbg.core.rollout import DrawPurpose, logical_rng_keys, logical_uniform
+from pbg.core.training import AttemptAddress, RecoverableOverflow, TrainingError
 
 
-class BranchingCutoffReached(RuntimeError):
-    """A geometry-only rollout stopped with a live, unexpanded frontier."""
+class BranchingError(RuntimeError):
+    """A branching control or recovery invariant was violated."""
+
+
+BRANCH_CONTROLLER_VERSION = "queued-branch-controller-v1"
+COST_SAFEGUARD_VERSION = "queued-cost-safeguard-v1"
+
+
+def randomized_round(beta: Tensor, uniform: Tensor) -> Tensor:
+    """Ordinarily randomized-round finite intensities in ``[1, beta_max]``."""
+
+    if (
+        beta.shape != uniform.shape
+        or beta.device != uniform.device
+        or not beta.is_floating_point()
+        or not uniform.is_floating_point()
+    ):
+        raise ValueError("beta and uniform must be aligned floating tensors")
+    torch._assert_async(
+        (torch.isfinite(beta) & beta.ge(1.0)).all(),
+        "branching intensities must be finite and at least one",
+    )
+    base = torch.floor(beta)
+    return (base + uniform.lt(beta - base)).to(torch.int32)
+
+
+def log_kkt_intensity(
+    trace: Tensor,
+    cost: Tensor,
+    *,
+    log_kappa: float,
+    log_player_ancestor_sum: Tensor,
+    log_ancestor_product: Tensor,
+    beta_max: float,
+) -> Tensor:
+    """Evaluate the authoritative continuous KKT update in FP32 log space."""
+
+    if not (
+        trace.shape
+        == cost.shape
+        == log_player_ancestor_sum.shape
+        == log_ancestor_product.shape
+    ):
+        raise ValueError("KKT head and path tensors must be aligned")
+    if not math.isfinite(beta_max) or beta_max < 1.0:
+        raise ValueError("beta_max must be finite and at least one")
+    tiny = torch.finfo(torch.float32).tiny
+    log_beta = 0.5 * (
+        float(log_kappa)
+        + trace.detach().float().clamp_min(tiny).log()
+        - cost.detach().float().clamp_min(tiny).log()
+        + log_player_ancestor_sum.detach().float()
+        - log_ancestor_product.detach().float()
+    )
+    return log_beta.clamp_(0.0, math.log(beta_max)).exp_()
+
+
+def child_path_factors(
+    log_player_ancestor_sum: Tensor,
+    log_ancestor_product: Tensor,
+    parent_beta: Tensor,
+    *,
+    child_is_player: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Advance the two KKT ancestor factors from one parent to its children."""
+
+    if not (
+        log_player_ancestor_sum.shape
+        == log_ancestor_product.shape
+        == parent_beta.shape
+        == child_is_player.shape
+    ):
+        raise ValueError("KKT child path factors must be aligned")
+    log_beta = parent_beta.detach().float().log()
+    inherited = log_player_ancestor_sum.detach().float() - log_beta
+    local = torch.where(
+        child_is_player,
+        torch.zeros_like(inherited),
+        torch.full_like(inherited, -torch.inf),
+    )
+    return (
+        torch.logaddexp(inherited, local),
+        log_ancestor_product.detach().float() + log_beta,
+    )
+
+
+def decision_log_path_mass(
+    parent: Tensor,
+    executed_degree: Tensor,
+    *,
+    device: torch.device,
+) -> Tensor:
+    """Recompute final log decision masses on CUDA after root augmentation."""
+
+    if (
+        parent.device.type != "cpu"
+        or executed_degree.device.type != "cpu"
+        or parent.dtype not in (torch.int32, torch.int64)
+        or executed_degree.dtype not in (torch.int32, torch.int64)
+        or parent.ndim != 1
+        or parent.shape != executed_degree.shape
+    ):
+        raise ValueError("topology mass inputs must be aligned CPU integers")
+    if device.type != "cuda":
+        raise ValueError("decision log mass requires a CUDA destination")
+    parent_device = parent.to(device=device, dtype=torch.int32)
+    degree_device = executed_degree.to(device=device, dtype=torch.int32)
+    failure = torch.zeros(1, dtype=torch.int32, device=device)
+    result = branching_cuda().decision_log_mass(
+        parent_device,
+        degree_device,
+        failure,
+    )
+    torch._assert_async(
+        failure.eq(0).all(),
+        "decision log mass encountered invalid topology",
+    )
+    return result
+
+
+@dataclass(frozen=True)
+class BranchDecision:
+    """Controller result for one device-local node pack."""
+
+    beta: Tensor
+    nominal_degree: Tensor
+    executed_degree: Tensor
+    target_degree: Tensor
+
+    def __post_init__(self) -> None:
+        shape = self.beta.shape
+        if self.beta.dtype != torch.float32 or self.beta.ndim != 1:
+            raise ValueError("branch beta must be FP32 [nodes]")
+        for name in ("nominal_degree", "executed_degree", "target_degree"):
+            value = getattr(self, name)
+            if (
+                value.device != self.beta.device
+                or value.dtype != torch.int32
+                or value.shape != shape
+            ):
+                raise ValueError(f"{name} must be aligned int32 [nodes]")
+        torch._assert_async(
+            (
+                self.nominal_degree.ge(1)
+                & self.executed_degree.ge(1)
+                & self.target_degree.ge(1)
+                & self.target_degree.le(self.executed_degree)
+            ).all(),
+            "branch degrees violate 1 <= N_tgt <= N",
+        )
+
+
+class BranchController(Protocol):
+    """The only rollout-facing fixed/KKT controller interface."""
+
+    mode: RolloutMode
+    beta_max: float
+
+    def decide(
+        self,
+        *,
+        schema: ModeSchema,
+        root: Tensor,
+        path: Tensor,
+        owner_is_player: Tensor,
+        iteration: int,
+        seed: int,
+        retry_epoch: Tensor | int,
+        trace: Tensor | None,
+        cost: Tensor | None,
+        log_player_ancestor_sum: Tensor,
+        log_ancestor_product: Tensor,
+        frontier_cost: Tensor | None = None,
+        active: Tensor | None = None,
+    ) -> BranchDecision: ...
+
+    def observe(
+        self,
+        counterfactual_tree_size: float,
+        *,
+        iteration: int,
+    ) -> Mapping[str, float]: ...
+
+    def backoff(self) -> Mapping[str, float]: ...
+
+    @property
+    def at_minimum(self) -> bool: ...
+
+    def state_dict(self) -> dict[str, object]: ...
+
+
+@dataclass
+class FixedBranchController:
+    """Stage-fixed intensities using the shared controller operation."""
+
+    fixed_beta: Mapping[str, float]
+    beta_max: int
+    scale: float = 1.0
+    minimum_scale: float = 0.25
+    backoff_factor: float = 0.5
+    safe_tree_size: float | None = None
+    mode: RolloutMode = RolloutMode.BRANCHED_FIXED
+    emergency_backoffs: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.beta_max, bool)
+            or not isinstance(self.beta_max, int)
+            or self.beta_max <= 0
+        ):
+            raise ValueError("beta_max must be a positive integer")
+        values = dict(self.fixed_beta)
+        if not values or any(
+            not isinstance(name, str)
+            or not name
+            or not math.isfinite(float(value))
+            or not 1.0 <= float(value) <= self.beta_max
+            for name, value in values.items()
+        ):
+            raise ValueError("fixed_beta must contain declared intensities")
+        self.fixed_beta = MappingProxyType(
+            {name: float(value) for name, value in values.items()}
+        )
+        if (
+            not math.isfinite(self.beta_max)
+            or self.beta_max < 1.0
+            or not math.isfinite(self.scale)
+            or not math.isfinite(self.minimum_scale)
+            or not 0 < self.minimum_scale <= self.scale
+            or not 0 < self.backoff_factor < 1
+        ):
+            raise ValueError("fixed branching scale bounds are invalid")
+        if self.safe_tree_size is not None and (
+            not math.isfinite(self.safe_tree_size) or self.safe_tree_size < 1
+        ):
+            raise ValueError("safe_tree_size must be finite and at least one")
+
+    def decide(
+        self,
+        *,
+        schema: ModeSchema,
+        root: Tensor,
+        path: Tensor,
+        owner_is_player: Tensor,
+        iteration: int,
+        seed: int,
+        retry_epoch: Tensor | int,
+        trace: Tensor | None,
+        cost: Tensor | None,
+        log_player_ancestor_sum: Tensor,
+        log_ancestor_product: Tensor,
+        frontier_cost: Tensor | None = None,
+        active: Tensor | None = None,
+    ) -> BranchDecision:
+        del trace, cost, log_player_ancestor_sum, log_ancestor_product
+        if schema.rollout_mode is not self.mode:
+            raise BranchingError("fixed controller received a different mode")
+        try:
+            player_beta = self.fixed_beta["player"]
+            chance_beta = self.fixed_beta["chance"]
+        except KeyError as exc:
+            raise BranchingError("fixed beta omits the requested node family") from exc
+        beta = torch.where(
+            owner_is_player,
+            torch.full_like(
+                root,
+                min(self.beta_max, max(1.0, player_beta * self.scale)),
+                dtype=torch.float32,
+            ),
+            torch.full_like(
+                root,
+                min(self.beta_max, max(1.0, chance_beta * self.scale)),
+                dtype=torch.float32,
+            ),
+        )
+        uniform = logical_uniform(
+            logical_rng_keys(
+                seed=seed,
+                iteration=iteration,
+                root=root,
+                path=path,
+                draw=0,
+                purpose=DrawPurpose.ROUND,
+                retry_epoch=retry_epoch,
+                active=active,
+            )
+        )
+        nominal = randomized_round(beta, uniform)
+        executed = nominal.clone()
+        if self.safe_tree_size is not None and frontier_cost is not None:
+            torch._assert_async(
+                (torch.isfinite(frontier_cost) & frontier_cost.ge(0)).all(),
+                "frontier cost must be finite and nonnegative",
+            )
+            suppressed = owner_is_player & frontier_cost.gt(self.safe_tree_size)
+            executed = torch.where(suppressed, torch.ones_like(executed), executed)
+        return BranchDecision(beta, nominal, executed, executed.clone())
+
+    def observe(
+        self,
+        counterfactual_tree_size: float,
+        *,
+        iteration: int,
+    ) -> Mapping[str, float]:
+        size = float(counterfactual_tree_size)
+        if not math.isfinite(size) or size <= 0 or iteration < 0:
+            raise ValueError("fixed controller observation is invalid")
+        return MappingProxyType({"counterfactual_tree_size": size})
+
+    @property
+    def at_minimum(self) -> bool:
+        return self.scale <= self.minimum_scale
+
+    def backoff(self) -> Mapping[str, float]:
+        before = self.scale
+        self.scale = max(self.minimum_scale, self.scale * self.backoff_factor)
+        self.emergency_backoffs += 1
+        return MappingProxyType(
+            {
+                "fixed_scale_before": before,
+                "fixed_scale_after": self.scale,
+                "emergency_backoffs": float(self.emergency_backoffs),
+            }
+        )
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "version": BRANCH_CONTROLLER_VERSION,
+            "mode": self.mode.value,
+            "fixed_beta": dict(self.fixed_beta),
+            "beta_max": self.beta_max,
+            "scale": self.scale,
+            "minimum_scale": self.minimum_scale,
+            "backoff_factor": self.backoff_factor,
+            "safe_tree_size": self.safe_tree_size,
+            "emergency_backoffs": self.emergency_backoffs,
+        }
+
+
+@dataclass
+class KKTBranchController:
+    """Warmup-fixed then trace/cost KKT branching through the same interface."""
+
+    fixed_beta: Mapping[str, float]
+    beta_max: int
+    warmup_iterations: int
+    target_tree_size: float
+    gamma_kappa: float
+    eta_kappa: float
+    kappa_min: float
+    kappa_max: float
+    log_kappa: float
+    emergency_scale: float = 1.0
+    minimum_scale: float = 0.25
+    backoff_factor: float = 0.5
+    safe_tree_size: float | None = None
+    ema_tree_size: float | None = None
+    updates: int = 0
+    emergency_backoffs: int = 0
+    pending_emergency: bool = False
+    mode: RolloutMode = RolloutMode.BRANCHED_KKT
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.beta_max, bool)
+            or not isinstance(self.beta_max, int)
+            or self.beta_max <= 0
+        ):
+            raise ValueError("beta_max must be a positive integer")
+        self.fixed_beta = MappingProxyType(
+            {name: float(value) for name, value in dict(self.fixed_beta).items()}
+        )
+        if set(self.fixed_beta) != {"player", "chance"} or any(
+            not math.isfinite(value) or not 1 <= value <= self.beta_max
+            for value in self.fixed_beta.values()
+        ):
+            raise ValueError("KKT warmup beta must cover player and chance")
+        positive = (
+            self.beta_max,
+            self.target_tree_size,
+            self.gamma_kappa,
+            self.eta_kappa,
+            self.kappa_min,
+            self.kappa_max,
+            self.emergency_scale,
+            self.minimum_scale,
+        )
+        if any(not math.isfinite(value) or value <= 0 for value in positive):
+            raise ValueError("KKT controller values must be finite and positive")
+        if (
+            self.beta_max < 1
+            or self.gamma_kappa > 1
+            or self.eta_kappa > 1
+            or self.kappa_min > self.kappa_max
+            or not self.minimum_scale <= self.emergency_scale <= 1
+            or not math.log(self.kappa_min)
+            <= self.log_kappa
+            <= math.log(self.kappa_max)
+            or not 0 < self.backoff_factor < 1
+            or self.warmup_iterations < 0
+        ):
+            raise ValueError("KKT controller bounds are invalid")
+
+    def decide(
+        self,
+        *,
+        schema: ModeSchema,
+        root: Tensor,
+        path: Tensor,
+        owner_is_player: Tensor,
+        iteration: int,
+        seed: int,
+        retry_epoch: Tensor | int,
+        trace: Tensor | None,
+        cost: Tensor | None,
+        log_player_ancestor_sum: Tensor,
+        log_ancestor_product: Tensor,
+        frontier_cost: Tensor | None = None,
+        active: Tensor | None = None,
+    ) -> BranchDecision:
+        if schema.rollout_mode is not self.mode:
+            raise BranchingError("KKT controller received a different mode")
+        if iteration < self.warmup_iterations:
+            player_beta = torch.full_like(
+                root,
+                max(1.0, self.fixed_beta["player"] * self.emergency_scale),
+                dtype=torch.float32,
+            )
+        else:
+            if (trace is None) != (cost is None):
+                raise BranchingError("active KKT branching requires T/C heads")
+            if trace is None:
+                torch._assert_async(
+                    (~owner_is_player).all(),
+                    "active KKT branching requires T/C heads",
+                )
+                player_beta = torch.ones_like(root, dtype=torch.float32)
+            else:
+                assert cost is not None
+                player_beta = log_kkt_intensity(
+                    trace,
+                    cost,
+                    log_kappa=self.log_kappa,
+                    log_player_ancestor_sum=log_player_ancestor_sum,
+                    log_ancestor_product=log_ancestor_product,
+                    beta_max=self.beta_max,
+                )
+            player_beta = (player_beta * self.emergency_scale).clamp_min(1)
+        chance = torch.full_like(
+            player_beta,
+            min(
+                self.beta_max,
+                max(1.0, self.fixed_beta["chance"] * self.emergency_scale),
+            ),
+        )
+        beta = torch.where(owner_is_player, player_beta, chance)
+        uniform = logical_uniform(
+            logical_rng_keys(
+                seed=seed,
+                iteration=iteration,
+                root=root,
+                path=path,
+                draw=0,
+                purpose=DrawPurpose.ROUND,
+                retry_epoch=retry_epoch,
+                active=active,
+            )
+        )
+        nominal = randomized_round(beta, uniform)
+        executed = nominal.clone()
+        if self.safe_tree_size is not None and frontier_cost is not None:
+            suppressed = owner_is_player & frontier_cost.gt(self.safe_tree_size)
+            executed = torch.where(suppressed, torch.ones_like(executed), executed)
+        return BranchDecision(beta, nominal, executed, executed.clone())
+
+    def observe(
+        self,
+        counterfactual_tree_size: float,
+        *,
+        iteration: int,
+    ) -> Mapping[str, float]:
+        size = float(counterfactual_tree_size)
+        if not math.isfinite(size) or size <= 0 or iteration < 0:
+            raise ValueError("counterfactual tree size must be positive")
+        if iteration < self.warmup_iterations:
+            return MappingProxyType(
+                {
+                    "counterfactual_tree_size": size,
+                    "ema_tree_size": (
+                        self.target_tree_size
+                        if self.ema_tree_size is None
+                        else self.ema_tree_size
+                    ),
+                    "log_kappa": self.log_kappa,
+                }
+            )
+        previous = (
+            self.target_tree_size
+            if self.ema_tree_size is None
+            else self.ema_tree_size
+        )
+        self.ema_tree_size = (1 - self.gamma_kappa) * previous + self.gamma_kappa * size
+        updated = min(
+            math.log(self.kappa_max),
+            max(
+                math.log(self.kappa_min),
+                self.log_kappa
+                + self.eta_kappa * math.log(self.target_tree_size / self.ema_tree_size),
+            ),
+        )
+        self.log_kappa = (
+            min(self.log_kappa, updated)
+            if self.pending_emergency
+            else updated
+        )
+        self.pending_emergency = False
+        self.updates += 1
+        return MappingProxyType(
+            {
+                "counterfactual_tree_size": size,
+                "ema_tree_size": self.ema_tree_size,
+                "log_kappa": self.log_kappa,
+            }
+        )
+
+    @property
+    def at_minimum(self) -> bool:
+        return self.emergency_scale <= self.minimum_scale
+
+    def backoff(self) -> Mapping[str, float]:
+        before = self.log_kappa
+        scale_before = self.emergency_scale
+        self.emergency_scale = max(
+            self.minimum_scale,
+            self.emergency_scale * self.backoff_factor,
+        )
+        self.log_kappa = max(
+            math.log(self.kappa_min),
+            self.log_kappa + math.log(self.backoff_factor),
+        )
+        self.emergency_backoffs += 1
+        self.pending_emergency = True
+        return MappingProxyType(
+            {
+                "log_kappa_before": before,
+                "log_kappa_after": self.log_kappa,
+                "emergency_scale_before": scale_before,
+                "emergency_scale_after": self.emergency_scale,
+                "emergency_backoffs": float(self.emergency_backoffs),
+            }
+        )
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "version": BRANCH_CONTROLLER_VERSION,
+            "mode": self.mode.value,
+            "fixed_beta": dict(self.fixed_beta),
+            "beta_max": self.beta_max,
+            "warmup_iterations": self.warmup_iterations,
+            "target_tree_size": self.target_tree_size,
+            "gamma_kappa": self.gamma_kappa,
+            "eta_kappa": self.eta_kappa,
+            "kappa_min": self.kappa_min,
+            "kappa_max": self.kappa_max,
+            "log_kappa": self.log_kappa,
+            "emergency_scale": self.emergency_scale,
+            "minimum_scale": self.minimum_scale,
+            "backoff_factor": self.backoff_factor,
+            "safe_tree_size": self.safe_tree_size,
+            "ema_tree_size": self.ema_tree_size,
+            "updates": self.updates,
+            "emergency_backoffs": self.emergency_backoffs,
+            "pending_emergency": self.pending_emergency,
+        }
+
+
+def controller_from_state_dict(
+    state: Mapping[str, object],
+) -> FixedBranchController | KKTBranchController:
+    if state.get("version") != BRANCH_CONTROLLER_VERSION:
+        raise BranchingError("branch controller checkpoint version is incompatible")
+    mode = state.get("mode")
+    values = dict(state)
+    values.pop("version")
+    values.pop("mode")
+    if mode == RolloutMode.BRANCHED_FIXED.value:
+        return FixedBranchController(**values)
+    if mode == RolloutMode.BRANCHED_KKT.value:
+        return KKTBranchController(**values)
+    raise BranchingError("branch controller checkpoint has an invalid mode")
+
+
+@dataclass
+class CostSafeguardController:
+    """Enable queue pressure only after sustained strict calibration."""
+
+    gamma_deviance_max: float
+    p95_underprediction_max: float
+    consecutive_iterations: int
+    consecutive_successes: int = 0
+    active: bool = False
+    observations: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.gamma_deviance_max)
+            or self.gamma_deviance_max < 0
+            or not math.isfinite(self.p95_underprediction_max)
+            or self.p95_underprediction_max < 1
+            or isinstance(self.consecutive_iterations, bool)
+            or self.consecutive_iterations <= 0
+            or not 0 <= self.consecutive_successes <= self.consecutive_iterations
+            or self.active
+            != (self.consecutive_successes == self.consecutive_iterations)
+            or self.observations < 0
+        ):
+            raise ValueError("cost safeguard state is invalid")
+
+    def observe(
+        self,
+        gamma_deviance_mean: float,
+        p95_underprediction: float,
+        rows: int,
+    ) -> Mapping[str, float]:
+        if (
+            not math.isfinite(gamma_deviance_mean)
+            or gamma_deviance_mean < 0
+            or not math.isfinite(p95_underprediction)
+            or p95_underprediction < 0
+            or rows <= 0
+        ):
+            raise ValueError("cost safeguard observation is invalid")
+        passed = (
+            gamma_deviance_mean < self.gamma_deviance_max
+            and p95_underprediction < self.p95_underprediction_max
+        )
+        self.consecutive_successes = (
+            min(self.consecutive_iterations, self.consecutive_successes + 1)
+            if passed
+            else 0
+        )
+        self.active = self.consecutive_successes == self.consecutive_iterations
+        self.observations += 1
+        return MappingProxyType(
+            {
+                "gamma_deviance_mean": float(gamma_deviance_mean),
+                "p95_underprediction": float(p95_underprediction),
+                "calibration_rows": float(rows),
+                "passed": float(passed),
+                "active": float(self.active),
+            }
+        )
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "version": COST_SAFEGUARD_VERSION,
+            "gamma_deviance_max": self.gamma_deviance_max,
+            "p95_underprediction_max": self.p95_underprediction_max,
+            "consecutive_iterations": self.consecutive_iterations,
+            "consecutive_successes": self.consecutive_successes,
+            "active": self.active,
+            "observations": self.observations,
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping[str, object]) -> CostSafeguardController:
+        if state.get("version") != COST_SAFEGUARD_VERSION:
+            raise BranchingError("cost safeguard checkpoint is incompatible")
+        values = dict(state)
+        values.pop("version")
+        return cls(**values)
+
+
+AttemptResult = TypeVar("AttemptResult")
+
+
+@dataclass(frozen=True)
+class BranchedRecoveryRecord:
+    severity: str
+    iteration: int
+    replica: int
+    failed_phase: str
+    failed_address: str
+    replacement_address: str
+    old_control: Mapping[str, object]
+    new_control: Mapping[str, object]
+    capacity: int
+    observed_demand: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "severity": self.severity,
+            "iteration": self.iteration,
+            "replica": self.replica,
+            "failed_phase": self.failed_phase,
+            "failed_address": self.failed_address,
+            "replacement_address": self.replacement_address,
+            "old_control": dict(self.old_control),
+            "new_control": dict(self.new_control),
+            "capacity": self.capacity,
+            "observed_demand": self.observed_demand,
+        }
+
+
+@dataclass(frozen=True)
+class RankCommonFailureAgreement:
+    """All-rank attempt boundary with deterministic minimum overflow."""
+
+    world_size: int = 1
+    collect: (
+        Callable[
+            [RecoverableOverflow | None],
+            Sequence[RecoverableOverflow | None],
+        ]
+        | None
+    ) = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.world_size, bool)
+            or not isinstance(self.world_size, int)
+            or self.world_size <= 0
+            or (self.world_size == 1) != (self.collect is None)
+        ):
+            raise ValueError("rank failure agreement ownership is invalid")
+
+    @classmethod
+    def from_runtime(cls) -> RankCommonFailureAgreement:
+        if not dist.is_available() or not dist.is_initialized():
+            return cls()
+        world_size = dist.get_world_size()
+
+        def collect(
+            local: RecoverableOverflow | None,
+        ) -> Sequence[RecoverableOverflow | None]:
+            wire = (
+                None
+                if local is None
+                else (
+                    local.failure,
+                    local.capacity,
+                    local.observed_demand,
+                )
+            )
+            gathered: list[object | None] = [None for _ in range(world_size)]
+            dist.all_gather_object(gathered, wire)
+            return tuple(
+                None
+                if item is None
+                else RecoverableOverflow(
+                    item[0],  # type: ignore[index]
+                    capacity=item[1],  # type: ignore[index]
+                    observed_demand=item[2],  # type: ignore[index]
+                )
+                for item in gathered
+            )
+
+        return cls(world_size=world_size, collect=collect)
+
+    def agree(
+        self, local: RecoverableOverflow | None
+    ) -> RecoverableOverflow | None:
+        failures = (
+            (local,)
+            if self.world_size == 1
+            else tuple(self.collect(local))  # type: ignore[misc]
+        )
+        if len(failures) != self.world_size or any(
+            item is not None and not isinstance(item, RecoverableOverflow)
+            for item in failures
+        ):
+            raise BranchingError(
+                "rank failure agreement returned an invalid rank set"
+            )
+        present = tuple(item for item in failures if item is not None)
+        if not present:
+            return None
+        return min(
+            present,
+            key=lambda item: (
+                item.failure.logical_address,
+                item.failure.phase,
+                item.failure.failure_code,
+                item.failure.input_type,
+                item.failure.lane,
+            ),
+        )
+
+
+class BranchedOverflowRecovery(Generic[AttemptResult]):
+    """Discard a failed tree and retry at a disjoint address with less work."""
 
     def __init__(
         self,
         *,
-        node_count: int,
-        queued_nodes: int,
-        frontier_nodes: int,
-        family_queue_nodes: Mapping[str, int],
-        completed_leaves: int,
-        completed_decisions: int,
+        iteration: int,
+        replica: int,
+        controller: BranchController,
+        run_state: RunState,
+        logger: logging.Logger | None = None,
+        rank_agreement: RankCommonFailureAgreement | None = None,
     ) -> None:
-        self.node_count = node_count
-        self.queued_nodes = queued_nodes
-        self.frontier_nodes = frontier_nodes
-        self.pending_nodes = queued_nodes + frontier_nodes
-        self.family_queue_nodes = dict(family_queue_nodes)
-        self.completed_leaves = completed_leaves
-        self.completed_decisions = completed_decisions
-        super().__init__(
-            f"branched rollout stopped at {node_count} nodes with "
-            f"{self.pending_nodes} live nodes pending"
+        if iteration < 0 or replica < 0:
+            raise ValueError("iteration and replica must be nonnegative")
+        self.iteration = iteration
+        self.replica = replica
+        self.controller = controller
+        self.run_state = run_state
+        self.logger = logging.getLogger(__name__) if logger is None else logger
+        self.rank_agreement = (
+            RankCommonFailureAgreement.from_runtime()
+            if rank_agreement is None
+            else rank_agreement
         )
 
-
-@dataclass(frozen=True)
-class BranchingDiagnosticLimits:
-    """Evaluation-only node stops; never part of the training configuration."""
-
-    upper_nodes: int | None = None
-    stop_nodes: int | None = None
-    reuse_root_private_profile: bool = False
-
-    def __post_init__(self) -> None:
-        for name, value in (("upper_nodes", self.upper_nodes), ("stop_nodes", self.stop_nodes)):
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value <= 1
-            ):
-                raise ValueError(f"diagnostic {name} must be an integer greater than one")
-        if not isinstance(self.reuse_root_private_profile, bool):
-            raise TypeError("reuse_root_private_profile must be bool")
-
-
-def sample_branched_tree(
-    bundle: GameBundle,
-    cfg: Any,
-    gen: torch.Generator,
-    *,
-    iteration: int = 0,
-    diagnostics: dict[str, int] | None = None,
-    controller: Any | None = None,
-    safeguard_controller: Any | None = None,
-    memory_controller: Any | None = None,
-    attempt: int = 0,
-    diagnostic_limits: BranchingDiagnosticLimits | None = None,
-) -> SealedRolloutSample:
-    """Sample one tree and release mutable backend owners on every exit."""
-
-    if isinstance(attempt, bool) or attempt < 0:
-        raise ValueError("branched rollout attempt must be nonnegative")
-    try:
-        return _sample_branched_tree_impl(
-            bundle,
-            cfg,
-            gen,
-            iteration=iteration,
-            diagnostics=diagnostics,
-            controller=controller,
-            safeguard_controller=safeguard_controller,
-            memory_controller=memory_controller,
-            attempt=attempt,
-            diagnostic_limits=diagnostic_limits,
-        )
-    except MemoryError as exc:
-        from pbg.core.memory_control import BranchedMemoryRejection
-
-        if memory_controller is None or isinstance(exc, BranchedMemoryRejection):
-            raise
-        device = torch.device(bundle.rollout_backend.device)
-        allocated_peak = (
-            int(torch.cuda.max_memory_allocated(device))
-            if device.type == "cuda"
-            else 0
-        )
-        reserved_peak = (
-            int(torch.cuda.max_memory_reserved(device))
-            if device.type == "cuda"
-            else 0
-        )
-        raise BranchedMemoryRejection(
-            phase=str(getattr(memory_controller, "last_phase", None) or "rollout"),
-            reason=f"{type(exc).__name__}: {exc}",
-            predicted_bytes=max(
-                int(getattr(memory_controller, "last_predicted_bytes", 0)),
-                allocated_peak,
-                reserved_peak,
-            ),
-            hard_ceiling_bytes=int(memory_controller.hard_ceiling_bytes),
-            allocated_peak_bytes=allocated_peak,
-            reserved_peak_bytes=reserved_peak,
-        ) from exc
-    finally:
-        release = getattr(bundle.rollout_backend, "release_rollout_owners", None)
-        if callable(release):
-            release()
-
-
-def _sample_branched_tree_impl(
-    bundle: GameBundle,
-    cfg: Any,
-    gen: torch.Generator,
-    *,
-    iteration: int = 0,
-    diagnostics: dict[str, int] | None = None,
-    controller: Any | None = None,
-    safeguard_controller: Any | None = None,
-    memory_controller: Any | None = None,
-    attempt: int = 0,
-    diagnostic_limits: BranchingDiagnosticLimits | None = None,
-) -> SealedRolloutSample:
-    """Sample one duplicate-preserving branched tree through execution families."""
-
-    if diagnostics is None:
-        diagnostics = {}
-
-    # Imports are local because rollout dispatch imports this module lazily.
-    import time
-    import torch.distributed as dist
-
-    from pbg.core.execution import (
-        ArenaField,
-        ByteAccountant,
-        DONE,
-        ChunkedOccurrenceArena,
-        DeviceWorkQueue,
-        DrawPurpose,
-        arena_fields,
-        child_path_keys,
-        logical_rng_keys,
-        logical_uniform,
-        select_work_queue,
-        stable_partition_masked,
-    )
-    from pbg.core.storage import (
-        PagedTensorArena,
-        PagedTensorColumn,
-        RecyclableTensorPool,
-        SealedTensorBlock,
-        TensorFieldSchema,
-        TensorSchema,
-        stopped_leaf_source_schema,
-    )
-    from pbg.core.rollout import (
-        _logical_seed,
-        _partition_ids,
-        _rollout_partitions,
-        _sample_events_logical,
-        _sample_profiles_logical,
-        _selected_policy_logp,
-    )
-
-    rollout_cfg = getattr(cfg, "rollout", cfg)
-    backend = bundle.rollout_backend
-    device = torch.device(backend.device)
-    if torch.device(gen.device) != device:
-        raise ValueError("rollout generator must be created on the backend device")
-    if int(rollout_cfg.roots_per_gpu) != 1:
-        raise ValueError("family-scheduled branched rollout requires one root")
-
-    p_max = int(backend.n_players)
-    x_sizes = tuple(int(value) for value in backend.x_sizes)
-    x_max = max(x_sizes)
-    page_rows = int(getattr(rollout_cfg, "storage_page_rows", None) or 256)
-    child_pack_rows = int(
-        getattr(rollout_cfg, "family_batch_rows", None) or page_rows
-    )
-    if child_pack_rows <= 0:
-        raise ValueError("branched physical child rows must be positive")
-    execution_limit = int(
-        getattr(rollout_cfg, "execution_memory_bytes", None) or (1 << 30)
-    )
-    accountant = ByteAccountant(execution_limit)
-    bind_accountant = getattr(backend, "bind_rollout_accountant", None)
-    if callable(bind_accountant):
-        bind_accountant(accountant)
-    limits = diagnostic_limits or BranchingDiagnosticLimits()
-    upper_cutoff = limits.upper_nodes
-    stop_cutoff = limits.stop_nodes
-    minimum_nodes = getattr(rollout_cfg, "branching_min_nodes", None)
-    if minimum_nodes is not None and (
-        isinstance(minimum_nodes, bool)
-        or not isinstance(minimum_nodes, int)
-        or minimum_nodes <= 1
-    ):
-        raise ValueError(
-            "branching_min_nodes must be an integer greater than one"
-        )
-    if diagnostics is not None:
-        diagnostics.clear()
-        diagnostics.update(
-            {
-                "upper_cutoff_batches": 0,
-                "upper_cutoff_parents": 0,
-                "upper_cutoff_avoided_children": 0,
-                "upper_cutoff_first_node_count": -1,
-            }
-        )
-    metrics = getattr(backend, "execution_metrics", None)
-
-    def timed_cuda(component: str, rows: int):
-        if metrics is None:
-            return nullcontext()
-        return metrics.time_cuda_work(component, rows=rows)
-
-    def timed_host_sync(source: str, nbytes: int):
-        if metrics is None:
-            return nullcontext()
-        return metrics.time_host_synchronization(source, nbytes=nbytes)
-
-    roots = backend.branched_root_state()
-    if roots.shape != (1,) or roots.dtype != torch.int32 or roots.device != device:
-        raise ValueError("branched_root_state must return device-local int32 [1]")
-    root_owner = backend.classify(roots).to(torch.int32)
-    buffer = PagedRolloutTopology(
-        1,
-        p_max,
-        device,
-        page_rows=page_rows,
-        accountant=accountant,
-        access_metrics=metrics,
-    )
-    root_nodes = buffer.add_roots(roots, root_owner)
-    arena = ChunkedOccurrenceArena(
-        None,
-        page_rows,
-        device,
-        fields=arena_fields(
-            ("path_key",),
-            extra={"reach_handle": ArenaField(torch.int64, fill=-1)},
-        ),
-        accountant=accountant,
-        label="branched_occurrences",
-        access_metrics=metrics,
-    )
-    root_handles = arena.allocate(1)
-    if device.type == "cuda":
-        torch._assert_async(
-            (root_handles == root_nodes.to(torch.int64)).all(),
-            "branched occurrence and root handles diverged",
-        )
-    elif not torch.equal(root_handles, root_nodes.to(torch.int64)):
-        raise RuntimeError("branched occurrence and root handles diverged")
-    root_reach = torch.zeros((1, p_max, x_max), dtype=torch.float32, device=device)
-    for player, size in enumerate(x_sizes):
-        root_reach[:, player, size:] = -torch.inf
-    reach_pool = RecyclableTensorPool(
-        TensorSchema(
-            "branched_live_reach",
-            (
-                TensorFieldSchema(
-                    "log_reach",
-                    torch.float32,
-                    (p_max, x_max),
-                    alignment=16,
-                ),
-            ),
-            chunk_header_bytes=64,
-            allocator_slack_bytes=64,
-        ),
-        page_rows,
-        device,
-        label="branched_live_reach",
-        accountant=accountant,
-        access_metrics=metrics,
-    )
-    root_reach_handles = reach_pool.allocate(1)
-    reach_pool.write(root_reach_handles, {"log_reach": root_reach})
-    arena.scatter_many(
-        root_handles,
-        {
-            "path_key": torch.zeros(1, dtype=torch.int64, device=device),
-            "reach_handle": root_reach_handles,
-        },
-    )
-
-    def reaches_for(occurrences: Tensor) -> Tensor:
-        handles = arena.gather_many(
-            ("reach_handle",), occurrences.to(torch.int64)
-        )["reach_handle"]
-        return reach_pool.gather("log_reach", handles)
-
-    def release_reaches(occurrences: Tensor) -> None:
-        handles = arena.gather_many(
-            ("reach_handle",), occurrences.to(torch.int64)
-        )["reach_handle"]
-        reach_pool.release_rows(handles)
-    partitions = _rollout_partitions(backend)
-    partition_ids = tuple(spec.partition_id for spec in partitions.specs)
-    partition_preorder = tuple(spec.preorder for spec in partitions.specs)
-    queue_limit = getattr(rollout_cfg, "queue_capacity_rows", None)
-    if (
-        isinstance(queue_limit, bool)
-        or not isinstance(queue_limit, int)
-        or queue_limit <= 0
-    ):
-        raise ValueError("branched rollout requires positive queue_capacity_rows")
-    if child_pack_rows > queue_limit:
-        raise ValueError("family_batch_rows cannot exceed queue_capacity_rows")
-    queues = {
-        partition_id: DeviceWorkQueue(
-            queue_limit,
-            device,
-            staging_rows=child_pack_rows,
-            accountant=accountant,
-            label=f"branched_queue_partition_{partition_id}",
-        )
-        for partition_id in partition_ids
-    }
-    actual_cost_forward = getattr(
-        backend, "policy_forward_partition_actual_cost", None
-    )
-    if not callable(actual_cost_forward):
-        raise ValueError("production requires an actual-cost partition forward")
-    logical_seed = _logical_seed(cfg, gen)
-    rng_tree_address = branched_attempt_address(attempt)
-    scheduler_step = 0
-    completed_decision_rows = 0
-    capture_inputs = getattr(backend, "capture_decision_inputs", None)
-    begin_captures = getattr(backend, "begin_decision_input_captures", None)
-    reserve_capture = getattr(backend, "reserve_decision_input_captures", None)
-    write_capture = getattr(backend, "write_decision_input_capture", None)
-    reserve_actions = getattr(backend, "reserve_action_captures", None)
-    write_actions = getattr(backend, "write_action_captures", None)
-    seal_captures = getattr(backend, "seal_decision_input_captures", None)
-    if not all(
-        callable(value)
-        for value in (
-            capture_inputs,
-            begin_captures,
-            reserve_capture,
-            write_capture,
-            reserve_actions,
-            write_actions,
-            seal_captures,
-        )
-    ):
-        raise TypeError(
-            "branched rollout backends must capture immutable natural decision inputs"
-        )
-    leaf_schema_factory = getattr(backend, "rollout_leaf_source_schema", None)
-    leaf_schema = (
-        leaf_schema_factory("branched_rb")
-        if callable(leaf_schema_factory)
-        else stopped_leaf_source_schema(
-            "generic", players=p_max, exact_width=x_max
-        )
-    )
-    leaf_rows = PagedTensorArena(
-        leaf_schema,
-        page_rows,
-        device,
-        accountant=accountant,
-        label="branched_stopped_leaf_rows",
-    )
-    cutoff_active = False
-    branching_mode = getattr(rollout_cfg, "branching_mode", None)
-    if branching_mode not in {"fixed", "dynamic"}:
-        raise ValueError("branched rollout requires branching_mode 'fixed' or 'dynamic'")
-    adaptive_cfg = getattr(rollout_cfg, "adaptive_kkt", None)
-    dynamic_configured = branching_mode == "dynamic"
-    if dynamic_configured and adaptive_cfg is None:
-        raise ValueError("dynamic branching requires adaptive_kkt configuration")
-    if not dynamic_configured and adaptive_cfg is not None:
-        raise ValueError("adaptive_kkt configuration is only valid for dynamic branching")
-    dynamic_active = bool(
-        dynamic_configured and iteration >= int(adaptive_cfg.warmup_iters)
-    )
-    if dynamic_active and controller is None:
-        raise ValueError("dynamic branching after warmup requires controller state")
-    fixed_scale = (
-        float(controller.scale)
-        if branching_mode == "fixed" and hasattr(controller, "scale")
-        else 1.0
-    )
-    source_model = (
-        bundle.model.module if hasattr(bundle.model, "module") else bundle.model
-    )
-    preflop_model = getattr(source_model, "preflop", None)
-    retains_branching_heads = (
-        getattr(preflop_model, "branching_heads", None) is not None
-    )
-    decision_input_store = begin_captures(
-        mode="branched_rb",
-        dynamic_heads=retains_branching_heads,
-        accountant=accountant,
-    )
-    safe_tree_size = getattr(rollout_cfg, "safe_tree_size", None)
-    if safe_tree_size is not None and (
-        isinstance(safe_tree_size, bool)
-        or not math.isfinite(float(safe_tree_size))
-        or float(safe_tree_size) < 1.0
-    ):
-        raise ValueError("safe_tree_size must be finite and at least one")
-    if safe_tree_size is not None and safeguard_controller is None:
-        raise ValueError("safe_tree_size requires cost-safeguard controller state")
-    if safe_tree_size is None and safeguard_controller is not None:
-        raise ValueError(
-            "cost-safeguard controller state requires safe_tree_size configuration"
-        )
-    queue_pressure_active = bool(
-        safe_tree_size is not None and safeguard_controller.active
-    )
-    if safe_tree_size is not None:
-        diagnostics.update(
-            {
-                "safe_tree_configured": 1,
-                "safe_tree_active": int(queue_pressure_active),
-            }
-        )
-    control_arena = PagedTensorArena(
-        TensorSchema(
-            "branched_controller_rows",
-            (
-                TensorFieldSchema("nominal_count", torch.int32, alignment=4),
-                TensorFieldSchema("beta", torch.float32, alignment=4),
-                TensorFieldSchema(
-                    "log_player_sum", torch.float32, fill=-torch.inf, alignment=4
-                ),
-                TensorFieldSchema("log_ancestor_product", torch.float32, alignment=4),
-                TensorFieldSchema("queue_cost", torch.float32, alignment=4),
-            ),
-            chunk_header_bytes=64,
-            allocator_slack_bytes=64,
-        ),
-        page_rows,
-        device,
-        accountant=accountant,
-        label="branched_controller_rows",
-        access_metrics=metrics,
-    )
-    nominal_count = PagedTensorColumn(control_arena, "nominal_count")
-    beta_rows = PagedTensorColumn(control_arena, "beta")
-    log_player_sum = PagedTensorColumn(control_arena, "log_player_sum")
-    log_ancestor_product = PagedTensorColumn(
-        control_arena, "log_ancestor_product"
-    )
-    queue_cost = PagedTensorColumn(control_arena, "queue_cost")
-    root_is_player = (root_owner >= 0) & (root_owner < p_max)
-    control_arena.append(
-        {
-            "nominal_count": torch.zeros(1, dtype=torch.int32, device=device),
-            "beta": torch.zeros(1, dtype=torch.float32, device=device),
-            "log_player_sum": torch.where(
-                root_is_player,
-                torch.zeros(1, dtype=torch.float32, device=device),
-                torch.full((1,), -torch.inf, dtype=torch.float32, device=device),
-            ),
-            "log_ancestor_product": torch.zeros(1, device=device),
-            "queue_cost": torch.zeros(1, device=device),
-        }
-    )
-    queue_cost_total = 0.0
-    reused_private_profile: Tensor | None = None
-    reused_private_profile_rows = 0
-
-    def admit_child_wave(count: int) -> None:
-        """Admit every mutable child owner before draws or state mutation."""
-
-        checkpoints = (
-            (buffer.nodes, buffer.nodes.page_count),
-            (buffer.edges, buffer.edges.page_count),
-            (control_arena, control_arena.page_count),
-            (reach_pool.arena, reach_pool.arena.page_count),
-        )
-        occurrence_chunks = arena.chunk_count
-        try:
-            buffer.require_child_capacity(count)
-            arena.require_capacity(count)
-            control_arena.require_rows(count)
-            reach_pool.require_capacity(count)
-            require_states = getattr(backend, "require_successor_capacity", None)
-            if callable(require_states):
-                # Dense state/history growth is one final grouped transaction.
-                # No later child-wave admission can fail after it publishes.
-                require_states(count)
-        except BaseException:
-            for owner, pages in reversed(checkpoints):
-                owner.rollback_page_growth(pages)
-            arena.rollback_chunk_growth(occurrence_chunks)
-            raise
-
-    def stop_if_cutoff_reached(frontier_nodes: int = 0) -> None:
-        if stop_cutoff is None or buffer.node_count < stop_cutoff:
-            return
-        family_queue_nodes = {
-            partitions[partition_id].name: int(queue.host_count)
-            for partition_id, queue in queues.items()
-        }
-        raise BranchingCutoffReached(
-            node_count=buffer.node_count,
-            queued_nodes=sum(family_queue_nodes.values()),
-            frontier_nodes=frontier_nodes,
-            family_queue_nodes=family_queue_nodes,
-            completed_leaves=leaf_rows.size,
-            completed_decisions=completed_decision_rows,
-        )
-
-    def read_control(value: Tensor) -> tuple[int, ...]:
-        if value.ndim != 1 or value.dtype != torch.int64:
-            raise ValueError("branched scheduler control must be int64 [K]")
-        if device.type == "cuda":
-            started = time.perf_counter()
-            host = value.to("cpu")
-            elapsed = time.perf_counter() - started
-            if metrics is not None:
-                metrics.record_scheduler_control_synchronization(
-                    seconds=elapsed,
-                    nbytes=value.numel() * value.element_size(),
-                )
-        else:
-            host = value
-        return tuple(int(item) for item in host.tolist())
-
-    def read_float_control(value: Tensor) -> float:
-        if value.numel() != 1 or not value.is_floating_point():
-            raise ValueError("branched scheduler float control must be one scalar")
-        if device.type == "cuda":
-            started = time.perf_counter()
-            host = value.detach().to("cpu")
-            elapsed = time.perf_counter() - started
-            if metrics is not None:
-                metrics.record_scheduler_control_synchronization(
-                    seconds=elapsed, nbytes=value.element_size()
-                )
-        else:
-            host = value.detach()
-        return float(host)
-
-    def record_queues() -> None:
-        if metrics is None:
-            return
-        for partition_id, queue in queues.items():
-            metrics.record_queue(
-                partitions[partition_id].name,
-                depth=queue.host_count,
-                oldest_age=float(queue.oldest_age(scheduler_step)),
-            )
-
-    def sample_private_profiles(
-        states: Tensor, reaches: Tensor, keys: Tensor
-    ) -> Tensor:
-        """Sample legally, or run the explicit one-profile diagnostic ablation."""
-
-        nonlocal reused_private_profile, reused_private_profile_rows
-        if not limits.reuse_root_private_profile:
-            return _sample_profiles_logical(backend, states, reaches, keys, gen)
-        if reused_private_profile is None:
-            sampled = _sample_profiles_logical(
-                backend,
-                states[:1],
-                reaches[:1],
-                keys[:1],
-                gen,
-            )
-            reused_private_profile = sampled[0].detach().clone()
-        reused_private_profile_rows += int(states.numel())
-        return reused_private_profile[None].expand(states.numel(), -1)
-
-    def forecast_workspace(partition_id: int, rows: int) -> int:
-        predictor = getattr(backend, "training_transient_bytes", None)
-        if not callable(predictor):
-            return 0
-        source = bundle.model.module if hasattr(bundle.model, "module") else bundle.model
-        amp = bool(getattr(getattr(cfg, "training", None), "amp", False))
-        return int(
-            predictor(source, partition_id, max(1, int(rows)), amp=amp)
-        )
-
-    def admit(
-        phase: str,
+    def run(
+        self,
+        attempt: Callable[[AttemptAddress], AttemptResult],
+        discard: Callable[[RecoverableOverflow | None], None],
         *,
-        additional_nodes: int = 0,
-        workspace_bytes: int = 0,
-        reason: str,
-    ) -> None:
-        if memory_controller is None:
-            return
-        predicted = memory_controller.admit(
-            phase,
-            buffer.node_count,
-            additional_units=additional_nodes,
-            workspace_bytes=workspace_bytes,
-            device=device,
-            reason=reason,
-        )
-        diagnostics["memory_predicted_bytes"] = int(predicted)
-
-    def offspring_for(
-        nodes: Tensor,
-        partition_id: int | None,
-        output: Any | None,
-        frontier_cost_forecast: float,
-    ) -> tuple[Tensor, Tensor, int]:
-        nonlocal cutoff_active
-        rows = nodes.to(torch.int64)
-        states = buffer.state_ref[rows]
-        fixed_beta = _validate_beta(
-            backend.beta_fn(states),
-            nodes.numel(),
-            device,
-            metrics=metrics,
-        )
-        if branching_mode == "fixed":
-            fixed_beta = (fixed_beta * fixed_scale).clamp_min(1.0)
-        if dynamic_active and partition_id is not None:
-            if output is None or output.t is None or output.c is None:
-                raise RuntimeError("adaptive KKT rollout model omitted T/C heads")
-            beta = log_kkt_intensity(
-                output.t,
-                output.c,
-                controller.log_kappa,
-                log_player_sum[rows],
-                log_ancestor_product[rows],
-                float(adaptive_cfg.beta_max),
-            )
-        else:
-            beta = fixed_beta
-        if cutoff_active:
-            beta = torch.ones_like(beta)
-        paths = arena.gather_many(("path_key",), rows)["path_key"]
-        keys = logical_rng_keys(
-            seed=logical_seed,
-            iteration=iteration,
-            trajectory=torch.full_like(paths, rng_tree_address),
-            path=paths,
-            draw=0,
-            purpose=DrawPurpose.ROUND,
-        )
-        nominal = randomized_round(beta, logical_uniform(keys))
-        offspring = nominal
-        safeguard = bool(
-            partition_id is not None
-            and queue_pressure_active
-            and buffer.node_count + frontier_cost_forecast
-            > float(safe_tree_size)
-        )
-        if safeguard:
-            offspring = torch.ones_like(nominal)
-        total = read_control(offspring.sum().reshape(1))[0]
-        if upper_cutoff is not None and (
-            cutoff_active or buffer.node_count + total >= upper_cutoff
-        ):
-            cutoff_active = True
-            proposed_total = total
-            offspring = torch.ones_like(offspring)
-            total = nodes.numel()
-            if diagnostics is not None:
-                diagnostics["upper_cutoff_batches"] += 1
-                diagnostics["upper_cutoff_parents"] += int(nodes.numel())
-                diagnostics["upper_cutoff_avoided_children"] += max(
-                    0, proposed_total - total
-                )
-                if diagnostics["upper_cutoff_first_node_count"] < 0:
-                    diagnostics["upper_cutoff_first_node_count"] = buffer.node_count
-        if total <= 0:
-            raise RuntimeError("branched intensity produced no child")
-        admit(
-            "rollout",
-            additional_nodes=total,
-            reason="child-wave owners",
-        )
-        admit_child_wave(total)
-        nominal_count[rows] = nominal.to(torch.int32)
-        beta_rows[rows] = beta.detach().to(torch.float32)
-        if queue_pressure_active and diagnostics is not None:
-            diagnostics["safeguard_batches"] = diagnostics.get("safeguard_batches", 0) + int(safeguard)
-            diagnostics["safeguard_suppressed_children"] = diagnostics.get(
-                "safeguard_suppressed_children", 0
-            ) + (int((nominal - offspring).sum()) if safeguard else 0)
-        return offspring, nominal, total
-
-    def expand(
-        nodes: Tensor,
-        partition_id: int | None,
-        frontier_cost_forecast: float = 0.0,
-        *,
-        forced_offspring: Tensor | None = None,
-        forced_edge_weight: float | None = None,
-        record_policy_node: bool = True,
-    ) -> Tensor:
-        nonlocal completed_decision_rows
-        rows = nodes.to(torch.int64)
-        states = buffer.state_ref[rows]
-        reaches = reaches_for(nodes)
-        decision_rows = None
-        if partition_id is not None and record_policy_node:
-            decision_rows = reserve_capture(
-                decision_input_store, partition_id, nodes.numel()
-            )
-            completed_decision_rows += nodes.numel()
-        output = None
-        physical_pack = (
-            None
-            if partition_id is None
-            else partitions[partition_id].byte_work.realize(
-                states, rows=nodes.numel()
-            )
-        )
-        if dynamic_active and partition_id is not None:
-            admit(
-                "rollout",
-                workspace_bytes=forecast_workspace(partition_id, nodes.numel()),
-                reason=f"{partitions[partition_id].name} adaptive policy forward",
-            )
-            output = actual_cost_forward(
-                bundle.model,
-                partition_id,
-                states,
-                reaches,
-                physical_pack=physical_pack,
-            )
-        if forced_offspring is None:
-            offspring, _, total = offspring_for(
-                nodes, partition_id, output, frontier_cost_forecast
-            )
-        else:
-            if (
-                forced_offspring.shape != nodes.shape
-                or forced_offspring.device != device
-                or forced_offspring.dtype != torch.int64
-                or bool((forced_offspring <= 0).any())
-            ):
-                raise ValueError(
-                    "forced offspring must be positive device-local int64 [B]"
-                )
-            offspring = forced_offspring
-            total = read_control(offspring.sum().reshape(1))[0]
-            admit(
-                "rollout",
-                additional_nodes=total,
-                reason="root-refill child wave",
-            )
-            admit_child_wave(total)
-        if partition_id is not None and output is None:
-            admit(
-                "rollout",
-                workspace_bytes=forecast_workspace(partition_id, nodes.numel()),
-                reason=f"{partitions[partition_id].name} policy forward",
-            )
-            output = actual_cost_forward(
-                bundle.model,
-                partition_id,
-                states,
-                reaches,
-                physical_pack=physical_pack,
-            )
-        action_rows = None
-        if partition_id is not None and record_policy_node:
-            assert output is not None
-            assert decision_rows is not None
-            action_rows = reserve_actions(
-                decision_input_store, partition_id, decision_rows, offspring
-            )
-            output_t = getattr(output, "t", None)
-            output_c = getattr(output, "c", None)
-            write_capture(
-                decision_input_store,
-                decision_rows,
-                nodes.to(torch.int32),
-                capture_inputs(partition_id, states, reaches),
-                {
-                    "node_id": nodes.to(torch.int32),
-                    "old_v": output.v.detach().to(torch.float32),
-                    **(
-                        {}
-                        if output_t is None or output_c is None
-                        else {
-                            "old_t": output_t.detach().to(torch.float32),
-                            "old_c": output_c.detach().to(torch.float32),
-                        }
-                    ),
-                },
-            )
-        prefix = torch.empty_like(offspring)
-        prefix[0] = 0
-        prefix[1:] = offspring.cumsum(0)[:-1]
-        child_ends = prefix + offspring
-        prior_children = buffer.child_count[rows].to(torch.int64)
-        parent_paths = arena.gather_many(("path_key",), rows)["path_key"]
-        if (
-            forced_edge_weight is not None
-            and not 0.0 < float(forced_edge_weight) <= 1.0
-        ):
-            raise ValueError("forced edge weight must lie in (0,1]")
-
-        def logical_child_subspan(start: int, end: int) -> tuple[Tensor, Tensor, Tensor]:
-            logical = torch.arange(start, end, dtype=torch.int64, device=device)
-            parent_positions = torch.searchsorted(child_ends, logical, right=True)
-            ordinal = (
-                logical
-                - prefix[parent_positions]
-                + 1
-                + prior_children[parent_positions]
-            )
-            return logical, parent_positions, ordinal
-
-        # Fix every topology, occurrence, reach, controller, and RNG address
-        # before the first posterior/event draw.  Only scalar address vectors are
-        # live here; dense child state/reach/profile work is staged below.
-        first_child = buffer.node_count
-        first_edge = buffer.edge_count
-        for start in range(0, total, child_pack_rows):
-            end = min(start + child_pack_rows, total)
-            _, parent_positions, ordinal = logical_child_subspan(start, end)
-            parents = nodes[parent_positions].to(torch.int32)
-            if forced_edge_weight is None:
-                weights = offspring[parent_positions].reciprocal().to(torch.float32)
-            else:
-                weights = torch.full(
-                    (end - start,),
-                    float(forced_edge_weight),
-                    dtype=torch.float32,
-                    device=device,
-                )
-            with timed_cuda("rollout_child_reservation", end - start):
-                children, edge_rows = buffer.reserve_children(parents, weights)
-            expected_children = torch.arange(
-                first_child + start,
-                first_child + end,
-                dtype=torch.int32,
-                device=device,
-            )
-            expected_edges = torch.arange(
-                first_edge + start,
-                first_edge + end,
-                dtype=torch.int32,
-                device=device,
-            )
-            with timed_host_sync("branched_child_reservation_alignment", 1):
-                children_aligned = torch.equal(children, expected_children)
-            with timed_host_sync("branched_edge_reservation_alignment", 1):
-                edges_aligned = torch.equal(edge_rows, expected_edges)
-            if not children_aligned or not edges_aligned:
-                raise RuntimeError("branched logical child reservation lost stable order")
-            with timed_cuda("rollout_child_reservation", end - start):
-                control_rows = control_arena.append(
-                    {
-                        "nominal_count": torch.zeros(
-                            end - start, dtype=torch.int32, device=device
-                        ),
-                        "beta": torch.zeros(
-                            end - start, dtype=torch.float32, device=device
-                        ),
-                        "log_player_sum": torch.full(
-                            (end - start,),
-                            -torch.inf,
-                            dtype=torch.float32,
-                            device=device,
-                        ),
-                        "log_ancestor_product": torch.zeros(
-                            end - start, device=device
-                        ),
-                        "queue_cost": torch.zeros(end - start, device=device),
-                    }
-                )
-            with timed_host_sync("branched_control_reservation_alignment", 1):
-                controls_aligned = torch.equal(
-                    control_rows.to(torch.int32), children
-                )
-            if not controls_aligned:
-                raise RuntimeError("branched controller rows lost topology alignment")
-            with timed_cuda("rollout_child_reservation", end - start):
-                child_handles = arena.allocate(end - start)
-            if device.type == "cuda":
-                torch._assert_async(
-                    (child_handles == children.to(torch.int64)).all(),
-                    "branched occurrence and child handles diverged",
-                )
-            elif not torch.equal(child_handles, children.to(torch.int64)):
-                raise RuntimeError("branched occurrence and child handles diverged")
-            with timed_cuda("rollout_child_reservation", end - start):
-                child_reach_handles = reach_pool.allocate(end - start)
-                expanded_paths = parent_paths[parent_positions]
-                arena.scatter_many(
-                    child_handles,
-                    {
-                        "path_key": child_path_keys(expanded_paths, ordinal),
-                        "reach_handle": child_reach_handles,
-                    },
-                )
-
-        for start in range(0, total, child_pack_rows):
-            end = min(start + child_pack_rows, total)
-            _, parent_positions, ordinal = logical_child_subspan(start, end)
-            children = torch.arange(
-                first_child + start,
-                first_child + end,
-                dtype=torch.int32,
-                device=device,
-            )
-            child_states = states[parent_positions]
-            child_reach = reaches[parent_positions]
-            expanded_paths = parent_paths[parent_positions]
-            posterior_keys = logical_rng_keys(
-                seed=logical_seed,
-                iteration=iteration,
-                trajectory=torch.full_like(expanded_paths, rng_tree_address),
-                path=expanded_paths,
-                draw=ordinal,
-                purpose=DrawPurpose.POSTERIOR,
-            )
-            profiles = sample_private_profiles(
-                child_states, child_reach, posterior_keys
-            )
-            child_output = None
-            if partition_id is not None:
-                assert output is not None
-                child_output = _index_policy_output(output, parent_positions)
-            event_keys = logical_rng_keys(
-                seed=logical_seed,
-                iteration=iteration,
-                trajectory=torch.full_like(expanded_paths, rng_tree_address),
-                path=expanded_paths,
-                draw=ordinal,
-                purpose=(
-                    DrawPurpose.ACTION
-                    if partition_id is not None
-                    else DrawPurpose.CHANCE
-                ),
-            )
-            with timed_cuda("rollout_event_sampling", end - start):
-                events = _sample_events_logical(
-                    backend,
-                    child_states,
-                    profiles,
-                    child_output,
-                    bundle.policy_adapter,
-                    event_keys,
-                    gen,
-                )
-            if partition_id is None:
-                step_batch = getattr(backend, "step_chance_batch", backend.step)
-            else:
-                step_batch = getattr(backend, "step_player_batch", backend.step)
-            with timed_cuda("rollout_state_transition", end - start):
-                next_states = step_batch(child_states, events)
-                next_owner = backend.classify(next_states).to(torch.int32)
-            with timed_cuda("rollout_reach_update", end - start):
-                next_reach = backend.reach_update(
-                    child_reach, child_states, events, child_output
-                )
-            with timed_cuda("rollout_child_commit", end - start):
-                buffer.commit_children(
-                    first_child + start,
-                    first_edge + start,
-                    next_states,
-                    next_owner,
-                    events.public_id,
-                )
-                child_reach_handles = arena.gather_many(
-                    ("reach_handle",), children.to(torch.int64)
-                )["reach_handle"]
-                reach_pool.write(child_reach_handles, {"log_reach": next_reach})
-                child_log_sum, child_log_product = child_path_factors(
-                    log_player_sum[rows][parent_positions],
-                    log_ancestor_product[rows][parent_positions],
-                    beta_rows[rows][parent_positions],
-                    (next_owner >= 0) & (next_owner < p_max),
-                )
-                log_player_sum[children.to(torch.int64)] = child_log_sum
-                log_ancestor_product[children.to(torch.int64)] = child_log_product
-            if partition_id is not None and record_policy_node:
-                assert child_output is not None
-                legal_ids, legal_mask = backend.legal_events(child_states)
-                edge_logp = _selected_policy_logp(
-                    bundle.policy_adapter,
-                    child_output,
-                    events.public_id[:, None],
-                    legal_ids,
-                    legal_mask,
-                ).detach()[:, 0]
-                assert partition_id is not None and action_rows is not None
-                write_actions(
-                    decision_input_store,
-                    partition_id,
-                    action_rows[start:end],
-                    {
-                        "event": events.public_id.to(torch.int32),
-                        "old_logp": edge_logp.to(torch.float32),
-                    },
-                )
-        children = torch.arange(
-            first_child,
-            first_child + total,
-            dtype=torch.int32,
-            device=device,
-        )
-        if partition_id is not None and record_policy_node:
-            DeviceWorkQueue.mark_done(arena, rows)
-        releasable = nodes[nodes != 0]
-        if releasable.numel():
-            release_reaches(releasable)
-            release_states = getattr(backend, "release_state_rows", None)
-            if callable(release_states):
-                released_rows = releasable.to(torch.int64)
-                release_states(buffer.state_ref[released_rows].to(torch.int32))
-                buffer.state_ref[released_rows] = -1
-        return children
-
-    def chance_close(frontier: Tensor) -> None:
-        nonlocal scheduler_step, queue_cost_total
-        frontier = frontier.to(torch.int32)
-        chance_steps = 0
-        while frontier.numel():
-            stop_if_cutoff_reached(int(frontier.numel()))
-            scheduler_step += 1
-            rows = frontier.to(torch.int64)
-            owners = buffer.owner[rows]
-            states = buffer.state_ref[rows]
-            routed_partition_ids = _partition_ids(partitions, states)
-            chance_route, leaf_route, invalid_route = -1, -2, -3
-            player = (owners >= 0) & (owners < p_max)
-            route = torch.where(
-                owners == CHANCE,
-                torch.full_like(routed_partition_ids, chance_route),
-                torch.where(
-                    (owners == TERMINAL) | (owners == PRETERM),
-                    torch.full_like(routed_partition_ids, leaf_route),
-                    torch.where(
-                        player,
-                        routed_partition_ids,
-                        torch.full_like(routed_partition_ids, invalid_route),
-                    ),
-                ),
-            )
-            partition = stable_partition_masked(
-                frontier.to(torch.int64),
-                route,
-                (*partition_ids, chance_route, leaf_route),
-            )
-            counts = read_control(partition.selected_count)
-            for index, (partition_id, count) in enumerate(
-                zip(partition_ids, counts[: len(partition_ids)], strict=True)
-            ):
-                if count:
-                    queued = partition.candidate_handles[index, :count]
-                    queues[partition_id].enqueue(
-                        queued,
-                        arena=arena,
-                        logical_time=scheduler_step,
-                    )
-                    if queue_pressure_active:
-                        qrows = queued.to(torch.int64)
-                        qstates = buffer.state_ref[qrows]
-                        admit(
-                            "rollout",
-                            workspace_bytes=forecast_workspace(partition_id, count),
-                            reason=(
-                                f"{partitions[partition_id].name} "
-                                "C-head queue forecast"
-                            ),
-                        )
-                        physical_pack = partitions[
-                            partition_id
-                        ].byte_work.realize(qstates, rows=count)
-                        qout = actual_cost_forward(
-                            bundle.model,
-                            partition_id,
-                            qstates,
-                            reaches_for(queued),
-                            physical_pack=physical_pack,
-                        )
-                        if qout.c is None:
-                            raise RuntimeError("queue-pressure accounting requires C head")
-                        queue_cost[qrows] = qout.c.detach().float()
-                        queue_cost_total += read_float_control(
-                            qout.c.detach().float().sum()
-                        )
-            record_queues()
-            stopped = counts[-1]
-            if stopped:
-                stopped_nodes = partition.candidate_handles[-1, :stopped].to(torch.int32)
-                stopped_rows = stopped_nodes.to(torch.int64)
-                stopped_states = buffer.state_ref[stopped_rows].to(torch.int32)
-                stopped_reach = reaches_for(stopped_nodes).detach().clone()
-                capture = getattr(backend, "capture_rb_leaf", None)
-                payload = None
-                if callable(capture):
-                    payload = capture(stopped_states, stopped_reach)
-                    release_states = getattr(backend, "release_state_rows", None)
-                    if callable(release_states):
-                        release_states(stopped_states)
-                        buffer.state_ref[stopped_rows] = -1
-                leaf_rows.append(
-                    {
-                        "node_id": stopped_nodes,
-                        "root_id": torch.full(
-                            (stopped,),
-                            int(rng_tree_address),
-                            dtype=torch.int32,
-                            device=device,
-                        ),
-                        "path_key": arena.gather_many(
-                            ("path_key",), stopped_rows
-                        )["path_key"].to(torch.int64),
-                        "log_reach": stopped_reach,
-                        **({} if payload is None else payload),
-                    }
-                )
-                release_reaches(stopped_nodes)
-            chance_count = counts[-2]
-            if chance_count == 0:
-                return
-            chance_steps += 1
-            if chance_steps > int(backend.max_rollout_steps):
-                raise RuntimeError("chance-only segment exceeded max_rollout_steps")
-            chance_nodes = partition.candidate_handles[-2, :chance_count].to(torch.int32)
-            frontier = expand(chance_nodes, None)
-
-    def run_chance_close(frontier: Tensor) -> None:
-        """Time one complete chance-closure invocation, including host waits."""
-
-        with timed_cuda("rollout_chance_closure", int(frontier.numel())):
-            chance_close(frontier)
-
-    def drain_player_queues() -> None:
-        nonlocal scheduler_step, queue_cost_total
-        while any(queue.host_count for queue in queues.values()):
-            stop_if_cutoff_reached()
-            scheduler_step += 1
-            selection = select_work_queue(
-                partition_ids,
-                partition_preorder,
-                queues,
-                child_pack_rows,
-                allow_partial=True,
-                logical_time=scheduler_step,
-            )
-            if selection is None:
-                raise RuntimeError("branched queue scheduler lost nonempty work")
-            partition_id = selection.partition_id
-            queue = queues[partition_id]
-            count = selection.rows
-            frontier_cost_forecast = queue_cost_total
-            nodes = queue.dequeue(count, arena=arena).to(torch.int32)
-            if queue_pressure_active:
-                # This synchronization is co-located with the scheduler's existing
-                # host control boundary and keeps R_F incremental.
-                removed = read_float_control(queue_cost[nodes.to(torch.int64)].sum())
-                queue_cost_total -= removed
-            record_queues()
-            run_chance_close(expand(nodes, partition_id, frontier_cost_forecast))
-
-    run_chance_close(root_nodes)
-    drain_player_queues()
-
-    pre_refill_node_count: int | None = None
-    root_pre_refill_child_count: int | None = None
-    if minimum_nodes is not None:
-        pre_refill_node_count = buffer.node_count
-        root_pre_refill_child_count = int(buffer.child_count[0])
-        if root_pre_refill_child_count <= 0:
-            raise RuntimeError("a refillable branched root must have an ordinary child")
-        root_owner_value = int(root_owner[0])
-        if root_owner_value == CHANCE:
-            root_partition_id = None
-        elif 0 <= root_owner_value < p_max:
-            root_partition_id = read_control(
-                _partition_ids(partitions, roots).reshape(1)
-            )[0]
+        agreement_in_attempt: bool = False,
+    ) -> AttemptResult:
+        epoch = self.run_state.retry_epoch
+        logical_base = self.run_state.attempt_logical_base
+        while True:
+            address = AttemptAddress(epoch, logical_base)
+            result: AttemptResult | None = None
+            local_failure: RecoverableOverflow | None = None
+            rank_agreed = False
             try:
-                partitions[root_partition_id]
-            except KeyError as error:
-                raise RuntimeError(
-                    "branched root has an unknown partition id"
-                ) from error
-        else:
-            raise RuntimeError("branched root must be expandable for root refill")
-
-        refill_count = 0
-        while buffer.node_count < minimum_nodes:
-            refill_count += 1
-            extra = expand(
-                root_nodes,
-                root_partition_id,
-                forced_offspring=torch.ones(1, dtype=torch.int64, device=device),
-                forced_edge_weight=1.0 / root_pre_refill_child_count,
-                record_policy_node=False,
+                result = attempt(address)
+            except RecoverableOverflow as caught:
+                # Strip the traceback before releasing the failed owner. The
+                # collective and replacement allocation retain only the small
+                # immutable diagnostic record.
+                local_failure = RecoverableOverflow(
+                    caught.failure,
+                    capacity=caught.capacity,
+                    observed_demand=caught.observed_demand,
+                )
+                rank_agreed = bool(
+                    getattr(caught, "_rank_agreed", False)
+                )
+                caught = None
+                discard(local_failure)
+            failure = (
+                local_failure
+                if rank_agreed
+                else (
+                    None
+                    if agreement_in_attempt and result is not None
+                    else self.rank_agreement.agree(local_failure)
+                )
             )
-            run_chance_close(extra)
-            drain_player_queues()
-        diagnostics.update(
-            {
-                "root_refill_count": refill_count,
-                "pre_refill_nodes": pre_refill_node_count,
-                "root_refill_added_nodes": buffer.node_count - pre_refill_node_count,
-                "root_pre_refill_child_count": root_pre_refill_child_count,
-                "root_final_child_count": int(buffer.child_count[0]),
-            }
-        )
-
-    for queue in queues.values():
-        queue.release()
-
-    release_reaches(root_nodes)
-    release_states = getattr(backend, "release_state_rows", None)
-    if callable(release_states):
-        release_states(buffer.state_ref[root_nodes.to(torch.int64)].to(torch.int32))
-        buffer.state_ref[root_nodes.to(torch.int64)] = -1
-    if reach_pool.live_rows != 0:
-        raise RuntimeError("branched live reach slots survived their last consumer")
-    reach_pool.release()
-    node_count = buffer.node_count
-    admit("seal", reason="exact branched rollout sealing")
-    all_nodes = torch.arange(node_count, device=device)
-    old_parent = buffer.parent[all_nodes].to(torch.int64)
-    old_order = torch.empty(node_count, dtype=torch.int64, device=device)
-    old_order[0] = 0
-    old_order[1:] = torch.argsort(old_parent[1:], stable=True) + 1
-    old_to_new = torch.empty(node_count, dtype=torch.int64, device=device)
-    old_to_new[old_order] = torch.arange(node_count, device=device)
-    parent = old_parent[old_order]
-    parent = torch.where(parent < 0, parent, old_to_new[parent]).to(torch.int32)
-    degree_old = buffer.child_count[all_nodes].to(torch.int32)
-    degree = degree_old[old_order]
-    child_begin = torch.full((node_count,), -1, dtype=torch.int32, device=device)
-    if node_count > 1:
-        child_ids = torch.arange(1, node_count, dtype=torch.int32, device=device)
-        first = torch.full((node_count,), node_count, dtype=torch.int32, device=device)
-        first.scatter_reduce_(
-            0, parent[1:].to(torch.int64), child_ids, reduce="amin", include_self=True
-        )
-        child_begin[degree > 0] = first[degree > 0]
-
-    if not leaf_rows.size:
-        raise RuntimeError("branched rollout produced no stopped-leaf rows")
-    source_nodes = leaf_rows.gather(
-        "node_id", torch.arange(leaf_rows.size, device=device)
-    )
-    leaf_order = torch.argsort(source_nodes.to(torch.int64), stable=True)
-    with timed_cuda("rollout_internal_leaf_seal", int(leaf_rows.size)):
-        leaf_block, leaf_metrics = leaf_rows.seal(
-            scratch_rows=page_rows, row_order=leaf_order, release_source=True
-        )
-    verify_recycling = getattr(backend, "verify_state_recycling_boundary", None)
-    if callable(verify_recycling):
-        verify_recycling()
-    with timed_cuda(
-        "rollout_internal_decision_seal", int(completed_decision_rows)
-    ):
-        decision_inputs = seal_captures(decision_input_store)
-    decision_nodes = decision_inputs.node_ids.to(torch.int64)
-    decision_new_nodes = old_to_new[decision_nodes]
-    decision_partition = torch.full(
-        (node_count,), -1, dtype=torch.int32, device=device
-    )
-    decision_row = torch.full_like(decision_partition, -1)
-    decision_partition[decision_new_nodes] = decision_inputs.partition_id
-    decision_row[decision_new_nodes] = decision_inputs.partition_row
-    leaf_old = leaf_block["node_id"].to(torch.int64)
-    leaf_new = old_to_new[leaf_old]
-    leaf_row = torch.full((node_count,), -1, dtype=torch.int32, device=device)
-    leaf_row[leaf_new] = torch.arange(
-        leaf_block.rows, dtype=torch.int32, device=device
-    )
-    nominal_old = nominal_count[:node_count].detach().to(torch.int32)
-    topology = BranchedTreeSpan(
-        parent=parent,
-        child_begin=child_begin,
-        degree=degree,
-        decision_partition=decision_partition,
-        decision_row=decision_row,
-        leaf_row=leaf_row,
-        root_target_degree=root_pre_refill_child_count,
-        pre_refill_node_count=pre_refill_node_count,
-        nominal_degree=nominal_old[old_order],
-    )
-    topology.validate(
-        partition_rows={
-            int(partition): block.rows
-            for partition, block in decision_inputs.inputs.items()
-        },
-        leaf_rows=leaf_block.rows,
-    )
-
-    if not decision_nodes.numel():
-        raise RuntimeError("branched rollout produced no player decisions")
-    target_counts = degree_old[decision_nodes].to(torch.int64)
-    if root_pre_refill_child_count is not None:
-        root_row = (decision_nodes == 0).nonzero(as_tuple=False).squeeze(1)
-        if root_row.numel() != 1:
-            raise RuntimeError("protected root is not a retained decision")
-        target_counts[root_row] = int(root_pre_refill_child_count)
-    for partition_id, ptr in decision_inputs.action_ptrs.items():
-        selected = decision_inputs.partition_id == partition_id
-        if not torch.equal(
-            (ptr[1:] - ptr[:-1]).to(torch.int64), target_counts[selected]
-        ):
-            raise RuntimeError("reserved natural action rows disagree with topology")
-    path_weight = buffer.path_weight[decision_nodes].detach().to(torch.float64)
-    if root_pre_refill_child_count is not None:
-        root_final_child_count = int(degree_old[0])
-        path_weight.mul_(root_pre_refill_child_count / root_final_child_count)
-        path_weight[decision_nodes == 0] = 1.0
-    decision_aux = {
-        "owner": buffer.owner[decision_nodes].detach().to(torch.int32),
-        "log_weight": torch.log(path_weight),
-        "nominal_child_count": nominal_old[decision_nodes],
-        "executed_child_count": target_counts.to(torch.int32),
-    }
-    decision_beta = beta_rows[decision_nodes].detach().to(torch.float32)
-    sealed_diagnostics = {
-        **diagnostics,
-        "branching_attempt": int(attempt),
-        "branching_attempt_address": rng_tree_address,
-        "fixed_beta_scale": fixed_scale,
-        "execution_accountant_limit_bytes": accountant.limit_bytes,
-        "execution_accountant_high_water_bytes": accountant.high_water_bytes,
-        "diagnostic_reuse_root_private_profile": int(
-            limits.reuse_root_private_profile
-        ),
-        "diagnostic_reused_private_profile_rows": reused_private_profile_rows,
-    }
-    arena.release()
-    buffer.release()
-    control_arena.release()
-    return SealedRolloutSample(
-        mode="branched_rb",
-        topology=topology,
-        leaf_source=leaf_block,
-        decision_inputs=decision_inputs,
-        node_count=node_count,
-        decision_node=decision_new_nodes.to(torch.int32),
-        decision_aux=decision_aux,
-        branching_beta=decision_beta,
-        branching_diagnostics=sealed_diagnostics,
-        seal_metrics={
-            "leaf_rows": leaf_metrics,
-            **decision_inputs.seal_metrics,
-        },
-    )
+            if failure is None:
+                if result is None:
+                    raise BranchingError(
+                        "rank agreement lost a local overflow"
+                    )
+                return result
+            if local_failure is None:
+                discard(failure)
+            result = None
+            local_failure = None
+            if self.controller.at_minimum:
+                raise TrainingError(
+                    "minimum branched control overflowed fixed capacity: "
+                    f"{failure.failure}"
+                ) from failure
+            old = self.controller.state_dict()
+            self.controller.backoff()
+            new = self.controller.state_dict()
+            replacement = AttemptAddress(
+                epoch + 1,
+                logical_base + self.run_state.root_count,
+            )
+            record = BranchedRecoveryRecord(
+                severity="critical",
+                iteration=self.iteration,
+                replica=self.replica,
+                failed_phase=failure.failure.phase,
+                failed_address=AttemptAddress(
+                    epoch, failure.failure.logical_address
+                ).as_text(),
+                replacement_address=replacement.as_text(),
+                old_control=old,
+                new_control=new,
+                capacity=failure.capacity,
+                observed_demand=failure.observed_demand,
+            )
+            self.run_state.recovered_overflow = True
+            self.run_state.retry_epoch = replacement.retry_epoch
+            self.run_state.attempt_logical_base = replacement.logical_base
+            self.run_state.branch_controller_state = new
+            self.run_state.overflow_recoveries.append(record.as_dict())
+            payload = json.dumps(record.as_dict(), sort_keys=True)
+            self.logger.critical("RECOVERED_BRANCHED_OVERFLOW %s", payload)
+            warnings.warn(
+                f"RECOVERED_BRANCHED_OVERFLOW {payload}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            epoch = replacement.retry_epoch
+            logical_base = replacement.logical_base
+            failure = None
 
 
-
-def _validate_beta(
-    beta: Tensor,
-    count: int,
-    device: torch.device,
-    *,
-    metrics: Any | None = None,
-) -> Tensor:
-    """Validate and return fixed intensities as fp32 ``[B]``."""
-
-    if beta.shape != (count,) or beta.dtype != torch.float32 or beta.device != device:
-        raise ValueError("beta_fn must return device-local fp32 [B]")
-    timing = (
-        nullcontext()
-        if metrics is None
-        else metrics.time_host_synchronization(
-            "branched_beta_finite_validation", nbytes=1
-        )
-    )
-    with timing:
-        finite = bool(torch.isfinite(beta).all())
-    timing = (
-        nullcontext()
-        if metrics is None
-        else metrics.time_host_synchronization(
-            "branched_beta_lower_bound_validation", nbytes=1
-        )
-    )
-    with timing:
-        below_one = bool((beta < 1.0).any())
-    if not finite or below_one:
-        raise ValueError("rollout beta must be finite and at least one")
-    return beta
-
-
-
-def _index_policy_output(output: Any, rows: Tensor) -> Any:
-    """Gather batch rows from a lightweight, tensor-structured policy output."""
-
-    if isinstance(output, Tensor):
-        return output[rows]
-    if is_dataclass(output) and not isinstance(output, type):
-        return type(output)(
-            **{
-                field.name: _index_policy_output(getattr(output, field.name), rows)
-                for field in fields(output)
-            }
-        )
-    if isinstance(output, Mapping):
-        return type(output)(
-            (key, _index_policy_output(value, rows)) for key, value in output.items()
-        )
-    if isinstance(output, tuple):
-        return type(output)(_index_policy_output(value, rows) for value in output)
-    if isinstance(output, list):
-        return [_index_policy_output(value, rows) for value in output]
-    # Immutable metadata may be shared by all gathered rows.
-    return output
+__all__ = [
+    "BRANCH_CONTROLLER_VERSION",
+    "COST_SAFEGUARD_VERSION",
+    "BranchController",
+    "BranchDecision",
+    "BranchedOverflowRecovery",
+    "BranchedRecoveryRecord",
+    "BranchingError",
+    "CostSafeguardController",
+    "FixedBranchController",
+    "KKTBranchController",
+    "RankCommonFailureAgreement",
+    "child_path_factors",
+    "controller_from_state_dict",
+    "decision_log_path_mass",
+    "log_kkt_intensity",
+    "randomized_round",
+]

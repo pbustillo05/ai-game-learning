@@ -11,9 +11,8 @@ from typing import Any
 
 import torch
 
-from pbg.games.poker.model.capacity import max_public_history_tokens
-from pbg.queued.config import BranchedModeConfig, SequentialModeConfig
-from pbg.queued.persistence import (
+from pbg.core.config import BranchedModeConfig, SequentialModeConfig
+from pbg.core.persistence import (
     CHECKPOINT_SCHEMA,
     DISTRIBUTED_CHECKPOINT_SCHEMA,
     REPLICA_CHECKPOINT_SCHEMA,
@@ -24,8 +23,6 @@ from pbg.queued.persistence import (
 )
 
 INFERENCE_ARTIFACT_SCHEMA_VERSION = "pbg-queued-inference-v1"
-LEGACY_INFERENCE_ARTIFACT_SCHEMA = "pbg-inference-v1"
-CONVERTED_INFERENCE_SOURCE_SCHEMA = "pbg-inference-v1-offline-conversion"
 _FIELDS = {
     "artifact_schema",
     "source_checkpoint_schema",
@@ -65,7 +62,6 @@ def _load_artifact(path: Path) -> dict[str, Any]:
             CHECKPOINT_SCHEMA,
             DISTRIBUTED_CHECKPOINT_SCHEMA,
             REPLICA_CHECKPOINT_SCHEMA,
-            CONVERTED_INFERENCE_SOURCE_SCHEMA,
         )
     ):
         raise RuntimeError("runtime accepts only strict queued inference artifacts")
@@ -104,27 +100,6 @@ def _load_artifact(path: Path) -> dict[str, Any]:
         raise RuntimeError("inference artifact payload hash differs")
     return value
 
-
-def _atomic_json(path: Path, value: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
 
 
 def _atomic_torch(path: Path, value: object) -> None:
@@ -240,122 +215,10 @@ def export_inference_artifact(
     }
 
 
-def convert_legacy_inference_artifact(
-    source_path: str | Path,
-    output_path: str | Path,
-    *,
-    scientific_config: dict[str, object],
-) -> dict[str, Any]:
-    """Offline-convert one exact legacy model artifact; runtime never loads it."""
-
-    source = Path(source_path)
-    destination = Path(output_path)
-    if destination.exists():
-        raise RuntimeError("inference conversion destination already exists")
-    legacy = torch.load(source, map_location="cpu", weights_only=True)
-    legacy_fields = {
-        "inference_artifact_schema_version",
-        "source_checkpoint_schema_version",
-        "source_checkpoint_sha256",
-        "iteration",
-        "config",
-        "model",
-    }
-    if (
-        not isinstance(legacy, dict)
-        or set(legacy) != legacy_fields
-        or legacy["inference_artifact_schema_version"]
-        != LEGACY_INFERENCE_ARTIFACT_SCHEMA
-        or legacy["source_checkpoint_schema_version"] != "pbg-checkpoint-v8"
-        or not isinstance(legacy["config"], dict)
-        or set(legacy["config"]) != {"game", "model"}
-        or not isinstance(legacy["model"], dict)
-    ):
-        raise RuntimeError("offline conversion requires one exact pbg-inference-v1")
-    source_checkpoint_hash = legacy["source_checkpoint_sha256"]
-    if (
-        not isinstance(source_checkpoint_hash, str)
-        or len(source_checkpoint_hash) != 64
-        or any(
-            character not in "0123456789abcdefABCDEF"
-            for character in source_checkpoint_hash
-        )
-    ):
-        raise RuntimeError("legacy artifact source checkpoint hash is invalid")
-    mode = scientific_config.get("mode")
-    try:
-        parsed = (
-            SequentialModeConfig.from_mapping(scientific_config)
-            if isinstance(mode, dict)
-            and mode.get("rollout_mode") == "sequential"
-            else BranchedModeConfig.from_mapping(scientific_config)
-        )
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("conversion scientific configuration is invalid") from exc
-    canonical = parsed.scientific_mapping()
-    old_game = dict(legacy["config"]["game"])
-    normalized_game = {
-        "players": old_game.pop("n_players", old_game.pop("players", None)),
-        "stack_bb": old_game.pop("stack_bb", None),
-        "rank_count": old_game.pop("rank_count", None),
-    }
-    if old_game or normalized_game != canonical["game"]:
-        raise RuntimeError("legacy artifact game differs from conversion contract")
-    old_model = dict(legacy["config"]["model"])
-    aliases = {"eps": "epsilon"}
-    derived = {
-        "k_act": 3 + int(canonical["model"]["m_raise"]),
-        "use_branching_heads": canonical["mode"]["rollout_mode"] != "sequential",
-        "max_history_tokens": max_public_history_tokens(
-            int(canonical["game"]["players"]),
-            float(canonical["game"]["stack_bb"]),
-        ),
-    }
-    for name, expected in derived.items():
-        if name in old_model and old_model[name] != expected:
-            raise RuntimeError(
-                f"legacy artifact derived model field {name} differs"
-            )
-    normalized_model = {
-        aliases.get(name, name): value
-        for name, value in old_model.items()
-        if name not in derived
-    }
-    if normalized_model != canonical["model"]:
-        raise RuntimeError("legacy artifact model differs from conversion contract")
-    model_state = {
-        name: tensor.detach().cpu().contiguous()
-        for name, tensor in legacy["model"].items()
-    }
-    artifact = {
-        "artifact_schema": INFERENCE_ARTIFACT_SCHEMA_VERSION,
-        "source_checkpoint_schema": CONVERTED_INFERENCE_SOURCE_SCHEMA,
-        "source_checkpoint_sha256": source_checkpoint_hash.lower(),
-        "iteration": int(legacy["iteration"]),
-        "scientific_config": canonical,
-        "model": model_state,
-        "model_sha256": model_state_sha256(model_state),
-    }
-    artifact["payload_sha256"] = _payload_sha256(artifact)
-    _atomic_torch(destination, artifact)
-    report = {
-        "schema": "pbg-queued-inference-conversion-v1",
-        "source_schema": LEGACY_INFERENCE_ARTIFACT_SCHEMA,
-        "result_schema": INFERENCE_ARTIFACT_SCHEMA_VERSION,
-        "source_sha256": sha256_file(source),
-        "result_sha256": sha256_file(destination),
-        "source_checkpoint_sha256": artifact["source_checkpoint_sha256"],
-    }
-    sidecar = destination.with_suffix(destination.suffix + ".conversion.json")
-    _atomic_json(sidecar, report)
-    return report
 
 
 __all__ = [
-    "CONVERTED_INFERENCE_SOURCE_SCHEMA",
     "INFERENCE_ARTIFACT_SCHEMA_VERSION",
-    "LEGACY_INFERENCE_ARTIFACT_SCHEMA",
-    "convert_legacy_inference_artifact",
     "export_inference_artifact",
     "load_inference_source",
     "sha256_file",

@@ -15,8 +15,8 @@ import torch
 from torch import Tensor
 
 from pbg.games.poker.model.primitives import accelerator_assert
-from pbg.queued.learner import PolicyEvaluation
-from pbg.queued.rollout import logical_categorical
+from pbg.core.learner import PolicyEvaluation
+from pbg.core.rollout import logical_categorical
 
 FOLD = 0
 CHECK_CALL = 1

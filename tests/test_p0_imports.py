@@ -3,23 +3,25 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-from pbg.queued.static_gates import (
+from tests.static_gates import (
+    accepted_root_violations,
+    core_firewall_violations,
     local_import_graph,
-    queued_firewall_violations,
     reachable_modules,
+    stale_cutover_violations,
 )
 
 
 ROOT = Path(__file__).parents[1]
 
 
-def test_queued_generic_core_keeps_its_game_and_legacy_firewall() -> None:
-    assert queued_firewall_violations(ROOT / "pbg/queued") == ()
+def test_generic_core_keeps_its_game_firewall() -> None:
+    assert core_firewall_violations(ROOT / "pbg/core") == ()
+    assert stale_cutover_violations(ROOT) == ()
 
 
-def test_public_roots_cannot_reach_the_old_core() -> None:
-    graph = local_import_graph(ROOT)
-    for root in (
+def test_public_roots_reach_the_final_core() -> None:
+    roots = (
         "pbg.cli.train",
         "pbg.cli.train_replicas",
         "pbg.cli.benchmark",
@@ -27,9 +29,12 @@ def test_public_roots_cannot_reach_the_old_core() -> None:
         "pbg.cli.export_inference",
         "pbg.cli.benchmark_inference",
         "pbg.cli.runpod_replica_selection",
-    ):
+    )
+    assert accepted_root_violations(ROOT, roots) == ()
+    graph = local_import_graph(ROOT)
+    for root in roots:
         reached = reachable_modules(graph, root)
-        assert not any(
+        assert any(
             value == "pbg.core" or value.startswith("pbg.core.")
             for value in reached
         ), root

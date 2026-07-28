@@ -1,7 +1,6 @@
 import pytest
 import torch
 
-from pbg.games.poker.model.heads import dlogistic_tick
 from pbg.games.poker.model.primitives import MHA
 
 
@@ -96,15 +95,3 @@ def test_cuda_biased_sdpa_matches_flex_throughput_precision() -> None:
     for left, right in zip(flex.parameters(), sdpa.parameters(), strict=True):
         if left.grad is not None:
             torch.testing.assert_close(right.grad, left.grad, atol=1e-4, rtol=5e-2)
-
-
-def test_dlogistic_ticks_and_allin_atom() -> None:
-    mu = torch.tensor([[0.15, 0.50, 0.85], [0.20, 0.60, 0.90]])
-    scale = torch.tensor([[1e-20, 0.03, 5.0], [0.01, 0.2, 1e20]])
-    probability = dlogistic_tick(64, mu, scale)
-    torch.testing.assert_close(
-        probability.sum(dim=-1), torch.ones_like(mu), atol=1e-6, rtol=0.0
-    )
-    low = dlogistic_tick(64, torch.tensor([0.2]), torch.tensor([0.03]))
-    high = dlogistic_tick(64, torch.tensor([0.8]), torch.tensor([0.03]))
-    assert int(low.argmax()) < int(high.argmax())

@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from pbg.games.poker.model.primitives import FFN, accelerator_assert
+from pbg.games.poker.model.primitives import FFN
 
 
 class TypeHead(nn.Module):
@@ -56,50 +56,6 @@ class RaiseMixtureHead(nn.Module):
         s = F.softplus(scale) + self.s_min
         iota = torch.sigmoid(self.allin_affine(z_allin)).squeeze(-1)
         return omega, mu, s, iota
-
-
-def dlogistic_tick(
-    n_ticks: int, mu: Tensor, s: Tensor, *, validate: bool = True
-) -> Tensor:
-    """Return a normalized discretized logistic distribution ``[...,n_ticks]``."""
-
-    if isinstance(n_ticks, bool) or not isinstance(n_ticks, int) or n_ticks <= 0:
-        raise ValueError("n_ticks must be a positive integer")
-    if mu.shape != s.shape:
-        raise ValueError("mu and s must have identical shapes")
-    if not mu.is_floating_point() or not s.is_floating_point():
-        raise TypeError("mu and s must be floating point")
-    if validate:
-        positive = (s > 0).all()
-        accelerator_assert(positive, "logistic scales must be positive")
-    # fp32 accumulation is important for wide mixtures under fp16 autocast.
-    work_dtype = torch.float64 if mu.dtype == torch.float64 or s.dtype == torch.float64 else torch.float32
-    location = mu.to(work_dtype)[..., None]
-    scale = s.to(work_dtype)[..., None]
-    edges = torch.linspace(0.0, 1.0, n_ticks + 1, dtype=work_dtype, device=mu.device)
-    standardized = (edges - location) / scale
-    lower = standardized[..., :-1]
-    upper = standardized[..., 1:]
-    # sigmoid(upper) - sigmoid(lower), written without subtracting nearly
-    # equal CDF values. This remains normalized even for extremely wide s.
-    probability = (
-        torch.sigmoid(upper)
-        * torch.sigmoid(-lower)
-        * (-torch.expm1(lower - upper))
-    ).clamp_min(0.0)
-    lower_zero = standardized[..., :1]
-    upper_one = standardized[..., -1:]
-    normalization = (
-        torch.sigmoid(upper_one)
-        * torch.sigmoid(-lower_zero)
-        * (-torch.expm1(lower_zero - upper_one))
-    )
-    probability = probability / normalization.clamp_min(torch.finfo(work_dtype).tiny)
-    # Preserve normalization when cancellation at extreme scales loses ulps.
-    probability = probability / probability.sum(dim=-1, keepdim=True).clamp_min(
-        torch.finfo(work_dtype).tiny
-    )
-    return probability.to(torch.promote_types(mu.dtype, s.dtype))
 
 
 class ValueHead(nn.Module):

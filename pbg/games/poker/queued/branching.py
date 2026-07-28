@@ -31,7 +31,7 @@ from pbg.games.poker.queued.rb_sampling import (
 )
 from pbg.games.poker.queued.replica import PokerReplicaInference
 from pbg.games.poker.queued.training import LearnerPreflightOptimizer
-from pbg.queued.branching import (
+from pbg.core.branching import (
     BranchController,
     BranchDecision,
     BranchedOverflowRecovery,
@@ -41,19 +41,19 @@ from pbg.queued.branching import (
     controller_from_state_dict,
     decision_log_path_mass,
 )
-from pbg.queued.capacity import (
+from pbg.core.capacity import (
     BRANCHED_TOPOLOGY_PACKET_ROW_BYTES,
     ExecutionPhase,
     GeneratedOwners,
     StoragePlan,
 )
-from pbg.queued.contracts import (
+from pbg.core.contracts import (
     ModeSchema,
     PrivateEstimator,
     TrainingRegime,
     validate_replica_group,
 )
-from pbg.queued.learner import (
+from pbg.core.learner import (
     BranchedBatchSampler,
     LearnerOperation,
     LearnerSchedule,
@@ -67,13 +67,13 @@ from pbg.queued.learner import (
     build_reference_output_cache,
     compact_best_response_evaluation,
 )
-from pbg.queued.optimization import DenseAdam
-from pbg.queued.persistence import RunState
-from pbg.queued.replica import (
+from pbg.core.optimization import DenseAdam
+from pbg.core.persistence import RunState
+from pbg.core.replica import (
     DistributedSUM,
     ReplicaOptimizerGroup,
 )
-from pbg.queued.rollout import (
+from pbg.core.rollout import (
     AsyncTopologyPublisher,
     CommitCoverage,
     CommitPlan,
@@ -95,20 +95,20 @@ from pbg.queued.rollout import (
     logical_rng_keys,
     stable_route,
 )
-from pbg.queued.storage import (
+from pbg.core.storage import (
     DeviceDestinationRequest,
     DeviceFailure,
     MonotoneSlab,
     PublicationTransaction,
 )
-from pbg.queued.targets import LayeredTargetExecutor, TargetAlgebra
-from pbg.queued.topology import (
+from pbg.core.targets import LayeredTargetExecutor, TargetAlgebra
+from pbg.core.topology import (
     TargetKind,
     Topology,
     TopologyBindings,
     build_layer_plan,
 )
-from pbg.queued.training import (
+from pbg.core.training import (
     AttemptAddress,
     BranchedSampledIteration,
     RecoverableOverflow,
@@ -2457,7 +2457,7 @@ class _BranchedSampledPokerAttempt:
         ):
             raise ValueError("branched best response requires a frozen operation")
         if mode.private_estimator is PrivateEstimator.RAO_BLACKWELL:
-            from pbg.queued.targets import (
+            from pbg.core.targets import (
                 rb_conversion_library_workspace_bytes,
                 rb_conversion_workspace_row_bytes,
             )
@@ -3702,7 +3702,7 @@ class _BranchedSampledPokerAttempt:
     def _target_algebra(self) -> TargetAlgebra:
         if self.mode.private_estimator is PrivateEstimator.SAMPLED:
             return TargetAlgebra(self.owners.plan.partitions, ())
-        from pbg.queued.targets import ConversionMap
+        from pbg.core.targets import ConversionMap
 
         cards = PokerStateMachine(self.geometry).combo_cards(
             torch.arange(self.geometry.private_hands, dtype=torch.int32)
@@ -4096,7 +4096,7 @@ class ReplicaBranchedPokerIteration:
     def _target_algebra(self) -> TargetAlgebra:
         if self.modes[0].private_estimator is PrivateEstimator.SAMPLED:
             return TargetAlgebra(self.owners.plan.partitions, ())
-        from pbg.queued.targets import ConversionMap
+        from pbg.core.targets import ConversionMap
 
         cards = PokerStateMachine(self.geometry).combo_cards(
             torch.arange(self.geometry.private_hands, dtype=torch.int32)

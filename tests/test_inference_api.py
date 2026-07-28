@@ -14,9 +14,9 @@ from pbg.inference_artifact import (
     INFERENCE_ARTIFACT_SCHEMA_VERSION,
     load_inference_source,
 )
-from pbg.queued.persistence import CHECKPOINT_SCHEMA, model_state_sha256
+from pbg.core.persistence import CHECKPOINT_SCHEMA, model_state_sha256
 
-CONFIG = Path("configs/train/nlhe_hu_8bb_normal_queued_smoke.yaml")
+CONFIG = Path("configs/train/nlhe_hu_8bb_normal_smoke.yaml")
 
 
 def _artifact(path: Path, device: str) -> Path:

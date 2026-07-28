@@ -5,13 +5,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any
 
 import torch
 import yaml
 
-from pbg.queued.capacity import (
+from pbg.core.capacity import (
     CapacityManifest,
     ExternalWorkspaceBounds,
     GameGeometry,
@@ -20,7 +19,7 @@ from pbg.queued.capacity import (
     PartitionRows,
     PhysicalLayout,
 )
-from pbg.queued.config import BranchedModeConfig, SequentialModeConfig
+from pbg.core.config import BranchedModeConfig, SequentialModeConfig
 
 
 class ConfigError(ValueError):

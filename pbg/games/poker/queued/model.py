@@ -30,8 +30,8 @@ from pbg.games.poker.queued.hooks import (
     PokerState,
     PokerStateMachine,
 )
-from pbg.queued.contracts import mode_schema
-from pbg.queued.learner import ModelEvaluation
+from pbg.core.contracts import mode_schema
+from pbg.core.learner import ModelEvaluation
 
 
 class PokerModelError(RuntimeError):
@@ -518,10 +518,10 @@ def build_model_from_config(
 ) -> QueuedPokerModel:
     """Reconstruct the selected queued architecture from scientific state.
 
-    The offline converter intentionally removes architecture values that are
-    functions of other scientific values.  This factory is the sole inverse:
-    it derives the action width, sequential head selection, and lossless
-    history capacity before constructing the exact parameter owners.
+    Architecture values that are functions of other scientific values are
+    derived here rather than accepted as duplicated inputs. This factory
+    derives the action width, sequential head selection, and lossless history
+    capacity before constructing the exact parameter owners.
     """
 
     mode = scientific.get("mode")

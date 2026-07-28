@@ -32,20 +32,20 @@ from pbg.games.poker.queued.response import (
     paired_probe_statistics,
     probe_evaluation_design,
 )
-from pbg.queued.branching import RankCommonFailureAgreement
-from pbg.queued.capacity import (
+from pbg.core.branching import RankCommonFailureAgreement
+from pbg.core.capacity import (
     ExecutionPhase,
     GeneratedOwners,
     StoragePlan,
 )
-from pbg.queued.config import Phase5Config
-from pbg.queued.contracts import (
+from pbg.core.config import Phase5Config
+from pbg.core.contracts import (
     ModeSchema,
     PrivateEstimator,
     RolloutMode,
     TrainingRegime,
 )
-from pbg.queued.learner import (
+from pbg.core.learner import (
     AlignedSequentialStore,
     LearnerOperation,
     LearnerSchedule,
@@ -59,18 +59,18 @@ from pbg.queued.learner import (
     build_reference_output_cache,
     compact_best_response_evaluation,
 )
-from pbg.queued.optimization import DenseAdam, LossScaler, OptimizerStep
-from pbg.queued.persistence import (
+from pbg.core.optimization import DenseAdam, LossScaler, OptimizerStep
+from pbg.core.persistence import (
     RunState,
     load_checkpoint,
     save_checkpoint,
     trim_metrics_after_checkpoint,
 )
-from pbg.queued.replica import (
+from pbg.core.replica import (
     DistributedSUM,
     ReplicaOptimizerGroup,
 )
-from pbg.queued.rollout import (
+from pbg.core.rollout import (
     AsyncTopologyPublisher,
     CompletionFIFO,
     FamilyQueueState,
@@ -79,16 +79,16 @@ from pbg.queued.rollout import (
     RolloutTransaction,
     SemanticFamilyFIFO,
 )
-from pbg.queued.storage import (
+from pbg.core.storage import (
     DestinationRequest,
     DeviceDestinationRequest,
     PublicationTransaction,
 )
-from pbg.queued.targets import ConversionMap, LayeredTargetExecutor, TargetAlgebra
-from pbg.queued.topology import (
+from pbg.core.targets import ConversionMap, LayeredTargetExecutor, TargetAlgebra
+from pbg.core.topology import (
     build_layer_plan,
 )
-from pbg.queued.training import (
+from pbg.core.training import (
     AttemptAddress,
     IterationResult,
     PreemptionNotice,
@@ -230,7 +230,7 @@ class SequentialPokerIteration:
                 "family workspace is below the concurrent sequential bound"
             )
         if mode.private_estimator is PrivateEstimator.RAO_BLACKWELL:
-            from pbg.queued.targets import (
+            from pbg.core.targets import (
                 rb_conversion_library_workspace_bytes,
                 rb_conversion_workspace_row_bytes,
             )

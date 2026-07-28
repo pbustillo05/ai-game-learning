@@ -10,11 +10,10 @@ import torch
 from pbg.config import load_config
 from pbg.devices import resolve_execution_device, validate_workload_capabilities
 from pbg.inference import PokerInferenceSession
-from pbg.runtime import TrainingSession
 
 
 ROOT = Path(__file__).parents[1]
-CONFIG = ROOT / "configs/train/nlhe_hu_8bb_normal_queued_smoke.yaml"
+CONFIG = ROOT / "configs/train/nlhe_hu_8bb_normal_smoke.yaml"
 
 
 @pytest.mark.parametrize("value", ["cpu", "auto", torch.device("cpu")])
@@ -45,7 +44,7 @@ def test_public_training_rejects_cpu_before_construction() -> None:
         replace(config.execution, device="cpu")
 
 
-def test_public_roots_do_not_import_old_core() -> None:
+def test_public_roots_do_not_import_retired_queued_namespace() -> None:
     for relative in (
         "pbg/config.py",
         "pbg/runtime.py",
@@ -62,7 +61,7 @@ def test_public_roots_do_not_import_old_core() -> None:
             if isinstance(node, ast.ImportFrom) and node.module is not None
         }
         assert not any(
-            value == "pbg.core" or value.startswith("pbg.core.")
+            value == "pbg.queued" or value.startswith("pbg.queued.")
             for value in imports
         ), relative
 

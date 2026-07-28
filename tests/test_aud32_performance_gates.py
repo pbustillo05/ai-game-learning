@@ -8,7 +8,7 @@ from pbg.config import load_config
 
 
 def _result(rate: float) -> dict:
-    cfg = load_config("configs/train/nlhe_hu_8bb_normal_queued_smoke.yaml")
+    cfg = load_config("configs/train/nlhe_hu_8bb_normal_smoke.yaml")
     required = [
         "seconds",
         "iteration",
@@ -97,7 +97,7 @@ def test_performance_gate_rejects_identity_and_environment_mismatch() -> None:
 
 
 def test_benchmark_never_converts_modes_or_capacity_manifests() -> None:
-    config = load_config("configs/train/nlhe_hu_8bb_normal_queued_smoke.yaml")
+    config = load_config("configs/train/nlhe_hu_8bb_normal_smoke.yaml")
     result = _result(100.0)
     assert result["mode"] == dict(config.mode)
     assert result["execution"]["manifest"] == config.execution.mapping()["manifest"]

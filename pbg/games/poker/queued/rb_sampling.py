@@ -8,7 +8,7 @@ import torch
 from torch import Tensor
 
 from pbg.games.poker.queued.hooks import NLHEGeometry, PAD_CARD
-from pbg.queued.rollout import DrawPurpose, logical_rng_keys, logical_uniform
+from pbg.core.rollout import DrawPurpose, logical_rng_keys, logical_uniform
 
 
 class PosteriorSamplingError(RuntimeError):

@@ -7,8 +7,8 @@ from types import MappingProxyType
 
 from torch import Tensor, nn
 
-from pbg.queued.learner import ModelEvaluation
-from pbg.queued.replica import (
+from pbg.core.learner import ModelEvaluation
+from pbg.core.replica import (
     FunctionalReplicaInference,
     ReplicaModuleOwner,
 )

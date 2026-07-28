@@ -1,7 +1,9 @@
+from collections.abc import Mapping
+from dataclasses import dataclass
+
 import torch
 import pytest
 
-from pbg.games.poker.folded import PartitionSummaryBatch
 from pbg.games.poker.model.incidence import (
     IncidenceResidual,
     build_compact_map,
@@ -13,6 +15,12 @@ from pbg.games.poker.model.postflop import (
     PostflopNet,
 )
 from pbg.games.poker.model.preflop import PokerModelConfig, PokerPublicBatch
+
+
+@dataclass(frozen=True)
+class PartitionSummaryBatch:
+    fields: Mapping[str, torch.Tensor]
+    metadata: Mapping[str, object]
 
 
 def _inputs():

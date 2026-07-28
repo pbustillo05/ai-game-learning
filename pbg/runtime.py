@@ -28,7 +28,7 @@ from pbg.games.poker.queued import (
     poker_partitions,
 )
 from pbg.identity import accelerator_identity, code_identity
-from pbg.queued import (
+from pbg.core import (
     CHECKPOINT_SCHEMA,
     REPLICA_CHECKPOINT_SCHEMA,
     AttemptAddress,
@@ -60,7 +60,7 @@ from pbg.queued import (
     save_replica_checkpoint,
     sha256_file,
 )
-from pbg.queued.persistence import LOGICAL_WORK_KEYS
+from pbg.core.persistence import LOGICAL_WORK_KEYS
 
 
 class RuntimeError(RuntimeError):
@@ -74,7 +74,7 @@ def _checkpoint_payload(path: Path) -> dict[str, object]:
         REPLICA_CHECKPOINT_SCHEMA,
     }:
         raise RuntimeError(
-            "runtime accepts only queued checkpoints; convert legacy artifacts offline"
+            "unsupported checkpoint schema"
         )
     return value
 
@@ -401,7 +401,7 @@ class TrainingSession:
             ):
                 if state.branch_controller_state is None:
                     raise RuntimeError("branched resume omitted controller state")
-                from pbg.queued import controller_from_state_dict
+                from pbg.core import controller_from_state_dict
 
                 restored.append(
                     controller_from_state_dict(state.branch_controller_state)

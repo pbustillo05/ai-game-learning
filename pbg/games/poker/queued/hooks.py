@@ -25,7 +25,7 @@ from pbg.games.poker.queued.policy import (
     PokerLegality,
     PokerPolicyOperator,
 )
-from pbg.queued.contracts import (
+from pbg.core.contracts import (
     ConversionSpec,
     ModeSchema,
     Partition,
@@ -36,8 +36,8 @@ from pbg.queued.contracts import (
     TrainingRegime,
     mode_schema,
 )
-from pbg.queued.learner import PolicyEvaluation
-from pbg.queued.rollout import (
+from pbg.core.learner import PolicyEvaluation
+from pbg.core.rollout import (
     CommitCoverage,
     CommitPlan,
     CompletionBatch,
@@ -54,7 +54,7 @@ from pbg.queued.rollout import (
     logical_rng_keys,
     stable_route,
 )
-from pbg.queued.storage import DeviceDestinationRequest, MonotoneSlab
+from pbg.core.storage import DeviceDestinationRequest, MonotoneSlab
 
 PAD_CARD = 255
 LIVE = 0
@@ -2169,7 +2169,7 @@ class RBCompletionBinding:
         n_samples: int,
         utility: str = "raw_bb",
     ) -> None:
-        from pbg.queued.targets import TargetAlgebra
+        from pbg.core.targets import TargetAlgebra
 
         if mode.private_estimator is not PrivateEstimator.RAO_BLACKWELL:
             raise ValueError("RB completion requires an RB schema")
@@ -2198,7 +2198,7 @@ class RBCompletionBinding:
         self.utility_scale = 1.0 if utility == "raw_bb" else 1.0 / geometry.stack_bb
 
     def leaf_to_layer_work(self, batch: CompletionBatch) -> CompletionPlan:
-        from pbg.queued.targets import rb_completion
+        from pbg.core.targets import rb_completion
 
         fields = batch.fields
         flat = batch.lanes.numel() * batch.rows

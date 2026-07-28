@@ -7,11 +7,11 @@ import pytest
 import yaml
 
 from pbg.config import ConfigError, load_config, load_config_mapping
-from pbg.queued.config import SequentialModeConfig
+from pbg.core.config import SequentialModeConfig
 
 
 ROOT = Path(__file__).parents[1]
-CONFIG = ROOT / "configs/train/nlhe_hu_8bb_normal_queued_smoke.yaml"
+CONFIG = ROOT / "configs/train/nlhe_hu_8bb_normal_smoke.yaml"
 
 
 def _raw() -> dict[str, object]:

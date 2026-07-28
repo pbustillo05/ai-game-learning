@@ -26,26 +26,6 @@ def max_public_history_tokens(n_players: int, stack_bb: float) -> int:
     return max_player_nodes(n_players, stack_bb) + STREET_SEPARATOR_COUNT
 
 
-def max_policy_sequence_tokens(
-    *,
-    n_players: int,
-    stack_bb: float,
-    rank_count: int,
-    k_act: int,
-) -> int:
-    """Return the widest legal one-row pre/postflop transformer sequence."""
-
-    geometry = DeckGeometry(rank_count)
-    history = max_public_history_tokens(n_players, stack_bb)
-    n_ticks = round(stack_bb / 0.5)
-    event_count = 3 + n_ticks
-    scalar_count = 3 * n_players + 13 + event_count + n_ticks
-    preflop = n_players * geometry.n_classes + scalar_count + 1 + history + k_act
-    flop_hands = math.comb(geometry.n_cards - 3, 2)
-    postflop = n_players * flop_hands + scalar_count + 6 + history + k_act
-    return max(preflop, postflop)
-
-
 def max_policy_partition_sequence_tokens(
     *,
     n_players: int,

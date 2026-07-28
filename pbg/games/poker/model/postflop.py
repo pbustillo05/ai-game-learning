@@ -9,7 +9,6 @@ import torch
 from torch import Tensor, nn
 
 from pbg.games.poker.cards import DeckGeometry
-from pbg.games.poker.folded import PartitionSummaryBatch
 from pbg.games.poker.model.heads import (
     PublicBranchingHeads,
     RaiseMixtureHead,
@@ -51,7 +50,7 @@ class PostflopMasks:
     combo_mask: Tensor | None = None
     status: Tensor | None = None
     combo_embeddings: Tensor | None = None
-    evaluator_summary: Tensor | Mapping[str, Tensor] | PartitionSummaryBatch | None = None
+    evaluator_summary: object | None = None
     fold_line_features: Tensor | None = None
     live_seat_ids: Tensor | None = None
     compact_size: int | None = None
@@ -145,7 +144,7 @@ class PostflopNet(nn.Module):
 
     def _folded_geometry(
         self,
-        summary: Tensor | Mapping[str, Tensor] | PartitionSummaryBatch | None,
+        summary: object | None,
         mapping: CompactMap,
         dtype: torch.dtype,
     ) -> tuple[Tensor, Tensor]:
@@ -157,8 +156,10 @@ class PostflopNet(nn.Module):
         cards = self.combo_ordinals[combo_ids]
         geometry = self.combo_two_hot[combo_ids].to(dtype)
         fields: Mapping[str, Tensor] | None
-        if isinstance(summary, PartitionSummaryBatch) or hasattr(summary, "fields"):
-            fields = summary.fields
+        if hasattr(summary, "fields"):
+            fields = getattr(summary, "fields")
+            if not isinstance(fields, Mapping):
+                raise TypeError("evaluator summary fields must be a mapping")
         elif isinstance(summary, Mapping):
             fields = summary
         else:
@@ -213,7 +214,7 @@ class PostflopNet(nn.Module):
 
     def _folder_context(
         self,
-        summary: Tensor | Mapping[str, Tensor] | PartitionSummaryBatch | None,
+        summary: object | None,
         mapping: CompactMap,
         players: int,
         dtype: torch.dtype,
@@ -221,8 +222,10 @@ class PostflopNet(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Build per-card pressure, per-folder seat context, and products."""
 
-        if isinstance(summary, PartitionSummaryBatch) or hasattr(summary, "fields"):
-            fields: Mapping[str, Tensor] | None = summary.fields
+        if hasattr(summary, "fields"):
+            fields = getattr(summary, "fields")
+            if not isinstance(fields, Mapping):
+                raise TypeError("evaluator summary fields must be a mapping")
         elif isinstance(summary, Mapping):
             fields = summary
         else:

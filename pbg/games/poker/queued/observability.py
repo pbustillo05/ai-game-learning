@@ -6,8 +6,8 @@ import math
 from types import MappingProxyType
 from typing import Mapping
 
-from pbg.queued.contracts import PartitionContract
-from pbg.queued.topology import Topology, TopologyBindings
+from pbg.core.contracts import PartitionContract
+from pbg.core.topology import Topology, TopologyBindings
 
 
 def topology_diagnostics(
