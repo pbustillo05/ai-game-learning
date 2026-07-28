@@ -22,6 +22,8 @@ from pbg.games.poker.queued.branching import (
     _discard_attempt,
     _ExpansionRecord,
     _StagedBranchedPayload,
+    sampled_branched_chance_frontier_row_bytes,
+    sampled_branched_topology_packet_row_bytes,
 )
 from pbg.games.poker.queued.branching import (
     _BranchedSampledPokerAttempt as BranchedSampledPokerIteration,
@@ -42,6 +44,7 @@ from pbg.queued import (
     LearnerSchedule,
     LossConfig,
     ModelEvaluation,
+    NamedShape,
     OptimizerConfig,
     PartitionRows,
     RankCommonFailureAgreement,
@@ -51,13 +54,14 @@ from pbg.queued import (
     child_path_factors,
     controller_from_state_dict,
     convert_queued_checkpoint_v1,
-    decision_path_mass,
+    decision_log_path_mass,
     load_checkpoint,
     log_kkt_intensity,
     mode_schema,
     randomized_round,
     save_checkpoint,
 )
+from pbg.queued.capacity import BRANCHED_ALIAS_PEAK_ROW_BYTES
 from pbg.queued.learner import _alias_table
 from pbg.queued.rollout import (
     AsyncTopologyPublisher,
@@ -104,24 +108,37 @@ class _BranchedModel(_EndToEndPokerModel):
         )
 
 
-def _manifest(device: torch.device) -> CapacityManifest:
+def _manifest(
+    device: torch.device,
+    geometry: NLHEGeometry | None = None,
+) -> CapacityManifest:
+    geometry = NLHEGeometry(2, 8.0, 4) if geometry is None else geometry
+    inputs = tuple(
+        item.name for item in sampled_partitions(geometry.players).inputs
+    )
     return CapacityManifest(
-        geometry=GameGeometry(2, 8.0, 4, 64, 4096),
+        geometry=GameGeometry(
+            geometry.players,
+            geometry.stack_bb,
+            geometry.rank_count,
+            64,
+            4096,
+        ),
         root_count=1,
         n_replica=1,
         beta_max=2,
-        player_node_cap=(
-            PartitionRows("pre", 1024),
-            PartitionRows("post_2", 1024),
+        player_node_cap=tuple(
+            PartitionRows(name, 1024) for name in inputs
         ),
-        trained_player_cap=(
-            PartitionRows("pre", 1024),
-            PartitionRows("post_2", 1024),
+        trained_player_cap=tuple(
+            PartitionRows(name, 1024) for name in inputs
         ),
-        action_cap=(PartitionRows("all", 2048),),
+        action_cap=(
+            PartitionRows("all", 2048 * max(1, geometry.players - 1)),
+        ),
         folded_range_cap=(
-            PartitionRows("pre", 2),
-            PartitionRows("post", 2),
+            PartitionRows("pre", 1024),
+            PartitionRows("post", 1024),
         ),
         leaf_cap=1024,
         topology_cap=1024,
@@ -145,6 +162,18 @@ def _manifest(device: torch.device) -> CapacityManifest:
             256,
         ),
         required_external=ExternalWorkspaceBounds(0, 0),
+    )
+
+
+def _phase7_layout(geometry: NLHEGeometry):
+    return replace(
+        _phase5_layout(geometry),
+        chance_frontier_row_bytes=(
+            sampled_branched_chance_frontier_row_bytes(geometry)
+        ),
+        topology_packet_row_bytes=(
+            sampled_branched_topology_packet_row_bytes(geometry)
+        ),
     )
 
 
@@ -187,7 +216,7 @@ def _scientific_config(regime: str, rollout: str) -> dict[str, object]:
         "seed": 991,
         "branching": {
             "fixed_beta": {"player": 1.5, "chance": 1.25},
-            "beta_max": 3.0,
+            "beta_max": 3,
             "minimum_tree_size": 16,
             "minimum_scale": 0.25,
             "backoff_factor": 0.5,
@@ -239,6 +268,100 @@ def test_phase7_config_is_closed_for_exactly_four_sampled_modes(
         }
         with pytest.raises(ValueError, match="KKT controller bounds"):
             BranchedModeConfig.from_mapping(bad_kkt)
+
+
+def test_branch_controller_requires_integral_capacity_bound() -> None:
+    invalid = _scientific_config("self_play", "branched.fixed")
+    invalid["branching"] = {
+        **invalid["branching"],
+        "beta_max": 2.5,
+    }
+    with pytest.raises(ValueError, match="controller bounds"):
+        BranchedModeConfig.from_mapping(invalid)
+    with pytest.raises(ValueError, match="positive integer"):
+        FixedBranchController(
+            {"player": 1.0, "chance": 1.0},
+            2.5,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="positive integer"):
+        KKTBranchController(
+            {"player": 1.0, "chance": 1.0},
+            2.5,  # type: ignore[arg-type]
+            warmup_iterations=0,
+            target_tree_size=8,
+            gamma_kappa=0.5,
+            eta_kappa=0.5,
+            kappa_min=0.25,
+            kappa_max=4,
+            log_kappa=0,
+        )
+
+
+@CUDA
+def test_phase7_admission_covers_fixed_and_full_decision_workspaces() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    layout = _phase7_layout(geometry)
+    manifest = _manifest(device)
+    self_plan = build_storage_plan(
+        mode_schema("self_play", "branched.fixed", "sampled"),
+        sampled_partitions(2),
+        manifest,
+        layout,
+        device,
+    )
+    response_plan = build_storage_plan(
+        mode_schema("best_response", "branched.fixed", "sampled"),
+        sampled_partitions(2),
+        manifest,
+        layout,
+        device,
+    )
+    trained_rows = sum(
+        manifest.partition_rows("trained_player_cap").values()
+    )
+    expected_learner = (
+        manifest.learner_sigma_pack_cap
+        * layout.learner_sigma_workspace_row_bytes
+        + manifest.learner_action_pack_cap
+        * layout.learner_action_workspace_row_bytes
+        + manifest.library_workspace_bytes
+        + trained_rows * BRANCHED_ALIAS_PEAK_ROW_BYTES
+    )
+    assert (
+        self_plan.admission(
+            ExecutionPhase.LEARNER
+        ).bounded_workspace_bytes
+        == expected_learner
+    )
+    self_rollout = self_plan.admission(
+        ExecutionPhase.ROLLOUT
+    ).bounded_workspace_bytes
+    response_rollout = response_plan.admission(
+        ExecutionPhase.ROLLOUT
+    ).bounded_workspace_bytes
+    assert (
+        response_rollout - self_rollout
+        == manifest.family_pack_cap * layout.family_workspace_row_bytes
+    )
+    assert (
+        layout.chance_frontier_row_bytes
+        == sampled_branched_chance_frontier_row_bytes(geometry)
+    )
+    assert (
+        layout.topology_packet_row_bytes
+        == sampled_branched_topology_packet_row_bytes(geometry)
+    )
+    with pytest.raises(ValueError, match="root count"):
+        PublicBranchedSampledPokerIteration(
+            owner_factory=lambda: GeneratedOwners(self_plan),
+            plan=self_plan,
+            controller=FixedBranchController(
+                {"player": 1.0, "chance": 1.0}, 2
+            ),
+            run_state=RunState("phase7-root-bound", root_count=2),
+            arguments={},
+        )
 
 
 @CUDA
@@ -467,12 +590,31 @@ def test_decisions_are_pack_invariant_and_final_root_degree_sets_mass() -> None:
         )
     )
     torch.testing.assert_close(whole, split)
-    mass = decision_path_mass(
+    log_mass = decision_log_path_mass(
         torch.tensor([-1, 0, 1, 0], dtype=torch.int32),
         torch.tensor([3, 2, 1, 1], dtype=torch.int32),
+        device=device,
     )
     torch.testing.assert_close(
-        mass, torch.tensor([1, 1 / 3, 1 / 6, 1 / 3], dtype=torch.float64)
+        log_mass.exp(),
+        torch.tensor([1, 1 / 3, 1 / 6, 1 / 3], device=device),
+    )
+    depth = 700
+    deep_log_mass = decision_log_path_mass(
+        torch.arange(-1, depth - 1, dtype=torch.int32),
+        torch.full((depth,), 4, dtype=torch.int32),
+        device=device,
+    )
+    assert bool(torch.isfinite(deep_log_mass).all())
+    torch.testing.assert_close(
+        deep_log_mass[-1],
+        torch.tensor(
+            -(depth - 1) * math.log(4),
+            dtype=torch.float32,
+            device=device,
+        ),
+        atol=2.0e-3,
+        rtol=3.0e-6,
     )
 
 
@@ -678,7 +820,7 @@ def test_failed_branched_attempt_releases_every_generated_owner() -> None:
         mode,
         sampled_partitions(2),
         _manifest(device),
-        replace(_phase5_layout(geometry), player_count=2),
+        replace(_phase7_layout(geometry), player_count=2),
         device,
     )
     owners = GeneratedOwners(plan)
@@ -712,7 +854,7 @@ def test_healthy_branched_attempt_discard_releases_without_failure_record() -> N
         mode,
         sampled_partitions(2),
         _manifest(device),
-        replace(_phase5_layout(geometry), player_count=2),
+        replace(_phase7_layout(geometry), player_count=2),
         device,
     )
     owners = GeneratedOwners(plan)
@@ -761,6 +903,7 @@ def test_untrained_unary_root_refill_restores_one_structural_root() -> None:
         return _StagedBranchedPayload(
             (record,),
             torch.tensor([0], dtype=torch.int64),
+            torch.zeros((1, 4), dtype=torch.bool),
             torch.tensor(1, dtype=torch.int64),
             torch.tensor(0, dtype=torch.float32),
             torch.tensor(1, dtype=torch.int64),
@@ -789,7 +932,7 @@ def test_branched_topology_publication_accepts_only_committed_payloads() -> None
         mode,
         sampled_partitions(2),
         _manifest(device),
-        replace(_phase5_layout(geometry), player_count=2),
+        replace(_phase7_layout(geometry), player_count=2),
         device,
     )
     owners = GeneratedOwners(plan)
@@ -843,7 +986,7 @@ def test_full_branched_iteration_is_family_pack_invariant() -> None:
             mode,
             sampled_partitions(2),
             replace(_manifest(device), family_pack_cap=family_pack_cap),
-            replace(_phase5_layout(geometry), player_count=2),
+            replace(_phase7_layout(geometry), player_count=2),
             device,
         )
         model = _BranchedModel(device, geometry.private_hands)
@@ -912,7 +1055,7 @@ def test_multi_pack_roots_use_complete_frontier_cost_forecast() -> None:
             root_count=3,
             family_pack_cap=1,
         ),
-        replace(_phase5_layout(geometry), player_count=2),
+        replace(_phase7_layout(geometry), player_count=2),
         device,
     )
     model = _BranchedModel(device, geometry.private_hands)
@@ -960,12 +1103,13 @@ def test_kkt_feedback_is_invariant_to_root_batching() -> None:
         plan = build_storage_plan(
             mode,
             sampled_partitions(2),
-            replace(
-                _manifest(device),
-                root_count=root_count,
-                family_pack_cap=1,
-            ),
-            replace(_phase5_layout(geometry), player_count=2),
+                replace(
+                    _manifest(device),
+                    root_count=root_count,
+                    beta_max=1,
+                    family_pack_cap=1,
+                ),
+            replace(_phase7_layout(geometry), player_count=2),
             device,
         )
         model = _BranchedModel(device, geometry.private_hands)
@@ -1026,7 +1170,7 @@ def test_ragged_statistical_work_subdivides_by_action_cap() -> None:
                 learner_sigma_pack_cap=8,
                 learner_action_pack_cap=action_cap,
             ),
-            replace(_phase5_layout(geometry), player_count=2),
+            replace(_phase7_layout(geometry), player_count=2),
             device,
         )
         model = _BranchedModel(device, geometry.private_hands)
@@ -1088,7 +1232,7 @@ def test_four_sampled_branched_modes_complete_optimizer_step(
         sampled_partitions(2),
         _manifest(device),
         replace(
-            _phase5_layout(geometry),
+            _phase7_layout(geometry),
             player_count=2,
         ),
         device,
@@ -1154,6 +1298,193 @@ def test_four_sampled_branched_modes_complete_optimizer_step(
 
 
 @CUDA
+def test_best_response_rollout_selects_one_model_per_role_subspan() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = mode_schema("best_response", "branched.fixed", "sampled")
+    plan = build_storage_plan(
+        mode,
+        sampled_partitions(2),
+        _manifest(device),
+        _phase7_layout(geometry),
+        device,
+    )
+
+    class RoleRecordingModel(_BranchedModel):
+        def __init__(self):
+            super().__init__(device, geometry.private_hands)
+            self.rollout_owners: list[torch.Tensor] = []
+
+        def evaluate(self, input_type, model_input, private, owner):
+            if not torch.is_grad_enabled():
+                self.rollout_owners.append(owner.detach().clone())
+            return super().evaluate(
+                input_type, model_input, private, owner
+            )
+
+    learned = RoleRecordingModel()
+    frozen = RoleRecordingModel()
+    BranchedSampledPokerIteration(
+        geometry=geometry,
+        owners=GeneratedOwners(plan),
+        mode=mode,
+        controller=FixedBranchController(
+            {"player": 1.0, "chance": 1.0}, 2
+        ),
+        model=learned,
+        model_operation=learned.evaluate,
+        frozen_operation=frozen.evaluate,
+        optimizer=DenseAdam(
+            learned,
+            OptimizerConfig(name="adamw", grad_clip=5),
+        ),
+        loss=LossConfig(
+            reference_kl_coefficient=0,
+            trace_coefficient=0.1,
+            cost_coefficient=0.1,
+        ),
+        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        generator=torch.Generator(device=device).manual_seed(701),
+        seed=701,
+        lambda_=0.95,
+    ).run(iteration=0)
+    assert learned.rollout_owners
+    assert frozen.rollout_owners
+    assert all(
+        bool(owner.eq(0).all()) for owner in learned.rollout_owners
+    )
+    assert all(
+        bool(owner.eq(1).all()) for owner in frozen.rollout_owners
+    )
+
+
+@CUDA
+def test_branched_allocator_and_reference_cache_controls_are_wired() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = mode_schema("self_play", "branched.fixed", "sampled")
+    plan = build_storage_plan(
+        mode,
+        sampled_partitions(2),
+        _manifest(device),
+        replace(
+            _phase7_layout(geometry),
+            reference_cache_bytes=4 << 20,
+        ),
+        device,
+    )
+    model = _BranchedModel(device, geometry.private_hands)
+    reference = _BranchedModel(device, geometry.private_hands)
+    result = BranchedSampledPokerIteration(
+        geometry=geometry,
+        owners=GeneratedOwners(plan),
+        mode=mode,
+        controller=FixedBranchController(
+            {"player": 2.0, "chance": 1.0}, 2
+        ),
+        model=model,
+        model_operation=model.evaluate,
+        reference_operation=reference.evaluate,
+        cache_reference_outputs=True,
+        allocation_inputs=(
+            torch.tensor([1.0, 1.0], dtype=torch.float64),
+            torch.tensor([1.0, 1.0], dtype=torch.float64),
+            torch.tensor([1.0, 2.0], dtype=torch.float64),
+            8,
+        ),
+        optimizer=DenseAdam(
+            model,
+            OptimizerConfig(name="adamw", grad_clip=5),
+        ),
+        loss=LossConfig(
+            reference_kl_coefficient=0.1,
+            trace_coefficient=0.1,
+            cost_coefficient=0.1,
+        ),
+        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        generator=torch.Generator(device=device).manual_seed(709),
+        seed=709,
+        lambda_=0.95,
+    ).run(iteration=0)
+    assert result.learner.statistical_presentations == 8
+    assert len(reference.no_grad_batch_sizes) == 2
+
+
+@CUDA
+def test_three_player_nonterminal_fold_seals_branched_summary() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(3, 8.0, 4)
+    mode = mode_schema("self_play", "branched.fixed", "sampled")
+    partitions = sampled_partitions(geometry.players)
+    layout = replace(
+        _phase7_layout(geometry),
+        model_input_shapes=tuple(
+            NamedShape(
+                partition.name,
+                (geometry.direct_model_input_width,),
+            )
+            for partition in partitions.inputs
+        ),
+        player_count=geometry.players,
+        stratum_count=geometry.players,
+    )
+    plan = build_storage_plan(
+        mode,
+        partitions,
+        _manifest(device, geometry),
+        layout,
+        device,
+    )
+
+    class FoldCheckingModel(_BranchedModel):
+        def __init__(self):
+            super().__init__(device, geometry.private_hands)
+            self.check_down = False
+            self.forward_count = 0
+            self.sealed_fold_seen = False
+
+        def evaluate(self, input_type, model_input, private, owner):
+            if not torch.is_grad_enabled():
+                self.forward_count += 1
+            if not torch.is_grad_enabled() and self.forward_count > 1:
+                torch._assert_async(
+                    model_input[:, -1].gt(0.5).all(),
+                    "nonterminal branched fold omitted its sealed summary",
+                )
+                self.sealed_fold_seen = True
+            return super().evaluate(
+                input_type, model_input, private, owner
+            )
+
+    model = FoldCheckingModel()
+    result = BranchedSampledPokerIteration(
+        geometry=geometry,
+        owners=GeneratedOwners(plan),
+        mode=mode,
+        controller=FixedBranchController(
+            {"player": 1.0, "chance": 1.0}, 2
+        ),
+        model=model,
+        model_operation=model.evaluate,
+        optimizer=DenseAdam(
+            model,
+            OptimizerConfig(name="adamw", grad_clip=5),
+        ),
+        loss=LossConfig(
+            reference_kl_coefficient=0,
+            trace_coefficient=0.1,
+            cost_coefficient=0.1,
+        ),
+        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        generator=torch.Generator(device=device).manual_seed(607),
+        seed=607,
+        lambda_=0.95,
+    ).run(iteration=0)
+    assert model.sealed_fold_seen
+    assert result.learner.optimizer_steps[0].applied
+
+
+@CUDA
 @pytest.mark.parametrize(
     ("player_beta", "chance_beta", "minimum_tree_size"),
     ((1.0, 2.0, 1), (1.0, 1.0, 20)),
@@ -1170,7 +1501,7 @@ def test_chance_branching_and_protected_root_refill_complete_targets(
         mode,
         sampled_partitions(2),
         _manifest(device),
-        replace(_phase5_layout(geometry), player_count=2),
+        replace(_phase7_layout(geometry), player_count=2),
         device,
     )
     model = _BranchedModel(device, geometry.private_hands)

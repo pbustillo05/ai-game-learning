@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import IntEnum
-import math
 from types import MappingProxyType
-from typing import Callable, Mapping
 
 import torch
 
@@ -178,6 +178,7 @@ class PhysicalLayout:
     learner_sigma_workspace_row_bytes: int
     learner_action_workspace_row_bytes: int
     topology_packet_row_bytes: int
+    reference_cache_bytes: int = 0
     field_alignment: int = 64
     model_dtype: torch.dtype = torch.float32
 
@@ -204,6 +205,7 @@ class PhysicalLayout:
             ("topology_packet_row_bytes", self.topology_packet_row_bytes),
         ):
             _positive_int(value, label)
+        _nonnegative_int(self.reference_cache_bytes, "reference_cache_bytes")
         if (
             isinstance(self.field_alignment, bool)
             or not isinstance(self.field_alignment, int)
@@ -393,6 +395,9 @@ _LIFETIMES: Mapping[str, tuple[ExecutionPhase, ExecutionPhase]] = MappingProxyTy
 )
 
 _CPU_OWNERS = ("Topology", "TopologyChild")
+BRANCHED_ALIAS_PEAK_ROW_BYTES = 44
+BRANCHED_LOG_MASS_ROW_BYTES = 12
+BRANCHED_TOPOLOGY_PACKET_ROW_BYTES = 95
 
 
 def _output_width(partitions: PartitionContract, input_name: str) -> int:
@@ -693,14 +698,28 @@ def _validate_manifest(
 
 def _bounded_workspace(
     phase: ExecutionPhase,
+    mode: ModeSchema,
     manifest: CapacityManifest,
     layout: PhysicalLayout,
 ) -> int:
     if phase is ExecutionPhase.ROLLOUT:
+        family_multiplier = (
+            2
+            if (
+                mode.rollout_mode.is_branched
+                and mode.training_regime is TrainingRegime.BEST_RESPONSE
+            )
+            else 1
+        )
+        topology_rows = manifest.topology_packet_cap + int(
+            mode.rollout_mode.is_branched
+        )
         return (
-            manifest.family_pack_cap * layout.family_workspace_row_bytes
+            family_multiplier
+            * manifest.family_pack_cap
+            * layout.family_workspace_row_bytes
             + manifest.chance_frontier_cap * layout.chance_frontier_row_bytes
-            + manifest.topology_packet_cap * layout.topology_packet_row_bytes
+            + topology_rows * layout.topology_packet_row_bytes
             + manifest.library_workspace_bytes
         )
     if phase is ExecutionPhase.QUEUE_DRAIN:
@@ -712,14 +731,34 @@ def _bounded_workspace(
             + manifest.library_workspace_bytes
         )
     if phase in (ExecutionPhase.ALIGN_AND_SEAL, ExecutionPhase.TARGETS):
-        return manifest.movement_scratch_bytes + manifest.library_workspace_bytes
+        log_mass_bytes = (
+            manifest.topology_cap * BRANCHED_LOG_MASS_ROW_BYTES
+            if (
+                phase is ExecutionPhase.ALIGN_AND_SEAL
+                and mode.rollout_mode.is_branched
+            )
+            else 0
+        )
+        return (
+            manifest.movement_scratch_bytes
+            + manifest.library_workspace_bytes
+            + log_mass_bytes
+        )
     if phase is ExecutionPhase.LEARNER:
+        alias_bytes = (
+            sum(manifest.partition_rows("trained_player_cap").values())
+            * BRANCHED_ALIAS_PEAK_ROW_BYTES
+            if mode.rollout_mode.is_branched
+            else 0
+        )
         return (
             manifest.learner_sigma_pack_cap
             * layout.learner_sigma_workspace_row_bytes
             + manifest.learner_action_pack_cap
             * layout.learner_action_workspace_row_bytes
             + manifest.library_workspace_bytes
+            + alias_bytes
+            + layout.reference_cache_bytes
         )
     return 0
 
@@ -788,7 +827,7 @@ def build_storage_plan(
             for allocation in allocations
             if allocation.start_phase <= phase <= allocation.last_consumer
         )
-        bounded = _bounded_workspace(phase, manifest, layout)
+        bounded = _bounded_workspace(phase, mode, manifest, layout)
         required = owner_bytes + bounded + manifest.memory_guard_bytes
         admission = PhaseAdmission(
             phase=phase,
@@ -1046,6 +1085,9 @@ class GeneratedOwners:
 
 
 __all__ = [
+    "BRANCHED_ALIAS_PEAK_ROW_BYTES",
+    "BRANCHED_LOG_MASS_ROW_BYTES",
+    "BRANCHED_TOPOLOGY_PACKET_ROW_BYTES",
     "AdmissionError",
     "CapacityError",
     "CapacityManifest",

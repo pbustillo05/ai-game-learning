@@ -16,7 +16,7 @@ T = TypeVar("T")
 
 def _mapping(value: object, path: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
-        raise ValueError(f"{path}: expected an object")
+        raise ValueError(f"{path}: expected an object")  # noqa: TRY004
     return value
 
 
@@ -513,6 +513,8 @@ class BranchedModeConfig:
             isinstance(branching["minimum_tree_size"], bool)
             or not isinstance(branching["minimum_tree_size"], int)
             or branching["minimum_tree_size"] <= 0
+            or isinstance(branching["beta_max"], bool)
+            or not isinstance(branching["beta_max"], int)
             or branching["beta_max"] < 1
             or any(
                 not 1 <= fixed_beta[name] <= branching["beta_max"]

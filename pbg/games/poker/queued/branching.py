@@ -10,7 +10,11 @@ from types import MappingProxyType
 import torch
 from torch import Tensor, nn
 
+from pbg.games.poker.model.capacity import (
+    max_policy_partition_sequence_tokens,
+)
 from pbg.games.poker.queued.hooks import (
+    FOLD,
     PAD_CARD,
     NLHEGeometry,
     PokerForwardInput,
@@ -28,9 +32,14 @@ from pbg.queued.branching import (
     RankCommonFailureAgreement,
     child_path_factors,
     controller_from_state_dict,
-    decision_path_mass,
+    decision_log_path_mass,
 )
-from pbg.queued.capacity import ExecutionPhase, GeneratedOwners, StoragePlan
+from pbg.queued.capacity import (
+    BRANCHED_TOPOLOGY_PACKET_ROW_BYTES,
+    ExecutionPhase,
+    GeneratedOwners,
+    StoragePlan,
+)
 from pbg.queued.contracts import (
     ModeSchema,
     PrivateEstimator,
@@ -44,7 +53,9 @@ from pbg.queued.learner import (
     ModelEvaluation,
     ModelOperation,
     RaggedBranchedStore,
+    ReferenceOutputCache,
     SealedBranchedInputs,
+    allocate_statistical_counts,
 )
 from pbg.queued.optimization import DenseAdam
 from pbg.queued.persistence import RunState
@@ -102,6 +113,38 @@ class BranchedTopologyArenaOverflow(BranchedPokerError):
         )
 
 
+def sampled_branched_chance_frontier_row_bytes(
+    geometry: NLHEGeometry,
+) -> int:
+    """Conservative concurrent device bytes for one chance-frontier row."""
+
+    players = geometry.players
+    hands = geometry.private_hands
+    history = (
+        geometry.base_model_input_width
+        - 8
+        - 10 * players
+        - players * hands
+    ) // 10
+    return (
+        512
+        + 8 * geometry.direct_model_input_width
+        + 16 * players * hands
+        + 128 * history
+        + 64 * geometry.deck_cards
+        + 128 * players
+        + 3 * BRANCHED_TOPOLOGY_PACKET_ROW_BYTES
+    )
+
+
+def sampled_branched_topology_packet_row_bytes(
+    geometry: NLHEGeometry,
+) -> int:
+    """Device packet bytes including one queued-role bit per input family."""
+
+    return BRANCHED_TOPOLOGY_PACKET_ROW_BYTES + geometry.players
+
+
 @dataclass(frozen=True)
 class BranchedPokerResult:
     learner: object
@@ -143,6 +186,7 @@ class _ExpansionRecord:
 class _StagedBranchedPayload:
     records: tuple[_ExpansionRecord, ...]
     produced: Tensor
+    produced_trained: Tensor
     sampled_nodes: Tensor
     counterfactual_correction: Tensor
     node_count: Tensor
@@ -274,6 +318,11 @@ class BranchedTopologyRecorder:
         )
         self._produced = torch.empty(
             len(input_names), dtype=torch.int64, pin_memory=True
+        )
+        self._produced_trained = torch.empty(
+            (len(input_names), topology_packet_cap),
+            dtype=torch.bool,
+            pin_memory=True,
         )
         self._sampled_nodes = torch.empty((), dtype=torch.int64, pin_memory=True)
         self._correction = torch.empty((), dtype=torch.float32, pin_memory=True)
@@ -446,6 +495,7 @@ class BranchedTopologyRecorder:
         records: tuple[_ExpansionRecord, ...],
         *,
         produced: Tensor,
+        produced_trained: Tensor,
         sampled_nodes: Tensor,
         counterfactual_correction: Tensor,
         frontier_overflow: Tensor,
@@ -455,6 +505,9 @@ class BranchedTopologyRecorder:
             not records
             or produced.device != self.device
             or produced.shape != (len(self.input_names),)
+            or produced_trained.device != self.device
+            or produced_trained.shape
+            != (len(self.input_names), self.topology_packet_cap)
         ):
             raise BranchedPokerError("branched topology payload is invalid")
         node_offset = torch.zeros((), dtype=torch.int64, device=self.device)
@@ -503,6 +556,9 @@ class BranchedTopologyRecorder:
                 non_blocking=True,
             )
         self._produced.copy_(produced, non_blocking=True)
+        self._produced_trained.copy_(
+            produced_trained, non_blocking=True
+        )
         self._sampled_nodes.copy_(sampled_nodes.detach(), non_blocking=True)
         self._correction.copy_(
             counterfactual_correction.detach(), non_blocking=True
@@ -531,6 +587,7 @@ class BranchedTopologyRecorder:
         return _StagedBranchedPayload(
             (staged,),
             self._produced,
+            self._produced_trained,
             self._sampled_nodes,
             self._correction,
             self._node_count,
@@ -560,6 +617,9 @@ class BranchedTopologyRecorder:
         self._host_node_active = torch.empty(0, dtype=torch.bool)
         self._host_edge_active = torch.empty(0, dtype=torch.bool)
         self._produced = torch.empty(0, dtype=torch.int64)
+        self._produced_trained = torch.empty(
+            (0, 0), dtype=torch.bool
+        )
         self._sampled_nodes = torch.empty(0, dtype=torch.int64)
         self._correction = torch.empty(0, dtype=torch.float32)
         self._node_count = torch.empty(0, dtype=torch.int64)
@@ -921,8 +981,9 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         private = parent_private.index_select(0, source)
         state = replace(state, combo_ids=private)
         action = sample["action"]
+        resolved_input = self._resolved_model_input(batch)
         log_reach, history = self.machine.model_context(
-            flat_input.index_select(0, source)
+            resolved_input.index_select(0, source)
         )
         raw = MappingProxyType(
             {
@@ -946,6 +1007,8 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             actor[:, None, None].expand(-1, 1, self.geometry.private_hands),
             (actor_reach + selected_log)[:, None],
         )
+        fold_log_reach = log_reach
+        fold_parent_street = state.street
         history = self.machine.append_player_history(state, action, history)
         next_state = self.machine.step_player(state, action)
         root = batch.fields["logical_rng_key"][0, :, 0].index_select(0, action_source)
@@ -994,6 +1057,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         )
         current_log_reach = log_reach.index_select(0, action_row)
         endpoint_source = initial_endpoint_source.index_select(0, action_row)
+        endpoint_action = action_row
         endpoint_mass = initial_endpoint_mass.index_select(0, action_row)
         endpoint_log_sum = initial_log_sum.index_select(0, action_row)
         endpoint_log_product = initial_log_product.index_select(0, action_row)
@@ -1024,7 +1088,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 cost=None,
                 log_player_ancestor_sum=endpoint_log_sum,
                 log_ancestor_product=endpoint_log_product,
-                active=current_active,
+                active=chance,
             )
             ones = torch.ones_like(chance_decision.executed_degree)
             chance_decision = BranchDecision(
@@ -1072,9 +1136,16 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 )
             )
             ordinal = frontier_row - prefix.index_select(0, chance_source)
-            next_path = child_path_keys(
-                current_key[:, 1].index_select(0, chance_source),
+            source_path = current_key[:, 1].index_select(0, chance_source)
+            source_is_chance = chance.index_select(0, chance_source)
+            branched_path = child_path_keys(
+                source_path,
                 ordinal + 1,
+            )
+            next_path = torch.where(
+                source_is_chance,
+                branched_path,
+                source_path,
             )
             next_key = torch.stack(
                 (
@@ -1219,6 +1290,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 )
             )
             endpoint_source = endpoint_source.index_select(0, chance_source)
+            endpoint_action = endpoint_action.index_select(0, chance_source)
             endpoint_mass = (
                 endpoint_mass.index_select(0, chance_source)
                 / degree.index_select(0, chance_source).clamp_min(1).float()
@@ -1380,14 +1452,150 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             )
         )
 
+        fold = action.eq(FOLD) & action_active
+        endpoint_nonterminal = current_active & ~terminal
+        fold_consumed = torch.zeros(
+            action_total, dtype=torch.int32, device=device
+        )
+        fold_consumed.scatter_reduce_(
+            0,
+            endpoint_action,
+            endpoint_nonterminal.to(torch.int32),
+            reduce="amax",
+            include_self=True,
+        )
+        stored_fold = fold & fold_consumed.gt(0)
+        finite_fold = torch.isfinite(fold_log_reach)
+        fold_gauge = fold_log_reach.masked_fill(
+            ~finite_fold, -torch.inf
+        ).amax(-1, keepdim=True)
+        fold_weight = torch.exp(
+            fold_log_reach
+            - fold_gauge.masked_fill(~torch.isfinite(fold_gauge), 0.0)
+        ).masked_fill(~finite_fold, 0.0)
+        actor_weight = fold_weight.gather(
+            1,
+            actor[:, None, None].expand(
+                -1, 1, self.geometry.private_hands
+            ),
+        ).squeeze(1)
+        actor_weight /= actor_weight.sum(-1, keepdim=True).clamp_min(
+            torch.finfo(torch.float32).tiny
+        )
+        folded_partition = "pre" if batch.input_type == "pre" else "post"
+        folded_slab = self._owner_slab("FoldedRanges", folded_partition)
+        folded_rows = actor_weight
+        if folded_partition == "pre":
+            classes = self._combo_class()
+            folded_rows = torch.zeros(
+                (action_total, self.geometry.rank_count**2),
+                dtype=torch.float32,
+                device=device,
+            )
+            folded_rows.scatter_add_(
+                1,
+                classes[None].expand_as(actor_weight),
+                actor_weight,
+            )
+        if folded_slab.columns["range"].shape[-1] == 1:
+            folded_rows = folded_rows.sum(-1, keepdim=True)
+        fold_order = torch.argsort(~stored_fold, stable=True)
+        folded_values = self._defaults(folded_slab, action_total)
+        folded_values["range"][0].copy_(
+            folded_rows.index_select(0, fold_order)
+        )
+        actor_log_mass = torch.logsumexp(
+            fold_log_reach.gather(
+                1,
+                actor[:, None, None].expand(
+                    -1, 1, self.geometry.private_hands
+                ),
+            ).squeeze(1),
+            -1,
+        )
+        folded_values["log_mass"][0].copy_(
+            actor_log_mass.index_select(0, fold_order)
+        )
+        fold_count = stored_fold.sum(dtype=torch.int64).reshape(1)
+        fold_base = folded_slab.reserved_tails_device()[0]
+        fold_ordinal = stored_fold.cumsum(0, dtype=torch.int64) - 1
+        encoded_reference = (
+            fold_base + fold_ordinal
+            if folded_partition == "pre"
+            else -(fold_base + fold_ordinal + 2)
+        )
+        action_folded_reference = batch.fields["folded_range_row"][
+            0
+        ].index_select(0, action_source).to(torch.int64)
+        prior_actor_reference = action_folded_reference.gather(
+            1, actor[:, None]
+        ).squeeze(1)
+        action_folded_reference = action_folded_reference.scatter(
+            1,
+            actor[:, None],
+            torch.where(
+                stored_fold,
+                encoded_reference,
+                prior_actor_reference,
+            )[:, None],
+        )
+        folded_reference = action_folded_reference.index_select(
+            0, endpoint_action
+        )
         next_input = self.machine.direct_model_input(next_state, log_reach, history)
+        if self.geometry.folded_summary_width:
+            summary_slice = slice(self.geometry.base_model_input_width, None)
+            next_input[:, summary_slice].copy_(
+                resolved_input.index_select(0, endpoint_source)[:, summary_slice]
+            )
+            endpoint_fold = stored_fold.index_select(0, endpoint_action)
+            refresh = (
+                endpoint_fold
+                | next_state.street.ne(
+                    fold_parent_street.index_select(0, endpoint_action)
+                )
+            ) & endpoint_nonterminal
+            refresh_rows = torch.nonzero(
+                refresh, as_tuple=False
+            ).flatten()
+            from pbg.games.poker.queued.folded import (
+                folded_statistics,
+                pack_folded_statistics,
+            )
+
+            refreshed_summary = folded_statistics(
+                self.geometry,
+                board_cards=next_state.board_cards.index_select(
+                    0, refresh_rows
+                ),
+                range_weights=torch.exp(
+                    log_reach.index_select(0, refresh_rows).float()
+                ).masked_fill(
+                    ~torch.isfinite(
+                        log_reach.index_select(0, refresh_rows)
+                    ),
+                    0.0,
+                ),
+                status=next_state.status.index_select(0, refresh_rows),
+                combo_cards=cards,
+                beta_rank=self.geometry.deck_cards,
+                line_dim=0,
+                tight_mask=self._tight_folder_mask(
+                    history, next_state.status
+                ).index_select(0, refresh_rows),
+            )
+            next_input[:, summary_slice].index_copy_(
+                0,
+                refresh_rows,
+                pack_folded_statistics(
+                    self.geometry, refreshed_summary
+                ).to(next_input.dtype),
+            )
         next_logical = torch.stack((root, child_path), -1)
         family_source: dict[str, Tensor] = {
             "logical_rng_key": next_logical,
             "true_profile": private,
-            "folded_range_row": batch.fields["folded_range_row"][0].index_select(
-                0, endpoint_source
-            ),
+            "folded_range_row": folded_reference.to(torch.int32),
             "model_input": next_input,
             "owner": next_state.to_act,
             "sampled_private_state": private,
@@ -1403,11 +1611,38 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             family_source["role_selector"] = batch.fields["role_selector"][
                 0
             ].index_select(0, endpoint_source)
+        child_trained = (
+            next_state.to_act.to(torch.int64).eq(
+                selected_player.index_select(0, endpoint_source)
+            )
+            if self.mode.training_regime is TrainingRegime.BEST_RESPONSE
+            else torch.ones(total, dtype=torch.bool, device=device)
+        )
+        packet_cap = self.topology_recorder.topology_packet_cap
+        packet_dummy = packet_cap
+        produced_trained_device = torch.zeros(
+            (len(self.queues), packet_cap + 1),
+            dtype=torch.bool,
+            device=device,
+        )
+        packet_source = torch.arange(
+            total, dtype=torch.int64, device=device
+        )
         published: list[SemanticFamilyFIFO] = []
         queue_cost_additions: list[Tensor] = []
         for family_index, (name, queue) in enumerate(self.queues.items()):
             selected_rows = route.source_row[0, family_index + 1]
             selected_valid = route.valid[0, family_index + 1]
+            packet_destination = torch.where(
+                selected_valid & packet_source.lt(packet_cap),
+                packet_source,
+                torch.full_like(packet_source, packet_dummy),
+            )
+            produced_trained_device[family_index].index_copy_(
+                0,
+                packet_destination,
+                child_trained.index_select(0, selected_rows),
+            )
             values = self._defaults(queue.family, total)
             for field, value in family_source.items():
                 if field in values:
@@ -1449,6 +1684,16 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             published.append(queue)
             queue_cost_additions.append(cost_addition)
 
+        folded_destination = len(destinations)
+        destinations.append(
+            DeviceDestinationRequest(
+                folded_slab,
+                fold_count,
+                folded_values,
+                batch.input_type,
+                address,
+            )
+        )
         descriptor_source: list[Tensor] = []
         descriptor_destination: list[Tensor] = []
         descriptor_ordinal: list[Tensor] = []
@@ -1467,6 +1712,16 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         descriptor_destination.append(torch.full_like(action_compact, 2))
         descriptor_ordinal.append(action_compact)
         descriptor_valid.append(trained_action_valid)
+        descriptor_source.append(
+            action_source.index_select(0, fold_order)
+        )
+        descriptor_destination.append(
+            torch.full_like(action_compact, folded_destination)
+        )
+        descriptor_ordinal.append(action_compact)
+        descriptor_valid.append(
+            stored_fold.index_select(0, fold_order)
+        )
         endpoint_destination = torch.zeros(
             total, dtype=torch.int64, device=device
         )
@@ -1614,6 +1869,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         staged_payload = self.topology_recorder.stage_payload(
             device_records,
             produced=route.counts[0, 1:],
+            produced_trained=produced_trained_device[:, :-1],
             sampled_nodes=sampled_nodes,
             counterfactual_correction=correction,
             frontier_overflow=frontier_overflow,
@@ -1662,6 +1918,8 @@ class _BranchedSampledPokerAttempt:
         cost_safeguard: CostSafeguardController | None = None,
         precision: str = "fp32",
         utility: str = "raw_bb",
+        cache_reference_outputs: bool = False,
+        allocation_inputs: tuple[Tensor, Tensor, Tensor, int] | None = None,
         run_state: RunState | None = None,
         frozen_operation: ModelOperation | None = None,
         reference_operation: ModelOperation | None = None,
@@ -1674,8 +1932,45 @@ class _BranchedSampledPokerAttempt:
             raise ValueError("Phase 7 iteration requires a sampled branched mode")
         if controller.mode is not mode.rollout_mode:
             raise ValueError("branch controller mode differs from the schema")
+        if controller.beta_max != owners.plan.manifest.beta_max:
+            raise ValueError(
+                "branch controller beta_max differs from the storage manifest"
+            )
         if owners.plan.mode != mode or owners.plan.manifest.n_replica != 1:
             raise ValueError("branched owners differ from the ordinary schema")
+        if (
+            run_state is not None
+            and not 0 < run_state.root_count <= owners.plan.manifest.root_count
+        ):
+            raise ValueError("branched root count is outside the storage plan")
+        postflop = getattr(model, "postflop", None)
+        postflop_config = getattr(postflop, "cfg", None)
+        m_raise = int(getattr(postflop_config, "m_raise", 1))
+        from pbg.games.poker.queued.folded import (
+            sequential_family_workspace_row_bytes,
+        )
+
+        if (
+            owners.plan.layout.family_workspace_row_bytes
+            < sequential_family_workspace_row_bytes(geometry, m_raise)
+        ):
+            raise ValueError(
+                "family workspace is below the concurrent branched bound"
+            )
+        if (
+            owners.plan.layout.chance_frontier_row_bytes
+            < sampled_branched_chance_frontier_row_bytes(geometry)
+        ):
+            raise ValueError(
+                "chance-frontier workspace is below the sampled poker bound"
+            )
+        if (
+            owners.plan.layout.topology_packet_row_bytes
+            < sampled_branched_topology_packet_row_bytes(geometry)
+        ):
+            raise ValueError(
+                "topology packet workspace is below the branched packet bound"
+            )
         if (
             mode.training_regime is TrainingRegime.BEST_RESPONSE
             and frozen_operation is None
@@ -1693,6 +1988,10 @@ class _BranchedSampledPokerAttempt:
         self.generator = generator
         self.seed = int(seed)
         self.lambda_ = float(lambda_)
+        if precision not in ("fp32", "fp16", "bf16"):
+            raise ValueError("branched poker precision is invalid")
+        if utility not in ("raw_bb", "stack_normalized"):
+            raise ValueError("branched poker utility is invalid")
         if (
             isinstance(minimum_tree_size, bool)
             or not isinstance(minimum_tree_size, int)
@@ -1703,6 +2002,10 @@ class _BranchedSampledPokerAttempt:
         self.cost_safeguard = cost_safeguard
         self.precision = precision
         self.utility = utility
+        if type(cache_reference_outputs) is not bool:
+            raise TypeError("cache_reference_outputs must be bool")
+        self.cache_reference_outputs = cache_reference_outputs
+        self.allocation_inputs = allocation_inputs
         self.run_state = run_state
         if (
             run_state is not None
@@ -1733,6 +2036,7 @@ class _BranchedSampledPokerAttempt:
         )
         self._attempt_success_event = torch.cuda.Event(blocking=False)
         self.policy = PokerPolicyOperator()
+        self._scheduled_model_operation: ModelOperation | None = None
 
     def _publication_succeeded(self, success: Tensor) -> bool:
         """Poll the fixed attempt-boundary feedback slot."""
@@ -1807,7 +2111,7 @@ class _BranchedSampledPokerAttempt:
         )
         if self.cost_safeguard is not None:
             with torch.no_grad():
-                root_cost = self._bounded_model(
+                root_cost = self._bounded_mixed_model(
                     PokerForwardInput(
                         "pre",
                         values["model_input"][0],
@@ -1893,6 +2197,58 @@ class _BranchedSampledPokerAttempt:
         )
 
     def _model(
+        self, forward: PokerForwardInput, lanes: Tensor
+    ) -> Mapping[str, Tensor]:
+        autocast_dtype = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[self.precision]
+        if self.precision == "bf16" and not torch.cuda.is_bf16_supported():
+            raise BranchedPokerError("selected CUDA device does not support BF16")
+        with torch.no_grad(), torch.autocast(
+            device_type="cuda",
+            dtype=autocast_dtype,
+            enabled=self.precision != "fp32",
+        ):
+            if self._scheduled_model_operation is not None:
+                return self._model_output(
+                    self._scheduled_model_operation(
+                        forward.input_type,
+                        forward.model_input,
+                        forward.sampled_private_state,
+                        forward.owner,
+                    )
+                )
+            return self._model_inference(forward, lanes)
+
+    def _mixed_model(
+        self, forward: PokerForwardInput, lanes: Tensor
+    ) -> Mapping[str, Tensor]:
+        scheduled = self._scheduled_model_operation
+        self._scheduled_model_operation = None
+        try:
+            return self._model(forward, lanes)
+        finally:
+            self._scheduled_model_operation = scheduled
+
+    @staticmethod
+    def _model_output(evaluation: ModelEvaluation) -> Mapping[str, Tensor]:
+        if set(evaluation.public_heads) != {"trace", "cost"}:
+            raise BranchedPokerError("branched model omitted public heads")
+        return MappingProxyType(
+            {
+                **{
+                    name: value.detach().float()
+                    for name, value in evaluation.policy_raw.items()
+                },
+                "value": evaluation.value.detach().float(),
+                "trace": evaluation.public_heads["trace"].detach().float(),
+                "cost": evaluation.public_heads["cost"].detach().float(),
+            }
+        )
+
+    def _model_inference(
         self, forward: PokerForwardInput, _lanes: Tensor
     ) -> Mapping[str, Tensor]:
         if self.mode.training_regime is TrainingRegime.SELF_PLAY:
@@ -1962,21 +2318,9 @@ class _BranchedSampledPokerAttempt:
                     }
                 ),
             )
-        if set(evaluation.public_heads) != {"trace", "cost"}:
-            raise BranchedPokerError("branched model omitted public heads")
-        return MappingProxyType(
-            {
-                **{
-                    name: value.detach().float()
-                    for name, value in evaluation.policy_raw.items()
-                },
-                "value": evaluation.value.detach().float(),
-                "trace": evaluation.public_heads["trace"].detach().float(),
-                "cost": evaluation.public_heads["cost"].detach().float(),
-            }
-        )
+        return self._model_output(evaluation)
 
-    def _bounded_model(
+    def _bounded_mixed_model(
         self, forward: PokerForwardInput, lanes: Tensor
     ) -> Mapping[str, Tensor]:
         """Run auxiliary T/C forwards in admitted family-pack subspans."""
@@ -1984,11 +2328,11 @@ class _BranchedSampledPokerAttempt:
         rows = int(forward.owner.numel())
         cap = self.owners.plan.manifest.family_pack_cap
         if rows <= cap:
-            return self._model(forward, lanes)
+            return self._mixed_model(forward, lanes)
         pieces: dict[str, list[Tensor]] = {}
         for begin in range(0, rows, cap):
             end = min(begin + cap, rows)
-            item = self._model(
+            item = self._mixed_model(
                 PokerForwardInput(
                     forward.input_type,
                     forward.model_input[begin:end],
@@ -2064,7 +2408,7 @@ class _BranchedSampledPokerAttempt:
             mode=self.mode,
             controller=self.controller,
             cost_safeguard=self.cost_safeguard,
-            child_model=self._bounded_model,
+            child_model=self._bounded_mixed_model,
             topology_recorder=recorder,
             policy=self.policy,
         )
@@ -2089,6 +2433,8 @@ class _BranchedSampledPokerAttempt:
         )
         depths = {name: 0 for name in input_names}
         depths["pre"] = roots
+        role_depths = {name: [] for name in input_names}
+        role_depths["pre"] = [True] * roots
         hooks.realized_tree_size = roots
         logical_time = 0
         last_event: torch.cuda.Event | None = None
@@ -2115,6 +2461,33 @@ class _BranchedSampledPokerAttempt:
                 scheduled = scheduler.select(states, allow_partial=True)
                 if scheduled is None:
                     raise BranchedPokerError("branched scheduler lost queued work")
+                scheduled_roles = role_depths[scheduled.input_type]
+                if len(scheduled_roles) != depths[scheduled.input_type]:
+                    raise BranchedPokerError(
+                        "branched role queue differs from family depth"
+                    )
+                scheduled_trained = scheduled_roles[0]
+                homogeneous_rows = 1
+                while (
+                    homogeneous_rows < scheduled.rows
+                    and scheduled_roles[homogeneous_rows] == scheduled_trained
+                ):
+                    homogeneous_rows += 1
+                if homogeneous_rows != scheduled.rows:
+                    scheduled = replace(
+                        scheduled,
+                        rows=homogeneous_rows,
+                        forced_partial=True,
+                    )
+                self._scheduled_model_operation = (
+                    self.model_operation
+                    if scheduled_trained
+                    else self.frozen_operation
+                )
+                if self._scheduled_model_operation is None:
+                    raise BranchedPokerError(
+                        "branched role has no selected model operation"
+                    )
                 if logical_time >= owners.plan.manifest.topology_cap:
                     recorder.release()
                     raise RecoverableOverflow(
@@ -2183,9 +2556,18 @@ class _BranchedSampledPokerAttempt:
                     ) from None
                 hooks.realized_tree_size += int(feedback.sampled_nodes)
                 depths[scheduled.input_type] -= scheduled.rows
+                del role_depths[scheduled.input_type][: scheduled.rows]
                 produced = tuple(int(value) for value in feedback.produced)
-                for name, count in zip(input_names, produced, strict=True):
+                for family_index, (name, count) in enumerate(
+                    zip(input_names, produced, strict=True)
+                ):
                     depths[name] += count
+                    role_depths[name].extend(
+                        bool(value)
+                        for value in feedback.produced_trained[
+                            family_index, :count
+                        ]
+                    )
                 logical_time += 1
                 last_event = commit.event
                 del feedback, publication
@@ -2213,6 +2595,7 @@ class _BranchedSampledPokerAttempt:
                 recorder.release()
                 raise
             depths["pre"] = 1
+            role_depths["pre"].append(True)
         assert last_event is not None
         recorder.materialize_cpu()
         topology, bindings, leaf_count = recorder.seal()
@@ -2276,7 +2659,11 @@ class _BranchedSampledPokerAttempt:
         owners.release_after(ExecutionPhase.COMPLETION)
 
         owners.enter_phase(ExecutionPhase.ALIGN_AND_SEAL)
-        decision_mass = decision_path_mass(topology.parent, topology.executed_degree)
+        decision_log_mass = decision_log_path_mass(
+            topology.parent,
+            topology.executed_degree,
+            device=owners.plan.device,
+        )
         sealed: dict[str, SealedBranchedInputs] = {}
         for input_index, name in enumerate(input_names):
             selected = (
@@ -2293,9 +2680,10 @@ class _BranchedSampledPokerAttempt:
                 action_begin=topology.action_begin[selected].to(device),
                 action_count=topology.target_degree[selected].to(device),
                 target_degree=topology.target_degree[selected].to(device),
-                log_sampling_weight=decision_mass[selected]
-                .log()
-                .to(device=device, dtype=torch.float32),
+                log_sampling_weight=decision_log_mass.index_select(
+                    0,
+                    selected.to(device=device, dtype=torch.int64),
+                ),
             )
         owners.release_after(ExecutionPhase.ALIGN_AND_SEAL)
 
@@ -2339,13 +2727,106 @@ class _BranchedSampledPokerAttempt:
             for name, value in sealed.items()
             if value.rows
         }
+        allocation_inputs = self.allocation_inputs
+        if allocation_inputs is None and self.schedule.gradient_steps is not None:
+            names = tuple(stores)
+            preflop = getattr(self.model, "preflop", None)
+            model_config = getattr(preflop, "cfg", None)
+            if model_config is not None:
+                token_bounds = max_policy_partition_sequence_tokens(
+                    n_players=self.geometry.players,
+                    stack_bb=self.geometry.stack_bb,
+                    rank_count=self.geometry.rank_count,
+                    k_act=model_config.k_act,
+                )
+                allocation_inputs = (
+                    torch.tensor(
+                        [float(stores[name].rows) for name in names],
+                        dtype=torch.float64,
+                    ),
+                    torch.ones(len(names), dtype=torch.float64),
+                    torch.tensor(
+                        [
+                            float(token_bounds[name] * token_bounds[name])
+                            for name in names
+                        ],
+                        dtype=torch.float64,
+                    ),
+                    self.schedule.batch_size,
+                )
+        statistical_counts = None
+        if allocation_inputs is not None:
+            counts = allocate_statistical_counts(
+                allocation_inputs[0],
+                allocation_inputs[1],
+                allocation_inputs[2],
+                allocation_inputs[3],
+            )
+            statistical_counts = {
+                name: int(counts[index])
+                for index, name in enumerate(stores)
+            }
         sampler = BranchedBatchSampler(
             stores,
             self.schedule,
             generator=self.generator,
             sigma_pack_cap=owners.plan.manifest.learner_sigma_pack_cap,
             action_pack_cap=owners.plan.manifest.learner_action_pack_cap,
+            statistical_counts=statistical_counts,
         )
+        reference_caches: dict[str, ReferenceOutputCache] | None = None
+        if self.cache_reference_outputs and self.reference_operation is not None:
+            admitted: dict[str, ReferenceOutputCache] = {}
+            resident = 0
+            budget = owners.plan.layout.reference_cache_bytes
+            autocast_dtype = {
+                "fp32": torch.float32,
+                "fp16": torch.float16,
+                "bf16": torch.bfloat16,
+            }[self.precision]
+            for name, store in stores.items():
+                columns = store.sealed_inputs.columns
+                with torch.no_grad(), torch.autocast(
+                    device_type="cuda",
+                    dtype=autocast_dtype,
+                    enabled=self.precision != "fp32",
+                ):
+                    evaluation = self.reference_operation(
+                        name,
+                        columns["model_input"],
+                        columns["sampled_private_state"],
+                        columns["owner"],
+                    )
+                batch_calls = max(
+                    1,
+                    (
+                        sampler.statistical_counts[name]
+                        + self.schedule.batch_size
+                        - 1
+                    )
+                    // self.schedule.batch_size,
+                )
+                build_bytes = sum(
+                    value.numel() * value.element_size()
+                    for value in evaluation.policy_raw.values()
+                )
+                candidate = ReferenceOutputCache.admit(
+                    evaluation.policy_raw,
+                    byte_budget=budget,
+                    resident_bytes=resident,
+                    build_bytes=build_bytes,
+                    predicted_saved_seconds=float(max(0, batch_calls - 1)),
+                    predicted_build_seconds=0.5,
+                )
+                if candidate is None:
+                    for cache in admitted.values():
+                        cache.release()
+                    admitted = {}
+                    break
+                admitted[name] = candidate
+                resident += candidate.allocated_bytes
+            if admitted:
+                reference_caches = admitted
         learner = LearnerOperation(
             self.mode,
             self.loss,
@@ -2363,8 +2844,16 @@ class _BranchedSampledPokerAttempt:
         ).optimize(
             sampler,
             iteration=iteration,
-            reference_operation=self.reference_operation,
+            reference_operation=(
+                None
+                if reference_caches is not None
+                else self.reference_operation
+            ),
+            reference_caches=reference_caches,
         )
+        if reference_caches is not None:
+            for cache in reference_caches.values():
+                cache.release()
         owners.release_after(ExecutionPhase.LEARNER)
         owners.enter_phase(ExecutionPhase.FINAL_BACKWARD)
         owners.release_after(ExecutionPhase.FINAL_BACKWARD)
@@ -2439,6 +2928,12 @@ class BranchedSampledPokerIteration:
         self.plan = plan
         self.controller = controller
         self.run_state = run_state
+        if controller.beta_max != plan.manifest.beta_max:
+            raise ValueError(
+                "branch controller beta_max differs from the storage manifest"
+            )
+        if not 0 < run_state.root_count <= plan.manifest.root_count:
+            raise ValueError("branched root count is outside the storage plan")
         if "rank_boundary" in arguments:
             raise ValueError("rank agreement is owned by the iteration")
         self.arguments = MappingProxyType(dict(arguments))
@@ -2507,4 +3002,6 @@ __all__ = [
     "BranchedSampledPokerHooks",
     "BranchedSampledPokerIteration",
     "BranchedTopologyRecorder",
+    "sampled_branched_chance_frontier_row_bytes",
+    "sampled_branched_topology_packet_row_bytes",
 ]

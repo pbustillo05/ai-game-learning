@@ -21,6 +21,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 from pbg.queued.contracts import ModeSchema, RolloutMode
+from pbg.queued.cuda_branching import branching_cuda
 from pbg.queued.persistence import RunState
 from pbg.queued.rollout import DrawPurpose, logical_rng_keys, logical_uniform
 from pbg.queued.training import AttemptAddress, RecoverableOverflow, TrainingError
@@ -112,8 +113,13 @@ def child_path_factors(
     )
 
 
-def decision_path_mass(parent: Tensor, executed_degree: Tensor) -> Tensor:
-    """Recompute final decision masses after protected root augmentation."""
+def decision_log_path_mass(
+    parent: Tensor,
+    executed_degree: Tensor,
+    *,
+    device: torch.device,
+) -> Tensor:
+    """Recompute final log decision masses on CUDA after root augmentation."""
 
     if (
         parent.device.type != "cpu"
@@ -124,17 +130,21 @@ def decision_path_mass(parent: Tensor, executed_degree: Tensor) -> Tensor:
         or parent.shape != executed_degree.shape
     ):
         raise ValueError("topology mass inputs must be aligned CPU integers")
-    mass = torch.ones(parent.numel(), dtype=torch.float64)
-    for node in range(parent.numel()):
-        ancestor = int(parent[node])
-        if ancestor >= node:
-            raise BranchingError("topology mass order must place every parent first")
-        if ancestor >= 0:
-            degree = int(executed_degree[ancestor])
-            if degree <= 0:
-                raise BranchingError("topology mass encountered zero degree")
-            mass[node] = mass[ancestor] / degree
-    return mass
+    if device.type != "cuda":
+        raise ValueError("decision log mass requires a CUDA destination")
+    parent_device = parent.to(device=device, dtype=torch.int32)
+    degree_device = executed_degree.to(device=device, dtype=torch.int32)
+    failure = torch.zeros(1, dtype=torch.int32, device=device)
+    result = branching_cuda().decision_log_mass(
+        parent_device,
+        degree_device,
+        failure,
+    )
+    torch._assert_async(
+        failure.eq(0).all(),
+        "decision log mass encountered invalid topology",
+    )
+    return result
 
 
 @dataclass(frozen=True)
@@ -213,7 +223,7 @@ class FixedBranchController:
     """Stage-fixed intensities using the shared controller operation."""
 
     fixed_beta: Mapping[str, float]
-    beta_max: float
+    beta_max: int
     scale: float = 1.0
     minimum_scale: float = 0.25
     backoff_factor: float = 0.5
@@ -222,6 +232,12 @@ class FixedBranchController:
     emergency_backoffs: int = 0
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.beta_max, bool)
+            or not isinstance(self.beta_max, int)
+            or self.beta_max <= 0
+        ):
+            raise ValueError("beta_max must be a positive integer")
         values = dict(self.fixed_beta)
         if not values or any(
             not isinstance(name, str)
@@ -355,7 +371,7 @@ class KKTBranchController:
     """Warmup-fixed then trace/cost KKT branching through the same interface."""
 
     fixed_beta: Mapping[str, float]
-    beta_max: float
+    beta_max: int
     warmup_iterations: int
     target_tree_size: float
     gamma_kappa: float
@@ -374,6 +390,12 @@ class KKTBranchController:
     mode: RolloutMode = RolloutMode.BRANCHED_KKT
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.beta_max, bool)
+            or not isinstance(self.beta_max, int)
+            or self.beta_max <= 0
+        ):
+            raise ValueError("beta_max must be a positive integer")
         self.fixed_beta = MappingProxyType(
             {name: float(value) for name, value in dict(self.fixed_beta).items()}
         )
@@ -925,7 +947,7 @@ __all__ = [
     "RankCommonFailureAgreement",
     "child_path_factors",
     "controller_from_state_dict",
-    "decision_path_mass",
+    "decision_log_path_mass",
     "log_kkt_intensity",
     "randomized_round",
 ]

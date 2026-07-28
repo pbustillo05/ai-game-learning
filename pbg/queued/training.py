@@ -365,6 +365,7 @@ class BranchedSampledIteration:
         *,
         iteration: int,
         reference_operation=None,
+        reference_caches: Mapping[str, ReferenceOutputCache] | None = None,
     ) -> IterationResult:
         metric_names = (
             "total",
@@ -407,6 +408,11 @@ class BranchedSampledIteration:
                 batch,
                 iteration=iteration,
                 reference_operation=reference_operation,
+                reference_cache=(
+                    None
+                    if reference_caches is None
+                    else reference_caches[batch.input_type]
+                ),
                 loss_scale=self.optimizer.scaler.scale,
                 objective_weight=weight,
             )
@@ -489,10 +495,9 @@ def convert_value_head_units(
     selected = tuple(
         name
         for name in result
-        if (name.startswith("preflop.") or name.startswith("postflop."))
-        and (
-            name.endswith("value_head.affine.weight")
-            or name.endswith("value_head.affine.bias")
+        if name.startswith(("preflop.", "postflop."))
+        and name.endswith(
+            ("value_head.affine.weight", "value_head.affine.bias")
         )
     )
     if len(selected) != 4:

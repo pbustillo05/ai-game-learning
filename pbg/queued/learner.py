@@ -1078,18 +1078,17 @@ class BranchedBatchSampler:
         devices = {store.device for store in stores.values()}
         if len(devices) != 1 or generator.device != next(iter(devices)):
             raise LearnerError("branched sampler must remain on one CUDA device")
-        log_weights = {
-            name: store.sealed_inputs.columns[
+        log_z: dict[str, Tensor] = {}
+        alias_tables: dict[str, tuple[Tensor, Tensor]] = {}
+        for name, store in stores.items():
+            log_weight = store.sealed_inputs.columns[
                 "log_sampling_weight"
             ].double()
-            for name, store in stores.items()
-        }
-        self.log_Z = MappingProxyType(
-            {name: torch.logsumexp(value, 0) for name, value in log_weights.items()}
-        )
-        self.alias = MappingProxyType(
-            {name: _alias_table(value) for name, value in log_weights.items()}
-        )
+            log_z[name] = torch.logsumexp(log_weight, 0)
+            alias_tables[name] = _alias_table(log_weight)
+            del log_weight
+        self.log_Z = MappingProxyType(log_z)
+        self.alias = MappingProxyType(alias_tables)
         log_mass = torch.stack(tuple(self.log_Z.values()))
         mass = torch.softmax(log_mass, 0)
         self.stratum_probability = MappingProxyType(
@@ -1346,6 +1345,7 @@ class LearnerOperation:
                 batch,
                 iteration=iteration,
                 reference_operation=reference_operation,
+                reference_cache=reference_cache,
                 loss_scale=loss_scale,
                 objective_weight=objective_weight,
             )
@@ -1560,6 +1560,7 @@ class LearnerOperation:
         *,
         iteration: int,
         reference_operation: ModelOperation | None,
+        reference_cache: ReferenceOutputCache | None,
         loss_scale: float,
         objective_weight: float | Tensor,
     ) -> LossResult:
@@ -1617,7 +1618,22 @@ class LearnerOperation:
             )
             repeated_owner = sigma["owner"].index_select(0, action_to_sigma)
             reference = None
-            if reference_operation is not None:
+            if reference_cache is not None:
+                if reference_operation is not None:
+                    raise LearnerError(
+                        "reference cache and operation are mutually exclusive"
+                    )
+                reference = {
+                    name: _select_sampled_private(
+                        value,
+                        sigma["sampled_private_state"],
+                        sigma["owner"],
+                    ).index_select(0, action_to_sigma)
+                    for name, value in reference_cache.gather(
+                        batch.sigma_index
+                    ).items()
+                }
+            elif reference_operation is not None:
                 reference_evaluation = reference_operation(
                     batch.input_type,
                     sigma["model_input"],

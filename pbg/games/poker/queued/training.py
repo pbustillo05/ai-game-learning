@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Mapping
 
 import torch
 from torch import Tensor, nn
@@ -21,7 +21,6 @@ from pbg.games.poker.queued.hooks import (
     RBCompletionBinding,
     SampledShowdownBinding,
     SequentialPokerHooks,
-    SequentialSampledPokerHooks,
 )
 from pbg.games.poker.queued.policy import PokerPolicyOperator
 from pbg.games.poker.queued.response import (
@@ -752,9 +751,7 @@ class SequentialPokerIteration:
         if self.cache_reference_outputs and self.reference_operation is not None:
             admitted: dict[str, ReferenceOutputCache] = {}
             resident = 0
-            budget = owners.plan.admission(
-                ExecutionPhase.LEARNER
-            ).bounded_workspace_bytes
+            budget = owners.plan.layout.reference_cache_bytes
             for name, store in stores.items():
                 columns = store.sealed_inputs.columns
                 with torch.no_grad():
@@ -1202,7 +1199,7 @@ class Phase5TrainingSession:
         preemption: PreemptionNotice | None = None,
         preemption_checkpoint: str | Path | None = None,
         allocation_inputs: tuple[Tensor, Tensor, Tensor, int] | None = None,
-    ) -> "Phase5TrainingSession":
+    ) -> Phase5TrainingSession:
         reference_model.load_state_dict(model.state_dict(), strict=True)
         scaler = LossScaler(enabled=config.precision.name == "fp16")
         return cls(
@@ -1248,7 +1245,7 @@ class Phase5TrainingSession:
         preemption: PreemptionNotice | None = None,
         preemption_checkpoint: str | Path | None = None,
         allocation_inputs: tuple[Tensor, Tensor, Tensor, int] | None = None,
-    ) -> "Phase5TrainingSession":
+    ) -> Phase5TrainingSession:
         optimizer = DenseAdam(
             model,
             config.optimizer,
@@ -1348,7 +1345,7 @@ __all__ = [
     "PokerIterationError",
     "PokerIterationResult",
     "RecoveringSequentialSampledPokerIteration",
-    "SequentialSampledPokerIteration",
     "SequentialPokerIteration",
+    "SequentialSampledPokerIteration",
     "SequentialSharedResponseProbe",
 ]
