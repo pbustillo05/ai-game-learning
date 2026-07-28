@@ -17,6 +17,7 @@ from torch import Tensor
 
 from pbg.games.poker.model.capacity import max_public_history_tokens
 from pbg.games.poker.model.primitives import accelerator_assert
+from pbg.games.poker.queued.evaluator import bound_evaluator
 from pbg.games.poker.queued.policy import (
     CHECK_CALL,
     FOLD,
@@ -2035,21 +2036,7 @@ class SampledShowdownBinding:
         pack_cap: int,
         utility: str = "raw_bb",
     ) -> None:
-        try:
-            import poker_gpu_evaluator as poker
-        except ImportError as exc:
-            raise QueuedPokerError("poker-gpu-evaluator is required") from exc
-        if str(getattr(poker, "CONTRACT_VERSION", "")) != "2":
-            raise QueuedPokerError("poker evaluator contract v2 is required")
-        self.evaluator = poker.bind(rank_count=geometry.rank_count)
-        info = self.evaluator.info
-        if (
-            str(info.contract_version) != "2"
-            or int(info.rank_count) != geometry.rank_count
-        ):
-            raise QueuedPokerError(
-                "bound evaluator identity differs from NLHE geometry"
-            )
+        self.evaluator = bound_evaluator(geometry.rank_count)
         if layer_work.schema.name != "LayerWork.all":
             raise QueuedPokerError("sampled showdown requires LayerWork.all")
         self.geometry = geometry
@@ -2190,13 +2177,7 @@ class RBCompletionBinding:
             raise TypeError("RB completion requires the target algebra")
         if isinstance(n_samples, bool) or n_samples <= 0:
             raise ValueError("completion samples must be positive")
-        try:
-            import poker_gpu_evaluator as poker
-        except ImportError as exc:
-            raise QueuedPokerError("poker-gpu-evaluator is required") from exc
-        if str(getattr(poker, "CONTRACT_VERSION", "")) != "2":
-            raise QueuedPokerError("poker evaluator contract v2 is required")
-        self.evaluator = poker.bind(rank_count=geometry.rank_count)
+        self.evaluator = bound_evaluator(geometry.rank_count)
         self.geometry = geometry
         self.layer_work = MappingProxyType(dict(layer_work))
         self.algebra = algebra

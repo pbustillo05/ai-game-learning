@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Literal
 
 import torch
 from torch import Tensor
@@ -19,9 +20,9 @@ from pbg.games.poker.queued import (
     PokerStateMachine,
     build_model_from_config,
 )
+from pbg.games.poker.queued.evaluator import bound_evaluator
 from pbg.games.poker.queued.hooks import FOLDED, LIVE, PAD_CARD, RAISE_OFFSET
 from pbg.inference_artifact import load_inference_source
-
 
 _RANKS = "23456789TJQKA"
 _SUITS = "cdhs"
@@ -495,9 +496,7 @@ class PokerInferenceSession:
             return result[0]
         if bool(state.board_cards[0].eq(PAD_CARD).any()):
             raise RuntimeError("showdown terminal omitted a complete board")
-        import poker_gpu_evaluator as poker
-
-        evaluator = poker.bind(rank_count=self.geometry.rank_count)
+        evaluator = bound_evaluator(self.geometry.rank_count)
         combo_ids = torch.where(
             contenders[None],
             state.combo_ids,

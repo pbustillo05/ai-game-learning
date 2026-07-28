@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from functools import cache
 from types import MappingProxyType
 from typing import Protocol
 
@@ -36,6 +37,32 @@ from pbg.queued.topology import (
     TopologyError,
     TopologyPacket,
 )
+
+
+@cache
+def _device_streams(
+    device_index: int,
+) -> tuple[torch.cuda.Stream, torch.cuda.Stream, torch.cuda.Stream]:
+    """Own one process-lifetime rollout stream set per CUDA device.
+
+    cuBLAS retains an allocator-visible workspace for every stream handle it
+    observes. Recreating these streams per iteration would therefore retain a
+    new workspace after the Python rollout owners are released.
+    """
+
+    device = torch.device("cuda", device_index)
+    return (
+        torch.cuda.Stream(device=device),
+        torch.cuda.Stream(device=device),
+        torch.cuda.Stream(device=device),
+    )
+
+
+def _runtime_streams(
+    device: torch.device,
+) -> tuple[torch.cuda.Stream, torch.cuda.Stream, torch.cuda.Stream]:
+    index = torch.cuda.current_device() if device.index is None else device.index
+    return _device_streams(index)
 
 
 class RolloutError(RuntimeError):
@@ -1366,7 +1393,7 @@ class AsyncTopologyPublisher:
             )
             for _ in range(self.max_inflight_deferred)
         )
-        self._accept_stream = torch.cuda.Stream(device=owners.device)
+        self._accept_stream = _runtime_streams(owners.device)[2]
         self._deferred_buffer = torch.empty(
             (owners.topology_cap, 14),
             dtype=torch.int64,
@@ -2405,12 +2432,12 @@ class RolloutTransaction:
         if len(self.lane_schemas) != self.n_replica:
             raise ValueError("rollout needs one semantic schema per replica lane")
         self.model_stream = (
-            torch.cuda.Stream(device=self.device)
+            _runtime_streams(self.device)[0]
             if model_stream is None
             else model_stream
         )
         self.commit_stream = (
-            torch.cuda.Stream(device=self.device)
+            _runtime_streams(self.device)[1]
             if commit_stream is None
             else commit_stream
         )

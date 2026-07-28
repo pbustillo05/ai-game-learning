@@ -1,33 +1,40 @@
 from __future__ import annotations
 
 import copy
+import gc
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 import yaml
 
+from pbg.benchmark import benchmark_training
 from pbg.config import ConfigError, load_config, load_config_mapping
 from pbg.devices import resolve_execution_device, validate_workload_capabilities
+from pbg.eval.br_probe import _play_one, evaluate_br_probe
+from pbg.games.poker.queued.evaluator import bound_evaluator
 from pbg.inference_artifact import (
     INFERENCE_ARTIFACT_SCHEMA_VERSION,
     convert_legacy_inference_artifact,
     export_inference_artifact,
     load_inference_source,
 )
-from pbg.eval.br_probe import _play_one, evaluate_br_probe
+from pbg.queued import model_state_sha256, sha256_file
 from pbg.queued.persistence import (
     CHECKPOINT_SCHEMA,
     load_distributed_checkpoint_manifest,
     save_distributed_checkpoint_manifest,
 )
-from pbg.queued import model_state_sha256, sha256_file
-from pbg.queued.static_gates import local_import_graph, reachable_modules
-from pbg.queued.static_gates import migrated_similarity_violations
+from pbg.queued.static_gates import (
+    local_import_graph,
+    migrated_similarity_violations,
+    reachable_modules,
+)
 from pbg.runtime import TrainingSession
 from pbg.variance import estimate_update_variance
-
 
 ROOT = Path(__file__).parents[1]
 CONFIG = ROOT / "configs/train/nlhe_hu_8bb_normal_queued_smoke.yaml"
@@ -421,3 +428,44 @@ def test_paired_br_chance_address_is_independent_of_action_path() -> None:
     ) == 0.0
     assert target.deal_addresses == [0]
     assert probe.deal_addresses == [0]
+
+
+def test_evaluator_binding_has_one_process_owner_per_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    def bind(*, rank_count: int) -> object:
+        calls.append(rank_count)
+        return SimpleNamespace(
+            info=SimpleNamespace(
+                contract_version="2",
+                rank_count=rank_count,
+            )
+        )
+
+    fake = SimpleNamespace(CONTRACT_VERSION="2", bind=bind)
+    bound_evaluator.cache_clear()
+    monkeypatch.setitem(sys.modules, "poker_gpu_evaluator", fake)
+    try:
+        first = bound_evaluator(4)
+        assert bound_evaluator(4) is first
+        assert bound_evaluator(5) is not first
+        assert calls == [4, 5]
+    finally:
+        bound_evaluator.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_benchmark_reuses_process_workspaces_across_repeats(
+    tmp_path: Path,
+) -> None:
+    raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    raw["execution"]["output_dir"] = str(tmp_path / "benchmark")
+    cfg = load_config_mapping(raw)
+    report = benchmark_training(cfg, warmup=1, repeats=3)
+    peaks = [sample["peak_allocated_bytes"] for sample in report["samples"]]
+    del report
+    gc.collect()
+    torch.cuda.synchronize()
+    assert peaks == [peaks[0]] * 3
