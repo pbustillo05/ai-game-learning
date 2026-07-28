@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
 import math
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
 from types import MappingProxyType
-from typing import Mapping, TypeVar
+from typing import TypeVar
 
 from pbg.queued.learner import LearnerSchedule, LossConfig
 from pbg.queued.optimization import OptimizerConfig
-
 
 T = TypeVar("T")
 
@@ -46,9 +46,7 @@ def _closed(
         return cls(**translated)
     except (TypeError, ValueError) as exc:
         message = str(exc)
-        field = next(
-            (name for name in allowed if name in message), "configuration"
-        )
+        field = next((name for name in allowed if name in message), "configuration")
         raise ValueError(f"{path}.{field}: {message}") from exc
 
 
@@ -204,9 +202,7 @@ class Phase5Config:
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
             raise TypeError("seed must be an integer")
         if self.reproducibility not in ("strict", "seeded", "throughput"):
-            raise ValueError(
-                "reproducibility must be strict, seeded, or throughput"
-            )
+            raise ValueError("reproducibility must be strict, seeded, or throughput")
         if self.utility not in ("raw_bb", "stack_normalized"):
             raise ValueError("utility must be raw_bb or stack_normalized")
         if not math.isfinite(self.lambda_) or not 0 <= self.lambda_ <= 1:
@@ -217,7 +213,7 @@ class Phase5Config:
             raise ValueError("folder_beta_rank exceeds the compact deck")
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, object]) -> "Phase5Config":
+    def from_mapping(cls, value: Mapping[str, object]) -> Phase5Config:
         source = dict(_mapping(value, "root"))
         allowed = {
             "mode",
@@ -277,18 +273,10 @@ class Phase5Config:
             game=_closed(Phase5GameConfig, source["game"], "root.game"),
             model=_closed(Phase5ModelConfig, source["model"], "root.model"),
             loss=_closed(LossConfig, source["loss"], "root.loss"),
-            optimizer=_closed(
-                OptimizerConfig, source["optimizer"], "root.optimizer"
-            ),
-            schedule=_closed(
-                LearnerSchedule, source["schedule"], "root.schedule"
-            ),
-            precision=_closed(
-                Phase5Precision, source["precision"], "root.precision"
-            ),
-            reference=_closed(
-                ReferenceConfig, source["reference"], "root.reference"
-            ),
+            optimizer=_closed(OptimizerConfig, source["optimizer"], "root.optimizer"),
+            schedule=_closed(LearnerSchedule, source["schedule"], "root.schedule"),
+            precision=_closed(Phase5Precision, source["precision"], "root.precision"),
+            reference=_closed(ReferenceConfig, source["reference"], "root.reference"),
             lambda_=source["lambda"],
             root_count=source["root_count"],
             root_count_minimum=source["root_count_minimum"],
@@ -299,10 +287,7 @@ class Phase5Config:
 
     def scientific_mapping(self) -> dict[str, object]:
         def values(item: object) -> dict[str, object]:
-            return {
-                field.name: getattr(item, field.name)
-                for field in fields(item)
-            }
+            return {field.name: getattr(item, field.name) for field in fields(item)}
 
         return {
             "mode": {
@@ -335,9 +320,7 @@ class SequentialModeConfig:
     applicable: Mapping[str, object]
 
     @classmethod
-    def from_mapping(
-        cls, value: Mapping[str, object]
-    ) -> "SequentialModeConfig":
+    def from_mapping(cls, value: Mapping[str, object]) -> SequentialModeConfig:
         source = dict(_mapping(value, "root"))
         mode = dict(_mapping(source.get("mode"), "root.mode"))
         allowed_mode = {
@@ -369,9 +352,7 @@ class SequentialModeConfig:
         common = Phase5Config.from_mapping(base_source)
         applicable: dict[str, object] = {}
         if rb:
-            completion = dict(
-                _mapping(source.get("completion"), "root.completion")
-            )
+            completion = dict(_mapping(source.get("completion"), "root.completion"))
             if set(completion) != {"n_samples", "strata"}:
                 raise ValueError(
                     "root.completion: RB requires exactly n_samples and strata"
@@ -386,15 +367,9 @@ class SequentialModeConfig:
         elif "completion" in source:
             raise ValueError("root.completion: inapplicable to sampled mode")
         if response:
-            frozen = dict(
-                _mapping(source.get("frozen_profile"), "root.frozen_profile")
-            )
-            if set(frozen) != {"sha256"} or not _is_sha256(
-                frozen["sha256"]
-            ):
-                raise ValueError(
-                    "root.frozen_profile.sha256: content hash is required"
-                )
+            frozen = dict(_mapping(source.get("frozen_profile"), "root.frozen_profile"))
+            if set(frozen) != {"sha256"} or not _is_sha256(frozen["sha256"]):
+                raise ValueError("root.frozen_profile.sha256: content hash is required")
             initialization = source.get("response_initialization")
             if initialization not in ("random", "target"):
                 raise ValueError(
@@ -444,7 +419,173 @@ class SequentialModeConfig:
         return result
 
 
+@dataclass(frozen=True)
+class BranchedModeConfig:
+    """Closed Phase 7 scientific configuration for sampled branched modes."""
+
+    mode: Mapping[str, str]
+    common: Phase5Config
+    branching: Mapping[str, object]
+    cost_safeguard: Mapping[str, object]
+    applicable: Mapping[str, object]
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> BranchedModeConfig:
+        source = dict(_mapping(value, "root"))
+        mode = dict(_mapping(source.get("mode"), "root.mode"))
+        if set(mode) != {
+            "training_regime",
+            "rollout_mode",
+            "private_estimator",
+        }:
+            raise ValueError("root.mode: branched mode axes are incomplete")
+        if mode["training_regime"] not in ("self_play", "best_response"):
+            raise ValueError("root.mode.training_regime: invalid branched axis")
+        if mode["rollout_mode"] not in ("branched.fixed", "branched.KKT"):
+            raise ValueError("root.mode.rollout_mode: invalid branched axis")
+        if mode["private_estimator"] != "sampled":
+            raise ValueError("root.mode.private_estimator: Phase 7 requires sampled")
+        extensions = {
+            "branching",
+            "cost_safeguard",
+            "frozen_profile",
+            "response_initialization",
+        }
+        base_source = {
+            key: item for key, item in source.items() if key not in extensions
+        }
+        base_source["mode"] = {
+            "training_regime": "self_play",
+            "rollout_mode": "sequential",
+            "private_estimator": "sampled",
+        }
+        common = Phase5Config.from_mapping(base_source)
+        branching = dict(_mapping(source.get("branching"), "root.branching"))
+        shared = {
+            "fixed_beta",
+            "beta_max",
+            "minimum_tree_size",
+            "backoff_factor",
+            "safe_tree_size",
+        }
+        adaptive = {
+            "warmup_iterations",
+            "target_tree_size",
+            "gamma_kappa",
+            "eta_kappa",
+            "kappa_min",
+            "kappa_max",
+            "log_kappa",
+        }
+        expected = (
+            shared | {"minimum_scale"}
+            if mode["rollout_mode"] == "branched.fixed"
+            else shared | adaptive
+        )
+        if set(branching) != expected:
+            unknown = sorted(set(branching).difference(expected))
+            missing = sorted(expected.difference(branching))
+            name = unknown[0] if unknown else missing[0]
+            detail = "unknown" if unknown else "missing"
+            raise ValueError(f"root.branching.{name}: {detail} field")
+        fixed_beta = dict(
+            _mapping(branching["fixed_beta"], "root.branching.fixed_beta")
+        )
+        if set(fixed_beta) != {"player", "chance"}:
+            raise ValueError(
+                "root.branching.fixed_beta: player and chance are required"
+            )
+        numeric = {
+            name: item
+            for name, item in branching.items()
+            if name not in ("fixed_beta", "minimum_tree_size")
+        }
+        numeric.update(fixed_beta)
+        if any(
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(item)
+            for item in numeric.values()
+        ):
+            raise ValueError("root.branching: numeric controller values must be finite")
+        if (
+            isinstance(branching["minimum_tree_size"], bool)
+            or not isinstance(branching["minimum_tree_size"], int)
+            or branching["minimum_tree_size"] <= 0
+            or branching["beta_max"] < 1
+            or any(
+                not 1 <= fixed_beta[name] <= branching["beta_max"]
+                for name in fixed_beta
+            )
+            or (
+                "minimum_scale" in branching
+                and not 0 < branching["minimum_scale"] <= 1
+            )
+            or not 0 < branching["backoff_factor"] < 1
+            or branching["safe_tree_size"] < 1
+        ):
+            raise ValueError("root.branching: controller bounds are invalid")
+        safeguard = dict(_mapping(source.get("cost_safeguard"), "root.cost_safeguard"))
+        if set(safeguard) != {
+            "gamma_deviance_max",
+            "p95_underprediction_max",
+            "consecutive_iterations",
+        }:
+            raise ValueError("root.cost_safeguard: calibration fields are incomplete")
+        if (
+            not isinstance(safeguard["consecutive_iterations"], int)
+            or isinstance(safeguard["consecutive_iterations"], bool)
+            or safeguard["consecutive_iterations"] <= 0
+            or safeguard["gamma_deviance_max"] < 0
+            or safeguard["p95_underprediction_max"] < 1
+        ):
+            raise ValueError("root.cost_safeguard: calibration bounds are invalid")
+        applicable: dict[str, object] = {}
+        response = mode["training_regime"] == "best_response"
+        if response:
+            frozen = dict(_mapping(source.get("frozen_profile"), "root.frozen_profile"))
+            if set(frozen) != {"sha256"} or not _is_sha256(frozen["sha256"]):
+                raise ValueError("root.frozen_profile.sha256: content hash is required")
+            initialization = source.get("response_initialization")
+            if initialization not in ("random", "target"):
+                raise ValueError(
+                    "root.response_initialization: expected random or target"
+                )
+            applicable["frozen_profile"] = frozen
+            applicable["response_initialization"] = initialization
+        elif any(
+            name in source for name in ("frozen_profile", "response_initialization")
+        ):
+            raise ValueError(
+                "root.frozen_profile: response fields require best_response"
+            )
+        return cls(
+            MappingProxyType(mode),
+            common,
+            MappingProxyType({**branching, "fixed_beta": MappingProxyType(fixed_beta)}),
+            MappingProxyType(safeguard),
+            MappingProxyType(applicable),
+        )
+
+    def scientific_mapping(self) -> dict[str, object]:
+        result = self.common.scientific_mapping()
+        result["mode"] = dict(self.mode)
+        result["branching"] = {
+            name: dict(value) if isinstance(value, Mapping) else value
+            for name, value in self.branching.items()
+        }
+        result["cost_safeguard"] = dict(self.cost_safeguard)
+        result.update(
+            {
+                name: dict(value) if isinstance(value, Mapping) else value
+                for name, value in self.applicable.items()
+            }
+        )
+        return result
+
+
 __all__ = [
+    "BranchedModeConfig",
     "Phase5Config",
     "Phase5GameConfig",
     "Phase5ModelConfig",

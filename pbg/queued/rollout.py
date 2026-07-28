@@ -2244,11 +2244,21 @@ class RolloutTransaction:
             declared_inputs = frozenset(
                 item.name for item in source.partitions.inputs
             )
+            declared_destinations = declared_inputs | frozenset(
+                item.name for item in source.partitions.outputs
+            )
             for request in plan.destinations:
                 self.owners.require(request.slab)
-                if request.input_type not in declared_inputs:
+                if request.input_type not in declared_destinations:
                     raise RolloutError(
-                        "destination names an undeclared input family"
+                        "destination names an undeclared partition"
+                    )
+                if (
+                    request.slab.schema.name.startswith("FamilyWork.")
+                    and request.input_type not in declared_inputs
+                ):
+                    raise RolloutError(
+                        "family destination names a non-input partition"
                     )
             for queue in plan.published_queues:
                 self.owners.require(queue.family)

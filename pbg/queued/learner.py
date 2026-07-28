@@ -9,20 +9,20 @@ backward.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Iterator, Mapping, Protocol
+from typing import Protocol
 
 import torch
-from torch import Tensor, nn
+from torch import Tensor
 
 from pbg.queued.capacity import GeneratedOwners
 from pbg.queued.contracts import (
     ModeSchema,
     PrivateEstimator,
     RolloutMode,
-    TrainingRegime,
 )
 from pbg.queued.storage import (
     DeviceDestinationRequest,
@@ -105,7 +105,7 @@ class ReferenceOutputCache:
         build_bytes: int,
         predicted_saved_seconds: float,
         predicted_build_seconds: float,
-    ) -> "ReferenceOutputCache | None":
+    ) -> ReferenceOutputCache | None:
         if min(byte_budget, resident_bytes, build_bytes) < 0:
             raise ValueError("reference cache byte values must be nonnegative")
         if (
@@ -153,6 +153,9 @@ class LossConfig:
     value_loss: str = "mse"
     entropy_schedule: str = "constant"
     entropy_decay_iterations: int | None = None
+    trace_coefficient: float = 0.0
+    cost_coefficient: float = 0.0
+    trace_epsilon: float = 1.0e-6
 
     def __post_init__(self) -> None:
         finite = (
@@ -161,15 +164,20 @@ class LossConfig:
             self.value_coefficient,
             self.entropy_coefficient,
             self.reference_kl_coefficient,
+            self.trace_coefficient,
+            self.cost_coefficient,
+            self.trace_epsilon,
         )
         if any(not math.isfinite(value) or value < 0 for value in finite):
-            raise ValueError("loss coefficients and clips must be finite and nonnegative")
+            raise ValueError(
+                "loss coefficients and clips must be finite and nonnegative"
+            )
         if self.value_loss not in ("mse", "clipped"):
             raise ValueError("value_loss must be 'mse' or 'clipped'")
+        if self.trace_epsilon <= 0:
+            raise ValueError("trace_epsilon must be positive")
         if self.entropy_schedule not in ("constant", "linear_decay"):
-            raise ValueError(
-                "entropy_schedule must be 'constant' or 'linear_decay'"
-            )
+            raise ValueError("entropy_schedule must be 'constant' or 'linear_decay'")
         if self.entropy_schedule == "linear_decay" and (
             isinstance(self.entropy_decay_iterations, bool)
             or not isinstance(self.entropy_decay_iterations, int)
@@ -185,9 +193,7 @@ class LossConfig:
         if self.entropy_schedule == "constant":
             return self.entropy_coefficient
         assert self.entropy_decay_iterations is not None
-        fraction = max(
-            0.0, 1.0 - float(iteration) / self.entropy_decay_iterations
-        )
+        fraction = max(0.0, 1.0 - float(iteration) / self.entropy_decay_iterations)
         return self.entropy_coefficient * fraction
 
 
@@ -226,6 +232,9 @@ class ModelEvaluation:
 
     policy_raw: Mapping[str, Tensor]
     value: Tensor
+    public_heads: Mapping[str, Tensor] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
 
 @dataclass(frozen=True)
@@ -313,7 +322,7 @@ class SealedSequentialInputs:
         *,
         input_type: str,
         lane: int = 0,
-    ) -> "SealedSequentialInputs":
+    ) -> SealedSequentialInputs:
         if family.schema.name != f"FamilyWork.{input_type}":
             raise LearnerError("input sealing is bound to the wrong family owner")
         if not 0 <= lane < family.n_replica:
@@ -354,9 +363,7 @@ class SealedSequentialInputs:
             )
             for name in fields
         }
-        counts = torch.zeros(
-            family.n_replica, dtype=torch.int64, device=family.device
-        )
+        counts = torch.zeros(family.n_replica, dtype=torch.int64, device=family.device)
         counts[lane] = rows
         address = torch.full_like(counts, torch.iinfo(torch.int64).max)
         address[lane] = 0
@@ -371,9 +378,7 @@ class SealedSequentialInputs:
                 ),
             ),
             phase="sequential_input_seal",
-            active=torch.arange(
-                family.n_replica, device=family.device
-            ).eq(lane),
+            active=torch.arange(family.n_replica, device=family.device).eq(lane),
         )
         transaction.fill_all()
         success = transaction.publish()
@@ -509,9 +514,7 @@ class SequentialBatchSampler:
                     "statistical allocation must cover every learner partition"
                 )
             if any(
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
                 for value in statistical_counts.values()
             ):
                 raise LearnerError(
@@ -540,12 +543,10 @@ class SequentialBatchSampler:
         seconds_per_draw: Tensor,
         total_count: int,
         reproducibility: str = "strict",
-    ) -> "SequentialBatchSampler":
+    ) -> SequentialBatchSampler:
         names = tuple(stores)
         if mass.numel() != len(names):
-            raise LearnerError(
-                "cost-aware allocation must match learner partitions"
-            )
+            raise LearnerError("cost-aware allocation must match learner partitions")
         counts = allocate_statistical_counts(
             mass, variance, seconds_per_draw, total_count
         )
@@ -554,8 +555,7 @@ class SequentialBatchSampler:
             schedule,
             generator=generator,
             statistical_counts={
-                name: int(counts[index])
-                for index, name in enumerate(names)
+                name: int(counts[index]) for index, name in enumerate(names)
             },
             reproducibility=reproducibility,
         )
@@ -717,6 +717,401 @@ class SequentialBatchSampler:
 
 
 @dataclass(frozen=True)
+class BranchedLearnerBatch:
+    """One ragged branched batch with no inactive action representation."""
+
+    input_type: str
+    sigma_index: Tensor
+    action_ptr: Tensor
+    action_index: Tensor
+    sigma_fields: Mapping[str, Tensor]
+    action_fields: Mapping[str, Tensor]
+    logical_step: int = 0
+    logical_rows: int | None = None
+
+    def __post_init__(self) -> None:
+        device = self.sigma_index.device
+        if (
+            device.type != "cuda"
+            or self.sigma_index.dtype not in (torch.int32, torch.int64)
+            or self.sigma_index.ndim != 1
+            or self.sigma_index.numel() == 0
+            or self.action_ptr.device != device
+            or self.action_ptr.dtype not in (torch.int32, torch.int64)
+            or self.action_ptr.shape != (self.sigma_index.numel() + 1,)
+            or self.action_index.device != device
+            or self.action_index.dtype not in (torch.int32, torch.int64)
+            or self.action_index.ndim != 1
+        ):
+            raise LearnerError("ragged learner indices have an invalid contract")
+        torch._assert_async(
+            (
+                self.action_ptr[0].eq(0)
+                & self.action_ptr[-1].eq(self.action_index.numel())
+                & (self.action_ptr[1:] > self.action_ptr[:-1]).all()
+            ),
+            "ragged learner action spans must be positive and exhaustive",
+        )
+
+    @property
+    def rows(self) -> int:
+        return int(self.sigma_index.numel())
+
+    @property
+    def action_rows(self) -> int:
+        return int(self.action_index.numel())
+
+    @property
+    def objective_rows(self) -> int:
+        return self.rows if self.logical_rows is None else self.logical_rows
+
+
+class SealedBranchedInputs:
+    """Compacted retained inputs and ragged spans for one input partition."""
+
+    def __init__(
+        self,
+        slab: MonotoneSlab,
+        *,
+        input_type: str,
+        lane: int,
+    ) -> None:
+        if slab.schema.name != f"LearnerIndex.{input_type}":
+            raise LearnerError("branched input is not the generated learner owner")
+        required = {
+            "model_input",
+            "sampled_private_state",
+            "owner",
+            "target_degree",
+            "action_begin",
+            "action_count",
+            "log_sampling_weight",
+        }
+        if set(slab.columns) != required:
+            raise LearnerError("sealed branched input has the wrong fields")
+        self.slab = slab
+        self.input_type = input_type
+        self.lane = lane
+        self.rows = slab.tail(lane)
+        self.device = slab.device
+
+    @classmethod
+    def seal(
+        cls,
+        family: MonotoneSlab,
+        destination: MonotoneSlab,
+        *,
+        input_type: str,
+        family_row: Tensor,
+        action_begin: Tensor,
+        action_count: Tensor,
+        target_degree: Tensor,
+        log_sampling_weight: Tensor,
+        lane: int = 0,
+    ) -> SealedBranchedInputs:
+        if family.schema.name != f"FamilyWork.{input_type}":
+            raise LearnerError("branched input sealing is bound to the wrong family")
+        if destination.schema.name != f"LearnerIndex.{input_type}":
+            raise LearnerError("branched input destination has the wrong identity")
+        rows = int(family_row.numel())
+        device = family.device
+        for name, value in (
+            ("family_row", family_row),
+            ("action_begin", action_begin),
+            ("action_count", action_count),
+            ("target_degree", target_degree),
+            ("log_sampling_weight", log_sampling_weight),
+        ):
+            if value.device != device or value.shape != (rows,):
+                raise LearnerError(f"{name} must be device-local [trained rows]")
+        if rows == 0:
+            return cls(destination, input_type=input_type, lane=lane)
+        torch._assert_async(
+            (
+                family_row.ge(0)
+                & family_row.lt(family.tail(lane))
+                & action_begin.ge(0)
+                & action_count.ge(1)
+                & target_degree.eq(action_count)
+                & torch.isfinite(log_sampling_weight)
+            ).all(),
+            "branched seal metadata is invalid",
+        )
+        selected = family_row.to(torch.int64)
+        values = {
+            "model_input": family.columns["model_input"][lane, selected][None],
+            "sampled_private_state": family.columns["sampled_private_state"][
+                lane, selected
+            ][None],
+            "owner": family.columns["owner"][lane, selected][None],
+            "target_degree": target_degree.to(torch.int32)[None],
+            "action_begin": action_begin.to(torch.int32)[None],
+            "action_count": action_count.to(torch.int32)[None],
+            "log_sampling_weight": log_sampling_weight.float()[None],
+        }
+        counts = torch.zeros(family.n_replica, dtype=torch.int64, device=device)
+        counts[lane] = rows
+        logical = torch.full_like(counts, torch.iinfo(torch.int64).max)
+        logical[lane] = 0
+        transaction = PublicationTransaction.begin_device(
+            (
+                DeviceDestinationRequest(
+                    destination,
+                    counts,
+                    values,
+                    input_type,
+                    logical,
+                ),
+            ),
+            phase="branched_input_seal",
+            active=torch.arange(family.n_replica, device=device).eq(lane),
+        )
+        transaction.fill_all()
+        success = transaction.publish()
+        torch._assert_async(success[lane], "branched input seal failed")
+        return cls(destination, input_type=input_type, lane=lane)
+
+    @property
+    def columns(self) -> Mapping[str, Tensor]:
+        return MappingProxyType(
+            {
+                name: value[self.lane, : self.rows]
+                for name, value in self.slab.columns.items()
+            }
+        )
+
+    def release(self) -> None:
+        return None
+
+
+class RaggedBranchedStore:
+    """Validated sigma owners plus exact output-partition action spans."""
+
+    def __init__(
+        self,
+        owners: GeneratedOwners,
+        input_type: str,
+        *,
+        sealed_inputs: SealedBranchedInputs,
+        lane: int = 0,
+    ) -> None:
+        mode = owners.plan.mode
+        if not mode.rollout_mode.is_branched:
+            raise LearnerError("ragged stores require branched mode")
+        if mode.private_estimator is not PrivateEstimator.SAMPLED:
+            raise LearnerError("Phase 7 ragged store requires sampled mode")
+        output_type = owners.plan.partitions.output_for(input_type).name
+        sigma = {
+            "SigmaHead": owners.slab("SigmaHead", input_type),
+            "SigmaTarget": owners.slab("SigmaTarget", input_type),
+        }
+        action = {
+            "ActionHead": owners.slab("ActionHead", output_type),
+            "ActionTarget": owners.slab("ActionTarget", output_type),
+        }
+        sigma_counts = {name: slab.tail(lane) for name, slab in sigma.items()}
+        sigma_counts["LearnerIndex"] = sealed_inputs.rows
+        if len(set(sigma_counts.values())) != 1:
+            raise LearnerError(
+                "branched sigma owners are not row aligned: "
+                + ", ".join(f"{name}={count}" for name, count in sigma_counts.items())
+            )
+        columns = sealed_inputs.columns
+        if sealed_inputs.rows:
+            torch._assert_async(
+                (
+                    columns["action_begin"].ge(0)
+                    & columns["action_count"].ge(1)
+                    & (
+                        columns["action_begin"].to(torch.int64)
+                        + columns["action_count"].to(torch.int64)
+                    ).le(action["ActionHead"].tail(lane))
+                ).all(),
+                "branched action spans exceed the sealed action extent",
+            )
+        if action["ActionHead"].tail(lane) != action["ActionTarget"].tail(lane):
+            raise LearnerError("branched action heads and targets are not aligned")
+        self.owners = owners
+        self.mode = mode
+        self.input_type = input_type
+        self.output_type = output_type
+        self.lane = lane
+        self.sealed_inputs = sealed_inputs
+        self.sigma_slabs = MappingProxyType(sigma)
+        self.action_slabs = MappingProxyType(action)
+        self.rows = sealed_inputs.rows
+        self.device = owners.plan.device
+
+    def gather(self, sigma_index: Tensor) -> BranchedLearnerBatch:
+        if (
+            sigma_index.device != self.device
+            or sigma_index.dtype not in (torch.int32, torch.int64)
+            or sigma_index.ndim != 1
+            or sigma_index.numel() == 0
+        ):
+            raise LearnerError("branched sigma indices must be CUDA integers")
+        selected = sigma_index.to(torch.int64)
+        torch._assert_async(
+            (selected.ge(0) & selected.lt(self.rows)).all(),
+            "branched sigma index is outside its sealed extent",
+        )
+        index = self.sealed_inputs.columns
+        begin = index["action_begin"][selected].to(torch.int64)
+        count = index["action_count"][selected].to(torch.int64)
+        ptr = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int64, device=self.device),
+                count.cumsum(0),
+            )
+        )
+        action_index = torch.repeat_interleave(begin, count)
+        action_index += torch.arange(
+            int(ptr[-1]), dtype=torch.int64, device=self.device
+        ) - torch.repeat_interleave(ptr[:-1], count)
+        sigma_fields: dict[str, Tensor] = {
+            name: value[selected]
+            for name, value in index.items()
+            if name not in ("action_begin", "action_count")
+        }
+        for slab in self.sigma_slabs.values():
+            for name, value in slab.columns.items():
+                if name in sigma_fields:
+                    raise LearnerError(f"duplicate branched sigma field {name!r}")
+                sigma_fields[name] = value[self.lane, selected]
+        action_fields: dict[str, Tensor] = {}
+        for slab in self.action_slabs.values():
+            for name, value in slab.columns.items():
+                if name in action_fields:
+                    raise LearnerError(f"duplicate branched action field {name!r}")
+                action_fields[name] = value[self.lane, action_index]
+        return BranchedLearnerBatch(
+            self.input_type,
+            sigma_index,
+            ptr,
+            action_index,
+            MappingProxyType(sigma_fields),
+            MappingProxyType(action_fields),
+        )
+
+
+def _alias_table(weights: Tensor) -> tuple[Tensor, Tensor]:
+    """Build one deterministic Walker alias table in float64."""
+
+    if weights.ndim != 1 or weights.numel() == 0:
+        raise LearnerError("alias weights must be a nonempty vector")
+    work = weights.detach().double().cpu()
+    if not bool(torch.isfinite(work).all()) or bool((work <= 0).any()):
+        raise LearnerError("alias weights must be finite and positive")
+    scaled = work * work.numel() / work.sum()
+    probability = torch.ones_like(scaled)
+    alias = torch.arange(work.numel(), dtype=torch.int32)
+    small = [index for index, value in enumerate(scaled.tolist()) if value < 1]
+    large = [index for index, value in enumerate(scaled.tolist()) if value >= 1]
+    while small and large:
+        low = small.pop()
+        high = large.pop()
+        probability[low] = scaled[low]
+        alias[low] = high
+        scaled[high] = scaled[high] - (1 - scaled[low])
+        (small if scaled[high] < 1 else large).append(high)
+    return probability.to(weights.device), alias.to(weights.device)
+
+
+class BranchedBatchSampler:
+    """Alias-sample decision mass and gather exact ragged action spans."""
+
+    def __init__(
+        self,
+        stores: Mapping[str, RaggedBranchedStore],
+        schedule: LearnerSchedule,
+        *,
+        generator: torch.Generator,
+        statistical_counts: Mapping[str, int] | None = None,
+    ) -> None:
+        if not stores:
+            raise ValueError("at least one branched learner store is required")
+        self.stores = MappingProxyType(dict(stores))
+        self.schedule = schedule
+        self.generator = generator
+        devices = {store.device for store in stores.values()}
+        if len(devices) != 1 or generator.device != next(iter(devices)):
+            raise LearnerError("branched sampler must remain on one CUDA device")
+        self.alias = MappingProxyType(
+            {
+                name: _alias_table(
+                    store.sealed_inputs.columns["log_sampling_weight"].double().exp()
+                )
+                for name, store in stores.items()
+            }
+        )
+        if statistical_counts is None:
+            statistical_counts = {name: store.rows for name, store in stores.items()}
+        if set(statistical_counts) != set(stores) or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in statistical_counts.values()
+        ):
+            raise LearnerError(
+                "branched statistical counts must positively cover every stratum"
+            )
+        self.statistical_counts = MappingProxyType(dict(statistical_counts))
+
+    def _draw(self, name: str, count: int) -> Tensor:
+        threshold, alias = self.alias[name]
+        column = torch.randint(
+            threshold.numel(),
+            (count,),
+            dtype=torch.int64,
+            device=threshold.device,
+            generator=self.generator,
+        )
+        uniform = torch.rand(
+            count,
+            dtype=torch.float64,
+            device=threshold.device,
+            generator=self.generator,
+        )
+        return torch.where(
+            uniform < threshold[column],
+            column,
+            alias[column].to(torch.int64),
+        )
+
+    @property
+    def statistical_presentations(self) -> int:
+        one_pass = sum(self.statistical_counts.values())
+        return one_pass * (
+            self.schedule.gradient_steps
+            if self.schedule.gradient_steps is not None
+            else self.schedule.epochs
+        )
+
+    def batches(self) -> Iterator[BranchedLearnerBatch]:
+        steps = (
+            self.schedule.gradient_steps
+            if self.schedule.gradient_steps is not None
+            else self.schedule.epochs
+        )
+        logical_rows = sum(self.statistical_counts.values())
+        for logical_step in range(steps):
+            for name, requested in self.statistical_counts.items():
+                emitted = 0
+                while emitted < requested:
+                    take = min(self.schedule.batch_size, requested - emitted)
+                    gathered = self.stores[name].gather(self._draw(name, take))
+                    yield BranchedLearnerBatch(
+                        gathered.input_type,
+                        gathered.sigma_index,
+                        gathered.action_ptr,
+                        gathered.action_index,
+                        gathered.sigma_fields,
+                        gathered.action_fields,
+                        logical_step=logical_step,
+                        logical_rows=logical_rows,
+                    )
+                    emitted += take
+
+
+@dataclass(frozen=True)
 class LossResult:
     total: Tensor
     policy: Tensor
@@ -761,9 +1156,7 @@ def _scalar_private_row(value: Tensor, private: Tensor, owner: Tensor) -> Tensor
     return value.gather(1, combo[:, None]).squeeze(1).float()
 
 
-def _select_sampled_private(
-    value: Tensor, private: Tensor, owner: Tensor
-) -> Tensor:
+def _select_sampled_private(value: Tensor, private: Tensor, owner: Tensor) -> Tensor:
     """Gather one owner-combo row while preserving trailing head fields."""
 
     if value.ndim < 2 or private.ndim != 2 or owner.shape != value.shape[:1]:
@@ -780,9 +1173,9 @@ def _select_sampled_private(
         ((combo >= 0) & (combo < value.shape[1])).all(),
         "sampled private combo is outside the model domain",
     )
-    index = combo.reshape(
-        combo.shape[0], 1, *((1,) * (value.ndim - 2))
-    ).expand(combo.shape[0], 1, *value.shape[2:])
+    index = combo.reshape(combo.shape[0], 1, *((1,) * (value.ndim - 2))).expand(
+        combo.shape[0], 1, *value.shape[2:]
+    )
     return value.gather(1, index)
 
 
@@ -798,8 +1191,6 @@ class LearnerOperation:
         *,
         precision: str = "fp32",
     ) -> None:
-        if mode.rollout_mode is not RolloutMode.SEQUENTIAL:
-            raise LearnerError("the aligned learner operation requires sequential mode")
         self.mode = mode
         self.loss = loss
         self.model_operation = model_operation
@@ -810,7 +1201,7 @@ class LearnerOperation:
 
     def forward_loss_backward(
         self,
-        batch: SequentialLearnerBatch,
+        batch: SequentialLearnerBatch | BranchedLearnerBatch,
         *,
         iteration: int,
         reference_operation: ModelOperation | None = None,
@@ -818,6 +1209,18 @@ class LearnerOperation:
         loss_scale: float = 1.0,
         objective_weight: float = 1.0,
     ) -> LossResult:
+        if self.mode.rollout_mode.is_branched:
+            if not isinstance(batch, BranchedLearnerBatch):
+                raise LearnerError("branched learner requires a ragged batch")
+            return self._forward_branched_loss_backward(
+                batch,
+                iteration=iteration,
+                reference_operation=reference_operation,
+                loss_scale=loss_scale,
+                objective_weight=objective_weight,
+            )
+        if not isinstance(batch, SequentialLearnerBatch):
+            raise LearnerError("sequential learner requires an aligned batch")
         fields = batch.fields
         autocast_dtype = {
             "fp32": torch.float32,
@@ -855,6 +1258,7 @@ class LearnerOperation:
                         fields["sampled_private_state"],
                         fields["owner"],
                     ),
+                    evaluation.public_heads,
                 )
             if reference_cache is not None:
                 if reference_operation is not None:
@@ -891,7 +1295,9 @@ class LearnerOperation:
                         for name, value in reference_operation(
                             batch.input_type,
                             fields["model_input"],
-                            fields.get("sampled_private_state", fields["owner"][:, None]),
+                            fields.get(
+                                "sampled_private_state", fields["owner"][:, None]
+                            ),
                             fields["owner"],
                         ).policy_raw.items()
                     }
@@ -937,15 +1343,21 @@ class LearnerOperation:
             old_value = old_value.reshape(batch.rows, -1)[:, 0]
             target_value = target_value.reshape(batch.rows, -1)[:, 0]
             advantage = advantage.reshape(batch.rows, -1)[:, 0]
-        if not all(tensor.shape == current_log.shape for tensor in (
-            entropy, reference_kl, current_value, old_log, old_value,
-            target_value, advantage,
-        )):
+        if not all(
+            tensor.shape == current_log.shape
+            for tensor in (
+                entropy,
+                reference_kl,
+                current_value,
+                old_log,
+                old_value,
+                target_value,
+                advantage,
+            )
+        ):
             raise LearnerError("learner fields are not batch/domain aligned")
         posterior = (
-            torch.ones_like(current_log)
-            if sampled
-            else fields["posterior"].float()
+            torch.ones_like(current_log) if sampled else fields["posterior"].float()
         )
         if posterior.shape != current_log.shape:
             raise LearnerError("RB posterior is not aligned to the natural domain")
@@ -959,9 +1371,7 @@ class LearnerOperation:
             1.0 - self.loss.clip_epsilon,
             1.0 + self.loss.clip_epsilon,
         )
-        policy_term = -torch.minimum(
-            ratio * advantage, clipped_ratio * advantage
-        )
+        policy_term = -torch.minimum(ratio * advantage, clipped_ratio * advantage)
         error = (current_value - target_value).square()
         if self.loss.value_loss == "clipped":
             clipped_value = old_value + (current_value - old_value).clamp(
@@ -1002,16 +1412,234 @@ class LearnerOperation:
             reference_kl_mean,
             (
                 (((ratio - 1.0) - log_ratio) * posterior).sum(-1).mean()
-                if not sampled else ((ratio - 1.0) - log_ratio).mean()
+                if not sampled
+                else ((ratio - 1.0) - log_ratio).mean()
             ),
             (
-                (
-                    (torch.abs(ratio - 1.0) > self.loss.clip_epsilon).float()
-                    * posterior
-                ).sum(-1).mean()
+                ((torch.abs(ratio - 1.0) > self.loss.clip_epsilon).float() * posterior)
+                .sum(-1)
+                .mean()
                 if not sampled
                 else (torch.abs(ratio - 1.0) > self.loss.clip_epsilon).float().mean()
             ),
+        )
+
+    def _forward_branched_loss_backward(
+        self,
+        batch: BranchedLearnerBatch,
+        *,
+        iteration: int,
+        reference_operation: ModelOperation | None,
+        loss_scale: float,
+        objective_weight: float,
+    ) -> LossResult:
+        if self.mode.private_estimator is not PrivateEstimator.SAMPLED:
+            raise LearnerError("Phase 7 branched learner requires sampled mode")
+        sigma = batch.sigma_fields
+        action = batch.action_fields
+        counts = batch.action_ptr[1:] - batch.action_ptr[:-1]
+        torch._assert_async(
+            counts.eq(sigma["target_degree"].to(counts.dtype)).all(),
+            "ragged action spans disagree with protected target degrees",
+        )
+        action_to_sigma = torch.repeat_interleave(
+            torch.arange(batch.rows, device=batch.sigma_index.device),
+            counts,
+        )
+        autocast_dtype = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[self.precision]
+        if self.precision == "bf16" and not torch.cuda.is_bf16_supported():
+            raise LearnerError("selected CUDA device does not support BF16")
+        with torch.autocast(
+            device_type="cuda",
+            dtype=autocast_dtype,
+            enabled=self.precision != "fp32",
+        ):
+            evaluation = self.model_operation(
+                batch.input_type,
+                sigma["model_input"],
+                sigma["sampled_private_state"],
+                sigma["owner"],
+            )
+            natural_raw = {
+                name: _select_sampled_private(
+                    value,
+                    sigma["sampled_private_state"],
+                    sigma["owner"],
+                )
+                for name, value in evaluation.policy_raw.items()
+            }
+            natural_value = _select_sampled_private(
+                evaluation.value,
+                sigma["sampled_private_state"],
+                sigma["owner"],
+            )
+            repeated_raw = {
+                name: value.index_select(0, action_to_sigma)
+                for name, value in natural_raw.items()
+            }
+            repeated_private = sigma["sampled_private_state"].index_select(
+                0, action_to_sigma
+            )
+            repeated_owner = sigma["owner"].index_select(0, action_to_sigma)
+            reference = None
+            if reference_operation is not None:
+                reference_evaluation = reference_operation(
+                    batch.input_type,
+                    sigma["model_input"],
+                    sigma["sampled_private_state"],
+                    sigma["owner"],
+                )
+                reference = {
+                    name: _select_sampled_private(
+                        value,
+                        sigma["sampled_private_state"],
+                        sigma["owner"],
+                    ).index_select(0, action_to_sigma)
+                    for name, value in reference_evaluation.policy_raw.items()
+                }
+        compact_private = torch.zeros_like(repeated_private)
+        policy = self.policy_operation(
+            batch.input_type,
+            sigma["model_input"].index_select(0, action_to_sigma),
+            repeated_raw,
+            action["action"].to(torch.int32),
+            compact_private,
+            repeated_owner.to(torch.int64),
+            reference,
+        )
+        current_log = _scalar_private_row(
+            policy.selected_log_policy, compact_private, repeated_owner
+        )
+        entropy = _scalar_private_row(policy.entropy, compact_private, repeated_owner)
+        reference_kl = _scalar_private_row(
+            policy.reference_kl, compact_private, repeated_owner
+        )
+        current_value = _scalar_private_row(
+            natural_value,
+            torch.zeros_like(sigma["sampled_private_state"]),
+            sigma["owner"],
+        )
+        old_log = action["old_log_policy"].reshape(batch.action_rows, -1)[:, 0]
+        advantage = action["advantage_target"].reshape(batch.action_rows, -1)[:, 0]
+        old_value = sigma["old_value"].reshape(batch.rows, -1)[:, 0]
+        target_value = sigma["value_target"].reshape(batch.rows, -1)[:, 0]
+        if not (
+            current_log.shape
+            == entropy.shape
+            == reference_kl.shape
+            == old_log.shape
+            == advantage.shape
+            == (batch.action_rows,)
+            and current_value.shape
+            == old_value.shape
+            == target_value.shape
+            == (batch.rows,)
+        ):
+            raise LearnerError("branched learner fields are not ragged-aligned")
+        log_ratio = current_log.float() - old_log.float()
+        ratio = log_ratio.exp()
+        clipped = ratio.clamp(
+            1 - self.loss.clip_epsilon,
+            1 + self.loss.clip_epsilon,
+        )
+        policy_row = -torch.minimum(
+            ratio * advantage.float(), clipped * advantage.float()
+        )
+        sigma_policy = torch.zeros(
+            batch.rows, dtype=torch.float32, device=current_log.device
+        )
+        sigma_entropy = torch.zeros_like(sigma_policy)
+        sigma_reference = torch.zeros_like(sigma_policy)
+        sigma_approximate = torch.zeros_like(sigma_policy)
+        sigma_clipped = torch.zeros_like(sigma_policy)
+        denominator = counts.float()
+        for destination, source in (
+            (sigma_policy, policy_row),
+            (sigma_entropy, entropy.float()),
+            (sigma_reference, reference_kl.float()),
+            (sigma_approximate, (ratio - 1) - log_ratio),
+            (
+                sigma_clipped,
+                ratio.sub(1).abs().gt(self.loss.clip_epsilon).float(),
+            ),
+        ):
+            destination.scatter_add_(0, action_to_sigma, source)
+            destination.div_(denominator)
+        value_error = (current_value.float() - target_value.float()).square()
+        if self.loss.value_loss == "clipped":
+            clipped_value = old_value.float() + (
+                current_value.float() - old_value.float()
+            ).clamp(
+                -self.loss.value_clip_epsilon,
+                self.loss.value_clip_epsilon,
+            )
+            value_error = torch.maximum(
+                value_error,
+                (clipped_value - target_value.float()).square(),
+            )
+        public = evaluation.public_heads
+        if set(public) != {"trace", "cost"}:
+            raise LearnerError("branched model must expose public trace/cost heads")
+        trace_prediction = public["trace"].float()
+        cost_prediction = public["cost"].float()
+        trace_target = sigma["trace_target"].float()
+        cost_target = sigma["cost_target"].float()
+        if not all(
+            value.shape == (batch.rows,)
+            for value in (
+                trace_prediction,
+                cost_prediction,
+                trace_target,
+                cost_target,
+            )
+        ):
+            raise LearnerError("branched public heads and targets are not aligned")
+        eps = self.loss.trace_epsilon
+        trace_ratio = (trace_target + eps) / (
+            trace_prediction.clamp_min(torch.finfo(torch.float32).tiny) + eps
+        )
+        trace_deviance = trace_ratio - trace_ratio.log() - 1
+        trace_valid = sigma["target_degree"].ge(2)
+        trace_loss = torch.where(
+            trace_valid, trace_deviance, torch.zeros_like(trace_deviance)
+        ).mean()
+        torch._assert_async(
+            cost_target.gt(0).all(),
+            "branched cost targets must be positive",
+        )
+        cost_ratio = cost_target / cost_prediction.clamp_min(
+            torch.finfo(torch.float32).tiny
+        )
+        cost_loss = (cost_ratio - cost_ratio.log() - 1).mean()
+        policy_loss = sigma_policy.mean()
+        value_loss = value_error.mean()
+        entropy_mean = sigma_entropy.mean()
+        reference_kl_mean = sigma_reference.mean()
+        total = (
+            policy_loss
+            + self.loss.value_coefficient * value_loss
+            - self.loss.entropy_at(iteration) * entropy_mean
+            + self.loss.reference_kl_coefficient * reference_kl_mean
+            + self.loss.trace_coefficient * trace_loss
+            + self.loss.cost_coefficient * cost_loss
+        )
+        if self.precision != "fp16" and not torch.isfinite(total):
+            raise LearnerError("branched learner loss is nonfinite")
+        if not math.isfinite(objective_weight) or not 0 < objective_weight <= 1:
+            raise LearnerError("physical objective weight must lie in (0,1]")
+        (total * float(loss_scale) * objective_weight).backward()
+        return LossResult(
+            total,
+            policy_loss,
+            value_loss,
+            entropy_mean,
+            reference_kl_mean,
+            sigma_approximate.mean(),
+            sigma_clipped.mean(),
         )
 
 
@@ -1033,12 +1661,9 @@ class ReferenceState:
             raise ValueError("select exactly one reference refresh cadence")
         if self.interval_iterations is not None and self.interval_iterations <= 0:
             raise ValueError("reference iteration cadence must be positive")
-        if (
-            self.interval_effective_hands is not None
-            and (
-                not math.isfinite(self.interval_effective_hands)
-                or self.interval_effective_hands <= 0
-            )
+        if self.interval_effective_hands is not None and (
+            not math.isfinite(self.interval_effective_hands)
+            or self.interval_effective_hands <= 0
         ):
             raise ValueError("reference effective-hand cadence must be positive")
 
@@ -1065,7 +1690,7 @@ class ReferenceState:
         }
 
     @classmethod
-    def from_state_dict(cls, state: Mapping[str, object]) -> "ReferenceState":
+    def from_state_dict(cls, state: Mapping[str, object]) -> ReferenceState:
         expected = {
             "reference_iteration",
             "effective_hands_rollout",
@@ -1079,7 +1704,8 @@ class ReferenceState:
 
 __all__ = [
     "AlignedSequentialStore",
-    "allocate_statistical_counts",
+    "BranchedBatchSampler",
+    "BranchedLearnerBatch",
     "LearnerError",
     "LearnerOperation",
     "LearnerSchedule",
@@ -1087,9 +1713,12 @@ __all__ = [
     "LossResult",
     "ModelEvaluation",
     "PolicyEvaluation",
-    "ReferenceState",
+    "RaggedBranchedStore",
     "ReferenceOutputCache",
+    "ReferenceState",
+    "SealedBranchedInputs",
     "SealedSequentialInputs",
     "SequentialBatchSampler",
     "SequentialLearnerBatch",
+    "allocate_statistical_counts",
 ]

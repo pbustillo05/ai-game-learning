@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Mapping
+
 import torch
 from torch import Tensor, nn
 
-from pbg.queued.learner import ModelEvaluation
-from pbg.queued.contracts import RolloutMode, mode_schema
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.model.capacity import max_public_history_tokens
 from pbg.games.poker.model.postflop import PostflopMasks, PostflopNet
@@ -21,16 +20,18 @@ from pbg.games.poker.model.preflop import (
     PreflopNet,
 )
 from pbg.games.poker.model.primitives import MHA
+from pbg.games.poker.queued.folded import unpack_folded_statistics
 from pbg.games.poker.queued.hooks import (
     FOLD,
     FOLDED,
-    NLHEGeometry,
     PAD_CARD,
+    NLHEGeometry,
     PokerHistory,
     PokerState,
     PokerStateMachine,
 )
-from pbg.games.poker.queued.folded import unpack_folded_statistics
+from pbg.queued.contracts import mode_schema
+from pbg.queued.learner import ModelEvaluation
 
 
 class PokerModelError(RuntimeError):
@@ -62,9 +63,7 @@ def _fold_line_metadata(
             (~folder | fold.any(-1)).all(),
             "folded seat has no retained fold-line event",
         )
-        last = torch.where(
-            fold, position, torch.full_like(position, -1)
-        ).max(-1).values
+        last = torch.where(fold, position, torch.full_like(position, -1)).max(-1).values
         gather = last.clamp_min(0)[:, None]
         through_fold = owned & position.le(last[:, None])
         call = through_fold & history.action.eq(1)
@@ -129,6 +128,16 @@ def _validate_output(
         raise PokerModelError("partition raise outputs have the wrong domain")
     if any(value.device != device for value in evaluation.policy_raw.values()):
         raise PokerModelError("partition policy output changed device")
+    if set(evaluation.public_heads).difference({"trace", "cost"}):
+        raise PokerModelError("partition public output has unknown fields")
+    if evaluation.public_heads and (
+        set(evaluation.public_heads) != {"trace", "cost"}
+        or any(
+            value.shape != (batch,) or value.device != device
+            for value in evaluation.public_heads.values()
+        )
+    ):
+        raise PokerModelError("partition trace/cost outputs have the wrong shape")
 
 
 class QueuedPokerModel(nn.Module):
@@ -167,9 +176,7 @@ class QueuedPokerModel(nn.Module):
 
         for module in self.modules():
             if isinstance(module, MHA):
-                module.configure_execution(
-                    attention_backend, query_chunk_size
-                )
+                module.configure_execution(attention_backend, query_chunk_size)
 
     @staticmethod
     def _call_direct(module: nn.Module, model_input: Tensor) -> ModelEvaluation:
@@ -180,7 +187,14 @@ class QueuedPokerModel(nn.Module):
 
     @staticmethod
     def _evaluation(result: PolicyOutput) -> ModelEvaluation:
-        return ModelEvaluation(MappingProxyType(dict(result.raw)), result.v)
+        public = (
+            MappingProxyType({})
+            if result.t is None and result.c is None
+            else MappingProxyType({"trace": result.t, "cost": result.c})
+        )
+        if (result.t is None) != (result.c is None):
+            raise PokerModelError("partition returned only one public branch head")
+        return ModelEvaluation(MappingProxyType(dict(result.raw)), result.v, public)
 
     def _state(self, model_input: Tensor) -> PokerState:
         combo_ids = torch.zeros(
@@ -213,9 +227,7 @@ class QueuedPokerModel(nn.Module):
         lower = torch.where(has_raise, lower, torch.zeros_like(lower))
         upper = torch.where(has_raise, upper, torch.zeros_like(upper))
         actor = state.to_act.to(torch.int64)
-        actor_committed = state.committed_street.gather(
-            1, actor[:, None]
-        ).squeeze(1)
+        actor_committed = state.committed_street.gather(1, actor[:, None]).squeeze(1)
         legality_summary = torch.stack(
             (
                 legality.mask[:, 0].float(),
@@ -247,9 +259,7 @@ class QueuedPokerModel(nn.Module):
             seat_mask=torch.ones_like(state.status, dtype=torch.bool),
             button=state.button.to(torch.int64),
             committed_street=state.committed_street,
-            call_amount=(
-                state.current_bet - actor_committed
-            ).clamp_min(0.0),
+            call_amount=(state.current_bet - actor_committed).clamp_min(0.0),
             current_bet=state.current_bet,
             min_raise_to=lower,
             max_raise_to=upper,
@@ -265,25 +275,17 @@ class QueuedPokerModel(nn.Module):
         )
         board = public.board
         compatible = ~(
-            self.combo_cards[None, :, :, None].eq(
-                board[:, None, None, :]
-            )
+            self.combo_cards[None, :, :, None].eq(board[:, None, None, :])
             & board[:, None, None, :].ge(0)
         ).any(3).any(2)
         return public, compatible
 
-    def _call_preflop(
-        self, model_input: Tensor
-    ) -> ModelEvaluation:
+    def _call_preflop(self, model_input: Tensor) -> ModelEvaluation:
         state = self._state(model_input)
-        log_reach, history = PokerStateMachine(
-            self.geometry
-        ).model_context(model_input)
+        log_reach, history = PokerStateMachine(self.geometry).model_context(model_input)
         public, _compatible = self._public(state, history)
         finite = torch.isfinite(log_reach)
-        gauge = log_reach.masked_fill(
-            ~finite, -torch.inf
-        ).max(2, keepdim=True).values
+        gauge = log_reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
         weights = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
         class_ranges = torch.zeros(
             (
@@ -308,30 +310,26 @@ class QueuedPokerModel(nn.Module):
             )
         )
 
-    def _call_postflop(
-        self, input_type: str, model_input: Tensor
-    ) -> ModelEvaluation:
+    def _call_postflop(self, input_type: str, model_input: Tensor) -> ModelEvaluation:
         state = self._state(model_input)
-        log_reach, history = PokerStateMachine(
-            self.geometry
-        ).model_context(model_input)
+        log_reach, history = PokerStateMachine(self.geometry).model_context(model_input)
         public, compatible = self._public(state, history)
         live = int(input_type[5:])
-        seats = torch.arange(
-            self.geometry.players, device=state.device
-        )[None].expand(state.rows, -1)
-        ordered = torch.where(
-            state.status.ne(FOLDED), seats, self.geometry.players
-        ).sort(1).values
+        seats = torch.arange(self.geometry.players, device=state.device)[None].expand(
+            state.rows, -1
+        )
+        ordered = (
+            torch.where(state.status.ne(FOLDED), seats, self.geometry.players)
+            .sort(1)
+            .values
+        )
         live_ids = ordered[:, :live]
         torch._assert_async(
             live_ids.lt(self.geometry.players).all(),
             "postflop family disagrees with live-seat state",
         )
         finite = torch.isfinite(log_reach)
-        gauge = log_reach.masked_fill(
-            ~finite, -torch.inf
-        ).max(2, keepdim=True).values
+        gauge = log_reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
         ranges = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
         line_dim = getattr(self.postflop.cfg, "folder_line_dim", 0)
         summary = unpack_folded_statistics(
@@ -388,20 +386,18 @@ class QueuedPokerModel(nn.Module):
             raw = MappingProxyType(
                 {name: value[:, index] for name, value in compact.policy_raw.items()}
             )
-            result = ModelEvaluation(raw, compact.value[:, index])
+            result = ModelEvaluation(raw, compact.value[:, index], compact.public_heads)
         elif input_type.startswith("post_") and input_type[5:].isdigit():
             live = int(input_type[5:])
             if not 2 <= live <= self.geometry.players:
                 raise PokerModelError("postflop family has an invalid live-seat count")
-            if (
-                self.geometry.folded_summary_width
-                and not isinstance(self.postflop, PostflopNet)
+            if self.geometry.folded_summary_width and not isinstance(
+                self.postflop, PostflopNet
             ):
                 state = self._state(model_input)
                 if not bool(
                     (
-                        ~state.status.eq(FOLDED).any(-1)
-                        | model_input[:, -1].gt(0.5)
+                        ~state.status.eq(FOLDED).any(-1) | model_input[:, -1].gt(0.5)
                     ).all()
                 ):
                     raise PokerModelError(
@@ -518,14 +514,12 @@ def build_model_from_config(
         schema = mode_schema(**dict(mode))
     except (TypeError, ValueError) as exc:
         raise ValueError("scientific.mode is not a closed queued mode") from exc
-    if schema.rollout_mode is not RolloutMode.SEQUENTIAL:
-        raise ValueError("scientific.mode must select sequential rollout")
+    if schema.rollout_mode.is_branched and schema.private_estimator.value != "sampled":
+        raise ValueError("Phase 7 model construction supports sampled branched modes")
     game = scientific.get("game")
     model = scientific.get("model")
     if not isinstance(game, Mapping) or not isinstance(model, Mapping):
-        raise ValueError(
-            "scientific configuration must contain game and model objects"
-        )
+        raise ValueError("scientific configuration must contain game and model objects")
     game_values = dict(game)
     if "players" in game_values:
         players = game_values["players"]
@@ -551,17 +545,16 @@ def build_model_from_config(
     if "k_act" in model_values and model_values["k_act"] != derived_action_width:
         raise ValueError("scientific.model.k_act disagrees with m_raise")
     model_values["k_act"] = derived_action_width
+    expected_branching_heads = schema.rollout_mode.is_branched
     if (
         "use_branching_heads" in model_values
-        and model_values["use_branching_heads"] is not False
+        and model_values["use_branching_heads"] is not expected_branching_heads
     ):
         raise ValueError(
-            "scientific.model.use_branching_heads is invalid for sequential mode"
+            "scientific.model.use_branching_heads disagrees with rollout mode"
         )
-    model_values["use_branching_heads"] = False
-    required_history = max_public_history_tokens(
-        geometry.players, geometry.stack_bb
-    )
+    model_values["use_branching_heads"] = expected_branching_heads
+    required_history = max_public_history_tokens(geometry.players, geometry.stack_bb)
     if (
         "max_history_tokens" in model_values
         and int(model_values["max_history_tokens"]) != required_history
@@ -574,9 +567,7 @@ def build_model_from_config(
     if model_config.max_players < geometry.players:
         raise ValueError("scientific.model.max_players does not cover all seats")
     if model_config.folder_beta_rank > geometry.deck_cards:
-        raise ValueError(
-            "scientific.model.folder_beta_rank exceeds the compact deck"
-        )
+        raise ValueError("scientific.model.folder_beta_rank exceeds the compact deck")
 
     target = torch.device(device)
     if target.type != "cuda":

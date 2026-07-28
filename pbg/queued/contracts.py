@@ -311,7 +311,15 @@ def _owners(
         family_fields.append("sampled_private_state")
     if branched:
         family_fields.extend(
-            ("path_mass", "nominal_degree", "executed_degree", "target_degree")
+            (
+                "path_mass",
+                "log_player_ancestor_sum",
+                "log_ancestor_product",
+                "branch_beta",
+                "nominal_degree",
+                "executed_degree",
+                "target_degree",
+            )
         )
 
     sigma_head_fields = ["old_value"]
@@ -347,14 +355,17 @@ def _owners(
     # generated align-to-backward handoff.  Sampled rows additionally retain
     # their realized profile; RB rows stay in their natural output partition
     # and therefore need no sampled private state in the learner.
-    learner_index_fields = (
-        ["model_input", "owner"] if not branched else ["target_degree"]
-    )
-    if sampled and not branched:
+    learner_index_fields = ["model_input", "owner"]
+    if sampled:
         learner_index_fields.insert(1, "sampled_private_state")
     if branched:
         learner_index_fields.extend(
-            ("action_begin", "action_count", "log_sampling_weight")
+            (
+                "target_degree",
+                "action_begin",
+                "action_count",
+                "log_sampling_weight",
+            )
         )
 
     queue_fields = ["head", "ready_tail", "reserved_tail"]

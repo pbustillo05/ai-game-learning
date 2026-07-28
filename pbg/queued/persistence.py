@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
 import tempfile
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch import Tensor, nn
@@ -16,7 +16,6 @@ from torch import Tensor, nn
 from pbg.queued.config import Phase5Config, SequentialModeConfig
 from pbg.queued.learner import ReferenceState
 from pbg.queued.optimization import DenseAdam, LossScaler
-
 
 CHECKPOINT_SCHEMA = "pbg-queued-checkpoint-v1"
 CONVERSION_SCHEMA = "pbg-queued-conversion-v1"
@@ -107,6 +106,8 @@ class RunState:
     recovered_overflow: bool = False
     overflow_recoveries: list[dict[str, object]] | None = None
     metrics_prefix: list[dict[str, object]] | None = None
+    branch_controller_state: dict[str, object] | None = None
+    cost_safeguard_state: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -148,6 +149,16 @@ class RunState:
             "recovered_overflow": self.recovered_overflow,
             "overflow_recoveries": list(self.overflow_recoveries),
             "metrics_prefix": list(self.metrics_prefix),
+            "branch_controller_state": (
+                None
+                if self.branch_controller_state is None
+                else dict(self.branch_controller_state)
+            ),
+            "cost_safeguard_state": (
+                None
+                if self.cost_safeguard_state is None
+                else dict(self.cost_safeguard_state)
+            ),
         }
 
 
@@ -179,7 +190,9 @@ def save_checkpoint(
         "run_state": run_state.state_dict(),
         "explicit_rng": generator.get_state().cpu(),
         "ambient_cpu_rng": torch.get_rng_state(),
-        "ambient_cuda_rng": tuple(value.cpu() for value in torch.cuda.get_rng_state_all()),
+        "ambient_cuda_rng": tuple(
+            value.cpu() for value in torch.cuda.get_rng_state_all()
+        ),
     }
     destination = Path(path)
     _atomic_torch_save(state, destination)
@@ -223,10 +236,9 @@ def load_checkpoint(
             "runtime accepts only queued checkpoints; use the offline converter"
         )
     expected_hash = _canonical_hash(expected_scientific_config)
-    if (
-        state["scientific_sha256"] != expected_hash
-        or state["scientific_config"] != dict(expected_scientific_config)
-    ):
+    if state["scientific_sha256"] != expected_hash or state[
+        "scientific_config"
+    ] != dict(expected_scientific_config):
         raise PersistenceError("resume rejected scientific configuration drift")
     model.load_state_dict(state["model"], strict=True)
     reference_model.load_state_dict(state["reference_model"], strict=True)
@@ -245,6 +257,8 @@ def load_checkpoint(
         "recovered_overflow",
         "overflow_recoveries",
         "metrics_prefix",
+        "branch_controller_state",
+        "cost_safeguard_state",
     }
     if not isinstance(run_data, dict) or set(run_data) != expected_run:
         raise PersistenceError("run state has unknown or missing fields")
@@ -304,14 +318,13 @@ def _convert_optimizer(
     state = legacy["state"]
     if set(state) != set(parameter_ids):
         raise PersistenceError("legacy optimizer parameter state is incomplete")
-    exp_avg = torch.cat(tuple(state[key]["exp_avg"].reshape(-1) for key in parameter_ids))
+    exp_avg = torch.cat(
+        tuple(state[key]["exp_avg"].reshape(-1) for key in parameter_ids)
+    )
     exp_avg_sq = torch.cat(
         tuple(state[key]["exp_avg_sq"].reshape(-1) for key in parameter_ids)
     )
-    steps = {
-        int(float(state[key]["step"]))
-        for key in parameter_ids
-    }
+    steps = {int(float(state[key]["step"])) for key in parameter_ids}
     if len(steps) != 1:
         raise PersistenceError("legacy optimizer parameters have divergent steps")
     betas = tuple(training["adam_betas"])
@@ -379,9 +392,7 @@ def convert_legacy_sequential(
         LEGACY_SCHEMA: _LEGACY_FIELDS_V8,
     }.get(source_schema)
     if expected_fields is None or set(legacy) != expected_fields:
-        raise PersistenceError(
-            "legacy checkpoint schema has unknown or missing fields"
-        )
+        raise PersistenceError("legacy checkpoint schema has unknown or missing fields")
     if source_schema == LEGACY_SCHEMA and (
         legacy["cost_safeguard_controller_schema_version"] is not None
         or legacy["cost_safeguard_controller_state"] is not None
@@ -408,11 +419,8 @@ def convert_legacy_sequential(
     else:
         raise PersistenceError("legacy artifact is not an approved sequential mode")
     if (
-        expected_training_regime is not None
-        and regime != expected_training_regime
-    ) or (
-        expected_estimator is not None and estimator != expected_estimator
-    ):
+        expected_training_regime is not None and regime != expected_training_regime
+    ) or (expected_estimator is not None and estimator != expected_estimator):
         raise PersistenceError("legacy artifact mode differs from requested conversion")
     training = config["training"]
     legacy_loss = config["loss"]
@@ -422,9 +430,7 @@ def convert_legacy_sequential(
     game["players"] = game.pop("n_players")
     effective_hand_cadence = training.get("kl_ref_effective_hands_rollout")
     interval_cadence = (
-        None
-        if effective_hand_cadence is not None
-        else int(training["kl_ref_interval"])
+        None if effective_hand_cadence is not None else int(training["kl_ref_interval"])
     )
     optimizer_state = _convert_optimizer(legacy["optimizer"], training)
     scientific = {
@@ -474,9 +480,7 @@ def convert_legacy_sequential(
             "cache_outputs": True,
         },
         "lambda": float(legacy_loss["lam"]),
-        "root_count": int(
-            legacy["adaptive_work_state"]["current_roots_per_gpu"]
-        ),
+        "root_count": int(legacy["adaptive_work_state"]["current_roots_per_gpu"]),
         "root_count_minimum": int(
             legacy["adaptive_work_state"]["minimum_roots_per_gpu"]
         ),
@@ -503,9 +507,7 @@ def convert_legacy_sequential(
         }
     if regime == "best_response":
         probe = config["probe"]
-        configured_target = (
-            probe.get("target_sha256") or probe.get("checkpoint_sha256")
-        )
+        configured_target = probe.get("target_sha256") or probe.get("checkpoint_sha256")
         target_metadata = legacy["probe_target"]
         metadata_target = (
             target_metadata.get("sha256")
@@ -513,20 +515,22 @@ def convert_legacy_sequential(
             else target_metadata
         )
         candidates = tuple(
-            value
-            for value in (configured_target, metadata_target)
-            if value is not None
+            value for value in (configured_target, metadata_target) if value is not None
         )
         if (
             not candidates
-            or any(not isinstance(value, str) or len(value) != 64 for value in candidates)
+            or any(
+                not isinstance(value, str) or len(value) != 64 for value in candidates
+            )
             or len(set(candidates)) != 1
         ):
             raise PersistenceError("probe target must have a content hash")
         target_hash = candidates[0]
-        if isinstance(target_metadata, Mapping) and target_metadata.get(
-            "semantics", "shared_seat_approximate_response_v1"
-        ) != "shared_seat_approximate_response_v1":
+        if (
+            isinstance(target_metadata, Mapping)
+            and target_metadata.get("semantics", "shared_seat_approximate_response_v1")
+            != "shared_seat_approximate_response_v1"
+        ):
             raise PersistenceError("probe target uses unknown response semantics")
         initialization_metadata = legacy["initialization"]
         initial_hash = (
@@ -679,9 +683,7 @@ def trim_metrics_after_checkpoint(
 ) -> list[dict[str, object]]:
     """Back up externally if desired, then retain the exact completed prefix."""
 
-    retained = [
-        dict(item) for item in metrics if int(item["iteration"]) <= iteration
-    ]
+    retained = [dict(item) for item in metrics if int(item["iteration"]) <= iteration]
     values = [int(item["iteration"]) for item in retained]
     if values and values != list(range(values[0], values[-1] + 1)):
         raise PersistenceError("metrics before the checkpoint are not gap-free")

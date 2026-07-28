@@ -519,6 +519,9 @@ def _field(
         return SoAField(field_name, torch.float32, (2, p_train), alignment)
     if field_name in (
         "path_mass",
+        "log_player_ancestor_sum",
+        "log_ancestor_product",
+        "branch_beta",
         "old_trace",
         "old_cost",
         "frontier_cost",

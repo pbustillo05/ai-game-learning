@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import logging
 import math
 import signal
-from types import MappingProxyType
 import warnings
-from typing import Callable, Generic, Mapping, TypeVar
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Generic, TypeVar
 
 import torch
 from torch import Tensor, nn
 
 from pbg.queued.learner import (
+    BranchedBatchSampler,
     LearnerOperation,
     LossResult,
     ReferenceOutputCache,
@@ -46,8 +48,7 @@ class RecoverableOverflow(RuntimeError):
         self.capacity = int(capacity)
         self.observed_demand = int(observed_demand)
         super().__init__(
-            f"{failure.phase} overflow at logical address "
-            f"{failure.logical_address}"
+            f"{failure.phase} overflow at logical address {failure.logical_address}"
         )
 
 
@@ -78,9 +79,7 @@ class OverflowRecoveryRecord:
     observed_demand: int
 
     def as_dict(self) -> dict[str, object]:
-        return {
-            name: getattr(self, name) for name in self.__dataclass_fields__
-        }
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
 
 
 AttemptResult = TypeVar("AttemptResult")
@@ -131,9 +130,7 @@ class SequentialOverflowRecovery(Generic[AttemptResult]):
             try:
                 return attempt(self.root_count, address)
             except RecoverableOverflow as local:
-                failure = (
-                    local if self.rank_common is None else self.rank_common(local)
-                )
+                failure = local if self.rank_common is None else self.rank_common(local)
                 # The callback must reset every live attempt-owned owner before
                 # another address is exposed. Completed replica lanes are not
                 # passed to this callback.
@@ -164,9 +161,7 @@ class SequentialOverflowRecovery(Generic[AttemptResult]):
                 self.run_state.recovered_overflow = True
                 self.run_state.root_count = replacement
                 self.run_state.retry_epoch = replacement_address.retry_epoch
-                self.run_state.attempt_logical_base = (
-                    replacement_address.logical_base
-                )
+                self.run_state.attempt_logical_base = replacement_address.logical_base
                 self.run_state.overflow_recoveries.append(record.as_dict())
                 payload = json.dumps(record.as_dict(), sort_keys=True)
                 self.logger.critical("RECOVERED_SEQUENTIAL_OVERFLOW %s", payload)
@@ -216,17 +211,14 @@ class SequentialSampledIteration:
                 raise ValueError(
                     "physical_batch_cap mapping must contain positive integer caps"
                 )
-            self.physical_batch_cap: int | Mapping[str, int] | None = (
-                MappingProxyType(caps)
+            self.physical_batch_cap: int | Mapping[str, int] | None = MappingProxyType(
+                caps
             )
         else:
-            if (
-                physical_batch_cap is not None
-                and (
-                    isinstance(physical_batch_cap, bool)
-                    or not isinstance(physical_batch_cap, int)
-                    or physical_batch_cap <= 0
-                )
+            if physical_batch_cap is not None and (
+                isinstance(physical_batch_cap, bool)
+                or not isinstance(physical_batch_cap, int)
+                or physical_batch_cap <= 0
             ):
                 raise ValueError("physical_batch_cap must be positive")
             self.physical_batch_cap = physical_batch_cap
@@ -270,8 +262,7 @@ class SequentialSampledIteration:
             if isinstance(configured_cap, Mapping):
                 if batch.input_type not in configured_cap:
                     raise ValueError(
-                        "physical_batch_cap has no entry for "
-                        f"{batch.input_type!r}"
+                        f"physical_batch_cap has no entry for {batch.input_type!r}"
                     )
                 configured_cap = configured_cap[batch.input_type]
             cap = (
@@ -285,10 +276,7 @@ class SequentialSampledIteration:
                     batch.input_type,
                     batch.indices[begin:end],
                     MappingProxyType(
-                        {
-                            name: value[begin:end]
-                            for name, value in batch.fields.items()
-                        }
+                        {name: value[begin:end] for name, value in batch.fields.items()}
                     ),
                 )
                 weight = physical.rows / batch.objective_rows
@@ -296,9 +284,7 @@ class SequentialSampledIteration:
                     physical,
                     iteration=iteration,
                     reference_operation=(
-                        reference_operation
-                        if reference_caches is None
-                        else None
+                        reference_operation if reference_caches is None else None
                     ),
                     reference_cache=(
                         None
@@ -316,21 +302,128 @@ class SequentialSampledIteration:
             presentations += batch.rows
         finish_logical_step()
         if loss_tensors:
-            host_metrics = torch.stack(
-                tuple(
-                    torch.stack(tuple(values[name] for name in metric_names))
-                    for values in loss_tensors
+            host_metrics = (
+                torch.stack(
+                    tuple(
+                        torch.stack(tuple(values[name] for name in metric_names))
+                        for values in loss_tensors
+                    )
                 )
-            ).to(device="cpu").tolist()
+                .to(device="cpu")
+                .tolist()
+            )
             losses = tuple(
-                {
-                    name: float(row[index])
-                    for index, name in enumerate(metric_names)
-                }
+                {name: float(row[index]) for index, name in enumerate(metric_names)}
                 for row in host_metrics
             )
         else:
             losses = ()
+        if self.run_state is not None:
+            self.run_state.logical_work["minibatches"] += len(steps)
+            self.run_state.logical_work["optimizer_steps"] += sum(
+                int(step.applied) for step in steps
+            )
+            self.run_state.iteration = iteration + 1
+            self.run_state.metrics_prefix.append(
+                {
+                    "iteration": iteration,
+                    "statistical_presentations": presentations,
+                    "minibatches": len(steps),
+                    "optimizer_steps": sum(int(step.applied) for step in steps),
+                }
+            )
+        return IterationResult(losses, tuple(steps), presentations)
+
+
+class BranchedSampledIteration:
+    """Compose ragged decision sampling with the shared learner and optimizer."""
+
+    def __init__(
+        self,
+        *,
+        model: nn.Module,
+        learner: LearnerOperation,
+        optimizer: DenseAdam,
+        sigma_pack_cap: int,
+        action_pack_cap: int,
+        run_state: RunState | None = None,
+    ) -> None:
+        if not learner.mode.rollout_mode.is_branched:
+            raise ValueError("branched iteration requires a branched learner")
+        if min(sigma_pack_cap, action_pack_cap) <= 0:
+            raise ValueError("branched physical pack caps must be positive")
+        self.model = model
+        self.learner = learner
+        self.optimizer = optimizer
+        self.sigma_pack_cap = int(sigma_pack_cap)
+        self.action_pack_cap = int(action_pack_cap)
+        self.run_state = run_state
+
+    def optimize(
+        self,
+        sampler: BranchedBatchSampler,
+        *,
+        iteration: int,
+        reference_operation=None,
+    ) -> IterationResult:
+        metric_names = (
+            "total",
+            "policy",
+            "value",
+            "entropy",
+            "reference_kl",
+            "approximate_kl",
+            "clip_fraction",
+        )
+        metric_tensors: list[Tensor] = []
+        steps: list[OptimizerStep] = []
+        presentations = 0
+        active_logical_step: int | None = None
+        weighted: dict[str, Tensor] = {}
+
+        def finish_step() -> None:
+            if active_logical_step is None:
+                return
+            steps.append(self.optimizer.step())
+            metric_tensors.append(
+                torch.stack(tuple(weighted[name] for name in metric_names))
+            )
+
+        for batch in sampler.batches():
+            if batch.logical_step != active_logical_step:
+                finish_step()
+                self.optimizer.zero_grad()
+                active_logical_step = batch.logical_step
+                weighted = {}
+            if (
+                batch.rows > self.sigma_pack_cap
+                or batch.action_rows > self.action_pack_cap
+            ):
+                raise TrainingError(
+                    "ragged learner batch exceeds an admitted physical pack"
+                )
+            weight = batch.rows / batch.objective_rows
+            result = self.learner.forward_loss_backward(
+                batch,
+                iteration=iteration,
+                reference_operation=reference_operation,
+                loss_scale=self.optimizer.scaler.scale,
+                objective_weight=weight,
+            )
+            for name in metric_names:
+                weighted[name] = (
+                    weighted.get(name, 0.0) + weight * getattr(result, name).detach()
+                )
+            presentations += batch.rows
+        finish_step()
+        losses = (
+            tuple(
+                {name: float(row[index]) for index, name in enumerate(metric_names)}
+                for row in torch.stack(metric_tensors).cpu().tolist()
+            )
+            if metric_tensors
+            else ()
+        )
         if self.run_state is not None:
             self.run_state.logical_work["minibatches"] += len(steps)
             self.run_state.logical_work["optimizer_steps"] += sum(
@@ -396,10 +489,7 @@ def convert_value_head_units(
     selected = tuple(
         name
         for name in result
-        if (
-            name.startswith("preflop.")
-            or name.startswith("postflop.")
-        )
+        if (name.startswith("preflop.") or name.startswith("postflop."))
         and (
             name.endswith("value_head.affine.weight")
             or name.endswith("value_head.affine.bias")
@@ -416,6 +506,7 @@ def convert_value_head_units(
 
 __all__ = [
     "AttemptAddress",
+    "BranchedSampledIteration",
     "IterationResult",
     "OverflowRecoveryRecord",
     "PreemptionNotice",

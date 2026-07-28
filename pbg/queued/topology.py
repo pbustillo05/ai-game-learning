@@ -7,9 +7,9 @@ one immutable movement/layer plan for the CUDA target executor.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Sequence
 
 import torch
 from torch import Tensor
@@ -55,12 +55,8 @@ class TopologyBindings:
     def validate(self, nodes: int, edges: int) -> None:
         _cpu_vector("input_type", self.input_type, nodes, torch.int32)
         _cpu_vector("output_type", self.output_type, nodes, torch.int32)
-        _cpu_vector(
-            "sigma_target_row", self.sigma_target_row, nodes, torch.int32
-        )
-        _cpu_vector(
-            "child_output_type", self.child_output_type, edges, torch.int32
-        )
+        _cpu_vector("sigma_target_row", self.sigma_target_row, nodes, torch.int32)
+        _cpu_vector("child_output_type", self.child_output_type, edges, torch.int32)
 
 
 @dataclass(frozen=True)
@@ -99,6 +95,7 @@ class Topology:
         *,
         p_train: int,
         compact: bool = False,
+        _allow_zero_path: bool = False,
     ) -> None:
         n = self.node_count
         e = self.edge_count
@@ -158,13 +155,16 @@ class Topology:
             if trained:
                 if owner[node] >= p_train:
                     raise TopologyError("owner slot is outside P_train")
-                if min(
-                    family[node],
-                    sigma[node],
-                    action[node],
-                    input_type[node],
-                    sigma_target[node],
-                ) < 0:
+                if (
+                    min(
+                        family[node],
+                        sigma[node],
+                        action[node],
+                        input_type[node],
+                        sigma_target[node],
+                    )
+                    < 0
+                ):
                     raise TopologyError("trained topology row has a missing address")
             elif any(
                 value != -1
@@ -186,7 +186,7 @@ class Topology:
                 if edge_owner[edge] != -1:
                     raise TopologyError("topology child spans overlap")
                 edge_owner[edge] = node
-                if path_length[edge] < 1:
+                if path_length[edge] < (0 if _allow_zero_path else 1):
                     raise TopologyError("compressed path length must be positive")
                 kind = target_kind[edge]
                 row = target_row[edge]
@@ -238,11 +238,19 @@ class Topology:
                 node = parent[node]
 
     def compact(
-        self, bindings: TopologyBindings, *, p_train: int
-    ) -> tuple["Topology", TopologyBindings]:
+        self,
+        bindings: TopologyBindings,
+        *,
+        p_train: int,
+        _allow_zero_path: bool = False,
+    ) -> tuple[Topology, TopologyBindings]:
         """Delete headless ordinary unary rows and summarize their paths."""
 
-        self.validate(bindings, p_train=p_train)
+        self.validate(
+            bindings,
+            p_train=p_train,
+            _allow_zero_path=_allow_zero_path,
+        )
         n = self.node_count
         if n == 0:
             return self, bindings
@@ -250,8 +258,7 @@ class Topology:
         nominal = self.nominal_degree.tolist()
         owner = self.owner.tolist()
         keep = [
-            owner[row] >= 0 or degree[row] >= 2 or nominal[row] >= 2
-            for row in range(n)
+            owner[row] >= 0 or degree[row] >= 2 or nominal[row] >= 2 for row in range(n)
         ]
         if all(keep):
             self.validate(bindings, p_train=p_train, compact=True)
@@ -385,9 +392,7 @@ class TopologyPacket:
             raise TopologyError("packet addresses must be nonnegative")
         if self.commit_sequence != self.sequence:
             raise TopologyError("topology packet is not transactionally committed")
-        self.bindings.validate(
-            self.topology.node_count, self.topology.edge_count
-        )
+        self.bindings.validate(self.topology.node_count, self.topology.edge_count)
 
 
 def assemble_topology_packets(
@@ -559,9 +564,7 @@ class LayerPlan:
             self.edge_count,
             torch.float32,
         )
-        _cpu_vector(
-            "layer_ptr", self.layer_ptr, self.layer_count + 1, torch.int32
-        )
+        _cpu_vector("layer_ptr", self.layer_ptr, self.layer_count + 1, torch.int32)
         layer_ptr = self.layer_ptr.tolist()
         if (
             not layer_ptr
@@ -577,9 +580,7 @@ class LayerPlan:
             "movement_output_type",
         )
         for name in movement_fields:
-            _cpu_vector(
-                name, getattr(self, name), self.movement_count, torch.int32
-            )
+            _cpu_vector(name, getattr(self, name), self.movement_count, torch.int32)
         if self.node_count > manifest.topology_cap:
             raise TopologyError("realized LayerPlan exceeds topology_cap")
         if self.edge_count > manifest.topology_edge_cap:
@@ -595,9 +596,8 @@ class LayerPlan:
         n_replica = manifest.n_replica
         input_count = len(self.input_names)
         output_count = len(self.output_names)
-        if (
-            len(self.output_widths) != output_count
-            or any(width <= 0 for width in self.output_widths)
+        if len(self.output_widths) != output_count or any(
+            width <= 0 for width in self.output_widths
         ):
             raise TopologyError("LayerPlan output widths are invalid")
         trained_caps = manifest.partition_rows("trained_player_cap")
@@ -617,15 +617,13 @@ class LayerPlan:
         action_count = output_count if self.branched else input_count
         if any(len(rows) != action_count for rows in self.action_rows):
             raise TopologyError("LayerPlan action partition axis is invalid")
-        if (
-            len(set(self.supported_conversions))
-            != len(self.supported_conversions)
-            or any(
-                source == destination
-                or not 0 <= source < output_count
-                or not 0 <= destination < output_count
-                for source, destination in self.supported_conversions
-            )
+        if len(set(self.supported_conversions)) != len(
+            self.supported_conversions
+        ) or any(
+            source == destination
+            or not 0 <= source < output_count
+            or not 0 <= destination < output_count
+            for source, destination in self.supported_conversions
         ):
             raise TopologyError("LayerPlan conversion vocabulary is invalid")
         child_lane = [-1] * self.edge_count
@@ -641,9 +639,7 @@ class LayerPlan:
                     int(self.destination_work_row[row]),
                 )
                 if key in destinations:
-                    raise TopologyError(
-                        "LayerPlan layer destinations are not distinct"
-                    )
+                    raise TopologyError("LayerPlan layer destinations are not distinct")
                 destinations.add(key)
         for row in range(self.node_count):
             lane = int(self.replica[row])
@@ -657,10 +653,13 @@ class LayerPlan:
             count = int(self.child_count[row])
             target_count = int(self.target_degree[row])
             nominal = int(self.nominal_degree[row])
+            refilled_root = target_count < count
             if (
                 begin < 0
                 or begin + count > self.edge_count
-                or not 1 <= target_count <= count <= manifest.beta_max
+                or not 1 <= target_count <= count
+                or target_count > manifest.beta_max
+                or (count > manifest.beta_max and not refilled_root)
                 or not 1 <= nominal <= manifest.beta_max
                 or (
                     not self.branched
@@ -699,14 +698,9 @@ class LayerPlan:
                 raise TopologyError(
                     "LayerPlan sigma target exceeds its realized reservation"
                 )
-            if (
-                not self.branched
-                and (
-                    int(self.sigma_head_row[row])
-                    != int(self.sigma_target_row[row])
-                    or int(self.action_begin[row])
-                    != int(self.sigma_target_row[row])
-                )
+            if not self.branched and (
+                int(self.sigma_head_row[row]) != int(self.sigma_target_row[row])
+                or int(self.action_begin[row]) != int(self.sigma_target_row[row])
             ):
                 raise TopologyError(
                     "sequential head and target rows must share one identity"
@@ -726,7 +720,10 @@ class LayerPlan:
                 else self.input_names[action_type]
             )
             action_stop = int(self.action_begin[row]) + int(self.target_degree[row])
-            if int(self.action_begin[row]) < 0 or action_stop > action_caps[action_name]:
+            if (
+                int(self.action_begin[row]) < 0
+                or action_stop > action_caps[action_name]
+            ):
                 raise TopologyError("LayerPlan action target span is out of bounds")
             if action_stop > self.action_rows[lane][action_type]:
                 raise TopologyError(
@@ -779,9 +776,7 @@ class LayerPlan:
             or self.rb_written_components != written_components
         ):
             raise TopologyError("LayerPlan traffic summary is inconsistent")
-        if self.target_edge_count != sum(
-            int(value) for value in self.target_degree
-        ):
+        if self.target_edge_count != sum(int(value) for value in self.target_degree):
             raise TopologyError("LayerPlan target-edge summary is inconsistent")
         movement_destinations: set[tuple[int, int, int]] = set()
         movement_sources: list[set[int]] = [set() for _ in range(n_replica)]
@@ -897,9 +892,7 @@ def build_layer_plan(
         for topology in topologies
         for value in (*topology.executed_degree, *topology.nominal_degree)
     ):
-        raise TopologyError(
-            "sequential topology requires N=N_tilde=1 at every row"
-        )
+        raise TopologyError("sequential topology requires N=N_tilde=1 at every row")
     compacted = [
         topology.compact(binding, p_train=p_train)
         for topology, binding in zip(topologies, bindings, strict=True)
@@ -955,9 +948,7 @@ def build_layer_plan(
                 name = input_names[input_type]
                 family_row = int(topology.familywork_row[node])
                 if not 0 <= family_row < player_caps[name]:
-                    raise TopologyError(
-                        "topology family-work address is out of bounds"
-                    )
+                    raise TopologyError("topology family-work address is out of bounds")
         if mode.rollout_mode is RolloutMode.SEQUENTIAL:
             for node in range(topology.node_count):
                 if int(topology.owner[node]) < 0:
@@ -994,9 +985,7 @@ def build_layer_plan(
     movement: list[tuple[int, int, int, int]] = []
     leaf_source_rows: list[set[int]] = [set() for _ in compacted]
     arena_max = [[0] * output_count for _ in compacted]
-    next_slot = [
-        [[0, 0] for _ in range(output_count)] for _ in compacted
-    ]
+    next_slot = [[[0, 0] for _ in range(output_count)] for _ in compacted]
     free_slot: list[list[list[list[int]]]] = [
         [[[], []] for _ in range(output_count)] for _ in compacted
     ]
@@ -1111,17 +1100,13 @@ def build_layer_plan(
             )
             if int(topology.parent[node]) >= 0:
                 encoded_destination = (
-                    destination
-                    if destination_arena == 0
-                    else -destination - 1
+                    destination if destination_arena == 0 else -destination - 1
                 )
-                new_results[
-                    (lane, int(TargetKind.TOPOLOGY), node, output)
-                ] = encoded_destination
+                new_results[(lane, int(TargetKind.TOPOLOGY), node, output)] = (
+                    encoded_destination
+                )
             else:
-                root_destinations.append(
-                    (lane, output, destination_arena, destination)
-                )
+                root_destinations.append((lane, output, destination_arena, destination))
         next_current = {
             key: source for key, source in current.items() if key not in consumed
         }

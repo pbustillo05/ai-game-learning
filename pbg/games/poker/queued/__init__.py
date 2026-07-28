@@ -45,10 +45,23 @@ from pbg.games.poker.queued.response import (
     paired_probe_statistics,
     training_probe_seats,
 )
+from pbg.games.poker.queued.branching import (
+    BranchedPokerError,
+    BranchedPokerResult,
+    BranchedSampledPokerHooks,
+    BranchedSampledPokerIteration,
+    BranchedTopologyRecorder,
+    RecoveringBranchedSampledPokerIteration,
+)
 
 __all__ = [
     "ActorSample",
     "BoundPokerPolicy",
+    "BranchedPokerError",
+    "BranchedPokerResult",
+    "BranchedSampledPokerHooks",
+    "BranchedSampledPokerIteration",
+    "BranchedTopologyRecorder",
     "CHECK_CALL",
     "FOLD",
     "NLHEGeometry",
@@ -69,6 +82,7 @@ __all__ = [
     "QueuedPokerError",
     "SampledShowdownBinding",
     "RBCompletionBinding",
+    "RecoveringBranchedSampledPokerIteration",
     "SequentialPokerHooks",
     "SequentialSampledPokerHooks",
     "SequentialPokerIteration",
