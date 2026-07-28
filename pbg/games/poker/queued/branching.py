@@ -194,6 +194,7 @@ class BranchedTopologyRecorder:
         self.topology_packet_cap = topology_packet_cap
         self.device = device
         self._nodes: dict[tuple[int, int], _CompactNode] = {}
+        self._compressed_roots: dict[tuple[int, int], _CompactNode] = {}
         self._pending: dict[tuple[int, int], list[_CompactEdge]] = {}
         self._tree_edges: dict[int, int] = {}
         self._root_degrees: dict[int, int] = {}
@@ -332,6 +333,13 @@ class BranchedTopologyRecorder:
                 self._root_degrees[logical_root] = (
                     self._root_degrees.get(logical_root, 0) + degree
                 )
+            compressed_root = self._compressed_roots.pop(key, None)
+            if compressed_root is not None:
+                if not bool(record.refill[row]):
+                    raise BranchedPokerError(
+                        "a compressed branched root was expanded twice"
+                    )
+                self._nodes[key] = compressed_root
             incoming = self._pending.pop(key, [])
             trained = bool(record.trained[row])
             retain = (
@@ -383,6 +391,22 @@ class BranchedTopologyRecorder:
                         "only ordinary unary rows may be compressed"
                     )
                 child = outgoing[0]
+                if key[1] == 0 and not incoming:
+                    compressed = _CompactNode(
+                        key=key,
+                        executed_degree=degree,
+                        nominal_degree=int(record.nominal_degree[row]),
+                        target_degree=int(record.target_degree[row]),
+                        owner=-1,
+                        input_type=-1,
+                        familywork_row=-1,
+                        sigma_head_row=-1,
+                        action_begin=-1,
+                        edges=outgoing,
+                    )
+                    self._compressed_roots[key] = compressed
+                    if not child.terminal:
+                        self._pending.setdefault(child.child_key, []).append(child)
                 for edge in incoming:
                     edge.path_length += child.path_length
                     edge.terminal = child.terminal
@@ -390,12 +414,17 @@ class BranchedTopologyRecorder:
                     edge.child_leaf_row = child.child_leaf_row
                     if not edge.terminal:
                         self._pending.setdefault(edge.child_key, []).append(edge)
-        if len(self._nodes) > self.topology_cap:
+        compact_node_count = len(self._nodes) + len(self._compressed_roots)
+        if compact_node_count > self.topology_cap:
             raise BranchedTopologyArenaOverflow(
                 capacity=self.topology_cap,
-                observed_demand=len(self._nodes),
+                observed_demand=compact_node_count,
             )
-        compact_edges = sum(len(node.edges) for node in self._nodes.values())
+        compact_edges = sum(
+            len(node.edges)
+            for nodes in (self._nodes.values(), self._compressed_roots.values())
+            for node in nodes
+        )
         if compact_edges > self.topology_edge_cap:
             raise BranchedTopologyArenaOverflow(
                 capacity=self.topology_edge_cap,
@@ -517,6 +546,7 @@ class BranchedTopologyRecorder:
         """Release the fixed pinned topology arena at its rollout consumer."""
 
         self._nodes.clear()
+        self._compressed_roots.clear()
         self._pending.clear()
         self._tree_edges.clear()
         self._root_degrees.clear()
@@ -994,6 +1024,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 cost=None,
                 log_player_ancestor_sum=endpoint_log_sum,
                 log_ancestor_product=endpoint_log_product,
+                active=current_active,
             )
             ones = torch.ones_like(chance_decision.executed_degree)
             chance_decision = BranchDecision(
@@ -1080,6 +1111,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 path=next_key[:, 1],
                 draw=generation,
                 retry_epoch=retry,
+                active=next_active,
             )
             final_generation = generation == 2
             terminal_child = (
@@ -1877,51 +1909,57 @@ class _BranchedSampledPokerAttempt:
             trained = forward.owner.to(torch.int64).eq(
                 forward.role_selector.to(torch.int64)
             )
-            groups: list[tuple[Tensor, ModelEvaluation]] = []
-            for mask, operation in (
-                (trained, self.model_operation),
-                (~trained, self.frozen_operation),
+            trained_evaluation = self.model_operation(
+                forward.input_type,
+                forward.model_input,
+                forward.sampled_private_state,
+                forward.owner,
+            )
+            frozen_evaluation = self.frozen_operation(
+                forward.input_type,
+                forward.model_input,
+                forward.sampled_private_state,
+                forward.owner,
+            )
+            if (
+                trained_evaluation.policy_raw.keys()
+                != frozen_evaluation.policy_raw.keys()
+                or trained_evaluation.public_heads.keys()
+                != frozen_evaluation.public_heads.keys()
             ):
-                row = torch.nonzero(mask, as_tuple=False).flatten()
-                if row.numel():
-                    groups.append(
-                        (
-                            row,
-                            operation(
-                                forward.input_type,
-                                forward.model_input.index_select(0, row),
-                                forward.sampled_private_state.index_select(0, row),
-                                forward.owner.index_select(0, row),
-                            ),
-                        )
-                    )
-            prototype = groups[0][1]
-
-            def merge(name: str, *, public: bool = False) -> Tensor:
-                source = (
-                    prototype.public_heads[name]
-                    if public
-                    else (
-                        prototype.value
-                        if name == "value"
-                        else prototype.policy_raw[name]
-                    )
+                raise BranchedPokerError(
+                    "trained and frozen BR models expose different heads"
                 )
-                result = source.new_empty((forward.owner.numel(), *source.shape[1:]))
-                for row, item in groups:
-                    value = (
-                        item.public_heads[name]
-                        if public
-                        else (item.value if name == "value" else item.policy_raw[name])
+
+            def select(trained_value: Tensor, frozen_value: Tensor) -> Tensor:
+                if trained_value.shape != frozen_value.shape:
+                    raise BranchedPokerError(
+                        "trained and frozen BR model heads have different shapes"
                     )
-                    result.index_copy_(0, row, value)
-                return result
+                mask = trained
+                while mask.ndim < trained_value.ndim:
+                    mask = mask.unsqueeze(-1)
+                return torch.where(mask, trained_value, frozen_value)
 
             evaluation = ModelEvaluation(
-                MappingProxyType({name: merge(name) for name in prototype.policy_raw}),
-                merge("value"),
                 MappingProxyType(
-                    {name: merge(name, public=True) for name in prototype.public_heads}
+                    {
+                        name: select(
+                            trained_evaluation.policy_raw[name],
+                            frozen_evaluation.policy_raw[name],
+                        )
+                        for name in trained_evaluation.policy_raw
+                    }
+                ),
+                select(trained_evaluation.value, frozen_evaluation.value),
+                MappingProxyType(
+                    {
+                        name: select(
+                            trained_evaluation.public_heads[name],
+                            frozen_evaluation.public_heads[name],
+                        )
+                        for name in trained_evaluation.public_heads
+                    }
                 ),
             )
         if set(evaluation.public_heads) != {"trace", "cost"}:
@@ -2368,7 +2406,8 @@ class _BranchedSampledPokerAttempt:
 
 
 def _discard_attempt(owners: GeneratedOwners) -> None:
-    owners.abort_failed_lane(0)
+    if owners.failure_state.snapshot(0) is not None:
+        owners.abort_failed_lane(0)
     owners.release_after(ExecutionPhase.ROLLOUT)
     for phase in (
         ExecutionPhase.QUEUE_DRAIN,

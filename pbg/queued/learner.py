@@ -25,6 +25,7 @@ from pbg.queued.contracts import (
     PrivateEstimator,
     RolloutMode,
 )
+from pbg.queued.cuda_alias import alias_table_cuda
 from pbg.queued.storage import (
     DeviceDestinationRequest,
     MonotoneSlab,
@@ -1039,31 +1040,20 @@ def _alias_table(log_weights: Tensor) -> tuple[Tensor, Tensor]:
         torch.isfinite(work).all(), "alias log weights must be finite"
     )
     size = work.numel()
-    scaled = torch.exp(work - torch.logsumexp(work, 0)) * size
-    probability = torch.ones_like(scaled)
-    alias = torch.arange(size, dtype=torch.int32, device=work.device)
-    indices = torch.arange(size, dtype=torch.int64, device=work.device)
-    live = torch.ones(size, dtype=torch.bool, device=work.device)
-    # A fixed N-step device program implements deterministic LIFO Walker
-    # pairing. Tensor scalar indices remain on the accelerator.
-    for _ in range(size):
-        small = live & scaled.lt(1)
-        large = live & ~small
-        low = torch.where(small, indices, -1).argmax()
-        high = torch.where(large, indices, -1).argmax()
-        active = small.any() & large.any()
-        low_mask = indices.eq(low) & active
-        high_mask = indices.eq(high) & active
-        low_value = scaled.gather(0, low.reshape(1)).squeeze(0)
-        high_value = scaled.gather(0, high.reshape(1)).squeeze(0)
-        probability = torch.where(low_mask, low_value, probability)
-        alias = torch.where(low_mask, high.to(torch.int32), alias)
-        scaled = torch.where(
-            high_mask,
-            high_value - (1 - low_value),
-            scaled,
-        )
-        live = live & ~low_mask
+    scaled = (
+        torch.exp(work - torch.logsumexp(work, 0)) * size
+    ).contiguous()
+    probability = torch.empty_like(scaled)
+    alias = torch.empty(size, dtype=torch.int32, device=work.device)
+    small = torch.empty(size, dtype=torch.int64, device=work.device)
+    large = torch.empty_like(small)
+    alias_table_cuda().build_alias_table(
+        scaled,
+        probability,
+        alias,
+        small,
+        large,
+    )
     return probability, alias
 
 

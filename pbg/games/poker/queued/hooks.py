@@ -108,14 +108,12 @@ class NLHEGeometry:
 
     @property
     def stack_ticks(self) -> int:
-        return int(round(self.stack_bb * 2))
+        return round(self.stack_bb * 2)
 
     @property
     def player_node_bound(self) -> int:
-        return int(
-            math.ceil(
-                self.stack_bb * self.players + 3 * self.players - self.stack_bb + 1
-            )
+        return math.ceil(
+            self.stack_bb * self.players + 3 * self.players - self.stack_bb + 1
         )
 
     @property
@@ -360,7 +358,6 @@ class PokerStateMachine:
         )
         combo_ids = self.geometry.combo_id(private_cards[..., 0], private_cards[..., 1])
         button = (roots % self.geometry.players).to(torch.int32)
-        seats = torch.arange(self.geometry.players, device=device)
         if self.geometry.players == 2:
             small_blind = button
             big_blind = (button + 1) % 2
@@ -846,10 +843,20 @@ class PokerStateMachine:
         self,
         state: PokerState,
         logical_key: Tensor,
+        *,
+        active: Tensor | None = None,
     ) -> PokerState:
         """Deal the next public street from the unused compact deck."""
 
         needs = self.needs_chance(state)
+        if active is not None:
+            if (
+                active.device != state.device
+                or active.dtype != torch.bool
+                or active.shape != (state.rows,)
+            ):
+                raise QueuedPokerError("chance active mask must be CUDA bool [B]")
+            needs &= active
         if logical_key.shape != (state.rows, self.geometry.deck_cards):
             raise QueuedPokerError("chance keys must be [B,D]")
         cards = torch.arange(
@@ -925,6 +932,7 @@ class PokerStateMachine:
         path: Tensor,
         draw: int,
         retry_epoch: Tensor | int,
+        active: Tensor | None = None,
     ) -> PokerState:
         """Own chance labels at schedule-independent logical RNG addresses."""
 
@@ -938,7 +946,15 @@ class PokerStateMachine:
         card_ordinal = torch.arange(
             self.geometry.deck_cards, dtype=torch.int64, device=state.device
         )
-        active = self.needs_chance(state)
+        chance_active = self.needs_chance(state)
+        if active is not None:
+            if (
+                active.device != state.device
+                or active.dtype != torch.bool
+                or active.shape != root.shape
+            ):
+                raise QueuedPokerError("chance active mask must be CUDA bool [B]")
+            chance_active &= active
         expanded_retry = (
             retry_epoch[:, None]
             if isinstance(retry_epoch, Tensor) and retry_epoch.shape == root.shape
@@ -952,9 +968,9 @@ class PokerStateMachine:
             draw=draw * self.geometry.deck_cards + card_ordinal[None, :],
             purpose=DrawPurpose.CHANCE,
             retry_epoch=expanded_retry,
-            active=active[:, None],
+            active=chance_active[:, None],
         )
-        return self.deal_next_street(state, key)
+        return self.deal_next_street(state, key, active=chance_active)
 
     def combo_cards(self, combo_ids: Tensor) -> Tensor:
         """Invert contract-v2 lexicographic combo ids on the accelerator."""

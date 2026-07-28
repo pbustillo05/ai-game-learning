@@ -190,6 +190,7 @@ class BranchController(Protocol):
         log_player_ancestor_sum: Tensor,
         log_ancestor_product: Tensor,
         frontier_cost: Tensor | None = None,
+        active: Tensor | None = None,
     ) -> BranchDecision: ...
 
     def observe(
@@ -262,6 +263,7 @@ class FixedBranchController:
         log_player_ancestor_sum: Tensor,
         log_ancestor_product: Tensor,
         frontier_cost: Tensor | None = None,
+        active: Tensor | None = None,
     ) -> BranchDecision:
         del trace, cost, log_player_ancestor_sum, log_ancestor_product
         if schema.rollout_mode is not self.mode:
@@ -293,6 +295,7 @@ class FixedBranchController:
                 draw=0,
                 purpose=DrawPurpose.ROUND,
                 retry_epoch=retry_epoch,
+                active=active,
             )
         )
         nominal = randomized_round(beta, uniform)
@@ -420,6 +423,7 @@ class KKTBranchController:
         log_player_ancestor_sum: Tensor,
         log_ancestor_product: Tensor,
         frontier_cost: Tensor | None = None,
+        active: Tensor | None = None,
     ) -> BranchDecision:
         if schema.rollout_mode is not self.mode:
             raise BranchingError("KKT controller received a different mode")
@@ -430,11 +434,17 @@ class KKTBranchController:
                 dtype=torch.float32,
             )
         else:
-            has_player = bool(owner_is_player.any())
-            if has_player and (trace is None or cost is None):
+            if (trace is None) != (cost is None):
                 raise BranchingError("active KKT branching requires T/C heads")
-            player_beta = (
-                log_kkt_intensity(
+            if trace is None:
+                torch._assert_async(
+                    (~owner_is_player).all(),
+                    "active KKT branching requires T/C heads",
+                )
+                player_beta = torch.ones_like(root, dtype=torch.float32)
+            else:
+                assert cost is not None
+                player_beta = log_kkt_intensity(
                     trace,
                     cost,
                     log_kappa=self.log_kappa,
@@ -442,9 +452,6 @@ class KKTBranchController:
                     log_ancestor_product=log_ancestor_product,
                     beta_max=self.beta_max,
                 )
-                if has_player
-                else torch.ones_like(root, dtype=torch.float32)
-            )
             player_beta = (player_beta * self.emergency_scale).clamp_min(1)
         chance = torch.full_like(
             player_beta,
@@ -463,6 +470,7 @@ class KKTBranchController:
                 draw=0,
                 purpose=DrawPurpose.ROUND,
                 retry_epoch=retry_epoch,
+                active=active,
             )
         )
         nominal = randomized_round(beta, uniform)

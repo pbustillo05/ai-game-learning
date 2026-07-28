@@ -14,12 +14,18 @@ from pbg.games.poker.queued import (
 )
 from pbg.games.poker.queued import (
     NLHEGeometry,
+    PokerStateMachine,
     sampled_partitions,
+)
+from pbg.games.poker.queued.branching import (
+    BranchedTopologyRecorder,
+    _discard_attempt,
+    _ExpansionRecord,
+    _StagedBranchedPayload,
 )
 from pbg.games.poker.queued.branching import (
     _BranchedSampledPokerAttempt as BranchedSampledPokerIteration,
 )
-from pbg.games.poker.queued.branching import _discard_attempt
 from pbg.queued import (
     BranchedModeConfig,
     BranchedOverflowRecovery,
@@ -289,6 +295,57 @@ def test_cuda_alias_table_preserves_log_mass_without_cpu_underflow() -> None:
         atol=1.0e-15,
         rtol=1.0e-12,
     )
+
+
+@CUDA
+def test_cuda_alias_table_scales_to_large_decision_owner() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    rows = 65_536
+    log_weight = torch.linspace(
+        -40,
+        0,
+        rows,
+        dtype=torch.float64,
+        device=device,
+    )
+    threshold, alias = _alias_table(log_weight)
+    torch.cuda.synchronize(device)
+    assert threshold.shape == (rows,)
+    assert alias.shape == (rows,)
+    assert bool(torch.isfinite(threshold).all())
+    assert bool(((threshold >= 0) & (threshold <= 1)).all())
+    assert bool(((alias >= 0) & (alias < rows)).all())
+
+
+@CUDA
+def test_inactive_fixed_chance_rows_do_not_draw_or_transition() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    machine = PokerStateMachine(NLHEGeometry(2, 8.0, 4))
+    initial = machine.initial_roots(
+        2,
+        seed=37,
+        iteration=0,
+        retry_epoch=0,
+        device=device,
+    )
+    state = replace(initial, pending=torch.zeros_like(initial.pending))
+    active = torch.tensor([True, False], dtype=torch.bool, device=device)
+    dealt = machine.deal_next_street_keyed(
+        state,
+        seed=41,
+        iteration=3,
+        root=torch.tensor([5, 6], dtype=torch.int64, device=device),
+        path=torch.tensor([7, 8], dtype=torch.int64, device=device),
+        draw=0,
+        retry_epoch=0,
+        active=active,
+    )
+    assert int(dealt.street[0]) == 1
+    for name in state.__dataclass_fields__:
+        torch.testing.assert_close(
+            getattr(dealt, name)[1],
+            getattr(state, name)[1],
+        )
 
 
 @CUDA
@@ -644,6 +701,83 @@ def test_failed_branched_attempt_releases_every_generated_owner() -> None:
     }
     with pytest.raises(StorageError, match="released"):
         owners.failure_state.snapshot(0)
+
+
+@CUDA
+def test_healthy_branched_attempt_discard_releases_without_failure_record() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = mode_schema("self_play", "branched.fixed", "sampled")
+    plan = build_storage_plan(
+        mode,
+        sampled_partitions(2),
+        _manifest(device),
+        replace(_phase5_layout(geometry), player_count=2),
+        device,
+    )
+    owners = GeneratedOwners(plan)
+    owners.enter_phase(ExecutionPhase.ROLLOUT)
+    _discard_attempt(owners)
+    assert owners.released_keys == {
+        allocation.key for allocation in plan.allocations
+    }
+
+
+@CUDA
+def test_untrained_unary_root_refill_restores_one_structural_root() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    recorder = BranchedTopologyRecorder(
+        input_names=("pre",),
+        p_train=2,
+        topology_cap=8,
+        topology_edge_cap=8,
+        topology_packet_cap=4,
+        device=device,
+    )
+
+    def payload(*, refill: bool, child_path: int, leaf_row: int):
+        record = _ExpansionRecord(
+            node_active=torch.tensor([True]),
+            edge_active=torch.tensor([True]),
+            parent_key=torch.tensor([[0, 0]], dtype=torch.int64),
+            child_key=torch.tensor([[0, child_path]], dtype=torch.int64),
+            source_ordinal=torch.tensor([0], dtype=torch.int64),
+            terminal=torch.tensor([True]),
+            child_input=torch.tensor([0], dtype=torch.int32),
+            child_leaf_row=torch.tensor([leaf_row], dtype=torch.int64),
+            label=torch.tensor([child_path], dtype=torch.int32),
+            owner=torch.tensor([0], dtype=torch.int32),
+            input_type=torch.tensor([0], dtype=torch.int32),
+            familywork_row=torch.tensor([0], dtype=torch.int32),
+            sigma_head_row=torch.tensor([-1], dtype=torch.int32),
+            action_begin=torch.tensor([-1], dtype=torch.int32),
+            executed_degree=torch.tensor([1], dtype=torch.int32),
+            nominal_degree=torch.tensor([1], dtype=torch.int32),
+            target_degree=torch.tensor([1], dtype=torch.int32),
+            trained=torch.tensor([False]),
+            refill=torch.tensor([refill]),
+            path_length=torch.tensor([1], dtype=torch.int32),
+        )
+        return _StagedBranchedPayload(
+            (record,),
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(0, dtype=torch.float32),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(False),
+            torch.tensor(1, dtype=torch.int64),
+        )
+
+    recorder.accept_payload(payload(refill=False, child_path=11, leaf_row=0))
+    recorder.accept_payload(payload(refill=True, child_path=12, leaf_row=1))
+    topology, _, leaf_count = recorder.seal()
+    assert topology.node_count == 1
+    assert topology.executed_degree.tolist() == [2]
+    assert topology.target_degree.tolist() == [1]
+    assert topology.parent.tolist() == [-1]
+    assert leaf_count == 2
+    recorder.release()
 
 
 @CUDA
