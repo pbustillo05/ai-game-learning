@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -12,8 +14,7 @@ from pbg.inference_artifact import (
     INFERENCE_ARTIFACT_SCHEMA_VERSION,
     load_inference_source,
 )
-from pbg.queued.persistence import CHECKPOINT_SCHEMA
-
+from pbg.queued.persistence import CHECKPOINT_SCHEMA, model_state_sha256
 
 CONFIG = Path("configs/train/nlhe_hu_8bb_normal_queued_smoke.yaml")
 
@@ -21,20 +22,39 @@ CONFIG = Path("configs/train/nlhe_hu_8bb_normal_queued_smoke.yaml")
 def _artifact(path: Path, device: str) -> Path:
     config = load_config(CONFIG)
     model = build_model_from_config(config.scientific_mapping(), device)
-    torch.save(
-        {
-            "artifact_schema": INFERENCE_ARTIFACT_SCHEMA_VERSION,
-            "source_checkpoint_schema": CHECKPOINT_SCHEMA,
-            "source_checkpoint_sha256": "1" * 64,
-            "iteration": 7,
-            "scientific_config": config.scientific_mapping(),
-            "model": {
-                name: value.detach().cpu()
-                for name, value in model.state_dict().items()
-            },
-        },
-        path,
-    )
+    model_state = {
+        name: value.detach().cpu()
+        for name, value in model.state_dict().items()
+    }
+    artifact = {
+        "artifact_schema": INFERENCE_ARTIFACT_SCHEMA_VERSION,
+        "source_checkpoint_schema": CHECKPOINT_SCHEMA,
+        "source_checkpoint_sha256": "1" * 64,
+        "iteration": 7,
+        "scientific_config": config.scientific_mapping(),
+        "model": model_state,
+        "model_sha256": model_state_sha256(model_state),
+    }
+    identity = {
+        name: artifact[name]
+        for name in (
+            "artifact_schema",
+            "source_checkpoint_schema",
+            "source_checkpoint_sha256",
+            "iteration",
+            "scientific_config",
+            "model_sha256",
+        )
+    }
+    artifact["payload_sha256"] = hashlib.sha256(
+        json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+    torch.save(artifact, path)
     return path
 
 

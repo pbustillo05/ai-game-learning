@@ -796,6 +796,32 @@ class SequentialBatchSampler:
             return rows * self.schedule.epochs
         return self.schedule.gradient_steps * self.schedule.batch_size
 
+    @property
+    def optimizer_steps(self) -> int:
+        """Number of logical optimizer transitions without consuming RNG."""
+
+        if self.schedule.gradient_steps is not None:
+            return self.schedule.gradient_steps
+        if self.statistical_counts is None:
+            return self.schedule.epochs * sum(
+                (store.rows + self.schedule.batch_size - 1)
+                // self.schedule.batch_size
+                for store in self.stores.values()
+            )
+        total = 0
+        for name, requested in self.statistical_counts.items():
+            rows = self.stores[name].rows
+            full, remainder = divmod(requested, rows)
+            total += full * (
+                (rows + self.schedule.batch_size - 1)
+                // self.schedule.batch_size
+            )
+            if remainder:
+                total += (
+                    remainder + self.schedule.batch_size - 1
+                ) // self.schedule.batch_size
+        return total
+
     def batches(self) -> Iterator[SequentialLearnerBatch]:
         if self.statistical_counts is not None:
             logical_steps = self.schedule.gradient_steps or 1

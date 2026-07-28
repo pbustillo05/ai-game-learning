@@ -4430,6 +4430,8 @@ class ReplicaBranchedPokerIteration:
                         "branched replica target padding failed",
                     )
         owners.release_after(ExecutionPhase.COMPLETION)
+        if self.distributed is not None:
+            self.distributed.barrier()
 
         owners.enter_phase(ExecutionPhase.ALIGN_AND_SEAL)
         sealed: dict[tuple[int, str], SealedBranchedInputs] = {}
@@ -4575,6 +4577,19 @@ class ReplicaBranchedPokerIteration:
             ):
                 generator.set_state(state)
             self.optimizers.zero_grad(range(count))
+        if self.distributed is not None:
+            local = torch.zeros(
+                count,
+                dtype=torch.bool,
+                device=owners.plan.device,
+            )
+            if preflight_error is not None:
+                local.fill_(True)
+            common = self.distributed.agree_failures(local)
+            if bool(common.any()) and preflight_error is None:
+                preflight_error = BranchedPokerError(
+                    "replica learner preflight failed on another rank"
+                )
         if preflight_error is not None:
             for value in sealed.values():
                 value.release()

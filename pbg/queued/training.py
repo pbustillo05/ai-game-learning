@@ -273,6 +273,12 @@ class SequentialSampledIteration:
         weighted_metrics: dict[str, Tensor] = {}
         step_error: Exception | None = None
         agree_failure = getattr(self.optimizer, "agree_failure", None)
+        common_step_count = getattr(self.optimizer, "common_step_count", None)
+        expected_steps = (
+            sampler.optimizer_steps
+            if common_step_count is None
+            else common_step_count(sampler.optimizer_steps)
+        )
 
         def finish_logical_step() -> None:
             nonlocal step_error
@@ -358,6 +364,17 @@ class SequentialSampledIteration:
                     step_error = exc
             presentations += batch.rows
         finish_logical_step()
+        while len(steps) < expected_steps:
+            self.optimizer.zero_grad()
+            if agree_failure is not None and agree_failure(False):
+                raise TrainingError(
+                    "learner step failed on another distributed rank"
+                )
+            steps.append(self.optimizer.step())
+        if len(steps) != expected_steps:
+            raise TrainingError(
+                "learner sampler exceeded its rank-common optimizer budget"
+            )
         if loss_tensors:
             host_metrics = (
                 torch.stack(

@@ -24,10 +24,14 @@ def main() -> None:
     raw["execution"]["iterations"] = args.iterations
     raw["execution"]["output_dir"] = args.out
     raw["execution"]["run_id"] = "nlhe_hu_8bb_normal_distributed_smoke"
-    TrainingSession(
+    session = TrainingSession(
         load_config_mapping(raw),
         resume_from=args.resume,
-    ).run()
+    )
+    try:
+        session.run()
+    finally:
+        session.close()
 
 
 if __name__ == "__main__":

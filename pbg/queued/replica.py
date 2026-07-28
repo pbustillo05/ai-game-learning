@@ -314,6 +314,23 @@ class DistributedSUM:
         gradients.masked_fill_(~active[:, None], 0.0)
         dist.all_reduce(gradients, op=dist.ReduceOp.SUM, group=self.group)
 
+    def barrier(self) -> None:
+        """Keep rank-varying work ahead of shared lazy CUDA modules phase-safe."""
+
+        dist.barrier(
+            group=self.group,
+            device_ids=[torch.cuda.current_device()],
+        )
+
+    def maximum_steps(self, local_steps: int, *, device: torch.device) -> int:
+        """Return one rank-common optimizer-call budget."""
+
+        if isinstance(local_steps, bool) or local_steps < 0:
+            raise ValueError("local optimizer step count must be nonnegative")
+        count = torch.tensor([local_steps], dtype=torch.int64, device=device)
+        dist.all_reduce(count, op=dist.ReduceOp.MAX, group=self.group)
+        return int(count.item())
+
 
 @dataclass(frozen=True)
 class ReplicaStepResult:
@@ -521,6 +538,16 @@ class ReplicaLaneOptimizer:
         )
         local[self.lane] = bool(failed)
         return bool(self.distributed.agree_failures(local)[self.lane])
+
+    def common_step_count(self, local_steps: int) -> int:
+        """Agree the number of ordered SUM/optimizer transitions across ranks."""
+
+        if self.distributed is None:
+            return int(local_steps)
+        return self.distributed.maximum_steps(
+            local_steps,
+            device=self.group.modules.device,
+        )
 
     def step(self) -> OptimizerStep:
         result = self.group.step(

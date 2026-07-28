@@ -1341,6 +1341,7 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
     )
     cost_batches = tuple(cost_sampler.batches())
     assert cost_sampler.statistical_presentations == 7
+    assert cost_sampler.optimizer_steps == len(cost_batches)
     assert sum(batch.rows for batch in cost_batches) == 7
     assert all(0 < batch.rows <= 3 for batch in cost_batches)
     mixed_sampler = SequentialBatchSampler.from_costs(
@@ -1367,6 +1368,7 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
         physical_batch_cap={"pre": 2, "post_2": 1},
     ).optimize(mixed_sampler, iteration=0)
     assert mixed_result.statistical_presentations == 8
+    assert mixed_sampler.optimizer_steps == 2
     assert len(mixed_result.optimizer_steps) == 2
     assert all(step.applied for step in mixed_result.optimizer_steps)
     sampler = SequentialBatchSampler(
@@ -1389,6 +1391,7 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
         physical_batch_cap={"pre": 2, "post_2": 1},
     ).optimize(sampler, iteration=0)
     assert result.statistical_presentations == 16
+    assert sampler.optimizer_steps == 6
     assert [step.applied for step in result.optimizer_steps] == [True] * 6
     assert optimizer.step_count == 6
     for sealed in sealed_inputs.values():

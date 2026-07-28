@@ -1065,6 +1065,8 @@ class SequentialPokerIteration:
                     padding.fill_defaults(0)
                     padding.publish()
         owners.release_after(ExecutionPhase.COMPLETION)
+        if self.distributed is not None:
+            self.distributed.barrier()
 
         owners.enter_phase(ExecutionPhase.ALIGN_AND_SEAL)
         sealed = {
@@ -1091,7 +1093,7 @@ class SequentialPokerIteration:
 
         owners.enter_phase(ExecutionPhase.LEARNER)
         learner_results: list[IterationResult | None] = []
-        if self.n_replica > 1:
+        if self.n_replica > 1 or self.distributed is not None:
             generator_states = tuple(
                 generator.get_state() for generator in self.generators
             )
@@ -1114,6 +1116,19 @@ class SequentialPokerIteration:
                     generator.set_state(state)
                 assert self.replica_optimizers is not None
                 self.replica_optimizers.zero_grad(range(self.n_replica))
+            if self.distributed is not None:
+                local = torch.zeros(
+                    self.n_replica,
+                    dtype=torch.bool,
+                    device=owners.plan.device,
+                )
+                if preflight_error is not None:
+                    local.fill_(True)
+                common = self.distributed.agree_failures(local)
+                if bool(common.any()) and preflight_error is None:
+                    preflight_error = PokerIterationError(
+                        "replica learner preflight failed on another rank"
+                    )
             if preflight_error is not None:
                 for value in sealed.values():
                     value.release()
