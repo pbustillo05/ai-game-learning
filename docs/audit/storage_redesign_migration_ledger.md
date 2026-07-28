@@ -45,6 +45,17 @@ and exact release, shared-response cutoff and paired evaluation, exact probe
 identity, and approved RB/probe conversion. Legacy folded, completion, and
 probe definitions remain open until cutover deletes their old callers.
 
+Phase 10 consumer evidence passed against candidate
+`944d097e221b90a075c5c813de9f604bfa38dfae`: one closed three-axis public
+configuration, one ordinary/distributed/replica runtime composition, queued
+BR/inference/variance/benchmark consumers, strict queued persistence and
+model-only artifacts, actual posterior effective hands, preserved reference
+cadence, exact rank/lane/global work, accelerator gates, and operational
+checkpoint selection. Every accepted production root now reaches the queued
+replacement and none reaches `pbg.core`. Public-consumer and artifact-runtime
+rows close here; unreachable legacy definitions remain open for atomic Phase
+11 deletion.
+
 Disposition meanings:
 
 - `move`: representation-independent behavior relocates once to its final
@@ -114,12 +125,12 @@ No row means reuse in place, adaptation, or indefinite compatibility.
 
 | Old root | Disposition | New owner / phase | Gate |
 |---|---|---|---|
-| `pbg.config`, `pbg.runtime`, training CLIs | rewrite | queued composition, Phase 10 | no dual-engine reachability |
-| `pbg.benchmark` and benchmark CLIs | rewrite | matched-work queued gates, Phase 10 | frozen tolerances/identity |
-| `pbg.eval.br_probe`, BR CLI | rewrite | ordinary response consumer, Phase 6 | balanced paired lower-bound report |
-| `pbg.inference`, artifact/export/benchmark CLIs | rewrite | queued model-only inference, Phase 10 | CUDA/MPS contract |
-| RunPod/replica benchmark CLIs | rewrite | Phase 9 experiment consumers | H100 hunk classification/parity |
-| package `__init__` modules | rewrite/delete exports at cutover | final public surface, Phase 10 | reachability and import audit |
+| `pbg.config`, `pbg.runtime`, training CLIs | rewrite, closed | queued composition, Phase 10 | exact-SHA no-dual-engine reachability |
+| `pbg.benchmark` and benchmark CLIs | rewrite, closed | matched-work queued gates, Phase 10 | JSON-stable identity and matched logical work |
+| `pbg.eval.br_probe`, BR CLI | rewrite, closed | ordinary response consumer, Phases 6/10 | balanced paired lower-bound production report |
+| `pbg.inference`, artifact/export/benchmark CLIs | rewrite, closed | queued model-only inference, Phase 10 | strict artifact and CUDA/MPS contract |
+| RunPod/replica benchmark CLIs | rewrite, closed | queued experiment consumers, Phases 9/10 | same runtime/benchmark composition |
+| package `__init__` modules | rewrite now; delete stale exports at cutover | final public surface, Phases 10/11 | accepted-root reachability closed; physical cutover open |
 
 The accepted root list is frozen in
 `queued_phase1_inventory_20260726.md`. Static tests fail if a production root
@@ -143,22 +154,27 @@ reachability does not authorize retaining an old owner.
 ## Preservation ledger
 
 Every row of `features_to_preserve.md` maps to a new owner and regression family
-in `queued_phase1_inventory_20260726.md`. Those rows remain open until their
-consumer phase passes. The default is rewrite/preserve; deletion or semantic
-change still requires explicit user approval.
+in `queued_phase1_inventory_20260726.md`. Phase 10 closes the consumer pass for
+every family: update/loss/reference/controller behavior reaches public
+training; poker/model/precision/utility behavior reaches training and
+inference; probe behavior reaches BR evaluation; and configuration,
+persistence, inference, performance, distributed, and observability behavior
+reaches its named public consumer. The final deletion half of rows backed by a
+legacy definition remains open for Phase 11. The default is rewrite/preserve;
+deletion or semantic change still requires explicit user approval.
 
 ## Artifact/converter ledger
 
 | Artifact family | Disposition | Consumer phase | Closure evidence |
 |---|---|---:|---|
-| selected current sampled sequential checkpoints | offline convert | 5 | source/result hashes, exact resume |
-| selected current sequential-RB checkpoints | offline convert | 6 | source/result hashes, exact state |
-| selected current branched artifacts | offline convert | 8 | mode/controller conversion |
-| selected ordinary/distributed/replica lanes | offline convert | 9 | lane/rank identity |
-| inference artifacts | offline convert | 10 | model/config/content identity |
+| selected current sampled sequential checkpoints | offline convert, closed to queued schema | 5/10 | exact source schema, source/result hashes, exact resume gate |
+| selected current sequential-RB checkpoints | offline convert, closed to queued schema | 6/10 | source/result hashes, reference/probe state gate |
+| selected current branched artifacts | offline convert, closed to queued schema | 8/10 | exact mode/controller/safeguard conversion |
+| selected ordinary/distributed/replica lanes | offline convert, closed to queued schema | 9/10 | lane/rank identity and content-addressed manifest |
+| inference artifacts | offline convert, closed to queued schema | 10 | model/config/source/payload content identity |
 | tracked range-database pairs | versioned dataset conversion | first consumer | source hash and semantic validation |
 | configs/run/benchmark JSON/YAML | evidence only | cumulative gates | read-only identity |
-| unknown/unselected legacy artifacts | delete | 10 | no runtime compatibility loader |
+| unknown/unselected legacy artifacts | delete as runtime inputs, closed | 10 | no runtime compatibility loader or permissive fallback |
 
 ## Saved H100 branch
 
@@ -244,3 +260,20 @@ rank-common recovery. The final independent read-only audit found no
 remaining critical/high or ownership/memory blocker and no parallel queued or
 legacy-core path. See `queued_phase7_report_20260727.md` and
 `../queued/branched_execution.md`.
+
+Phase 10 candidate `944d097e221b90a075c5c813de9f604bfa38dfae`
+passed 19 focused consumer/inference tests, 246 cumulative Phase 1–10 CUDA
+tests, a separately executed two-GPU NCCL gate, fresh and resumed real
+two-rank production runs, all sequential/branched effective-hand mode gates,
+matched-work/JSON comparisons, malformed persistence probes, launcher
+selection, and seven stable lifecycle cycles. Evidence covers one public
+three-axis configuration, ordinary/distributed/replica ownership, rank-common
+updates over disjoint work, strict checkpoint/manifests and offline-only
+conversion, CUDA/MPS failures before fallback, actual evaluator `n_eff`,
+reference cadence/resume/overshoot, exact rank/lane/global logical work, BR,
+variance, inference, benchmark, identity, and memory reporting. The final
+read-only audit found no critical/high or ownership/memory/preservation
+blocker, no missing accepted root, no accepted path to `pbg.core`, and no
+migrated implementation duplicate. See
+`queued_phase10_report_20260728.md` and
+`../queued/runtime_and_consumers.md`.
