@@ -155,14 +155,14 @@ def sampled_branched_chance_frontier_row_bytes(
     players = geometry.players
     hands = geometry.private_hands
     history = (
-        geometry.base_model_input_width
+        geometry.postflop_base_model_input_width
         - 8
         - 10 * players
         - players * hands
     ) // 10
     return (
         512
-        + 8 * geometry.direct_model_input_width
+        + 8 * geometry.postflop_model_input_width
         + 16 * players * hands
         + 128 * history
         + 64 * geometry.deck_cards
@@ -1193,8 +1193,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         parent_profile = batch.fields["true_profile"][0]
         private = parent_profile.index_select(0, source)
         if self.mode.private_estimator is PrivateEstimator.RAO_BLACKWELL:
-            resolved = self._resolved_model_input(batch)
-            log_reach, _history = self.machine.model_context(resolved)
+            log_reach, _history = self._resolved_model_context(batch)
             finite = torch.isfinite(log_reach)
             gauge = log_reach.masked_fill(~finite, -torch.inf).amax(
                 -1, keepdim=True
@@ -1204,6 +1203,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 - gauge.masked_fill(~torch.isfinite(gauge), 0.0)
             ).masked_fill(~finite, 0.0)
             parent_state = self.machine.state_from_model_input(
+                batch.input_type,
                 self._forward_model_input(batch),
                 parent_profile,
             )
@@ -1226,13 +1226,18 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             )
             self._observe_posterior()
         owner = batch.fields["owner"][0].index_select(0, source).to(torch.int64)
-        state = self.machine.state_from_model_input(expanded_input, private)
+        state = self.machine.state_from_model_input(
+            batch.input_type, expanded_input, private
+        )
         raw = {
             name: value.index_select(0, source)
             for name, value in values.items()
             if name not in ("value", "trace", "cost")
         }
-        actor_hand = private.gather(1, owner[:, None]).squeeze(1)
+        actor_hand = self._private_index(
+            batch.input_type,
+            private.gather(1, owner[:, None]).squeeze(1),
+        )
         action_key = logical_rng_keys(
             seed=self.seed,
             iteration=self.iteration,
@@ -1283,7 +1288,9 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         action_total = int(action_source.numel())
         flat_input = self._forward_model_input(batch)
         parent_private = batch.fields["true_profile"][0]
-        parent_state = self.machine.state_from_model_input(flat_input, parent_private)
+        parent_state = self.machine.state_from_model_input(
+            batch.input_type, flat_input, parent_private
+        )
         state = replace(
             parent_state,
             **{
@@ -1295,9 +1302,14 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         private = sample["profile"]
         state = replace(state, combo_ids=private)
         action = sample["action"]
-        resolved_input = self._resolved_model_input(batch)
-        log_reach, history = self.machine.model_context(
-            resolved_input.index_select(0, source)
+        resolved_reach, resolved_history = self._resolved_model_context(batch)
+        log_reach = resolved_reach.index_select(0, source)
+        history = replace(
+            resolved_history,
+            **{
+                name: value.index_select(0, source)
+                for name, value in resolved_history.__dict__.items()
+            },
         )
         raw = MappingProxyType(
             {
@@ -1311,10 +1323,11 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             .detach()
             .float()
         )
+        selected_log_exact = self._exact_rows(selected_log, batch.input_type)
         actor = state.to_act.to(torch.int64)
         log_reach = action_conditioned_log_reach(
             log_reach,
-            selected_log,
+            selected_log_exact,
             actor,
         )
         fold_log_reach = log_reach
@@ -1804,10 +1817,14 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         sigma_old_tail = sigma.reserved_tails_device()[lane]
         sigma_values = self._defaults(sigma, rows)
         model_value = request.model.values["value"]
+        parent_index = self._private_index(
+            batch.input_type,
+            parent_private.gather(1, owner[:, None]).squeeze(1),
+        )
         selected_value = (
             model_value.gather(
                 1,
-                parent_private.gather(1, owner[:, None]).to(torch.int64),
+                parent_index[:, None],
             ).float()
             if sampled_mode
             else self._natural_rows(model_value, batch.input_type)
@@ -1904,7 +1921,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         if folded_partition == "pre":
             classes = self._combo_class()
             folded_rows = torch.zeros(
-                (action_total, self.geometry.rank_count**2),
+                (action_total, self.geometry.private_classes),
                 dtype=torch.float32,
                 device=device,
             )
@@ -1958,19 +1975,23 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         folded_reference = action_folded_reference.index_select(
             0, endpoint_action
         )
-        next_input = self.machine.direct_model_input(next_state, log_reach, history)
+        post_summary = log_reach.new_zeros(
+            (total, self.geometry.folded_summary_width)
+        )
         if self.geometry.folded_summary_width:
-            summary_slice = slice(self.geometry.base_model_input_width, None)
-            next_input[:, summary_slice].copy_(
-                resolved_input.index_select(0, endpoint_source)[:, summary_slice]
-            )
+            if batch.input_type != "pre":
+                post_summary.copy_(
+                    flat_input.index_select(0, endpoint_source)[
+                        :, self.geometry.postflop_base_model_input_width :
+                    ].float()
+                )
             endpoint_fold = stored_fold.index_select(0, endpoint_action)
             refresh = (
                 endpoint_fold
                 | next_state.street.ne(
                     fold_parent_street.index_select(0, endpoint_action)
                 )
-            ) & endpoint_nonterminal
+            ) & endpoint_nonterminal & next_state.street.ne(0)
             refresh_rows = torch.nonzero(
                 refresh, as_tuple=False
             ).flatten()
@@ -2000,19 +2021,18 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                     history, next_state.status
                 ).index_select(0, refresh_rows),
             )
-            next_input[:, summary_slice].index_copy_(
+            post_summary.index_copy_(
                 0,
                 refresh_rows,
                 pack_folded_statistics(
                     self.geometry, refreshed_summary
-                ).to(next_input.dtype),
+                ),
             )
         next_logical = torch.stack((root, child_path), -1)
         family_source: dict[str, Tensor] = {
             "logical_rng_key": next_logical,
             "true_profile": private,
             "folded_range_row": folded_reference.to(torch.int32),
-            "model_input": next_input,
             "owner": next_state.to_act,
             "path_mass": endpoint_mass,
             "log_player_ancestor_sum": endpoint_log_sum,
@@ -2034,7 +2054,15 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             selected_rows = route.source_row[0, family_index + 1]
             selected_valid = route.valid[0, family_index + 1]
             values = self._defaults(queue.family, total)
-            for field, value in family_source.items():
+            next_input = self.machine.direct_model_input(
+                name, next_state, log_reach, history
+            )
+            if name != "pre" and self.geometry.folded_summary_width:
+                next_input[
+                    :, self.geometry.postflop_base_model_input_width :
+                ].copy_(post_summary.to(next_input.dtype))
+            queue_source = {**family_source, "model_input": next_input}
+            for field, value in queue_source.items():
                 if field in values:
                     values[field][lane].copy_(
                         value.index_select(0, selected_rows)
@@ -2048,28 +2076,42 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 self.cost_safeguard is not None
                 and self.cost_safeguard.active
             ):
+                active_position = torch.nonzero(
+                    selected_valid, as_tuple=False
+                ).flatten()
+                active_rows = selected_rows.index_select(
+                    0, active_position
+                )
                 selected_role = (
                     None
                     if "role_selector" not in family_source
                     else family_source["role_selector"].index_select(
-                        0, selected_rows
+                        0, active_rows
                     )
                 )
                 with torch.no_grad():
                     child_evaluation = self.child_model(
                         PokerForwardInput(
                             name,
-                            next_input.index_select(0, selected_rows),
-                            private.index_select(0, selected_rows),
-                            next_state.to_act.index_select(0, selected_rows),
+                            next_input.index_select(0, active_rows),
+                            private.index_select(0, active_rows),
+                            next_state.to_act.index_select(0, active_rows),
                             selected_role,
                         ),
                         torch.tensor(
                             [lane], dtype=torch.int64, device=device
                         ),
                     )
-                child_cost = child_evaluation["cost"].detach().float()
-                child_cost = child_cost.masked_fill(~selected_valid, 0)
+                child_cost = torch.zeros(
+                    selected_valid.shape,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                child_cost.index_copy_(
+                    0,
+                    active_position,
+                    child_evaluation["cost"].detach().float(),
+                )
                 values["frontier_cost_contribution"][lane].copy_(child_cost)
                 cost_addition[lane] = child_cost.sum()
             count = lane_count(route.counts[0, family_index + 1])
@@ -2470,7 +2512,7 @@ class _BranchedSampledPokerAttempt:
                 owners.plan.layout.completion_workspace_row_bytes
                 < rb_conversion_workspace_row_bytes(
                     geometry.private_hands,
-                    geometry.rank_count**2,
+                    geometry.private_classes,
                 )
             ):
                 raise ValueError(
@@ -2480,7 +2522,7 @@ class _BranchedSampledPokerAttempt:
                 owners.plan.manifest.library_workspace_bytes
                 < rb_conversion_library_workspace_bytes(
                     geometry.private_hands,
-                    geometry.rank_count**2,
+                    geometry.private_classes,
                 )
             ):
                 raise ValueError(
@@ -2493,7 +2535,7 @@ class _BranchedSampledPokerAttempt:
         self.model = model
         self.model_operation = model_operation
         self.rollout_operation = (
-            model_operation
+            getattr(model, "rollout_operation", model_operation)
             if rollout_operation is None
             else rollout_operation
         )
@@ -2642,7 +2684,7 @@ class _BranchedSampledPokerAttempt:
         values["true_profile"][0] = state.combo_ids
         if "sampled_private_state" in values:
             values["sampled_private_state"][0] = state.combo_ids
-        values["model_input"][0] = machine.direct_model_input(state)
+        values["model_input"][0] = machine.direct_model_input("pre", state)
         values["owner"][0] = state.to_act
         values["path_mass"][0].fill_(1)
         values["log_player_ancestor_sum"][0].fill_(0)
@@ -2656,21 +2698,34 @@ class _BranchedSampledPokerAttempt:
             roots, dtype=torch.float32, device=state.device
         )
         if self.cost_safeguard is not None:
+            pack = self.owners.plan.manifest.family_pack_cap
             with torch.no_grad():
-                root_cost = self._model(
-                    PokerForwardInput(
-                        "pre",
-                        values["model_input"][0],
-                        state.combo_ids,
-                        state.to_act,
-                        (
-                            None
-                            if "role_selector" not in values
-                            else values["role_selector"][0]
-                        ),
-                    ),
-                    torch.zeros(1, dtype=torch.int64, device=state.device),
-                )["cost"].detach().float()
+                root_cost = torch.cat(
+                    tuple(
+                        self._model(
+                            PokerForwardInput(
+                                "pre",
+                                values["model_input"][0, begin:end],
+                                state.combo_ids[begin:end],
+                                state.to_act[begin:end],
+                                (
+                                    None
+                                    if "role_selector" not in values
+                                    else values["role_selector"][
+                                        0, begin:end
+                                    ]
+                                ),
+                            ),
+                            torch.zeros(
+                                1,
+                                dtype=torch.int64,
+                                device=state.device,
+                            ),
+                        )["cost"].detach().float()
+                        for begin in range(0, roots, pack)
+                        for end in (min(begin + pack, roots),)
+                    )
+                )
             values["frontier_cost_contribution"][0].copy_(root_cost)
         count = torch.tensor([roots], dtype=torch.int64, device=state.device)
         transaction = PublicationTransaction.begin_device(
@@ -3887,7 +3942,7 @@ class ReplicaBranchedPokerIteration:
         values["true_profile"][lane] = state.combo_ids
         if "sampled_private_state" in values:
             values["sampled_private_state"][lane] = state.combo_ids
-        values["model_input"][lane] = machine.direct_model_input(state)
+        values["model_input"][lane] = machine.direct_model_input("pre", state)
         values["owner"][lane] = state.to_act
         values["path_mass"][lane].fill_(1)
         values["log_player_ancestor_sum"][lane].zero_()

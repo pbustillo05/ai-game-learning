@@ -247,7 +247,9 @@ class PokerInferenceSession:
             }
         )
         log_reach = torch.cat([item.log_reach for item in items], dim=0)
-        model_input = self.machine.direct_model_input(state, log_reach, history)
+        model_input = self.machine.direct_model_input(
+            family, state, log_reach, history
+        )
         with torch.inference_mode(), torch.autocast(
             device_type=self.device.type,
             dtype=torch.float16,
@@ -305,7 +307,14 @@ class PokerInferenceSession:
             raise ValueError("private hand conflicts with the public board")
         actions = self._actions(legality)
         columns = torch.nonzero(legality.mask[0], as_tuple=False).flatten()
-        probability = all_probability[0, private].index_select(0, columns).cpu()
+        private_index = (
+            int(self.model.combo_class[private])
+            if self._family(item.state) == "pre"
+            else private
+        )
+        probability = all_probability[0, private_index].index_select(
+            0, columns
+        ).cpu()
         selected = None
         if action_mode == "argmax":
             selected = actions[int(probability.argmax())]
@@ -320,7 +329,7 @@ class PokerInferenceSession:
             private,
             actions,
             probability,
-            float(evaluation.value[0, private].float().cpu()),
+            float(evaluation.value[0, private_index].float().cpu()),
             None,
             selected,
         )
@@ -377,8 +386,13 @@ class PokerInferenceSession:
                     columns = torch.nonzero(
                         legality.mask[row], as_tuple=False
                     ).flatten()
+                    private_index = (
+                        int(self.model.combo_class[private])
+                        if self._family(item.state) == "pre"
+                        else private
+                    )
                     probability = all_probability[
-                        row, private
+                        row, private_index
                     ].index_select(0, columns).cpu()
                     selected = None
                     if action_mode == "argmax":
@@ -396,7 +410,7 @@ class PokerInferenceSession:
                         private,
                         actions,
                         probability,
-                        float(evaluation.value[row, private].float().cpu()),
+                        float(evaluation.value[row, private_index].float().cpu()),
                         None,
                         selected,
                     )
@@ -451,6 +465,14 @@ class PokerInferenceSession:
             raise ValueError("seat is outside the table")
         return int(item.state.combo_ids[0, seat])
 
+    def private_policy_index(self, hand: HandHandle, seat: int) -> int:
+        """Return this decision family's natural policy row for one seat."""
+
+        combo = self.private_hand_id(hand, seat)
+        if self._family(self._hand(hand).state) == "pre":
+            return int(self.model.combo_class[combo])
+        return combo
+
     def is_terminal(self, hand: HandHandle) -> bool:
         return bool(self._hand(hand).state.terminal[0])
 
@@ -458,7 +480,7 @@ class PokerInferenceSession:
         return bool(self.machine.needs_chance(self._hand(hand).state)[0])
 
     def policy_table(self, hand: HandHandle) -> tuple[tuple[PokerAction, ...], Tensor]:
-        """Return legal actions and the full private-hand policy on-device."""
+        """Return legal actions and the natural-domain policy on-device."""
 
         _evaluation, legality, probabilities = self._evaluate(self._hand(hand))
         return self._actions(legality), probabilities[0]
@@ -513,11 +535,14 @@ class PokerInferenceSession:
             or bool((policy < 0).any())
         ):
             raise ValueError(
-                "external policy probabilities must be finite accelerator [H,E]"
+                "external policy probabilities must use the finite accelerator "
+                "natural private domain"
             )
         selected = policy[:, event].float().clamp_min(
             torch.finfo(torch.float32).tiny
         )
+        if self._family(item.state) == "pre":
+            selected = selected.index_select(0, self.model.combo_class)
         item.log_reach[:, actor].add_(selected.log())
         event_tensor = torch.tensor([event], dtype=torch.int32, device=self.device)
         item.history = self.machine.append_player_history(

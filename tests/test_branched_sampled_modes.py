@@ -13,6 +13,7 @@ from pbg.games.poker.queued.branching import (
     BranchedSampledPokerIteration as PublicBranchedSampledPokerIteration,
 )
 from pbg.games.poker.queued.hooks import (
+    FOLDED,
     NLHEGeometry,
     PokerStateMachine,
     sampled_partitions,
@@ -112,7 +113,7 @@ def _manifest(
 ) -> CapacityManifest:
     geometry = NLHEGeometry(2, 8.0, 4) if geometry is None else geometry
     inputs = tuple(
-        item.name for item in sampled_partitions(geometry.players).inputs
+        item.name for item in sampled_partitions(geometry).inputs
     )
     return CapacityManifest(
         geometry=ExecutionGeometry(
@@ -303,14 +304,14 @@ def test_phase7_admission_covers_fixed_and_full_decision_workspaces() -> None:
     manifest = _manifest(device)
     self_plan = build_storage_plan(
         mode_schema("self_play", "branched.fixed", "sampled"),
-        sampled_partitions(2),
+        sampled_partitions(geometry),
         manifest,
         layout,
         device,
     )
     response_plan = build_storage_plan(
         mode_schema("best_response", "branched.fixed", "sampled"),
-        sampled_partitions(2),
+        sampled_partitions(geometry),
         manifest,
         layout,
         device,
@@ -362,7 +363,7 @@ def test_phase7_admission_covers_fixed_and_full_decision_workspaces() -> None:
         )
     two_root_plan = build_storage_plan(
         self_plan.mode,
-        sampled_partitions(2),
+        sampled_partitions(geometry),
         replace(manifest, root_count=2),
         layout,
         device,
@@ -816,7 +817,7 @@ def test_failed_branched_attempt_releases_every_generated_owner() -> None:
     mode = mode_schema("self_play", "branched.fixed", "sampled")
     plan = build_storage_plan(
         mode,
-        sampled_partitions(2),
+        sampled_partitions(geometry),
         _manifest(device),
         replace(_phase7_layout(geometry), player_count=2),
         device,
@@ -850,7 +851,7 @@ def test_healthy_branched_attempt_discard_releases_without_failure_record() -> N
     mode = mode_schema("self_play", "branched.fixed", "sampled")
     plan = build_storage_plan(
         mode,
-        sampled_partitions(2),
+        sampled_partitions(geometry),
         _manifest(device),
         replace(_phase7_layout(geometry), player_count=2),
         device,
@@ -930,7 +931,7 @@ def test_full_branched_iteration_is_family_pack_invariant() -> None:
         torch.cuda.manual_seed(191)
         plan = build_storage_plan(
             mode,
-            sampled_partitions(2),
+            sampled_partitions(geometry),
             replace(_manifest(device), family_pack_cap=family_pack_cap),
             replace(_phase7_layout(geometry), player_count=2),
             device,
@@ -995,7 +996,7 @@ def test_multi_pack_roots_use_complete_frontier_cost_forecast() -> None:
     mode = mode_schema("self_play", "branched.fixed", "sampled")
     plan = build_storage_plan(
         mode,
-        sampled_partitions(2),
+        sampled_partitions(geometry),
         replace(
             _manifest(device),
             root_count=3,
@@ -1048,7 +1049,7 @@ def test_kkt_feedback_is_invariant_to_root_batching() -> None:
         torch.cuda.manual_seed(313)
         plan = build_storage_plan(
             mode,
-            sampled_partitions(2),
+            sampled_partitions(geometry),
                 replace(
                     _manifest(device),
                     root_count=root_count,
@@ -1110,7 +1111,7 @@ def test_ragged_statistical_work_subdivides_by_action_cap() -> None:
         torch.cuda.manual_seed(431)
         plan = build_storage_plan(
             mode,
-            sampled_partitions(2),
+            sampled_partitions(geometry),
             replace(
                 _manifest(device),
                 learner_sigma_pack_cap=8,
@@ -1175,7 +1176,7 @@ def test_four_sampled_branched_modes_complete_optimizer_step(
     mode = mode_schema(regime, rollout, "sampled")
     plan = build_storage_plan(
         mode,
-        sampled_partitions(2),
+        sampled_partitions(geometry),
         _manifest(device),
         replace(
             _phase7_layout(geometry),
@@ -1250,7 +1251,7 @@ def test_best_response_rollout_selects_one_model_per_role_subspan() -> None:
     mode = mode_schema("best_response", "branched.fixed", "sampled")
     plan = build_storage_plan(
         mode,
-        sampled_partitions(2),
+        sampled_partitions(geometry),
         _manifest(device),
         _phase7_layout(geometry),
         device,
@@ -1309,7 +1310,7 @@ def test_multiplayer_best_response_root_uses_frozen_opponent_model() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(4, 8.0, 4)
     mode = mode_schema("best_response", "branched.fixed", "sampled")
-    partitions = sampled_partitions(geometry.players)
+    partitions = sampled_partitions(geometry)
     plan = build_storage_plan(
         mode,
         partitions,
@@ -1319,7 +1320,7 @@ def test_multiplayer_best_response_root_uses_frozen_opponent_model() -> None:
             model_input_shapes=tuple(
                 NamedShape(
                     partition.name,
-                    (geometry.direct_model_input_width,),
+                    (geometry.model_input_width(partition.name),),
                 )
                 for partition in partitions.inputs
             ),
@@ -1377,7 +1378,7 @@ def test_branched_allocator_and_reference_cache_controls_are_wired() -> None:
     mode = mode_schema("self_play", "branched.fixed", "sampled")
     plan = build_storage_plan(
         mode,
-        sampled_partitions(2),
+        sampled_partitions(geometry),
         replace(_manifest(device), learner_sigma_pack_cap=1),
         replace(
             _phase7_layout(geometry),
@@ -1428,13 +1429,13 @@ def test_three_player_nonterminal_fold_seals_branched_summary() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(3, 8.0, 4)
     mode = mode_schema("self_play", "branched.fixed", "sampled")
-    partitions = sampled_partitions(geometry.players)
+    partitions = sampled_partitions(geometry)
     layout = replace(
         _phase7_layout(geometry),
         model_input_shapes=tuple(
             NamedShape(
                 partition.name,
-                (geometry.direct_model_input_width,),
+                (geometry.model_input_width(partition.name),),
             )
             for partition in partitions.inputs
         ),
@@ -1460,10 +1461,27 @@ def test_three_player_nonterminal_fold_seals_branched_summary() -> None:
             if not torch.is_grad_enabled():
                 self.forward_count += 1
             if not torch.is_grad_enabled() and self.forward_count > 1:
-                torch._assert_async(
-                    model_input[:, -1].gt(0.5).all(),
-                    "nonterminal branched fold omitted its sealed summary",
-                )
+                if input_type == "pre":
+                    assert (
+                        PokerStateMachine(geometry)
+                        .model_context("pre", model_input)[0]
+                        .shape[-1]
+                        == geometry.private_classes
+                    )
+                    state = PokerStateMachine(
+                        geometry
+                    ).state_from_model_input(
+                        "pre", model_input, private
+                    )
+                    torch._assert_async(
+                        state.status.eq(FOLDED).any(-1).all(),
+                        "nonterminal preflop fold was not retained",
+                    )
+                else:
+                    torch._assert_async(
+                        model_input[:, -1].gt(0.5).all(),
+                        "nonterminal postflop fold omitted its sealed summary",
+                    )
                 self.sealed_fold_seen = True
             return super().evaluate(
                 input_type, model_input, private, owner
@@ -1512,7 +1530,7 @@ def test_chance_branching_and_protected_root_refill_complete_targets(
     mode = mode_schema("self_play", "branched.fixed", "sampled")
     plan = build_storage_plan(
         mode,
-        sampled_partitions(2),
+        sampled_partitions(geometry),
         _manifest(device),
         replace(_phase7_layout(geometry), player_count=2),
         device,

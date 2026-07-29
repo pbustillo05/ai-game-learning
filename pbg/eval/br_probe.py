@@ -158,7 +158,7 @@ def _play_one(
         selected = probe if mixed and actor == probe_seat else target
         selected_hand = probe_hand if selected is probe else target_hand
         actions, policy = selected.policy_table(selected_hand)
-        private = selected.private_hand_id(selected_hand, actor)
+        private = selected.private_policy_index(selected_hand, actor)
         columns = torch.tensor(
             [action.event_id for action in actions],
             dtype=torch.int64,

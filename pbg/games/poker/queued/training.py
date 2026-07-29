@@ -190,14 +190,13 @@ class SequentialPokerIteration:
             raise ValueError("one device-local poker learner RNG is required per lane")
         if mode.rollout_mode is not RolloutMode.SEQUENTIAL:
             raise ValueError("sequential poker iteration requires sequential mode")
-        expected_width = geometry.direct_model_input_width
         if any(
             owners.plan.layout.input_shapes[partition.name]
-            != (expected_width,)
+            != (geometry.model_input_width(partition.name),)
             for partition in owners.plan.partitions.inputs
         ):
             raise ValueError(
-                "family model-input layout omits retained folded statistics"
+                "family model-input layout differs from its natural partition"
             )
         postflop = getattr(model, "postflop", None)
         postflop_config = getattr(postflop, "cfg", None)
@@ -225,7 +224,7 @@ class SequentialPokerIteration:
             required_conversion_workspace = (
                 rb_conversion_workspace_row_bytes(
                     geometry.private_hands,
-                    geometry.rank_count**2,
+                    geometry.private_classes,
                 )
             )
             if (
@@ -237,7 +236,7 @@ class SequentialPokerIteration:
                 )
             required_library_bytes = rb_conversion_library_workspace_bytes(
                 geometry.private_hands,
-                geometry.rank_count**2,
+                geometry.private_classes,
             )
             if (
                 owners.plan.manifest.library_workspace_bytes
@@ -336,7 +335,7 @@ class SequentialPokerIteration:
             (
                 replica_inference
                 if n_replica > 1
-                else model_operation
+                else getattr(model, "rollout_operation", model_operation)
             )
             if rollout_operation is None
             else rollout_operation
@@ -453,7 +452,9 @@ class SequentialPokerIteration:
             values["logical_rng_key"][lane, :roots, 0] = logical_root
             values["logical_rng_key"][lane, :roots, 1] = 0
             values["true_profile"][lane, :roots] = state.combo_ids
-            values["model_input"][lane, :roots] = machine.direct_model_input(state)
+            values["model_input"][lane, :roots] = machine.direct_model_input(
+                "pre", state
+            )
             values["owner"][lane, :roots] = state.to_act
             if "sampled_private_state" in values:
                 values["sampled_private_state"][lane, :roots] = state.combo_ids

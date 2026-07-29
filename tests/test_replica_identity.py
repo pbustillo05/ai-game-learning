@@ -253,11 +253,11 @@ def _branched_check_down_model(geometry: NLHEGeometry) -> QueuedPokerModel:
     return QueuedPokerModel(
         geometry,
         _BranchedCheckDownPartition(
-            geometry.direct_model_input_width,
+            geometry.preflop_model_input_width,
             geometry.rank_count**2,
         ),
         _BranchedCheckDownPartition(
-            geometry.direct_model_input_width,
+            geometry.postflop_model_input_width,
             geometry.private_hands,
         ),
     ).cuda()
@@ -374,11 +374,10 @@ def _poker_manifest(
 
 
 def _poker_layout(geometry: NLHEGeometry) -> PhysicalLayout:
-    width = geometry.direct_model_input_width
     return PhysicalLayout(
         model_input_shapes=(
-            NamedShape("pre", (width,)),
-            NamedShape("post_2", (width,)),
+            NamedShape("pre", (geometry.preflop_model_input_width,)),
+            NamedShape("post_2", (geometry.postflop_model_input_width,)),
         ),
         player_count=2,
         stratum_count=2,
@@ -402,11 +401,11 @@ def _check_down_model(geometry: NLHEGeometry) -> QueuedPokerModel:
     return QueuedPokerModel(
         geometry,
         _CheckDownPartition(
-            geometry.direct_model_input_width,
+            geometry.preflop_model_input_width,
             geometry.rank_count**2,
         ),
         _CheckDownPartition(
-            geometry.direct_model_input_width,
+            geometry.postflop_model_input_width,
             geometry.private_hands,
         ),
     ).cuda()
@@ -544,7 +543,7 @@ def test_poker_rollout_vmap_preserves_lane_weights_and_natural_labels() -> None:
     lanes = torch.tensor([2, 0], dtype=torch.int64, device="cuda")
     rows = 3
     model_input = torch.zeros(
-        (2, rows, geometry.direct_model_input_width),
+        (2, rows, geometry.preflop_model_input_width),
         device="cuda",
     )
     private = torch.zeros((2, rows, geometry.players), dtype=torch.int32, device="cuda")
@@ -567,7 +566,7 @@ def test_poker_rollout_vmap_preserves_lane_weights_and_natural_labels() -> None:
         )
     )
     torch.testing.assert_close(actual.value, expected)
-    assert actual.value.shape == (2, rows, geometry.private_hands)
+    assert actual.value.shape == (2, rows, geometry.private_classes)
     assert float(actual.value[0, 0, 0]) != float(actual.value[1, 0, 0])
 @CUDA
 def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
@@ -585,7 +584,7 @@ def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
         owners=GeneratedOwners(
             build_storage_plan(
                 mode,
-                sampled_partitions(geometry.players),
+                sampled_partitions(geometry),
                 _poker_manifest(device, n_replica=1),
                 _poker_layout(geometry),
                 device,
@@ -610,7 +609,7 @@ def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
     owners = GeneratedOwners(
         build_storage_plan(
             mode,
-            sampled_partitions(geometry.players),
+            sampled_partitions(geometry),
             _poker_manifest(device, n_replica=2),
             _poker_layout(geometry),
             device,
@@ -712,7 +711,7 @@ def test_complete_sequential_transactions_isolate_every_replica_lane(
         owners=GeneratedOwners(
             build_storage_plan(
                 mode,
-                sampled_partitions(geometry.players),
+                sampled_partitions(geometry),
                 _poker_manifest(device, n_replica=count),
                 _poker_layout(geometry),
                 device,
@@ -793,7 +792,7 @@ def test_shared_owner_branched_poker_preserves_fixed_kkt_lane_identity(
     plan = (
         build_storage_plan(
             fixed,
-            sampled_partitions(geometry.players),
+            sampled_partitions(geometry),
             replace(_branched_manifest(device), n_replica=2),
             replace(_phase7_layout(geometry), player_count=2),
             device,
@@ -908,7 +907,7 @@ def test_branched_replica_learner_failure_aborts_before_any_lane_commit() -> Non
         owners=GeneratedOwners(
             build_storage_plan(
                 mode,
-                sampled_partitions(geometry.players),
+                sampled_partitions(geometry),
                 replace(_branched_manifest(device), n_replica=2),
                 replace(_phase7_layout(geometry), player_count=2),
                 device,
@@ -966,7 +965,7 @@ def test_replica_best_response_groups_compact_learned_and_frozen_rows() -> None:
         owners=GeneratedOwners(
             build_storage_plan(
                 mode,
-                sampled_partitions(geometry.players),
+                sampled_partitions(geometry),
                 _poker_manifest(device, n_replica=2),
                 _poker_layout(geometry),
                 device,
@@ -1015,7 +1014,7 @@ def test_replica_best_response_groups_compact_learned_and_frozen_rows() -> None:
     frozen.operation = frozen_calls  # type: ignore[assignment]
     rows = 3
     model_input = torch.zeros(
-        (2, rows, geometry.direct_model_input_width), device=device
+        (2, rows, geometry.preflop_model_input_width), device=device
     )
     private = torch.zeros(
         (2, rows, geometry.players), dtype=torch.int32, device=device

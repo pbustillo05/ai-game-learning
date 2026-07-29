@@ -110,6 +110,10 @@ class NLHEGeometry:
         return self.deck_cards * (self.deck_cards - 1) // 2
 
     @property
+    def private_classes(self) -> int:
+        return self.rank_count**2
+
+    @property
     def stack_ticks(self) -> int:
         return round(self.stack_bb * 2)
 
@@ -120,19 +124,48 @@ class NLHEGeometry:
         )
 
     @property
-    def direct_model_input_width(self) -> int:
-        """Width of the sealed family row, including folded statistics."""
-
-        return self.base_model_input_width + self.folded_summary_width
+    def public_model_input_width(self) -> int:
+        return 8 + 10 * self.players
 
     @property
-    def base_model_input_width(self) -> int:
+    def history_model_input_width(self) -> int:
+        return 10 * max_public_history_tokens(self.players, self.stack_bb)
+
+    @property
+    def preflop_model_input_width(self) -> int:
         return (
-            8
-            + 10 * self.players
-            + self.players * self.private_hands
-            + 10 * max_public_history_tokens(self.players, self.stack_bb)
+            self.public_model_input_width
+            + self.players * self.private_classes
+            + self.history_model_input_width
         )
+
+    @property
+    def postflop_base_model_input_width(self) -> int:
+        return (
+            self.public_model_input_width
+            + self.players * self.private_hands
+            + self.history_model_input_width
+        )
+
+    @property
+    def postflop_model_input_width(self) -> int:
+        """Width of one retained postflop row, including folded statistics."""
+
+        return self.postflop_base_model_input_width + self.folded_summary_width
+
+    def model_input_width(self, input_type: str) -> int:
+        if input_type == "pre":
+            return self.preflop_model_input_width
+        if input_type.startswith("post_") and input_type[5:].isdigit():
+            return self.postflop_model_input_width
+        raise ValueError(f"unknown poker input partition {input_type!r}")
+
+    def model_private_width(self, input_type: str) -> int:
+        if input_type == "pre":
+            return self.private_classes
+        if input_type.startswith("post_") and input_type[5:].isdigit():
+            return self.private_hands
+        raise ValueError(f"unknown poker input partition {input_type!r}")
 
     @property
     def folded_summary_width(self) -> int:
@@ -158,11 +191,8 @@ class NLHEGeometry:
         )
 
 
-def sampled_partitions(
-    players: int, geometry: NLHEGeometry | None = None
-) -> PartitionContract:
-    if not 2 <= players <= 6:
-        raise ValueError("players must lie in [2,6]")
+def sampled_partitions(geometry: NLHEGeometry) -> PartitionContract:
+    players = geometry.players
     inputs = (Partition("pre", 1),) + tuple(
         Partition(f"post_{live}", 1) for live in range(2, players + 1)
     )
@@ -170,8 +200,8 @@ def sampled_partitions(
         inputs=inputs,
         outputs=(Partition("all", 1),),
         folded=(
-            Partition("pre", 1 if geometry is None else geometry.rank_count**2),
-            Partition("post", 1 if geometry is None else geometry.private_hands),
+            Partition("pre", geometry.private_classes),
+            Partition("post", geometry.private_hands),
         ),
         input_to_output=tuple(
             PartitionMap(partition.name, "all") for partition in inputs
@@ -183,7 +213,7 @@ def sampled_partitions(
 def rb_partitions(geometry: NLHEGeometry) -> PartitionContract:
     """Natural learner domains for sequential Rao--Blackwell poker."""
 
-    k = geometry.rank_count**2
+    k = geometry.private_classes
     h = geometry.private_hands
     inputs = (Partition("pre", k),) + tuple(
         Partition(f"post_{live}", h) for live in range(2, geometry.players + 1)
@@ -206,7 +236,7 @@ def rb_partitions(geometry: NLHEGeometry) -> PartitionContract:
 def poker_partitions(geometry: NLHEGeometry, schema: ModeSchema) -> PartitionContract:
     if schema.private_estimator is PrivateEstimator.RAO_BLACKWELL:
         return rb_partitions(geometry)
-    return sampled_partitions(geometry.players, geometry)
+    return sampled_partitions(geometry)
 
 
 @dataclass(frozen=True)
@@ -477,6 +507,7 @@ class PokerStateMachine:
 
     def direct_model_input(
         self,
+        input_type: str,
         state: PokerState,
         log_reach: Tensor | None = None,
         history: PokerHistory | None = None,
@@ -519,15 +550,32 @@ class PokerStateMachine:
             ),
             1,
         )
+        private_width = self.geometry.model_private_width(input_type)
         if log_reach is None:
-            log_reach = torch.zeros(
-                (
-                    state.rows,
-                    self.geometry.players,
-                    self.geometry.private_hands,
-                ),
-                dtype=torch.float32,
-                device=state.device,
+            if input_type == "pre":
+                count = self._class_count(state.device)
+                log_reach = count.log()[None, None].expand(
+                    state.rows, self.geometry.players, -1
+                )
+            else:
+                log_reach = torch.zeros(
+                    (state.rows, self.geometry.players, private_width),
+                    dtype=torch.float32,
+                    device=state.device,
+                )
+        elif input_type == "pre" and log_reach.shape == (
+            state.rows,
+            self.geometry.players,
+            self.geometry.private_hands,
+        ):
+            log_reach = self._compact_preflop_reach(log_reach)
+        elif log_reach.shape != (
+            state.rows,
+            self.geometry.players,
+            private_width,
+        ):
+            raise QueuedPokerError(
+                "retained model reach differs from its input partition"
             )
         if history is None:
             history = self.empty_history(state.rows, state.device)
@@ -535,27 +583,88 @@ class PokerStateMachine:
             getattr(history, name).float() for name in history.__dataclass_fields__
         )
         base = torch.cat((public, log_reach.flatten(1), *history_values), 1)
-        summary = torch.zeros(
-            (state.rows, self.geometry.folded_summary_width),
-            dtype=base.dtype,
-            device=base.device,
-        )
+        if input_type == "pre":
+            return base.contiguous()
+        summary = base.new_zeros((state.rows, self.geometry.folded_summary_width))
         return torch.cat((base, summary), 1).contiguous()
 
-    def model_context(self, model_input: Tensor) -> tuple[Tensor, PokerHistory]:
+    def _combo_class(self, device: torch.device) -> Tensor:
+        cards = self.combo_cards(
+            torch.arange(
+                self.geometry.private_hands,
+                dtype=torch.int32,
+                device=device,
+            )
+        ).to(torch.int64)
+        ranks = self.geometry.rank_count
+        rank = cards // 4 - (13 - ranks)
+        high, low = rank.max(1).values, rank.min(1).values
+        high_position, low_position = ranks - 1 - high, ranks - 1 - low
+        suited_or_pair = rank[:, 0].eq(rank[:, 1]) | cards[:, 0].remainder(4).eq(
+            cards[:, 1].remainder(4)
+        )
+        return torch.where(
+            suited_or_pair,
+            high_position * ranks + low_position,
+            low_position * ranks + high_position,
+        )
+
+    def _class_count(self, device: torch.device) -> Tensor:
+        return torch.bincount(
+            self._combo_class(device), minlength=self.geometry.private_classes
+        ).to(torch.float32)
+
+    def _compact_preflop_reach(self, exact: Tensor) -> Tensor:
+        finite = torch.isfinite(exact)
+        gauge = exact.masked_fill(~finite, -torch.inf).amax(-1, keepdim=True)
+        safe_gauge = gauge.masked_fill(~torch.isfinite(gauge), 0.0)
+        weight = torch.exp(exact - safe_gauge).masked_fill(~finite, 0.0)
+        classes = self._combo_class(exact.device)
+        compact = exact.new_zeros(
+            (*exact.shape[:-1], self.geometry.private_classes)
+        )
+        compact.scatter_add_(
+            -1,
+            classes.expand(*exact.shape[:-1], -1),
+            weight,
+        )
+        return torch.where(
+            compact > 0,
+            compact.clamp_min(torch.finfo(torch.float32).tiny).log() + safe_gauge,
+            torch.full_like(compact, -torch.inf),
+        )
+
+    def expand_preflop_reach(self, compact: Tensor) -> Tensor:
+        if compact.shape[-1] != self.geometry.private_classes:
+            raise QueuedPokerError("preflop reach is not class-wide")
+        classes = self._combo_class(compact.device)
+        log_count = self._class_count(compact.device).log().index_select(0, classes)
+        return compact.index_select(-1, classes) - log_count
+
+    def model_context(
+        self, input_type: str, model_input: Tensor
+    ) -> tuple[Tensor, PokerHistory]:
         players = self.geometry.players
-        hands = self.geometry.private_hands
+        private_width = self.geometry.model_private_width(input_type)
         tokens = max_public_history_tokens(players, self.geometry.stack_bb)
         offset = 8 + 10 * players
-        reach = model_input[:, offset : offset + players * hands].float()
-        offset += players * hands
+        reach = model_input[:, offset : offset + players * private_width].float()
+        offset += players * private_width
         columns = []
         for _ in range(10):
             columns.append(model_input[:, offset : offset + tokens])
             offset += tokens
-        if offset != self.geometry.base_model_input_width:
+        expected_base = (
+            self.geometry.preflop_model_input_width
+            if input_type == "pre"
+            else self.geometry.postflop_base_model_input_width
+        )
+        if (
+            offset != expected_base
+            or model_input.shape[1] != self.geometry.model_input_width(input_type)
+        ):
             raise QueuedPokerError("retained model context layout is not exact")
-        return reach.reshape(-1, players, hands), PokerHistory(
+        return reach.reshape(-1, players, private_width), PokerHistory(
             columns[0].round().to(torch.int64),
             columns[1].round().to(torch.int64),
             columns[2].round().to(torch.int64),
@@ -567,6 +676,14 @@ class PokerStateMachine:
             columns[8].float(),
             columns[9].gt(0.5),
         )
+
+    def exact_model_context(
+        self, input_type: str, model_input: Tensor
+    ) -> tuple[Tensor, PokerHistory]:
+        reach, history = self.model_context(input_type, model_input)
+        if input_type == "pre":
+            reach = self.expand_preflop_reach(reach)
+        return reach, history
 
     @staticmethod
     def _append_history(
@@ -673,7 +790,7 @@ class PokerStateMachine:
         )
 
     def state_from_model_input(
-        self, model_input: Tensor, combo_ids: Tensor
+        self, input_type: str, model_input: Tensor, combo_ids: Tensor
     ) -> PokerState:
         """Recover exact public transition state from the retained input row."""
 
@@ -682,7 +799,7 @@ class PokerStateMachine:
             model_input.device.type not in ("cuda", "mps")
             or model_input.dtype not in (torch.float32, torch.float16, torch.bfloat16)
             or model_input.ndim != 2
-            or model_input.shape[1] != self.geometry.direct_model_input_width
+            or model_input.shape[1] != self.geometry.model_input_width(input_type)
             or combo_ids.shape != (model_input.shape[0], players)
             or combo_ids.dtype != torch.int32
             or combo_ids.device != model_input.device
@@ -1217,38 +1334,42 @@ class SequentialPokerHooks:
         except StopIteration as exc:
             raise QueuedPokerError(f"missing retained owner {name}") from exc
 
-    def _resolved_model_input(self, batch: FamilyBatch) -> Tensor:
-        """Refresh folded reaches from the sole retained FoldedRanges owner."""
+    def _resolved_model_context(
+        self, batch: FamilyBatch
+    ) -> tuple[Tensor, PokerHistory]:
+        """Return exact-combo transition reaches with folded rows resolved."""
 
         model_input = batch.fields["model_input"].reshape(
-            -1, self.geometry.direct_model_input_width
+            -1, self.geometry.model_input_width(batch.input_type)
         )
         references = (
             batch.fields["folded_range_row"]
             .reshape(-1, self.geometry.players)
             .to(torch.int64)
         )
-        refreshed = model_input.clone()
-        log_reach, _ = self.machine.model_context(refreshed)
+        log_reach, history = self.machine.exact_model_context(
+            batch.input_type, model_input
+        )
         log_reach = log_reach.clone()
-        rows = torch.arange(refreshed.shape[0], device=refreshed.device)
+        rows = torch.arange(model_input.shape[0], device=model_input.device)
         classes = self._combo_class()
         class_count = torch.bincount(
-            classes, minlength=self.geometry.rank_count**2
+            classes, minlength=self.geometry.private_classes
         ).float()
         state = self.machine.state_from_model_input(
-            refreshed,
+            batch.input_type,
+            model_input,
             torch.zeros(
-                (refreshed.shape[0], self.geometry.players),
+                (model_input.shape[0], self.geometry.players),
                 dtype=torch.int32,
-                device=refreshed.device,
+                device=model_input.device,
             ),
         )
         combo_cards = self.machine.combo_cards(
             torch.arange(
                 self.geometry.private_hands,
                 dtype=torch.int32,
-                device=refreshed.device,
+                device=model_input.device,
             )
         )
         board_conflict = (
@@ -1262,10 +1383,10 @@ class SequentialPokerHooks:
         batch_lanes = getattr(
             batch,
             "lanes",
-            torch.zeros(1, dtype=torch.int64, device=refreshed.device),
+            torch.zeros(1, dtype=torch.int64, device=model_input.device),
         )
         lane_count = int(batch_lanes.numel())
-        lane_rows = refreshed.shape[0] // lane_count
+        lane_rows = model_input.shape[0] // lane_count
         lane = (
             batch_lanes[:, None]
             .expand(lane_count, lane_rows)
@@ -1318,15 +1439,11 @@ class SequentialPokerHooks:
             log_reach[rows, seat] = torch.where(
                 active[:, None], log_weight, log_reach[rows, seat]
             )
-        offset = 8 + 10 * self.geometry.players
-        refreshed[
-            :, offset : offset + self.geometry.players * self.geometry.private_hands
-        ] = log_reach.flatten(1).to(refreshed.dtype)
-        return refreshed
+        return log_reach, history
 
     def _forward_model_input(self, batch: FamilyBatch) -> Tensor:
         return batch.fields["model_input"].reshape(
-            -1, self.geometry.direct_model_input_width
+            -1, self.geometry.model_input_width(batch.input_type)
         )
 
     def model_input(self, batch: FamilyBatch) -> PokerForwardInput:
@@ -1334,7 +1451,7 @@ class SequentialPokerHooks:
         return PokerForwardInput(
             batch.input_type,
             self._forward_model_input(batch).reshape(
-                *shape, self.geometry.direct_model_input_width
+                *shape, self.geometry.model_input_width(batch.input_type)
             ),
             batch.fields.get(
                 "sampled_private_state", batch.fields["true_profile"]
@@ -1351,7 +1468,7 @@ class SequentialPokerHooks:
         forward = PokerForwardInput(
             request.batch.input_type,
             self._forward_model_input(request.batch).reshape(
-                -1, self.geometry.direct_model_input_width
+                -1, self.geometry.model_input_width(request.batch.input_type)
             ),
             request.batch.fields.get(
                 "sampled_private_state", request.batch.fields["true_profile"]
@@ -1364,7 +1481,9 @@ class SequentialPokerHooks:
             ),
         )
         state = self.machine.state_from_model_input(
-            forward.model_input, forward.sampled_private_state
+            forward.input_type,
+            forward.model_input,
+            forward.sampled_private_state,
         )
         legality = self.machine.legality(state)
         raw = {
@@ -1373,7 +1492,10 @@ class SequentialPokerHooks:
             if name != "value"
         }
         row = torch.arange(state.rows, device=state.device)
-        actor_hand = state.combo_ids[row, forward.owner.to(torch.int64)]
+        actor_hand = self._private_index(
+            request.batch.input_type,
+            state.combo_ids[row, forward.owner.to(torch.int64)],
+        )
         sampled = self.policy.sample_actor(
             raw,
             legality,
@@ -1425,35 +1547,28 @@ class SequentialPokerHooks:
             destination[name].index_copy_(0, lanes, value.gather(1, index))
 
     def _natural_rows(self, value: Tensor, input_type: str) -> Tensor:
-        """Select one deterministic exact-hand representative per pre class."""
+        expected = (
+            self.geometry.private_classes
+            if input_type == "pre"
+            else self.geometry.private_hands
+        )
+        if value.shape[1] != expected:
+            raise QueuedPokerError("model output differs from its natural domain")
+        return value.float()
 
-        if input_type != "pre":
-            return value.float()
-        ranks = self.geometry.rank_count
-        cards = self.machine.combo_cards(
-            torch.arange(
-                self.geometry.private_hands,
-                dtype=torch.int32,
-                device=value.device,
-            )
+    def _exact_rows(self, value: Tensor, input_type: str) -> Tensor:
+        return (
+            value.index_select(1, self._combo_class()).float()
+            if input_type == "pre"
+            else value.float()
         )
-        rank = cards.long() // 4 - (13 - ranks)
-        high, low = rank.max(1).values, rank.min(1).values
-        hp, lp = ranks - 1 - high, ranks - 1 - low
-        suited_or_pair = rank[:, 0].eq(rank[:, 1]) | cards[:, 0].remainder(4).eq(
-            cards[:, 1].remainder(4)
+
+    def _private_index(self, input_type: str, combo: Tensor) -> Tensor:
+        return (
+            self._combo_class().index_select(0, combo.to(torch.int64))
+            if input_type == "pre"
+            else combo.to(torch.int64)
         )
-        classes = torch.where(suited_or_pair, hp * ranks + lp, lp * ranks + hp)
-        representatives = torch.full(
-            (ranks * ranks,), -1, dtype=torch.int64, device=value.device
-        )
-        # Reverse assignment leaves the smallest exact-hand row in each class.
-        for combo in range(self.geometry.private_hands - 1, -1, -1):
-            representatives[classes[combo]] = combo
-        accelerator_assert(
-            representatives.ge(0).all(), "preflop class map is incomplete"
-        )
-        return value.index_select(1, representatives).float()
 
     def _tight_folder_mask(self, history: PokerHistory, status: Tensor) -> Tensor:
         """Classify acted-then-folded seats; instant preflop folds are loose."""
@@ -1475,9 +1590,10 @@ class SequentialPokerHooks:
         flat_private = batch.fields.get(
             "sampled_private_state", batch.fields["true_profile"]
         ).reshape(-1, self.geometry.players)
-        state = self.machine.state_from_model_input(flat_input, flat_private)
-        resolved_input = self._resolved_model_input(batch)
-        log_reach, history = self.machine.model_context(resolved_input)
+        state = self.machine.state_from_model_input(
+            batch.input_type, flat_input, flat_private
+        )
+        log_reach, history = self._resolved_model_context(batch)
         action = request.sample.values["action"].reshape(-1)
         raw = MappingProxyType(
             {
@@ -1491,6 +1607,7 @@ class SequentialPokerHooks:
             .detach()
             .float()
         )
+        selected_log_exact = self._exact_rows(selected_log, batch.input_type)
         actor = state.to_act.to(torch.int64)
         actor_reach = log_reach.gather(
             1,
@@ -1499,7 +1616,7 @@ class SequentialPokerHooks:
         log_reach = log_reach.scatter(
             1,
             actor[:, None, None].expand(-1, 1, self.geometry.private_hands),
-            (actor_reach + selected_log)[:, None],
+            (actor_reach + selected_log_exact)[:, None],
         )
         fold_log_reach = log_reach
         history = self.machine.append_player_history(state, action, history)
@@ -1665,8 +1782,12 @@ class SequentialPokerHooks:
         value = request.model.values["value"]
         private = flat_private
         flat_row = torch.arange(owner.numel(), device=state.device)
+        private_index = self._private_index(
+            batch.input_type,
+            private[flat_row, owner],
+        )
         selected_value = (
-            value[flat_row, private[flat_row, owner].to(torch.int64), None]
+            value[flat_row, private_index, None]
             if sampled_mode
             else self._natural_rows(value, batch.input_type)
         ).reshape(lane_count, rows, -1)
@@ -1713,9 +1834,6 @@ class SequentialPokerHooks:
         )
 
         next_path = child_path_keys(path, 1).reshape(lane_count, rows)
-        next_input = self.machine.direct_model_input(
-            next_state, log_reach, history
-        ).reshape(lane_count, rows, -1)
         next_private = next_state.combo_ids.reshape(
             lane_count, rows, self.geometry.players
         )
@@ -1724,7 +1842,6 @@ class SequentialPokerHooks:
         family_source = {
             "logical_rng_key": next_logical,
             "true_profile": next_private,
-            "model_input": next_input,
             "owner": next_owner,
         }
         folded_reference = (
@@ -1756,7 +1873,7 @@ class SequentialPokerHooks:
             folded_rows = torch.zeros(
                 (
                     actor_weight.shape[0],
-                    self.geometry.rank_count**2,
+                    self.geometry.private_classes,
                 ),
                 dtype=torch.float32,
                 device=state.device,
@@ -1822,15 +1939,25 @@ class SequentialPokerHooks:
         family_source["folded_range_row"] = folded_reference.reshape(
             lane_count, rows, self.geometry.players
         ).to(torch.int32)
-        refresh = fold | next_state.street.ne(state.street)
+        refresh = (
+            fold | next_state.street.ne(state.street)
+        ) & next_state.street.ne(0)
         refresh_rows = torch.nonzero(refresh, as_tuple=False).flatten()
         from pbg.games.poker.queued.folded import (
             folded_statistics,
             pack_folded_statistics,
         )
 
-        next_input_flat = next_input.reshape(-1, self.geometry.direct_model_input_width)
+        post_summary = log_reach.new_zeros(
+            (log_reach.shape[0], self.geometry.folded_summary_width)
+        )
         if self.geometry.folded_summary_width:
+            if batch.input_type != "pre":
+                post_summary.copy_(
+                    flat_input[
+                        :, self.geometry.postflop_base_model_input_width :
+                    ].float()
+                )
             refreshed_summary = folded_statistics(
                 self.geometry,
                 board_cards=next_state.board_cards.index_select(0, refresh_rows),
@@ -1848,12 +1975,12 @@ class SequentialPokerHooks:
                     history, next_state.status
                 ).index_select(0, refresh_rows),
             )
-            packed_summary = pack_folded_statistics(self.geometry, refreshed_summary)
-            next_input_flat[:, self.geometry.base_model_input_width :].copy_(
-                flat_input[:, self.geometry.base_model_input_width :]
-            )
-            next_input_flat[:, self.geometry.base_model_input_width :].index_copy_(
-                0, refresh_rows, packed_summary.to(next_input.dtype)
+            post_summary.index_copy_(
+                0,
+                refresh_rows,
+                pack_folded_statistics(
+                    self.geometry, refreshed_summary
+                ),
             )
         if sampled_mode:
             family_source["sampled_private_state"] = next_private
@@ -1862,9 +1989,20 @@ class SequentialPokerHooks:
         published_queues: list[SemanticFamilyFIFO] = []
         for family_index, (name, queue) in enumerate(self.queues.items()):
             values = self._defaults(queue.family, rows)
+            next_input = self.machine.direct_model_input(
+                name, next_state, log_reach, history
+            )
+            if name != "pre" and self.geometry.folded_summary_width:
+                next_input[
+                    :, self.geometry.postflop_base_model_input_width :
+                ].copy_(post_summary.to(next_input.dtype))
+            queue_source = {
+                **family_source,
+                "model_input": next_input.reshape(lane_count, rows, -1),
+            }
             self._gather_route(
                 values,
-                family_source,
+                queue_source,
                 route.source_row[:, family_index + 1],
                 batch.lanes,
             )
@@ -1996,7 +2134,7 @@ class PokerLearnerPolicy:
 
     def __call__(
         self,
-        _input_type: str,
+        input_type: str,
         model_input: Tensor,
         raw: Mapping[str, Tensor],
         action: Tensor,
@@ -2015,7 +2153,9 @@ class PokerLearnerPolicy:
                 device=model_input.device,
             )
         state = self.machine.state_from_model_input(
-            model_input, sampled_private_state.to(torch.int32)
+            input_type,
+            model_input,
+            sampled_private_state.to(torch.int32),
         )
         return self.policy.learner(
             raw,

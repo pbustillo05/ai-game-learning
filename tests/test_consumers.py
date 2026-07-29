@@ -61,7 +61,7 @@ def test_public_config_is_one_closed_three_axis_composition() -> None:
     }
     assert config.execution.manifest.root_count == 1
     assert config.execution.layout.input_shapes == {
-        "pre": (448,),
+        "pre": (240,),
         "post_2": (448,),
     }
     raw = {
@@ -412,6 +412,9 @@ def test_paired_br_chance_address_is_independent_of_action_path() -> None:
             return (Action(),), torch.ones((4, 1))
 
         def private_hand_id(self, _hand: object, _actor: int) -> int:
+            return 0
+
+        def private_policy_index(self, _hand: object, _actor: int) -> int:
             return 0
 
         def advance(

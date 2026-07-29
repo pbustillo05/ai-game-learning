@@ -38,7 +38,7 @@ def test_public_config_loads_complete_scientific_and_execution_contract() -> Non
     assert cfg.execution.device == "cuda:0"
     assert cfg.execution.manifest.root_count == 1
     assert cfg.execution.layout.input_shapes == {
-        "pre": (448,),
+        "pre": (240,),
         "post_2": (448,),
     }
 

@@ -57,14 +57,14 @@ def sequential_family_workspace_row_bytes(
     hands = geometry.private_hands
     players = geometry.players
     model_values = (
-        geometry.direct_model_input_width
+        geometry.postflop_model_input_width
         + hands * (5 + 3 * m_raise)
     )
     # Transition retains the resolved/current/next family rows, reach updates,
     # conflict masks, route descriptors, and per-seat leaf/fold operands while
     # folded statistics consume the model evaluation.
     transition_values = (
-        2 * geometry.direct_model_input_width
+        2 * geometry.postflop_model_input_width
         + 8 * players * hands
         + 4 * hands
         + 128 * players

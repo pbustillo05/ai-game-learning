@@ -199,14 +199,14 @@ class QueuedPokerModel(nn.Module):
             raise PokerModelError("partition returned only one public branch head")
         return ModelEvaluation(MappingProxyType(dict(result.raw)), result.v, public)
 
-    def _state(self, model_input: Tensor) -> PokerState:
+    def _state(self, input_type: str, model_input: Tensor) -> PokerState:
         combo_ids = torch.zeros(
             (model_input.shape[0], self.geometry.players),
             dtype=torch.int32,
             device=model_input.device,
         )
         return PokerStateMachine(self.geometry).state_from_model_input(
-            model_input, combo_ids
+            input_type, model_input, combo_ids
         )
 
     def _public(
@@ -284,16 +284,14 @@ class QueuedPokerModel(nn.Module):
         return public, compatible
 
     def _call_preflop(self, model_input: Tensor) -> ModelEvaluation:
-        state = self._state(model_input)
-        log_reach, history = PokerStateMachine(self.geometry).model_context(model_input)
+        state = self._state("pre", model_input)
+        log_reach, history = PokerStateMachine(self.geometry).model_context(
+            "pre", model_input
+        )
         public, _compatible = self._public(state, history)
         finite = torch.isfinite(log_reach)
         gauge = log_reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
-        weights = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
-        classes = self.combo_class[None, None, :].expand_as(weights)
-        class_ranges = weights[
-            ..., : self.geometry.rank_count**2
-        ].clone().zero_().scatter_add(2, classes, weights)
+        class_ranges = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
         return self._evaluation(
             self.preflop(
                 public,
@@ -307,8 +305,10 @@ class QueuedPokerModel(nn.Module):
         )
 
     def _call_postflop(self, input_type: str, model_input: Tensor) -> ModelEvaluation:
-        state = self._state(model_input)
-        log_reach, history = PokerStateMachine(self.geometry).model_context(model_input)
+        state = self._state(input_type, model_input)
+        log_reach, history = PokerStateMachine(self.geometry).model_context(
+            input_type, model_input
+        )
         public, compatible = self._public(state, history)
         live = int(input_type[5:])
         seats = torch.arange(self.geometry.players, device=state.device)[None].expand(
@@ -338,7 +338,9 @@ class QueuedPokerModel(nn.Module):
                 stack_bb=self.geometry.stack_bb,
             ),
             status=state.status,
-            packed=model_input[:, self.geometry.base_model_input_width :].float(),
+            packed=model_input[
+                :, self.geometry.postflop_base_model_input_width :
+            ].float(),
         )
         return self._evaluation(
             self.postflop(
@@ -369,22 +371,17 @@ class QueuedPokerModel(nn.Module):
             )
         batch = model_input.shape[0]
         if input_type == "pre":
-            compact = (
+            result = (
                 self._call_preflop(model_input)
                 if isinstance(self.preflop, PreflopNet)
                 else self._call_direct(self.preflop, model_input)
             )
             _validate_output(
-                compact,
+                result,
                 batch=batch,
-                width=self.geometry.rank_count**2,
+                width=self.geometry.private_classes,
                 device=model_input.device,
             )
-            index = self.combo_class
-            raw = MappingProxyType(
-                {name: value[:, index] for name, value in compact.policy_raw.items()}
-            )
-            result = ModelEvaluation(raw, compact.value[:, index], compact.public_heads)
         elif input_type.startswith("post_") and input_type[5:].isdigit():
             live = int(input_type[5:])
             if not 2 <= live <= self.geometry.players:
@@ -392,7 +389,7 @@ class QueuedPokerModel(nn.Module):
             if self.geometry.folded_summary_width and not isinstance(
                 self.postflop, PostflopNet
             ):
-                state = self._state(model_input)
+                state = self._state(input_type, model_input)
                 if not bool(
                     (
                         ~state.status.eq(FOLDED).any(-1) | model_input[:, -1].gt(0.5)
@@ -408,12 +405,13 @@ class QueuedPokerModel(nn.Module):
             )
         else:
             raise PokerModelError(f"unknown poker input partition {input_type!r}")
-        _validate_output(
-            result,
-            batch=batch,
-            width=self.geometry.private_hands,
-            device=model_input.device,
-        )
+        if input_type != "pre":
+            _validate_output(
+                result,
+                batch=batch,
+                width=self.geometry.private_hands,
+                device=model_input.device,
+            )
         return result
 
     def forward_natural_partition(
@@ -421,33 +419,7 @@ class QueuedPokerModel(nn.Module):
     ) -> ModelEvaluation:
         """Return K-wide preflop or H-wide postflop learner outputs."""
 
-        if input_type == "pre":
-            result = (
-                self._call_preflop(model_input)
-                if isinstance(self.preflop, PreflopNet)
-                else self._call_direct(self.preflop, model_input)
-            )
-            _validate_output(
-                result,
-                batch=model_input.shape[0],
-                width=self.geometry.rank_count**2,
-                device=model_input.device,
-            )
-            return result
-        if input_type.startswith("post_") and input_type[5:].isdigit():
-            result = (
-                self._call_postflop(input_type, model_input)
-                if isinstance(self.postflop, PostflopNet)
-                else self._call_direct(self.postflop, model_input)
-            )
-            _validate_output(
-                result,
-                batch=model_input.shape[0],
-                width=self.geometry.private_hands,
-                device=model_input.device,
-            )
-            return result
-        raise PokerModelError(f"unknown poker input partition {input_type!r}")
+        return self.forward_partition(input_type, model_input)
 
     def forward_sequential_partition(
         self, input_type: str, model_input: Tensor
@@ -460,10 +432,26 @@ class QueuedPokerModel(nn.Module):
         self,
         input_type: str,
         model_input: Tensor,
-        _sampled_private_state: Tensor,
-        _owner: Tensor,
+        sampled_private_state: Tensor,
+        owner: Tensor,
     ) -> ModelEvaluation:
-        return self.forward_sequential_partition(input_type, model_input)
+        result = self.forward_sequential_partition(input_type, model_input)
+        owner64 = owner.to(torch.int64)
+        combo = sampled_private_state.gather(
+            1, owner64[:, None]
+        ).squeeze(1).to(torch.int64)
+        index = self.combo_class.index_select(0, combo) if input_type == "pre" else combo
+        row = torch.arange(index.numel(), device=index.device)
+        return ModelEvaluation(
+            MappingProxyType(
+                {
+                    name: value[row, index].unsqueeze(1)
+                    for name, value in result.policy_raw.items()
+                }
+            ),
+            result.value[row, index].unsqueeze(1),
+            result.public_heads,
+        )
 
     def rollout_operation(
         self,

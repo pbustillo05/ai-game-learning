@@ -360,8 +360,8 @@ def pilot_config_mapping(
             },
             "layout": {
                 "model_input_shapes": {
-                    "pre": [geometry.direct_model_input_width],
-                    "post_2": [geometry.direct_model_input_width],
+                    "pre": [geometry.preflop_model_input_width],
+                    "post_2": [geometry.postflop_model_input_width],
                 },
                 "player_count": 2,
                 "stratum_count": 2,

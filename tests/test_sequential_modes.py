@@ -210,7 +210,9 @@ def test_native_postflop_model_consumes_signed_folded_summary() -> None:
     )
     assert line[0, 2, 0] == 0.0
     assert line[0, 2, 1] > 0.0
-    model_input = machine.direct_model_input(state, log_reach, history)
+    model_input = machine.direct_model_input(
+        "post_2", state, log_reach, history
+    )
     summary = folded_statistics(
         geometry,
         board_cards=state.board_cards,
@@ -227,7 +229,7 @@ def test_native_postflop_model_consumes_signed_folded_summary() -> None:
         line_dim=0,
         tight_mask=torch.zeros_like(state.status, dtype=torch.bool),
     )
-    model_input[:, geometry.base_model_input_width :] = (
+    model_input[:, geometry.postflop_base_model_input_width :] = (
         pack_folded_statistics(geometry, summary)
     )
     with torch.profiler.profile(
@@ -460,16 +462,22 @@ def test_full_deck_folded_statistics_stays_within_admitted_workspace() -> None:
 def test_every_model_forward_uses_the_sealed_family_input() -> None:
     hooks = object.__new__(SequentialPokerHooks)
     hooks.geometry = NLHEGeometry(3, 8.0, 4)
-    width = hooks.geometry.direct_model_input_width
-    raw = torch.zeros((1, 1, width))
-    refreshed = torch.ones((1, width))
-    hooks._resolved_model_input = lambda _batch: refreshed
-    pre = SimpleNamespace(input_type="pre", fields={"model_input": raw})
-    post_two = SimpleNamespace(input_type="post_2", fields={"model_input": raw})
-    post_three = SimpleNamespace(input_type="post_3", fields={"model_input": raw})
-    assert torch.equal(hooks._forward_model_input(pre), raw.reshape(1, width))
-    assert torch.equal(hooks._forward_model_input(post_two), raw.reshape(1, width))
-    assert torch.equal(hooks._forward_model_input(post_three), raw.reshape(1, width))
+    pre_width = hooks.geometry.preflop_model_input_width
+    post_width = hooks.geometry.postflop_model_input_width
+    pre_raw = torch.zeros((1, 1, pre_width))
+    post_raw = torch.zeros((1, 1, post_width))
+    pre = SimpleNamespace(input_type="pre", fields={"model_input": pre_raw})
+    post_two = SimpleNamespace(input_type="post_2", fields={"model_input": post_raw})
+    post_three = SimpleNamespace(input_type="post_3", fields={"model_input": post_raw})
+    assert torch.equal(
+        hooks._forward_model_input(pre), pre_raw.reshape(1, pre_width)
+    )
+    assert torch.equal(
+        hooks._forward_model_input(post_two), post_raw.reshape(1, post_width)
+    )
+    assert torch.equal(
+        hooks._forward_model_input(post_three), post_raw.reshape(1, post_width)
+    )
 
 
 @CUDA
@@ -791,7 +799,7 @@ def test_folded_owner_refreshes_model_input_and_releases_at_seal() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 4)
     mode = mode_schema("self_play", "sequential", "sampled")
-    partitions = sampled_partitions(2, geometry)
+    partitions = sampled_partitions(geometry)
     owners = GeneratedOwners(
         build_storage_plan(
             mode,
@@ -833,21 +841,22 @@ def test_folded_owner_refreshes_model_input_and_releases_at_seal() -> None:
         1, seed=5, iteration=0, retry_epoch=0, device=device
     )
     batch = SimpleNamespace(
+        input_type="pre",
         fields={
-            "model_input": machine.direct_model_input(state)[None],
+            "model_input": machine.direct_model_input("pre", state)[None],
             "folded_range_row": torch.tensor(
                 [[[0, -1]]], dtype=torch.int32, device=device
             ),
         }
     )
-    refreshed = hooks._resolved_model_input(batch)
-    reach, _ = machine.model_context(refreshed)
+    reach, _ = hooks._resolved_model_context(batch)
     weights = reach[:, 0].exp()
     classes = hooks._combo_class()
     reconstructed = torch.zeros_like(class_range)
     reconstructed.scatter_add_(0, classes, weights[0])
     torch.testing.assert_close(reconstructed, class_range)
-    assert torch.equal(refreshed, hooks._resolved_model_input(batch))
+    second_reach, _ = hooks._resolved_model_context(batch)
+    assert torch.equal(reach, second_reach)
     board = torch.tensor(
         [[geometry.first_card, geometry.first_card + 1, geometry.first_card + 2,
           PAD_CARD, PAD_CARD]],
@@ -859,9 +868,11 @@ def test_folded_owner_refreshes_model_input_and_releases_at_seal() -> None:
         street=torch.ones_like(state.street),
         board_cards=board,
     )
-    batch.fields["model_input"] = machine.direct_model_input(post_state)[None]
-    chance_refreshed = hooks._resolved_model_input(batch)
-    chance_reach, _ = machine.model_context(chance_refreshed)
+    batch.fields["model_input"] = machine.direct_model_input(
+        "post_2", post_state
+    )[None]
+    batch.input_type = "post_2"
+    chance_reach, _ = hooks._resolved_model_context(batch)
     combo_cards = machine.combo_cards(
         torch.arange(
             geometry.private_hands, dtype=torch.int32, device=device
@@ -1046,7 +1057,7 @@ def test_all_four_sequential_modes_complete_an_optimizer_step(
     owners = GeneratedOwners(
         build_storage_plan(
             mode,
-            rb_partitions(geometry) if rb else sampled_partitions(2),
+            rb_partitions(geometry) if rb else sampled_partitions(geometry),
             manifest,
             layout,
             device,
@@ -1057,12 +1068,12 @@ def test_all_four_sequential_modes_complete_an_optimizer_step(
         result = QueuedPokerModel(
             geometry,
             _FinitePartitionNetwork(
-                geometry.direct_model_input_width,
+                geometry.preflop_model_input_width,
                 geometry.rank_count**2,
                 device,
             ),
             _FinitePartitionNetwork(
-                geometry.direct_model_input_width,
+                geometry.postflop_model_input_width,
                 geometry.private_hands,
                 device,
             ),
@@ -1121,7 +1132,7 @@ def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
     partitions = (
         rb_partitions(geometry)
         if estimator == "rao_blackwell"
-        else sampled_partitions(3, geometry)
+        else sampled_partitions(geometry)
     )
     inputs = tuple(item.name for item in partitions.inputs)
     base_manifest = _phase5_manifest(device)
@@ -1143,10 +1154,10 @@ def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
             else base_manifest.library_workspace_bytes
         ),
     )
-    width = geometry.direct_model_input_width
     layout = PhysicalLayout(
         model_input_shapes=tuple(
-            NamedShape(name, (width,)) for name in inputs
+            NamedShape(name, (geometry.model_input_width(name),))
+            for name in inputs
         ),
         player_count=3,
         stratum_count=3,
@@ -1172,10 +1183,14 @@ def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
         result = QueuedPokerModel(
             geometry,
             _FinitePartitionNetwork(
-                width, geometry.rank_count**2, device
+                geometry.preflop_model_input_width,
+                geometry.rank_count**2,
+                device,
             ),
             _FinitePartitionNetwork(
-                width, geometry.private_hands, device
+                geometry.postflop_model_input_width,
+                geometry.private_hands,
+                device,
             ),
         ).to(device)
         with torch.no_grad():

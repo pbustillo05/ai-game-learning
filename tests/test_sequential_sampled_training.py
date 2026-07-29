@@ -13,6 +13,7 @@ from pbg.games.poker.queued.hooks import (
     NLHEGeometry,
     PokerStateMachine,
     SampledShowdownBinding,
+    rb_partitions,
     sampled_partitions,
 )
 from pbg.games.poker.queued.model import QueuedPokerModel, build_model_from_config
@@ -176,7 +177,7 @@ def test_nlhe_geometry_and_partition_boundary_matrix() -> None:
                     assert geometry.player_node_bound == math.ceil(
                         stack * players + 3 * players - stack + 1
                     )
-                    partitions = sampled_partitions(players)
+                    partitions = sampled_partitions(geometry)
                     assert tuple(item.name for item in partitions.inputs) == (
                         ("pre",)
                         + tuple(f"post_{live}" for live in range(2, players + 1))
@@ -188,6 +189,37 @@ def test_nlhe_geometry_and_partition_boundary_matrix() -> None:
     for invalid in (7.5, 8.25, 128.5):
         with pytest.raises(ValueError):
             NLHEGeometry(2, invalid, 13)
+
+
+def test_full_deck_partition_widths_match_the_storage_contract() -> None:
+    geometry = NLHEGeometry(2, 8.0, 13)
+    assert geometry.private_classes == 169
+    assert geometry.private_hands == 1326
+
+    sampled = sampled_partitions(geometry)
+    assert {item.name: item.width for item in sampled.inputs} == {
+        "pre": 1,
+        "post_2": 1,
+    }
+    assert {item.name: item.width for item in sampled.outputs} == {"all": 1}
+    assert {item.name: item.width for item in sampled.folded} == {
+        "pre": 169,
+        "post": 1326,
+    }
+
+    rb = rb_partitions(geometry)
+    assert {item.name: item.width for item in rb.inputs} == {
+        "pre": 169,
+        "post_2": 1326,
+    }
+    assert {item.name: item.width for item in rb.outputs} == {
+        "pre": 169,
+        "post": 1326,
+    }
+    assert {item.name: item.width for item in rb.folded} == {
+        "pre": 169,
+        "post": 1326,
+    }
 
 
 @CUDA
@@ -389,9 +421,11 @@ def test_root_profiles_are_collision_free_and_public_transition_is_conservative(
     cards = machine.combo_cards(state.combo_ids)
     for row in cards:
         assert torch.unique(row).numel() == 2 * geometry.players
-    initial_input = machine.direct_model_input(state)
+    initial_input = machine.direct_model_input("pre", state)
     assert initial_input.device == device and initial_input.shape[0] == 8
-    reconstructed = machine.state_from_model_input(initial_input, state.combo_ids)
+    reconstructed = machine.state_from_model_input(
+        "pre", initial_input, state.combo_ids
+    )
     for name in state.__dataclass_fields__:
         if name != "terminal":
             torch.testing.assert_close(
@@ -568,12 +602,12 @@ def test_two_partition_model_routes_natural_domains_and_preserves_class_order() 
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 4)
     preflop = _PartitionNetwork(
-        geometry.direct_model_input_width, geometry.rank_count**2, device
+        geometry.preflop_model_input_width, geometry.rank_count**2, device
     )
     postflop = _PartitionNetwork(
-        geometry.direct_model_input_width, geometry.private_hands, device
+        geometry.postflop_model_input_width, geometry.private_hands, device
     )
-    model = QueuedPokerModel(geometry, preflop, postflop)
+    model = QueuedPokerModel(geometry, preflop, postflop).to(device)
     assert model.combo_class.cpu().tolist() == list(
         DeckGeometry(geometry.rank_count).class_of_combo
     )
@@ -581,8 +615,29 @@ def test_two_partition_model_routes_natural_domains_and_preserves_class_order() 
     state = machine.initial_roots(
         3, seed=17, iteration=0, retry_epoch=0, device=device
     )
-    model_input = machine.direct_model_input(state)
+    model_input = machine.direct_model_input("pre", state)
+    pre_reach, _ = machine.model_context("pre", model_input)
+    assert pre_reach.shape == (
+        state.rows,
+        geometry.players,
+        geometry.private_classes,
+    )
     pre = model.forward_partition("pre", model_input)
+    pre_rollout = model.rollout_operation(
+        "pre", model_input, state.combo_ids, state.to_act
+    )
+    pre_learner = model.learner_operation(
+        "pre", model_input, state.combo_ids, state.to_act
+    )
+    assert pre_rollout.value.shape == (state.rows, geometry.private_classes)
+    assert pre_learner.value.shape == (state.rows, 1)
+    assert all(
+        value.shape[1] == geometry.private_classes
+        for value in pre_rollout.policy_raw.values()
+    )
+    assert all(
+        value.shape[1] == 1 for value in pre_learner.policy_raw.values()
+    )
     state = machine.step_player(
         state,
         torch.full((3,), CHECK_CALL, dtype=torch.int32, device=device),
@@ -597,13 +652,21 @@ def test_two_partition_model_routes_natural_domains_and_preserves_class_order() 
             geometry.deck_cards, dtype=torch.int64, device=device
         )[None].expand(3, -1),
     )
-    post = model.forward_partition(
-        "post_2", machine.direct_model_input(state)
-    )
-    assert pre.value.shape == post.value.shape == (
-        3,
+    post_input = machine.direct_model_input("post_2", state)
+    post_reach, _ = machine.model_context("post_2", post_input)
+    assert post_reach.shape == (
+        state.rows,
+        geometry.players,
         geometry.private_hands,
     )
+    post = model.forward_partition("post_2", post_input)
+    post_learner = model.learner_operation(
+        "post_2", post_input, state.combo_ids, state.to_act
+    )
+    assert pre.value.shape == (3, geometry.private_classes)
+    assert post.value.shape == (3, geometry.private_hands)
+    assert post_learner.value.shape == (state.rows, 1)
+    assert all(value.shape[1] == 1 for value in post_learner.policy_raw.values())
     loss = (
         pre.value.mean()
         + post.value.mean()
@@ -633,19 +696,19 @@ def test_phase5_postflop_fails_before_silent_folded_summary_omission() -> None:
     model = QueuedPokerModel(
         geometry,
         _PartitionNetwork(
-            geometry.direct_model_input_width,
+            geometry.preflop_model_input_width,
             geometry.rank_count**2,
             device,
         ),
         _PartitionNetwork(
-            geometry.direct_model_input_width,
+            geometry.postflop_model_input_width,
             geometry.private_hands,
             device,
         ),
     )
     with pytest.raises(RuntimeError, match="folded summaries"):
         model.forward_partition(
-            "post_2", machine.direct_model_input(state)
+            "post_2", machine.direct_model_input("post_2", state)
         )
 
 
@@ -702,11 +765,10 @@ def _phase5_layout(
     geometry = (
         NLHEGeometry(2, 8.0, 4) if geometry is None else geometry
     )
-    input_width = geometry.direct_model_input_width
     return PhysicalLayout(
         model_input_shapes=(
-            NamedShape("pre", (input_width,)),
-            NamedShape("post_2", (input_width,)),
+            NamedShape("pre", (geometry.preflop_model_input_width,)),
+            NamedShape("post_2", (geometry.postflop_model_input_width,)),
         ),
         player_count=2,
         stratum_count=2,
@@ -890,7 +952,7 @@ def test_complete_poker_iteration_runs_roots_to_optimizer() -> None:
     owners = GeneratedOwners(
         build_storage_plan(
             mode,
-            sampled_partitions(geometry.players),
+            sampled_partitions(geometry),
             _phase5_manifest(device),
             _phase5_layout(),
             device,
@@ -1008,7 +1070,7 @@ def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
     owners = GeneratedOwners(
         build_storage_plan(
             mode,
-            sampled_partitions(2),
+            sampled_partitions(geometry),
             manifest,
             _phase5_layout(geometry),
             device,
@@ -1053,7 +1115,7 @@ def test_end_to_end_overflow_exposes_no_failed_attempt_rows() -> None:
     owners = GeneratedOwners(
         build_storage_plan(
             mode,
-            sampled_partitions(2),
+            sampled_partitions(geometry),
             manifest,
             _phase5_layout(),
             device,
@@ -1114,7 +1176,7 @@ def test_end_to_end_overflow_rebuilds_and_retries_at_lower_roots() -> None:
     )
     plan = build_storage_plan(
         mode,
-        sampled_partitions(2),
+        sampled_partitions(geometry),
         manifest,
         _phase5_layout(),
         device,
@@ -1174,14 +1236,14 @@ def test_end_to_end_overflow_rejects_retry_capacity_drift() -> None:
     )
     plan = build_storage_plan(
         mode,
-        sampled_partitions(2),
+        sampled_partitions(geometry),
         manifest,
         _phase5_layout(),
         device,
     )
     drifted = build_storage_plan(
         mode,
-        sampled_partitions(2),
+        sampled_partitions(geometry),
         replace(
             manifest,
             player_node_cap=(
@@ -1220,17 +1282,18 @@ def test_end_to_end_overflow_rejects_retry_capacity_drift() -> None:
 @CUDA
 def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
     mode = next(
         schema
         for schema in MODE_SCHEMAS
         if schema.key == "self_play/sequential/sampled"
     )
-    partitions = sampled_partitions(2)
+    partitions = sampled_partitions(geometry)
     plan = build_storage_plan(
         mode,
         partitions,
         _phase5_manifest(device),
-        _phase5_layout(),
+        _phase5_layout(geometry),
         device,
     )
     owners = GeneratedOwners(plan)

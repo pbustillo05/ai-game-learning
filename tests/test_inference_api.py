@@ -127,8 +127,11 @@ def test_stateful_singleton_batch_actions_and_export_identity(tmp_path: Path) ->
     )
     torch.testing.assert_close(batch[0].probabilities, singleton.probabilities)
     full = session.full_strategy((first, second))
-    assert full.probabilities.shape[:2] == (2, 120)
-    assert full.values_bb.shape == (2, 120)
+    assert full.probabilities.shape[:2] == (
+        2,
+        session.geometry.private_classes,
+    )
+    assert full.values_bb.shape == (2, session.geometry.private_classes)
     session.advance(second, "call")
     assert session.source_checkpoint_sha256 == "1" * 64
 
