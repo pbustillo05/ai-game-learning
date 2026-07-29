@@ -1747,7 +1747,20 @@ class LearnerOperation:
                 advantage,
             )
         ):
-            raise LearnerError("learner fields are not batch/domain aligned")
+            shapes = {
+                "current_log": tuple(current_log.shape),
+                "entropy": tuple(entropy.shape),
+                "reference_kl": tuple(reference_kl.shape),
+                "current_value": tuple(current_value.shape),
+                "old_log": tuple(old_log.shape),
+                "old_value": tuple(old_value.shape),
+                "target_value": tuple(target_value.shape),
+                "advantage": tuple(advantage.shape),
+            }
+            raise LearnerError(
+                "learner fields are not batch/domain aligned for "
+                f"{batch.input_type}: {shapes}"
+            )
         posterior = (
             torch.ones_like(current_log) if sampled else fields["posterior"].float()
         )

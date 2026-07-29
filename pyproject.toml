@@ -14,6 +14,7 @@ dependencies = ["numpy", "pyyaml", "pytest", "torch>=2.2"]
 pbg-train = "pbg.cli.train:main"
 pbg-train-replicas = "pbg.cli.train_replicas:main"
 pbg-runpod-replica-selection = "pbg.cli.runpod_replica_selection:main"
+pbg-h100-pilot = "pbg.cli.h100_pilot:main"
 pbg-benchmark = "pbg.cli.benchmark:main"
 pbg-br-eval = "pbg.cli.br_eval:main"
 pbg-export-inference = "pbg.cli.export_inference:main"

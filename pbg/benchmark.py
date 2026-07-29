@@ -6,6 +6,7 @@ import json
 import platform
 import statistics
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -13,9 +14,9 @@ from typing import Any
 import torch
 
 from pbg.config import RootConfig
-from pbg.identity import accelerator_identity, code_identity
-from pbg.core.persistence import sha256_file
+from pbg.core.persistence import model_state_sha256, sha256_file
 from pbg.core.rollout import LOGICAL_RNG_VERSION
+from pbg.identity import accelerator_identity, code_identity
 from pbg.runtime import TrainingSession
 
 _REQUIRED_SAMPLE_METRICS = (
@@ -39,16 +40,29 @@ def benchmark_training(
     warmup: int = 1,
     repeats: int = 5,
     checkpoint: str | Path | None = None,
+    initial_model_state: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     if warmup < 0 or repeats <= 0:
         raise ValueError("warmup must be nonnegative and repeats positive")
+    if checkpoint is not None and initial_model_state is not None:
+        raise ValueError(
+            "checkpoint resume and model-only initialization are mutually exclusive"
+        )
+    initializer_sha256 = (
+        None
+        if initial_model_state is None
+        else model_state_sha256(initial_model_state)
+    )
     samples = []
     benchmark_device: torch.device | None = None
     for index in range(warmup + repeats):
         # Every repeat starts from the identical model/optimizer/RNG/run state.
         # Warmup compiles the same production path but is never a measured row.
         session = TrainingSession(
-            cfg, resume_from=checkpoint, benchmark_telemetry=True
+            cfg,
+            resume_from=checkpoint,
+            benchmark_telemetry=True,
+            initial_model_state=initial_model_state,
         )
         benchmark_device = session.device
         iteration = session.run_states[0].iteration
@@ -140,6 +154,7 @@ def benchmark_training(
             "checkpoint_sha256": (
                 None if checkpoint is None else sha256_file(Path(checkpoint))
             ),
+            "initializer_model_sha256": initializer_sha256,
             "code": code_identity(),
             "accelerator": accelerator_identity(
                 cfg.scientific.common.game.rank_count

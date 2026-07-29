@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
 
@@ -15,25 +16,6 @@ import torch
 import torch.distributed as dist
 
 from pbg.config import RootConfig
-from pbg.devices import resolve_execution_device, validate_workload_capabilities
-from pbg.games.poker.queued.branching import (
-    BranchedSampledPokerIteration,
-    ReplicaBranchedPokerIteration,
-)
-from pbg.games.poker.queued.hooks import (
-    NLHEGeometry,
-    poker_partitions,
-)
-from pbg.games.poker.queued.model import build_model_from_config
-from pbg.games.poker.queued.replica import (
-    PokerReplicaInference,
-)
-from pbg.games.poker.queued.training import (
-    RecoveringSequentialPokerIteration,
-    SequentialPokerIteration,
-    discard_unpublished_attempt,
-)
-from pbg.identity import accelerator_identity, code_identity
 from pbg.core.branching import (
     BranchedRecoveryRecord,
     CostSafeguardController,
@@ -43,14 +25,13 @@ from pbg.core.branching import (
     controller_from_state_dict,
 )
 from pbg.core.capacity import GeneratedOwners, build_storage_plan
-from pbg.games.poker.queued.config import BranchedModeConfig, SequentialModeConfig
 from pbg.core.contracts import mode_schema
 from pbg.core.learner import ReferenceState
 from pbg.core.optimization import LossScaler
 from pbg.core.persistence import (
     CHECKPOINT_SCHEMA,
-    REPLICA_CHECKPOINT_SCHEMA,
     LOGICAL_WORK_KEYS,
+    REPLICA_CHECKPOINT_SCHEMA,
     RunState,
     load_checkpoint,
     load_distributed_checkpoint_manifest,
@@ -72,6 +53,26 @@ from pbg.core.training import (
     PreemptionNotice,
     RecoverableOverflow,
 )
+from pbg.devices import resolve_execution_device, validate_workload_capabilities
+from pbg.games.poker.queued.branching import (
+    BranchedSampledPokerIteration,
+    ReplicaBranchedPokerIteration,
+)
+from pbg.games.poker.queued.config import BranchedModeConfig, SequentialModeConfig
+from pbg.games.poker.queued.hooks import (
+    NLHEGeometry,
+    poker_partitions,
+)
+from pbg.games.poker.queued.model import build_model_from_config
+from pbg.games.poker.queued.replica import (
+    PokerReplicaInference,
+)
+from pbg.games.poker.queued.training import (
+    RecoveringSequentialPokerIteration,
+    SequentialPokerIteration,
+    discard_unpublished_attempt,
+)
+from pbg.identity import accelerator_identity, code_identity
 
 
 class RuntimeError(RuntimeError):
@@ -142,7 +143,15 @@ class TrainingSession:
         *,
         resume_from: str | Path | None = None,
         benchmark_telemetry: bool = False,
+        initial_model_state: Mapping[str, torch.Tensor] | None = None,
     ) -> None:
+        if initial_model_state is not None and (
+            resume_from is not None or config.execution.frozen_checkpoint is not None
+        ):
+            raise ValueError(
+                "model-only initialization is mutually exclusive with resume "
+                "and frozen-profile initialization"
+            )
         self.config = config
         self.resume_from = None if resume_from is None else Path(resume_from)
         self.benchmark_telemetry = bool(benchmark_telemetry)
@@ -208,6 +217,27 @@ class TrainingSession:
             modules.append(module)
         self.inference = PokerReplicaInference(modules)
         self.modules: ReplicaModuleOwner = self.inference.modules
+        if initial_model_state is not None:
+            if not initial_model_state or any(
+                not isinstance(name, str) or not isinstance(value, torch.Tensor)
+                for name, value in initial_model_state.items()
+            ):
+                raise ValueError(
+                    "model-only initialization requires a nonempty tensor state"
+                )
+            for lane in range(count):
+                self.modules.lane_module(lane).load_state_dict(
+                    initial_model_state, strict=True
+                )
+        rb = self.mode.private_estimator.value == "rao_blackwell"
+        self.model_operations = tuple(
+            (
+                self.modules.lane_module(lane).rb_learner_operation
+                if rb
+                else self.modules.lane_module(lane).learner_operation
+            )
+            for lane in range(count)
+        )
         self.optimizers = ReplicaOptimizerGroup(
             self.modules,
             config.scientific.common.optimizer,
@@ -235,10 +265,19 @@ class TrainingSession:
             for lane in range(count)
         )
         self.reference_modules = ReplicaModuleOwner(
-            tuple(copy.deepcopy(module).eval().requires_grad_(False) for module in modules)
+            tuple(
+                copy.deepcopy(self.modules.lane_module(lane))
+                .eval()
+                .requires_grad_(False)
+                for lane in range(count)
+            )
         )
         self.reference_operations = tuple(
-            self.reference_modules.lane_module(lane).learner_operation
+            (
+                self.reference_modules.lane_module(lane).rb_learner_operation
+                if rb
+                else self.reference_modules.lane_module(lane).learner_operation
+            )
             for lane in range(count)
         )
         self.reference_states = tuple(
@@ -492,7 +531,10 @@ class TrainingSession:
             geometry=self.geometry,
             mode=self.mode,
             model=models[0],
-            model_operation=models[0].learner_operation,
+            model_operation=self.model_operations[0],
+            rollout_operation=(
+                models[0].rollout_operation if count == 1 else None
+            ),
             optimizer=self.optimizers.optimizers[0],
             loss=self.config.scientific.common.loss,
             schedule=self.config.scientific.common.schedule,
@@ -525,9 +567,7 @@ class TrainingSession:
             ),
             replica_generators=self.generators,
             replica_run_states=self.run_states,
-            replica_model_operations=tuple(
-                model.learner_operation for model in models
-            ),
+            replica_model_operations=self.model_operations,
             replica_reference_operations=self.reference_operations,
             replica_frozen_inference=self.frozen_inference,
             distributed=self.distributed,
