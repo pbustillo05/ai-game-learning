@@ -540,6 +540,49 @@ def test_fixed_and_kkt_share_decision_contract_and_round_the_root() -> None:
     assert guarded.nominal_degree.tolist() == [2, 2, 2, 2]
     assert guarded.executed_degree.tolist() == [1, 1, 1, 1]
     assert guarded.target_degree.tolist() == [1, 1, 1, 1]
+    guarded_chance = FixedBranchController(
+        {"player": 2.0, "chance": 2.0},
+        2,
+        safe_tree_size=1,
+    ).decide(
+        schema=mode_schema("self_play", "branched.fixed", "sampled"),
+        **{
+            **common,
+            "owner_is_player": torch.zeros_like(
+                common["owner_is_player"]
+            ),
+            "trace": None,
+            "cost": None,
+        },
+        frontier_cost=torch.full((4,), 2.0, device=device),
+    )
+    assert guarded_chance.nominal_degree.tolist() == [2, 2, 2, 2]
+    assert guarded_chance.executed_degree.tolist() == [1, 1, 1, 1]
+    guarded_kkt_chance = KKTBranchController(
+        {"player": 2.0, "chance": 2.0},
+        2,
+        warmup_iterations=2,
+        target_tree_size=100,
+        gamma_kappa=0.2,
+        eta_kappa=0.2,
+        kappa_min=0.25,
+        kappa_max=4,
+        log_kappa=0,
+        safe_tree_size=1,
+    ).decide(
+        schema=mode_schema("self_play", "branched.KKT", "sampled"),
+        **{
+            **common,
+            "owner_is_player": torch.zeros_like(
+                common["owner_is_player"]
+            ),
+            "trace": None,
+            "cost": None,
+        },
+        frontier_cost=torch.full((4,), 2.0, device=device),
+    )
+    assert guarded_kkt_chance.nominal_degree.tolist() == [2, 2, 2, 2]
+    assert guarded_kkt_chance.executed_degree.tolist() == [1, 1, 1, 1]
     safeguard = CostSafeguardController(0.2, 1.5, 2)
     safeguard.observe(0.1, 1.2, 100)
     assert not safeguard.active

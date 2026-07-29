@@ -1049,6 +1049,8 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         self.realized_tree_size = torch.zeros(
             (), dtype=torch.float32, device=owners.device
         )
+        self._frontier_cost: Tensor | None = None
+        self._safe_tree_triggered = False
         self.last_topology: DeferredBranchedTopologyPublication | None = None
         self._topology_sequence = 0
         self._refill = False
@@ -1126,6 +1128,33 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         missing_frontier_cost = values["cost"].detach().float().masked_fill(
             batch.fields["frontier_cost_contribution"][0].gt(0), 0
         ).sum()
+        frontier_cost = (
+            self.realized_tree_size.to(values["cost"].dtype).expand_as(
+                values["cost"]
+            )
+            + (
+                torch.stack(
+                    tuple(
+                        queue.frontier_cost[lane]
+                        for queue in self.queues.values()
+                    )
+                ).sum()
+                + missing_frontier_cost
+                if self.cost_safeguard is not None
+                and self.cost_safeguard.active
+                else 0
+            )
+            if self.cost_safeguard is not None
+            else None
+        )
+        self._frontier_cost = frontier_cost
+        self._safe_tree_triggered = (
+            frontier_cost is not None
+            and self.controller.safe_tree_size is not None
+            and bool(
+                frontier_cost.gt(self.controller.safe_tree_size).all()
+            )
+        )
         decision = self.controller.decide(
             schema=self.mode,
             root=root,
@@ -1138,25 +1167,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             cost=values["cost"],
             log_player_ancestor_sum=batch.fields["log_player_ancestor_sum"][0],
             log_ancestor_product=batch.fields["log_ancestor_product"][0],
-            frontier_cost=(
-                self.realized_tree_size.to(values["cost"].dtype).expand_as(
-                    values["cost"]
-                )
-                + (
-                    torch.stack(
-                        tuple(
-                            queue.frontier_cost[lane]
-                            for queue in self.queues.values()
-                        )
-                    ).sum()
-                    + missing_frontier_cost
-                    if self.cost_safeguard is not None
-                    and self.cost_safeguard.active
-                    else 0
-                )
-                if self.cost_safeguard is not None
-                else None
-            ),
+            frontier_cost=frontier_cost,
         )
         if self._refill:
             if rows != 1:
@@ -1192,7 +1203,10 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         expanded_input = self._forward_model_input(batch).index_select(0, source)
         parent_profile = batch.fields["true_profile"][0]
         private = parent_profile.index_select(0, source)
-        if self.mode.private_estimator is PrivateEstimator.RAO_BLACKWELL:
+        if (
+            self.mode.private_estimator is PrivateEstimator.RAO_BLACKWELL
+            and not (self._safe_tree_triggered and not self._refill)
+        ):
             log_reach, _history = self._resolved_model_context(batch)
             finite = torch.isfinite(log_reach)
             gauge = log_reach.masked_fill(~finite, -torch.inf).amax(
@@ -1376,6 +1390,11 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             },
         )
         current_log_reach = log_reach
+        current_frontier_cost = (
+            None
+            if self._frontier_cost is None
+            else self._frontier_cost.index_select(0, action_source)
+        )
         endpoint_source = initial_endpoint_source
         endpoint_action = action_row
         endpoint_mass = initial_endpoint_mass
@@ -1421,6 +1440,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 cost=None,
                 log_player_ancestor_sum=endpoint_log_sum,
                 log_ancestor_product=endpoint_log_product,
+                frontier_cost=current_frontier_cost,
                 active=chance,
             )
             ones = torch.ones_like(chance_decision.executed_degree)
@@ -1496,7 +1516,10 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 },
             )
             expanded_private = current_private.index_select(0, chance_source)
-            if self.mode.private_estimator is PrivateEstimator.RAO_BLACKWELL:
+            if (
+                self.mode.private_estimator is PrivateEstimator.RAO_BLACKWELL
+                and not self._safe_tree_triggered
+            ):
                 finite = torch.isfinite(current_log_reach)
                 gauge = current_log_reach.masked_fill(
                     ~finite, -torch.inf
@@ -1671,6 +1694,11 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             current_private = expanded_private
             current_history = chance_history
             current_log_reach = current_log_reach.index_select(0, chance_source)
+            current_frontier_cost = (
+                None
+                if current_frontier_cost is None
+                else current_frontier_cost.index_select(0, chance_source)
+            )
             current_beta = chance_decision.beta.index_select(0, chance_source)
             current_active = next_active
             endpoint_record = next_endpoint_record
@@ -2089,29 +2117,34 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                         0, active_rows
                     )
                 )
-                with torch.no_grad():
-                    child_evaluation = self.child_model(
-                        PokerForwardInput(
-                            name,
-                            next_input.index_select(0, active_rows),
-                            private.index_select(0, active_rows),
-                            next_state.to_act.index_select(0, active_rows),
-                            selected_role,
-                        ),
-                        torch.tensor(
-                            [lane], dtype=torch.int64, device=device
-                        ),
-                    )
                 child_cost = torch.zeros(
                     selected_valid.shape,
                     dtype=torch.float32,
                     device=device,
                 )
-                child_cost.index_copy_(
-                    0,
-                    active_position,
-                    child_evaluation["cost"].detach().float(),
-                )
+                if active_rows.numel():
+                    with torch.no_grad():
+                        child_evaluation = self.child_model(
+                            PokerForwardInput(
+                                name,
+                                next_input.index_select(0, active_rows),
+                                private.index_select(0, active_rows),
+                                next_state.to_act.index_select(
+                                    0, active_rows
+                                ),
+                                selected_role,
+                            ),
+                            torch.tensor(
+                                [lane],
+                                dtype=torch.int64,
+                                device=device,
+                            ),
+                        )
+                    child_cost.index_copy_(
+                        0,
+                        active_position,
+                        child_evaluation["cost"].detach().float(),
+                    )
                 values["frontier_cost_contribution"][lane].copy_(child_cost)
                 cost_addition[lane] = child_cost.sum()
             count = lane_count(route.counts[0, family_index + 1])

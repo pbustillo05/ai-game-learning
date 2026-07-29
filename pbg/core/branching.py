@@ -184,6 +184,7 @@ class BranchController(Protocol):
 
     mode: RolloutMode
     beta_max: float
+    safe_tree_size: float | None
 
     def decide(
         self,
@@ -321,7 +322,7 @@ class FixedBranchController:
                 (torch.isfinite(frontier_cost) & frontier_cost.ge(0)).all(),
                 "frontier cost must be finite and nonnegative",
             )
-            suppressed = owner_is_player & frontier_cost.gt(self.safe_tree_size)
+            suppressed = frontier_cost.gt(self.safe_tree_size)
             executed = torch.where(suppressed, torch.ones_like(executed), executed)
         return BranchDecision(beta, nominal, executed, executed.clone())
 
@@ -498,7 +499,11 @@ class KKTBranchController:
         nominal = randomized_round(beta, uniform)
         executed = nominal.clone()
         if self.safe_tree_size is not None and frontier_cost is not None:
-            suppressed = owner_is_player & frontier_cost.gt(self.safe_tree_size)
+            torch._assert_async(
+                (torch.isfinite(frontier_cost) & frontier_cost.ge(0)).all(),
+                "frontier cost must be finite and nonnegative",
+            )
+            suppressed = frontier_cost.gt(self.safe_tree_size)
             executed = torch.where(suppressed, torch.ones_like(executed), executed)
         return BranchDecision(beta, nominal, executed, executed.clone())
 

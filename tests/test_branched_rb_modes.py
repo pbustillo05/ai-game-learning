@@ -24,6 +24,7 @@ from pbg.games.poker.queued.rb_sampling import (
 from pbg.games.poker.queued.model import build_model_from_config
 from pbg.games.poker.queued.config import BranchedModeConfig
 from pbg.core.branching import (
+    CostSafeguardController,
     FixedBranchController,
     KKTBranchController,
 )
@@ -642,6 +643,93 @@ def test_rejection_exhaustion_blocks_commit_and_publishes_device_failure(
     assert failure.phase == "posterior_sample"
     assert failure.sampler_attempt_count == 7
     assert failure.logical_address >= 0
+
+
+@CUDA
+def test_safe_tree_uses_only_inherited_profiles_for_rb_player_and_chance(
+    monkeypatch,
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    geometry = NLHEGeometry(2, 8.0, 4)
+    mode = mode_schema(
+        "self_play", "branched.fixed", "rao_blackwell"
+    )
+    plan = _plan(device, mode, geometry)
+
+    def unexpected_posterior(
+        _sampler: CollisionConditionedProfileSampler,
+        **_request,
+    ) -> torch.Tensor:
+        raise AssertionError(
+            "safe-tree N=1 work entered posterior profile sampling"
+        )
+
+    monkeypatch.setattr(
+        CollisionConditionedProfileSampler,
+        "sample_children",
+        unexpected_posterior,
+    )
+
+    class RecordingController(FixedBranchController):
+        def __init__(self) -> None:
+            super().__init__(
+                {"player": 2.0, "chance": 2.0},
+                2,
+                safe_tree_size=1,
+            )
+            self.chance_degrees: list[torch.Tensor] = []
+
+        def decide(self, **request):
+            decision = super().decide(**request)
+            if not bool(request["owner_is_player"].any()):
+                self.chance_degrees.append(
+                    decision.executed_degree.detach().cpu()
+                )
+            return decision
+
+    controller = RecordingController()
+    safeguard = CostSafeguardController(1.0, 2.0, 1)
+    safeguard.observe(0.1, 1.1, 1)
+    model = build_model_from_config(
+        _config("self_play", "branched.fixed"), device
+    )
+    result = BranchedSampledPokerIteration(
+        owner_factory=lambda: GeneratedOwners(plan),
+        plan=plan,
+        controller=controller,
+        run_state=RunState("phase8-safe-tree-profile", root_count=1),
+        arguments={
+            "geometry": geometry,
+            "mode": mode,
+            "model": model,
+            "model_operation": model.rb_learner_operation,
+            "rollout_operation": model.rollout_operation,
+            "optimizer": DenseAdam(
+                model, OptimizerConfig(name="adamw", grad_clip=5)
+            ),
+            "loss": LossConfig(
+                reference_kl_coefficient=0,
+                trace_coefficient=0.1,
+                cost_coefficient=0.1,
+            ),
+            "schedule": LearnerSchedule(
+                batch_size=2, gradient_steps=1
+            ),
+            "generator": torch.Generator(
+                device=device
+            ).manual_seed(613),
+            "seed": 613,
+            "lambda_": 0.95,
+            "completion_samples": 4,
+            "posterior_max_attempts": 16,
+            "cost_safeguard": safeguard,
+        },
+    ).run(iteration=0)
+    assert result.root_executed_degree == (1,)
+    assert controller.chance_degrees
+    assert all(
+        degree.eq(1).all() for degree in controller.chance_degrees
+    )
 
 
 @CUDA
