@@ -267,7 +267,9 @@ def pilot_config_mapping(
     leaf_cap = 2 * arm.roots
     topology_cap = 42 * arm.roots
     topology_edge_cap = topology_cap - arm.roots
-    folded_rows = max(1, min(arm.family_pack, arm.roots))
+    # Folded ranges are retained for the complete rollout, so this is a
+    # cumulative per-attempt capacity rather than a scheduler-pack bound.
+    folded_rows = arm.roots
     learner_pack = min(arm.family_pack, batch_size)
     completion_pack = min(256 if h100 else 8, leaf_cap)
     chance_pack = min(max(2 * arm.family_pack, 8), pre_rows + post_rows + leaf_cap)

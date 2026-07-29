@@ -47,6 +47,10 @@ def test_h100_plan_keeps_batch_fixed_and_sweeps_replicas() -> None:
             assert scientific["precision"] == {"name": "bf16"}
             assert execution["layout"]["model_dtype"] == "bfloat16"
             assert execution["manifest"]["n_replica"] == arm.replicas
+            assert execution["manifest"]["folded_range_cap"] == {
+                "pre": arm.roots,
+                "post": arm.roots,
+            }
             assert (
                 execution["manifest"]["hardware"]["memory_budget_bytes"]
                 == H100_MEMORY_BUDGET_BYTES
