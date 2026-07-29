@@ -1422,7 +1422,19 @@ class SequentialPokerHooks:
             index = index.expand(
                 (value.shape[0], source_row.shape[1], *value.shape[2:])
             )
-            destination[name].index_copy_(0, lanes, value.gather(1, index))
+            gathered = value.gather(1, index)
+            target = destination[name]
+            if gathered.dtype != target.dtype:
+                if (
+                    name != "model_input"
+                    or not gathered.is_floating_point()
+                    or not target.is_floating_point()
+                ):
+                    raise QueuedPokerError(
+                        f"route field {name!r} differs from storage dtype"
+                    )
+                gathered = gathered.to(dtype=target.dtype)
+            target.index_copy_(0, lanes, gathered)
 
     def _natural_rows(self, value: Tensor, input_type: str) -> Tensor:
         """Select one deterministic exact-hand representative per pre class."""

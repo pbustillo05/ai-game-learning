@@ -20,6 +20,7 @@ from pbg.games.poker.queued.hooks import (
     PAD_CARD,
     PokerForwardInput,
     PokerStateMachine,
+    QueuedPokerError,
     SequentialPokerHooks,
     rb_partitions,
     sampled_partitions,
@@ -86,6 +87,52 @@ class _FinitePartitionNetwork(_PartitionNetwork):
 CUDA = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"
 )
+
+
+@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda", marks=CUDA)))
+def test_route_casts_only_model_input_to_storage_dtype(device: str) -> None:
+    source_row = torch.tensor(
+        [[2, 0], [1, 2]], dtype=torch.int64, device=device
+    )
+    lanes = torch.tensor([1, 3], dtype=torch.int64, device=device)
+    model_input = torch.arange(
+        12, dtype=torch.float32, device=device
+    ).reshape(2, 3, 2)
+    destination = {
+        "model_input": torch.zeros(
+            (4, 2, 2), dtype=torch.bfloat16, device=device
+        ),
+    }
+
+    SequentialPokerHooks._gather_route(
+        destination,
+        {"model_input": model_input},
+        source_row,
+        lanes,
+    )
+
+    expected_index = source_row[..., None].expand(-1, -1, 2)
+    expected = model_input.gather(1, expected_index).to(torch.bfloat16)
+    assert destination["model_input"].dtype == torch.bfloat16
+    assert torch.equal(destination["model_input"].index_select(0, lanes), expected)
+
+    with pytest.raises(
+        QueuedPokerError, match="route field 'owner' differs from storage dtype"
+    ):
+        SequentialPokerHooks._gather_route(
+            {
+                "owner": torch.zeros(
+                    (1, 1), dtype=torch.int32, device=device
+                )
+            },
+            {
+                "owner": torch.zeros(
+                    (1, 1), dtype=torch.int64, device=device
+                )
+            },
+            torch.zeros((1, 1), dtype=torch.int64, device=device),
+            torch.zeros(1, dtype=torch.int64, device=device),
+        )
 
 
 def _config(regime: str, estimator: str) -> dict[str, object]:
