@@ -254,6 +254,8 @@ class BranchedPokerResult:
     root_target_degree: tuple[int, ...]
     duplicate_child_labels: int
     sampled_tree_nodes: int
+    pre_refill_nodes: int | None = None
+    refill_count: int = 0
     posterior_effective_hands: float | None = None
     telemetry: BranchedBenchmarkTelemetry | None = None
     observability: Mapping[str, object] = field(
@@ -1037,7 +1039,10 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         )
         self.controller = controller
         if (
-            owners.family_pack_cap * controller.beta_max
+            owners.family_pack_cap
+            * controller.max_degree(
+                owner_is_player=True,
+            )
             > owners.chance_frontier_cap
         ):
             raise ValueError(
@@ -1168,6 +1173,9 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             log_player_ancestor_sum=batch.fields["log_player_ancestor_sum"][0],
             log_ancestor_product=batch.fields["log_ancestor_product"][0],
             frontier_cost=frontier_cost,
+            player_family=(
+                "pre" if batch.input_type == "pre" else "post"
+            ),
         )
         if self._refill:
             if rows != 1:
@@ -1182,7 +1190,11 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             )
         degree = decision.executed_degree.to(torch.int64)
         total_tensor = degree.sum()
-        beta_max = self.controller.beta_max
+        player_family = "pre" if batch.input_type == "pre" else "post"
+        beta_max = self.controller.max_degree(
+            owner_is_player=True,
+            player_family=player_family,
+        )
         source = torch.arange(
             rows, dtype=torch.int64, device=root.device
         ).repeat_interleave(beta_max)
@@ -1420,7 +1432,8 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             current_rows = current_active.numel()
             generation_capacity = min(
                 chance_capacity,
-                current_rows * self.controller.beta_max,
+                current_rows
+                * self.controller.max_degree(owner_is_player=False),
             )
             frontier_row = torch.arange(
                 generation_capacity,
@@ -2482,6 +2495,7 @@ class _BranchedSampledPokerAttempt:
         benchmark_telemetry: bool = False,
         benchmark_identity: Mapping[str, str] | None = None,
         benchmark_rollout_only: bool = False,
+        benchmark_tree_only: bool = False,
     ) -> None:
         if not mode.rollout_mode.is_branched:
             raise ValueError("branched poker requires a branched mode")
@@ -2643,9 +2657,14 @@ class _BranchedSampledPokerAttempt:
         )
         self.benchmark_telemetry = bool(benchmark_telemetry)
         self.benchmark_rollout_only = bool(benchmark_rollout_only)
+        self.benchmark_tree_only = bool(benchmark_tree_only)
         if self.benchmark_rollout_only and not self.benchmark_telemetry:
             raise ValueError(
                 "rollout-only execution is reserved for benchmark telemetry"
+            )
+        if self.benchmark_tree_only and not self.benchmark_telemetry:
+            raise ValueError(
+                "tree-only execution is reserved for benchmark telemetry"
             )
         self.benchmark_identity = (
             None
@@ -3000,9 +3019,10 @@ class _BranchedSampledPokerAttempt:
             policy=self.policy,
             posterior_sampler=self.posterior_sampler,
         )
-        beta_max = owners.plan.manifest.beta_max
-        topology_rows_per_root = sum(
-            beta_max**generation for generation in range(1, 5)
+        player_beta_max = self.controller.max_degree(owner_is_player=True)
+        chance_beta_max = self.controller.max_degree(owner_is_player=False)
+        topology_rows_per_root = player_beta_max * sum(
+            chance_beta_max**generation for generation in range(4)
         )
         if topology_rows_per_root > owners.plan.manifest.topology_packet_cap:
             raise ValueError(
@@ -3026,6 +3046,7 @@ class _BranchedSampledPokerAttempt:
         last_event: torch.cuda.Event | None = None
         pre_refill_size: int | None = None
         pre_refill_record_count: int | None = None
+        refill_count = 0
         logical_base = (
             0 if self.run_state is None else self.run_state.attempt_logical_base
         )
@@ -3248,6 +3269,7 @@ class _BranchedSampledPokerAttempt:
                 pre_refill_size = recorder.sampled_tree_size()
                 pre_refill_record_count = recorder.record_count
             hooks.begin_root_refill(recorder.root_degree(deficient) + 1)
+            refill_count += 1
             try:
                 self._publish_refill_root(
                     queues["pre"],
@@ -3287,6 +3309,92 @@ class _BranchedSampledPokerAttempt:
         ) / roots
         recorder.release()
         publisher.assert_drained()
+        if self.benchmark_tree_only:
+            model_timing = dict(self._model_timing())
+            routing_traffic_bytes = hooks.routing_traffic_bytes
+            duplicate_labels = 0
+            for node in range(topology.node_count):
+                begin = int(topology.child_begin[node])
+                count = int(topology.executed_degree[node])
+                labels = topology.label[begin : begin + count]
+                duplicate_labels += count - int(labels.unique().numel())
+            self.controller.observe(
+                counterfactual_tree_size,
+                iteration=iteration,
+            )
+            if self.run_state is not None:
+                self.run_state.logical_work["trajectories"] += (
+                    self.run_state.root_count
+                )
+                self.run_state.branch_controller_state = (
+                    self.controller.state_dict()
+                )
+                self.run_state.cost_safeguard_state = (
+                    None
+                    if self.cost_safeguard is None
+                    else self.cost_safeguard.state_dict()
+                )
+            del transaction, publisher, registry, queues, hooks
+            _discard_attempt(owners)
+            return BranchedPokerResult(
+                None,
+                player_nodes=int(topology.owner.ge(0).sum()),
+                leaves=leaf_count,
+                target_layers=0,
+                executed_edges=topology.edge_count,
+                root_executed_degree=tuple(
+                    int(value)
+                    for value in topology.executed_degree[
+                        topology.parent.eq(-1)
+                    ].tolist()
+                ),
+                root_target_degree=tuple(
+                    int(value)
+                    for value in topology.target_degree[
+                        topology.parent.eq(-1)
+                    ].tolist()
+                ),
+                duplicate_child_labels=duplicate_labels,
+                sampled_tree_nodes=sampled_tree_nodes,
+                pre_refill_nodes=pre_refill_size,
+                refill_count=refill_count,
+                telemetry=BranchedBenchmarkTelemetry(
+                    rollout_seconds=rollout_seconds,
+                    routing_traffic_bytes=routing_traffic_bytes,
+                    host_synchronizations=host_synchronizations,
+                    child_reservation_commit_seconds=(
+                        child_reservation_commit_seconds
+                    ),
+                    target_propagation_seconds=0.0,
+                    peak_allocated_bytes=rollout_peak_allocated_bytes,
+                    peak_reserved_bytes=rollout_peak_reserved_bytes,
+                    model_inference_seconds=model_inference_seconds,
+                    posterior_and_action_sampling_seconds=(
+                        posterior_and_action_sampling_seconds
+                    ),
+                    transition_seconds=transition_seconds,
+                    rollout_peak_allocated_bytes=(
+                        rollout_peak_allocated_bytes
+                    ),
+                    model_stage_peak_allocated_bytes=(
+                        model_stage_peak_allocated_bytes
+                    ),
+                    sampling_stage_peak_allocated_bytes=(
+                        sampling_stage_peak_allocated_bytes
+                    ),
+                    transition_stage_peak_allocated_bytes=(
+                        transition_stage_peak_allocated_bytes
+                    ),
+                ),
+                observability=MappingProxyType(
+                    {
+                        **topology_diagnostics(
+                            topology, bindings, owners.plan.partitions
+                        ),
+                        "model_timing_by_family": model_timing,
+                    }
+                ),
+            )
         plan = build_layer_plan(
             self.mode,
             owners.plan.partitions,
@@ -3616,6 +3724,8 @@ class _BranchedSampledPokerAttempt:
                 ),
                 duplicate_child_labels=duplicate_labels,
                 sampled_tree_nodes=sampled_tree_nodes,
+                pre_refill_nodes=pre_refill_size,
+                refill_count=refill_count,
                 posterior_effective_hands=posterior_effective_hands,
                 telemetry=telemetry,
                 observability=MappingProxyType(
@@ -4288,9 +4398,15 @@ class ReplicaBranchedPokerIteration:
                 depths = {name: 0 for name in input_names}
                 depths["pre"] = roots
                 hooks.realized_tree_size.fill_(roots)
-                topology_rows_per_root = sum(
-                    owners.plan.manifest.beta_max**generation
-                    for generation in range(1, 5)
+                player_beta_max = self.controllers[lane].max_degree(
+                    owner_is_player=True
+                )
+                chance_beta_max = self.controllers[lane].max_degree(
+                    owner_is_player=False
+                )
+                topology_rows_per_root = player_beta_max * sum(
+                    chance_beta_max**generation
+                    for generation in range(4)
                 )
                 if (
                     topology_rows_per_root

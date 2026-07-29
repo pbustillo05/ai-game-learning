@@ -296,6 +296,45 @@ def test_branch_controller_requires_integral_capacity_bound() -> None:
         )
 
 
+def test_fixed_config_accepts_stage_specific_player_beta_only() -> None:
+    value = _scientific_config("self_play", "branched.fixed")
+    value["branching"] = {
+        **value["branching"],
+        "fixed_beta": {
+            "player_pre": 14.0,
+            "player_post": 2.0,
+            "chance": 2.4,
+        },
+        "beta_max": {
+            "player_pre": 15,
+            "player_post": 3,
+            "chance": 3,
+        },
+    }
+    configured = BranchedModeConfig.from_mapping(value)
+    assert dict(configured.branching["fixed_beta"]) == {
+        "player_pre": 14.0,
+        "player_post": 2.0,
+        "chance": 2.4,
+    }
+    assert dict(configured.branching["beta_max"]) == {
+        "player_pre": 15,
+        "player_post": 3,
+        "chance": 3,
+    }
+    value = _scientific_config("self_play", "branched.KKT")
+    value["branching"] = {
+        **value["branching"],
+        "fixed_beta": {
+            "player_pre": 3.0,
+            "player_post": 2.0,
+            "chance": 2.4,
+        },
+    }
+    with pytest.raises(ValueError, match="KKT requires player/chance"):
+        BranchedModeConfig.from_mapping(value)
+
+
 @CUDA
 def test_phase7_admission_covers_fixed_and_full_decision_workspaces() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
@@ -558,6 +597,25 @@ def test_fixed_and_kkt_share_decision_contract_and_round_the_root() -> None:
     )
     assert guarded_chance.nominal_degree.tolist() == [2, 2, 2, 2]
     assert guarded_chance.executed_degree.tolist() == [1, 1, 1, 1]
+    split = FixedBranchController(
+        {"player_pre": 6.0, "player_post": 3.0, "chance": 2.0},
+        {"player_pre": 6, "player_post": 3, "chance": 3},
+    )
+    pre = split.decide(
+        schema=mode_schema("self_play", "branched.fixed", "sampled"),
+        **common,
+        player_family="pre",
+    )
+    post = split.decide(
+        schema=mode_schema("self_play", "branched.fixed", "sampled"),
+        **common,
+        player_family="post",
+    )
+    assert pre.executed_degree.tolist() == [6, 6, 6, 6]
+    assert post.executed_degree.tolist() == [3, 3, 3, 3]
+    assert split.max_degree(owner_is_player=True, player_family="pre") == 6
+    assert split.max_degree(owner_is_player=True, player_family="post") == 3
+    assert split.max_degree(owner_is_player=False) == 3
     guarded_kkt_chance = KKTBranchController(
         {"player": 2.0, "chance": 2.0},
         2,

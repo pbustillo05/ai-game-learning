@@ -503,14 +503,45 @@ class BranchedModeConfig:
         fixed_beta = dict(
             _mapping(branching["fixed_beta"], "root.branching.fixed_beta")
         )
-        if set(fixed_beta) != {"player", "chance"}:
+        valid_fixed_beta = (
+            {"player", "chance"},
+            {"player_pre", "player_post", "chance"},
+        )
+        if set(fixed_beta) not in valid_fixed_beta or (
+            mode["rollout_mode"] == "branched.KKT"
+            and set(fixed_beta) != {"player", "chance"}
+        ):
             raise ValueError(
-                "root.branching.fixed_beta: player and chance are required"
+                "root.branching.fixed_beta: fixed mode requires player/chance "
+                "or player_pre/player_post/chance; KKT requires player/chance"
+            )
+        beta_max_raw = branching["beta_max"]
+        if isinstance(beta_max_raw, Mapping):
+            beta_max = dict(beta_max_raw)
+            valid_beta_max = (
+                mode["rollout_mode"] == "branched.fixed"
+                and set(fixed_beta)
+                == {"player_pre", "player_post", "chance"}
+                and set(beta_max)
+                == {"player_pre", "player_post", "chance"}
+                and all(
+                    not isinstance(item, bool)
+                    and isinstance(item, int)
+                    and item >= 1
+                    for item in beta_max.values()
+                )
+            )
+        else:
+            beta_max = beta_max_raw
+            valid_beta_max = (
+                not isinstance(beta_max, bool)
+                and isinstance(beta_max, int)
+                and beta_max >= 1
             )
         numeric = {
             name: item
             for name, item in branching.items()
-            if name not in ("fixed_beta", "minimum_tree_size")
+            if name not in ("fixed_beta", "beta_max", "minimum_tree_size")
         }
         numeric.update(fixed_beta)
         if any(
@@ -524,11 +555,15 @@ class BranchedModeConfig:
             isinstance(branching["minimum_tree_size"], bool)
             or not isinstance(branching["minimum_tree_size"], int)
             or branching["minimum_tree_size"] <= 0
-            or isinstance(branching["beta_max"], bool)
-            or not isinstance(branching["beta_max"], int)
-            or branching["beta_max"] < 1
+            or not valid_beta_max
             or any(
-                not 1 <= fixed_beta[name] <= branching["beta_max"]
+                not 1
+                <= fixed_beta[name]
+                <= (
+                    beta_max[name]
+                    if isinstance(beta_max, dict)
+                    else beta_max
+                )
                 for name in fixed_beta
             )
             or (
@@ -620,7 +655,17 @@ class BranchedModeConfig:
         return cls(
             MappingProxyType(mode),
             common,
-            MappingProxyType({**branching, "fixed_beta": MappingProxyType(fixed_beta)}),
+            MappingProxyType(
+                {
+                    **branching,
+                    "fixed_beta": MappingProxyType(fixed_beta),
+                    "beta_max": (
+                        MappingProxyType(beta_max)
+                        if isinstance(beta_max, dict)
+                        else beta_max
+                    ),
+                }
+            ),
             MappingProxyType(safeguard),
             MappingProxyType(applicable),
         )

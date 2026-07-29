@@ -186,6 +186,13 @@ class BranchController(Protocol):
     beta_max: float
     safe_tree_size: float | None
 
+    def max_degree(
+        self,
+        *,
+        owner_is_player: bool,
+        player_family: str | None = None,
+    ) -> int: ...
+
     def decide(
         self,
         *,
@@ -202,6 +209,7 @@ class BranchController(Protocol):
         log_ancestor_product: Tensor,
         frontier_cost: Tensor | None = None,
         active: Tensor | None = None,
+        player_family: str | None = None,
     ) -> BranchDecision: ...
 
     def observe(
@@ -224,7 +232,7 @@ class FixedBranchController:
     """Stage-fixed intensities using the shared controller operation."""
 
     fixed_beta: Mapping[str, float]
-    beta_max: int
+    beta_max: int | Mapping[str, int]
     scale: float = 1.0
     minimum_scale: float = 0.25
     backoff_factor: float = 0.5
@@ -233,18 +241,56 @@ class FixedBranchController:
     emergency_backoffs: int = 0
 
     def __post_init__(self) -> None:
-        if (
-            isinstance(self.beta_max, bool)
-            or not isinstance(self.beta_max, int)
-            or self.beta_max <= 0
+        raw_beta_max = self.beta_max
+        if isinstance(raw_beta_max, Mapping):
+            beta_max_by_family = dict(raw_beta_max)
+            if set(beta_max_by_family) != {
+                "player_pre",
+                "player_post",
+                "chance",
+            } or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in beta_max_by_family.values()
+            ):
+                raise ValueError(
+                    "stage beta_max must cover positive integer "
+                    "player_pre/player_post/chance bounds"
+                )
+        elif (
+            isinstance(raw_beta_max, bool)
+            or not isinstance(raw_beta_max, int)
+            or raw_beta_max <= 0
         ):
             raise ValueError("beta_max must be a positive integer")
+        else:
+            beta_max_by_family = {
+                "player_pre": raw_beta_max,
+                "player_post": raw_beta_max,
+                "chance": raw_beta_max,
+            }
+        self.beta_max_by_family = MappingProxyType(beta_max_by_family)
+        self.beta_max = max(beta_max_by_family.values())
         values = dict(self.fixed_beta)
-        if not values or any(
+        valid_keys = (
+            {"player", "chance"},
+            {"player_pre", "player_post", "chance"},
+        )
+        if set(values) not in valid_keys or any(
             not isinstance(name, str)
             or not name
             or not math.isfinite(float(value))
-            or not 1.0 <= float(value) <= self.beta_max
+            or not 1.0
+            <= float(value)
+            <= self.max_degree(
+                owner_is_player=name != "chance",
+                player_family=(
+                    "pre"
+                    if name in ("player", "player_pre")
+                    else "post"
+                ),
+            )
             for name, value in values.items()
         ):
             raise ValueError("fixed_beta must contain declared intensities")
@@ -265,6 +311,23 @@ class FixedBranchController:
         ):
             raise ValueError("safe_tree_size must be finite and at least one")
 
+    def max_degree(
+        self,
+        *,
+        owner_is_player: bool,
+        player_family: str | None = None,
+    ) -> int:
+        if not owner_is_player:
+            return self.beta_max_by_family["chance"]
+        if player_family is None:
+            return max(
+                self.beta_max_by_family["player_pre"],
+                self.beta_max_by_family["player_post"],
+            )
+        if player_family not in ("pre", "post"):
+            raise BranchingError("player family must be pre or post")
+        return self.beta_max_by_family[f"player_{player_family}"]
+
     def decide(
         self,
         *,
@@ -281,25 +344,40 @@ class FixedBranchController:
         log_ancestor_product: Tensor,
         frontier_cost: Tensor | None = None,
         active: Tensor | None = None,
+        player_family: str | None = None,
     ) -> BranchDecision:
         del trace, cost, log_player_ancestor_sum, log_ancestor_product
         if schema.rollout_mode is not self.mode:
             raise BranchingError("fixed controller received a different mode")
         try:
-            player_beta = self.fixed_beta["player"]
             chance_beta = self.fixed_beta["chance"]
         except KeyError as exc:
             raise BranchingError("fixed beta omits the requested node family") from exc
+        if "player" in self.fixed_beta:
+            player_beta = self.fixed_beta["player"]
+        else:
+            if player_family is None:
+                player_family = "pre"
+            if player_family not in ("pre", "post"):
+                raise BranchingError(
+                    "stage-fixed player beta requires pre/post family"
+                )
+            player_beta = self.fixed_beta[f"player_{player_family}"]
+        player_beta_max = self.max_degree(
+            owner_is_player=True,
+            player_family=player_family,
+        )
+        chance_beta_max = self.max_degree(owner_is_player=False)
         beta = torch.where(
             owner_is_player,
             torch.full_like(
                 root,
-                min(self.beta_max, max(1.0, player_beta * self.scale)),
+                min(player_beta_max, max(1.0, player_beta * self.scale)),
                 dtype=torch.float32,
             ),
             torch.full_like(
                 root,
-                min(self.beta_max, max(1.0, chance_beta * self.scale)),
+                min(chance_beta_max, max(1.0, chance_beta * self.scale)),
                 dtype=torch.float32,
             ),
         )
@@ -358,7 +436,7 @@ class FixedBranchController:
             "version": BRANCH_CONTROLLER_VERSION,
             "mode": self.mode.value,
             "fixed_beta": dict(self.fixed_beta),
-            "beta_max": self.beta_max,
+            "beta_max": dict(self.beta_max_by_family),
             "scale": self.scale,
             "minimum_scale": self.minimum_scale,
             "backoff_factor": self.backoff_factor,
@@ -431,6 +509,15 @@ class KKTBranchController:
         ):
             raise ValueError("KKT controller bounds are invalid")
 
+    def max_degree(
+        self,
+        *,
+        owner_is_player: bool,
+        player_family: str | None = None,
+    ) -> int:
+        del owner_is_player, player_family
+        return self.beta_max
+
     def decide(
         self,
         *,
@@ -447,7 +534,9 @@ class KKTBranchController:
         log_ancestor_product: Tensor,
         frontier_cost: Tensor | None = None,
         active: Tensor | None = None,
+        player_family: str | None = None,
     ) -> BranchDecision:
+        del player_family
         if schema.rollout_mode is not self.mode:
             raise BranchingError("KKT controller received a different mode")
         if iteration < self.warmup_iterations:

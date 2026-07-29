@@ -12,12 +12,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import subprocess
 import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,12 @@ import pbg.games.poker.queued.branching as branching_module
 import pbg.games.poker.queued.folded as folded_module
 from pbg.config import RootConfig, load_config_mapping
 from pbg.core.branching import CostSafeguardController, FixedBranchController
-from pbg.core.capacity import GeneratedOwners, build_storage_plan
+from pbg.core.capacity import (
+    GeneratedOwners,
+    NamedShape,
+    PartitionRows,
+    build_storage_plan,
+)
 from pbg.core.contracts import mode_schema
 from pbg.core.optimization import DenseAdam
 from pbg.core.persistence import RunState
@@ -41,6 +47,7 @@ from pbg.games.poker.queued.hooks import (
     NLHEGeometry,
     PokerStateMachine,
     RBCompletionBinding,
+    SequentialPokerHooks,
     rb_partitions,
 )
 from pbg.games.poker.queued.model import build_model_from_config
@@ -185,7 +192,7 @@ def _instrument(timing: CudaOperationTimes) -> ExitStack:
         _Patch(PokerPolicyOperator, "selected_log_pi", selected_log_pi)
     )
 
-    original_resolve = BranchedSampledPokerHooks._resolved_model_input
+    original_resolve = SequentialPokerHooks._resolved_model_context
 
     def resolved_model_input(self: object, batch: object) -> object:
         rows = int(getattr(batch, "rows", 0))
@@ -199,8 +206,8 @@ def _instrument(timing: CudaOperationTimes) -> ExitStack:
 
     stack.enter_context(
         _Patch(
-            BranchedSampledPokerHooks,
-            "_resolved_model_input",
+            SequentialPokerHooks,
+            "_resolved_model_context",
             resolved_model_input,
         )
     )
@@ -539,6 +546,8 @@ def _run_once(
     device: torch.device,
     scenario: ProfileScenario,
     timing: CudaOperationTimes | None,
+    tree_only: bool = False,
+    beta_max: int | Mapping[str, int] | None = None,
 ) -> object:
     scientific = config.scientific
     assert isinstance(scientific, BranchedModeConfig)
@@ -546,7 +555,11 @@ def _run_once(
     owners = GeneratedOwners(plan)
     controller = FixedBranchController(
         scenario.fixed_beta,
-        int(scientific.branching["beta_max"]),
+        (
+            int(scientific.branching["beta_max"])
+            if beta_max is None
+            else beta_max
+        ),
         minimum_scale=float(scientific.branching["minimum_scale"]),
         backoff_factor=float(scientific.branching["backoff_factor"]),
         safe_tree_size=scenario.safe_tree_size,
@@ -587,6 +600,7 @@ def _run_once(
             posterior_max_attempts=scenario.posterior_max_attempts,
             benchmark_telemetry=True,
             benchmark_rollout_only=True,
+            benchmark_tree_only=tree_only,
         ).run(iteration=scenario.iteration)
 
 
@@ -596,11 +610,205 @@ def main() -> None:
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--scenario")
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--output")
+    parser.add_argument("--player-pre-beta", type=float)
+    parser.add_argument("--player-post-beta", type=float)
+    parser.add_argument("--chance-beta", type=float)
+    parser.add_argument("--tree-only", action="store_true")
+    parser.add_argument("--large-tree-manifest", action="store_true")
+    parser.add_argument("--safe-tree-size", type=float)
+    parser.add_argument("--player-pre-beta-max", type=int)
+    parser.add_argument("--player-post-beta-max", type=int, default=3)
+    parser.add_argument("--chance-beta-max", type=int, default=3)
     args = parser.parse_args()
 
     profile = _load_profile_config(Path(args.config), args.scenario)
     scenario = profile.scenario
+    split_values = (args.player_pre_beta, args.player_post_beta)
+    stage_beta_max: Mapping[str, int] | None = None
+    if any(value is not None for value in split_values):
+        if not all(value is not None for value in split_values):
+            parser.error(
+                "--player-pre-beta and --player-post-beta must be supplied together"
+            )
+        chance_beta = (
+            float(args.chance_beta)
+            if args.chance_beta is not None
+            else float(scenario.fixed_beta["chance"])
+        )
+        fixed_beta = {
+            "player_pre": float(args.player_pre_beta),
+            "player_post": float(args.player_post_beta),
+            "chance": chance_beta,
+        }
+        pre_beta_max = (
+            int(args.player_pre_beta_max)
+            if args.player_pre_beta_max is not None
+            else int(math.ceil(float(args.player_pre_beta)))
+        )
+        stage_beta_max = {
+            "player_pre": pre_beta_max,
+            "player_post": int(args.player_post_beta_max),
+            "chance": int(args.chance_beta_max),
+        }
+        if any(value < 1 for value in stage_beta_max.values()) or any(
+            fixed_beta[name] > stage_beta_max[name]
+            for name in fixed_beta
+        ):
+            parser.error("beta overrides exceed their positive stage maxima")
+        scenario = ProfileScenario(
+            **{
+                **asdict(scenario),
+                "fixed_beta": fixed_beta,
+            }
+        )
+    elif args.chance_beta is not None:
+        parser.error("--chance-beta requires the two stage-specific player betas")
+    if args.seed is not None:
+        scenario = ProfileScenario(
+            **{**asdict(scenario), "seed": int(args.seed)}
+        )
+    if args.output is not None:
+        scenario = ProfileScenario(
+            **{**asdict(scenario), "output": Path(args.output).resolve()}
+        )
+    if args.safe_tree_size is not None:
+        if args.safe_tree_size < 1:
+            parser.error("--safe-tree-size must be at least one")
+        scenario = ProfileScenario(
+            **{
+                **asdict(scenario),
+                "safe_tree_size": float(args.safe_tree_size),
+            }
+        )
     config = profile.root
+    if args.large_tree_manifest:
+        experiment_geometry = NLHEGeometry(
+            config.scientific.common.game.players,
+            config.scientific.common.game.stack_bb,
+            config.scientific.common.game.rank_count,
+        )
+        manifest = config.execution.manifest
+        manifest = replace(
+            manifest,
+            beta_max=(
+                manifest.beta_max
+                if stage_beta_max is None
+                else max(stage_beta_max.values())
+            ),
+            player_node_cap=(
+                PartitionRows(
+                    "pre",
+                    2_000
+                    * (
+                        manifest.beta_max
+                        if stage_beta_max is None
+                        else stage_beta_max["player_pre"]
+                    )
+                    * (
+                        manifest.beta_max
+                        if stage_beta_max is None
+                        else stage_beta_max["chance"]
+                    )
+                    ** 3,
+                ),
+                PartitionRows("post_2", 48_000),
+            ),
+            trained_player_cap=(
+                PartitionRows("pre", 2_000),
+                PartitionRows("post_2", 48_000),
+            ),
+            action_cap=(
+                PartitionRows(
+                    "pre",
+                    2_000
+                    * (
+                        manifest.beta_max
+                        if stage_beta_max is None
+                        else stage_beta_max["player_pre"]
+                    ),
+                ),
+                PartitionRows("post", 149_999),
+            ),
+            folded_range_cap=(
+                PartitionRows(
+                    "pre",
+                    64
+                    * (
+                        manifest.beta_max
+                        if stage_beta_max is None
+                        else stage_beta_max["player_pre"]
+                    ),
+                ),
+                PartitionRows("post", 192),
+            ),
+            leaf_cap=80_000,
+            topology_cap=150_000,
+            topology_edge_cap=149_999,
+            family_pack_cap=64,
+            chance_frontier_cap=(
+                64
+                * (
+                    manifest.beta_max
+                    if stage_beta_max is None
+                    else stage_beta_max["player_pre"]
+                )
+                * (
+                    manifest.beta_max
+                    if stage_beta_max is None
+                    else stage_beta_max["chance"]
+                )
+                ** 3
+            ),
+            completion_pack_cap=8_192,
+            topology_packet_cap=(
+                64
+                * (
+                    manifest.beta_max
+                    if stage_beta_max is None
+                    else stage_beta_max["player_pre"]
+                )
+                * sum(
+                    (
+                        manifest.beta_max
+                        if stage_beta_max is None
+                        else stage_beta_max["chance"]
+                    )
+                    ** generation
+                    for generation in range(4)
+                )
+            ),
+            learner_action_pack_cap=(
+                20
+                * (
+                    manifest.beta_max
+                    if stage_beta_max is None
+                    else max(stage_beta_max.values())
+                )
+            ),
+            target_arena_cap=230_000,
+        )
+        config = replace(
+            config,
+            execution=replace(
+                config.execution,
+                manifest=manifest,
+                layout=replace(
+                    config.execution.layout,
+                    model_input_shapes=(
+                        NamedShape(
+                            "pre",
+                            (experiment_geometry.preflop_model_input_width,),
+                        ),
+                        NamedShape(
+                            "post_2",
+                            (experiment_geometry.postflop_model_input_width,),
+                        ),
+                    ),
+                ),
+            ),
+        )
     common = config.scientific.common
     device = torch.device(config.execution.device)
     torch.cuda.set_device(device)
@@ -633,6 +841,7 @@ def main() -> None:
         config.execution.manifest,
         config.execution.layout,
         device,
+        rollout_only=args.tree_only,
     )
 
     if scenario.warmup:
@@ -645,6 +854,8 @@ def main() -> None:
             device=device,
             scenario=scenario,
             timing=None,
+            tree_only=args.tree_only,
+            beta_max=stage_beta_max,
         )
         torch.cuda.synchronize(device)
 
@@ -659,6 +870,8 @@ def main() -> None:
         device=device,
         scenario=scenario,
         timing=timing,
+        tree_only=args.tree_only,
+        beta_max=stage_beta_max,
     )
     torch.cuda.synchronize(device)
     wall_seconds = time.perf_counter() - started
@@ -701,6 +914,11 @@ def main() -> None:
                 "rank_count": common.game.rank_count,
             },
             "fixed_beta": dict(scenario.fixed_beta),
+            "beta_max": (
+                config.scientific.branching["beta_max"]
+                if stage_beta_max is None
+                else dict(stage_beta_max)
+            ),
             "minimum_tree_size": scenario.minimum_tree_size,
             "safe_tree_size": scenario.safe_tree_size,
             "cost_safeguard": (
@@ -713,6 +931,15 @@ def main() -> None:
             "seed": scenario.seed,
             "iteration": scenario.iteration,
             "warmup": scenario.warmup,
+            "tree_only": args.tree_only,
+            "scientific_caps": {
+                "player_pre": 2_000,
+                "player_post": 48_000,
+                "player_total": 50_000,
+                "leaf": 80_000,
+            }
+            if args.large_tree_manifest
+            else None,
             "historical_physical_gpu": scenario.historical_physical_gpu,
             "expected_outcome": scenario.expected_outcome,
         },
@@ -722,6 +949,8 @@ def main() -> None:
             "leaves": result.leaves,
             "executed_edges": result.executed_edges,
             "sampled_tree_nodes": result.sampled_tree_nodes,
+            "pre_refill_nodes": result.pre_refill_nodes,
+            "refill_count": result.refill_count,
             "duplicate_child_labels": result.duplicate_child_labels,
             "posterior_effective_hands": result.posterior_effective_hands,
             "telemetry": asdict(result.telemetry),

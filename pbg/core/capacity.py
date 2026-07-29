@@ -753,6 +753,8 @@ def build_storage_plan(
     manifest: CapacityManifest,
     layout: PhysicalLayout,
     device: torch.device | str,
+    *,
+    rollout_only: bool = False,
 ) -> StoragePlan:
     """Validate a manifest and generate every declared CUDA owner."""
 
@@ -769,6 +771,8 @@ def build_storage_plan(
         except KeyError as exc:
             raise CapacityError(f"owner {owner.name!r} has no lifetime plan") from exc
         for partition in _axis_partitions(owner.partition_axis, partitions):
+            if rollout_only and start_phase is not ExecutionPhase.ROLLOUT:
+                continue
             partition_name = "" if partition is None else partition.name
             schema = SoASchema(
                 name=OwnerKey(owner.name, partition_name).label,

@@ -4,3 +4,5 @@
 4. there seems to be a few redundant parameters like "trained_player_cap" (redundant in non-BR mode) which should ONLY be required in some modes
 5. safe_tree_size = None should be allowed to remove that functionality
 6. does completion happen AFTER all rollouts?
+7. the checked-in allocator still sizes both completion arenas to leaf_cap + topology_cap
+8. chance-closure envelope? apparantly the preflop arrays are min-sized to some massive useless thing?
