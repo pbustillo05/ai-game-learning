@@ -957,6 +957,10 @@ class SequentialPokerIteration:
         owners.enter_phase(ExecutionPhase.QUEUE_DRAIN)
         owners.release_after(ExecutionPhase.QUEUE_DRAIN)
 
+        # Completion admits native evaluator workspace against driver-visible
+        # free memory. Return inactive rollout blocks held by PyTorch's cache.
+        torch.cuda.synchronize(owners.plan.device)
+        torch.cuda.empty_cache()
         owners.enter_phase(ExecutionPhase.COMPLETION)
         completion = CompletionFIFO(
             owners.slab("Leaf"),

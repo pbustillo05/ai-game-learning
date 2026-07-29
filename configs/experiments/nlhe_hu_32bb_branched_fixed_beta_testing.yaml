@@ -1,0 +1,255 @@
+# Validated beta-2.4 guarded execution configuration from the 2026-07-28
+# 32-seed, three-GPU capacity and pack-size audit.
+#
+# Run the default successful case:
+#   ./tools/poker-python tools/profile-queued-branching.py \
+#     --config configs/experiments/nlhe_hu_32bb_branched_fixed_beta_testing.yaml
+#
+# Select another recorded case with:
+#   --scenario successful_seed209559
+#
+# The two failed_beta3_* cases intentionally reproduce failed diagnostics.
+
+scientific:
+  mode:
+    training_regime: self_play
+    rollout_mode: branched.fixed
+    private_estimator: rao_blackwell
+
+  game:
+    players: 2
+    stack_bb: 32.0
+    rank_count: 13
+
+  model:
+    d_model: 128
+    n_heads: 4
+    n_layers_pre: 4
+    n_layers_post: 6
+    m_raise: 2
+    s_min: 0.02
+    max_players: 2
+    class_embedding_dim: 32
+    ffn_hidden: null
+    folder_beta_rank: 0
+    folder_line_dim: 8
+    epsilon: 1.0e-8
+
+  loss:
+    clip_epsilon: 0.2
+    value_clip_epsilon: 0.2
+    value_coefficient: 0.5
+    entropy_coefficient: 0.01
+    reference_kl_coefficient: 0.0
+    value_loss: mse
+    entropy_schedule: constant
+    entropy_decay_iterations: null
+    trace_coefficient: 1.0
+    cost_coefficient: 1.0
+    trace_epsilon: 1.0e-6
+
+  optimizer:
+    name: adamw
+    learning_rate: 5.0e-5
+    beta1: 0.9
+    beta2: 0.999
+    epsilon: 1.0e-8
+    weight_decay: 0.0
+    grad_clip: 0.5
+
+  schedule:
+    batch_size: 128
+    epochs: 1
+    gradient_steps: 1
+
+  precision:
+    name: fp16
+
+  reference:
+    interval_iterations: 100
+    interval_effective_hands: null
+    cache_outputs: false
+
+  lambda: 0.95
+  root_count: 1
+  root_count_minimum: 1
+  seed: 104830
+  reproducibility: strict
+  utility: raw_bb
+
+  # Profile scenarios below explicitly reproduce this safeguard state.
+  branching:
+    fixed_beta:
+      player: 2.4
+      chance: 2.4
+    beta_max: 3
+    minimum_tree_size: 1000
+    minimum_scale: 0.25
+    backoff_factor: 0.5
+    safe_tree_size: 25000.0
+
+  cost_safeguard:
+    gamma_deviance_max: 1.0
+    p95_underprediction_max: 2.0
+    consecutive_iterations: 1
+
+  completion:
+    n_samples: 1024
+    strata: default
+
+execution:
+  device: cuda:0  # Runtime device; the profiler also selects logical CUDA GPU 0.
+  iterations: 1  # Runtime loop endpoint; ignored by the one-shot profiler.
+  checkpoint_every: 1  # Runtime checkpoint cadence; ignored by the profiler.
+  output_dir: runs/experiments/nlhe_hu_32bb_branched_fixed_beta_testing  # Runtime artifacts; profile scenarios use their own output paths.
+  run_id: nlhe_hu_32bb_branched_fixed_beta_testing  # RunState/checkpoint identity; used by the profiler's RunState.
+  distributed: false  # Runtime NCCL toggle; the profiler always runs one process.
+  frozen_checkpoint: null  # Correctly null for self-play; the profiler loads profile.checkpoint instead.
+  attention_backend: sdpa  # Selects PyTorch SDPA; this makes execution.query_chunk_size inert.
+  query_chunk_size: 128  # Used only by chunked_dense attention, not by sdpa.
+
+  manifest:  # Immutable storage, pack-size, workspace, and admission bounds.
+    model_token_bound: 2555  # Declared one-row maximum; safely covers the computed 2554-token postflop bound.
+    model_token_pair_bound: 6528025  # 2555^2; declared one-row attention-pair bound.
+    root_count: 1  # Must equal scientific.root_count; seeds one rollout root.
+    n_replica: 1  # Allocates one storage/model lane; required by this profiler.
+    beta_max: 3  # Must match scientific branching.beta_max; caps every branch degree.
+
+    player_node_cap:  # FamilyWork rows, partitioned by model input family.
+      pre: 6804  # Required staged device-pack envelope: family_pack_cap * beta_max^4 = 84 * 3^4.
+      post_2: 20000  # 37.2% above the guarded 32-seed maximum of 14,582 rows.
+    trained_player_cap:  # Sigma head/target and learner-index rows.
+      pre: 84  # One full family pack; guarded 32-seed high-water was 6.
+      post_2: 20000  # Self-play can train every retained postflop decision.
+
+    action_cap:  # Branched action head/target rows, partitioned by output domain.
+      pre: 252  # Exact one-pack branching envelope: family_pack_cap * beta_max.
+      post: 35999  # Cannot be exceeded by the one-root 35,999-edge topology envelope.
+
+    folded_range_cap:  # Action-conditioned fold-range snapshots; HU skips summary statistics but still stores these.
+      pre: 252  # Cumulative preflop fold-snapshot slab; measured high-water was zero in these HU rollouts.
+      post: 252  # Cumulative postflop fold-snapshot slab; measured high-water was zero in these HU rollouts.
+    leaf_cap: 20000  # 35.9% above the guarded 32-seed maximum of 14,719 leaves.
+
+    topology_cap: 36000  # 17.1% above the guarded 32-seed maximum of 30,742 nodes.
+    topology_edge_cap: 35999  # Exact one-root tree bound: topology_cap - root_count.
+    family_pack_cap: 84  # Fastest measured forward and wall time in the matched-seed pack sweep.
+    chance_frontier_cap: 8192  # Temporary chance rows; covers the derived 84 * 3^4 = 6,804 envelope.
+    completion_pack_cap: 8192  # Lowest measured completion ms/decision; at most three calls for leaf_cap.
+    learner_sigma_pack_cap: 20  # Maximum decision rows in one physical learner batch, from the pair ceiling.
+    learner_action_pack_cap: 60  # beta_max * sigma cap; avoids splitting any legal 20-decision batch by action count.
+    topology_packet_cap: 10080  # Per-inflight topology packet; 84 maximal 120-row root expansions.
+    target_arena_cap: 56000  # Exact generic bound: leaf_cap + topology_cap.
+
+    movement_scratch_bytes: 67108864  # 64 MiB cap for LayerPlan upload/movement indices.
+    library_workspace_bytes: 9306112  # Exact H-to-K mask plus versioned 8 MiB cuBLAS workspace.
+    evaluator_workspace_bytes: 268435456  # Admission charge only; no nonzero external lower bound is declared.
+    memory_guard_bytes: 536870912  # 512 MiB charged in every phase for allocator/unmodeled overhead.
+
+    hardware:  # Declared device identity and training/admission ceilings.
+      total_memory_bytes: 11344740352  # Lowest CUDA-visible total across the three RTX 2080 Ti cards.
+      memory_budget_bytes: 10500000000  # 92.6% of the lowest VRAM total; leaves 844,740,352 bytes outside the budget.
+      training_max_tokens: 65536  # Aggregate learner token ceiling; branched batches do not currently apply it.
+      training_max_token_pairs: 134217728  # Aggregate pair ceiling; branched batches do not currently apply it.
+      query_chunk_size: 128  # Validation-only hardware datum; not linked to execution.query_chunk_size.
+
+    required_external:  # Versioned lower bounds checked against the two workspace declarations.
+      library_bytes: 0  # Disables the external lower-bound check; poker performs a separate 9,306,112-byte check.
+      evaluator_bytes: 0  # Disables any evaluator-version lower-bound check.
+
+  layout:  # Physical tensor shapes and per-row workspace accounting.
+    model_input_shapes:  # Retained FamilyWork/LearnerIndex input shape by input family.
+      pre: [3100]  # Bloated rollout ABI: retains 2*1326 combo reaches; the preflop net reduces them to 2*169 classes.
+      post_2: [3100]  # Same canonical state layout; family tokenization differs later.
+    player_count: 2  # Shapes player-axis fields and must match game geometry.
+    stratum_count: 2  # Shapes each leaf's stratum_amount vector.
+    evaluator_private_width: 1326  # Exact C(52, 2) private-hand domain.
+    family_workspace_row_bytes: 203672  # Exact concurrent family bound for this geometry and m_raise=2.
+    chance_frontier_row_bytes: 116813  # Exact RB frontier bound for 256 posterior attempts.
+    completion_workspace_row_bytes: 17264  # Exact per-row H-to-K conversion workspace.
+    learner_sigma_workspace_row_bytes: 1048576  # 1 MiB accounting estimate per decision pack row; not runtime-checked.
+    learner_action_workspace_row_bytes: 1048576  # 1 MiB accounting estimate per action pack row; not runtime-checked.
+    topology_packet_row_bytes: 95  # Exact compact node/edge packet row size.
+    reference_cache_bytes: 0  # Correct because scientific.reference.cache_outputs is false.
+    field_alignment: 64  # SoA field alignment; valid power of two and used in analytical allocation.
+    model_dtype: float16  # Stored model-input dtype; consistent with scientific precision fp16.
+
+profile:
+  checkpoint: runs/experiments/nlhe_hu_32bb_branched_fixed_storage_baseline_20260723/benchmark_init_ckpt_0001110_dummy_heads_seed91301_v8.pt
+  checkpoint_sha256: 7ddaad84f691ee31336f4e852ca44e566596275ba05fcdf56cb527087009aa21
+  default_scenario: successful_seed104830
+
+  scenarios:
+    successful_seed104830:
+      output: runs/experiments/nlhe_hu_32bb_branched_fixed_beta_testing/profile_beta2p4_seed104830.json
+      fixed_beta: {player: 2.4, chance: 2.4}
+      minimum_tree_size: 1000
+      safe_tree_size: 25000.0
+      cost_safeguard:
+        gamma_deviance_max: 1.0
+        p95_underprediction_max: 2.0
+        consecutive_iterations: 1
+        consecutive_successes: 0
+        active: false
+        observations: 0
+      completion_samples: 1024
+      posterior_max_attempts: 256
+      seed: 104830
+      iteration: 1110
+      warmup: 0
+      historical_physical_gpu: 2
+      expected_outcome: success
+
+    successful_seed209559:
+      output: runs/experiments/nlhe_hu_32bb_branched_fixed_beta_testing/profile_beta2p4_seed209559.json
+      fixed_beta: {player: 2.4, chance: 2.4}
+      minimum_tree_size: 1000
+      safe_tree_size: 25000.0
+      cost_safeguard:
+        gamma_deviance_max: 1.0
+        p95_underprediction_max: 2.0
+        consecutive_iterations: 1
+        consecutive_successes: 0
+        active: false
+        observations: 0
+      completion_samples: 1024
+      posterior_max_attempts: 256
+      seed: 209559
+      iteration: 1110
+      warmup: 0
+      historical_physical_gpu: 1
+      expected_outcome: success
+
+    failed_beta3_capacity:
+      output: runs/experiments/nlhe_hu_32bb_branched_fixed_beta_testing/failed_beta3_capacity.json
+      fixed_beta: {player: 3.0, chance: 3.0}
+      minimum_tree_size: 1000
+      safe_tree_size: 10000.0
+      cost_safeguard: null
+      completion_samples: 1024
+      posterior_max_attempts: 256
+      seed: 104830
+      iteration: 1110
+      warmup: 1
+      historical_physical_gpu: 0
+      expected_outcome: "RecoverableOverflow: rollout_commit overflow"
+
+    failed_beta3_active_safeguard:
+      output: runs/experiments/nlhe_hu_32bb_branched_fixed_beta_testing/failed_beta3_active_safeguard.json
+      fixed_beta: {player: 3.0, chance: 3.0}
+      minimum_tree_size: 1000
+      safe_tree_size: 10000.0
+      cost_safeguard:
+        gamma_deviance_max: 1.0
+        p95_underprediction_max: 2.0
+        consecutive_iterations: 1
+        consecutive_successes: 1
+        active: true
+        observations: 0
+      completion_samples: 1024
+      posterior_max_attempts: 256
+      seed: 104830
+      iteration: 1110
+      warmup: 0
+      historical_physical_gpu: 1
+      expected_outcome: "CUDA assert: postflop family disagrees with live-seat state"
