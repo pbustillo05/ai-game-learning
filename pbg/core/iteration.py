@@ -160,10 +160,22 @@ class IterationConfig:
 
 
 @dataclass(frozen=True)
+class RootDestination:
+    """Game-declared input partition that receives every root row."""
+
+    input_type: str
+
+    def __post_init__(self) -> None:
+        if not self.input_type or not self.input_type.isidentifier():
+            raise ValueError("root destination must name one input partition")
+
+
+@dataclass(frozen=True)
 class RootRequest:
     """Lane-local logical root request presented to a game operation."""
 
     plan: StoragePlan
+    destination: RootDestination
     lane: int
     rows: int
     iteration: int
@@ -242,6 +254,8 @@ class GameOperations(Protocol):
 
     seed: int
     error_type: type[Exception]
+
+    def root_destination(self, plan: StoragePlan) -> RootDestination: ...
 
     def root_payload(self, request: RootRequest) -> RootPayload: ...
 
@@ -394,8 +408,6 @@ class _ModelTiming:
 @dataclass
 class _IterationState:
     input_names: tuple[str, ...]
-    queues: Mapping[str, SemanticFamilyFIFO]
-    rollout: GameRollout
     topology: SealedTopology
     last_event: torch.cuda.Event
     roots: tuple[int, ...]
@@ -768,6 +780,7 @@ class IterationEngine:
         owners: GeneratedOwners,
         queue: SemanticFamilyFIFO,
         *,
+        destination: RootDestination,
         iteration: int,
         roots: tuple[int, ...],
         logical_bases: tuple[int, ...],
@@ -780,6 +793,7 @@ class IterationEngine:
             payload = self.operations.root_payload(
                 RootRequest(
                     owners.plan,
+                    destination,
                     lane,
                     rows,
                     iteration,
@@ -791,12 +805,12 @@ class IterationEngine:
             if set(payload.values) - set(values):
                 raise IterationError("root payload contains undeclared columns")
             for name, source in payload.values.items():
-                destination = values[name][lane, :rows]
-                if source.shape != destination.shape:
+                column_destination = values[name][lane, :rows]
+                if source.shape != column_destination.shape:
                     raise IterationError(
                         f"root column {name!r} has the wrong shape"
                     )
-                destination.copy_(source)
+                column_destination.copy_(source)
             if payload.frontier_cost is not None and payload.frontier_cost.shape != (
                 rows,
             ):
@@ -899,6 +913,16 @@ class IterationEngine:
         input_names = tuple(
             partition.name for partition in owners.plan.partitions.inputs
         )
+        root_destination = self.operations.root_destination(owners.plan)
+        if not isinstance(root_destination, RootDestination):
+            raise IterationError(
+                "game root destination has the wrong contract"
+            )
+        root_input_type = root_destination.input_type
+        if root_input_type not in input_names:
+            raise IterationError(
+                "game root destination is not a declared input partition"
+            )
         queues = {
             name: SemanticFamilyFIFO(
                 name,
@@ -917,7 +941,8 @@ class IterationEngine:
         )
         self._publish_roots(
             owners,
-            queues["pre"],
+            queues[root_input_type],
+            destination=root_destination,
             iteration=iteration,
             roots=roots,
             logical_bases=logical_bases,
@@ -962,13 +987,14 @@ class IterationEngine:
         ):
             raise IterationError("game rollout lanes are not aligned")
         depths = [
-            {name: (roots[lane] if name == "pre" else 0) for name in input_names}
+            {
+                name: (roots[lane] if name == root_input_type else 0)
+                for name in input_names
+            }
             for lane in range(count)
         ]
-        last_events: list[torch.cuda.Event | None] = [None] * count
         last_event: torch.cuda.Event | None = None
         pre_refill_nodes: list[int | None] = [None] * count
-        pre_refill_records: list[int | None] = [None] * count
         pre_refill_correction: list[float | None] = [None] * count
 
         def queue_states(logical_time: int) -> tuple[FamilyQueueState, ...]:
@@ -1005,7 +1031,6 @@ class IterationEngine:
                     input_names, accepted.produced, strict=True
                 ):
                     depths[lane][name] += produced
-                last_events[lane] = accepted.commit.event
                 last_event = accepted.commit.event
 
         def has_work() -> bool:
@@ -1032,7 +1057,6 @@ class IterationEngine:
                     continue
                 if pre_refill_nodes[lane] is None:
                     pre_refill_nodes[lane] = stager.sampled_tree_size()
-                    pre_refill_records[lane] = stager.record_count
                     pre_refill_correction[lane] = (
                         stager.counterfactual_correction(stager.record_count)
                     )
@@ -1040,12 +1064,12 @@ class IterationEngine:
                     lane, stager.root_degree(deficient) + 1
                 )
                 self._publish_refill_root(
-                    queues["pre"],
+                    queues[root_input_type],
                     lane=lane,
                     original_row=deficient - logical_base,
                     logical_root=deficient,
                 )
-                depths[lane]["pre"] = 1
+                depths[lane][root_input_type] = 1
                 return True
             return False
 
@@ -1077,7 +1101,6 @@ class IterationEngine:
         for lane, sampled in enumerate(topology.sampled_nodes):
             if pre_refill_nodes[lane] is None:
                 pre_refill_nodes[lane] = sampled
-                pre_refill_records[lane] = topology.record_counts[lane]
                 pre_refill_correction[lane] = (
                     topology.counterfactual_corrections[lane]
                 )
@@ -1094,10 +1117,14 @@ class IterationEngine:
             torch.cuda.synchronize(owners.plan.device)
             host_synchronizations += 1
             rollout_seconds = time.perf_counter() - benchmark_started
+        # These objects own rollout hooks, queues, registry references, and
+        # game state.  Completion is serialized after their exact last use.
+        del rollout
+        del queues
+        del publisher
+        del registry
         return _IterationState(
             input_names,
-            MappingProxyType(queues),
-            rollout,
             topology,
             last_event,
             roots,
@@ -1901,6 +1928,7 @@ __all__ = [
     "RolloutOperationRequest",
     "RolloutSubmission",
     "RootPayload",
+    "RootDestination",
     "RootRequest",
     "SealedTopology",
 ]

@@ -21,6 +21,7 @@ from pbg.core.iteration import (
     GameCompletion,
     GameRollout,
     RolloutOperationRequest,
+    RootDestination,
     RootPayload,
     RootRequest,
 )
@@ -404,6 +405,13 @@ class PokerOperations:
             }
         )
 
+    def root_destination(self, plan: StoragePlan) -> RootDestination:
+        if plan != self.plan:
+            raise PokerOperationsError(
+                "root destination requested for a different storage plan"
+            )
+        return RootDestination("pre")
+
     def root_payload(self, request: RootRequest) -> RootPayload:
         machine = PokerStateMachine(self.geometry)
         state = machine.initial_roots(
@@ -426,7 +434,9 @@ class PokerOperations:
                 (logical, torch.zeros_like(logical)), dim=1
             ),
             "true_profile": state.combo_ids,
-            "model_input": machine.direct_model_input("pre", state),
+            "model_input": machine.direct_model_input(
+                request.destination.input_type, state
+            ),
             "owner": state.to_act,
         }
         if (

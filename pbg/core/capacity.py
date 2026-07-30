@@ -943,6 +943,9 @@ class GeneratedOwners:
                     "have not been explicitly released"
                 )
 
+        if phase is ExecutionPhase.COMPLETION:
+            torch.cuda.synchronize(self.plan.device)
+            torch.cuda.empty_cache()
         admission = self.plan.admission(phase)
         if admission.required_bytes > admission.configured_budget_bytes:
             raise AdmissionError(f"{phase.name} failed immutable admission")
