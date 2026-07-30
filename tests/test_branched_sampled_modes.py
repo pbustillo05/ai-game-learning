@@ -776,6 +776,7 @@ def test_common_engine_branched_backoff_is_disjoint_and_durable() -> None:
         generator=torch.Generator().manual_seed(13),
         optimizer=object(),
         model_operation=object(),
+        loss=LossConfig(),
         branch_controller=controller,
     )
     engine.config = SimpleNamespace(lanes=(lane,))

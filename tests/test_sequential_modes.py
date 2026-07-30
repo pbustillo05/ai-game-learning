@@ -30,6 +30,7 @@ from pbg.games.poker.queued.model import (
     _fold_line_metadata,
     build_model_from_config,
 )
+from pbg.games.poker.queued.operations import PokerOperations
 from tests.iteration_support import EngineDrivenSequentialAttempt
 from pbg.games.poker.queued.response import (
     SequentialSharedResponseEvaluator,
@@ -1009,10 +1010,13 @@ def test_best_response_rollout_calls_each_model_only_for_its_role_rows() -> None
 
         return run
 
-    runner = object.__new__(EngineDrivenSequentialAttempt)
-    runner.mode = mode_schema("best_response", "sequential", "sampled")
-    runner.rollout_operation = operation("trained")
-    runner.frozen_operation = operation("frozen")
+    runner = object.__new__(PokerOperations)
+    runner.modes = (
+        mode_schema("best_response", "sequential", "sampled"),
+    )
+    runner.rollout_operations = (operation("trained"),)
+    runner.frozen_operations = (operation("frozen"),)
+    runner.inference = None
     runner.precision = "fp32"
     forward = PokerForwardInput(
         "pre",
@@ -1022,7 +1026,9 @@ def test_best_response_rollout_calls_each_model_only_for_its_role_rows() -> None
         torch.tensor([0, 0, 2, 1], dtype=torch.uint8, device=device),
     )
     merged = runner._model(
-        forward, torch.tensor([0], dtype=torch.int64, device=device)
+        0,
+        forward,
+        torch.tensor([0], dtype=torch.int64, device=device),
     )
     assert calls == {"trained": [0, 2], "frozen": [1, 3]}
     torch.testing.assert_close(

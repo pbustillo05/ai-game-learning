@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from pbg.games.poker.queued.branching import (
-    BranchedBenchmarkTelemetry,
     BranchedPosteriorExhaustion,
     action_conditioned_log_reach,
     branched_rb_chance_frontier_row_bytes,
@@ -30,6 +29,7 @@ from pbg.core.branching import (
 )
 from pbg.core.capacity import GeneratedOwners, PartitionRows, build_storage_plan
 from pbg.core.contracts import mode_schema
+from pbg.core.iteration import IterationTelemetry
 from pbg.core.learner import (
     LearnerSchedule,
     LossConfig,
@@ -816,7 +816,7 @@ def test_four_branched_rb_modes_complete_optimizer_step(
     assert result.learner.optimizer_steps
     assert result.learner.optimizer_steps[0].applied
     if regime == "self_play" and rollout == "branched.fixed":
-        assert isinstance(result.telemetry, BranchedBenchmarkTelemetry)
+        assert isinstance(result.telemetry, IterationTelemetry)
         assert result.telemetry.rollout_seconds > 0
         assert result.telemetry.routing_traffic_bytes > 0
         assert result.telemetry.host_synchronizations > 0

@@ -22,7 +22,6 @@ from pbg.games.poker.queued.hooks import (
 )
 from pbg.games.poker.queued.model import QueuedPokerModel, build_model_from_config
 from pbg.games.poker.queued.replica import PokerReplicaInference
-from pbg.games.poker.queued.training import ReplicaPokerIterationResult
 from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
 from pbg.core.branching import (
     CostSafeguardController,
@@ -41,6 +40,7 @@ from pbg.core.capacity import (
     build_storage_plan,
 )
 from pbg.core.contracts import mode_schema
+from pbg.core.iteration import IterationBatchResult
 from pbg.core.learner import (
     LearnerDTypes,
     LearnerOperation,
@@ -645,7 +645,7 @@ def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
             module.learner_operation for module in modules
         ),
     ).run(iteration=0)
-    assert isinstance(result, ReplicaPokerIterationResult)
+    assert isinstance(result, IterationBatchResult)
     assert result.failures == {}
     assert result.versions == (8, 8)
     assert all(value is not None for value in result.results)
@@ -746,7 +746,7 @@ def test_complete_sequential_transactions_isolate_every_replica_lane(
         replica_run_states=run_states,
         replica_model_operations=learner_operations,
     ).run(iteration=0)
-    assert isinstance(result, ReplicaPokerIterationResult)
+    assert isinstance(result, IterationBatchResult)
     assert result.failures == {}
     assert result.versions == (8,) * count
     assert all(value is not None for value in result.results)
@@ -1082,7 +1082,8 @@ def test_replica_best_response_groups_compact_learned_and_frozen_rows() -> None:
     role = torch.tensor(
         [[0, 1, 1], [1, 1, 1]], dtype=torch.uint8, device=device
     )
-    observed = iteration._model(
+    observed = iteration.operations._model(
+        0,
         PokerForwardInput(
             "pre",
             model_input.flatten(0, 1),

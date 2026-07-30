@@ -40,9 +40,6 @@ from pbg.core.iteration import IterationConfig, IterationEngine, LaneContext
 from pbg.core.optimization import DenseAdam
 from pbg.core.persistence import RunState
 from pbg.core.replica import ReplicaOptimizerGroup
-from pbg.games.poker.queued.branching import (
-    PokerBranchedProgram,
-)
 from pbg.games.poker.queued.config import BranchedModeConfig
 from pbg.games.poker.queued.hooks import (
     NLHEGeometry,
@@ -51,8 +48,8 @@ from pbg.games.poker.queued.hooks import (
     SequentialPokerHooks,
     rb_partitions,
 )
-from pbg.games.poker.queued.iteration import PokerIterationHooks
 from pbg.games.poker.queued.model import build_model_from_config
+from pbg.games.poker.queued.operations import PokerOperations
 from pbg.games.poker.queued.policy import PokerPolicyOperator
 from pbg.games.poker.queued.rb_sampling import CollisionConditionedProfileSampler
 from pbg.games.poker.queued.replica import PokerReplicaInference
@@ -583,6 +580,20 @@ def _run_once(
         scalers=(optimizer.scaler,),
     )
     with context:
+        lane_model = inference.modules.lane_module(0)
+        operations = PokerOperations(
+            geometry=geometry,
+            plan=plan,
+            modes=(plan.mode,),
+            models=(lane_model,),
+            rollout_operations=(lane_model.rollout_operation,),
+            frozen_operations=(None,),
+            seed=scenario.seed,
+            precision=common.precision.name,
+            utility=common.utility,
+            completion_samples=scenario.completion_samples,
+            posterior_max_attempts=scenario.posterior_max_attempts,
+        )
         result = IterationEngine(
             config=IterationConfig(
                 plan,
@@ -591,46 +602,24 @@ def _run_once(
                         mode=plan.mode,
                         run_state=run_state,
                         generator=generator,
-                        optimizer=optimizer,
-                        model_operation=model.rb_learner_operation,
+                        optimizer=optimizers.optimizers[0],
+                        model_operation=lane_model.rb_learner_operation,
                         loss=common.loss,
+                        model=lane_model,
                         branch_controller=controller,
+                        cost_safeguard=safeguard,
+                        minimum_tree_size=scenario.minimum_tree_size,
                     ),
                 ),
+                common.schedule,
+                optimizers,
+                common.lambda_,
+                precision=common.precision.name,
+                cache_reference_outputs=common.reference.cache_outputs,
+                benchmark_telemetry=True,
             ),
             owner_factory=lambda: GeneratedOwners(plan),
-            hooks=PokerIterationHooks(
-                lambda owners: PokerBranchedProgram(
-                    geometry=geometry,
-                    owners=owners,
-                    modes=(plan.mode,),
-                    controllers=(controller,),
-                    safeguards=(safeguard,),
-                    inference=None,
-                    reference_operations=(None,),
-                    optimizers=optimizers,
-                    losses=(common.loss,),
-                    schedule=common.schedule,
-                    generators=(generator,),
-                    run_states=(run_state,),
-                    minimum_tree_sizes=(scenario.minimum_tree_size,),
-                    seed=scenario.seed,
-                    lambda_=common.lambda_,
-                    precision=common.precision.name,
-                    utility=common.utility,
-                    cache_reference_outputs=common.reference.cache_outputs,
-                    completion_samples=scenario.completion_samples,
-                    posterior_max_attempts=scenario.posterior_max_attempts,
-                    benchmark_telemetry=True,
-                    models=(inference.modules.lane_module(0),),
-                    rollout_operations=(
-                        inference.modules.lane_module(0).rollout_operation,
-                    ),
-                    learner_operations=(
-                        inference.modules.lane_module(0).rb_learner_operation,
-                    ),
-                )
-            ),
+            operations=operations,
         ).run(iteration=scenario.iteration)
     lane_result = result.results[0]
     if lane_result is None:
