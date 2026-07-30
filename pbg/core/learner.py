@@ -493,7 +493,7 @@ class PolicyOperation(Protocol):
 
 @dataclass(frozen=True)
 class SequentialLearnerBatch:
-    """The exact aligned rows gathered by one permutation slice."""
+    """Aligned rows exposed through the canonical unit-span action schema."""
 
     input_type: str
     indices: Tensor
@@ -508,6 +508,34 @@ class SequentialLearnerBatch:
     @property
     def objective_rows(self) -> int:
         return self.rows if self.logical_rows is None else self.logical_rows
+
+    @property
+    def sigma_index(self) -> Tensor:
+        return self.indices
+
+    @property
+    def action_ptr(self) -> Tensor:
+        return torch.arange(
+            self.rows + 1,
+            dtype=torch.int64,
+            device=self.indices.device,
+        )
+
+    @property
+    def action_index(self) -> Tensor:
+        return self.indices
+
+    @property
+    def sigma_fields(self) -> Mapping[str, Tensor]:
+        return self.fields
+
+    @property
+    def action_fields(self) -> Mapping[str, Tensor]:
+        return self.fields
+
+    @property
+    def action_rows(self) -> int:
+        return self.rows
 
 
 class SealedSequentialInputs:
@@ -1430,14 +1458,17 @@ class BranchedBatchSampler:
             else self.schedule.epochs
         )
 
-    def batches(self) -> Iterator[BranchedLearnerBatch]:
-        steps = (
+    @property
+    def optimizer_steps(self) -> int:
+        return (
             self.schedule.gradient_steps
             if self.schedule.gradient_steps is not None
             else self.schedule.epochs
         )
+
+    def batches(self) -> Iterator[BranchedLearnerBatch]:
         logical_rows = sum(self.statistical_counts.values())
-        for logical_step in range(steps):
+        for logical_step in range(self.optimizer_steps):
             for name, requested in self.statistical_counts.items():
                 draw = self._draw(name, requested)
                 action_counts = (
@@ -1600,20 +1631,38 @@ class LearnerOperation:
         loss_scale: float = 1.0,
         objective_weight: float | Tensor = 1.0,
     ) -> LossResult:
-        if self.mode.rollout_mode.is_branched:
-            if not isinstance(batch, BranchedLearnerBatch):
-                raise LearnerError("branched learner requires a ragged batch")
-            return self._forward_branched_loss_backward(
-                batch,
-                iteration=iteration,
-                reference_operation=reference_operation,
-                reference_cache=reference_cache,
-                loss_scale=loss_scale,
-                objective_weight=objective_weight,
+        if not isinstance(
+            batch, (SequentialLearnerBatch, BranchedLearnerBatch)
+        ):
+            raise LearnerError("learner batch has no supported presentation")
+        rows = batch.rows
+        sigma_index = batch.sigma_index
+        action_ptr = batch.action_ptr
+        sigma = batch.sigma_fields
+        action = batch.action_fields
+        counts = action_ptr[1:] - action_ptr[:-1]
+        action_rows = batch.action_rows
+        if "target_degree" in sigma:
+            torch._assert_async(
+                counts.eq(sigma["target_degree"].to(counts.dtype)).all(),
+                "learner action spans disagree with protected target degrees",
             )
-        if not isinstance(batch, SequentialLearnerBatch):
-            raise LearnerError("sequential learner requires an aligned batch")
-        fields = batch.fields
+        else:
+            torch._assert_async(
+                counts.eq(1).all(),
+                "aligned learner rows must have unit action spans",
+            )
+        action_to_sigma = torch.repeat_interleave(
+            torch.arange(rows, device=sigma_index.device),
+            counts,
+            output_size=action_rows,
+        )
+        sampled = self.mode.private_estimator is PrivateEstimator.SAMPLED
+        sigma_private = (
+            sigma["sampled_private_state"]
+            if sampled
+            else sigma["owner"][:, None]
+        )
         autocast_dtype = {
             "fp32": torch.float32,
             "fp16": torch.float16,
@@ -1628,561 +1677,147 @@ class LearnerOperation:
         ):
             evaluation = self.model_operation(
                 batch.input_type,
-                fields["model_input"],
-                fields.get("sampled_private_state", fields["owner"][:, None]),
-                fields["owner"],
+                sigma["model_input"],
+                sigma_private,
+                sigma["owner"],
             )
-            sampled = self.mode.private_estimator is PrivateEstimator.SAMPLED
-            if sampled:
-                evaluation = ModelEvaluation(
-                    MappingProxyType(
-                        {
-                            name: _select_sampled_private(
-                                value,
-                                fields["sampled_private_state"],
-                                fields["owner"],
-                            )
-                            for name, value in evaluation.policy_raw.items()
-                        }
-                    ),
-                    _select_sampled_private(
-                        evaluation.value,
-                        fields["sampled_private_state"],
-                        fields["owner"],
-                    ),
-                    evaluation.public_heads,
+            natural_raw = (
+                {
+                    name: _select_sampled_private(
+                        value,
+                        sigma_private,
+                        sigma["owner"],
+                    )
+                    for name, value in evaluation.policy_raw.items()
+                }
+                if sampled
+                else dict(evaluation.policy_raw)
+            )
+            natural_value = (
+                _select_sampled_private(
+                    evaluation.value,
+                    sigma_private,
+                    sigma["owner"],
                 )
+                if sampled
+                else evaluation.value
+            )
+            reference = None
             if reference_cache is not None:
                 if reference_operation is not None:
                     raise LearnerError(
-                        "reference cache and reference operation are mutually exclusive"
+                        "reference cache and operation are mutually exclusive"
                     )
-                cached = reference_cache.gather(batch.indices)
-                reference = (
+                cached = reference_cache.gather(sigma_index)
+                reference_sigma = (
                     {
                         name: _select_sampled_private(
                             value,
-                            fields["sampled_private_state"],
-                            fields["owner"],
+                            sigma_private,
+                            sigma["owner"],
                         )
                         for name, value in cached.items()
                     }
                     if sampled
                     else dict(cached)
                 )
-            else:
-                reference = (
-                    None
-                    if reference_operation is None
-                    else {
-                        name: (
-                            _select_sampled_private(
-                                value,
-                                fields["sampled_private_state"],
-                                fields["owner"],
-                            )
-                            if sampled
-                            else value
-                        )
-                        for name, value in reference_operation(
-                            batch.input_type,
-                            fields["model_input"],
-                            fields.get(
-                                "sampled_private_state", fields["owner"][:, None]
-                            ),
-                            fields["owner"],
-                        ).policy_raw.items()
-                    }
-                )
-        compact_private = (
-            torch.zeros_like(fields["sampled_private_state"])
-            if sampled
-            else fields["owner"][:, None]
-        )
-        policy = self.policy_operation(
-            batch.input_type,
-            fields["model_input"],
-            evaluation.policy_raw,
-            fields["action"].to(torch.int32),
-            compact_private,
-            fields["owner"].to(torch.int64),
-            reference,
-        )
-        if sampled:
-            current_log = _scalar_private_row(
-                policy.selected_log_policy, compact_private, fields["owner"]
-            )
-            entropy = _scalar_private_row(
-                policy.entropy, compact_private, fields["owner"]
-            )
-            reference_kl = _scalar_private_row(
-                policy.reference_kl, compact_private, fields["owner"]
-            )
-            current_value = _scalar_private_row(
-                evaluation.value, compact_private, fields["owner"]
-            )
-        else:
-            current_log = policy.selected_log_policy.float()
-            entropy = policy.entropy.float()
-            reference_kl = policy.reference_kl.float()
-            current_value = evaluation.value.float()
-        old_log = fields["old_log_policy"].float()
-        old_value = fields["old_value"].float()
-        target_value = fields["value_target"].float()
-        advantage = fields["advantage_target"].float()
-        if sampled:
-            old_log = old_log.reshape(batch.rows, -1)[:, 0]
-            old_value = old_value.reshape(batch.rows, -1)[:, 0]
-            target_value = target_value.reshape(batch.rows, -1)[:, 0]
-            advantage = advantage.reshape(batch.rows, -1)[:, 0]
-        if not all(
-            tensor.shape == current_log.shape
-            for tensor in (
-                entropy,
-                reference_kl,
-                current_value,
-                old_log,
-                old_value,
-                target_value,
-                advantage,
-            )
-        ):
-            shapes = {
-                "current_log": tuple(current_log.shape),
-                "entropy": tuple(entropy.shape),
-                "reference_kl": tuple(reference_kl.shape),
-                "current_value": tuple(current_value.shape),
-                "old_log": tuple(old_log.shape),
-                "old_value": tuple(old_value.shape),
-                "target_value": tuple(target_value.shape),
-                "advantage": tuple(advantage.shape),
-            }
-            raise LearnerError(
-                "learner fields are not batch/domain aligned for "
-                f"{batch.input_type}: {shapes}"
-            )
-        posterior = (
-            torch.ones_like(current_log) if sampled else fields["posterior"].float()
-        )
-        if posterior.shape != current_log.shape:
-            raise LearnerError("RB posterior is not aligned to the natural domain")
-        posterior_mass = posterior.sum(-1, keepdim=True).clamp_min(
-            torch.finfo(torch.float32).tiny
-        )
-        posterior = posterior / posterior_mass
-        log_ratio = current_log - old_log
-        ratio = torch.exp(log_ratio)
-        clipped_ratio = ratio.clamp(
-            1.0 - self.loss.clip_epsilon,
-            1.0 + self.loss.clip_epsilon,
-        )
-        policy_term = -torch.minimum(ratio * advantage, clipped_ratio * advantage)
-        error = (current_value - target_value).square()
-        if self.loss.value_loss == "clipped":
-            clipped_value = old_value + (current_value - old_value).clamp(
-                -self.loss.value_clip_epsilon,
-                self.loss.value_clip_epsilon,
-            )
-            error = torch.maximum(error, (clipped_value - target_value).square())
-        if sampled:
-            policy_loss = policy_term.mean()
-            value_loss = error.mean()
-            entropy_mean = entropy.mean()
-            reference_kl_mean = reference_kl.mean()
-        else:
-            policy_loss = (posterior * policy_term).sum(-1).mean()
-            value_loss = (posterior * error).sum(-1).mean()
-            entropy_mean = (posterior * entropy).sum(-1).mean()
-            reference_kl_mean = (posterior * reference_kl).sum(-1).mean()
-        total = (
-            policy_loss
-            + self.loss.value_coefficient * value_loss
-            - self.loss.entropy_at(iteration) * entropy_mean
-            + self.loss.reference_kl_coefficient * reference_kl_mean
-        )
-        if self.precision != "fp16" and not torch.isfinite(total):
-            raise LearnerError("learner loss is nonfinite")
-        if (
-            not math.isfinite(objective_weight)
-            or objective_weight <= 0
-            or objective_weight > 1
-        ):
-            raise LearnerError("physical objective weight must lie in (0,1]")
-        (total * float(loss_scale) * objective_weight).backward()
-        return LossResult(
-            total,
-            policy_loss,
-            value_loss,
-            entropy_mean,
-            reference_kl_mean,
-            (
-                (((ratio - 1.0) - log_ratio) * posterior).sum(-1).mean()
-                if not sampled
-                else ((ratio - 1.0) - log_ratio).mean()
-            ),
-            (
-                ((torch.abs(ratio - 1.0) > self.loss.clip_epsilon).float() * posterior)
-                .sum(-1)
-                .mean()
-                if not sampled
-                else (torch.abs(ratio - 1.0) > self.loss.clip_epsilon).float().mean()
-            ),
-        )
-
-    def _forward_branched_loss_backward(
-        self,
-        batch: BranchedLearnerBatch,
-        *,
-        iteration: int,
-        reference_operation: ModelOperation | None,
-        reference_cache: ReferenceOutputCache | None,
-        loss_scale: float,
-        objective_weight: float | Tensor,
-    ) -> LossResult:
-        if self.mode.private_estimator is PrivateEstimator.RAO_BLACKWELL:
-            return self._forward_branched_rb_loss_backward(
-                batch,
-                iteration=iteration,
-                reference_operation=reference_operation,
-                reference_cache=reference_cache,
-                loss_scale=loss_scale,
-                objective_weight=objective_weight,
-            )
-        sigma = batch.sigma_fields
-        action = batch.action_fields
-        counts = batch.action_ptr[1:] - batch.action_ptr[:-1]
-        torch._assert_async(
-            counts.eq(sigma["target_degree"].to(counts.dtype)).all(),
-            "ragged action spans disagree with protected target degrees",
-        )
-        action_to_sigma = torch.repeat_interleave(
-            torch.arange(batch.rows, device=batch.sigma_index.device),
-            counts,
-            output_size=batch.action_rows,
-        )
-        autocast_dtype = {
-            "fp32": torch.float32,
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-        }[self.precision]
-        if self.precision == "bf16" and not torch.cuda.is_bf16_supported():
-            raise LearnerError("selected CUDA device does not support BF16")
-        with torch.autocast(
-            device_type="cuda",
-            dtype=autocast_dtype,
-            enabled=self.precision != "fp32",
-        ):
-            evaluation = self.model_operation(
-                batch.input_type,
-                sigma["model_input"],
-                sigma["sampled_private_state"],
-                sigma["owner"],
-            )
-            natural_raw = {
-                name: _select_sampled_private(
-                    value,
-                    sigma["sampled_private_state"],
+            elif reference_operation is not None:
+                reference_evaluation = reference_operation(
+                    batch.input_type,
+                    sigma["model_input"],
+                    sigma_private,
                     sigma["owner"],
                 )
-                for name, value in evaluation.policy_raw.items()
-            }
-            natural_value = _select_sampled_private(
-                evaluation.value,
-                sigma["sampled_private_state"],
-                sigma["owner"],
-            )
+                reference_sigma = (
+                    {
+                        name: _select_sampled_private(
+                            value,
+                            sigma_private,
+                            sigma["owner"],
+                        )
+                        for name, value in reference_evaluation.policy_raw.items()
+                    }
+                    if sampled
+                    else dict(reference_evaluation.policy_raw)
+                )
+            else:
+                reference_sigma = None
             repeated_raw = {
                 name: value.index_select(0, action_to_sigma)
                 for name, value in natural_raw.items()
             }
-            repeated_private = sigma["sampled_private_state"].index_select(
-                0, action_to_sigma
-            )
-            repeated_owner = sigma["owner"].index_select(0, action_to_sigma)
-            reference = None
-            if reference_cache is not None:
-                if reference_operation is not None:
-                    raise LearnerError(
-                        "reference cache and operation are mutually exclusive"
-                    )
+            if reference_sigma is not None:
                 reference = {
-                    name: _select_sampled_private(
-                        value,
-                        sigma["sampled_private_state"],
-                        sigma["owner"],
-                    ).index_select(0, action_to_sigma)
-                    for name, value in reference_cache.gather(batch.sigma_index).items()
+                    name: value.index_select(0, action_to_sigma)
+                    for name, value in reference_sigma.items()
                 }
-            elif reference_operation is not None:
-                reference_evaluation = reference_operation(
-                    batch.input_type,
-                    sigma["model_input"],
-                    sigma["sampled_private_state"],
-                    sigma["owner"],
-                )
-                reference = {
-                    name: _select_sampled_private(
-                        value,
-                        sigma["sampled_private_state"],
-                        sigma["owner"],
-                    ).index_select(0, action_to_sigma)
-                    for name, value in reference_evaluation.policy_raw.items()
-                }
-        compact_private = torch.zeros_like(repeated_private)
+        repeated_owner = sigma["owner"].index_select(0, action_to_sigma)
+        repeated_private = sigma_private.index_select(0, action_to_sigma)
+        policy_private = (
+            torch.zeros_like(repeated_private)
+            if sampled
+            else repeated_owner[:, None]
+        )
         policy = self.policy_operation(
             batch.input_type,
             sigma["model_input"].index_select(0, action_to_sigma),
             repeated_raw,
             action["action"].to(torch.int32),
-            compact_private,
+            policy_private,
             repeated_owner.to(torch.int64),
             reference,
         )
-        current_log = _scalar_private_row(
-            policy.selected_log_policy, compact_private, repeated_owner
-        )
-        entropy = _scalar_private_row(policy.entropy, compact_private, repeated_owner)
-        reference_kl = _scalar_private_row(
-            policy.reference_kl, compact_private, repeated_owner
-        )
-        current_value = _scalar_private_row(
-            natural_value,
-            torch.zeros_like(sigma["sampled_private_state"]),
-            sigma["owner"],
-        )
-        old_log = action["old_log_policy"].reshape(batch.action_rows, -1)[:, 0]
-        advantage = action["advantage_target"].reshape(batch.action_rows, -1)[:, 0]
-        old_value = sigma["old_value"].reshape(batch.rows, -1)[:, 0]
-        target_value = sigma["value_target"].reshape(batch.rows, -1)[:, 0]
-        if not (
-            current_log.shape
-            == entropy.shape
-            == reference_kl.shape
-            == old_log.shape
-            == advantage.shape
-            == (batch.action_rows,)
-            and current_value.shape
-            == old_value.shape
-            == target_value.shape
-            == (batch.rows,)
-        ):
-            raise LearnerError("branched learner fields are not ragged-aligned")
-        log_ratio = current_log.float() - old_log.float()
-        ratio = log_ratio.exp()
-        clipped = ratio.clamp(
-            1 - self.loss.clip_epsilon,
-            1 + self.loss.clip_epsilon,
-        )
-        policy_row = -torch.minimum(
-            ratio * advantage.float(), clipped * advantage.float()
-        )
-        sigma_policy = torch.zeros(
-            batch.rows, dtype=torch.float32, device=current_log.device
-        )
-        sigma_entropy = torch.zeros_like(sigma_policy)
-        sigma_reference = torch.zeros_like(sigma_policy)
-        sigma_approximate = torch.zeros_like(sigma_policy)
-        sigma_clipped = torch.zeros_like(sigma_policy)
-        denominator = counts.float()
-        for destination, source in (
-            (sigma_policy, policy_row),
-            (sigma_entropy, entropy.float()),
-            (sigma_reference, reference_kl.float()),
-            (sigma_approximate, (ratio - 1) - log_ratio),
-            (
-                sigma_clipped,
-                ratio.sub(1).abs().gt(self.loss.clip_epsilon).float(),
-            ),
-        ):
-            destination.scatter_add_(0, action_to_sigma, source)
-            destination.div_(denominator)
-        value_error = (current_value.float() - target_value.float()).square()
-        if self.loss.value_loss == "clipped":
-            clipped_value = old_value.float() + (
-                current_value.float() - old_value.float()
-            ).clamp(
-                -self.loss.value_clip_epsilon,
-                self.loss.value_clip_epsilon,
-            )
-            value_error = torch.maximum(
-                value_error,
-                (clipped_value - target_value.float()).square(),
-            )
-        public = evaluation.public_heads
-        if set(public) != {"trace", "cost"}:
-            raise LearnerError("branched model must expose public trace/cost heads")
-        trace_prediction = public["trace"].float()
-        cost_prediction = public["cost"].float()
-        trace_target = sigma["trace_target"].float()
-        cost_target = sigma["cost_target"].float()
-        if not all(
-            value.shape == (batch.rows,)
-            for value in (
-                trace_prediction,
-                cost_prediction,
-                trace_target,
-                cost_target,
-            )
-        ):
-            raise LearnerError("branched public heads and targets are not aligned")
-        eps = self.loss.trace_epsilon
-        trace_ratio = (trace_target + eps) / (
-            trace_prediction.clamp_min(torch.finfo(torch.float32).tiny) + eps
-        )
-        trace_deviance = trace_ratio - trace_ratio.log() - 1
-        trace_valid = sigma["target_degree"].ge(2)
-        trace_loss = torch.where(
-            trace_valid, trace_deviance, torch.zeros_like(trace_deviance)
-        ).mean()
-        torch._assert_async(
-            cost_target.gt(0).all(),
-            "branched cost targets must be positive",
-        )
-        cost_ratio = cost_target / cost_prediction.clamp_min(
-            torch.finfo(torch.float32).tiny
-        )
-        cost_loss = (cost_ratio - cost_ratio.log() - 1).mean()
-        policy_loss = sigma_policy.mean()
-        value_loss = value_error.mean()
-        entropy_mean = sigma_entropy.mean()
-        reference_kl_mean = sigma_reference.mean()
-        total = (
-            policy_loss
-            + self.loss.value_coefficient * value_loss
-            - self.loss.entropy_at(iteration) * entropy_mean
-            + self.loss.reference_kl_coefficient * reference_kl_mean
-            + self.loss.trace_coefficient * trace_loss
-            + self.loss.cost_coefficient * cost_loss
-        )
-        if self.precision != "fp16" and not torch.isfinite(total):
-            raise LearnerError("branched learner loss is nonfinite")
-        if isinstance(objective_weight, Tensor):
-            if (
-                objective_weight.device != batch.sigma_index.device
-                or objective_weight.numel() != 1
-            ):
-                raise LearnerError(
-                    "physical objective weight must be one device scalar"
-                )
-            torch._assert_async(
-                torch.isfinite(objective_weight)
-                & objective_weight.gt(0)
-                & objective_weight.le(1),
-                "physical objective weight must lie in (0,1]",
-            )
-        elif not math.isfinite(objective_weight) or not 0 < objective_weight <= 1:
-            raise LearnerError("physical objective weight must lie in (0,1]")
-        (total * float(loss_scale) * objective_weight).backward()
-        return LossResult(
-            total,
-            policy_loss,
-            value_loss,
-            entropy_mean,
-            reference_kl_mean,
-            sigma_approximate.mean(),
-            sigma_clipped.mean(),
-        )
-
-    def _forward_branched_rb_loss_backward(
-        self,
-        batch: BranchedLearnerBatch,
-        *,
-        iteration: int,
-        reference_operation: ModelOperation | None,
-        reference_cache: ReferenceOutputCache | None,
-        loss_scale: float,
-        objective_weight: float | Tensor,
-    ) -> LossResult:
-        """Natural-domain RB loss over exact ragged action rows."""
-
-        sigma = batch.sigma_fields
-        action = batch.action_fields
-        counts = batch.action_ptr[1:] - batch.action_ptr[:-1]
-        torch._assert_async(
-            counts.eq(sigma["target_degree"].to(counts.dtype)).all(),
-            "ragged RB spans disagree with protected target degrees",
-        )
-        action_to_sigma = torch.repeat_interleave(
-            torch.arange(batch.rows, device=batch.sigma_index.device),
-            counts,
-            output_size=batch.action_rows,
-        )
-        compact_private = sigma["owner"][:, None]
-        autocast_dtype = {
-            "fp32": torch.float32,
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-        }[self.precision]
-        with torch.autocast(
-            device_type="cuda",
-            dtype=autocast_dtype,
-            enabled=self.precision != "fp32",
-        ):
-            evaluation = self.model_operation(
-                batch.input_type,
-                sigma["model_input"],
-                compact_private,
+        if sampled:
+            current_log = _scalar_private_row(
+                policy.selected_log_policy,
+                policy_private,
+                repeated_owner,
+            ).reshape(action_rows, 1)
+            entropy = _scalar_private_row(
+                policy.entropy, policy_private, repeated_owner
+            ).reshape(action_rows, 1)
+            reference_kl = _scalar_private_row(
+                policy.reference_kl, policy_private, repeated_owner
+            ).reshape(action_rows, 1)
+            current_value = _scalar_private_row(
+                natural_value,
+                torch.zeros_like(sigma_private),
                 sigma["owner"],
-            )
-            repeated_raw = {
-                name: value.index_select(0, action_to_sigma)
-                for name, value in evaluation.policy_raw.items()
-            }
-            reference = None
-            if reference_cache is not None:
-                if reference_operation is not None:
-                    raise LearnerError(
-                        "reference cache and operation are mutually exclusive"
-                    )
-                reference = {
-                    name: value.index_select(0, action_to_sigma)
-                    for name, value in reference_cache.gather(batch.sigma_index).items()
-                }
-            elif reference_operation is not None:
-                reference_evaluation = reference_operation(
-                    batch.input_type,
-                    sigma["model_input"],
-                    compact_private,
-                    sigma["owner"],
-                )
-                reference = {
-                    name: value.index_select(0, action_to_sigma)
-                    for name, value in reference_evaluation.policy_raw.items()
-                }
-        repeated_owner = sigma["owner"].index_select(0, action_to_sigma)
-        policy = self.policy_operation(
-            batch.input_type,
-            sigma["model_input"].index_select(0, action_to_sigma),
-            repeated_raw,
-            action["action"].to(torch.int32),
-            repeated_owner[:, None],
-            repeated_owner,
-            reference,
-        )
-        current_log = policy.selected_log_policy.float()
-        entropy = policy.entropy.float()
-        reference_kl = policy.reference_kl.float()
-        current_value = evaluation.value.float()
-        old_log = action["old_log_policy"].float()
-        advantage = action["advantage_target"].float()
-        posterior = action["posterior"].float()
-        old_value = sigma["old_value"].float()
-        target_value = sigma["value_target"].float()
-        if not (
-            current_log.shape
-            == entropy.shape
-            == reference_kl.shape
-            == old_log.shape
-            == advantage.shape
-            == posterior.shape
-            and current_value.shape == old_value.shape == target_value.shape
-            and current_log.shape[0] == batch.action_rows
-            and current_value.shape[0] == batch.rows
-            and current_log.shape[1:] == current_value.shape[1:]
+            ).reshape(rows, 1)
+            old_log = action["old_log_policy"].float().reshape(
+                action_rows, -1
+            )[:, :1]
+            advantage = action["advantage_target"].float().reshape(
+                action_rows, -1
+            )[:, :1]
+            old_value = sigma["old_value"].float().reshape(rows, -1)[:, :1]
+            target_value = sigma["value_target"].float().reshape(
+                rows, -1
+            )[:, :1]
+            posterior = torch.ones_like(current_log)
+        else:
+            current_log = policy.selected_log_policy.float()
+            entropy = policy.entropy.float()
+            reference_kl = policy.reference_kl.float()
+            current_value = natural_value.float()
+            old_log = action["old_log_policy"].float()
+            advantage = action["advantage_target"].float()
+            posterior = action["posterior"].float()
+            old_value = sigma["old_value"].float()
+            target_value = sigma["value_target"].float()
+        if (
+            current_log.shape != entropy.shape
+            or current_log.shape != reference_kl.shape
+            or current_log.shape != old_log.shape
+            or current_log.shape != advantage.shape
+            or current_log.shape != posterior.shape
+            or current_value.shape != old_value.shape
+            or current_value.shape != target_value.shape
+            or current_log.shape[0] != action_rows
+            or current_value.shape[0] != rows
+            or current_log.shape[1:] != current_value.shape[1:]
         ):
-            raise LearnerError(
-                "branched RB fields are not ragged/natural-domain aligned"
-            )
+            raise LearnerError("learner fields are not sigma/action aligned")
         posterior = posterior / posterior.sum(-1, keepdim=True).clamp_min(
             torch.finfo(torch.float32).tiny
         )
@@ -2205,7 +1840,7 @@ class LearnerOperation:
         clipped_row = (
             posterior * ratio.sub(1).abs().gt(self.loss.clip_epsilon).float()
         ).sum(-1)
-        sigma_posterior = torch.zeros_like(current_value)
+        sigma_posterior = torch.zeros_like(current_value, dtype=torch.float32)
         sigma_posterior.scatter_add_(
             0,
             action_to_sigma[:, None].expand_as(posterior),
@@ -2228,7 +1863,11 @@ class LearnerOperation:
         value_row = (sigma_posterior * value_error).sum(-1)
 
         def mean_by_sigma(rows: Tensor) -> Tensor:
-            result = torch.zeros(batch.rows, dtype=torch.float32, device=rows.device)
+            result = torch.zeros(
+                current_value.shape[0],
+                dtype=torch.float32,
+                device=rows.device,
+            )
             result.scatter_add_(0, action_to_sigma, rows)
             return result / counts.float()
 
@@ -2237,30 +1876,57 @@ class LearnerOperation:
         sigma_reference = mean_by_sigma(reference_row)
         sigma_approximate = mean_by_sigma(approximate_row)
         sigma_clipped = mean_by_sigma(clipped_row)
-        public = evaluation.public_heads
-        if set(public) != {"trace", "cost"}:
-            raise LearnerError("branched model must expose public trace/cost heads")
-        trace_prediction = public["trace"].float()
-        cost_prediction = public["cost"].float()
-        trace_target = sigma["trace_target"].float()
-        cost_target = sigma["cost_target"].float()
-        eps = self.loss.trace_epsilon
-        trace_ratio = (trace_target + eps) / (
-            trace_prediction.clamp_min(torch.finfo(torch.float32).tiny) + eps
-        )
-        trace_loss = torch.where(
-            sigma["target_degree"].ge(2),
-            trace_ratio - trace_ratio.log() - 1,
-            torch.zeros_like(trace_ratio),
-        ).mean()
-        torch._assert_async(
-            cost_target.gt(0).all(),
-            "branched cost targets must be positive",
-        )
-        cost_ratio = cost_target / cost_prediction.clamp_min(
-            torch.finfo(torch.float32).tiny
-        )
-        cost_loss = (cost_ratio - cost_ratio.log() - 1).mean()
+        if "trace_target" in sigma or "cost_target" in sigma:
+            if (
+                set(evaluation.public_heads) != {"trace", "cost"}
+                or "trace_target" not in sigma
+                or "cost_target" not in sigma
+                or "target_degree" not in sigma
+            ):
+                raise LearnerError(
+                    "public heads and targets must share one schema"
+                )
+            trace_prediction = evaluation.public_heads["trace"].float()
+            cost_prediction = evaluation.public_heads["cost"].float()
+            trace_target = sigma["trace_target"].float()
+            cost_target = sigma["cost_target"].float()
+            if not all(
+                value.shape == (rows,)
+                for value in (
+                    trace_prediction,
+                    cost_prediction,
+                    trace_target,
+                    cost_target,
+                )
+            ):
+                raise LearnerError(
+                    "public heads and targets are not sigma aligned"
+                )
+            eps = self.loss.trace_epsilon
+            trace_ratio = (trace_target + eps) / (
+                trace_prediction.clamp_min(
+                    torch.finfo(torch.float32).tiny
+                )
+                + eps
+            )
+            trace_loss = torch.where(
+                sigma["target_degree"].ge(2),
+                trace_ratio - trace_ratio.log() - 1,
+                torch.zeros_like(trace_ratio),
+            ).mean()
+            torch._assert_async(
+                cost_target.gt(0).all(),
+                "cost targets must be positive",
+            )
+            cost_ratio = cost_target / cost_prediction.clamp_min(
+                torch.finfo(torch.float32).tiny
+            )
+            cost_loss = (
+                cost_ratio - cost_ratio.log() - 1
+            ).mean()
+        else:
+            trace_loss = current_value.new_zeros(())
+            cost_loss = current_value.new_zeros(())
         policy_loss = sigma_policy.mean()
         value_loss = value_row.mean()
         entropy_mean = sigma_entropy.mean()
@@ -2273,16 +1939,26 @@ class LearnerOperation:
             + self.loss.trace_coefficient * trace_loss
             + self.loss.cost_coefficient * cost_loss
         )
-        if not torch.isfinite(total):
-            raise LearnerError("branched RB learner loss is nonfinite")
+        if self.precision != "fp16" and not torch.isfinite(total):
+            raise LearnerError("learner loss is nonfinite")
         if isinstance(objective_weight, Tensor):
+            if (
+                objective_weight.device != sigma_index.device
+                or objective_weight.numel() != 1
+            ):
+                raise LearnerError(
+                    "physical objective weight must be one device scalar"
+                )
             torch._assert_async(
                 torch.isfinite(objective_weight)
                 & objective_weight.gt(0)
                 & objective_weight.le(1),
                 "physical objective weight must lie in (0,1]",
             )
-        elif not math.isfinite(objective_weight) or not 0 < objective_weight <= 1:
+        elif (
+            not math.isfinite(objective_weight)
+            or not 0 < objective_weight <= 1
+        ):
             raise LearnerError("physical objective weight must lie in (0,1]")
         (total * float(loss_scale) * objective_weight).backward()
         return LossResult(

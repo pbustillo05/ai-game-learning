@@ -10,22 +10,20 @@ import shutil
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from types import MappingProxyType
 
 import torch
 import torch.distributed as dist
 
 from pbg.config import RootConfig
 from pbg.core.branching import (
-    BranchedRecoveryRecord,
     CostSafeguardController,
     FixedBranchController,
     KKTBranchController,
-    RankCommonFailureAgreement,
     controller_from_state_dict,
 )
 from pbg.core.capacity import GeneratedOwners, build_storage_plan
 from pbg.core.contracts import mode_schema
+from pbg.core.iteration import IterationConfig, IterationEngine, LaneContext
 from pbg.core.learner import ReferenceState
 from pbg.core.optimization import LossScaler
 from pbg.core.persistence import (
@@ -47,30 +45,23 @@ from pbg.core.replica import (
     ReplicaModuleOwner,
     ReplicaOptimizerGroup,
 )
-from pbg.core.training import (
-    AttemptAddress,
-    OverflowRecoveryRecord,
-    PreemptionNotice,
-    RecoverableOverflow,
-)
+from pbg.core.training import PreemptionNotice
 from pbg.devices import resolve_execution_device, validate_workload_capabilities
 from pbg.games.poker.queued.branching import (
-    BranchedSampledPokerIteration,
-    ReplicaBranchedPokerIteration,
+    PokerBranchedProgram,
 )
-from pbg.games.poker.queued.config import BranchedModeConfig, SequentialModeConfig
+from pbg.games.poker.queued.config import BranchedModeConfig
 from pbg.games.poker.queued.hooks import (
     NLHEGeometry,
     poker_partitions,
 )
+from pbg.games.poker.queued.iteration import PokerIterationHooks
 from pbg.games.poker.queued.model import build_model_from_config
 from pbg.games.poker.queued.replica import (
     PokerReplicaInference,
 )
 from pbg.games.poker.queued.training import (
-    RecoveringSequentialPokerIteration,
-    SequentialPokerIteration,
-    discard_unpublished_attempt,
+    PokerSequentialProgram,
 )
 from pbg.identity import accelerator_identity, code_identity
 
@@ -523,234 +514,31 @@ class TrainingSession:
             return str(broadcast[0])
         return digest
 
-    def _run_sequential(self, iteration: int):
+    def _sequential_attempt(self, owners: GeneratedOwners):
         count = self.plan.manifest.n_replica
         models = tuple(self.modules.lane_module(lane) for lane in range(count))
         completion = self.config.scientific.applicable.get("completion", {})
-        arguments = dict(
-            geometry=self.geometry,
-            mode=self.mode,
-            model=models[0],
-            model_operation=self.model_operations[0],
-            rollout_operation=(
-                models[0].rollout_operation if count == 1 else None
-            ),
-            optimizer=self.optimizers.optimizers[0],
-            loss=self.config.scientific.common.loss,
-            schedule=self.config.scientific.common.schedule,
-            generator=self.generators[0],
-            seed=self.config.scientific.common.seed,
-            lambda_=self.config.scientific.common.lambda_,
-            precision=self.config.scientific.common.precision.name,
-            utility=self.config.scientific.common.utility,
-            cache_reference_outputs=(
-                self.config.scientific.common.reference.cache_outputs
-            ),
-            reproducibility=self.config.scientific.common.reproducibility,
-            run_state=self.run_states[0],
-            reference_operation=self.reference_operations[0],
-            frozen_operation=(
-                None
-                if self.frozen_inference is None
-                else self.frozen_inference.modules.lane_module(0).rollout_operation
-            ),
-            completion_samples=int(completion.get("n_samples", 0)),
-            response_cutoff="probe" in self.config.scientific.applicable,
-            replica_inference=self.inference if count > 1 else None,
-            replica_optimizers=(
-                self.optimizers
-                if count > 1 or self.distributed is not None
-                else None
-            ),
-            replica_losses=tuple(
-                self.config.scientific.common.loss for _ in range(count)
-            ),
-            replica_generators=self.generators,
-            replica_run_states=self.run_states,
-            replica_model_operations=self.model_operations,
-            replica_reference_operations=self.reference_operations,
-            replica_frozen_inference=self.frozen_inference,
-            distributed=self.distributed,
-        )
-        if count == 1 and self.distributed is None:
-            ordinary = {
-                name: value
-                for name, value in arguments.items()
-                if not name.startswith("replica_")
-                and name != "distributed"
-            }
-            return RecoveringSequentialPokerIteration(
-                owner_factory=lambda: GeneratedOwners(self.plan),
-                plan=self.plan,
-                minimum_root_count=(
-                    self.config.scientific.common.root_count_minimum
-                ),
-                **ordinary,
-            ).run(iteration=iteration)
-        return self._run_recovering_replica(
-            iteration,
-            branched=False,
-            build=lambda owners, boundary: SequentialPokerIteration(
-                owners=owners,
-                rank_boundary=boundary,
-                **arguments,
-            ).run(iteration=iteration),
-        )
-
-    def _run_recovering_replica(self, iteration, *, branched, build):
-        """Retry one shared-owner replica attempt before any learner commit."""
-
-        agreement = RankCommonFailureAgreement.from_runtime()
-        while True:
-            owners = GeneratedOwners(self.plan)
-
-            def rank_boundary() -> None:
-                failure = agreement.agree(None)
-                if failure is None:
-                    return
-                agreed = RecoverableOverflow(
-                    failure.failure,
-                    capacity=failure.capacity,
-                    observed_demand=failure.observed_demand,
-                )
-                agreed._rank_agreed = True  # type: ignore[attr-defined]
-                raise agreed
-
-            try:
-                return build(owners, rank_boundary)
-            except RecoverableOverflow as caught:
-                local = RecoverableOverflow(
-                    caught.failure,
-                    capacity=caught.capacity,
-                    observed_demand=caught.observed_demand,
-                )
-                failure = (
-                    local
-                    if bool(getattr(caught, "_rank_agreed", False))
-                    else agreement.agree(local)
-                )
-                lane = int(failure.failure.lane)
-                discard_unpublished_attempt(owners, lane)
-                state = self.run_states[lane]
-                replacement = AttemptAddress(
-                    state.retry_epoch + 1,
-                    state.attempt_logical_base + state.root_count,
-                )
-                if branched:
-                    controller = self.controllers[lane]
-                    if controller.at_minimum:
-                        raise RuntimeError(
-                            "minimum branched control overflowed fixed capacity"
-                        ) from failure
-                    old_control = controller.state_dict()
-                    controller.backoff()
-                    new_control = controller.state_dict()
-                    record = BranchedRecoveryRecord(
-                        severity="critical",
-                        iteration=iteration,
-                        replica=lane,
-                        failed_phase=failure.failure.phase,
-                        failed_address=AttemptAddress(
-                            state.retry_epoch,
-                            failure.failure.logical_address,
-                        ).as_text(),
-                        replacement_address=replacement.as_text(),
-                        old_control=old_control,
-                        new_control=new_control,
-                        capacity=failure.capacity,
-                        observed_demand=failure.observed_demand,
-                    )
-                    state.branch_controller_state = new_control
-                else:
-                    minimum = self.config.scientific.common.root_count_minimum
-                    if state.root_count == minimum:
-                        raise RuntimeError(
-                            "minimum sequential root_count overflowed fixed capacity"
-                        ) from failure
-                    old_root = state.root_count
-                    state.root_count = max(minimum, old_root // 2)
-                    record = OverflowRecoveryRecord(
-                        severity="critical",
-                        iteration=iteration,
-                        replica=lane,
-                        failed_phase=failure.failure.phase,
-                        failed_address=AttemptAddress(
-                            state.retry_epoch,
-                            failure.failure.logical_address,
-                        ).as_text(),
-                        replacement_address=replacement.as_text(),
-                        old_root_count=old_root,
-                        new_root_count=state.root_count,
-                        capacity=failure.capacity,
-                        observed_demand=failure.observed_demand,
-                    )
-                state.recovered_overflow = True
-                state.retry_epoch = replacement.retry_epoch
-                state.attempt_logical_base = replacement.logical_base
-                state.overflow_recoveries.append(record.as_dict())
-
-    def _run_branched(self, iteration: int):
-        assert isinstance(self.config.scientific, BranchedModeConfig)
-        count = self.plan.manifest.n_replica
-        completion = self.config.scientific.applicable.get("completion", {})
-        if count > 1 or self.distributed is not None:
-            return self._run_recovering_replica(
-                iteration,
-                branched=True,
-                build=lambda owners, boundary: ReplicaBranchedPokerIteration(
-                    geometry=self.geometry,
-                    owners=owners,
-                    modes=tuple(self.mode for _ in range(count)),
-                    controllers=self.controllers,
-                    safeguards=self.safeguards,
-                    inference=self.inference,
-                    reference_operations=self.reference_operations,
-                    optimizers=self.optimizers,
-                    losses=tuple(
-                        self.config.scientific.common.loss for _ in range(count)
-                    ),
-                    schedule=self.config.scientific.common.schedule,
-                    generators=self.generators,
-                    run_states=self.run_states,
-                    seed=self.config.scientific.common.seed,
-                    lambda_=self.config.scientific.common.lambda_,
-                    precision=self.config.scientific.common.precision.name,
-                    utility=self.config.scientific.common.utility,
-                    completion_samples=int(completion.get("n_samples", 0)),
-                    cache_reference_outputs=(
-                        self.config.scientific.common.reference.cache_outputs
-                    ),
-                    frozen_inference=self.frozen_inference,
-                    distributed=self.distributed,
-                    rank_boundary=boundary,
-                ).run(iteration=iteration),
-            )
-        model = self.modules.lane_module(0)
         arguments = {
             "geometry": self.geometry,
             "mode": self.mode,
-            "model": model,
-            "model_operation": (
-                model.rb_learner_operation
-                if self.mode.private_estimator.value == "rao_blackwell"
-                else model.learner_operation
+            "model": models[0],
+            "model_operation": self.model_operations[0],
+            "rollout_operation": (
+                models[0].rollout_operation if count == 1 else None
             ),
-            "rollout_operation": model.rollout_operation,
             "optimizer": self.optimizers.optimizers[0],
             "loss": self.config.scientific.common.loss,
             "schedule": self.config.scientific.common.schedule,
             "generator": self.generators[0],
             "seed": self.config.scientific.common.seed,
             "lambda_": self.config.scientific.common.lambda_,
-            "minimum_tree_size": self.config.scientific.branching[
-                "minimum_tree_size"
-            ],
-            "cost_safeguard": self.safeguards[0],
             "precision": self.config.scientific.common.precision.name,
             "utility": self.config.scientific.common.utility,
             "cache_reference_outputs": (
                 self.config.scientific.common.reference.cache_outputs
             ),
+            "reproducibility": self.config.scientific.common.reproducibility,
+            "run_state": self.run_states[0],
             "reference_operation": self.reference_operations[0],
             "frozen_operation": (
                 None
@@ -758,15 +546,123 @@ class TrainingSession:
                 else self.frozen_inference.modules.lane_module(0).rollout_operation
             ),
             "completion_samples": int(completion.get("n_samples", 0)),
-            "benchmark_telemetry": self.benchmark_telemetry,
+            "response_cutoff": "probe" in self.config.scientific.applicable,
+            "replica_inference": self.inference if count > 1 else None,
+            "replica_optimizers": (
+                self.optimizers
+                if count > 1 or self.distributed is not None
+                else None
+            ),
+            "replica_losses": tuple(
+                self.config.scientific.common.loss for _ in range(count)
+            ),
+            "replica_generators": self.generators,
+            "replica_run_states": self.run_states,
+            "replica_model_operations": self.model_operations,
+            "replica_reference_operations": self.reference_operations,
+            "replica_frozen_inference": self.frozen_inference,
+            "distributed": self.distributed,
         }
-        return BranchedSampledPokerIteration(
+        if count == 1 and self.distributed is None:
+            ordinary = {
+                name: value
+                for name, value in arguments.items()
+                if not name.startswith("replica_")
+                and name != "distributed"
+            }
+            return PokerSequentialProgram(owners=owners, **ordinary)
+        return PokerSequentialProgram(owners=owners, **arguments)
+
+    def _branched_attempt(self, owners: GeneratedOwners):
+        assert isinstance(self.config.scientific, BranchedModeConfig)
+        count = self.plan.manifest.n_replica
+        ordinary = count == 1 and self.distributed is None
+        models = tuple(
+            self.modules.lane_module(lane) for lane in range(count)
+        )
+        completion = self.config.scientific.applicable.get("completion", {})
+        minimum_tree_size = int(
+            self.config.scientific.branching["minimum_tree_size"]
+        )
+        return PokerBranchedProgram(
+            geometry=self.geometry,
+            owners=owners,
+            modes=tuple(self.mode for _ in range(count)),
+            controllers=self.controllers,
+            safeguards=self.safeguards,
+            inference=None if ordinary else self.inference,
+            reference_operations=self.reference_operations,
+            optimizers=self.optimizers,
+            losses=tuple(
+                self.config.scientific.common.loss for _ in range(count)
+            ),
+            schedule=self.config.scientific.common.schedule,
+            generators=self.generators,
+            run_states=self.run_states,
+            minimum_tree_sizes=tuple(
+                minimum_tree_size for _ in range(count)
+            ),
+            seed=self.config.scientific.common.seed,
+            lambda_=self.config.scientific.common.lambda_,
+            precision=self.config.scientific.common.precision.name,
+            utility=self.config.scientific.common.utility,
+            completion_samples=int(completion.get("n_samples", 0)),
+            cache_reference_outputs=(
+                self.config.scientific.common.reference.cache_outputs
+            ),
+            benchmark_telemetry=self.benchmark_telemetry,
+            frozen_inference=(
+                None if ordinary else self.frozen_inference
+            ),
+            models=models if ordinary else None,
+            rollout_operations=(
+                (models[0].rollout_operation,) if ordinary else None
+            ),
+            learner_operations=(
+                (self.model_operations[0],) if ordinary else None
+            ),
+            frozen_operations=(
+                (
+                    None
+                    if self.frozen_inference is None
+                    else self.frozen_inference.modules.lane_module(
+                        0
+                    ).rollout_operation
+                ),
+            )
+            if ordinary
+            else None,
+            distributed=self.distributed,
+        )
+
+    def _iteration_engine(self) -> IterationEngine:
+        branched = self.mode.rollout_mode.is_branched
+        hooks = PokerIterationHooks(
+            self._branched_attempt if branched else self._sequential_attempt
+        )
+        lanes = tuple(
+            LaneContext(
+                mode=self.mode,
+                run_state=self.run_states[lane],
+                generator=self.generators[lane],
+                optimizer=self.optimizers.optimizers[lane],
+                model_operation=self.model_operations[lane],
+                loss=self.config.scientific.common.loss,
+                reference_operation=self.reference_operations[lane],
+                branch_controller=(
+                    self.controllers[lane] if branched else None
+                ),
+                minimum_root_count=(
+                    self.config.scientific.common.root_count_minimum
+                ),
+            )
+            for lane in range(self.plan.manifest.n_replica)
+        )
+        return IterationEngine(
+            config=IterationConfig(self.plan, lanes),
             owner_factory=lambda: GeneratedOwners(self.plan),
-            plan=self.plan,
-            controller=self.controllers[0],
-            run_state=self.run_states[0],
-            arguments=MappingProxyType(arguments),
-        ).run(iteration=iteration)
+            hooks=hooks,
+        )
 
     @staticmethod
     def _lane_results(result: object) -> tuple[object | None, ...]:
@@ -794,11 +690,7 @@ class TrainingSession:
                     self.modules.lane_module(lane).state_dict(),
                     strict=True,
                 )
-        result = (
-            self._run_sequential(iteration)
-            if isinstance(self.config.scientific, SequentialModeConfig)
-            else self._run_branched(iteration)
-        )
+        result = self._iteration_engine().run(iteration=iteration)
         lane_results = self._lane_results(result)
         local_nodes = [
             int(

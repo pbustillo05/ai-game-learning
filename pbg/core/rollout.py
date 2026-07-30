@@ -31,10 +31,12 @@ from pbg.core.storage import (
     PublicationTransaction,
 )
 from pbg.core.topology import (
-    TargetKind,
     Topology,
+    TopologyAssembler,
     TopologyBindings,
     TopologyError,
+    TopologyExpansion,
+    TopologyExpansionEdge,
     TopologyPacket,
 )
 
@@ -374,6 +376,7 @@ class FamilyQueueState:
     oldest_time: int
     schema: ModeSchema
     active: bool = True
+    max_prefix: int | None = None
 
     def __post_init__(self) -> None:
         if self.lane < 0 or not self.input_type or self.preorder < 0:
@@ -382,6 +385,8 @@ class FamilyQueueState:
             raise ValueError("queue state violates head <= ready_tail")
         if not 0 <= self.oldest_time <= self.logical_time:
             raise ValueError("queue age times are invalid")
+        if self.max_prefix is not None and self.max_prefix <= 0:
+            raise ValueError("queue maximum prefix must be positive")
 
     @property
     def depth(self) -> int:
@@ -390,6 +395,13 @@ class FamilyQueueState:
     @property
     def age(self) -> int:
         return 0 if not self.depth else self.logical_time - self.oldest_time
+
+    def prefix_cap(self, global_cap: int) -> int:
+        return (
+            global_cap
+            if self.max_prefix is None
+            else min(global_cap, self.max_prefix)
+        )
 
 
 @dataclass(frozen=True)
@@ -459,11 +471,10 @@ class FamilyScheduler:
         full = tuple(
             state
             for state in candidates
-            if state.depth >= self.family_pack_cap
+            if state.depth >= state.prefix_cap(self.family_pack_cap)
         )
         if full:
             eligible = full
-            rows = self.family_pack_cap
             forced_partial = False
         else:
             if not allow_partial:
@@ -478,20 +489,27 @@ class FamilyScheduler:
                 for state in eligible
                 if self._positions[state.input_type] == first_preorder
             )
-            rows = max(state.depth for state in layer)
+            rows = max(
+                min(state.depth, state.prefix_cap(self.family_pack_cap))
+                for state in layer
+            )
         first = min(
             eligible,
             key=lambda state: (
                 self._positions[state.input_type],
-                -state.depth / self.family_pack_cap,
+                -state.depth / state.prefix_cap(self.family_pack_cap),
                 -state.age,
                 state.lane,
             ),
         )
+        if full:
+            rows = first.prefix_cap(self.family_pack_cap)
         same_family = tuple(
             state
             for state in candidates
-            if state.input_type == first.input_type and state.depth >= rows
+            if state.input_type == first.input_type
+            and state.depth >= rows
+            and state.prefix_cap(self.family_pack_cap) >= rows
         )
         validate_replica_group(tuple(state.schema for state in same_family))
         lanes = tuple(sorted(state.lane for state in same_family))
@@ -1149,7 +1167,7 @@ class ReplicaTopologyPacket:
 
 @dataclass(frozen=True)
 class DeferredUnaryTopologyPublication:
-    """Device-produced sequential unary trace committed with destinations."""
+    """Device-produced unit-degree expansion packet committed with destinations."""
 
     lane: int
     sequence: int
@@ -1161,6 +1179,9 @@ class DeferredUnaryTopologyPublication:
     owner: Tensor
     action: Tensor
     familywork_row: Tensor
+    executed_degree: Tensor
+    nominal_degree: Tensor
+    target_degree: Tensor
     leaf_reservation_index: int
     leaf_target_ordinal: Tensor
     trained: Tensor | None = None
@@ -1192,6 +1213,9 @@ class DeferredUnaryTopologyPublication:
             "owner",
             "action",
             "familywork_row",
+            "executed_degree",
+            "nominal_degree",
+            "target_degree",
             "leaf_target_ordinal",
         ):
             value = getattr(self, name)
@@ -1203,6 +1227,22 @@ class DeferredUnaryTopologyPublication:
                 raise TopologyError(
                     f"deferred topology {name} must be CUDA [rows]"
                 )
+        for name in (
+            "executed_degree",
+            "nominal_degree",
+            "target_degree",
+        ):
+            if getattr(self, name).dtype not in (
+                torch.int32,
+                torch.int64,
+            ):
+                raise TopologyError(
+                    "topology packet degrees must be integer tensors"
+                )
+            torch._assert_async(
+                getattr(self, name).eq(1).all(),
+                "sequential topology packet degrees must all equal one",
+            )
         if self.trained is not None and (
             self.trained.device != device
             or self.trained.dtype != torch.bool
@@ -1326,7 +1366,7 @@ class AsyncTopologyPublisher:
         )
         self._accept_stream = _runtime_streams(owners.device)[2]
         self._deferred_buffer = torch.empty(
-            (owners.topology_cap, 14),
+            (owners.topology_cap, 17),
             dtype=torch.int64,
             pin_memory=True,
         )
@@ -1592,6 +1632,9 @@ class AsyncTopologyPublisher:
                     dtype=torch.int64,
                     device=self.owners.device,
                 ),
+                publication.executed_degree.to(torch.int64)[:, None],
+                publication.nominal_degree.to(torch.int64)[:, None],
+                publication.target_degree.to(torch.int64)[:, None],
                 leaf_row.to(torch.int64)[:, None],
                 trained.to(torch.int64)[:, None],
                 sigma_row.to(torch.int64)[:, None],
@@ -1984,14 +2027,14 @@ class AsyncTopologyPublisher:
             if publication is not None:
                 self._deferred_reserved_rows -= publication.terminal.numel()
 
-    def seal_deferred_unary(
+    def seal_expansions(
         self,
         *,
         lane: int = 0,
         input_count: int,
         input_output: Sequence[int] | None = None,
     ) -> tuple[Topology, TopologyBindings, int]:
-        """Aggregate once, then link the committed unary logical trace."""
+        """Seal committed degree-one rows through the common assembler."""
 
         if not 0 <= lane < self.owners.n_replica:
             raise TopologyError("deferred topology lane is outside replicas")
@@ -2024,102 +2067,58 @@ class AsyncTopologyPublisher:
         ):
             raise TopologyError("deferred input/output map is invalid")
         trace = torch.cat(ordered, 0)
-        logical_to_node: dict[tuple[int, int], int] = {}
-        pending_parent: dict[tuple[int, int], int] = {}
-        parent: list[int] = []
-        owner: list[int] = []
-        familywork_row: list[int] = []
-        sigma_head_row: list[int] = []
-        action_begin: list[int] = []
-        label: list[int] = []
-        target_kind: list[int] = []
-        target_key: list[tuple[int, int] | None] = []
-        target_row: list[int] = []
-        input_type: list[int] = []
-        output_type: list[int] = []
-        child_output_type: list[int] = []
-        leaves = 0
+        assembler = TopologyAssembler(
+            input_to_output=output_for_input,
+            p_train=self.p_train,
+            topology_cap=self.owners.topology_cap,
+            topology_edge_cap=self.owners.topology_edge_cap,
+        )
+        expansions = []
         for values in trace.tolist():
-            logical = (int(values[0]), int(values[1]))
-            if logical in logical_to_node:
-                raise TopologyError("a deferred logical node was processed twice")
-            node = len(parent)
-            parent.append(pending_parent.pop(logical, -1))
-            logical_to_node[logical] = node
-            trained = bool(values[11])
-            owner.append(int(values[6]) if trained else -1)
-            # Align-and-seal compacts trained best-response inputs.  The
-            # retained learner identity is therefore the resolved Sigma row,
-            # while headless frozen rows retain no FamilyWork address.
-            familywork_row.append(int(values[12]) if trained else -1)
-            sigma_head_row.append(int(values[12]) if trained else -1)
-            action_begin.append(int(values[13]) if trained else -1)
-            label.append(int(values[7]))
+            trained = bool(values[14])
             input_index = int(values[9])
-            if not 0 <= input_index < input_count:
-                raise TopologyError("deferred input type is outside preorder")
-            input_type.append(input_index if trained else -1)
-            output_type.append(output_for_input[input_index])
             next_input = int(values[4])
+            if not 0 <= input_index < input_count:
+                raise TopologyError(
+                    "deferred input type is outside preorder"
+                )
             if not 0 <= next_input < input_count:
                 raise TopologyError(
                     "deferred next input type is outside preorder"
                 )
-            child_output_type.append(output_for_input[next_input])
-            if bool(values[5]):
-                target_kind.append(int(TargetKind.LEAF))
-                target_key.append(None)
-                target_row.append(int(values[10]))
-                leaves += 1
-            else:
-                child = (int(values[2]), int(values[3]))
-                if child in pending_parent:
-                    raise TopologyError(
-                        "two deferred nodes produced one logical child"
-                    )
-                pending_parent[child] = node
-                target_kind.append(int(TargetKind.TOPOLOGY))
-                target_key.append(child)
-                target_row.append(-1)
-        if pending_parent:
-            raise TopologyError("deferred topology has unresolved player children")
-        for edge, key in enumerate(target_key):
-            if key is not None:
-                try:
-                    target_row[edge] = logical_to_node[key]
-                except KeyError as exc:
-                    raise TopologyError(
-                        "deferred topology child was never processed"
-                    ) from exc
-
-        def i32(values: Sequence[int]) -> Tensor:
-            return torch.tensor(values, dtype=torch.int32)
-
-        nodes = len(parent)
-        topology = Topology(
-            parent=i32(parent),
-            child_begin=torch.arange(nodes, dtype=torch.int32),
-            executed_degree=torch.ones(nodes, dtype=torch.int32),
-            nominal_degree=torch.ones(nodes, dtype=torch.int32),
-            target_degree=torch.ones(nodes, dtype=torch.int32),
-            owner=i32(owner),
-            familywork_row=i32(familywork_row),
-            sigma_head_row=i32(sigma_head_row),
-            action_begin=i32(action_begin),
-            label=i32(label),
-            path_length=torch.ones(nodes, dtype=torch.int32),
-            target_kind=i32(target_kind),
-            target_row=i32(target_row),
-        )
-        bindings = TopologyBindings(
-            input_type=i32(input_type),
-            output_type=i32(output_type),
-            sigma_target_row=i32(sigma_head_row),
-            child_output_type=i32(child_output_type),
-        )
-        topology.validate(bindings, p_train=self.p_train)
-        topology, bindings = topology.compact(bindings, p_train=self.p_train)
-        return topology, bindings, leaves
+            terminal = bool(values[5])
+            expansions.append(
+                TopologyExpansion(
+                    key=(int(values[0]), int(values[1])),
+                    executed_degree=int(values[10]),
+                    nominal_degree=int(values[11]),
+                    target_degree=int(values[12]),
+                    trained=trained,
+                    owner=int(values[6]),
+                    input_type=input_index,
+                    familywork_row=int(values[15]),
+                    sigma_head_row=int(values[15]),
+                    action_begin=int(values[16]),
+                    refill=False,
+                    edges=(
+                        TopologyExpansionEdge(
+                            label=int(values[7]),
+                            path_length=1,
+                            terminal=terminal,
+                            child_key=(
+                                int(values[2]),
+                                int(values[3]),
+                            ),
+                            child_leaf_row=(
+                                int(values[13]) if terminal else -1
+                            ),
+                            child_input=next_input,
+                        ),
+                    ),
+                )
+            )
+        assembler.accept(expansions, sampled_nodes=0)
+        return assembler.seal()
 
     def assert_drained(self) -> None:
         if (

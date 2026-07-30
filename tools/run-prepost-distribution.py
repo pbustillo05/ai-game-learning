@@ -66,7 +66,6 @@ def main() -> None:
             "3",
             "--safe-tree-size",
             "120000",
-            "--tree-only",
             "--large-tree-manifest",
             "--output",
             str(output),

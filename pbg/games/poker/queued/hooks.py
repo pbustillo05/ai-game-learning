@@ -15,16 +15,6 @@ from types import MappingProxyType
 import torch
 from torch import Tensor
 
-from pbg.games.poker.model.capacity import max_public_history_tokens
-from pbg.games.poker.model.primitives import accelerator_assert
-from pbg.games.poker.queued.evaluator import bound_evaluator
-from pbg.games.poker.queued.policy import (
-    CHECK_CALL,
-    FOLD,
-    RAISE_OFFSET,
-    PokerLegality,
-    PokerPolicyOperator,
-)
 from pbg.core.contracts import (
     ConversionSpec,
     ModeSchema,
@@ -56,6 +46,16 @@ from pbg.core.rollout import (
     stable_route,
 )
 from pbg.core.storage import DeviceDestinationRequest, MonotoneSlab
+from pbg.games.poker.model.capacity import max_public_history_tokens
+from pbg.games.poker.model.primitives import accelerator_assert
+from pbg.games.poker.queued.evaluator import bound_evaluator
+from pbg.games.poker.queued.policy import (
+    CHECK_CALL,
+    FOLD,
+    RAISE_OFFSET,
+    PokerLegality,
+    PokerPolicyOperator,
+)
 
 PAD_CARD = 255
 LIVE = 0
@@ -2102,6 +2102,18 @@ class SequentialPokerHooks:
                 ),
                 action=request.sample.values["action"][local_lane],
                 familywork_row=batch.row[local_lane],
+                executed_degree=torch.ones_like(
+                    batch.fields["owner"][local_lane],
+                    dtype=torch.int32,
+                ),
+                nominal_degree=torch.ones_like(
+                    batch.fields["owner"][local_lane],
+                    dtype=torch.int32,
+                ),
+                target_degree=torch.ones_like(
+                    batch.fields["owner"][local_lane],
+                    dtype=torch.int32,
+                ),
                 leaf_reservation_index=0,
                 leaf_target_ordinal=destination_ordinal[lane, 2::4],
                 trained=trained[local_lane],

@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum
+from itertools import pairwise
 
 import torch
 from torch import Tensor
@@ -377,6 +378,419 @@ class Topology:
 
 
 @dataclass(frozen=True)
+class TopologyExpansionEdge:
+    """One logical child in the common rollout topology packet."""
+
+    label: int
+    path_length: int
+    terminal: bool
+    child_key: tuple[int, int]
+    child_leaf_row: int
+    child_input: int
+
+
+@dataclass(frozen=True)
+class TopologyExpansion:
+    """One expanded structural row before unary compaction."""
+
+    key: tuple[int, int]
+    executed_degree: int
+    nominal_degree: int
+    target_degree: int
+    trained: bool
+    owner: int
+    input_type: int
+    familywork_row: int
+    sigma_head_row: int
+    action_begin: int
+    refill: bool
+    edges: tuple[TopologyExpansionEdge, ...]
+
+
+@dataclass
+class _AssembledEdge:
+    label: int
+    path_length: int
+    terminal: bool
+    child_key: tuple[int, int]
+    child_leaf_row: int
+    child_input: int
+
+
+@dataclass
+class _AssembledNode:
+    key: tuple[int, int]
+    executed_degree: int
+    nominal_degree: int
+    target_degree: int
+    owner: int
+    input_type: int
+    familywork_row: int
+    sigma_head_row: int
+    action_begin: int
+    edges: list[_AssembledEdge]
+
+
+class TopologyAssembler:
+    """The sole packet consumer for sequential and branched forests."""
+
+    def __init__(
+        self,
+        *,
+        input_to_output: Sequence[int],
+        p_train: int,
+        topology_cap: int,
+        topology_edge_cap: int,
+    ) -> None:
+        self.input_to_output = tuple(int(value) for value in input_to_output)
+        self.p_train = int(p_train)
+        self.topology_cap = int(topology_cap)
+        self.topology_edge_cap = int(topology_edge_cap)
+        if (
+            not self.input_to_output
+            or any(value < 0 for value in self.input_to_output)
+            or min(self.p_train, self.topology_cap, self.topology_edge_cap) <= 0
+        ):
+            raise TopologyError("topology assembler bounds are invalid")
+        self._nodes: dict[tuple[int, int], _AssembledNode] = {}
+        self._compressed_roots: dict[tuple[int, int], _AssembledNode] = {}
+        self._pending: dict[tuple[int, int], list[_AssembledEdge]] = {}
+        self._tree_edges: dict[int, int] = {}
+        self._root_degrees: dict[int, int] = {}
+        self._sampled_roots: set[int] = set()
+        self._sampled_prefix: list[int] = []
+        self._record_corrections: list[float] = []
+
+    def accept(
+        self,
+        expansions: Sequence[TopologyExpansion],
+        *,
+        sampled_nodes: int,
+        counterfactual_correction: float = 0.0,
+    ) -> None:
+        if not expansions or sampled_nodes < 0:
+            raise TopologyError("topology expansion packet is invalid")
+        roots_before = len(self._sampled_roots)
+        for expansion in expansions:
+            key = expansion.key
+            degree = expansion.executed_degree
+            if (
+                degree <= 0
+                or len(expansion.edges) != degree
+                or expansion.nominal_degree <= 0
+                or not 1 <= expansion.target_degree <= degree
+            ):
+                raise TopologyError("topology expansion degrees are invalid")
+            outgoing = [
+                _AssembledEdge(
+                    edge.label,
+                    edge.path_length,
+                    edge.terminal,
+                    edge.child_key,
+                    edge.child_leaf_row,
+                    edge.child_input,
+                )
+                for edge in expansion.edges
+            ]
+            logical_root = key[0]
+            self._tree_edges[logical_root] = (
+                self._tree_edges.get(logical_root, 0) + len(outgoing)
+            )
+            if key[1] == 0:
+                self._sampled_roots.add(logical_root)
+                self._root_degrees[logical_root] = (
+                    self._root_degrees.get(logical_root, 0) + degree
+                )
+            compressed_root = self._compressed_roots.pop(key, None)
+            if compressed_root is not None:
+                if not expansion.refill:
+                    raise TopologyError(
+                        "a compressed topology root was expanded twice"
+                    )
+                self._nodes[key] = compressed_root
+            incoming = self._pending.pop(key, [])
+            retain = (
+                key in self._nodes
+                or expansion.trained
+                or degree >= 2
+                or expansion.nominal_degree >= 2
+            )
+            if retain:
+                node = self._nodes.get(key)
+                if node is None:
+                    node = _AssembledNode(
+                        key=key,
+                        executed_degree=degree,
+                        nominal_degree=expansion.nominal_degree,
+                        target_degree=expansion.target_degree,
+                        owner=expansion.owner if expansion.trained else -1,
+                        input_type=(
+                            expansion.input_type if expansion.trained else -1
+                        ),
+                        familywork_row=(
+                            expansion.familywork_row
+                            if expansion.trained
+                            else -1
+                        ),
+                        sigma_head_row=(
+                            expansion.sigma_head_row
+                            if expansion.trained
+                            else -1
+                        ),
+                        action_begin=(
+                            expansion.action_begin
+                            if expansion.trained
+                            else -1
+                        ),
+                        edges=[],
+                    )
+                    self._nodes[key] = node
+                elif not expansion.refill:
+                    raise TopologyError(
+                        "a logical topology row was expanded twice"
+                    )
+                else:
+                    node.executed_degree += degree
+                node.edges.extend(outgoing)
+                for edge in outgoing:
+                    if not edge.terminal:
+                        self._pending.setdefault(
+                            edge.child_key, []
+                        ).append(edge)
+            else:
+                if degree != 1:
+                    raise TopologyError(
+                        "only ordinary unary rows may be compressed"
+                    )
+                child = outgoing[0]
+                if key[1] == 0 and not incoming:
+                    compressed = _AssembledNode(
+                        key,
+                        degree,
+                        expansion.nominal_degree,
+                        expansion.target_degree,
+                        -1,
+                        -1,
+                        -1,
+                        -1,
+                        -1,
+                        outgoing,
+                    )
+                    self._compressed_roots[key] = compressed
+                    if not child.terminal:
+                        self._pending.setdefault(
+                            child.child_key, []
+                        ).append(child)
+                for edge in incoming:
+                    edge.path_length += child.path_length
+                    edge.terminal = child.terminal
+                    edge.child_key = child.child_key
+                    edge.child_leaf_row = child.child_leaf_row
+                    edge.child_input = child.child_input
+                    if not edge.terminal:
+                        self._pending.setdefault(
+                            edge.child_key, []
+                        ).append(edge)
+        compact_nodes = len(self._nodes) + len(self._compressed_roots)
+        compact_edges = sum(
+            len(node.edges)
+            for group in (self._nodes.values(), self._compressed_roots.values())
+            for node in group
+        )
+        if compact_nodes > self.topology_cap:
+            raise TopologyError("realized topology exceeds its fixed node cap")
+        if compact_edges > self.topology_edge_cap:
+            raise TopologyError("realized topology exceeds its fixed edge cap")
+        self._sampled_prefix.append(
+            sampled_nodes
+            + len(self._sampled_roots)
+            - roots_before
+            + (self._sampled_prefix[-1] if self._sampled_prefix else 0)
+        )
+        self._record_corrections.append(float(counterfactual_correction))
+
+    def seal(self) -> tuple[Topology, TopologyBindings, int]:
+        if not self._nodes:
+            raise TopologyError("topology is empty")
+        if self._pending:
+            raise TopologyError("topology has unresolved child endpoints")
+        targeted = {
+            edge.child_key
+            for node in self._nodes.values()
+            for edge in node.edges
+            if not edge.terminal
+        }
+        ordered: list[tuple[int, int]] = []
+        visited: set[tuple[int, int]] = set()
+
+        def visit(key: tuple[int, int]) -> None:
+            if key in visited:
+                return
+            visited.add(key)
+            ordered.append(key)
+            for edge in self._nodes[key].edges:
+                if not edge.terminal:
+                    visit(edge.child_key)
+
+        for key in sorted(key for key in self._nodes if key not in targeted):
+            visit(key)
+        if len(visited) != len(self._nodes):
+            raise TopologyError("topology contains an unreachable row")
+        node_for_key = {key: node for node, key in enumerate(ordered)}
+        resolved_output: dict[tuple[int, int], int] = {}
+
+        def resolve_output(key: tuple[int, int]) -> int:
+            if key in resolved_output:
+                return resolved_output[key]
+            record = self._nodes[key]
+            if record.input_type >= 0:
+                result = self.input_to_output[record.input_type]
+            else:
+                domains = [
+                    (
+                        self.input_to_output[edge.child_input]
+                        if edge.terminal
+                        else resolve_output(edge.child_key)
+                    )
+                    for edge in record.edges
+                ]
+                if not domains or any(value != domains[0] for value in domains):
+                    raise TopologyError(
+                        "structural row has no single output domain"
+                    )
+                result = domains[0]
+            resolved_output[key] = result
+            return result
+
+        parent = [-1] * len(ordered)
+        child_begin: list[int] = []
+        executed: list[int] = []
+        nominal: list[int] = []
+        target: list[int] = []
+        owner: list[int] = []
+        family: list[int] = []
+        sigma: list[int] = []
+        action: list[int] = []
+        input_type: list[int] = []
+        output_type: list[int] = []
+        labels: list[int] = []
+        paths: list[int] = []
+        kinds: list[int] = []
+        rows: list[int] = []
+        child_output: list[int] = []
+        leaves: set[int] = set()
+        for node, key in enumerate(ordered):
+            record = self._nodes[key]
+            child_begin.append(len(labels))
+            executed.append(record.executed_degree)
+            nominal.append(record.nominal_degree)
+            target.append(record.target_degree)
+            owner.append(record.owner)
+            family.append(record.familywork_row)
+            sigma.append(record.sigma_head_row)
+            action.append(record.action_begin)
+            input_type.append(record.input_type)
+            output_type.append(resolve_output(key))
+            for edge in record.edges:
+                labels.append(edge.label)
+                paths.append(edge.path_length)
+                if edge.terminal:
+                    if not 0 <= edge.child_input < len(self.input_to_output):
+                        raise TopologyError(
+                            "leaf endpoint input type is invalid"
+                        )
+                    kinds.append(int(TargetKind.LEAF))
+                    rows.append(edge.child_leaf_row)
+                    child_output.append(
+                        self.input_to_output[edge.child_input]
+                    )
+                    leaves.add(edge.child_leaf_row)
+                else:
+                    child = node_for_key[edge.child_key]
+                    if parent[child] != -1:
+                        raise TopologyError(
+                            "a topology row has two structural parents"
+                        )
+                    parent[child] = node
+                    kinds.append(int(TargetKind.TOPOLOGY))
+                    rows.append(child)
+                    child_output.append(resolve_output(edge.child_key))
+
+        def i32(values: Sequence[int]) -> Tensor:
+            return torch.tensor(values, dtype=torch.int32)
+
+        topology = Topology(
+            parent=i32(parent),
+            child_begin=i32(child_begin),
+            executed_degree=i32(executed),
+            nominal_degree=i32(nominal),
+            target_degree=i32(target),
+            owner=i32(owner),
+            familywork_row=i32(family),
+            sigma_head_row=i32(sigma),
+            action_begin=i32(action),
+            label=i32(labels),
+            path_length=i32(paths),
+            target_kind=i32(kinds),
+            target_row=i32(rows),
+        )
+        bindings = TopologyBindings(
+            input_type=i32(input_type),
+            output_type=i32(output_type),
+            sigma_target_row=i32(sigma),
+            child_output_type=i32(child_output),
+        )
+        topology.validate(
+            bindings,
+            p_train=self.p_train,
+            compact=True,
+            _allow_zero_path=True,
+        )
+        return topology, bindings, len(leaves)
+
+    def tree_size(self, logical_root: int) -> int:
+        return 1 + self._tree_edges.get(logical_root, 0)
+
+    def sampled_tree_size(self, record_limit: int | None = None) -> int:
+        if not self._sampled_prefix:
+            return 0
+        if record_limit is None:
+            return self._sampled_prefix[-1]
+        if not 0 <= record_limit <= len(self._sampled_prefix):
+            raise ValueError("sampled record limit is invalid")
+        return (
+            0
+            if record_limit == 0
+            else self._sampled_prefix[record_limit - 1]
+        )
+
+    def root_degree(self, logical_root: int) -> int:
+        degree = self._root_degrees.get(logical_root, 0)
+        if degree <= 0:
+            raise TopologyError("logical root has no committed expansion")
+        return degree
+
+    @property
+    def record_count(self) -> int:
+        return len(self._sampled_prefix)
+
+    def counterfactual_correction(self, record_limit: int) -> float:
+        if not 0 <= record_limit <= len(self._record_corrections):
+            raise ValueError("counterfactual record limit is invalid")
+        return sum(self._record_corrections[:record_limit])
+
+    def release(self) -> None:
+        self._nodes.clear()
+        self._compressed_roots.clear()
+        self._pending.clear()
+        self._tree_edges.clear()
+        self._root_degrees.clear()
+        self._sampled_roots.clear()
+        self._sampled_prefix.clear()
+        self._record_corrections.clear()
+
+
+@dataclass(frozen=True)
 class TopologyPacket:
     """One committed absolute-address slice of a topology transfer."""
 
@@ -518,7 +932,7 @@ class LayerPlan:
             not layer_ptr
             or layer_ptr[0] != 0
             or layer_ptr[-1] != self.node_count
-            or any(left > right for left, right in zip(layer_ptr, layer_ptr[1:]))
+            or any(left > right for left, right in pairwise(layer_ptr))
         ):
             raise TopologyError("LayerPlan layer pointers are invalid")
         movement_fields = (
@@ -578,7 +992,7 @@ class LayerPlan:
         child_owner = [-1] * self.edge_count
         sigma_destinations: set[tuple[int, int, int]] = set()
         action_destinations: set[tuple[int, int, int]] = set()
-        for first, stop in zip(layer_ptr, layer_ptr[1:]):
+        for first, stop in pairwise(layer_ptr):
             destinations: set[tuple[int, int, int]] = set()
             for row in range(first, stop):
                 key = (
@@ -1219,8 +1633,11 @@ __all__ = [
     "LayerPlan",
     "TargetKind",
     "Topology",
+    "TopologyAssembler",
     "TopologyBindings",
     "TopologyError",
+    "TopologyExpansion",
+    "TopologyExpansionEdge",
     "TopologyPacket",
     "build_layer_plan",
 ]

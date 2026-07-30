@@ -30,7 +30,7 @@ from pbg.games.poker.queued.model import (
     _fold_line_metadata,
     build_model_from_config,
 )
-from pbg.games.poker.queued.training import SequentialPokerIteration
+from tests.iteration_support import EngineDrivenSequentialAttempt
 from pbg.games.poker.queued.response import (
     SequentialSharedResponseEvaluator,
     balanced_evaluation_probe_seats,
@@ -996,7 +996,7 @@ def test_best_response_rollout_calls_each_model_only_for_its_role_rows() -> None
 
         return run
 
-    runner = object.__new__(SequentialPokerIteration)
+    runner = object.__new__(EngineDrivenSequentialAttempt)
     runner.mode = mode_schema("best_response", "sequential", "sampled")
     runner.rollout_operation = operation("trained")
     runner.frozen_operation = operation("frozen")
@@ -1088,7 +1088,7 @@ def test_all_four_sequential_modes_complete_an_optimizer_step(
     frozen = make_model() if regime == "best_response" else None
     generator = torch.Generator(device=device)
     generator.manual_seed(101)
-    iteration_runner = SequentialPokerIteration(
+    iteration_runner = EngineDrivenSequentialAttempt(
         geometry=geometry,
         owners=owners,
         mode=mode,
@@ -1202,7 +1202,7 @@ def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
     model = make_model()
     frozen = make_model()
     generator = torch.Generator(device=device).manual_seed(911)
-    runner = SequentialPokerIteration(
+    runner = EngineDrivenSequentialAttempt(
         geometry=geometry,
         owners=owners,
         mode=mode,

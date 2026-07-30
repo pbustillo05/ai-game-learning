@@ -2,40 +2,27 @@
 
 from __future__ import annotations
 
-import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
 import torch
 from torch import Tensor, nn
 
-from pbg.games.poker.model.capacity import (
-    max_policy_partition_sequence_tokens,
-)
-from pbg.games.poker.queued.hooks import (
-    NLHEGeometry,
-    PokerForwardInput,
-    PokerLearnerPolicy,
-    PokerStateMachine,
-    RBCompletionBinding,
-    SampledShowdownBinding,
-    SequentialPokerHooks,
-)
-from pbg.games.poker.queued.observability import topology_diagnostics
-from pbg.games.poker.queued.policy import PokerPolicyOperator
-from pbg.games.poker.queued.replica import PokerReplicaInference
-from pbg.core.branching import RankCommonFailureAgreement
 from pbg.core.capacity import (
-    ExecutionPhase,
     GeneratedOwners,
-    StoragePlan,
 )
 from pbg.core.contracts import (
     ModeSchema,
     PrivateEstimator,
     RolloutMode,
     TrainingRegime,
+)
+from pbg.core.iteration import (
+    CompletionLoop,
+    IterationEngine,
+    LearnerPreflightOptimizer,
+    RolloutLoop,
 )
 from pbg.core.learner import (
     AlignedSequentialStore,
@@ -50,7 +37,7 @@ from pbg.core.learner import (
     build_reference_output_cache,
     compact_best_response_evaluation,
 )
-from pbg.core.optimization import DenseAdam, OptimizerStep
+from pbg.core.optimization import DenseAdam
 from pbg.core.persistence import (
     RunState,
 )
@@ -77,12 +64,25 @@ from pbg.core.topology import (
     build_layer_plan,
 )
 from pbg.core.training import (
-    AttemptAddress,
     IterationResult,
+    LearnerIteration,
     RecoverableOverflow,
-    SequentialOverflowRecovery,
-    SequentialSampledIteration,
 )
+from pbg.games.poker.model.capacity import (
+    max_policy_partition_sequence_tokens,
+)
+from pbg.games.poker.queued.hooks import (
+    NLHEGeometry,
+    PokerForwardInput,
+    PokerLearnerPolicy,
+    PokerStateMachine,
+    RBCompletionBinding,
+    SampledShowdownBinding,
+    SequentialPokerHooks,
+)
+from pbg.games.poker.queued.observability import topology_diagnostics
+from pbg.games.poker.queued.policy import PokerPolicyOperator
+from pbg.games.poker.queued.replica import PokerReplicaInference
 
 
 class PokerIterationError(RuntimeError):
@@ -96,7 +96,6 @@ class PokerIterationResult:
     leaves: int
     target_layers: int
     posterior_effective_hands: float | None = None
-    telemetry: SequentialBenchmarkTelemetry | None = None
     observability: Mapping[str, object] = field(
         default_factory=lambda: MappingProxyType({})
     )
@@ -111,30 +110,8 @@ class ReplicaPokerIterationResult:
     versions: tuple[int, ...]
 
 
-@dataclass(frozen=True)
-class SequentialBenchmarkTelemetry:
-    """Rollout-only timing emitted solely by an explicit benchmark run."""
-
-    rollout_seconds: float
-
-
-class LearnerPreflightOptimizer:
-    """Exercise every learner batch without permitting a parameter transition."""
-
-    def __init__(self, optimizer: DenseAdam) -> None:
-        self.optimizer = optimizer
-        self.scaler = optimizer.scaler
-
-    def zero_grad(self) -> None:
-        self.optimizer.zero_grad()
-
-    def step(self) -> OptimizerStep:
-        self.optimizer.zero_grad()
-        return OptimizerStep(False, True, 0.0, 1.0, self.scaler.scale, self.scaler.scale, 0)
-
-
-class SequentialPokerIteration:
-    """Run any sequential schema through the sole queued engine."""
+class PokerSequentialProgram:
+    """Supply sequential poker work to the common iteration engine."""
 
     def __init__(
         self,
@@ -161,7 +138,6 @@ class SequentialPokerIteration:
         frozen_operation: ModelOperation | None = None,
         completion_samples: int = 0,
         response_cutoff: bool = False,
-        benchmark_rollout_only: bool = False,
         replica_inference: PokerReplicaInference | None = None,
         replica_optimizers: ReplicaOptimizerGroup | None = None,
         replica_losses: Sequence[LossConfig] | None = None,
@@ -172,7 +148,6 @@ class SequentialPokerIteration:
         | None = None,
         replica_frozen_inference: PokerReplicaInference | None = None,
         distributed: DistributedSUM | None = None,
-        rank_boundary: Callable[[], None] | None = None,
     ) -> None:
         if owners.plan.mode != mode:
             raise ValueError("poker iteration mode differs from generated owners")
@@ -328,7 +303,6 @@ class SequentialPokerIteration:
         self.replica_frozen_inference = replica_frozen_inference
         self.replica_optimizers = replica_optimizers
         self.distributed = distributed
-        self.rank_boundary = rank_boundary
         self.model = models[0]
         self.model_operation = model_operations[0]
         self.rollout_operation = (
@@ -375,9 +349,6 @@ class SequentialPokerIteration:
         self._model_events: dict[
             str, list[tuple[torch.cuda.Event, torch.cuda.Event, int]]
         ] = {}
-        if type(benchmark_rollout_only) is not bool:
-            raise TypeError("benchmark_rollout_only must be bool")
-        self.benchmark_rollout_only = benchmark_rollout_only
         if (
             n_replica > 1
             and mode.training_regime is TrainingRegime.BEST_RESPONSE
@@ -765,14 +736,8 @@ class SequentialPokerIteration:
             MappingProxyType(public),
         )
 
-    def run(
-        self, *, iteration: int
-    ) -> PokerIterationResult | ReplicaPokerIterationResult:
+    def prepare_rollout(self, *, iteration: int) -> RolloutLoop:
         owners = self.owners
-        if self.benchmark_rollout_only:
-            torch.cuda.synchronize(owners.plan.device)
-            rollout_started = time.perf_counter()
-        owners.enter_phase(ExecutionPhase.ROLLOUT)
         registry = RolloutOwnerRegistry.from_generated(owners)
         input_names = tuple(
             partition.name for partition in owners.plan.partitions.inputs
@@ -838,26 +803,25 @@ class SequentialPokerIteration:
                 if state is None
                 else state.root_count
             )
-        logical_time = 0
-        last_event: torch.cuda.Event | None = None
-        while True:
-            states = tuple(
+        self._iteration_last_event: torch.cuda.Event | None = None
+
+        def queue_states(time: int) -> tuple[FamilyQueueState, ...]:
+            return tuple(
                 FamilyQueueState(
                     lane,
                     name,
                     index,
                     0,
                     depths[lane][name],
-                    logical_time,
+                    time,
                     0,
                     self.mode,
                 )
                 for lane in range(self.n_replica)
                 for index, name in enumerate(queues)
             )
-            scheduled = scheduler.select(states, allow_partial=True)
-            if scheduled is None:
-                break
+
+        def execute_scheduled(scheduled, _time: int):
             commit = transaction.execute(
                 queues[scheduled.input_type],
                 scheduled,
@@ -870,30 +834,55 @@ class SequentialPokerIteration:
                 )
             publications = hooks.last_topology
             hooks.last_topology = ()
-            for publication in publications:
-                failed, produced = topology_publisher.wait_deferred_feedback(
-                    publication,
-                    input_count=len(input_names),
-                )
-                if failed:
-                    raise self._recoverable_overflow(publication.lane)
-                depths[publication.lane][scheduled.input_type] -= scheduled.rows
-                for name, count in zip(input_names, produced, strict=True):
-                    depths[publication.lane][name] += count
-            last_event = commit.event
-            logical_time += 1
-            if logical_time > (
+            return scheduled, commit, publications
+
+        def accept_commits(pending: tuple[object, ...]) -> None:
+            for scheduled, commit, publications in pending:
+                for publication in publications:
+                    failed, produced = topology_publisher.wait_deferred_feedback(
+                        publication,
+                        input_count=len(input_names),
+                    )
+                    if failed:
+                        raise self._recoverable_overflow(publication.lane)
+                    depths[publication.lane][scheduled.input_type] -= scheduled.rows
+                    for name, count in zip(input_names, produced, strict=True):
+                        depths[publication.lane][name] += count
+                self._iteration_last_event = commit.event
+
+        self._iteration_registry = registry
+        self._iteration_input_names = input_names
+        self._iteration_queues = queues
+        self._iteration_hooks = hooks
+        self._iteration_topology_publisher = topology_publisher
+        self._iteration_transaction = transaction
+        self._iteration_depths = depths
+        self._iteration_iteration = iteration
+        return RolloutLoop(
+            scheduler=scheduler,
+            states=queue_states,
+            has_work=lambda: any(
+                any(lane_depths.values()) for lane_depths in depths.values()
+            ),
+            execute=execute_scheduled,
+            accept=accept_commits,
+            inflight_cap=1,
+            logical_limit=(
                 self.n_replica
                 * owners.plan.manifest.root_count
                 * self.geometry.player_node_bound
-            ):
-                raise PokerIterationError("poker rollout exceeded its geometry bound")
-        if last_event is None:
+            ),
+        )
+
+    def finish_rollout(self, *, logical_time: int) -> None:
+        del logical_time
+        owners = self.owners
+        input_names = self._iteration_input_names
+        topology_publisher = self._iteration_topology_publisher
+        if self._iteration_last_event is None:
             raise PokerIterationError("poker rollout produced no player nodes")
-        if self.rank_boundary is not None:
-            self.rank_boundary()
         sealed_topologies = tuple(
-            topology_publisher.seal_deferred_unary(
+            topology_publisher.seal_expansions(
                 lane=lane,
                 input_count=len(input_names),
                 input_output=tuple(
@@ -907,15 +896,21 @@ class SequentialPokerIteration:
             )
             for lane in range(self.n_replica)
         )
-        topologies = tuple(item[0] for item in sealed_topologies)
-        bindings = tuple(item[1] for item in sealed_topologies)
-        leaf_counts = tuple(item[2] for item in sealed_topologies)
+        self._iteration_topologies = tuple(
+            item[0] for item in sealed_topologies
+        )
+        self._iteration_bindings = tuple(
+            item[1] for item in sealed_topologies
+        )
+        self._iteration_leaf_counts = tuple(
+            item[2] for item in sealed_topologies
+        )
         topology_publisher.assert_drained()
-        plan = build_layer_plan(
+        self._iteration_plan = build_layer_plan(
             self.mode,
             owners.plan.partitions,
-            topologies,
-            bindings,
+            self._iteration_topologies,
+            self._iteration_bindings,
             p_train=(
                 self.geometry.players
                 if self.mode.training_regime is TrainingRegime.SELF_PLAY
@@ -923,46 +918,21 @@ class SequentialPokerIteration:
             ),
             manifest=owners.plan.manifest,
         )
-        if self.benchmark_rollout_only:
-            if self.n_replica != 1:
-                raise PokerIterationError(
-                    "rollout benchmark requires the ordinary one-lane composition"
-                )
-            torch.cuda.synchronize(owners.plan.device)
-            rollout_seconds = time.perf_counter() - rollout_started
-            owners.release_after(ExecutionPhase.ROLLOUT)
-            for phase in (
-                ExecutionPhase.QUEUE_DRAIN,
-                ExecutionPhase.COMPLETION,
-                ExecutionPhase.ALIGN_AND_SEAL,
-                ExecutionPhase.TARGETS,
-                ExecutionPhase.LEARNER,
-                ExecutionPhase.FINAL_BACKWARD,
-            ):
-                owners.enter_phase(phase)
-                owners.release_after(phase)
-            owners.close()
-            return PokerIterationResult(
-                None,
-                player_nodes=int(topologies[0].owner.ge(0).sum()),
-                leaves=leaf_counts[0],
-                target_layers=plan.layer_count,
-                telemetry=SequentialBenchmarkTelemetry(rollout_seconds),
-                observability=topology_diagnostics(
-                    topologies[0], bindings[0], owners.plan.partitions
-                ),
-            )
-        owners.release_after(ExecutionPhase.ROLLOUT)
-        del hooks, transaction, topology_publisher, registry, queues
+        self._iteration_hooks = None
+        self._iteration_transaction = None
+        self._iteration_topology_publisher = None
+        self._iteration_registry = None
+        self._iteration_queues = None
 
-        owners.enter_phase(ExecutionPhase.QUEUE_DRAIN)
-        owners.release_after(ExecutionPhase.QUEUE_DRAIN)
+    def finish_queue_drain(self) -> None:
+        return None
 
+    def prepare_completion(self) -> CompletionLoop:
+        owners = self.owners
         # Completion admits native evaluator workspace against driver-visible
         # free memory. Return inactive rollout blocks held by PyTorch's cache.
         torch.cuda.synchronize(owners.plan.device)
         torch.cuda.empty_cache()
-        owners.enter_phase(ExecutionPhase.COMPLETION)
         completion = CompletionFIFO(
             owners.slab("Leaf"),
             RolloutOwnerRegistry.from_generated(owners),
@@ -977,8 +947,8 @@ class SequentialPokerIteration:
                 device=owners.plan.device,
             ),
         )
-        algebra = self._target_algebra()
-        binding = (
+        self._iteration_algebra = self._target_algebra()
+        self._iteration_completion_binding = (
             SampledShowdownBinding(
                 self.geometry,
                 owners.slab("LayerWork", "all"),
@@ -993,7 +963,7 @@ class SequentialPokerIteration:
                     name: owners.slab("LayerWork", name)
                     for name in ("pre", "post")
                 },
-                algebra,
+                self._iteration_algebra,
                 mode=self.mode,
                 n_replica=self.n_replica,
                 pack_cap=owners.plan.manifest.completion_pack_cap,
@@ -1001,35 +971,20 @@ class SequentialPokerIteration:
                 utility=self.utility,
             )
         )
-        remaining_leaves = list(leaf_counts)
-        while any(remaining_leaves):
-            active_lanes = tuple(
-                lane
-                for lane, remaining in enumerate(remaining_leaves)
-                if remaining > 0
-            )
-            rows = min(
-                owners.plan.manifest.completion_pack_cap,
-                *(remaining_leaves[lane] for lane in active_lanes),
-            )
-            success = completion.complete(
-                active_lanes,
-                rows,
-                binding.leaf_to_layer_work,
-                wait_for=last_event,
-            )
-            lane_index = torch.tensor(
-                active_lanes,
-                dtype=torch.int64,
-                device=owners.plan.device,
-            )
-            torch._assert_async(
-                success.index_select(0, lane_index).all(),
-                "poker completion failed",
-            )
-            for lane in active_lanes:
-                remaining_leaves[lane] -= rows
-        completion.release()
+        assert self._iteration_last_event is not None
+        return CompletionLoop(
+            completion=completion,
+            remaining=self._iteration_leaf_counts,
+            hook=self._iteration_completion_binding.leaf_to_layer_work,
+            wait_for=self._iteration_last_event,
+            failure_message="poker completion failed",
+        )
+
+    def finish_completion(self) -> None:
+        owners = self.owners
+        binding = self._iteration_completion_binding
+        plan = self._iteration_plan
+        leaf_counts = self._iteration_leaf_counts
         posterior_effective_hands = (
             None
             if not isinstance(binding, RBCompletionBinding)
@@ -1038,6 +993,7 @@ class SequentialPokerIteration:
                 for value in binding.effective_hands.detach().cpu().tolist()
             )
         )
+        self._iteration_posterior_effective_hands = posterior_effective_hands
         # RBCompletionBinding owns the resident H-to-K CUDA mask. Completion
         # is its exact last consumer; do not carry library workspace into
         # align/targets/learner or the zero-workspace final-backward phase.
@@ -1065,12 +1021,12 @@ class SequentialPokerIteration:
                     )
                     padding.fill_defaults(0)
                     padding.publish()
-        owners.release_after(ExecutionPhase.COMPLETION)
         if self.distributed is not None:
             self.distributed.barrier()
 
-        owners.enter_phase(ExecutionPhase.ALIGN_AND_SEAL)
-        sealed = {
+    def align_and_seal(self) -> None:
+        owners = self.owners
+        self._iteration_sealed = {
             (lane, name): SealedSequentialInputs.seal(
                 owners.slab("FamilyWork", name),
                 owners.slab("LearnerIndex", name),
@@ -1078,68 +1034,46 @@ class SequentialPokerIteration:
                 lane=lane,
             )
             for lane in range(self.n_replica)
-            for name in input_names
+            for name in self._iteration_input_names
         }
-        owners.release_after(ExecutionPhase.ALIGN_AND_SEAL)
 
-        owners.enter_phase(ExecutionPhase.TARGETS)
+    def execute_targets(self) -> None:
         target_result = LayeredTargetExecutor(
             self.mode,
-            algebra,
+            self._iteration_algebra,
             lambda_=self.lambda_,
-        ).execute(owners, plan)
+        ).execute(self.owners, self._iteration_plan)
         if target_result.failed_lanes:
             raise PokerIterationError("layered poker targets failed")
-        owners.release_after(ExecutionPhase.TARGETS)
 
-        owners.enter_phase(ExecutionPhase.LEARNER)
+    def execute_learner(self, *, iteration: int) -> None:
+        owners = self.owners
+        input_names = self._iteration_input_names
+        sealed = self._iteration_sealed
         learner_results: list[IterationResult | None] = []
         if self.n_replica > 1 or self.distributed is not None:
-            generator_states = tuple(
-                generator.get_state() for generator in self.generators
-            )
-            preflight_error: Exception | None = None
+            assert self.replica_optimizers is not None
             try:
-                for lane in range(self.n_replica):
-                    self._learn_lane(
+                IterationEngine.preflight_learners(
+                    generators=self.generators,
+                    validate_lane=lambda lane: self._learn_lane(
                         lane,
                         input_names=input_names,
                         sealed=sealed,
                         iteration=iteration,
                         validate_only=True,
-                    )
-            except Exception as exc:  # noqa: BLE001 - transaction-wide abort
-                preflight_error = exc
-            finally:
-                for generator, state in zip(
-                    self.generators, generator_states, strict=True
-                ):
-                    generator.set_state(state)
-                assert self.replica_optimizers is not None
-                self.replica_optimizers.zero_grad(range(self.n_replica))
-            if self.distributed is not None:
-                local = torch.zeros(
-                    self.n_replica,
-                    dtype=torch.bool,
+                    ),
+                    clear_gradients=lambda: self.replica_optimizers.zero_grad(
+                        range(self.n_replica)
+                    ),
+                    distributed=self.distributed,
                     device=owners.plan.device,
+                    error_type=PokerIterationError,
                 )
-                if preflight_error is not None:
-                    local.fill_(True)
-                common = self.distributed.agree_failures(local)
-                if bool(common.any()) and preflight_error is None:
-                    preflight_error = PokerIterationError(
-                        "replica learner preflight failed on another rank"
-                    )
-            if preflight_error is not None:
+            except Exception:
                 for value in sealed.values():
                     value.release()
-                owners.release_after(ExecutionPhase.LEARNER)
-                owners.enter_phase(ExecutionPhase.FINAL_BACKWARD)
-                owners.release_after(ExecutionPhase.FINAL_BACKWARD)
-                owners.close()
-                raise PokerIterationError(
-                    "replica learner preflight failed before optimizer transition"
-                ) from preflight_error
+                raise
         for lane in range(self.n_replica):
             learner_results.append(
                 self._learn_lane(
@@ -1151,10 +1085,20 @@ class SequentialPokerIteration:
             )
         for value in sealed.values():
             value.release()
-        owners.release_after(ExecutionPhase.LEARNER)
-        owners.enter_phase(ExecutionPhase.FINAL_BACKWARD)
-        owners.release_after(ExecutionPhase.FINAL_BACKWARD)
-        owners.close()
+        self._iteration_learner_results = learner_results
+
+    def finish_backward(
+        self,
+    ) -> PokerIterationResult | ReplicaPokerIterationResult:
+        owners = self.owners
+        topologies = self._iteration_topologies
+        bindings = self._iteration_bindings
+        leaf_counts = self._iteration_leaf_counts
+        plan = self._iteration_plan
+        learner_results = self._iteration_learner_results
+        posterior_effective_hands = (
+            self._iteration_posterior_effective_hands
+        )
         results = tuple(
             None
             if learner_results[lane] is None
@@ -1357,7 +1301,7 @@ class SequentialPokerIteration:
         )
         if validate_only:
             optimizer = LearnerPreflightOptimizer(self.optimizers[lane])
-        result = SequentialSampledIteration(
+        result = LearnerIteration(
             model=model,
             learner=learner,
             optimizer=optimizer,  # type: ignore[arg-type]
@@ -1397,153 +1341,8 @@ class SequentialPokerIteration:
             (ConversionMap("post", "pre", tuple(int(x) for x in classes.tolist())),),
         )
 
-
-def discard_unpublished_attempt(
-    owners: GeneratedOwners, failure_lane: int
-) -> None:
-    """Reset and close an unpublished failed attempt before replacement."""
-
-    if owners.failure_state.snapshot(failure_lane) is not None:
-        owners.abort_failed_lane(failure_lane)
-    owners.release_after(ExecutionPhase.ROLLOUT)
-    for phase in (
-        ExecutionPhase.QUEUE_DRAIN,
-        ExecutionPhase.COMPLETION,
-        ExecutionPhase.ALIGN_AND_SEAL,
-        ExecutionPhase.TARGETS,
-        ExecutionPhase.LEARNER,
-        ExecutionPhase.FINAL_BACKWARD,
-    ):
-        owners.enter_phase(phase)
-        owners.release_after(phase)
-    owners.close()
-
-
-class RecoveringSequentialPokerIteration:
-    """Own attempt allocation and automatic lower-root disjoint retries."""
-
-    def __init__(
-        self,
-        *,
-        owner_factory: Callable[[], GeneratedOwners],
-        plan: StoragePlan,
-        minimum_root_count: int,
-        geometry: NLHEGeometry,
-        mode: ModeSchema,
-        model: nn.Module,
-        model_operation: ModelOperation,
-        rollout_operation: ModelOperation | None = None,
-        optimizer: DenseAdam,
-        loss: LossConfig,
-        schedule: LearnerSchedule,
-        generator: torch.Generator,
-        seed: int,
-        lambda_: float,
-        precision: str = "fp32",
-        utility: str = "raw_bb",
-        cache_reference_outputs: bool = False,
-        allocation_inputs: tuple[Tensor, Tensor, Tensor, int] | None = None,
-        reproducibility: str = "strict",
-        run_state: RunState,
-        reference_operation: ModelOperation | None = None,
-        frozen_operation: ModelOperation | None = None,
-        completion_samples: int = 0,
-        response_cutoff: bool = False,
-    ) -> None:
-        self.owner_factory = owner_factory
-        self.plan = plan
-        self.minimum_root_count = int(minimum_root_count)
-        self.arguments = {
-            "geometry": geometry,
-            "mode": mode,
-            "model": model,
-            "model_operation": model_operation,
-            "rollout_operation": (
-                model_operation
-                if rollout_operation is None
-                else rollout_operation
-            ),
-            "optimizer": optimizer,
-            "loss": loss,
-            "schedule": schedule,
-            "generator": generator,
-            "seed": seed,
-            "lambda_": lambda_,
-            "precision": precision,
-            "utility": utility,
-            "cache_reference_outputs": cache_reference_outputs,
-            "allocation_inputs": allocation_inputs,
-            "reproducibility": reproducibility,
-            "run_state": run_state,
-            "reference_operation": reference_operation,
-            "frozen_operation": frozen_operation,
-            "completion_samples": completion_samples,
-            "response_cutoff": response_cutoff,
-        }
-        self.mode = mode
-        self.model = model
-        self.model_operation = model_operation
-        self.rollout_operation = self.arguments["rollout_operation"]
-        self.optimizer = optimizer
-        self.run_state = run_state
-
-    def run(self, *, iteration: int) -> PokerIterationResult:
-        active: list[GeneratedOwners] = []
-        agreement = RankCommonFailureAgreement.from_runtime()
-        controller = SequentialOverflowRecovery[PokerIterationResult](
-            iteration=iteration,
-            replica=0,
-            root_count=self.run_state.root_count,
-            minimum_root_count=self.minimum_root_count,
-            run_state=self.run_state,
-            rank_common=agreement.agree,
-        )
-
-        def rank_boundary() -> None:
-            failure = agreement.agree(None)
-            if failure is None:
-                return
-            agreed = RecoverableOverflow(
-                failure.failure,
-                capacity=failure.capacity,
-                observed_demand=failure.observed_demand,
-            )
-            agreed._rank_agreed = True  # type: ignore[attr-defined]
-            raise agreed
-
-        def attempt(
-            root_count: int, address: AttemptAddress
-        ) -> PokerIterationResult:
-            if (
-                self.run_state.root_count != root_count
-                or self.run_state.retry_epoch != address.retry_epoch
-                or self.run_state.attempt_logical_base != address.logical_base
-            ):
-                raise PokerIterationError(
-                    "overflow controller and run state addresses diverged"
-                )
-            owners = self.owner_factory()
-            if owners.plan != self.plan:
-                owners.failure_state.release()
-                raise PokerIterationError(
-                    "overflow retry changed the immutable storage plan"
-                )
-            active[:] = [owners]
-            return SequentialPokerIteration(
-                owners=owners, rank_boundary=rank_boundary, **self.arguments
-            ).run(iteration=iteration)
-
-        def discard(_failure: RecoverableOverflow) -> None:
-            if len(active) != 1:
-                raise PokerIterationError("failed attempt owner is unavailable")
-            discard_unpublished_attempt(active.pop(), 0)
-
-        return controller.run(attempt, discard)
-
-
 __all__ = [
     "PokerIterationError",
     "PokerIterationResult",
-    "RecoveringSequentialPokerIteration",
-    "SequentialPokerIteration",
+    "PokerSequentialProgram",
 ]

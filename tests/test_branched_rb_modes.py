@@ -8,11 +8,11 @@ import torch
 
 from pbg.games.poker.queued.branching import (
     BranchedBenchmarkTelemetry,
-    BranchedSampledPokerIteration,
     BranchedPosteriorExhaustion,
     action_conditioned_log_reach,
     branched_rb_chance_frontier_row_bytes,
 )
+from tests.iteration_support import BranchedRecoveryHarness
 from pbg.games.poker.queued.hooks import (
     NLHEGeometry,
     rb_partitions,
@@ -274,7 +274,7 @@ def test_root_refill_uses_fresh_posterior_ordinals(
     model = build_model_from_config(
         _config("self_play", "branched.fixed"), device
     )
-    result = BranchedSampledPokerIteration(
+    result = BranchedRecoveryHarness(
         owner_factory=lambda: GeneratedOwners(plan),
         plan=plan,
         controller=FixedBranchController(
@@ -604,7 +604,7 @@ def test_rejection_exhaustion_blocks_commit_and_publishes_device_failure(
         _config("self_play", "branched.fixed"), device
     )
     with pytest.raises(BranchedPosteriorExhaustion) as raised:
-        BranchedSampledPokerIteration(
+        BranchedRecoveryHarness(
             owner_factory=lambda: GeneratedOwners(plan),
             plan=plan,
             controller=FixedBranchController(
@@ -693,7 +693,7 @@ def test_safe_tree_uses_only_inherited_profiles_for_rb_player_and_chance(
     model = build_model_from_config(
         _config("self_play", "branched.fixed"), device
     )
-    result = BranchedSampledPokerIteration(
+    result = BranchedRecoveryHarness(
         owner_factory=lambda: GeneratedOwners(plan),
         plan=plan,
         controller=controller,
@@ -771,7 +771,7 @@ def test_four_branched_rb_modes_complete_optimizer_step(
             log_kappa=math.log(1.0),
         )
     )
-    result = BranchedSampledPokerIteration(
+    result = BranchedRecoveryHarness(
         owner_factory=lambda: GeneratedOwners(plan),
         plan=plan,
         controller=controller,

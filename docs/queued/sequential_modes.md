@@ -5,7 +5,9 @@ Status: Phase 6 executable contract, validated and audited at
 
 ## Closed mode surface
 
-One `SequentialPokerIteration` composes all four sequential modes:
+The common `pbg.core.iteration.IterationEngine` composes all four sequential
+modes through `PokerSequentialProgram`, using the same phase lifecycle and
+recovery authority as branched, replica, and distributed execution:
 
 | Training regime | Private estimator |
 |---|---|

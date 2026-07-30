@@ -26,10 +26,9 @@ from pbg.games.poker.queued.policy import (
 from pbg.games.poker.queued.folded import (
     sequential_family_workspace_row_bytes,
 )
-from pbg.games.poker.queued.training import (
-    PokerIterationError,
-    RecoveringSequentialPokerIteration,
-    SequentialPokerIteration,
+from tests.iteration_support import (
+    EngineDrivenSequentialAttempt,
+    SequentialRecoveryHarness,
 )
 from pbg.games.poker.queued.config import PokerScientificConfig
 from pbg.core.capacity import (
@@ -58,6 +57,7 @@ from pbg.core.learner import (
     SequentialLearnerBatch,
     allocate_statistical_counts,
 )
+from pbg.core.iteration import IterationError
 from pbg.core.optimization import DenseAdam, LossScaler, OptimizerConfig
 from pbg.core.persistence import (
     RunState,
@@ -74,13 +74,9 @@ from pbg.core.storage import (
     SoASchema,
 )
 from pbg.core.training import (
-    AttemptAddress,
     RecoverableOverflow,
-    SequentialOverflowRecovery,
-    SequentialSampledIteration,
-    TrainingError,
+    LearnerIteration,
 )
-from pbg.core.storage import DeviceFailure
 from pbg.core.storage import MonotoneSlab
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.model.capacity import max_policy_partition_sequence_tokens
@@ -965,7 +961,7 @@ def test_complete_poker_iteration_runs_roots_to_optimizer() -> None:
         model, OptimizerConfig(name="adamw", grad_clip=5.0)
     )
     run_state = RunState("phase5-e2e", root_count=1)
-    result = SequentialPokerIteration(
+    result = EngineDrivenSequentialAttempt(
         geometry=geometry,
         owners=owners,
         mode=mode,
@@ -1076,7 +1072,7 @@ def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
             device,
         )
     )
-    result = SequentialPokerIteration(
+    result = EngineDrivenSequentialAttempt(
         geometry=geometry,
         owners=owners,
         mode=mode,
@@ -1126,7 +1122,7 @@ def test_end_to_end_overflow_exposes_no_failed_attempt_rows() -> None:
     )
     run_state = RunState("phase5-overflow", root_count=1)
     with pytest.raises(RecoverableOverflow) as raised:
-        SequentialPokerIteration(
+        EngineDrivenSequentialAttempt(
             geometry=geometry,
             owners=owners,
             mode=mode,
@@ -1141,20 +1137,8 @@ def test_end_to_end_overflow_exposes_no_failed_attempt_rows() -> None:
             run_state=run_state,
         ).run(iteration=0)
     assert raised.value.failure.failure_code == "capacity_overflow"
-    owners.abort_failed_lane(0)
-    assert all(slab.tail(0) == 0 and slab.epoch(0) == 1 for slab in owners.live_slabs)
-    owners.release_after(ExecutionPhase.ROLLOUT)
-    for phase in (
-        ExecutionPhase.QUEUE_DRAIN,
-        ExecutionPhase.COMPLETION,
-        ExecutionPhase.ALIGN_AND_SEAL,
-        ExecutionPhase.TARGETS,
-        ExecutionPhase.LEARNER,
-        ExecutionPhase.FINAL_BACKWARD,
-    ):
-        owners.enter_phase(phase)
-        owners.release_after(phase)
-    owners.close()
+    assert not owners.live_keys
+    assert len(owners.released_keys) == len(owners.plan.allocations)
 
 
 @CUDA
@@ -1186,7 +1170,7 @@ def test_end_to_end_overflow_rebuilds_and_retries_at_lower_roots() -> None:
     )
     run_state = RunState("phase5-retry", root_count=2)
     with pytest.warns(RuntimeWarning, match="RECOVERED_SEQUENTIAL_OVERFLOW"):
-        result = RecoveringSequentialPokerIteration(
+        result = SequentialRecoveryHarness(
             owner_factory=lambda: GeneratedOwners(plan),
             plan=plan,
             minimum_root_count=1,
@@ -1260,8 +1244,8 @@ def test_end_to_end_overflow_rejects_retry_capacity_drift() -> None:
     )
     run_state = RunState("phase5-cap-drift", root_count=2)
     with pytest.warns(RuntimeWarning, match="RECOVERED_SEQUENTIAL_OVERFLOW"):
-        with pytest.raises(PokerIterationError, match="immutable storage plan"):
-            RecoveringSequentialPokerIteration(
+        with pytest.raises(IterationError, match="immutable storage plan"):
+            SequentialRecoveryHarness(
                 owner_factory=lambda: GeneratedOwners(next(attempts)),
                 plan=plan,
                 minimum_root_count=1,
@@ -1399,7 +1383,7 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
         total_count=4,
     )
     mixed_model = _LearnerModel(device)
-    mixed_result = SequentialSampledIteration(
+    mixed_result = LearnerIteration(
         model=mixed_model,
         learner=LearnerOperation(
             mode,
@@ -1429,7 +1413,7 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
         model.evaluate,
         _LearnerPolicy(),
     )
-    result = SequentialSampledIteration(
+    result = LearnerIteration(
         model=model,
         learner=learner,
         optimizer=optimizer,
@@ -1509,77 +1493,6 @@ def test_nonfinite_fp16_update_backs_off_once_without_mutating_parameters() -> N
     assert not result.applied
     assert result.loss_scale_before == 128 and result.loss_scale_after == 64
     torch.testing.assert_close(model.weight, initial)
-
-
-def _failure() -> DeviceFailure:
-    return DeviceFailure(
-        lane=0,
-        status=1,
-        phase="rollout_commit",
-        failure_code="capacity_overflow",
-        input_type="pre",
-        logical_address=17,
-        requested_extent=9,
-        available_extent=4,
-    )
-
-
-def test_overflow_recovery_is_disjoint_lower_and_durable() -> None:
-    run = RunState("run-1")
-    calls: list[tuple[int, AttemptAddress]] = []
-    discarded = []
-
-    def attempt(root_count: int, address: AttemptAddress) -> str:
-        calls.append((root_count, address))
-        if len(calls) == 1:
-            raise RecoverableOverflow(_failure(), capacity=4, observed_demand=9)
-        return "complete"
-
-    recovery = SequentialOverflowRecovery(
-        iteration=3,
-        replica=0,
-        root_count=8,
-        minimum_root_count=2,
-        run_state=run,
-    )
-    with pytest.warns(RuntimeWarning, match="RECOVERED"):
-        assert recovery.run(attempt, discarded.append) == "complete"
-    assert [value for value, _ in calls] == [8, 4]
-    assert calls[1][1].retry_epoch == calls[0][1].retry_epoch + 1
-    assert calls[1][1].logical_base >= 8
-    assert discarded and run.recovered_overflow
-    record = run.overflow_recoveries[0]
-    assert {
-        "iteration",
-        "replica",
-        "failed_phase",
-        "failed_address",
-        "replacement_address",
-        "old_root_count",
-        "new_root_count",
-        "capacity",
-        "observed_demand",
-    }.issubset(record)
-
-
-def test_minimum_root_overflow_is_terminal_after_discard() -> None:
-    run = RunState("run-min")
-    discarded = []
-    recovery = SequentialOverflowRecovery(
-        iteration=4,
-        replica=1,
-        root_count=2,
-        minimum_root_count=2,
-        run_state=run,
-    )
-
-    def fail(_root_count: int, _address: AttemptAddress):
-        raise RecoverableOverflow(_failure(), capacity=1, observed_demand=2)
-
-    with pytest.raises(TrainingError, match="minimum"):
-        recovery.run(fail, discarded.append)
-    assert len(discarded) == 1
-    assert not run.recovered_overflow
 
 
 def test_cost_allocation_and_reference_cache_fallback_preserve_work() -> None:

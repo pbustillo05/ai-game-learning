@@ -7,14 +7,11 @@ refill metadata, and the only recoverable transition for a branched attempt.
 
 from __future__ import annotations
 
-import json
-import logging
 import math
-import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Generic, Protocol, TypeVar
+from typing import Protocol
 
 import torch
 import torch.distributed as dist
@@ -22,9 +19,8 @@ from torch import Tensor
 
 from pbg.core.contracts import ModeSchema, RolloutMode
 from pbg.core.cuda_branching import branching_cuda
-from pbg.core.persistence import RunState
 from pbg.core.rollout import DrawPurpose, logical_rng_keys, logical_uniform
-from pbg.core.training import AttemptAddress, RecoverableOverflow, TrainingError
+from pbg.core.training import RecoverableOverflow
 
 
 class BranchingError(RuntimeError):
@@ -794,9 +790,6 @@ class CostSafeguardController:
         return cls(**values)
 
 
-AttemptResult = TypeVar("AttemptResult")
-
-
 @dataclass(frozen=True)
 class BranchedRecoveryRecord:
     severity: str
@@ -910,130 +903,11 @@ class RankCommonFailureAgreement:
         )
 
 
-class BranchedOverflowRecovery(Generic[AttemptResult]):
-    """Discard a failed tree and retry at a disjoint address with less work."""
-
-    def __init__(
-        self,
-        *,
-        iteration: int,
-        replica: int,
-        controller: BranchController,
-        run_state: RunState,
-        logger: logging.Logger | None = None,
-        rank_agreement: RankCommonFailureAgreement | None = None,
-    ) -> None:
-        if iteration < 0 or replica < 0:
-            raise ValueError("iteration and replica must be nonnegative")
-        self.iteration = iteration
-        self.replica = replica
-        self.controller = controller
-        self.run_state = run_state
-        self.logger = logging.getLogger(__name__) if logger is None else logger
-        self.rank_agreement = (
-            RankCommonFailureAgreement.from_runtime()
-            if rank_agreement is None
-            else rank_agreement
-        )
-
-    def run(
-        self,
-        attempt: Callable[[AttemptAddress], AttemptResult],
-        discard: Callable[[RecoverableOverflow | None], None],
-        *,
-        agreement_in_attempt: bool = False,
-    ) -> AttemptResult:
-        epoch = self.run_state.retry_epoch
-        logical_base = self.run_state.attempt_logical_base
-        while True:
-            address = AttemptAddress(epoch, logical_base)
-            result: AttemptResult | None = None
-            local_failure: RecoverableOverflow | None = None
-            rank_agreed = False
-            try:
-                result = attempt(address)
-            except RecoverableOverflow as caught:
-                # Strip the traceback before releasing the failed owner. The
-                # collective and replacement allocation retain only the small
-                # immutable diagnostic record.
-                local_failure = RecoverableOverflow(
-                    caught.failure,
-                    capacity=caught.capacity,
-                    observed_demand=caught.observed_demand,
-                )
-                rank_agreed = bool(
-                    getattr(caught, "_rank_agreed", False)
-                )
-                caught = None
-                discard(local_failure)
-            failure = (
-                local_failure
-                if rank_agreed
-                else (
-                    None
-                    if agreement_in_attempt and result is not None
-                    else self.rank_agreement.agree(local_failure)
-                )
-            )
-            if failure is None:
-                if result is None:
-                    raise BranchingError(
-                        "rank agreement lost a local overflow"
-                    )
-                return result
-            if local_failure is None:
-                discard(failure)
-            result = None
-            local_failure = None
-            if self.controller.at_minimum:
-                raise TrainingError(
-                    "minimum branched control overflowed fixed capacity: "
-                    f"{failure.failure}"
-                ) from failure
-            old = self.controller.state_dict()
-            self.controller.backoff()
-            new = self.controller.state_dict()
-            replacement = AttemptAddress(
-                epoch + 1,
-                logical_base + self.run_state.root_count,
-            )
-            record = BranchedRecoveryRecord(
-                severity="critical",
-                iteration=self.iteration,
-                replica=self.replica,
-                failed_phase=failure.failure.phase,
-                failed_address=AttemptAddress(
-                    epoch, failure.failure.logical_address
-                ).as_text(),
-                replacement_address=replacement.as_text(),
-                old_control=old,
-                new_control=new,
-                capacity=failure.capacity,
-                observed_demand=failure.observed_demand,
-            )
-            self.run_state.recovered_overflow = True
-            self.run_state.retry_epoch = replacement.retry_epoch
-            self.run_state.attempt_logical_base = replacement.logical_base
-            self.run_state.branch_controller_state = new
-            self.run_state.overflow_recoveries.append(record.as_dict())
-            payload = json.dumps(record.as_dict(), sort_keys=True)
-            self.logger.critical("RECOVERED_BRANCHED_OVERFLOW %s", payload)
-            warnings.warn(
-                f"RECOVERED_BRANCHED_OVERFLOW {payload}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            epoch = replacement.retry_epoch
-            logical_base = replacement.logical_base
-            failure = None
-
-
 __all__ = [
     "BRANCH_CONTROLLER_VERSION",
     "COST_SAFEGUARD_VERSION",
     "BranchController",
     "BranchDecision",
-    "BranchedOverflowRecovery",
     "BranchedRecoveryRecord",
     "BranchingError",
     "CostSafeguardController",

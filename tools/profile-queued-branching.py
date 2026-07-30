@@ -36,11 +36,12 @@ from pbg.core.capacity import (
     build_storage_plan,
 )
 from pbg.core.contracts import mode_schema
+from pbg.core.iteration import IterationConfig, IterationEngine, LaneContext
 from pbg.core.optimization import DenseAdam
 from pbg.core.persistence import RunState
+from pbg.core.replica import ReplicaOptimizerGroup
 from pbg.games.poker.queued.branching import (
-    BranchedSampledPokerHooks,
-    _BranchedSampledPokerAttempt,
+    PokerBranchedProgram,
 )
 from pbg.games.poker.queued.config import BranchedModeConfig
 from pbg.games.poker.queued.hooks import (
@@ -50,9 +51,11 @@ from pbg.games.poker.queued.hooks import (
     SequentialPokerHooks,
     rb_partitions,
 )
+from pbg.games.poker.queued.iteration import PokerIterationHooks
 from pbg.games.poker.queued.model import build_model_from_config
 from pbg.games.poker.queued.policy import PokerPolicyOperator
 from pbg.games.poker.queued.rb_sampling import CollisionConditionedProfileSampler
+from pbg.games.poker.queued.replica import PokerReplicaInference
 
 
 def _sha256(path: Path) -> str:
@@ -546,13 +549,11 @@ def _run_once(
     device: torch.device,
     scenario: ProfileScenario,
     timing: CudaOperationTimes | None,
-    tree_only: bool = False,
     beta_max: int | Mapping[str, int] | None = None,
 ) -> object:
     scientific = config.scientific
     assert isinstance(scientific, BranchedModeConfig)
     common = scientific.common
-    owners = GeneratedOwners(plan)
     controller = FixedBranchController(
         scenario.fixed_beta,
         (
@@ -564,44 +565,77 @@ def _run_once(
         backoff_factor=float(scientific.branching["backoff_factor"]),
         safe_tree_size=scenario.safe_tree_size,
     )
+    generator = torch.Generator(device=device).manual_seed(scenario.seed)
+    run_state = RunState(
+        config.execution.run_id,
+        root_count=common.root_count,
+    )
     safeguard = (
         None
         if scenario.cost_safeguard is None
         else CostSafeguardController(**dict(scenario.cost_safeguard))
     )
     context = _instrument(timing) if timing is not None else ExitStack()
+    inference = PokerReplicaInference((model,))
+    optimizers = ReplicaOptimizerGroup(
+        inference.modules,
+        optimizer.config,
+        scalers=(optimizer.scaler,),
+    )
     with context:
-        return _BranchedSampledPokerAttempt(
-            geometry=geometry,
-            owners=owners,
-            mode=plan.mode,
-            controller=controller,
-            model=model,
-            model_operation=model.rb_learner_operation,
-            rollout_operation=model.rollout_operation,
-            optimizer=optimizer,
-            loss=common.loss,
-            schedule=common.schedule,
-            generator=torch.Generator(device=device).manual_seed(
-                scenario.seed
+        result = IterationEngine(
+            config=IterationConfig(
+                plan,
+                (
+                    LaneContext(
+                        mode=plan.mode,
+                        run_state=run_state,
+                        generator=generator,
+                        optimizer=optimizer,
+                        model_operation=model.rb_learner_operation,
+                        loss=common.loss,
+                        branch_controller=controller,
+                    ),
+                ),
             ),
-            seed=scenario.seed,
-            lambda_=common.lambda_,
-            minimum_tree_size=scenario.minimum_tree_size,
-            cost_safeguard=safeguard,
-            precision=common.precision.name,
-            utility=common.utility,
-            cache_reference_outputs=common.reference.cache_outputs,
-            run_state=RunState(
-                config.execution.run_id,
-                root_count=common.root_count,
+            owner_factory=lambda: GeneratedOwners(plan),
+            hooks=PokerIterationHooks(
+                lambda owners: PokerBranchedProgram(
+                    geometry=geometry,
+                    owners=owners,
+                    modes=(plan.mode,),
+                    controllers=(controller,),
+                    safeguards=(safeguard,),
+                    inference=None,
+                    reference_operations=(None,),
+                    optimizers=optimizers,
+                    losses=(common.loss,),
+                    schedule=common.schedule,
+                    generators=(generator,),
+                    run_states=(run_state,),
+                    minimum_tree_sizes=(scenario.minimum_tree_size,),
+                    seed=scenario.seed,
+                    lambda_=common.lambda_,
+                    precision=common.precision.name,
+                    utility=common.utility,
+                    cache_reference_outputs=common.reference.cache_outputs,
+                    completion_samples=scenario.completion_samples,
+                    posterior_max_attempts=scenario.posterior_max_attempts,
+                    benchmark_telemetry=True,
+                    models=(inference.modules.lane_module(0),),
+                    rollout_operations=(
+                        inference.modules.lane_module(0).rollout_operation,
+                    ),
+                    learner_operations=(
+                        inference.modules.lane_module(0).rb_learner_operation,
+                    ),
+                )
             ),
-            completion_samples=scenario.completion_samples,
-            posterior_max_attempts=scenario.posterior_max_attempts,
-            benchmark_telemetry=True,
-            benchmark_rollout_only=True,
-            benchmark_tree_only=tree_only,
         ).run(iteration=scenario.iteration)
+    lane_result = result.results[0]
+    if lane_result is None:
+        raise RuntimeError("profiled iteration did not produce a lane result")
+    return lane_result
 
 
 def main() -> None:
@@ -615,7 +649,6 @@ def main() -> None:
     parser.add_argument("--player-pre-beta", type=float)
     parser.add_argument("--player-post-beta", type=float)
     parser.add_argument("--chance-beta", type=float)
-    parser.add_argument("--tree-only", action="store_true")
     parser.add_argument("--large-tree-manifest", action="store_true")
     parser.add_argument("--safe-tree-size", type=float)
     parser.add_argument("--player-pre-beta-max", type=int)
@@ -645,7 +678,7 @@ def main() -> None:
         pre_beta_max = (
             int(args.player_pre_beta_max)
             if args.player_pre_beta_max is not None
-            else int(math.ceil(float(args.player_pre_beta)))
+            else math.ceil(float(args.player_pre_beta))
         )
         stage_beta_max = {
             "player_pre": pre_beta_max,
@@ -841,7 +874,6 @@ def main() -> None:
         config.execution.manifest,
         config.execution.layout,
         device,
-        rollout_only=args.tree_only,
     )
 
     if scenario.warmup:
@@ -854,7 +886,6 @@ def main() -> None:
             device=device,
             scenario=scenario,
             timing=None,
-            tree_only=args.tree_only,
             beta_max=stage_beta_max,
         )
         torch.cuda.synchronize(device)
@@ -870,7 +901,6 @@ def main() -> None:
         device=device,
         scenario=scenario,
         timing=timing,
-        tree_only=args.tree_only,
         beta_max=stage_beta_max,
     )
     torch.cuda.synchronize(device)
@@ -931,7 +961,6 @@ def main() -> None:
             "seed": scenario.seed,
             "iteration": scenario.iteration,
             "warmup": scenario.warmup,
-            "tree_only": args.tree_only,
             "scientific_caps": {
                 "player_pre": 2_000,
                 "player_post": 48_000,

@@ -3,14 +3,16 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
-from pbg.games.poker.queued.branching import (
-    BranchedSampledPokerIteration as PublicBranchedSampledPokerIteration,
+from tests.iteration_support import (
+    BranchedRecoveryHarness,
+    EngineDrivenBranchedAttempt,
+    discard_attempt as _discard_attempt,
 )
 from pbg.games.poker.queued.hooks import (
     FOLDED,
@@ -19,19 +21,14 @@ from pbg.games.poker.queued.hooks import (
     sampled_partitions,
 )
 from pbg.games.poker.queued.branching import (
-    BranchedTopologyRecorder,
-    _discard_attempt,
+    TopologyPacketStager,
     _ExpansionRecord,
     _StagedBranchedPayload,
     sampled_branched_chance_frontier_row_bytes,
     sampled_branched_topology_packet_row_bytes,
 )
-from pbg.games.poker.queued.branching import (
-    _BranchedSampledPokerAttempt as BranchedSampledPokerIteration,
-)
 from pbg.games.poker.queued.config import BranchedModeConfig
 from pbg.core.branching import (
-    BranchedOverflowRecovery,
     CostSafeguardController,
     FixedBranchController,
     KKTBranchController,
@@ -42,6 +39,7 @@ from pbg.core.branching import (
     log_kkt_intensity,
     randomized_round,
 )
+from pbg.core.iteration import IterationEngine, LaneContext
 from pbg.core.capacity import (
     CapacityManifest,
     ExecutionGeometry,
@@ -391,7 +389,7 @@ def test_phase7_admission_covers_fixed_and_full_decision_workspaces() -> None:
         == sampled_branched_topology_packet_row_bytes(geometry)
     )
     with pytest.raises(ValueError, match="root count"):
-        PublicBranchedSampledPokerIteration(
+        BranchedRecoveryHarness(
             owner_factory=lambda: GeneratedOwners(self_plan),
             plan=self_plan,
             controller=FixedBranchController(
@@ -408,7 +406,7 @@ def test_phase7_admission_covers_fixed_and_full_decision_workspaces() -> None:
         device,
     )
     with pytest.raises(ValueError, match="root count"):
-        PublicBranchedSampledPokerIteration(
+        BranchedRecoveryHarness(
             owner_factory=lambda: GeneratedOwners(two_root_plan),
             plan=two_root_plan,
             controller=FixedBranchController(
@@ -735,15 +733,13 @@ def test_decisions_are_pack_invariant_and_final_root_degree_sets_mass() -> None:
     )
 
 
-def test_whole_attempt_backoff_is_disjoint_and_other_failures_terminate() -> None:
+def test_common_engine_branched_backoff_is_disjoint_and_durable() -> None:
     controller = FixedBranchController(
         {"player": 2.0, "chance": 1.0},
         2,
         minimum_scale=0.25,
     )
     run = RunState("phase7-recovery", root_count=3)
-    calls = []
-    discarded = []
     failure = DeviceFailure(
         lane=0,
         status=1,
@@ -754,12 +750,6 @@ def test_whole_attempt_backoff_is_disjoint_and_other_failures_terminate() -> Non
         requested_extent=9,
         available_extent=4,
     )
-
-    def attempt(address):
-        calls.append(address)
-        if len(calls) == 1:
-            raise RecoverableOverflow(failure, capacity=4, observed_demand=9)
-        return "committed"
 
     local = RecoverableOverflow(failure, capacity=4, observed_demand=9)
     remote = RecoverableOverflow(
@@ -773,59 +763,33 @@ def test_whole_attempt_backoff_is_disjoint_and_other_failures_terminate() -> Non
     )
     assert agreement.agree(local) is remote
     assert agreement.agree(remote) is remote
-    rounds = iter(((local, remote), (None, None)))
-    agreement = RankCommonFailureAgreement(
+    engine = object.__new__(IterationEngine)
+    engine.rank_agreement = RankCommonFailureAgreement(
         world_size=2,
-        collect=lambda _local: next(rounds),
+        collect=lambda _local: (local, remote),
     )
-    recovery = BranchedOverflowRecovery(
-        iteration=5,
-        replica=0,
-        controller=controller,
+    lane = LaneContext(
+        mode=mode_schema("self_play", "branched.fixed", "sampled"),
         run_state=run,
-        rank_agreement=agreement,
+        generator=torch.Generator().manual_seed(13),
+        optimizer=object(),
+        model_operation=object(),
+        branch_controller=controller,
     )
+    engine.config = SimpleNamespace(lanes=(lane,))
+
+    agreed = engine._agree_failure(local)
+    assert agreed is remote
     with pytest.warns(RuntimeWarning, match="RECOVERED_BRANCHED_OVERFLOW"):
-        assert recovery.run(attempt, discarded.append) == "committed"
-    assert len(discarded) == 1
-    assert discarded[0].failure.logical_address == 19
-    assert calls[1].retry_epoch == calls[0].retry_epoch + 1
-    assert calls[1].logical_base == calls[0].logical_base + 3
+        engine._recover(iteration=5, failure=agreed)
+    assert run.retry_epoch == 1
+    assert run.attempt_logical_base == 3
+    assert run.recovered_overflow
     assert run.branch_controller_state == controller.state_dict()
-
-    with pytest.raises(RuntimeError, match="terminal"):
-        recovery.run(
-            lambda _address: (_ for _ in ()).throw(RuntimeError("terminal")),
-            discarded.append,
-        )
-
-    healthy_discards = []
-    healthy_rounds = iter(((None, remote), (None, None)))
-    healthy_recovery = BranchedOverflowRecovery(
-        iteration=6,
-        replica=0,
-        controller=FixedBranchController(
-            {"player": 2.0, "chance": 1.0},
-            2,
-            minimum_scale=0.25,
-        ),
-        run_state=RunState("phase7-healthy-rank", root_count=1),
-        rank_agreement=RankCommonFailureAgreement(
-            world_size=2,
-            collect=lambda _local: next(healthy_rounds),
-        ),
-    )
-    healthy_calls = []
-    with pytest.warns(RuntimeWarning, match="RECOVERED_BRANCHED_OVERFLOW"):
-        assert (
-            healthy_recovery.run(
-                lambda address: healthy_calls.append(address) or "committed",
-                healthy_discards.append,
-            )
-            == "committed"
-        )
-    assert len(healthy_calls) == 2
-    assert healthy_discards == [remote]
+    record = run.overflow_recoveries[0]
+    assert record["failed_address"] == "0:7"
+    assert record["replacement_address"] == "1:3"
+    assert record["old_control"] != record["new_control"]
 
 
 @CUDA
@@ -968,7 +932,7 @@ def test_healthy_branched_attempt_discard_releases_without_failure_record() -> N
 @CUDA
 def test_untrained_unary_root_refill_restores_one_structural_root() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
-    recorder = BranchedTopologyRecorder(
+    recorder = TopologyPacketStager(
         input_names=("pre",),
         p_train=2,
         topology_cap=8,
@@ -1038,7 +1002,7 @@ def test_full_branched_iteration_is_family_pack_invariant() -> None:
             device,
         )
         model = _BranchedModel(device, geometry.private_hands)
-        result = BranchedSampledPokerIteration(
+        result = EngineDrivenBranchedAttempt(
             geometry=geometry,
             owners=GeneratedOwners(plan),
             mode=mode,
@@ -1109,7 +1073,7 @@ def test_multi_pack_roots_use_complete_frontier_cost_forecast() -> None:
     model = _BranchedModel(device, geometry.private_hands)
     safeguard = CostSafeguardController(1, 2, 1)
     safeguard.observe(0.1, 1.1, 3)
-    result = BranchedSampledPokerIteration(
+    result = EngineDrivenBranchedAttempt(
         geometry=geometry,
         owners=GeneratedOwners(plan),
         mode=mode,
@@ -1172,7 +1136,7 @@ def test_kkt_feedback_is_invariant_to_root_batching() -> None:
             kappa_max=1,
             log_kappa=0,
         )
-        BranchedSampledPokerIteration(
+        EngineDrivenBranchedAttempt(
             geometry=geometry,
             owners=GeneratedOwners(plan),
             mode=mode,
@@ -1222,7 +1186,7 @@ def test_ragged_statistical_work_subdivides_by_action_cap() -> None:
             device,
         )
         model = _BranchedModel(device, geometry.private_hands)
-        result = BranchedSampledPokerIteration(
+        result = EngineDrivenBranchedAttempt(
             geometry=geometry,
             owners=GeneratedOwners(plan),
             mode=mode,
@@ -1308,7 +1272,7 @@ def test_four_sampled_branched_modes_complete_optimizer_step(
     )
     optimizer = DenseAdam(model, OptimizerConfig(name="adamw", grad_clip=5))
     run_state = RunState(f"phase7-{regime}-{rollout}", root_count=1)
-    result = PublicBranchedSampledPokerIteration(
+    result = BranchedRecoveryHarness(
         owner_factory=lambda: GeneratedOwners(plan),
         plan=plan,
         controller=controller,
@@ -1372,7 +1336,7 @@ def test_best_response_rollout_selects_one_model_per_role_subspan() -> None:
 
     learned = RoleRecordingModel()
     frozen = RoleRecordingModel()
-    BranchedSampledPokerIteration(
+    EngineDrivenBranchedAttempt(
         geometry=geometry,
         owners=GeneratedOwners(plan),
         mode=mode,
@@ -1443,7 +1407,7 @@ def test_multiplayer_best_response_root_uses_frozen_opponent_model() -> None:
 
     learned = RoleRecordingModel()
     frozen = RoleRecordingModel()
-    BranchedSampledPokerIteration(
+    EngineDrivenBranchedAttempt(
         geometry=geometry,
         owners=GeneratedOwners(plan),
         mode=mode,
@@ -1489,7 +1453,7 @@ def test_branched_allocator_and_reference_cache_controls_are_wired() -> None:
     )
     model = _BranchedModel(device, geometry.private_hands)
     reference = _BranchedModel(device, geometry.private_hands)
-    result = BranchedSampledPokerIteration(
+    result = EngineDrivenBranchedAttempt(
         geometry=geometry,
         owners=GeneratedOwners(plan),
         mode=mode,
@@ -1589,7 +1553,7 @@ def test_three_player_nonterminal_fold_seals_branched_summary() -> None:
             )
 
     model = FoldCheckingModel()
-    result = BranchedSampledPokerIteration(
+    result = EngineDrivenBranchedAttempt(
         geometry=geometry,
         owners=GeneratedOwners(plan),
         mode=mode,
@@ -1638,7 +1602,7 @@ def test_chance_branching_and_protected_root_refill_complete_targets(
     )
     model = _BranchedModel(device, geometry.private_hands)
     optimizer = DenseAdam(model, OptimizerConfig(name="adamw", grad_clip=5))
-    result = BranchedSampledPokerIteration(
+    result = EngineDrivenBranchedAttempt(
         geometry=geometry,
         owners=GeneratedOwners(plan),
         mode=mode,

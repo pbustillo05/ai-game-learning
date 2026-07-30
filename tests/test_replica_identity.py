@@ -11,8 +11,9 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from pbg.games.poker.queued.branching import (
-    ReplicaBranchedPokerIteration,
+from tests.iteration_support import (
+    EngineDrivenReplicaBranchedAttempt,
+    EngineDrivenSequentialAttempt,
 )
 from pbg.games.poker.queued.hooks import (
     NLHEGeometry,
@@ -23,7 +24,6 @@ from pbg.games.poker.queued.model import QueuedPokerModel, build_model_from_conf
 from pbg.games.poker.queued.replica import PokerReplicaInference
 from pbg.games.poker.queued.training import ReplicaPokerIterationResult
 from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
-from pbg.games.poker.queued.training import SequentialPokerIteration
 from pbg.core.branching import (
     CostSafeguardController,
     FixedBranchController,
@@ -65,7 +65,7 @@ from pbg.core.replica import (
     ReplicaOptimizerGroup,
 )
 from pbg.core.storage import SoAField
-from pbg.core.training import SequentialSampledIteration, TrainingError
+from pbg.core.training import LearnerIteration, TrainingError
 from tests.test_branched_sampled_modes import (
     _manifest as _branched_manifest,
 )
@@ -476,7 +476,7 @@ def _distributed_sum_worker(
         with pytest.raises(
             TrainingError, match="failed .* distributed SUM|another distributed"
         ):
-            SequentialSampledIteration(
+            LearnerIteration(
                 model=module,
                 learner=_AsymmetricLearner(),  # type: ignore[arg-type]
                 optimizer=optimizer_group.lane_stepper(
@@ -579,7 +579,7 @@ def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
         ordinary_model,
         OptimizerConfig(name="adamw", grad_clip=5.0),
     )
-    ordinary = SequentialPokerIteration(
+    ordinary = EngineDrivenSequentialAttempt(
         geometry=geometry,
         owners=GeneratedOwners(
             build_storage_plan(
@@ -626,7 +626,7 @@ def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
         RunState(f"real-replica-{lane}", root_count=1)
         for lane in range(2)
     )
-    result = SequentialPokerIteration(
+    result = EngineDrivenSequentialAttempt(
         geometry=geometry,
         owners=owners,
         mode=mode,
@@ -706,7 +706,7 @@ def test_complete_sequential_transactions_isolate_every_replica_lane(
         RunState(f"complete-isolation-{count}-{lane}", root_count=1)
         for lane in range(count)
     )
-    result = SequentialPokerIteration(
+    result = EngineDrivenSequentialAttempt(
         geometry=geometry,
         owners=GeneratedOwners(
             build_storage_plan(
@@ -830,7 +830,7 @@ def test_shared_owner_branched_poker_preserves_fixed_kkt_lane_identity(
             log_kappa=math.log(1.0e-6),
         ),
     )
-    result = ReplicaBranchedPokerIteration(
+    result = EngineDrivenReplicaBranchedAttempt(
         geometry=geometry,
         owners=GeneratedOwners(plan),
         modes=(fixed, kkt),
@@ -902,7 +902,7 @@ def test_branched_replica_learner_failure_aborts_before_any_lane_commit() -> Non
         RunState("branched-failed-lane", root_count=1),
     )
     with pytest.raises(RuntimeError, match="before optimizer transition"):
-        ReplicaBranchedPokerIteration(
+        EngineDrivenReplicaBranchedAttempt(
         geometry=geometry,
         owners=GeneratedOwners(
             build_storage_plan(
@@ -960,7 +960,7 @@ def test_replica_best_response_groups_compact_learned_and_frozen_rows() -> None:
         OptimizerConfig(name="adamw"),
     )
     modules = tuple(learned.modules.lane_module(lane) for lane in range(2))
-    iteration = SequentialPokerIteration(
+    iteration = EngineDrivenSequentialAttempt(
         geometry=geometry,
         owners=GeneratedOwners(
             build_storage_plan(
