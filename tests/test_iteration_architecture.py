@@ -210,6 +210,17 @@ def test_one_topology_assembler_accepts_all_rollout_shapes() -> None:
     assert definitions == [
         (REPOSITORY / "pbg/core/topology.py", "TopologyAssembler")
     ]
+    constructors = [
+        path
+        for path in production
+        for node in ast.walk(
+            ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        )
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "TopologyAssembler"
+    ]
+    assert constructors == [REPOSITORY / "pbg/core/topology.py"]
     topology_source = (REPOSITORY / "pbg/core/topology.py").read_text(
         encoding="utf-8"
     )
@@ -218,7 +229,7 @@ def test_one_topology_assembler_accepts_all_rollout_shapes() -> None:
     assert "class TopologyExpansionRecord" in topology_source
     assert "executed_degree=one" in hook_source
     assert "target_degree=one" in hook_source
-    assert "DeferredUnaryTopologyPublication" not in hook_source
+    assert "TopologyPublication(" in hook_source
 
 
 def test_one_learner_objective_accepts_unit_or_ragged_action_spans() -> None:
@@ -312,7 +323,7 @@ def test_common_engine_owns_rollout_transactions_and_topology_lifecycle() -> Non
         encoding="utf-8"
     )
     assert "RolloutTransaction(" in engine
-    assert "accept_expansion(" in engine
+    assert "topology.accept(" in engine
     assert "seal_lane(" in engine
     assert "build_layer_plan(" in engine
     for path in POKER.glob("*.py"):
@@ -325,9 +336,24 @@ def test_production_modes_use_one_topology_publication_protocol() -> None:
     poker_source = "\n".join(
         path.read_text(encoding="utf-8") for path in POKER.glob("*.py")
     )
-    assert "TopologyExpansionPublication(" in poker_source
-    assert "DeferredUnaryTopologyPublication" not in poker_source
-    assert "DeferredBranchedTopologyPublication" not in poker_source
+    assert "TopologyPublication(" in poker_source
+    forbidden = {
+        "TopologyDraftPacket",
+        "EndpointPatch",
+        "ReplicaTopologyPacket",
+        "DeferredUnaryTopologyPublication",
+        "DeferredBranchedTopologyPublication",
+        "TopologyExpansionPublication",
+        "expansion_topology",
+        "deferred_topology",
+    }
+    production_source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (REPOSITORY / "pbg").rglob("*.py")
+    )
+    assert not {
+        name for name in forbidden if name in production_source
+    }
     definitions = [
         (path, node.name)
         for path in (REPOSITORY / "pbg").rglob("*.py")
@@ -340,3 +366,19 @@ def test_production_modes_use_one_topology_publication_protocol() -> None:
     assert definitions == [
         (REPOSITORY / "pbg/core/topology.py", "TopologyPacketStager")
     ]
+
+
+def test_no_retired_or_compatibility_iteration_objects_remain() -> None:
+    forbidden_fragments = ("_Retired", "_Legacy", "_Deprecated")
+    for path in (REPOSITORY / "pbg").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        names = (
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+        )
+        assert not any(
+            fragment in name
+            for name in names
+            for fragment in forbidden_fragments
+        ), path

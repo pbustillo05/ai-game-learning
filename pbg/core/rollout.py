@@ -33,12 +33,8 @@ from pbg.core.storage import (
 from pbg.core.topology import (
     StagedTopologyPacket,
     Topology,
-    TopologyAssembler,
     TopologyBindings,
     TopologyError,
-    TopologyExpansion,
-    TopologyExpansionEdge,
-    TopologyPacket,
     TopologyPacketStager,
 )
 
@@ -1063,218 +1059,8 @@ class RolloutOwnerRegistry:
 
 
 @dataclass(frozen=True)
-class TopologyDraftPacket:
-    """A sampled compact packet whose listed endpoints await commit."""
-
-    sequence: int
-    node_begin: int
-    edge_begin: int
-    topology: Topology
-    bindings: TopologyBindings
-    unresolved_edges: tuple[int, ...]
-    declared_node_count: int
-    declared_edge_count: int
-    validation_event: torch.cuda.Event
-    ready_event: torch.cuda.Event
-    device_valid: Tensor
-
-    def __post_init__(self) -> None:
-        if min(self.sequence, self.node_begin, self.edge_begin) < 0:
-            raise TopologyError("draft packet addresses must be nonnegative")
-        if self.declared_node_count <= 0 or self.declared_edge_count < 0:
-            raise TopologyError("draft packet declared extents are invalid")
-        if len(set(self.unresolved_edges)) != len(self.unresolved_edges):
-            raise TopologyError("draft packet repeats an unresolved endpoint")
-        if any(
-            edge < 0 or edge >= self.declared_edge_count
-            for edge in self.unresolved_edges
-        ):
-            raise TopologyError("draft endpoint is outside its edge table")
-        if (
-            self.device_valid.device.type != "cuda"
-            or self.device_valid.dtype != torch.bool
-            or self.device_valid.numel() != 1
-        ):
-            raise TopologyError(
-                "draft device validation marker must be CUDA bool scalar"
-            )
-
-
-@dataclass(frozen=True)
-class EndpointPatch:
-    """Endpoint ordinals resolved against the actual device reservation."""
-
-    sequence: int
-    edge: Tensor
-    target_kind: Tensor
-    reservation_index: Tensor
-    preflight_target_row: Tensor
-    target_ordinal: Tensor
-    child_output_type: Tensor
-    commit_sequence: int
-
-    def __post_init__(self) -> None:
-        count = int(self.edge.numel())
-        for name in (
-            "edge",
-            "target_kind",
-            "reservation_index",
-            "preflight_target_row",
-            "child_output_type",
-        ):
-            value = getattr(self, name)
-            if (
-                value.device.type != "cpu"
-                or value.dtype != torch.int32
-                or value.shape != (count,)
-                or not value.is_contiguous()
-            ):
-                raise TopologyError(
-                    f"endpoint patch {name} must be contiguous CPU int32 [{count}]"
-                )
-        if (
-            self.target_ordinal.device.type != "cuda"
-            or self.target_ordinal.dtype != torch.int64
-            or self.target_ordinal.shape != (count,)
-            or not self.target_ordinal.is_contiguous()
-        ):
-            raise TopologyError(
-                "endpoint target_ordinal must be contiguous CUDA int64 "
-                f"[{count}]"
-            )
-        if self.sequence < 0 or self.commit_sequence != self.sequence:
-            raise TopologyError("endpoint patch lacks its commit marker")
-
-
-@dataclass(frozen=True)
 class TopologyPublication:
-    """One replica-local draft/patch pair tied to a device commit lane."""
-
-    lane: int
-    draft: TopologyDraftPacket
-    patch: EndpointPatch
-
-    def __post_init__(self) -> None:
-        if self.lane < 0:
-            raise TopologyError("topology publication lane is negative")
-        if self.draft.sequence != self.patch.sequence:
-            raise TopologyError("topology draft and patch sequences differ")
-
-
-@dataclass(frozen=True)
-class ReplicaTopologyPacket:
-    """A committed packet whose replica identity is never discarded."""
-
-    lane: int
-    packet: TopologyPacket
-
-
-@dataclass(frozen=True)
-class DeferredUnaryTopologyPublication:
-    """Device-produced unit-degree expansion packet committed with destinations."""
-
-    lane: int
-    sequence: int
-    input_type_index: int
-    logical_rng_key: Tensor
-    next_logical_rng_key: Tensor
-    next_input_type: Tensor
-    terminal: Tensor
-    owner: Tensor
-    action: Tensor
-    familywork_row: Tensor
-    executed_degree: Tensor
-    nominal_degree: Tensor
-    target_degree: Tensor
-    leaf_reservation_index: int
-    leaf_target_ordinal: Tensor
-    trained: Tensor | None = None
-    sigma_reservation_index: int = -1
-    action_reservation_index: int = -1
-    trained_target_ordinal: Tensor | None = None
-
-    def __post_init__(self) -> None:
-        if min(
-            self.lane,
-            self.sequence,
-            self.input_type_index,
-            self.leaf_reservation_index,
-        ) < 0:
-            raise TopologyError("deferred topology addresses must be nonnegative")
-        rows = self.terminal.numel()
-        device = self.terminal.device
-        if (
-            device.type != "cuda"
-            or self.terminal.dtype != torch.bool
-            or self.terminal.ndim != 1
-            or rows <= 0
-        ):
-            raise TopologyError(
-                "deferred topology terminal must be CUDA bool [rows]"
-            )
-        for name in (
-            "next_input_type",
-            "owner",
-            "action",
-            "familywork_row",
-            "executed_degree",
-            "nominal_degree",
-            "target_degree",
-            "leaf_target_ordinal",
-        ):
-            value = getattr(self, name)
-            if (
-                value.device != device
-                or value.ndim != 1
-                or value.numel() != rows
-            ):
-                raise TopologyError(
-                    f"deferred topology {name} must be CUDA [rows]"
-                )
-        for name in (
-            "executed_degree",
-            "nominal_degree",
-            "target_degree",
-        ):
-            if getattr(self, name).dtype not in (
-                torch.int32,
-                torch.int64,
-            ):
-                raise TopologyError(
-                    "topology packet degrees must be integer tensors"
-                )
-            torch._assert_async(
-                getattr(self, name).eq(1).all(),
-                "sequential topology packet degrees must all equal one",
-            )
-        if self.trained is not None and (
-            self.trained.device != device
-            or self.trained.dtype != torch.bool
-            or self.trained.shape != (rows,)
-        ):
-            raise TopologyError("deferred trained mask must be CUDA bool [rows]")
-        if self.trained_target_ordinal is not None and (
-            self.trained_target_ordinal.device != device
-            or self.trained_target_ordinal.shape != (rows,)
-        ):
-            raise TopologyError(
-                "deferred trained ordinals must be CUDA [rows]"
-            )
-        for name in ("logical_rng_key", "next_logical_rng_key"):
-            value = getattr(self, name)
-            if (
-                value.device != device
-                or value.dtype != torch.int64
-                or value.shape != (rows, 2)
-            ):
-                raise TopologyError(
-                    f"deferred topology {name} must be CUDA int64 [rows,2]"
-            )
-
-
-@dataclass(frozen=True)
-class TopologyExpansionPublication:
-    """One mode-independent expansion packet awaiting commit visibility."""
+    """One mode-independent topology packet awaiting commit visibility."""
 
     lane: int
     sequence: int
@@ -1289,212 +1075,95 @@ class TopologyExpansionPublication:
             or self.declared_nodes <= 0
             or self.declared_edges < 0
         ):
-            raise TopologyError("topology expansion publication is invalid")
+            raise TopologyError("topology publication is invalid")
 
 
 @dataclass
-class _PendingExpansion:
-    publication: TopologyExpansionPublication
+class _PendingTopology:
+    publication: TopologyPublication
     success: Tensor
     event: torch.cuda.Event
 
 
-@dataclass
-class _PendingDeferredUnary:
-    slot: int
-    publication: DeferredUnaryTopologyPublication
-    row_slice: slice
-    marker: Tensor
-    event: torch.cuda.Event
-    armed: bool = False
-
-
-@dataclass
-class _PendingTopologyBatch:
-    slot: int
-    publications: tuple[TopologyPublication, ...]
-    rows: Tensor
-    row_slices: tuple[slice, ...]
-    marker: Tensor
-    event: torch.cuda.Event
-    armed: bool = False
-
-
 class AsyncTopologyPublisher:
-    """Accept topology descriptors only after endpoint commit visibility."""
+    """Publish every mode's topology packets after commit visibility."""
 
     def __init__(
         self,
         owners: RolloutOwnerRegistry,
         *,
         p_train: int,
-        input_names: Sequence[str] | None = None,
-        input_to_output: Sequence[int] | None = None,
+        input_names: Sequence[str],
+        input_to_output: Sequence[int],
     ) -> None:
         if p_train <= 0:
             raise ValueError("topology publication bounds must be positive")
         self.owners = owners
         self.p_train = int(p_train)
-        if (input_names is None) != (input_to_output is None):
-            raise ValueError(
-                "topology input names and output mapping must be paired"
+        self._stagers = tuple(
+            TopologyPacketStager(
+                input_names=input_names,
+                input_to_output=input_to_output,
+                p_train=self.p_train,
+                topology_cap=owners.topology_cap,
+                topology_edge_cap=owners.topology_edge_cap,
+                topology_packet_cap=owners.topology_packet_cap,
+                device=owners.device,
             )
-        self._expansion_stagers = (
-            ()
-            if input_names is None
-            else tuple(
-                TopologyPacketStager(
-                    input_names=input_names,
-                    input_to_output=input_to_output,  # type: ignore[arg-type]
-                    p_train=self.p_train,
-                    topology_cap=owners.topology_cap,
-                    topology_edge_cap=owners.topology_edge_cap,
-                    topology_packet_cap=owners.topology_packet_cap,
-                    device=owners.device,
-                )
-                for _lane in range(owners.n_replica)
-            )
-        )
-        self.max_inflight_batches = 2
-        self.max_inflight_deferred = max(
-            self.max_inflight_batches,
-            owners.n_replica,
-        )
-        self._drafts: dict[tuple[int, int], TopologyDraftPacket] = {}
-        self._packets: list[ReplicaTopologyPacket] = []
-        self._pending: list[_PendingTopologyBatch] = []
-        self._reserved_packets = 0
-        self._reserved_nodes = 0
-        self._reserved_edges = 0
-        self._row_buffers = tuple(
-            torch.empty(
-                owners.topology_edge_cap,
-                dtype=torch.int64,
-                pin_memory=True,
-            )
-            for _ in range(self.max_inflight_batches)
-        )
-        self._marker_buffers = tuple(
-            torch.empty(
-                owners.n_replica,
-                dtype=torch.int64,
-                pin_memory=True,
-            )
-            for _ in range(self.max_inflight_batches)
-        )
-        self._deferred_marker_buffers = tuple(
-            torch.empty(
-                owners.n_replica,
-                dtype=torch.int64,
-                pin_memory=True,
-            )
-            for _ in range(self.max_inflight_deferred)
+            for _lane in range(owners.n_replica)
         )
         self._accept_stream = _runtime_streams(owners.device)[2]
-        self._deferred_buffer = torch.empty(
-            (owners.topology_cap, 17),
-            dtype=torch.int64,
-            pin_memory=True,
-        )
-        self._deferred_pending: list[_PendingDeferredUnary] = []
-        self._deferred_staged: dict[
-            tuple[int, int], DeferredUnaryTopologyPublication
-        ] = {}
-        self._deferred_accepted: list[tuple[int, int, Tensor]] = []
-        self._deferred_reserved_rows = 0
-        self._expansion_staged: dict[
-            tuple[int, int], TopologyExpansionPublication
-        ] = {}
-        self._expansion_pending: list[_PendingExpansion] = []
-        self._expansion_accepted: dict[
-            tuple[int, int], StagedTopologyPacket
-        ] = {}
-        self._expansion_success_buffer = torch.empty(
+        self._staged: dict[tuple[int, int], TopologyPublication] = {}
+        self._pending: list[_PendingTopology] = []
+        self._accepted: dict[tuple[int, int], StagedTopologyPacket] = {}
+        self._success_buffer = torch.empty(
             owners.n_replica * owners.topology_cap,
             dtype=torch.bool,
             pin_memory=True,
         )
 
-    @staticmethod
-    def _key(publication: TopologyPublication) -> tuple[int, int]:
-        return publication.lane, publication.draft.sequence
-
     def stage(self, publication: TopologyPublication) -> None:
-        key = self._key(publication)
-        draft = publication.draft
-        if key in self._drafts or any(
-            item.lane == key[0] and item.packet.sequence == key[1]
-            for item in self._packets
-        ):
-            raise TopologyError("duplicate topology transaction sequence")
-        if (
-            draft.declared_node_count + draft.declared_edge_count
-            > self.owners.topology_packet_cap
-        ):
-            raise TopologyError("topology draft exceeds its fixed packet cap")
-        if (
-            self._reserved_nodes + draft.declared_node_count
-            > self.owners.topology_cap
-        ):
-            raise TopologyError("topology publication exceeds cumulative node cap")
-        if (
-            self._reserved_edges + draft.declared_edge_count
-            > self.owners.topology_edge_cap
-        ):
-            raise TopologyError("topology publication exceeds cumulative edge cap")
-        self._drafts[key] = draft
-        self._reserved_packets += 1
-        self._reserved_nodes += draft.declared_node_count
-        self._reserved_edges += draft.declared_edge_count
-
-    def stage_expansion(
-        self, publication: TopologyExpansionPublication
-    ) -> None:
         key = (publication.lane, publication.sequence)
-        if key in self._expansion_staged:
-            raise TopologyError("duplicate topology expansion sequence")
+        if key in self._staged:
+            raise TopologyError("duplicate topology packet sequence")
         if (
             publication.declared_nodes + publication.declared_edges
             > self.owners.topology_packet_cap
         ):
-            raise TopologyError(
-                "topology expansion exceeds its fixed packet cap"
-            )
+            raise TopologyError("topology packet exceeds its fixed packet cap")
         if publication.sequence >= self.owners.topology_cap:
-            raise TopologyError(
-                "topology expansion exceeds its sequence arena"
-            )
-        self._expansion_staged[key] = publication
+            raise TopologyError("topology packet exceeds its sequence arena")
+        self._staged[key] = publication
 
-    def finalize_expansion(
+    def finalize(
         self,
-        publication: TopologyExpansionPublication,
+        publication: TopologyPublication,
         success: Tensor,
         *,
         stream: torch.cuda.Stream,
     ) -> None:
         key = (publication.lane, publication.sequence)
-        if self._expansion_staged.get(key) is not publication:
-            raise TopologyError("topology expansion was not staged")
-        host_success = self._expansion_success_buffer[
+        if self._staged.get(key) is not publication:
+            raise TopologyError("topology packet was not staged")
+        host_success = self._success_buffer[
             publication.lane * self.owners.topology_cap
             + publication.sequence
         ]
         host_success.copy_(success[publication.lane], non_blocking=True)
         event = torch.cuda.Event(blocking=False)
         event.record(stream)
-        self._expansion_pending.append(
-            _PendingExpansion(publication, host_success, event)
+        self._pending.append(
+            _PendingTopology(publication, host_success, event)
         )
 
-    def cancel_expansions(
+    def cancel(
         self,
-        publications: Sequence[TopologyExpansionPublication],
+        publications: Sequence[TopologyPublication],
     ) -> None:
         keys = {(item.lane, item.sequence) for item in publications}
-        self._expansion_pending = [
+        self._pending = [
             pending
-            for pending in self._expansion_pending
+            for pending in self._pending
             if (
                 pending.publication.lane,
                 pending.publication.sequence,
@@ -1502,710 +1171,101 @@ class AsyncTopologyPublisher:
             not in keys
         ]
         for key in keys:
-            self._expansion_staged.pop(key, None)
-            self._expansion_accepted.pop(key, None)
+            self._staged.pop(key, None)
+            self._accepted.pop(key, None)
 
-    def _accept_expansions_ready(self, *, block: bool = False) -> None:
-        ready: list[_PendingExpansion] = []
-        waiting: list[_PendingExpansion] = []
-        if block and self._expansion_pending:
+    def _accept_ready(self, *, block: bool = False) -> None:
+        ready: list[_PendingTopology] = []
+        waiting: list[_PendingTopology] = []
+        if block and self._pending:
             with torch.cuda.stream(self._accept_stream):
-                for pending in self._expansion_pending:
+                for pending in self._pending:
                     self._accept_stream.wait_event(pending.event)
                 all_ready = torch.cuda.Event(blocking=False)
                 all_ready.record(self._accept_stream)
             all_ready.synchronize()
-            ready = self._expansion_pending
+            ready = self._pending
         else:
-            for pending in self._expansion_pending:
+            for pending in self._pending:
                 (ready if pending.event.query() else waiting).append(pending)
-        self._expansion_pending = waiting
+        self._pending = waiting
         for pending in ready:
             publication = pending.publication
             key = (publication.lane, publication.sequence)
             if bool(pending.success):
-                self._expansion_accepted[key] = publication.payload
-            self._expansion_staged.pop(key, None)
+                self._accepted[key] = publication.payload
+            self._staged.pop(key, None)
 
-    def expansion_feedback(
+    def feedback(
         self,
-        publication: TopologyExpansionPublication,
+        publication: TopologyPublication,
     ) -> tuple[bool, StagedTopologyPacket | None] | None:
         """Poll one pinned commit result without reading a device scalar."""
 
-        self._accept_expansions_ready()
+        self._accept_ready()
         key = (publication.lane, publication.sequence)
-        if key in self._expansion_accepted:
-            return False, self._expansion_accepted.pop(key)
-        if key not in self._expansion_staged:
+        if key in self._accepted:
+            return False, self._accepted.pop(key)
+        if key not in self._staged:
             return True, None
         return None
 
-    def wait_expansion_feedback(
+    def wait_feedback(
         self,
-        publication: TopologyExpansionPublication,
+        publication: TopologyPublication,
     ) -> tuple[bool, StagedTopologyPacket | None]:
         while True:
-            result = self.expansion_feedback(publication)
+            result = self.feedback(publication)
             if result is not None:
                 return result
             time.sleep(0)
 
     @property
-    def expansion_stagers(self) -> tuple[TopologyPacketStager, ...]:
-        if not self._expansion_stagers:
-            raise TopologyError(
-                "topology publisher was not configured for expansion packets"
-            )
-        return self._expansion_stagers
+    def stagers(self) -> tuple[TopologyPacketStager, ...]:
+        return self._stagers
 
-    def accept_expansion(
+    def accept(
         self,
-        publication: TopologyExpansionPublication,
+        publication: TopologyPublication,
     ) -> tuple[bool, tuple[int, ...]]:
-        failed, packet = self.wait_expansion_feedback(publication)
+        failed, packet = self.wait_feedback(publication)
         if failed or packet is None:
             return True, ()
-        stager = self.expansion_stagers[publication.lane]
+        stager = self.stagers[publication.lane]
         stager.accept(packet)
         return False, tuple(int(value) for value in packet.produced)
 
     def seal_lane(self, lane: int) -> tuple[Topology, TopologyBindings, int]:
-        return self.expansion_stagers[lane].seal()
+        return self.stagers[lane].seal()
 
     def tree_size(self, lane: int, logical_root: int) -> int:
-        return self.expansion_stagers[lane].tree_size(logical_root)
+        return self.stagers[lane].tree_size(logical_root)
 
     def sampled_tree_size(
         self, lane: int, record_limit: int | None = None
     ) -> int:
-        return self.expansion_stagers[lane].sampled_tree_size(record_limit)
+        return self.stagers[lane].sampled_tree_size(record_limit)
 
     def root_degree(self, lane: int, logical_root: int) -> int:
-        return self.expansion_stagers[lane].root_degree(logical_root)
+        return self.stagers[lane].root_degree(logical_root)
 
     def record_count(self, lane: int) -> int:
-        return self.expansion_stagers[lane].record_count
+        return self.stagers[lane].record_count
 
     def counterfactual_correction(
         self, lane: int, record_limit: int
     ) -> float:
-        return self.expansion_stagers[lane].counterfactual_correction(
+        return self.stagers[lane].counterfactual_correction(
             record_limit
         )
 
-    def release_expansion_storage(self) -> None:
-        for stager in self._expansion_stagers:
+    def release_storage(self) -> None:
+        for stager in self._stagers:
             stager.release()
-        self._expansion_stagers = ()
-
-    def preflight_deferred(
-        self,
-        publication: DeferredUnaryTopologyPublication,
-        requests: Sequence[DeviceDestinationRequest],
-    ) -> None:
-        if publication.lane >= self.owners.n_replica:
-            raise TopologyError("deferred topology lane is outside replicas")
-        if publication.leaf_reservation_index >= len(requests):
-            raise TopologyError("deferred leaf reservation is outside commit plan")
-        if (
-            requests[
-                publication.leaf_reservation_index
-            ].slab.schema.name
-            != "Leaf"
-        ):
-            raise TopologyError("deferred leaf endpoint must bind to Leaf")
-        if publication.terminal.numel() > self.owners.topology_packet_cap:
-            raise TopologyError("deferred topology packet exceeds its cap")
-        if publication.trained is not None:
-            for index, expected in (
-                (publication.sigma_reservation_index, "SigmaHead."),
-                (publication.action_reservation_index, "ActionHead."),
-            ):
-                if not 0 <= index < len(requests):
-                    raise TopologyError(
-                        "deferred trained reservation is outside commit plan"
-                    )
-                if not requests[index].slab.schema.name.startswith(expected):
-                    raise TopologyError(
-                        "deferred trained reservation has the wrong owner"
-                    )
-
-    def stage_deferred(
-        self, publication: DeferredUnaryTopologyPublication
-    ) -> None:
-        key = (publication.lane, publication.sequence)
-        if key in self._deferred_staged:
-            raise TopologyError("duplicate deferred topology sequence")
-        rows = publication.terminal.numel()
-        if self._deferred_reserved_rows + rows > self.owners.topology_cap:
-            raise TopologyError("deferred topology exceeds cumulative node cap")
-        self._deferred_staged[key] = publication
-        self._deferred_reserved_rows += rows
-
-    def prepare_deferred(
-        self,
-        publication: DeferredUnaryTopologyPublication,
-        transaction: object,
-        *,
-        stream: torch.cuda.Stream,
-    ) -> _PendingDeferredUnary:
-        if len(self._deferred_pending) >= self.max_inflight_deferred:
-            raise TopologyError("deferred topology exceeds in-flight batch cap")
-        key = (publication.lane, publication.sequence)
-        if self._deferred_staged.get(key) is not publication:
-            raise TopologyError("deferred topology was not staged")
-        rows = publication.terminal.numel()
-        begin = sum(
-            item[2].shape[0] for item in self._deferred_accepted
-        ) + sum(
-            item.publication.terminal.numel()
-            for item in self._deferred_pending
-        )
-        end = begin + rows
-        if end > self._deferred_buffer.shape[0]:
-            raise TopologyError("deferred topology host buffer overflow")
-        leaf_begin = transaction.begins[
-            publication.leaf_reservation_index
-        ][publication.lane]
-        leaf_row = leaf_begin + publication.leaf_target_ordinal
-        trained = (
-            torch.ones(rows, dtype=torch.bool, device=self.owners.device)
-            if publication.trained is None
-            else publication.trained
-        )
-        trained_ordinal = (
-            publication.familywork_row
-            if publication.trained_target_ordinal is None
-            else publication.trained_target_ordinal
-        )
-        if publication.sigma_reservation_index >= 0:
-            sigma_begin = transaction.begins[
-                publication.sigma_reservation_index
-            ][publication.lane]
-            sigma_row = sigma_begin + trained_ordinal
-            action_begin = transaction.begins[
-                publication.action_reservation_index
-            ][publication.lane]
-            action_row = action_begin + trained_ordinal
-        else:
-            sigma_row = publication.familywork_row
-            action_row = publication.familywork_row
-        sigma_row = torch.where(trained, sigma_row, -1)
-        action_row = torch.where(trained, action_row, -1)
-        packed = torch.cat(
-            (
-                publication.logical_rng_key,
-                publication.next_logical_rng_key,
-                publication.next_input_type.to(torch.int64)[:, None],
-                publication.terminal.to(torch.int64)[:, None],
-                publication.owner.to(torch.int64)[:, None],
-                publication.action.to(torch.int64)[:, None],
-                publication.familywork_row.to(torch.int64)[:, None],
-                torch.full(
-                    (rows, 1),
-                    publication.input_type_index,
-                    dtype=torch.int64,
-                    device=self.owners.device,
-                ),
-                publication.executed_degree.to(torch.int64)[:, None],
-                publication.nominal_degree.to(torch.int64)[:, None],
-                publication.target_degree.to(torch.int64)[:, None],
-                leaf_row.to(torch.int64)[:, None],
-                trained.to(torch.int64)[:, None],
-                sigma_row.to(torch.int64)[:, None],
-                action_row.to(torch.int64)[:, None],
-            ),
-            1,
-        )
-        self._deferred_buffer[begin:end].copy_(packed, non_blocking=True)
-        used = {item.slot for item in self._deferred_pending}
-        slot = next(
-            candidate
-            for candidate in range(self.max_inflight_deferred)
-            if candidate not in used
-        )
-        pending = _PendingDeferredUnary(
-            slot,
-            publication,
-            slice(begin, end),
-            self._deferred_marker_buffers[slot],
-            torch.cuda.Event(blocking=False),
-        )
-        self._deferred_pending.append(pending)
-        packed.record_stream(stream)
-        return pending
-
-    @staticmethod
-    def finalize_deferred(
-        pending: _PendingDeferredUnary,
-        marker: Tensor,
-        *,
-        stream: torch.cuda.Stream,
-    ) -> None:
-        pending.marker.copy_(marker, non_blocking=True)
-        pending.event.record(stream)
-        pending.armed = True
-
-    def _accept_deferred_ready(self) -> None:
-        waiting: list[_PendingDeferredUnary] = []
-        for item in self._deferred_pending:
-            if not item.armed or not item.event.query():
-                waiting.append(item)
-                continue
-            publication = item.publication
-            marker = int(item.marker[publication.lane])
-            key = (publication.lane, publication.sequence)
-            self._deferred_staged.pop(key, None)
-            if marker == publication.sequence:
-                self._deferred_accepted.append(
-                    (
-                        publication.lane,
-                        publication.sequence,
-                        self._deferred_buffer[item.row_slice],
-                    )
-                )
-        self._deferred_pending = waiting
-
-    def deferred_feedback(
-        self,
-        publication: DeferredUnaryTopologyPublication,
-        *,
-        input_count: int,
-    ) -> tuple[bool, tuple[int, ...]] | None:
-        """Poll scheduler feedback from the atomically committed packet."""
-
-        self._accept_deferred_ready()
-        accepted = next(
-            (
-                rows
-                for lane, sequence, rows in self._deferred_accepted
-                if lane == publication.lane
-                and sequence == publication.sequence
-            ),
-            None,
-        )
-        if accepted is None:
-            if (publication.lane, publication.sequence) not in self._deferred_staged:
-                return True, tuple(0 for _ in range(input_count))
-            return None
-        terminal = accepted[:, 5].bool()
-        family = accepted[:, 4]
-        counts = tuple(
-            int(family.eq(index).logical_and(~terminal).sum())
-            for index in range(input_count)
-        )
-        return False, counts
-
-    def wait_deferred_feedback(
-        self,
-        publication: DeferredUnaryTopologyPublication,
-        *,
-        input_count: int,
-    ) -> tuple[bool, tuple[int, ...]]:
-        while True:
-            result = self.deferred_feedback(
-                publication, input_count=input_count
-            )
-            if result is not None:
-                return result
-            # This polls an asynchronous topology packet, never a device
-            # scalar, and does not synchronize a CUDA stream or event.
-            time.sleep(0)
-
-    @staticmethod
-    def _materialize(
-        draft: TopologyDraftPacket,
-        patch: EndpointPatch,
-        target_row: Tensor,
-        *,
-        p_train: int,
-    ) -> TopologyPacket:
-        if (
-            draft.topology.node_count != draft.declared_node_count
-            or draft.topology.edge_count != draft.declared_edge_count
-        ):
-            raise TopologyError("ready topology differs from declared extents")
-        draft_tensors = tuple(
-            getattr(draft.topology, name)
-            for name in (
-                "parent",
-                "child_begin",
-                "executed_degree",
-                "nominal_degree",
-                "target_degree",
-                "owner",
-                "familywork_row",
-                "sigma_head_row",
-                "action_begin",
-                "label",
-                "path_length",
-                "target_kind",
-                "target_row",
-            )
-        ) + (
-            draft.bindings.input_type,
-            draft.bindings.output_type,
-            draft.bindings.sigma_target_row,
-            draft.bindings.child_output_type,
-        )
-        if not all(value.is_pinned() for value in draft_tensors):
-            raise TopologyError(
-                "asynchronous topology draft must use pinned CPU columns"
-            )
-        draft.bindings.validate(
-            draft.declared_node_count, draft.declared_edge_count
-        )
-        expected = draft.unresolved_edges
-        actual = tuple(int(value) for value in patch.edge.tolist())
-        if actual != expected:
-            raise TopologyError(
-                "endpoint patch must cover unresolved edges in stable order"
-            )
-        if (
-            target_row.device.type != "cpu"
-            or target_row.dtype != torch.int64
-            or target_row.shape != patch.edge.shape
-        ):
-            raise TopologyError("resolved endpoint rows must be CPU int64")
-        topology_columns = {
-            name: getattr(draft.topology, name).clone()
-            for name in (
-                "parent",
-                "child_begin",
-                "executed_degree",
-                "nominal_degree",
-                "target_degree",
-                "owner",
-                "familywork_row",
-                "sigma_head_row",
-                "action_begin",
-                "label",
-                "path_length",
-                "target_kind",
-                "target_row",
-            )
-        }
-        binding_columns = {
-            "input_type": draft.bindings.input_type.clone(),
-            "output_type": draft.bindings.output_type.clone(),
-            "sigma_target_row": draft.bindings.sigma_target_row.clone(),
-            "child_output_type": draft.bindings.child_output_type.clone(),
-        }
-        if actual:
-            edge = patch.edge.to(torch.int64)
-            topology_columns["target_kind"][edge] = patch.target_kind
-            topology_columns["target_row"][edge] = target_row.to(torch.int32)
-            binding_columns["child_output_type"][
-                edge
-            ] = patch.child_output_type
-        topology = Topology(**topology_columns)
-        bindings = TopologyBindings(**binding_columns)
-        packet = TopologyPacket(
-            sequence=draft.sequence,
-            node_begin=draft.node_begin,
-            edge_begin=draft.edge_begin,
-            commit_sequence=patch.commit_sequence,
-            topology=topology,
-            bindings=bindings,
-        )
-        packet.topology.validate(packet.bindings, p_train=p_train)
-        return packet
-
-    def preflight(
-        self,
-        publication: TopologyPublication,
-        requests: Sequence[DeviceDestinationRequest],
-    ) -> None:
-        """Validate the static endpoint descriptor before reservations."""
-
-        draft = publication.draft
-        patch = publication.patch
-        if draft.sequence != patch.sequence:
-            raise TopologyError("topology draft and patch sequences differ")
-        expected = draft.unresolved_edges
-        actual = tuple(int(value) for value in patch.edge.tolist())
-        if actual != expected:
-            raise TopologyError(
-                "endpoint patch must cover unresolved edges in stable order"
-            )
-        kinds = tuple(int(value) for value in patch.target_kind.tolist())
-        reservations = tuple(
-            int(value) for value in patch.reservation_index.tolist()
-        )
-        for kind, reservation in zip(kinds, reservations):
-            if kind == 0:
-                if reservation != -1:
-                    raise TopologyError(
-                        "topology endpoint cannot name a destination reservation"
-                    )
-            elif kind == 1:
-                if not 0 <= reservation < len(requests):
-                    raise TopologyError(
-                        "leaf endpoint reservation is outside the commit plan"
-                    )
-                if requests[reservation].slab.schema.name != "Leaf":
-                    raise TopologyError(
-                        "leaf endpoint must bind to a Leaf reservation"
-                    )
-            else:
-                raise TopologyError("unknown topology endpoint kind")
-    def resolve_rows(
-        self,
-        publication: TopologyPublication,
-        transaction: object,
-    ) -> Tensor:
-        """Resolve endpoint rows from the actual reservation beginnings."""
-
-        patch = publication.patch
-        rows = patch.target_ordinal
-        for index, begin in enumerate(transaction.begins):
-            selected_cpu = patch.reservation_index.eq(index)
-            if bool(selected_cpu.any()):
-                selected = selected_cpu.to(
-                    device=rows.device, dtype=torch.bool, non_blocking=True
-                )
-                lane_begin = begin[publication.lane]
-                rows = torch.where(
-                    selected,
-                    lane_begin + patch.target_ordinal,
-                    rows,
-                )
-                request = transaction.requests[index]
-                torch._assert_async(
-                    (
-                        ~selected
-                        | (
-                            (patch.target_ordinal >= 0)
-                            & (
-                                patch.target_ordinal
-                                < request.counts[publication.lane]
-                            )
-                        )
-                    ).all(),
-                    "endpoint ordinal exceeds its realized reservation",
-                )
-        return rows
-
-    def prepare_defer(
-        self,
-        publications: Sequence[TopologyPublication],
-        resolved_rows: Sequence[Tensor],
-        marker: Tensor,
-        *,
-        stream: torch.cuda.Stream,
-    ) -> _PendingTopologyBatch | None:
-        if not publications:
-            return None
-        if len(publications) != len(resolved_rows):
-            raise TopologyError("topology publications and resolved rows differ")
-        if len(self._pending) >= self.max_inflight_batches:
-            raise TopologyError("topology publication exceeds in-flight batch cap")
-        total = sum(int(value.numel()) for value in resolved_rows)
-        if total > self.owners.topology_edge_cap:
-            raise TopologyError("endpoint transfer exceeds topology edge cap")
-        used = {pending.slot for pending in self._pending}
-        slot = next(
-            (
-                candidate
-                for candidate in range(self.max_inflight_batches)
-                if candidate not in used
-            ),
-            None,
-        )
-        if slot is None:
-            raise TopologyError("no bounded topology transfer slot is free")
-        cpu_rows = self._row_buffers[slot][:total]
-        slices: list[slice] = []
-        offset = 0
-        for value in resolved_rows:
-            stop = offset + value.numel()
-            cpu_rows[offset:stop].copy_(value, non_blocking=True)
-            slices.append(slice(offset, stop))
-            offset = stop
-        cpu_marker = self._marker_buffers[slot]
-        pending = _PendingTopologyBatch(
-            slot,
-            tuple(publications),
-            cpu_rows,
-            tuple(slices),
-            cpu_marker,
-            torch.cuda.Event(blocking=False),
-        )
-        self._pending.append(pending)
-        return pending
-
-    @staticmethod
-    def finalize_defer(
-        pending: _PendingTopologyBatch | None,
-        marker: Tensor,
-        *,
-        stream: torch.cuda.Stream,
-    ) -> None:
-        if pending is None:
-            return
-        pending.marker.copy_(marker, non_blocking=True)
-        pending.event.record(stream)
-        pending.armed = True
-
-    def _commit(
-        self,
-        publication: TopologyPublication,
-        target_row: Tensor,
-    ) -> ReplicaTopologyPacket:
-        key = self._key(publication)
-        try:
-            draft = self._drafts[key]
-        except KeyError as exc:
-            raise TopologyError("endpoint patch has no staged packet") from exc
-        packet = self._materialize(
-            draft,
-            publication.patch,
-            target_row,
-            p_train=self.p_train,
-        )
-        del self._drafts[key]
-        retained = ReplicaTopologyPacket(publication.lane, packet)
-        self._packets.append(retained)
-        return retained
-
-    def abort(self, lane: int, sequence: int) -> None:
-        key = (lane, sequence)
-        if key not in self._drafts:
-            raise TopologyError("cannot abort an unknown topology sequence")
-        draft = self._drafts.pop(key)
-        self._reserved_packets -= 1
-        self._reserved_nodes -= draft.declared_node_count
-        self._reserved_edges -= draft.declared_edge_count
-
-    def cancel(self, publications: Sequence[TopologyPublication]) -> None:
-        keys = {self._key(item) for item in publications}
-        self._pending = [
-            pending
-            for pending in self._pending
-            if not any(self._key(item) in keys for item in pending.publications)
-        ]
-        for lane, sequence in keys:
-            if (lane, sequence) in self._drafts:
-                self.abort(lane, sequence)
-
-    def cancel_deferred(
-        self, publications: Sequence[DeferredUnaryTopologyPublication]
-    ) -> None:
-        keys = {(item.lane, item.sequence) for item in publications}
-        self._deferred_pending = [
-            item
-            for item in self._deferred_pending
-            if (item.publication.lane, item.publication.sequence) not in keys
-        ]
-        for key in keys:
-            publication = self._deferred_staged.pop(key, None)
-            if publication is not None:
-                self._deferred_reserved_rows -= publication.terminal.numel()
-
-    def seal_expansions(
-        self,
-        *,
-        lane: int = 0,
-        input_count: int,
-        input_output: Sequence[int] | None = None,
-    ) -> tuple[Topology, TopologyBindings, int]:
-        """Seal committed degree-one rows through the common assembler."""
-
-        if not 0 <= lane < self.owners.n_replica:
-            raise TopologyError("deferred topology lane is outside replicas")
-        if self._deferred_pending:
-            with torch.cuda.stream(self._accept_stream):
-                for item in self._deferred_pending:
-                    self._accept_stream.wait_event(item.event)
-                ready = torch.cuda.Event(blocking=False)
-                ready.record(self._accept_stream)
-            ready.synchronize()
-            self._accept_deferred_ready()
-        if self._deferred_staged or self._deferred_pending:
-            raise TopologyError("deferred topology did not reach commit visibility")
-        ordered = [
-            rows
-            for accepted_lane, _sequence, rows in sorted(
-                self._deferred_accepted, key=lambda item: (item[0], item[1])
-            )
-            if accepted_lane == lane
-        ]
-        if not ordered:
-            raise TopologyError("deferred topology is empty")
-        output_for_input = (
-            tuple(0 for _ in range(input_count))
-            if input_output is None
-            else tuple(int(value) for value in input_output)
-        )
-        if len(output_for_input) != input_count or any(
-            value < 0 for value in output_for_input
-        ):
-            raise TopologyError("deferred input/output map is invalid")
-        trace = torch.cat(ordered, 0)
-        assembler = TopologyAssembler(
-            input_to_output=output_for_input,
-            p_train=self.p_train,
-            topology_cap=self.owners.topology_cap,
-            topology_edge_cap=self.owners.topology_edge_cap,
-        )
-        expansions = []
-        for values in trace.tolist():
-            trained = bool(values[14])
-            input_index = int(values[9])
-            next_input = int(values[4])
-            if not 0 <= input_index < input_count:
-                raise TopologyError(
-                    "deferred input type is outside preorder"
-                )
-            if not 0 <= next_input < input_count:
-                raise TopologyError(
-                    "deferred next input type is outside preorder"
-                )
-            terminal = bool(values[5])
-            expansions.append(
-                TopologyExpansion(
-                    key=(int(values[0]), int(values[1])),
-                    executed_degree=int(values[10]),
-                    nominal_degree=int(values[11]),
-                    target_degree=int(values[12]),
-                    trained=trained,
-                    owner=int(values[6]),
-                    input_type=input_index,
-                    familywork_row=int(values[15]),
-                    sigma_head_row=int(values[15]),
-                    action_begin=int(values[16]),
-                    refill=False,
-                    edges=(
-                        TopologyExpansionEdge(
-                            label=int(values[7]),
-                            path_length=1,
-                            terminal=terminal,
-                            child_key=(
-                                int(values[2]),
-                                int(values[3]),
-                            ),
-                            child_leaf_row=(
-                                int(values[13]) if terminal else -1
-                            ),
-                            child_input=next_input,
-                        ),
-                    ),
-                )
-            )
-        assembler.accept(expansions, sampled_nodes=0)
-        return assembler.seal()
+        self._stagers = ()
 
     def assert_drained(self) -> None:
-        if (
-            self._drafts
-            or self._pending
-            or self._deferred_staged
-            or self._deferred_pending
-            or self._expansion_staged
-            or self._expansion_pending
-            or self._expansion_accepted
-        ):
+        if self._staged or self._pending or self._accepted:
             raise TopologyError("uncommitted topology packets remain staged")
 
 
@@ -2217,46 +1277,19 @@ class CommitPlan:
     coverage: CommitCoverage
     published_queues: tuple[SemanticFamilyFIFO, ...] = ()
     topology: tuple[TopologyPublication, ...] = ()
-    deferred_topology: tuple[DeferredUnaryTopologyPublication, ...] = ()
-    expansion_topology: tuple[TopologyExpansionPublication, ...] = ()
     queue_cost_additions: tuple[Tensor, ...] = ()
     device_failure: DeviceCommitFailure | None = None
 
     def __post_init__(self) -> None:
         if not self.destinations:
             raise ValueError("a commit plan requires retained destinations")
-        keys = tuple((item.lane, item.draft.sequence) for item in self.topology)
+        keys = tuple((item.lane, item.sequence) for item in self.topology)
         if len(set(keys)) != len(keys):
             raise ValueError("a commit plan repeats a topology sequence")
         lanes = tuple(item.lane for item in self.topology)
         if len(set(lanes)) != len(lanes):
             raise ValueError(
                 "a family commit may stage only one topology packet per lane"
-            )
-        deferred_keys = tuple(
-            (item.lane, item.sequence) for item in self.deferred_topology
-        )
-        if len(set(deferred_keys)) != len(deferred_keys):
-            raise ValueError("a commit plan repeats a deferred topology sequence")
-        deferred_lanes = tuple(item.lane for item in self.deferred_topology)
-        if len(set(deferred_lanes)) != len(deferred_lanes):
-            raise ValueError(
-                "a family commit may stage only one deferred packet per lane"
-            )
-        expansion_keys = tuple(
-            (item.lane, item.sequence)
-            for item in self.expansion_topology
-        )
-        if len(set(expansion_keys)) != len(expansion_keys):
-            raise ValueError(
-                "a commit plan repeats a topology expansion sequence"
-            )
-        expansion_lanes = tuple(
-            item.lane for item in self.expansion_topology
-        )
-        if len(set(expansion_lanes)) != len(expansion_lanes):
-            raise ValueError(
-                "a family commit may stage only one expansion packet per lane"
             )
         queue_ids = tuple(id(queue) for queue in self.published_queues)
         if len(set(queue_ids)) != len(queue_ids):
@@ -2341,7 +1374,7 @@ class RolloutCommit:
     peak_after_transition: int
     commit_started: torch.cuda.Event | None
     event: torch.cuda.Event
-    topology: tuple[TopologyExpansionPublication, ...] = ()
+    topology: tuple[TopologyPublication, ...] = ()
 
 
 class RolloutTransaction:
@@ -2585,12 +1618,6 @@ class RolloutTransaction:
                     plan.destinations, realized_counts
                 )
             )
-            marker = torch.full(
-                (self.n_replica,),
-                -1,
-                dtype=torch.int64,
-                device=self.device,
-            )
             sample_ready = torch.cuda.Event(blocking=False)
             sample_ready.record(self.model_stream)
             device_failure = plan.device_failure
@@ -2606,25 +1633,7 @@ class RolloutTransaction:
                 raise RolloutError("topology publication lane is outside replicas")
             if publication.lane not in scheduled.lanes:
                 raise RolloutError("topology publication lane was not scheduled")
-            self.topology.preflight(publication, destinations)
-        for publication in plan.deferred_topology:
-            if publication.lane not in scheduled.lanes:
-                raise RolloutError(
-                    "deferred topology lane was not scheduled"
-                )
-            self.topology.preflight_deferred(publication, destinations)
-        for publication in plan.expansion_topology:
-            if publication.lane >= self.n_replica:
-                raise RolloutError(
-                    "topology expansion lane is outside replicas"
-                )
-            if publication.lane not in scheduled.lanes:
-                raise RolloutError(
-                    "topology expansion lane was not scheduled"
-                )
         transaction = None
-        pending_topology = None
-        pending_deferred: list[_PendingDeferredUnary] = []
         published = False
         source_head_before: Tensor | None = None
         queue_before: list[tuple[SemanticFamilyFIFO, Tensor, Tensor]] = []
@@ -2640,23 +1649,7 @@ class RolloutTransaction:
                 if commit_started is not None:
                     commit_started.record(self.commit_stream)
                 for publication in plan.topology:
-                    self.commit_stream.wait_event(
-                        publication.draft.validation_event
-                    )
-                    torch._assert_async(
-                        publication.draft.device_valid.all(),
-                        "device topology validation failed before commit",
-                    )
-                    torch._assert_async(
-                        (publication.patch.target_ordinal >= 0).all(),
-                        "endpoint ordinal must be nonnegative",
-                    )
-                for publication in plan.topology:
                     self.topology.stage(publication)
-                for publication in plan.deferred_topology:
-                    self.topology.stage_deferred(publication)
-                for publication in plan.expansion_topology:
-                    self.topology.stage_expansion(publication)
                 transaction = PublicationTransaction.begin_device(
                     destinations,
                     phase="rollout_commit",
@@ -2685,24 +1678,6 @@ class RolloutTransaction:
                         failure_code=device_failure.failure_code,
                         input_type=device_failure.input_type,
                     )
-                resolved_rows = tuple(
-                    self.topology.resolve_rows(publication, transaction)
-                    for publication in plan.topology
-                )
-                pending_topology = self.topology.prepare_defer(
-                    plan.topology,
-                    resolved_rows,
-                    marker,
-                    stream=self.commit_stream,
-                )
-                pending_deferred = [
-                    self.topology.prepare_deferred(
-                        publication,
-                        transaction,
-                        stream=self.commit_stream,
-                    )
-                    for publication in plan.deferred_topology
-                ]
                 transaction.fill_all()
                 if failure_injector is not None:
                     failure_injector()
@@ -2741,42 +1716,7 @@ class RolloutTransaction:
                 source.head[batch.lanes] = torch.where(
                     selected, new_source_head, old_source_head
                 )
-                marker_sequence = torch.full_like(marker, -1)
-                for publication in plan.topology:
-                    lane_mask = torch.arange(
-                        self.n_replica,
-                        dtype=torch.int64,
-                        device=self.device,
-                    ).eq(publication.lane)
-                    marker_sequence.copy_(
-                        torch.where(
-                            lane_mask,
-                            torch.full_like(
-                                marker_sequence,
-                                publication.draft.sequence,
-                            ),
-                            marker_sequence,
-                        )
-                    )
-                for publication in plan.deferred_topology:
-                    lane_mask = torch.arange(
-                        self.n_replica,
-                        dtype=torch.int64,
-                        device=self.device,
-                    ).eq(publication.lane)
-                    marker_sequence.copy_(
-                        torch.where(
-                            lane_mask,
-                            torch.full_like(
-                                marker_sequence, publication.sequence
-                            ),
-                            marker_sequence,
-                        )
-                    )
-                success = transaction.publish(
-                    commit_marker=marker,
-                    sequence=marker_sequence,
-                )
+                success = transaction.publish()
                 published = True
                 if "frontier_cost_contribution" in batch.fields:
                     frontier_before.append(
@@ -2820,23 +1760,12 @@ class RolloutTransaction:
                 source._record_ready(self.commit_stream)
                 for queue in plan.published_queues:
                     queue._record_ready(self.commit_stream)
-                self.topology.finalize_defer(
-                    pending_topology,
-                    marker,
-                    stream=self.commit_stream,
-                )
-                for pending in pending_deferred:
-                    self.topology.finalize_deferred(
-                        pending,
-                        marker,
-                        stream=self.commit_stream,
-                    )
                 commit_ready = torch.cuda.Event(
                     enable_timing=measure_commit, blocking=False
                 )
                 commit_ready.record(self.commit_stream)
-                for publication in plan.expansion_topology:
-                    self.topology.finalize_expansion(
+                for publication in plan.topology:
+                    self.topology.finalize(
                         publication,
                         success,
                         stream=self.commit_stream,
@@ -2856,23 +1785,9 @@ class RolloutTransaction:
                     for queue, frontier in reversed(frontier_before):
                         queue.frontier_cost.copy_(frontier)
             self.topology.cancel(plan.topology)
-            self.topology.cancel_deferred(plan.deferred_topology)
-            self.topology.cancel_expansions(plan.expansion_topology)
             self._state = _MachineState.FAILED
             raise
-        sequence = (
-            plan.expansion_topology[-1].sequence
-            if plan.expansion_topology
-            else (
-                plan.deferred_topology[-1].sequence
-                if plan.deferred_topology
-                else (
-                    0
-                    if not plan.topology
-                    else plan.topology[-1].draft.sequence
-                )
-            )
-        )
+        sequence = 0 if not plan.topology else plan.topology[-1].sequence
         self._state = _MachineState.COMMITTED
         return RolloutCommit(
             success=success,
@@ -2888,7 +1803,7 @@ class RolloutTransaction:
             peak_after_transition=peak_after_transition,
             commit_started=commit_started,
             event=commit_ready,
-            topology=plan.expansion_topology,
+            topology=plan.topology,
         )
 
 
@@ -3118,16 +2033,13 @@ __all__ = [
     "CompletionBatch",
     "CompletionFIFO",
     "CompletionPlan",
-    "DeferredUnaryTopologyPublication",
     "DeviceCommitFailure",
     "DeviceStableRoute",
     "DrawPurpose",
-    "EndpointPatch",
     "FamilyBatch",
     "FamilyQueueState",
     "FamilyScheduler",
     "ModelWorkspace",
-    "ReplicaTopologyPacket",
     "RolloutCommit",
     "RolloutError",
     "RolloutHooks",
@@ -3137,8 +2049,6 @@ __all__ = [
     "SampleWorkspace",
     "ScheduledFamily",
     "SemanticFamilyFIFO",
-    "TopologyDraftPacket",
-    "TopologyExpansionPublication",
     "TopologyPublication",
     "TransitionRequest",
     "child_path_keys",

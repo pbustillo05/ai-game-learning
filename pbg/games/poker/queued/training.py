@@ -788,7 +788,7 @@ class PokerSequentialProgram:
             mode=self.mode,
             policy=self.policy,
             response_cutoff=self.response_cutoff,
-            topology_stagers=topology_publisher.expansion_stagers,
+            topology_stagers=topology_publisher.stagers,
         )
         scheduler = FamilyScheduler(
             input_names, owners.plan.manifest.family_pack_cap

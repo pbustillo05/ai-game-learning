@@ -312,7 +312,7 @@ class IterationEngine:
             for submission in pending:
                 produced: tuple[int, ...] | None = None
                 for publication in submission.commit.topology:
-                    failed, current = topology.accept_expansion(publication)
+                    failed, current = topology.accept(publication)
                     if failed:
                         raise failure(publication.lane)
                     if produced is not None:
@@ -357,7 +357,7 @@ class IterationEngine:
             for lane in range(lane_count)
         )
         publisher.assert_drained()
-        publisher.release_expansion_storage()
+        publisher.release_storage()
         topologies = tuple(item[0] for item in sealed)
         bindings = tuple(item[1] for item in sealed)
         leaf_counts = tuple(item[2] for item in sealed)

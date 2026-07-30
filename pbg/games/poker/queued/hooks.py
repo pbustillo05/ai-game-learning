@@ -39,7 +39,7 @@ from pbg.core.rollout import (
     SampleRequest,
     SampleWorkspace,
     SemanticFamilyFIFO,
-    TopologyExpansionPublication,
+    TopologyPublication,
     TransitionRequest,
     child_path_keys,
     logical_rng_keys,
@@ -1311,7 +1311,7 @@ class SequentialPokerHooks:
                 "sequential poker hooks require one core topology stager per lane"
             )
         self.topology_stagers = topology_stagers
-        self.last_topology: tuple[TopologyExpansionPublication, ...] = ()
+        self.last_topology: tuple[TopologyPublication, ...] = ()
         self._topology_sequence = [0] * owners.n_replica
 
     def _combo_class(self) -> Tensor:
@@ -2082,7 +2082,7 @@ class SequentialPokerHooks:
             destination[lane, 2::4].copy_(route_destination)
             destination_ordinal[lane, 2::4].copy_(route_ordinal)
 
-        topologies: list[TopologyExpansionPublication] = []
+        topologies: list[TopologyPublication] = []
         boards = next_state.board_cards.reshape(lane_count, rows, 5)
         for local_lane, lane in enumerate(batch.lanes.tolist()):
             topology_next_family = next_family[local_lane]
@@ -2182,7 +2182,7 @@ class SequentialPokerHooks:
                     rows, dtype=torch.int64, device=state.device
                 ),
             )
-            topology = TopologyExpansionPublication(
+            topology = TopologyPublication(
                 lane=lane,
                 sequence=sequence,
                 declared_nodes=rows,
@@ -2196,11 +2196,10 @@ class SequentialPokerHooks:
             tuple(destinations),
             CommitCoverage(valid, source_ordinal, destination, destination_ordinal),
             published_queues=tuple(published_queues),
-            expansion_topology=self.last_topology,
+            topology=self.last_topology,
         )
 
 
-# Phase 5 imports retain their public spelling while using the shared engine.
 class PokerLearnerPolicy:
     """Reconstruct public legality and invoke the canonical policy operation."""
 

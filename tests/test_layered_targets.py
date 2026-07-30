@@ -48,7 +48,6 @@ from pbg.core.topology import (
     Topology,
     TopologyBindings,
     TopologyError,
-    TopologyPacket,
     build_layer_plan,
 )
 from tests.static_gates import core_firewall_violations
@@ -74,60 +73,6 @@ def sampled_completion(
         return_value=payoff.unsqueeze(-1),
         trace_vector=payoff if branched else None,
     )
-
-
-def assemble_topology_packets(
-    packets: tuple[TopologyPacket, ...], *, p_train: int
-) -> tuple[Topology, TopologyBindings]:
-    if not packets:
-        raise TopologyError("at least one topology packet is required")
-    ordered = sorted(packets, key=lambda packet: packet.sequence)
-    node_cursor = 0
-    edge_cursor = 0
-    for sequence, packet in enumerate(ordered):
-        if packet.sequence != sequence:
-            raise TopologyError("topology packet sequence has a gap")
-        if packet.node_begin != node_cursor or packet.edge_begin != edge_cursor:
-            raise TopologyError("topology packet extents are not contiguous")
-        node_cursor += packet.topology.node_count
-        edge_cursor += packet.topology.edge_count
-
-    def join(name: str) -> torch.Tensor:
-        return torch.cat(
-            tuple(getattr(packet.topology, name) for packet in ordered)
-        ).contiguous()
-
-    topology = Topology(
-        parent=join("parent"),
-        child_begin=join("child_begin"),
-        executed_degree=join("executed_degree"),
-        nominal_degree=join("nominal_degree"),
-        target_degree=join("target_degree"),
-        owner=join("owner"),
-        familywork_row=join("familywork_row"),
-        sigma_head_row=join("sigma_head_row"),
-        action_begin=join("action_begin"),
-        label=join("label"),
-        path_length=join("path_length"),
-        target_kind=join("target_kind"),
-        target_row=join("target_row"),
-    )
-    bindings = TopologyBindings(
-        input_type=torch.cat(
-            tuple(packet.bindings.input_type for packet in ordered)
-        ).contiguous(),
-        output_type=torch.cat(
-            tuple(packet.bindings.output_type for packet in ordered)
-        ).contiguous(),
-        sigma_target_row=torch.cat(
-            tuple(packet.bindings.sigma_target_row for packet in ordered)
-        ).contiguous(),
-        child_output_type=torch.cat(
-            tuple(packet.bindings.child_output_type for packet in ordered)
-        ).contiguous(),
-    )
-    topology.validate(bindings, p_train=p_train)
-    return topology.compact(bindings, p_train=p_train)
 
 
 def initialize_work_arenas(
@@ -622,31 +567,17 @@ def _close(owners: GeneratedOwners) -> None:
     owners.close()
 
 
-def test_topology_packets_compact_unary_rows_and_preserve_path_cost() -> None:
+def test_topology_compaction_preserves_unary_path_cost() -> None:
     mode = mode_schema("self_play", "branched.fixed", "sampled")
     topology, bindings = _topology(mode, structural_unary=True)
-    packet = TopologyPacket(0, 0, 0, 0, topology, bindings)
-    compact, compact_bindings = assemble_topology_packets(
-        (packet,), p_train=2
-    )
+    topology.validate(bindings, p_train=2)
+    compact, compact_bindings = topology.compact(bindings, p_train=2)
     assert compact.node_count == 1
     assert compact.edge_count == 1
     assert compact.path_length.tolist() == [3]
     assert compact.label.tolist() == [4]
     assert compact.target_kind.tolist() == [int(TargetKind.LEAF)]
     compact.validate(compact_bindings, p_train=2, compact=True)
-
-
-def test_topology_packets_reject_partial_commit_and_sequence_gap() -> None:
-    mode = mode_schema("self_play", "sequential", "sampled")
-    topology, bindings = _topology(mode)
-    with pytest.raises(TopologyError, match="committed"):
-        TopologyPacket(1, 0, 0, 0, topology, bindings)
-    packet = TopologyPacket(1, 0, 0, 1, topology, bindings)
-    with pytest.raises(TopologyError, match="sequence"):
-        assemble_topology_packets((packet,), p_train=2)
-
-
 def test_layer_plan_handles_duplicates_unbalanced_last_consumers_and_dense_rows() -> None:
     mode = mode_schema("self_play", "branched.fixed", "sampled")
     topology, bindings = _topology(mode, unbalanced=True)

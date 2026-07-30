@@ -21,11 +21,13 @@ from pbg.games.poker.queued.hooks import (
     sampled_partitions,
 )
 from pbg.games.poker.queued.branching import (
-    TopologyPacketStager,
-    _ExpansionRecord,
-    _StagedBranchedPayload,
     sampled_branched_chance_frontier_row_bytes,
     sampled_branched_topology_packet_row_bytes,
+)
+from pbg.core.topology import (
+    StagedTopologyPacket,
+    TopologyExpansionRecord,
+    TopologyPacketStager,
 )
 from pbg.games.poker.queued.config import BranchedModeConfig
 from pbg.core.branching import (
@@ -934,6 +936,7 @@ def test_untrained_unary_root_refill_restores_one_structural_root() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     recorder = TopologyPacketStager(
         input_names=("pre",),
+        input_to_output=(0,),
         p_train=2,
         topology_cap=8,
         topology_edge_cap=8,
@@ -942,7 +945,7 @@ def test_untrained_unary_root_refill_restores_one_structural_root() -> None:
     )
 
     def payload(*, refill: bool, child_path: int, leaf_row: int):
-        record = _ExpansionRecord(
+        record = TopologyExpansionRecord(
             node_active=torch.tensor([True]),
             edge_active=torch.tensor([True]),
             parent_key=torch.tensor([[0, 0]], dtype=torch.int64),
@@ -964,8 +967,8 @@ def test_untrained_unary_root_refill_restores_one_structural_root() -> None:
             refill=torch.tensor([refill]),
             path_length=torch.tensor([1], dtype=torch.int32),
         )
-        return _StagedBranchedPayload(
-            (record,),
+        return StagedTopologyPacket(
+            record,
             torch.tensor([0], dtype=torch.int64),
             torch.tensor(1, dtype=torch.int64),
             torch.tensor(0, dtype=torch.float32),
@@ -975,8 +978,8 @@ def test_untrained_unary_root_refill_restores_one_structural_root() -> None:
             torch.tensor(1, dtype=torch.int64),
         )
 
-    recorder.accept_payload(payload(refill=False, child_path=11, leaf_row=0))
-    recorder.accept_payload(payload(refill=True, child_path=12, leaf_row=1))
+    recorder.accept(payload(refill=False, child_path=11, leaf_row=0))
+    recorder.accept(payload(refill=True, child_path=12, leaf_row=1))
     topology, _, leaf_count = recorder.seal()
     assert topology.node_count == 1
     assert topology.executed_degree.tolist() == [2]

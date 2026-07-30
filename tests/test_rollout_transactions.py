@@ -26,7 +26,6 @@ from pbg.core.rollout import (
     CompletionFIFO,
     CompletionPlan,
     DrawPurpose,
-    EndpointPatch,
     FamilyQueueState,
     FamilyScheduler,
     LOGICAL_RNG_VERSION,
@@ -34,8 +33,6 @@ from pbg.core.rollout import (
     RolloutOwnerRegistry,
     SampleWorkspace,
     SemanticFamilyFIFO,
-    TopologyDraftPacket,
-    TopologyPublication,
     child_path_keys,
     device_exclusive_scan,
     logical_categorical,
@@ -52,7 +49,6 @@ from pbg.core.storage import (
     SoASchema,
     StorageError,
 )
-from pbg.core.topology import Topology, TopologyBindings, TopologyError
 
 
 CUDA = pytest.mark.skipif(
@@ -180,6 +176,17 @@ def _registry(
     )
 
 
+def _publisher(
+    owners: RolloutOwnerRegistry, *, p_train: int = 1
+) -> AsyncTopologyPublisher:
+    return AsyncTopologyPublisher(
+        owners,
+        p_train=p_train,
+        input_names=("pre", "post2"),
+        input_to_output=(0, 0),
+    )
+
+
 def _coverage(
     counts: torch.Tensor,
     rows: int,
@@ -195,70 +202,6 @@ def _coverage(
         destination=torch.full_like(ordinal, destination),
         destination_ordinal=ordinal,
     )
-
-
-def _i32(values) -> torch.Tensor:
-    return torch.tensor(values, dtype=torch.int32, pin_memory=True)
-
-
-def _draft(
-    sequence: int = 0,
-    *,
-    device: torch.device | str = "cuda",
-    target_ordinal: int = 0,
-) -> tuple[TopologyDraftPacket, EndpointPatch]:
-    topology = Topology(
-        parent=_i32([-1]),
-        child_begin=_i32([0]),
-        executed_degree=_i32([1]),
-        nominal_degree=_i32([1]),
-        target_degree=_i32([1]),
-        owner=_i32([0]),
-        familywork_row=_i32([0]),
-        sigma_head_row=_i32([0]),
-        action_begin=_i32([0]),
-        label=_i32([7]),
-        path_length=_i32([1]),
-        target_kind=_i32([-1]),
-        target_row=_i32([-1]),
-    )
-    bindings = TopologyBindings(
-        input_type=_i32([0]),
-        output_type=_i32([0]),
-        sigma_target_row=_i32([0]),
-        child_output_type=_i32([-1]),
-    )
-    draft = TopologyDraftPacket(
-        sequence=sequence,
-        node_begin=0,
-        edge_begin=0,
-        topology=topology,
-        bindings=bindings,
-        unresolved_edges=(0,),
-        declared_node_count=1,
-        declared_edge_count=1,
-        validation_event=torch.cuda.Event(blocking=False),
-        ready_event=torch.cuda.Event(blocking=False),
-        device_valid=torch.ones(
-            1, dtype=torch.bool, device=device
-        ),
-    )
-    draft.validation_event.record(torch.cuda.current_stream(device))
-    draft.ready_event.record(torch.cuda.current_stream(device))
-    patch = EndpointPatch(
-        sequence=sequence,
-        edge=_i32([0]),
-        target_kind=_i32([1]),
-        reservation_index=_i32([0]),
-        preflight_target_row=_i32([0]),
-        target_ordinal=torch.tensor(
-            [target_ordinal], dtype=torch.int64, device=device
-        ),
-        child_output_type=_i32([0]),
-        commit_sequence=sequence,
-    )
-    return draft, patch
-
 
 def test_scheduler_is_full_first_preorder_load_age_and_never_pads_lanes() -> None:
     fixed = mode_schema("self_play", "branched.fixed", "sampled")
@@ -760,8 +703,7 @@ def test_one_model_sample_commit_path_serves_sequential_and_branched(
     )
     assert scheduled is not None
     owners = _registry((family, metadata, leaf), family_pack_cap=2)
-    publisher = AsyncTopologyPublisher(owners, p_train=1)
-    draft, patch = _draft(0, device=device)
+    publisher = _publisher(owners)
     seen: dict[str, object] = {}
 
     class Hooks:
@@ -884,7 +826,7 @@ def test_sample_cannot_publish_retained_storage() -> None:
         schema,
         seed=1,
         iteration=1,
-        topology=AsyncTopologyPublisher(owners, p_train=1),
+        topology=_publisher(owners),
         owners=owners,
     )
     with pytest.raises(Exception, match="sample wrote"):
@@ -942,7 +884,7 @@ def test_branched_fanout_publishes_a_declared_cross_family_fifo() -> None:
         ),
         family_pack_cap=1,
     )
-    publisher = AsyncTopologyPublisher(owners, p_train=1)
+    publisher = _publisher(owners)
     duplicate_coverage = _coverage(one, 1)
     with pytest.raises(ValueError, match="repeats a published queue"):
         CommitPlan(
@@ -1052,7 +994,7 @@ def test_post_publish_exception_rolls_back_destination_and_source_visibility() -
         family_pack_cap=1,
         completion_pack_cap=1,
     )
-    publisher = AsyncTopologyPublisher(owners, p_train=1)
+    publisher = _publisher(owners)
 
     class Hooks:
         def model_input(self, batch):
@@ -1098,33 +1040,6 @@ def test_post_publish_exception_rolls_back_destination_and_source_visibility() -
     assert family.epoch(0) == metadata.epoch(0) == leaf.epoch(0) == 1
     family.release()
     metadata.release()
-    leaf.release()
-    failures.release()
-
-
-@CUDA
-def test_topology_staging_enforces_cumulative_manifest_caps() -> None:
-    device = torch.device("cuda", 0)
-    failures = DeviceFailureState(2, device)
-    leaf = _slab(
-        _schema("Leaf", (SoAField("terminal", torch.int32),)),
-        2,
-        failures,
-    )
-    owners = _registry(
-        (leaf,),
-        topology_packet_cap=2,
-        topology_cap=1,
-        topology_edge_cap=1,
-    )
-    publisher = AsyncTopologyPublisher(owners, p_train=1)
-    first = TopologyPublication(0, *_draft(0, device=device))
-    second = TopologyPublication(1, *_draft(0, device=device))
-    publisher.stage(first)
-    with pytest.raises(TopologyError, match="cumulative node cap"):
-        publisher.stage(second)
-    publisher.abort(0, 0)
-    publisher.assert_drained()
     leaf.release()
     failures.release()
 

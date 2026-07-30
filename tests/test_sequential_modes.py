@@ -63,6 +63,7 @@ from pbg.core.targets import (
 )
 from pbg.core.optimization import DenseAdam, OptimizerConfig
 from pbg.core.rollout import (
+    AsyncTopologyPublisher,
     RolloutOwnerRegistry,
     SemanticFamilyFIFO,
 )
@@ -820,8 +821,20 @@ def test_folded_owner_refreshes_model_input_and_releases_at_seal() -> None:
         )
         for name in ("pre", "post_2")
     }
+    publisher = AsyncTopologyPublisher(
+        registry,
+        p_train=2,
+        input_names=("pre", "post_2"),
+        input_to_output=(0, 0),
+    )
     hooks = SequentialPokerHooks(
-        geometry, registry, queues, seed=3, iteration=0, mode=mode
+        geometry,
+        registry,
+        queues,
+        seed=3,
+        iteration=0,
+        mode=mode,
+        topology_stagers=publisher.stagers,
     )
     folded = owners.slab("FoldedRanges", "pre")
     class_range = torch.arange(

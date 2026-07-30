@@ -1196,25 +1196,6 @@ class TopologyPacketStager:
         self._observed_demand = torch.empty(0, dtype=torch.int64)
 
 @dataclass(frozen=True)
-class TopologyPacket:
-    """One committed absolute-address slice of a topology transfer."""
-
-    sequence: int
-    node_begin: int
-    edge_begin: int
-    commit_sequence: int
-    topology: Topology
-    bindings: TopologyBindings
-
-    def __post_init__(self) -> None:
-        if min(self.sequence, self.node_begin, self.edge_begin) < 0:
-            raise TopologyError("packet addresses must be nonnegative")
-        if self.commit_sequence != self.sequence:
-            raise TopologyError("topology packet is not transactionally committed")
-        self.bindings.validate(self.topology.node_count, self.topology.edge_count)
-
-
-@dataclass(frozen=True)
 class LayerPlan:
     """Exact CPU movement and reverse-layer execution plan."""
 
@@ -2045,7 +2026,6 @@ __all__ = [
     "TopologyExpansion",
     "TopologyExpansionEdge",
     "TopologyExpansionRecord",
-    "TopologyPacket",
     "TopologyPacketOverflow",
     "TopologyPacketStager",
     "build_layer_plan",
