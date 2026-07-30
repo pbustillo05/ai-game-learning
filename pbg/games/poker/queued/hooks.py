@@ -33,19 +33,20 @@ from pbg.core.rollout import (
     CommitPlan,
     CompletionBatch,
     CompletionPlan,
-    DeferredUnaryTopologyPublication,
     DrawPurpose,
     FamilyBatch,
     RolloutOwnerRegistry,
     SampleRequest,
     SampleWorkspace,
     SemanticFamilyFIFO,
+    TopologyExpansionPublication,
     TransitionRequest,
     child_path_keys,
     logical_rng_keys,
     stable_route,
 )
 from pbg.core.storage import DeviceDestinationRequest, MonotoneSlab
+from pbg.core.topology import TopologyExpansionRecord, TopologyPacketStager
 from pbg.games.poker.model.capacity import max_public_history_tokens
 from pbg.games.poker.model.primitives import accelerator_assert
 from pbg.games.poker.queued.evaluator import bound_evaluator
@@ -1268,6 +1269,7 @@ class SequentialPokerHooks:
         mode: ModeSchema | None = None,
         policy: PokerPolicyOperator | None = None,
         response_cutoff: bool = False,
+        topology_stagers: tuple[TopologyPacketStager, ...] | None = None,
     ) -> None:
         self.mode = (
             mode_schema("self_play", "sequential", "sampled") if mode is None else mode
@@ -1301,7 +1303,15 @@ class SequentialPokerHooks:
             dtype=torch.int32,
             device=self.owners.device,
         )
-        self.last_topology: tuple[DeferredUnaryTopologyPublication, ...] = ()
+        if (
+            topology_stagers is None
+            or len(topology_stagers) != owners.n_replica
+        ):
+            raise ValueError(
+                "sequential poker hooks require one core topology stager per lane"
+            )
+        self.topology_stagers = topology_stagers
+        self.last_topology: tuple[TopologyExpansionPublication, ...] = ()
         self._topology_sequence = [0] * owners.n_replica
 
     def _combo_class(self) -> Tensor:
@@ -2072,7 +2082,7 @@ class SequentialPokerHooks:
             destination[lane, 2::4].copy_(route_destination)
             destination_ordinal[lane, 2::4].copy_(route_ordinal)
 
-        topologies: list[DeferredUnaryTopologyPublication] = []
+        topologies: list[TopologyExpansionPublication] = []
         boards = next_state.board_cards.reshape(lane_count, rows, 5)
         for local_lane, lane in enumerate(batch.lanes.tolist()):
             topology_next_family = next_family[local_lane]
@@ -2087,39 +2097,97 @@ class SequentialPokerHooks:
                     leaf_family,
                     topology_next_family,
                 )
-            topology = DeferredUnaryTopologyPublication(
-                lane=lane,
-                sequence=self._topology_sequence[lane],
-                input_type_index=self.input_index[batch.input_type],
-                logical_rng_key=logical[local_lane],
-                next_logical_rng_key=next_logical[local_lane],
-                next_input_type=topology_next_family,
-                terminal=terminal[local_lane],
+            lane_terminal = terminal[local_lane]
+            lane_trained = trained[local_lane]
+            edge_ordinal = torch.arange(
+                rows, dtype=torch.int64, device=state.device
+            )
+            leaf_row = torch.where(
+                lane_terminal,
+                leaf.reserved_tails_device()[lane]
+                + destination_ordinal[lane, 2::4],
+                torch.full_like(edge_ordinal, -1),
+            )
+            trained_ordinal = (
+                lane_trained.cumsum(0, dtype=torch.int64) - 1
+            ).clamp_min(0)
+            sigma_row = torch.where(
+                lane_trained,
+                sigma.reserved_tails_device()[lane] + trained_ordinal,
+                torch.full_like(trained_ordinal, -1),
+            )
+            action_row = torch.where(
+                lane_trained,
+                action_head.reserved_tails_device()[lane] + trained_ordinal,
+                torch.full_like(trained_ordinal, -1),
+            )
+            one = torch.ones(rows, dtype=torch.int32, device=state.device)
+            record = TopologyExpansionRecord(
+                node_active=torch.ones(
+                    rows, dtype=torch.bool, device=state.device
+                ),
+                edge_active=torch.ones(
+                    rows, dtype=torch.bool, device=state.device
+                ),
+                parent_key=logical[local_lane],
+                child_key=next_logical[local_lane],
+                source_ordinal=edge_ordinal,
+                terminal=lane_terminal,
+                child_input=topology_next_family.to(torch.int32),
+                child_leaf_row=leaf_row,
+                label=request.sample.values["action"][local_lane].to(
+                    torch.int32
+                ),
                 owner=(
-                    torch.zeros_like(batch.fields["owner"][local_lane])
+                    torch.zeros_like(
+                        batch.fields["owner"][local_lane],
+                        dtype=torch.int32,
+                    )
                     if response
-                    else batch.fields["owner"][local_lane]
+                    else batch.fields["owner"][local_lane].to(torch.int32)
                 ),
-                action=request.sample.values["action"][local_lane],
-                familywork_row=batch.row[local_lane],
-                executed_degree=torch.ones_like(
-                    batch.fields["owner"][local_lane],
+                input_type=torch.full(
+                    (rows,),
+                    self.input_index[batch.input_type],
                     dtype=torch.int32,
+                    device=state.device,
                 ),
-                nominal_degree=torch.ones_like(
-                    batch.fields["owner"][local_lane],
-                    dtype=torch.int32,
+                familywork_row=sigma_row.to(torch.int32),
+                sigma_head_row=sigma_row.to(torch.int32),
+                action_begin=action_row.to(torch.int32),
+                executed_degree=one,
+                nominal_degree=one,
+                target_degree=one,
+                trained=lane_trained,
+                refill=torch.zeros(
+                    rows, dtype=torch.bool, device=state.device
                 ),
-                target_degree=torch.ones_like(
-                    batch.fields["owner"][local_lane],
-                    dtype=torch.int32,
+                path_length=one,
+            )
+            sequence = self._topology_sequence[lane]
+            payload = self.topology_stagers[lane].stage(
+                (record,),
+                slot=sequence % self.topology_stagers[lane].inflight_cap,
+                produced=route.counts[local_lane, 1:].to(torch.int64),
+                sampled_nodes=torch.zeros(
+                    (), dtype=torch.int64, device=state.device
                 ),
-                leaf_reservation_index=0,
-                leaf_target_ordinal=destination_ordinal[lane, 2::4],
-                trained=trained[local_lane],
-                sigma_reservation_index=1,
-                action_reservation_index=2,
-                trained_target_ordinal=destination_ordinal[lane, 0::4],
+                counterfactual_correction=torch.zeros(
+                    (), dtype=torch.float32, device=state.device
+                ),
+                frontier_overflow=torch.zeros(
+                    (), dtype=torch.bool, device=state.device
+                ),
+                frontier_demand=torch.tensor(
+                    rows, dtype=torch.int64, device=state.device
+                ),
+            )
+            topology = TopologyExpansionPublication(
+                lane=lane,
+                sequence=sequence,
+                declared_nodes=rows,
+                declared_edges=rows,
+                payload=payload,
             )
             self._topology_sequence[lane] += 1
             topologies.append(topology)
@@ -2128,7 +2196,7 @@ class SequentialPokerHooks:
             tuple(destinations),
             CommitCoverage(valid, source_ordinal, destination, destination_ordinal),
             published_queues=tuple(published_queues),
-            deferred_topology=self.last_topology,
+            expansion_topology=self.last_topology,
         )
 
 

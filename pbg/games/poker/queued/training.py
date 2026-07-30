@@ -19,10 +19,12 @@ from pbg.core.contracts import (
     TrainingRegime,
 )
 from pbg.core.iteration import (
+    AcceptedRollout,
     CompletionLoop,
     IterationEngine,
     LearnerPreflightOptimizer,
     RolloutLoop,
+    SealedTopology,
 )
 from pbg.core.learner import (
     AlignedSequentialStore,
@@ -51,7 +53,6 @@ from pbg.core.rollout import (
     FamilyQueueState,
     FamilyScheduler,
     RolloutOwnerRegistry,
-    RolloutTransaction,
     SemanticFamilyFIFO,
 )
 from pbg.core.storage import (
@@ -60,9 +61,6 @@ from pbg.core.storage import (
     PublicationTransaction,
 )
 from pbg.core.targets import ConversionMap, LayeredTargetExecutor, TargetAlgebra
-from pbg.core.topology import (
-    build_layer_plan,
-)
 from pbg.core.training import (
     IterationResult,
     LearnerIteration,
@@ -765,6 +763,22 @@ class PokerSequentialProgram:
             logical_base=logical_base,
             retry_epoch=retry_epoch,
         )
+        input_to_output = tuple(
+            tuple(
+                output.name for output in owners.plan.partitions.outputs
+            ).index(owners.plan.partitions.output_for(name).name)
+            for name in input_names
+        )
+        topology_publisher = AsyncTopologyPublisher(
+            registry,
+            p_train=(
+                self.geometry.players
+                if self.mode.training_regime is TrainingRegime.SELF_PLAY
+                else 1
+            ),
+            input_names=input_names,
+            input_to_output=input_to_output,
+        )
         hooks = SequentialPokerHooks(
             self.geometry,
             registry,
@@ -774,21 +788,7 @@ class PokerSequentialProgram:
             mode=self.mode,
             policy=self.policy,
             response_cutoff=self.response_cutoff,
-        )
-        topology_publisher = AsyncTopologyPublisher(
-            registry,
-            p_train=(
-                self.geometry.players
-                if self.mode.training_regime is TrainingRegime.SELF_PLAY
-                else 1
-            ),
-        )
-        transaction = RolloutTransaction(
-            self.mode,
-            seed=self.seed,
-            iteration=iteration,
-            topology=topology_publisher,
-            owners=registry,
+            topology_stagers=topology_publisher.expansion_stagers,
         )
         scheduler = FamilyScheduler(
             input_names, owners.plan.manifest.family_pack_cap
@@ -821,41 +821,23 @@ class PokerSequentialProgram:
                 for index, name in enumerate(queues)
             )
 
-        def execute_scheduled(scheduled, _time: int):
-            commit = transaction.execute(
-                queues[scheduled.input_type],
-                scheduled,
-                self._model,
-                hooks,
-            )
-            if not hooks.last_topology:
-                raise PokerIterationError(
-                    "poker transition omitted atomic topology"
+        def accept_commits(pending: tuple[AcceptedRollout, ...]) -> None:
+            for accepted in pending:
+                lane = int(accepted.scheduled.lanes[0])
+                depths[lane][accepted.scheduled.input_type] -= (
+                    accepted.scheduled.rows
                 )
-            publications = hooks.last_topology
-            hooks.last_topology = ()
-            return scheduled, commit, publications
-
-        def accept_commits(pending: tuple[object, ...]) -> None:
-            for scheduled, commit, publications in pending:
-                for publication in publications:
-                    failed, produced = topology_publisher.wait_deferred_feedback(
-                        publication,
-                        input_count=len(input_names),
-                    )
-                    if failed:
-                        raise self._recoverable_overflow(publication.lane)
-                    depths[publication.lane][scheduled.input_type] -= scheduled.rows
-                    for name, count in zip(input_names, produced, strict=True):
-                        depths[publication.lane][name] += count
-                self._iteration_last_event = commit.event
+                for name, count in zip(
+                    input_names, accepted.produced, strict=True
+                ):
+                    depths[lane][name] += count
+                self._iteration_last_event = accepted.commit.event
 
         self._iteration_registry = registry
         self._iteration_input_names = input_names
         self._iteration_queues = queues
         self._iteration_hooks = hooks
         self._iteration_topology_publisher = topology_publisher
-        self._iteration_transaction = transaction
         self._iteration_depths = depths
         self._iteration_iteration = iteration
         return RolloutLoop(
@@ -864,8 +846,15 @@ class PokerSequentialProgram:
             has_work=lambda: any(
                 any(lane_depths.values()) for lane_depths in depths.values()
             ),
-            execute=execute_scheduled,
+            queues=queues,
+            registry=registry,
+            schemas=tuple(self.mode for _lane in range(self.n_replica)),
+            seed=self.seed,
+            models=tuple(self._model for _lane in range(self.n_replica)),
+            hooks=tuple(hooks for _lane in range(self.n_replica)),
             accept=accept_commits,
+            topology=topology_publisher,
+            failure=self._recoverable_overflow,
             inflight_cap=1,
             logical_limit=(
                 self.n_replica
@@ -874,52 +863,17 @@ class PokerSequentialProgram:
             ),
         )
 
-    def finish_rollout(self, *, logical_time: int) -> None:
+    def finish_rollout(
+        self, *, logical_time: int, topology: SealedTopology
+    ) -> None:
         del logical_time
-        owners = self.owners
-        input_names = self._iteration_input_names
-        topology_publisher = self._iteration_topology_publisher
         if self._iteration_last_event is None:
             raise PokerIterationError("poker rollout produced no player nodes")
-        sealed_topologies = tuple(
-            topology_publisher.seal_expansions(
-                lane=lane,
-                input_count=len(input_names),
-                input_output=tuple(
-                    tuple(
-                        item.name for item in owners.plan.partitions.outputs
-                    ).index(
-                        owners.plan.partitions.output_for(name).name
-                    )
-                    for name in input_names
-                ),
-            )
-            for lane in range(self.n_replica)
-        )
-        self._iteration_topologies = tuple(
-            item[0] for item in sealed_topologies
-        )
-        self._iteration_bindings = tuple(
-            item[1] for item in sealed_topologies
-        )
-        self._iteration_leaf_counts = tuple(
-            item[2] for item in sealed_topologies
-        )
-        topology_publisher.assert_drained()
-        self._iteration_plan = build_layer_plan(
-            self.mode,
-            owners.plan.partitions,
-            self._iteration_topologies,
-            self._iteration_bindings,
-            p_train=(
-                self.geometry.players
-                if self.mode.training_regime is TrainingRegime.SELF_PLAY
-                else 1
-            ),
-            manifest=owners.plan.manifest,
-        )
+        self._iteration_topologies = topology.topologies
+        self._iteration_bindings = topology.bindings
+        self._iteration_leaf_counts = topology.leaf_counts
+        self._iteration_plan = topology.plan
         self._iteration_hooks = None
-        self._iteration_transaction = None
         self._iteration_topology_publisher = None
         self._iteration_registry = None
         self._iteration_queues = None

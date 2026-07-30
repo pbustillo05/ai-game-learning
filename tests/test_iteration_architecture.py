@@ -48,13 +48,21 @@ class _Attempt:
             FamilyScheduler(("pre",), 1),
             lambda _time: (),
             lambda: False,
-            lambda _scheduled, _time: None,
+            {},
+            None,
+            (),
+            0,
+            (),
+            (),
             lambda _pending: None,
+            None,
+            lambda _lane: RuntimeError("unused"),
             1,
         )
 
-    def finish_rollout(self, *, logical_time: int) -> None:
+    def finish_rollout(self, *, logical_time: int, topology) -> None:
         assert logical_time == 0
+        assert topology == "sealed"
 
     def finish_queue_drain(self) -> None:
         self.events.append(("work", "QUEUE_DRAIN"))
@@ -99,6 +107,7 @@ def test_iteration_engine_owns_the_exact_phase_trace() -> None:
     engine = object.__new__(IterationEngine)
     engine.rank_agreement = _Agreement()
     engine.hooks = _Hooks(_Attempt(owners.events))
+    engine.seal_topology = lambda _publisher: "sealed"
     result = engine._run_attempt(owners, iteration=7)
     assert result == "committed"
     assert owners.events == [
@@ -201,15 +210,15 @@ def test_one_topology_assembler_accepts_all_rollout_shapes() -> None:
     assert definitions == [
         (REPOSITORY / "pbg/core/topology.py", "TopologyAssembler")
     ]
-    rollout_source = (REPOSITORY / "pbg/core/rollout.py").read_text(
+    topology_source = (REPOSITORY / "pbg/core/topology.py").read_text(
         encoding="utf-8"
     )
     hook_source = (POKER / "hooks.py").read_text(encoding="utf-8")
-    assert "TopologyExpansion(" in rollout_source
-    assert "executed_degree=int(values[10])" in rollout_source
-    assert "target_degree=int(values[12])" in rollout_source
-    assert "executed_degree=torch.ones_like" in hook_source
-    assert "target_degree=torch.ones_like" in hook_source
+    assert "class TopologyPacketStager" in topology_source
+    assert "class TopologyExpansionRecord" in topology_source
+    assert "executed_degree=one" in hook_source
+    assert "target_degree=one" in hook_source
+    assert "DeferredUnaryTopologyPublication" not in hook_source
 
 
 def test_one_learner_objective_accepts_unit_or_ragged_action_spans() -> None:
@@ -296,3 +305,38 @@ def test_common_engine_owns_the_only_completion_drain_loop() -> None:
         ):
             calls.append(path)
     assert calls == [REPOSITORY / "pbg/core/iteration.py"]
+
+
+def test_common_engine_owns_rollout_transactions_and_topology_lifecycle() -> None:
+    engine = (REPOSITORY / "pbg/core/iteration.py").read_text(
+        encoding="utf-8"
+    )
+    assert "RolloutTransaction(" in engine
+    assert "accept_expansion(" in engine
+    assert "seal_lane(" in engine
+    assert "build_layer_plan(" in engine
+    for path in POKER.glob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        assert "RolloutTransaction(" not in source, path
+        assert "build_layer_plan(" not in source, path
+
+
+def test_production_modes_use_one_topology_publication_protocol() -> None:
+    poker_source = "\n".join(
+        path.read_text(encoding="utf-8") for path in POKER.glob("*.py")
+    )
+    assert "TopologyExpansionPublication(" in poker_source
+    assert "DeferredUnaryTopologyPublication" not in poker_source
+    assert "DeferredBranchedTopologyPublication" not in poker_source
+    definitions = [
+        (path, node.name)
+        for path in (REPOSITORY / "pbg").rglob("*.py")
+        for node in ast.walk(
+            ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        )
+        if isinstance(node, ast.ClassDef)
+        and node.name == "TopologyPacketStager"
+    ]
+    assert definitions == [
+        (REPOSITORY / "pbg/core/topology.py", "TopologyPacketStager")
+    ]

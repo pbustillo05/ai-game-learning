@@ -28,10 +28,12 @@ from pbg.core.contracts import (
     validate_replica_group,
 )
 from pbg.core.iteration import (
+    AcceptedRollout,
     CompletionLoop,
     IterationEngine,
     LearnerPreflightOptimizer,
     RolloutLoop,
+    SealedTopology,
 )
 from pbg.core.learner import (
     BranchedBatchSampler,
@@ -58,17 +60,15 @@ from pbg.core.rollout import (
     CommitCoverage,
     CommitPlan,
     CompletionFIFO,
-    DeferredBranchedTopologyPublication,
     DeviceCommitFailure,
     DrawPurpose,
     FamilyQueueState,
     FamilyScheduler,
     RolloutOwnerRegistry,
-    RolloutTransaction,
     SampleRequest,
     SampleWorkspace,
-    ScheduledFamily,
     SemanticFamilyFIFO,
+    TopologyExpansionPublication,
     TransitionRequest,
     child_path_keys,
     logical_rng_keys,
@@ -82,13 +82,19 @@ from pbg.core.storage import (
 )
 from pbg.core.targets import LayeredTargetExecutor, TargetAlgebra
 from pbg.core.topology import (
+    StagedTopologyPacket as _StagedBranchedPayload,
+)
+from pbg.core.topology import (
     Topology,
     TopologyAssembler,
     TopologyBindings,
     TopologyError,
     TopologyExpansion,
     TopologyExpansionEdge,
-    build_layer_plan,
+    TopologyPacketStager,
+)
+from pbg.core.topology import (
+    TopologyExpansionRecord as _ExpansionRecord,
 )
 from pbg.core.training import (
     LearnerIteration,
@@ -286,7 +292,7 @@ class BranchedBenchmarkTelemetry:
 
 
 @dataclass(frozen=True)
-class _ExpansionRecord:
+class _RetiredExpansionRecord:
     node_active: Tensor
     edge_active: Tensor
     parent_key: Tensor
@@ -310,7 +316,7 @@ class _ExpansionRecord:
 
 
 @dataclass(frozen=True)
-class _StagedBranchedPayload:
+class _RetiredStagedBranchedPayload:
     records: tuple[_ExpansionRecord, ...]
     produced: Tensor
     sampled_nodes: Tensor
@@ -321,7 +327,7 @@ class _StagedBranchedPayload:
     observed_demand: Tensor
 
 
-class TopologyPacketStager:
+class _RetiredPokerTopologyPacketStager:
     """Commit-visible logical expansions assembled into compact CPU topology."""
 
     inflight_cap = 4
@@ -749,7 +755,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         )
         self._frontier_cost: Tensor | None = None
         self._safe_tree_triggered = False
-        self.last_topology: DeferredBranchedTopologyPublication | None = None
+        self.last_topology: TopologyExpansionPublication | None = None
         self._topology_sequence = 0
         self._refill = False
         self._refill_child_ordinal = 0
@@ -2073,7 +2079,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             )
             * request.model.values["cost"].detach().float()
         ).sum()
-        staged_payload = self.topology_stager.stage_payload(
+        staged_payload = self.topology_stager.stage(
             device_records,
             slot=(
                 self._topology_sequence
@@ -2086,7 +2092,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             frontier_demand=frontier_demand,
         )
         self.realized_tree_size.add_(sampled_nodes.to(torch.float32))
-        topology_publication = DeferredBranchedTopologyPublication(
+        topology_publication = TopologyExpansionPublication(
             lane=lane,
             sequence=self._topology_sequence,
             declared_nodes=self.topology_stager.topology_packet_cap,
@@ -2102,7 +2108,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             tuple(destinations),
             coverage,
             published_queues=tuple(published),
-            deferred_branched_topology=(topology_publication,),
+            expansion_topology=(topology_publication,),
             queue_cost_additions=tuple(queue_cost_additions),
             device_failure=(
                 DeviceCommitFailure(
@@ -2778,7 +2784,6 @@ class PokerBranchedProgram:
             ).index(owners.plan.partitions.output_for(name).name)
             for name in input_names
         )
-        lane_schemas = self.modes
         publisher = AsyncTopologyPublisher(
             registry,
             p_train=(
@@ -2787,8 +2792,9 @@ class PokerBranchedProgram:
                 is TrainingRegime.SELF_PLAY
                 else 1
             ),
+            input_names=input_names,
+            input_to_output=input_to_output,
         )
-        transactions: list[RolloutTransaction] = []
         recorders: list[TopologyPacketStager] = []
         hooks_by_lane: list[BranchedSampledPokerHooks] = []
         depths_by_lane: list[dict[str, int]] = []
@@ -2800,26 +2806,7 @@ class PokerBranchedProgram:
                 lane, machine, queues["pre"], iteration=iteration
             )
             mode = self.modes[lane]
-            transaction = RolloutTransaction(
-                lane_schemas,
-                seed=self.seed,
-                iteration=iteration,
-                topology=publisher,
-                owners=registry,
-            )
-            recorder = TopologyPacketStager(
-                input_names=input_names,
-                input_to_output=input_to_output,
-                p_train=(
-                    self.geometry.players
-                    if mode.training_regime is TrainingRegime.SELF_PLAY
-                    else 1
-                ),
-                topology_cap=owners.plan.manifest.topology_cap,
-                topology_edge_cap=owners.plan.manifest.topology_edge_cap,
-                topology_packet_cap=owners.plan.manifest.topology_packet_cap,
-                device=owners.plan.device,
-            )
+            recorder = publisher.expansion_stagers[lane]
             posterior = (
                 None
                 if mode.private_estimator is PrivateEstimator.SAMPLED
@@ -2870,7 +2857,6 @@ class PokerBranchedProgram:
                 raise ValueError(
                     "topology packet cannot cover one maximal branched root"
                 )
-            transactions.append(transaction)
             recorders.append(recorder)
             hooks_by_lane.append(hooks)
             depths_by_lane.append(depths)
@@ -2895,6 +2881,9 @@ class PokerBranchedProgram:
         self._iteration_pre_refill_records: list[int | None] = [
             None
         ] * count
+        self._iteration_pre_refill_correction: list[float | None] = [
+            None
+        ] * count
         self._iteration_refill_counts = [0] * count
 
         def queue_states(time: int) -> tuple[FamilyQueueState, ...]:
@@ -2914,73 +2903,37 @@ class PokerBranchedProgram:
                 for index, name in enumerate(input_names)
             )
 
-        def execute_scheduled(scheduled, time: int):
-            result = []
-            for lane in scheduled.lanes:
-                local = ScheduledFamily(
-                    input_type=scheduled.input_type,
-                    lanes=(lane,),
-                    lane_schemas=(self.modes[lane],),
-                    rows=scheduled.rows,
-                    forced_partial=scheduled.forced_partial,
+        def rollout_failure(lane: int) -> Exception:
+            failure = owners.failure_state.snapshot(lane)
+            if (
+                failure is not None
+                and failure.failure_code == "rejection_exhausted"
+            ):
+                return BranchedPosteriorExhaustion(failure)
+            if (
+                failure is not None
+                and failure.failure_code == "capacity_overflow"
+            ):
+                return RecoverableOverflow(
+                    failure,
+                    capacity=failure.available_extent,
+                    observed_demand=failure.requested_extent,
                 )
-                commit = transactions[lane].execute(
-                    queues[scheduled.input_type],
-                    local,
-                    lambda forward, _lanes, selected=lane: self._inference(
-                        selected, forward
-                    ),
-                    hooks_by_lane[lane],
-                )
-                publication = hooks_by_lane[lane].last_topology
-                hooks_by_lane[lane].last_topology = None
-                if publication is None:
-                    raise BranchedPokerError(
-                        "branched lane commit omitted topology"
-                    )
-                result.append((lane, local, commit, publication))
-            return tuple(result)
+            return BranchedPokerError("branched rollout failed terminally")
 
-        def accept_commits(pending: tuple[object, ...]) -> None:
-            for group in pending:
-                for lane, scheduled, commit, publication in group:
-                    failed, feedback = publisher.wait_branched_feedback(
-                        publication
-                    )
-                    if failed:
-                        failure = owners.failure_state.snapshot(lane)
-                        if (
-                            failure is not None
-                            and failure.failure_code
-                            == "rejection_exhausted"
-                        ):
-                            raise BranchedPosteriorExhaustion(failure)
-                        if (
-                            failure is not None
-                            and failure.failure_code
-                            == "capacity_overflow"
-                        ):
-                            raise RecoverableOverflow(
-                                failure,
-                                capacity=failure.available_extent,
-                                observed_demand=failure.requested_extent,
-                            )
-                        raise BranchedPokerError(
-                            "branched rollout failed terminally"
-                        )
-                    if not isinstance(feedback, _StagedBranchedPayload):
-                        raise BranchedPokerError(
-                            "branched commit returned invalid topology feedback"
-                        )
-                    recorders[lane].accept_payload(feedback)
-                    depths = depths_by_lane[lane]
-                    depths[scheduled.input_type] -= scheduled.rows
-                    for name, produced in zip(
-                        input_names, feedback.produced, strict=True
-                    ):
-                        depths[name] += int(produced)
-                    last_events[lane] = commit.event
-                    self._iteration_last_commit_event = commit.event
+        def accept_commits(pending: tuple[AcceptedRollout, ...]) -> None:
+            for accepted in pending:
+                lane = int(accepted.scheduled.lanes[0])
+                depths = depths_by_lane[lane]
+                depths[accepted.scheduled.input_type] -= (
+                    accepted.scheduled.rows
+                )
+                for name, produced in zip(
+                    input_names, accepted.produced, strict=True
+                ):
+                    depths[name] += produced
+                last_events[lane] = accepted.commit.event
+                self._iteration_last_commit_event = accepted.commit.event
 
         def has_work() -> bool:
             if any(any(depths.values()) for depths in depths_by_lane):
@@ -3007,6 +2960,11 @@ class PokerBranchedProgram:
                     )
                     self._iteration_pre_refill_records[lane] = (
                         recorder.record_count
+                    )
+                    self._iteration_pre_refill_correction[lane] = (
+                        recorder.counterfactual_correction(
+                            recorder.record_count
+                        )
                     )
                 hooks_by_lane[lane].begin_root_refill(
                     recorder.root_degree(deficient) + 1
@@ -3037,31 +2995,47 @@ class PokerBranchedProgram:
             scheduler=scheduler,
             states=queue_states,
             has_work=has_work,
-            execute=execute_scheduled,
+            queues=queues,
+            registry=registry,
+            schemas=tuple(self.modes),
+            seed=self.seed,
+            models=tuple(
+                (
+                    lambda forward, _lanes, selected=lane: self._inference(
+                        selected, forward
+                    )
+                )
+                for lane in range(count)
+            ),
+            hooks=tuple(hooks_by_lane),
             accept=accept_commits,
+            topology=publisher,
+            failure=rollout_failure,
             # Produced depths become host-visible with the accepted topology
             # packet.  Select the next stable prefix only after that accept.
             inflight_cap=1,
             logical_limit=count * owners.plan.manifest.topology_cap,
         )
 
-    def finish_rollout(self, *, logical_time: int) -> None:
+    def finish_rollout(
+        self, *, logical_time: int, topology: SealedTopology
+    ) -> None:
         del logical_time
         owners = self.owners
-        topologies: list[Topology] = []
-        bindings: list[TopologyBindings] = []
-        leaf_counts: list[int] = []
-        sampled_nodes: list[int] = []
+        topologies = topology.topologies
+        bindings = topology.bindings
+        leaf_counts = topology.leaf_counts
+        sampled_nodes = topology.sampled_nodes
         counterfactual_sizes: list[float] = []
-        for lane, recorder in enumerate(self._iteration_recorders):
-            recorder.materialize_cpu()
-            topology, binding, leaves = recorder.seal()
-            sampled = recorder.sampled_tree_size()
-            sampled_nodes.append(sampled)
+        for lane, _record in enumerate(topologies):
+            sampled = sampled_nodes[lane]
             if self._iteration_pre_refill_nodes[lane] is None:
                 self._iteration_pre_refill_nodes[lane] = sampled
                 self._iteration_pre_refill_records[lane] = (
-                    recorder.record_count
+                    topology.record_counts[lane]
+                )
+                self._iteration_pre_refill_correction[lane] = (
+                    topology.counterfactual_corrections[lane]
                 )
             pre_refill_nodes = self._iteration_pre_refill_nodes[lane]
             pre_refill_records = self._iteration_pre_refill_records[lane]
@@ -3069,37 +3043,20 @@ class PokerBranchedProgram:
                 pre_refill_nodes is not None
                 and pre_refill_records is not None
             )
+            correction = self._iteration_pre_refill_correction[lane]
+            assert correction is not None
             counterfactual_sizes.append(
                 (
                     float(pre_refill_nodes)
-                    + recorder.counterfactual_correction(
-                        pre_refill_records
-                    )
+                    + correction
                 )
                 / self._iteration_roots_by_lane[lane]
             )
-            recorder.release()
-            topologies.append(topology)
-            bindings.append(binding)
-            leaf_counts.append(leaves)
-        self._iteration_publisher.assert_drained()
-        self._iteration_plan = build_layer_plan(
-            self.modes[0],
-            owners.plan.partitions,
-            tuple(topologies),
-            tuple(bindings),
-            p_train=(
-                self.geometry.players
-                if self.modes[0].training_regime
-                is TrainingRegime.SELF_PLAY
-                else 1
-            ),
-            manifest=owners.plan.manifest,
-        )
-        self._iteration_topologies = tuple(topologies)
-        self._iteration_bindings = tuple(bindings)
-        self._iteration_leaf_counts = tuple(leaf_counts)
-        self._iteration_sampled_nodes = tuple(sampled_nodes)
+        self._iteration_plan = topology.plan
+        self._iteration_topologies = topologies
+        self._iteration_bindings = bindings
+        self._iteration_leaf_counts = leaf_counts
+        self._iteration_sampled_nodes = sampled_nodes
         self._iteration_counterfactual_sizes = tuple(
             counterfactual_sizes
         )
@@ -3675,7 +3632,6 @@ __all__ = [
     "BranchedSampledPokerHooks",
     "PokerBranchedProgram",
     "ReplicaBranchedPokerResult",
-    "TopologyPacketStager",
     "action_conditioned_log_reach",
     "branched_rb_chance_frontier_row_bytes",
     "sampled_branched_chance_frontier_row_bytes",

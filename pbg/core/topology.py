@@ -23,6 +23,18 @@ class TopologyError(ValueError):
     """A topology packet or sealed structural forest is invalid."""
 
 
+class TopologyPacketOverflow(TopologyError):
+    """A realized packet or forest exceeded an immutable topology capacity."""
+
+    def __init__(self, *, capacity: int, observed_demand: int) -> None:
+        self.capacity = int(capacity)
+        self.observed_demand = int(observed_demand)
+        super().__init__(
+            f"topology packet requires {observed_demand} rows with capacity "
+            f"{capacity}"
+        )
+
+
 class TargetKind(IntEnum):
     TOPOLOGY = 0
     LEAF = 1
@@ -407,6 +419,46 @@ class TopologyExpansion:
     edges: tuple[TopologyExpansionEdge, ...]
 
 
+@dataclass(frozen=True)
+class TopologyExpansionRecord:
+    """Device or pinned-host columns for one logical expansion packet."""
+
+    node_active: Tensor
+    edge_active: Tensor
+    parent_key: Tensor
+    child_key: Tensor
+    source_ordinal: Tensor
+    terminal: Tensor
+    child_input: Tensor
+    child_leaf_row: Tensor
+    label: Tensor
+    owner: Tensor
+    input_type: Tensor
+    familywork_row: Tensor
+    sigma_head_row: Tensor
+    action_begin: Tensor
+    executed_degree: Tensor
+    nominal_degree: Tensor
+    target_degree: Tensor
+    trained: Tensor
+    refill: Tensor
+    path_length: Tensor
+
+
+@dataclass(frozen=True)
+class StagedTopologyPacket:
+    """One bounded expansion packet copied to commit-visible pinned storage."""
+
+    record: TopologyExpansionRecord
+    produced: Tensor
+    sampled_nodes: Tensor
+    counterfactual_correction: Tensor
+    node_count: Tensor
+    edge_count: Tensor
+    overflow: Tensor
+    observed_demand: Tensor
+
+
 @dataclass
 class _AssembledEdge:
     label: int
@@ -789,6 +841,359 @@ class TopologyAssembler:
         self._sampled_prefix.clear()
         self._record_corrections.clear()
 
+
+class TopologyPacketStager:
+    """The sole packet staging, acceptance, assembly, and sealing authority."""
+
+    inflight_cap = 4
+
+    _NODE_DTYPES = (
+        ("owner", torch.int32),
+        ("input_type", torch.int32),
+        ("familywork_row", torch.int32),
+        ("sigma_head_row", torch.int32),
+        ("action_begin", torch.int32),
+        ("executed_degree", torch.int32),
+        ("nominal_degree", torch.int32),
+        ("target_degree", torch.int32),
+        ("trained", torch.bool),
+        ("refill", torch.bool),
+    )
+    _EDGE_DTYPES = (
+        ("source_ordinal", torch.int64),
+        ("terminal", torch.bool),
+        ("child_input", torch.int32),
+        ("child_leaf_row", torch.int64),
+        ("label", torch.int32),
+        ("path_length", torch.int32),
+    )
+
+    def __init__(
+        self,
+        *,
+        input_names: Sequence[str],
+        input_to_output: Sequence[int],
+        p_train: int,
+        topology_cap: int,
+        topology_edge_cap: int,
+        topology_packet_cap: int,
+        device: torch.device,
+    ) -> None:
+        self.input_names = tuple(input_names)
+        self.input_to_output = tuple(int(value) for value in input_to_output)
+        self.p_train = int(p_train)
+        self.topology_cap = int(topology_cap)
+        self.topology_edge_cap = int(topology_edge_cap)
+        self.topology_packet_cap = int(topology_packet_cap)
+        self.device = device
+        if (
+            not self.input_names
+            or len(self.input_to_output) != len(self.input_names)
+            or any(value < 0 for value in self.input_to_output)
+            or min(
+                self.p_train,
+                self.topology_cap,
+                self.topology_edge_cap,
+                self.topology_packet_cap,
+            )
+            <= 0
+            or device.type != "cuda"
+        ):
+            raise TopologyError("topology packet staging bounds are invalid")
+        self._assembler = TopologyAssembler(
+            input_to_output=self.input_to_output,
+            p_train=self.p_train,
+            topology_cap=self.topology_cap,
+            topology_edge_cap=self.topology_edge_cap,
+        )
+        packet_rows = self.topology_packet_cap + 1
+        self._device_nodes = {
+            "parent_key": torch.empty(
+                (self.inflight_cap, packet_rows, 2),
+                dtype=torch.int64,
+                device=device,
+            ),
+            **{
+                name: torch.empty(
+                    (self.inflight_cap, packet_rows),
+                    dtype=dtype,
+                    device=device,
+                )
+                for name, dtype in self._NODE_DTYPES
+            },
+        }
+        self._device_edges = {
+            "child_key": torch.empty(
+                (self.inflight_cap, packet_rows, 2),
+                dtype=torch.int64,
+                device=device,
+            ),
+            **{
+                name: torch.empty(
+                    (self.inflight_cap, packet_rows),
+                    dtype=dtype,
+                    device=device,
+                )
+                for name, dtype in self._EDGE_DTYPES
+            },
+        }
+        self._host_nodes = {
+            name: torch.empty_like(
+                value[:, : self.topology_packet_cap],
+                device="cpu",
+                pin_memory=True,
+            )
+            for name, value in self._device_nodes.items()
+        }
+        self._host_edges = {
+            name: torch.empty_like(
+                value[:, : self.topology_packet_cap],
+                device="cpu",
+                pin_memory=True,
+            )
+            for name, value in self._device_edges.items()
+        }
+        self._host_node_active = torch.ones(
+            (self.inflight_cap, self.topology_packet_cap),
+            dtype=torch.bool,
+            pin_memory=True,
+        )
+        self._host_edge_active = torch.ones(
+            (self.inflight_cap, self.topology_packet_cap),
+            dtype=torch.bool,
+            pin_memory=True,
+        )
+        self._produced = torch.empty(
+            (self.inflight_cap, len(self.input_names)),
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+        self._sampled_nodes = torch.empty(
+            self.inflight_cap, dtype=torch.int64, pin_memory=True
+        )
+        self._correction = torch.empty(
+            self.inflight_cap, dtype=torch.float32, pin_memory=True
+        )
+        self._node_count = torch.empty(
+            self.inflight_cap, dtype=torch.int64, pin_memory=True
+        )
+        self._edge_count = torch.empty(
+            self.inflight_cap, dtype=torch.int64, pin_memory=True
+        )
+        self._overflow = torch.empty(
+            self.inflight_cap, dtype=torch.bool, pin_memory=True
+        )
+        self._observed_demand = torch.empty(
+            self.inflight_cap, dtype=torch.int64, pin_memory=True
+        )
+
+    def stage(
+        self,
+        records: Sequence[TopologyExpansionRecord],
+        *,
+        slot: int,
+        produced: Tensor,
+        sampled_nodes: Tensor,
+        counterfactual_correction: Tensor,
+        frontier_overflow: Tensor,
+        frontier_demand: Tensor,
+    ) -> StagedTopologyPacket:
+        if (
+            not records
+            or produced.device != self.device
+            or produced.shape != (len(self.input_names),)
+            or not 0 <= slot < self.inflight_cap
+        ):
+            raise TopologyError("topology expansion payload is invalid")
+        node_offset = torch.zeros((), dtype=torch.int64, device=self.device)
+        edge_offset = torch.zeros((), dtype=torch.int64, device=self.device)
+        dummy = self.topology_packet_cap
+        for record in records:
+            node_rank = record.node_active.cumsum(0, dtype=torch.int64) - 1
+            edge_rank = record.edge_active.cumsum(0, dtype=torch.int64) - 1
+            node_destination = node_offset + node_rank
+            edge_destination = edge_offset + edge_rank
+            valid_node = record.node_active & node_destination.lt(dummy)
+            valid_edge = record.edge_active & edge_destination.lt(dummy)
+            node_destination = torch.where(
+                valid_node,
+                node_destination,
+                torch.full_like(node_destination, dummy),
+            )
+            edge_destination = torch.where(
+                valid_edge,
+                edge_destination,
+                torch.full_like(edge_destination, dummy),
+            )
+            for name, buffers in self._device_nodes.items():
+                buffers[slot].index_copy_(
+                    0, node_destination, getattr(record, name)
+                )
+            for name, buffers in self._device_edges.items():
+                value = getattr(record, name)
+                if name == "source_ordinal":
+                    value = node_destination.index_select(
+                        0, value.to(torch.int64)
+                    )
+                buffers[slot].index_copy_(0, edge_destination, value)
+            node_offset += record.node_active.sum(dtype=torch.int64)
+            edge_offset += record.edge_active.sum(dtype=torch.int64)
+        for name, hosts in self._host_nodes.items():
+            hosts[slot].copy_(
+                self._device_nodes[name][slot, :-1], non_blocking=True
+            )
+        for name, hosts in self._host_edges.items():
+            hosts[slot].copy_(
+                self._device_edges[name][slot, :-1], non_blocking=True
+            )
+        self._produced[slot].copy_(produced, non_blocking=True)
+        self._sampled_nodes[slot].copy_(
+            sampled_nodes.detach(), non_blocking=True
+        )
+        self._correction[slot].copy_(
+            counterfactual_correction.detach(), non_blocking=True
+        )
+        self._node_count[slot].copy_(node_offset, non_blocking=True)
+        self._edge_count[slot].copy_(edge_offset, non_blocking=True)
+        self._overflow[slot].copy_(
+            node_offset.gt(self.topology_packet_cap)
+            | edge_offset.gt(self.topology_packet_cap)
+            | frontier_overflow,
+            non_blocking=True,
+        )
+        self._observed_demand[slot].copy_(
+            torch.maximum(
+                torch.maximum(node_offset, edge_offset),
+                frontier_demand,
+            ),
+            non_blocking=True,
+        )
+        record = TopologyExpansionRecord(
+            node_active=self._host_node_active[slot],
+            edge_active=self._host_edge_active[slot],
+            **{
+                name: values[slot] for name, values in self._host_nodes.items()
+            },
+            **{
+                name: values[slot] for name, values in self._host_edges.items()
+            },
+        )
+        return StagedTopologyPacket(
+            record,
+            self._produced[slot],
+            self._sampled_nodes[slot],
+            self._correction[slot],
+            self._node_count[slot],
+            self._edge_count[slot],
+            self._overflow[slot],
+            self._observed_demand[slot],
+        )
+
+    def accept(self, packet: StagedTopologyPacket) -> None:
+        node_count = int(packet.node_count)
+        edge_count = int(packet.edge_count)
+        if bool(packet.overflow) or (
+            node_count > self.topology_packet_cap
+            or edge_count > self.topology_packet_cap
+        ):
+            raise TopologyPacketOverflow(
+                capacity=self.topology_packet_cap,
+                observed_demand=int(packet.observed_demand),
+            )
+        record = packet.record
+        edges_by_source: list[list[int]] = [
+            [] for _ in range(node_count)
+        ]
+        for edge in range(edge_count):
+            source = int(record.source_ordinal[edge])
+            if not 0 <= source < node_count:
+                raise TopologyError("topology edge source is outside its packet")
+            edges_by_source[source].append(edge)
+        expansions = [
+            TopologyExpansion(
+                key=tuple(int(value) for value in record.parent_key[row]),
+                executed_degree=int(record.executed_degree[row]),
+                nominal_degree=int(record.nominal_degree[row]),
+                target_degree=int(record.target_degree[row]),
+                trained=bool(record.trained[row]),
+                owner=int(record.owner[row]),
+                input_type=int(record.input_type[row]),
+                familywork_row=int(record.familywork_row[row]),
+                sigma_head_row=int(record.sigma_head_row[row]),
+                action_begin=int(record.action_begin[row]),
+                refill=bool(record.refill[row]),
+                edges=tuple(
+                    TopologyExpansionEdge(
+                        label=int(record.label[edge]),
+                        path_length=int(record.path_length[edge]),
+                        terminal=bool(record.terminal[edge]),
+                        child_key=tuple(
+                            int(value) for value in record.child_key[edge]
+                        ),
+                        child_leaf_row=int(record.child_leaf_row[edge]),
+                        child_input=int(record.child_input[edge]),
+                    )
+                    for edge in edge_rows
+                ),
+            )
+            for row, edge_rows in enumerate(edges_by_source)
+        ]
+        try:
+            self._assembler.accept(
+                expansions,
+                sampled_nodes=int(packet.sampled_nodes),
+                counterfactual_correction=float(
+                    packet.counterfactual_correction
+                ),
+            )
+        except TopologyError as exc:
+            message = str(exc)
+            if "node cap" in message:
+                raise TopologyPacketOverflow(
+                    capacity=self.topology_cap,
+                    observed_demand=self.topology_cap + 1,
+                ) from exc
+            if "edge cap" in message:
+                raise TopologyPacketOverflow(
+                    capacity=self.topology_edge_cap,
+                    observed_demand=self.topology_edge_cap + 1,
+                ) from exc
+            raise
+
+    def seal(self) -> tuple[Topology, TopologyBindings, int]:
+        return self._assembler.seal()
+
+    def tree_size(self, logical_root: int) -> int:
+        return self._assembler.tree_size(logical_root)
+
+    def sampled_tree_size(self, record_limit: int | None = None) -> int:
+        return self._assembler.sampled_tree_size(record_limit)
+
+    def root_degree(self, logical_root: int) -> int:
+        return self._assembler.root_degree(logical_root)
+
+    @property
+    def record_count(self) -> int:
+        return self._assembler.record_count
+
+    def counterfactual_correction(self, record_limit: int) -> float:
+        return self._assembler.counterfactual_correction(record_limit)
+
+    def release(self) -> None:
+        self._assembler.release()
+        self._device_nodes.clear()
+        self._device_edges.clear()
+        self._host_nodes.clear()
+        self._host_edges.clear()
+        self._host_node_active = torch.empty(0, dtype=torch.bool)
+        self._host_edge_active = torch.empty(0, dtype=torch.bool)
+        self._produced = torch.empty(0, dtype=torch.int64)
+        self._sampled_nodes = torch.empty(0, dtype=torch.int64)
+        self._correction = torch.empty(0, dtype=torch.float32)
+        self._node_count = torch.empty(0, dtype=torch.int64)
+        self._edge_count = torch.empty(0, dtype=torch.int64)
+        self._overflow = torch.empty(0, dtype=torch.bool)
+        self._observed_demand = torch.empty(0, dtype=torch.int64)
 
 @dataclass(frozen=True)
 class TopologyPacket:
@@ -1631,6 +2036,7 @@ def build_layer_plan(
 
 __all__ = [
     "LayerPlan",
+    "StagedTopologyPacket",
     "TargetKind",
     "Topology",
     "TopologyAssembler",
@@ -1638,6 +2044,9 @@ __all__ = [
     "TopologyError",
     "TopologyExpansion",
     "TopologyExpansionEdge",
+    "TopologyExpansionRecord",
     "TopologyPacket",
+    "TopologyPacketOverflow",
+    "TopologyPacketStager",
     "build_layer_plan",
 ]

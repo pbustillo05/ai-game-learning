@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -21,13 +21,25 @@ from pbg.core.contracts import ModeSchema, validate_replica_group
 from pbg.core.optimization import OptimizerStep
 from pbg.core.persistence import RunState
 from pbg.core.rollout import (
+    AsyncTopologyPublisher,
     CompletionFIFO,
     CompletionHook,
     FamilyQueueState,
     FamilyScheduler,
+    RolloutCommit,
+    RolloutHooks,
+    RolloutOwnerRegistry,
+    RolloutTransaction,
     ScheduledFamily,
+    SemanticFamilyFIFO,
 )
 from pbg.core.storage import DeviceFailure
+from pbg.core.topology import (
+    LayerPlan,
+    Topology,
+    TopologyBindings,
+    build_layer_plan,
+)
 from pbg.core.training import (
     AttemptAddress,
     OverflowRecoveryRecord,
@@ -98,11 +110,48 @@ class RolloutLoop:
     scheduler: FamilyScheduler
     states: Callable[[int], Sequence[FamilyQueueState]]
     has_work: Callable[[], bool]
-    execute: Callable[[ScheduledFamily, int], object]
-    accept: Callable[[tuple[object, ...]], None]
+    queues: Mapping[str, SemanticFamilyFIFO]
+    registry: RolloutOwnerRegistry
+    schemas: tuple[ModeSchema, ...]
+    seed: int
+    models: tuple[Callable[[object, torch.Tensor], Mapping[str, torch.Tensor]], ...]
+    hooks: tuple[RolloutHooks, ...]
+    accept: Callable[[tuple[AcceptedRollout, ...]], None]
+    topology: AsyncTopologyPublisher
+    failure: Callable[[int], Exception]
     inflight_cap: int
     logical_time: int = 0
     logical_limit: int | None = None
+
+
+@dataclass(frozen=True)
+class RolloutSubmission:
+    """One lane-local transaction submitted by a game rollout hook."""
+
+    scheduled: ScheduledFamily
+    commit: RolloutCommit
+
+
+@dataclass(frozen=True)
+class AcceptedRollout:
+    """Commit-visible queue counts accepted by the core topology authority."""
+
+    scheduled: ScheduledFamily
+    commit: RolloutCommit
+    produced: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class SealedTopology:
+    """Core-owned compact forests and their exact common layer plan."""
+
+    topologies: tuple[Topology, ...]
+    bindings: tuple[TopologyBindings, ...]
+    leaf_counts: tuple[int, ...]
+    plan: LayerPlan
+    sampled_nodes: tuple[int, ...]
+    record_counts: tuple[int, ...]
+    counterfactual_corrections: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -121,7 +170,9 @@ class IterationAttempt(Protocol):
 
     def prepare_rollout(self, *, iteration: int) -> RolloutLoop: ...
 
-    def finish_rollout(self, *, logical_time: int) -> None: ...
+    def finish_rollout(
+        self, *, logical_time: int, topology: SealedTopology
+    ) -> None: ...
 
     def finish_queue_drain(self) -> None: ...
 
@@ -189,8 +240,18 @@ class IterationEngine:
         scheduler: FamilyScheduler,
         states: Callable[[int], Sequence[FamilyQueueState]],
         has_work: Callable[[], bool],
-        execute: Callable[[ScheduledFamily, int], object],
-        accept: Callable[[tuple[object, ...]], None],
+        queues: Mapping[str, SemanticFamilyFIFO],
+        registry: RolloutOwnerRegistry,
+        schemas: Sequence[ModeSchema],
+        seed: int,
+        iteration: int,
+        models: Sequence[
+            Callable[[object, torch.Tensor], Mapping[str, torch.Tensor]]
+        ],
+        hooks: Sequence[RolloutHooks],
+        accept: Callable[[tuple[AcceptedRollout, ...]], None],
+        topology: AsyncTopologyPublisher,
+        failure: Callable[[int], Exception],
         inflight_cap: int,
         logical_time: int = 0,
         logical_limit: int | None = None,
@@ -199,8 +260,30 @@ class IterationEngine:
 
         if inflight_cap <= 0 or logical_time < 0:
             raise ValueError("rollout scheduling bounds must be positive")
+        if not has_work():
+            return logical_time
+        lane_schemas = tuple(schemas)
+        lane_models = tuple(models)
+        lane_hooks = tuple(hooks)
+        if not (
+            len(lane_schemas)
+            == len(lane_models)
+            == len(lane_hooks)
+            == registry.n_replica
+        ):
+            raise IterationError("rollout lane operations are not aligned")
+        transactions = tuple(
+            RolloutTransaction(
+                lane_schemas,
+                seed=seed,
+                iteration=iteration,
+                topology=topology,
+                owners=registry,
+            )
+            for _lane in range(registry.n_replica)
+        )
         while has_work():
-            pending: list[object] = []
+            pending: list[RolloutSubmission] = []
             while len(pending) < inflight_cap and has_work():
                 scheduled = scheduler.select(
                     states(logical_time), allow_partial=True
@@ -209,10 +292,98 @@ class IterationEngine:
                     raise IterationError("scheduler lost published queue work")
                 if logical_limit is not None and logical_time >= logical_limit:
                     raise IterationError("rollout exceeded its logical bound")
-                pending.append(execute(scheduled, logical_time))
+                for lane in scheduled.lanes:
+                    local = ScheduledFamily(
+                        input_type=scheduled.input_type,
+                        lanes=(lane,),
+                        lane_schemas=(lane_schemas[lane],),
+                        rows=scheduled.rows,
+                        forced_partial=scheduled.forced_partial,
+                    )
+                    commit = transactions[lane].execute(
+                        queues[scheduled.input_type],
+                        local,
+                        lane_models[lane],
+                        lane_hooks[lane],
+                    )
+                    pending.append(RolloutSubmission(local, commit))
                 logical_time += 1
-            accept(tuple(pending))
+            accepted: list[AcceptedRollout] = []
+            for submission in pending:
+                produced: tuple[int, ...] | None = None
+                for publication in submission.commit.topology:
+                    failed, current = topology.accept_expansion(publication)
+                    if failed:
+                        raise failure(publication.lane)
+                    if produced is not None:
+                        raise IterationError(
+                            "one rollout submission published two topology packets"
+                        )
+                    produced = current
+                if produced is None:
+                    raise IterationError(
+                        "rollout commit omitted its topology expansion"
+                    )
+                accepted.append(
+                    AcceptedRollout(
+                        submission.scheduled,
+                        submission.commit,
+                        produced,
+                    )
+                )
+            accept(tuple(accepted))
         return logical_time
+
+    def seal_topology(
+        self, publisher: AsyncTopologyPublisher
+    ) -> SealedTopology:
+        """Seal every lane through the sole assembler and layer planner."""
+
+        plan = publisher.owners.plan
+        lane_count = plan.manifest.n_replica
+        sealed = tuple(
+            publisher.seal_lane(lane) for lane in range(lane_count)
+        )
+        sampled_nodes = tuple(
+            publisher.sampled_tree_size(lane) for lane in range(lane_count)
+        )
+        record_counts = tuple(
+            publisher.record_count(lane) for lane in range(lane_count)
+        )
+        corrections = tuple(
+            publisher.counterfactual_correction(
+                lane, record_counts[lane]
+            )
+            for lane in range(lane_count)
+        )
+        publisher.assert_drained()
+        publisher.release_expansion_storage()
+        topologies = tuple(item[0] for item in sealed)
+        bindings = tuple(item[1] for item in sealed)
+        leaf_counts = tuple(item[2] for item in sealed)
+        mode = plan.mode
+        p_train = (
+            plan.manifest.geometry.actor_count
+            if mode.training_regime.value == "self_play"
+            else 1
+        )
+        plan = build_layer_plan(
+            mode,
+            plan.partitions,
+            topologies,
+            bindings,
+            p_train=p_train,
+            manifest=plan.manifest,
+        )
+        return SealedTopology(
+            topologies,
+            bindings,
+            leaf_counts,
+            plan,
+            sampled_nodes,
+            record_counts,
+            corrections,
+        )
 
     @staticmethod
     def drain_completion(
@@ -350,13 +521,24 @@ class IterationEngine:
                 scheduler=rollout.scheduler,
                 states=rollout.states,
                 has_work=rollout.has_work,
-                execute=rollout.execute,
+                queues=rollout.queues,
+                registry=rollout.registry,
+                schemas=rollout.schemas,
+                seed=rollout.seed,
+                iteration=iteration,
+                models=rollout.models,
+                hooks=rollout.hooks,
                 accept=rollout.accept,
+                topology=rollout.topology,
+                failure=rollout.failure,
                 inflight_cap=rollout.inflight_cap,
                 logical_time=rollout.logical_time,
                 logical_limit=rollout.logical_limit,
             )
-            attempt.finish_rollout(logical_time=logical_time)
+            attempt.finish_rollout(
+                logical_time=logical_time,
+                topology=self.seal_topology(rollout.topology),
+            )
             remote = self.rank_agreement.agree(None)
             if remote is not None:
                 agreed = self._failure_from_device(remote.failure)
@@ -530,6 +712,7 @@ class IterationEngine:
 
 
 __all__ = [
+    "AcceptedRollout",
     "CompletionLoop",
     "IterationAttempt",
     "IterationConfig",
@@ -539,4 +722,6 @@ __all__ = [
     "LaneContext",
     "LearnerPreflightOptimizer",
     "RolloutLoop",
+    "RolloutSubmission",
+    "SealedTopology",
 ]

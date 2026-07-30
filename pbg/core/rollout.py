@@ -31,6 +31,7 @@ from pbg.core.storage import (
     PublicationTransaction,
 )
 from pbg.core.topology import (
+    StagedTopologyPacket,
     Topology,
     TopologyAssembler,
     TopologyBindings,
@@ -38,6 +39,7 @@ from pbg.core.topology import (
     TopologyExpansion,
     TopologyExpansionEdge,
     TopologyPacket,
+    TopologyPacketStager,
 )
 
 
@@ -981,7 +983,7 @@ class RolloutOwnerRegistry:
         plan = owners.plan
         manifest = plan.manifest
         slabs = owners.live_slabs
-        return cls(
+        result = cls(
             slabs,
             family_pack_cap=manifest.family_pack_cap,
             chance_frontier_cap=manifest.chance_frontier_cap,
@@ -999,6 +1001,8 @@ class RolloutOwnerRegistry:
             ).bounded_workspace_bytes,
             _token=_OWNER_REGISTRY_TOKEN,
         )
+        result.plan = plan
+        return result
 
     def require(self, slab: MonotoneSlab) -> None:
         if id(slab) not in self._ids:
@@ -1269,14 +1273,14 @@ class DeferredUnaryTopologyPublication:
 
 
 @dataclass(frozen=True)
-class DeferredBranchedTopologyPublication:
-    """Opaque branched descriptors accepted only after their commit marker."""
+class TopologyExpansionPublication:
+    """One mode-independent expansion packet awaiting commit visibility."""
 
     lane: int
     sequence: int
     declared_nodes: int
     declared_edges: int
-    payload: object
+    payload: StagedTopologyPacket
 
     def __post_init__(self) -> None:
         if (
@@ -1285,12 +1289,12 @@ class DeferredBranchedTopologyPublication:
             or self.declared_nodes <= 0
             or self.declared_edges < 0
         ):
-            raise TopologyError("deferred branched topology address is invalid")
+            raise TopologyError("topology expansion publication is invalid")
 
 
 @dataclass
-class _PendingDeferredBranched:
-    publication: DeferredBranchedTopologyPublication
+class _PendingExpansion:
+    publication: TopologyExpansionPublication
     success: Tensor
     event: torch.cuda.Event
 
@@ -1324,11 +1328,33 @@ class AsyncTopologyPublisher:
         owners: RolloutOwnerRegistry,
         *,
         p_train: int,
+        input_names: Sequence[str] | None = None,
+        input_to_output: Sequence[int] | None = None,
     ) -> None:
         if p_train <= 0:
             raise ValueError("topology publication bounds must be positive")
         self.owners = owners
         self.p_train = int(p_train)
+        if (input_names is None) != (input_to_output is None):
+            raise ValueError(
+                "topology input names and output mapping must be paired"
+            )
+        self._expansion_stagers = (
+            ()
+            if input_names is None
+            else tuple(
+                TopologyPacketStager(
+                    input_names=input_names,
+                    input_to_output=input_to_output,  # type: ignore[arg-type]
+                    p_train=self.p_train,
+                    topology_cap=owners.topology_cap,
+                    topology_edge_cap=owners.topology_edge_cap,
+                    topology_packet_cap=owners.topology_packet_cap,
+                    device=owners.device,
+                )
+                for _lane in range(owners.n_replica)
+            )
+        )
         self.max_inflight_batches = 2
         self.max_inflight_deferred = max(
             self.max_inflight_batches,
@@ -1376,12 +1402,14 @@ class AsyncTopologyPublisher:
         ] = {}
         self._deferred_accepted: list[tuple[int, int, Tensor]] = []
         self._deferred_reserved_rows = 0
-        self._branched_staged: dict[
-            tuple[int, int], DeferredBranchedTopologyPublication
+        self._expansion_staged: dict[
+            tuple[int, int], TopologyExpansionPublication
         ] = {}
-        self._branched_pending: list[_PendingDeferredBranched] = []
-        self._branched_accepted: dict[tuple[int, int], object] = {}
-        self._branched_success_buffer = torch.empty(
+        self._expansion_pending: list[_PendingExpansion] = []
+        self._expansion_accepted: dict[
+            tuple[int, int], StagedTopologyPacket
+        ] = {}
+        self._expansion_success_buffer = torch.empty(
             owners.n_replica * owners.topology_cap,
             dtype=torch.bool,
             pin_memory=True,
@@ -1419,54 +1447,54 @@ class AsyncTopologyPublisher:
         self._reserved_nodes += draft.declared_node_count
         self._reserved_edges += draft.declared_edge_count
 
-    def stage_branched(
-        self, publication: DeferredBranchedTopologyPublication
+    def stage_expansion(
+        self, publication: TopologyExpansionPublication
     ) -> None:
         key = (publication.lane, publication.sequence)
-        if key in self._branched_staged:
-            raise TopologyError("duplicate deferred branched topology sequence")
+        if key in self._expansion_staged:
+            raise TopologyError("duplicate topology expansion sequence")
         if (
             publication.declared_nodes + publication.declared_edges
             > self.owners.topology_packet_cap
         ):
             raise TopologyError(
-                "deferred branched topology exceeds its fixed packet cap"
+                "topology expansion exceeds its fixed packet cap"
             )
         if publication.sequence >= self.owners.topology_cap:
             raise TopologyError(
-                "deferred branched topology exceeds its sequence arena"
+                "topology expansion exceeds its sequence arena"
             )
-        self._branched_staged[key] = publication
+        self._expansion_staged[key] = publication
 
-    def finalize_branched(
+    def finalize_expansion(
         self,
-        publication: DeferredBranchedTopologyPublication,
+        publication: TopologyExpansionPublication,
         success: Tensor,
         *,
         stream: torch.cuda.Stream,
     ) -> None:
         key = (publication.lane, publication.sequence)
-        if self._branched_staged.get(key) is not publication:
-            raise TopologyError("deferred branched topology was not staged")
-        host_success = self._branched_success_buffer[
+        if self._expansion_staged.get(key) is not publication:
+            raise TopologyError("topology expansion was not staged")
+        host_success = self._expansion_success_buffer[
             publication.lane * self.owners.topology_cap
             + publication.sequence
         ]
         host_success.copy_(success[publication.lane], non_blocking=True)
         event = torch.cuda.Event(blocking=False)
         event.record(stream)
-        self._branched_pending.append(
-            _PendingDeferredBranched(publication, host_success, event)
+        self._expansion_pending.append(
+            _PendingExpansion(publication, host_success, event)
         )
 
-    def cancel_branched(
+    def cancel_expansions(
         self,
-        publications: Sequence[DeferredBranchedTopologyPublication],
+        publications: Sequence[TopologyExpansionPublication],
     ) -> None:
         keys = {(item.lane, item.sequence) for item in publications}
-        self._branched_pending = [
+        self._expansion_pending = [
             pending
-            for pending in self._branched_pending
+            for pending in self._expansion_pending
             if (
                 pending.publication.lane,
                 pending.publication.sequence,
@@ -1474,54 +1502,102 @@ class AsyncTopologyPublisher:
             not in keys
         ]
         for key in keys:
-            self._branched_staged.pop(key, None)
-            self._branched_accepted.pop(key, None)
+            self._expansion_staged.pop(key, None)
+            self._expansion_accepted.pop(key, None)
 
-    def _accept_branched_ready(self, *, block: bool = False) -> None:
-        ready: list[_PendingDeferredBranched] = []
-        waiting: list[_PendingDeferredBranched] = []
-        if block and self._branched_pending:
+    def _accept_expansions_ready(self, *, block: bool = False) -> None:
+        ready: list[_PendingExpansion] = []
+        waiting: list[_PendingExpansion] = []
+        if block and self._expansion_pending:
             with torch.cuda.stream(self._accept_stream):
-                for pending in self._branched_pending:
+                for pending in self._expansion_pending:
                     self._accept_stream.wait_event(pending.event)
                 all_ready = torch.cuda.Event(blocking=False)
                 all_ready.record(self._accept_stream)
             all_ready.synchronize()
-            ready = self._branched_pending
+            ready = self._expansion_pending
         else:
-            for pending in self._branched_pending:
+            for pending in self._expansion_pending:
                 (ready if pending.event.query() else waiting).append(pending)
-        self._branched_pending = waiting
+        self._expansion_pending = waiting
         for pending in ready:
             publication = pending.publication
             key = (publication.lane, publication.sequence)
             if bool(pending.success):
-                self._branched_accepted[key] = publication.payload
-            self._branched_staged.pop(key, None)
+                self._expansion_accepted[key] = publication.payload
+            self._expansion_staged.pop(key, None)
 
-    def branched_feedback(
+    def expansion_feedback(
         self,
-        publication: DeferredBranchedTopologyPublication,
-    ) -> tuple[bool, object | None] | None:
+        publication: TopologyExpansionPublication,
+    ) -> tuple[bool, StagedTopologyPacket | None] | None:
         """Poll one pinned commit result without reading a device scalar."""
 
-        self._accept_branched_ready()
+        self._accept_expansions_ready()
         key = (publication.lane, publication.sequence)
-        if key in self._branched_accepted:
-            return False, self._branched_accepted.pop(key)
-        if key not in self._branched_staged:
+        if key in self._expansion_accepted:
+            return False, self._expansion_accepted.pop(key)
+        if key not in self._expansion_staged:
             return True, None
         return None
 
-    def wait_branched_feedback(
+    def wait_expansion_feedback(
         self,
-        publication: DeferredBranchedTopologyPublication,
-    ) -> tuple[bool, object | None]:
+        publication: TopologyExpansionPublication,
+    ) -> tuple[bool, StagedTopologyPacket | None]:
         while True:
-            result = self.branched_feedback(publication)
+            result = self.expansion_feedback(publication)
             if result is not None:
                 return result
             time.sleep(0)
+
+    @property
+    def expansion_stagers(self) -> tuple[TopologyPacketStager, ...]:
+        if not self._expansion_stagers:
+            raise TopologyError(
+                "topology publisher was not configured for expansion packets"
+            )
+        return self._expansion_stagers
+
+    def accept_expansion(
+        self,
+        publication: TopologyExpansionPublication,
+    ) -> tuple[bool, tuple[int, ...]]:
+        failed, packet = self.wait_expansion_feedback(publication)
+        if failed or packet is None:
+            return True, ()
+        stager = self.expansion_stagers[publication.lane]
+        stager.accept(packet)
+        return False, tuple(int(value) for value in packet.produced)
+
+    def seal_lane(self, lane: int) -> tuple[Topology, TopologyBindings, int]:
+        return self.expansion_stagers[lane].seal()
+
+    def tree_size(self, lane: int, logical_root: int) -> int:
+        return self.expansion_stagers[lane].tree_size(logical_root)
+
+    def sampled_tree_size(
+        self, lane: int, record_limit: int | None = None
+    ) -> int:
+        return self.expansion_stagers[lane].sampled_tree_size(record_limit)
+
+    def root_degree(self, lane: int, logical_root: int) -> int:
+        return self.expansion_stagers[lane].root_degree(logical_root)
+
+    def record_count(self, lane: int) -> int:
+        return self.expansion_stagers[lane].record_count
+
+    def counterfactual_correction(
+        self, lane: int, record_limit: int
+    ) -> float:
+        return self.expansion_stagers[lane].counterfactual_correction(
+            record_limit
+        )
+
+    def release_expansion_storage(self) -> None:
+        for stager in self._expansion_stagers:
+            stager.release()
+        self._expansion_stagers = ()
 
     def preflight_deferred(
         self,
@@ -2126,9 +2202,9 @@ class AsyncTopologyPublisher:
             or self._pending
             or self._deferred_staged
             or self._deferred_pending
-            or self._branched_staged
-            or self._branched_pending
-            or self._branched_accepted
+            or self._expansion_staged
+            or self._expansion_pending
+            or self._expansion_accepted
         ):
             raise TopologyError("uncommitted topology packets remain staged")
 
@@ -2142,9 +2218,7 @@ class CommitPlan:
     published_queues: tuple[SemanticFamilyFIFO, ...] = ()
     topology: tuple[TopologyPublication, ...] = ()
     deferred_topology: tuple[DeferredUnaryTopologyPublication, ...] = ()
-    deferred_branched_topology: tuple[
-        DeferredBranchedTopologyPublication, ...
-    ] = ()
+    expansion_topology: tuple[TopologyExpansionPublication, ...] = ()
     queue_cost_additions: tuple[Tensor, ...] = ()
     device_failure: DeviceCommitFailure | None = None
 
@@ -2169,20 +2243,20 @@ class CommitPlan:
             raise ValueError(
                 "a family commit may stage only one deferred packet per lane"
             )
-        branched_keys = tuple(
+        expansion_keys = tuple(
             (item.lane, item.sequence)
-            for item in self.deferred_branched_topology
+            for item in self.expansion_topology
         )
-        if len(set(branched_keys)) != len(branched_keys):
+        if len(set(expansion_keys)) != len(expansion_keys):
             raise ValueError(
-                "a commit plan repeats a deferred branched topology sequence"
+                "a commit plan repeats a topology expansion sequence"
             )
-        branched_lanes = tuple(
-            item.lane for item in self.deferred_branched_topology
+        expansion_lanes = tuple(
+            item.lane for item in self.expansion_topology
         )
-        if len(set(branched_lanes)) != len(branched_lanes):
+        if len(set(expansion_lanes)) != len(expansion_lanes):
             raise ValueError(
-                "a family commit may stage only one branched packet per lane"
+                "a family commit may stage only one expansion packet per lane"
             )
         queue_ids = tuple(id(queue) for queue in self.published_queues)
         if len(set(queue_ids)) != len(queue_ids):
@@ -2267,6 +2341,7 @@ class RolloutCommit:
     peak_after_transition: int
     commit_started: torch.cuda.Event | None
     event: torch.cuda.Event
+    topology: tuple[TopologyExpansionPublication, ...] = ()
 
 
 class RolloutTransaction:
@@ -2538,14 +2613,14 @@ class RolloutTransaction:
                     "deferred topology lane was not scheduled"
                 )
             self.topology.preflight_deferred(publication, destinations)
-        for publication in plan.deferred_branched_topology:
+        for publication in plan.expansion_topology:
             if publication.lane >= self.n_replica:
                 raise RolloutError(
-                    "deferred branched topology lane is outside replicas"
+                    "topology expansion lane is outside replicas"
                 )
             if publication.lane not in scheduled.lanes:
                 raise RolloutError(
-                    "deferred branched topology lane was not scheduled"
+                    "topology expansion lane was not scheduled"
                 )
         transaction = None
         pending_topology = None
@@ -2580,8 +2655,8 @@ class RolloutTransaction:
                     self.topology.stage(publication)
                 for publication in plan.deferred_topology:
                     self.topology.stage_deferred(publication)
-                for publication in plan.deferred_branched_topology:
-                    self.topology.stage_branched(publication)
+                for publication in plan.expansion_topology:
+                    self.topology.stage_expansion(publication)
                 transaction = PublicationTransaction.begin_device(
                     destinations,
                     phase="rollout_commit",
@@ -2760,8 +2835,8 @@ class RolloutTransaction:
                     enable_timing=measure_commit, blocking=False
                 )
                 commit_ready.record(self.commit_stream)
-                for publication in plan.deferred_branched_topology:
-                    self.topology.finalize_branched(
+                for publication in plan.expansion_topology:
+                    self.topology.finalize_expansion(
                         publication,
                         success,
                         stream=self.commit_stream,
@@ -2782,12 +2857,12 @@ class RolloutTransaction:
                         queue.frontier_cost.copy_(frontier)
             self.topology.cancel(plan.topology)
             self.topology.cancel_deferred(plan.deferred_topology)
-            self.topology.cancel_branched(plan.deferred_branched_topology)
+            self.topology.cancel_expansions(plan.expansion_topology)
             self._state = _MachineState.FAILED
             raise
         sequence = (
-            plan.deferred_branched_topology[-1].sequence
-            if plan.deferred_branched_topology
+            plan.expansion_topology[-1].sequence
+            if plan.expansion_topology
             else (
                 plan.deferred_topology[-1].sequence
                 if plan.deferred_topology
@@ -2813,6 +2888,7 @@ class RolloutTransaction:
             peak_after_transition=peak_after_transition,
             commit_started=commit_started,
             event=commit_ready,
+            topology=plan.expansion_topology,
         )
 
 
@@ -3042,7 +3118,6 @@ __all__ = [
     "CompletionBatch",
     "CompletionFIFO",
     "CompletionPlan",
-    "DeferredBranchedTopologyPublication",
     "DeferredUnaryTopologyPublication",
     "DeviceCommitFailure",
     "DeviceStableRoute",
@@ -3063,6 +3138,7 @@ __all__ = [
     "ScheduledFamily",
     "SemanticFamilyFIFO",
     "TopologyDraftPacket",
+    "TopologyExpansionPublication",
     "TopologyPublication",
     "TransitionRequest",
     "child_path_keys",
