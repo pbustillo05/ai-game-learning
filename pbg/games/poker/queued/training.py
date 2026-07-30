@@ -21,8 +21,6 @@ from pbg.core.contracts import (
 from pbg.core.iteration import (
     AcceptedRollout,
     CompletionLoop,
-    IterationEngine,
-    LearnerPreflightOptimizer,
     RolloutLoop,
     SealedTopology,
 )
@@ -64,6 +62,8 @@ from pbg.core.targets import ConversionMap, LayeredTargetExecutor, TargetAlgebra
 from pbg.core.training import (
     IterationResult,
     LearnerIteration,
+    LearnerTransaction,
+    PreparedLearner,
     RecoverableOverflow,
 )
 from pbg.games.poker.model.capacity import (
@@ -1004,42 +1004,34 @@ class PokerSequentialProgram:
         owners = self.owners
         input_names = self._iteration_input_names
         sealed = self._iteration_sealed
-        learner_results: list[IterationResult | None] = []
-        if self.n_replica > 1 or self.distributed is not None:
-            assert self.replica_optimizers is not None
-            try:
-                IterationEngine.preflight_learners(
-                    generators=self.generators,
-                    validate_lane=lambda lane: self._learn_lane(
-                        lane,
-                        input_names=input_names,
-                        sealed=sealed,
-                        iteration=iteration,
-                        validate_only=True,
-                    ),
-                    clear_gradients=lambda: self.replica_optimizers.zero_grad(
-                        range(self.n_replica)
-                    ),
-                    distributed=self.distributed,
-                    device=owners.plan.device,
-                    error_type=PokerIterationError,
-                )
-            except Exception:
-                for value in sealed.values():
-                    value.release()
-                raise
-        for lane in range(self.n_replica):
-            learner_results.append(
-                self._learn_lane(
+        optimizer_owner = (
+            self.optimizer
+            if self.replica_optimizers is None
+            else self.replica_optimizers
+        )
+        try:
+            learner_results = LearnerTransaction(
+                optimizer=optimizer_owner,
+                generators=self.generators,
+                run_states=self.run_states,
+                distributed=self.distributed,
+                device=owners.plan.device,
+                error_type=PokerIterationError,
+            ).optimize(
+                lambda lane: self._prepare_learner_lane(
                     lane,
                     input_names=input_names,
                     sealed=sealed,
-                    iteration=iteration,
-                )
+                ),
+                iteration=iteration,
             )
-        for value in sealed.values():
-            value.release()
-        self._iteration_learner_results = learner_results
+        finally:
+            for value in sealed.values():
+                value.release()
+        for state in self.run_states:
+            if state is not None:
+                state.logical_work["trajectories"] += state.root_count
+        self._iteration_learner_results = list(learner_results)
 
     def finish_backward(
         self,
@@ -1094,20 +1086,17 @@ class PokerSequentialProgram:
             ),
         )
 
-    def _learn_lane(
+    def _prepare_learner_lane(
         self,
         lane: int,
         *,
         input_names: tuple[str, ...],
         sealed: Mapping[tuple[int, str], SealedSequentialInputs],
-        iteration: int,
-        validate_only: bool = False,
-    ) -> IterationResult:
+    ) -> PreparedLearner:
         owners = self.owners
         model = self.models[lane]
         model_operation = self.model_operations[lane]
         generator = self.generators[lane]
-        run_state = self.run_states[lane]
         reference_operation = self.reference_operations[lane]
         stores = {
             name: AlignedSequentialStore(
@@ -1253,26 +1242,23 @@ class PokerSequentialProgram:
                 distributed=self.distributed,
             )
         )
-        if validate_only:
-            optimizer = LearnerPreflightOptimizer(self.optimizers[lane])
-        result = LearnerIteration(
-            model=model,
-            learner=learner,
-            optimizer=optimizer,  # type: ignore[arg-type]
-            run_state=None if validate_only else run_state,
-            physical_batch_cap=physical_caps,
-        ).optimize(
+
+        def release() -> None:
+            if reference_caches is not None:
+                for cache in reference_caches.values():
+                    cache.release()
+
+        return PreparedLearner(
+            LearnerIteration(
+                learner=learner,
+                optimizer=optimizer,  # type: ignore[arg-type]
+                physical_batch_cap=physical_caps,
+            ),
             sampler,
-            iteration=iteration,
             reference_operation=reference_operation,
             reference_caches=reference_caches,
+            release=release,
         )
-        if reference_caches is not None:
-            for cache in reference_caches.values():
-                cache.release()
-        if run_state is not None and not validate_only:
-            run_state.logical_work["trajectories"] += run_state.root_count
-        return result
 
     def _target_algebra(self) -> TargetAlgebra:
         if self.mode.private_estimator is PrivateEstimator.SAMPLED:

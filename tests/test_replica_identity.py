@@ -477,7 +477,6 @@ def _distributed_sum_worker(
             TrainingError, match="failed .* distributed SUM|another distributed"
         ):
             LearnerIteration(
-                model=module,
                 learner=_AsymmetricLearner(),  # type: ignore[arg-type]
                 optimizer=optimizer_group.lane_stepper(
                     0, distributed=synchronizer
@@ -697,6 +696,21 @@ def test_complete_sequential_transactions_isolate_every_replica_lane(
     modules = tuple(
         inference.modules.lane_module(lane) for lane in range(count)
     )
+    learner_calls = [0 for _ in range(count)]
+
+    class _CountedLearner:
+        def __init__(self, lane: int, operation) -> None:
+            self.lane = lane
+            self.operation = operation
+
+        def __call__(self, *arguments, **keywords):
+            learner_calls[self.lane] += 1
+            return self.operation(*arguments, **keywords)
+
+    learner_operations = tuple(
+        _CountedLearner(lane, module.learner_operation)
+        for lane, module in enumerate(modules)
+    )
     generators = tuple(
         torch.Generator(device=device).manual_seed(730 + lane)
         for lane in range(count)
@@ -719,7 +733,7 @@ def test_complete_sequential_transactions_isolate_every_replica_lane(
         ),
         mode=mode,
         model=modules[0],
-        model_operation=modules[0].learner_operation,
+        model_operation=learner_operations[0],
         optimizer=optimizers.optimizers[0],
         loss=LossConfig(reference_kl_coefficient=0),
         schedule=LearnerSchedule(batch_size=1),
@@ -730,15 +744,14 @@ def test_complete_sequential_transactions_isolate_every_replica_lane(
         replica_optimizers=optimizers,
         replica_generators=generators,
         replica_run_states=run_states,
-        replica_model_operations=tuple(
-            module.learner_operation for module in modules
-        ),
+        replica_model_operations=learner_operations,
     ).run(iteration=0)
     assert isinstance(result, ReplicaPokerIterationResult)
     assert result.failures == {}
     assert result.versions == (8,) * count
     assert all(value is not None for value in result.results)
     assert tuple(state.iteration for state in run_states) == (1,) * count
+    assert learner_calls == [8] * count
     final_rng = tuple(generator.get_state() for generator in generators)
     assert all(
         not torch.equal(before, after)
@@ -891,17 +904,47 @@ def test_branched_replica_learner_failure_aborts_before_any_lane_commit() -> Non
         inference.modules,
         OptimizerConfig(name="adamw", grad_clip=5.0),
     )
+    healthy_module = inference.modules.lane_module(0)
     failed_module = inference.modules.lane_module(1)
+    healthy_operation = healthy_module.learner_operation
+    learner_calls = [0, 0]
+
+    def count_healthy(*args, **kwargs):
+        learner_calls[0] += 1
+        return healthy_operation(*args, **kwargs)
 
     def fail_learner(*_args, **_kwargs):
+        learner_calls[1] += 1
         raise RuntimeError("injected branched lane failure")
 
+    healthy_module.learner_operation = count_healthy  # type: ignore[method-assign]
     failed_module.learner_operation = fail_learner  # type: ignore[method-assign]
     run_states = (
         RunState("branched-healthy-lane", root_count=1),
         RunState("branched-failed-lane", root_count=1),
     )
-    with pytest.raises(RuntimeError, match="before optimizer transition"):
+    generators = tuple(
+        torch.Generator(device=device).manual_seed(950 + lane)
+        for lane in range(2)
+    )
+    parameters_before = {
+        name: value.clone()
+        for name, value in inference.modules.parameters.items()
+    }
+    buffers_before = {
+        name: value.clone()
+        for name, value in inference.modules.buffers.items()
+    }
+    exp_avg_before = optimizers.exp_avg.clone()
+    exp_avg_sq_before = optimizers.exp_avg_sq.clone()
+    steps_before = tuple(
+        optimizer.step_count for optimizer in optimizers.optimizers
+    )
+    scalers_before = tuple(
+        optimizer.scaler.state_dict() for optimizer in optimizers.optimizers
+    )
+    rng_before = tuple(generator.get_state() for generator in generators)
+    with pytest.raises(RuntimeError, match="every transition was rolled back"):
         EngineDrivenReplicaBranchedAttempt(
         geometry=geometry,
         owners=GeneratedOwners(
@@ -933,17 +976,31 @@ def test_branched_replica_learner_failure_aborts_before_any_lane_commit() -> Non
         optimizers=optimizers,
         losses=(LossConfig(reference_kl_coefficient=0),) * 2,
         schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
-        generators=tuple(
-            torch.Generator(device=device).manual_seed(950 + lane)
-            for lane in range(2)
-        ),
+        generators=generators,
         run_states=run_states,
         seed=950,
         lambda_=0.95,
         ).run(iteration=0)
     assert tuple(int(value) for value in optimizers.versions.tolist()) == (0, 0)
     assert tuple(state.iteration for state in run_states) == (0, 0)
-    assert bool(optimizers.gradients[1].eq(0).all())
+    assert learner_calls == [2, 1]
+    assert bool(optimizers.gradients.eq(0).all())
+    for name, expected in parameters_before.items():
+        torch.testing.assert_close(inference.modules.parameters[name], expected)
+    for name, expected in buffers_before.items():
+        torch.testing.assert_close(inference.modules.buffers[name], expected)
+    torch.testing.assert_close(optimizers.exp_avg, exp_avg_before)
+    torch.testing.assert_close(optimizers.exp_avg_sq, exp_avg_sq_before)
+    assert tuple(
+        optimizer.step_count for optimizer in optimizers.optimizers
+    ) == steps_before
+    assert tuple(
+        optimizer.scaler.state_dict() for optimizer in optimizers.optimizers
+    ) == scalers_before
+    assert all(
+        torch.equal(generator.get_state(), expected)
+        for generator, expected in zip(generators, rng_before, strict=True)
+    )
 
 
 @CUDA
@@ -1184,6 +1241,9 @@ def test_zero_copy_lanes_use_one_dense_gradient_axis_and_dense_oracle(
     memory.assert_reconciled(owner, group)
     assert memory.gradient_bytes == 4 * owner.parameter_count * 4
     assert memory.optimizer_bytes == 2 * memory.gradient_bytes
+    assert memory.transaction_bytes == (
+        3 * memory.gradient_bytes + memory.buffer_bytes
+    )
     assert bool(group.gradients[1].eq(0).all())
     assert group.versions.tolist() == [1, 0, 1, 1]
     owner.assert_zero_copy()

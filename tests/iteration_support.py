@@ -76,6 +76,23 @@ class _SingleOptimizerGroup:
     def __init__(self, optimizer) -> None:
         self.optimizers = (optimizer,)
         self.versions = torch.zeros(1, dtype=torch.int64)
+        self._transaction_versions = None
+
+    def begin_transaction(self) -> None:
+        assert self._transaction_versions is None
+        self.optimizers[0].begin_transaction()
+        self._transaction_versions = self.versions.clone()
+
+    def rollback_transaction(self) -> None:
+        assert self._transaction_versions is not None
+        self.optimizers[0].rollback_transaction()
+        self.versions.copy_(self._transaction_versions)
+        self._transaction_versions = None
+
+    def commit_transaction(self) -> None:
+        assert self._transaction_versions is not None
+        self.optimizers[0].commit_transaction()
+        self._transaction_versions = None
 
     def zero_grad(self, lanes) -> None:
         for lane in lanes:

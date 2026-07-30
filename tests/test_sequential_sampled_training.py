@@ -1384,7 +1384,6 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
     )
     mixed_model = _LearnerModel(device)
     mixed_result = LearnerIteration(
-        model=mixed_model,
         learner=LearnerOperation(
             mode,
             LossConfig(reference_kl_coefficient=0.0),
@@ -1414,7 +1413,6 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
         _LearnerPolicy(),
     )
     result = LearnerIteration(
-        model=model,
         learner=learner,
         optimizer=optimizer,
         physical_batch_cap={"pre": 2, "post_2": 1},

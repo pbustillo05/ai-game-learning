@@ -30,8 +30,6 @@ from pbg.core.contracts import (
 from pbg.core.iteration import (
     AcceptedRollout,
     CompletionLoop,
-    IterationEngine,
-    LearnerPreflightOptimizer,
     RolloutLoop,
     SealedTopology,
 )
@@ -87,6 +85,8 @@ from pbg.core.topology import (
 )
 from pbg.core.training import (
     LearnerIteration,
+    LearnerTransaction,
+    PreparedLearner,
     RecoverableOverflow,
 )
 from pbg.games.poker.queued.hooks import (
@@ -2866,7 +2866,6 @@ class PokerBranchedProgram:
 
     def execute_learner(self, *, iteration: int) -> None:
         owners = self.owners
-        count = owners.plan.manifest.n_replica
         input_names = self._iteration_input_names
         sealed = self._iteration_sealed
 
@@ -2888,7 +2887,7 @@ class PokerBranchedProgram:
                 }
             )
 
-        def validate_lane(lane: int) -> None:
+        def prepare_lane(lane: int) -> PreparedLearner:
             stores = {
                 name: RaggedBranchedStore(
                     owners,
@@ -2908,7 +2907,7 @@ class PokerBranchedProgram:
                 statistical_counts=statistical_counts(lane, stores),
             )
             module = self.models[lane]
-            operation = (
+            model_operation = (
                 self.learner_operations[lane]
                 if self.learner_operations is not None
                 else (
@@ -2918,91 +2917,9 @@ class PokerBranchedProgram:
                     else module.rb_learner_operation
                 )
             )
+            reference_operation = self.reference_operations[lane]
+            reference_caches: dict[str, ReferenceOutputCache] | None = None
             try:
-                LearnerIteration(
-                    model=module,
-                    learner=LearnerOperation(
-                        self.modes[lane],
-                        self.losses[lane],
-                        operation,
-                        PokerLearnerPolicy(self.geometry, self.policy),
-                        precision=self.precision,
-                    ),
-                    optimizer=LearnerPreflightOptimizer(
-                        self.optimizers.optimizers[lane]
-                    ),  # type: ignore[arg-type]
-                    sigma_pack_cap=(
-                        owners.plan.manifest.learner_sigma_pack_cap
-                    ),
-                    action_pack_cap=(
-                        owners.plan.manifest.learner_action_pack_cap
-                    ),
-                ).optimize(
-                    sampler,
-                    iteration=iteration,
-                    reference_operation=self.reference_operations[lane],
-                )
-            finally:
-                sampler.release()
-
-        try:
-            IterationEngine.preflight_learners(
-                generators=self.generators,
-                validate_lane=validate_lane,
-                clear_gradients=lambda: self.optimizers.zero_grad(range(count)),
-                distributed=self.distributed,
-                device=owners.plan.device,
-                error_type=BranchedPokerError,
-            )
-        except Exception:
-            for value in sealed.values():
-                value.release()
-            raise
-        learner_results: list[object | None] = []
-        for lane in range(count):
-            try:
-                stores = {
-                    name: RaggedBranchedStore(
-                        owners,
-                        name,
-                        sealed_inputs=sealed[(lane, name)],
-                        lane=lane,
-                    )
-                    for name in input_names
-                    if sealed[(lane, name)].rows
-                }
-                sampler = BranchedBatchSampler(
-                    stores,
-                    self.schedule,
-                    generator=self.generators[lane],
-                    sigma_pack_cap=(
-                        owners.plan.manifest.learner_sigma_pack_cap
-                    ),
-                    action_pack_cap=(
-                        owners.plan.manifest.learner_action_pack_cap
-                    ),
-                    statistical_counts=statistical_counts(lane, stores),
-                )
-                module = self.models[lane]
-                model_operation = (
-                    self.learner_operations[lane]
-                    if self.learner_operations is not None
-                    else (
-                        module.learner_operation
-                        if self.modes[lane].private_estimator
-                        is PrivateEstimator.SAMPLED
-                        else module.rb_learner_operation
-                    )
-                )
-                learner = LearnerOperation(
-                    self.modes[lane],
-                    self.losses[lane],
-                    model_operation,
-                    PokerLearnerPolicy(self.geometry, self.policy),
-                    precision=self.precision,
-                )
-                reference_operation = self.reference_operations[lane]
-                reference_caches: dict[str, ReferenceOutputCache] | None = None
                 if (
                     self.cache_reference_outputs
                     and reference_operation is not None
@@ -3038,10 +2955,22 @@ class PokerBranchedProgram:
                         resident += candidate.allocated_bytes
                     if admitted:
                         reference_caches = admitted
-                try:
-                    optimized = LearnerIteration(
-                        model=module,
-                        learner=learner,
+
+                def release() -> None:
+                    if reference_caches is not None:
+                        for cache in reference_caches.values():
+                            cache.release()
+                    sampler.release()
+
+                return PreparedLearner(
+                    LearnerIteration(
+                        learner=LearnerOperation(
+                            self.modes[lane],
+                            self.losses[lane],
+                            model_operation,
+                            PokerLearnerPolicy(self.geometry, self.policy),
+                            precision=self.precision,
+                        ),
                         optimizer=self.optimizers.lane_stepper(
                             lane, distributed=self.distributed
                         ),  # type: ignore[arg-type]
@@ -3051,28 +2980,35 @@ class PokerBranchedProgram:
                         action_pack_cap=(
                             owners.plan.manifest.learner_action_pack_cap
                         ),
-                        run_state=self.run_states[lane],
-                    ).optimize(
-                        sampler,
-                        iteration=iteration,
-                        reference_operation=reference_operation,
-                        reference_caches=reference_caches,
-                    )
-                finally:
-                    if reference_caches is not None:
-                        for cache in reference_caches.values():
-                            cache.release()
-                    sampler.release()
-            except Exception as exc:
-                raise BranchedPokerError(
-                    "replica learner failed after successful preflight"
-                ) from exc
-            learner_results.append(optimized)
-        for value in sealed.values():
-            value.release()
-        for lane, optimized in enumerate(learner_results):
-            if optimized is None:
-                continue
+                    ),
+                    sampler,
+                    reference_operation=reference_operation,
+                    reference_caches=reference_caches,
+                    release=release,
+                )
+            except Exception:
+                if reference_caches is not None:
+                    for cache in reference_caches.values():
+                        cache.release()
+                sampler.release()
+                raise
+
+        try:
+            learner_results = LearnerTransaction(
+                optimizer=self.optimizers,  # type: ignore[arg-type]
+                generators=self.generators,
+                run_states=self.run_states,
+                distributed=self.distributed,
+                device=owners.plan.device,
+                error_type=BranchedPokerError,
+            ).optimize(
+                prepare_lane,
+                iteration=iteration,
+            )
+        finally:
+            for value in sealed.values():
+                value.release()
+        for lane in range(len(learner_results)):
             self.controllers[lane].observe(
                 self._iteration_counterfactual_sizes[lane],
                 iteration=iteration,
@@ -3088,7 +3024,7 @@ class PokerBranchedProgram:
                     if self.safeguards[lane] is None
                     else self.safeguards[lane].state_dict()
                 )
-        self._iteration_learner_results = learner_results
+        self._iteration_learner_results = list(learner_results)
 
     def finish_backward(self) -> ReplicaBranchedPokerResult:
         owners = self.owners

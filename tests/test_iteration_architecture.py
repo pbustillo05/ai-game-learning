@@ -271,6 +271,28 @@ def test_one_learner_objective_accepts_unit_or_ragged_action_spans() -> None:
     }.issubset(properties)
 
 
+def test_one_learner_transaction_replaces_validate_only_replay() -> None:
+    production = tuple((REPOSITORY / "pbg").rglob("*.py"))
+    definitions = [
+        (path, node.name)
+        for path in production
+        for node in ast.walk(
+            ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        )
+        if isinstance(node, ast.ClassDef)
+        and node.name == "LearnerTransaction"
+    ]
+    assert definitions == [
+        (REPOSITORY / "pbg/core/training.py", "LearnerTransaction")
+    ]
+    source = "\n".join(
+        path.read_text(encoding="utf-8") for path in production
+    )
+    assert "LearnerPreflightOptimizer" not in source
+    assert "preflight_learners" not in source
+    assert "validate_only" not in source
+
+
 def test_runtime_constructs_only_the_common_engine() -> None:
     path = REPOSITORY / "pbg/runtime.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

@@ -340,6 +340,7 @@ class ReplicaMemoryReport:
     buffer_bytes: int
     gradient_bytes: int
     optimizer_bytes: int
+    transaction_bytes: int
 
     @property
     def total_bytes(self) -> int:
@@ -348,6 +349,7 @@ class ReplicaMemoryReport:
             + self.buffer_bytes
             + self.gradient_bytes
             + self.optimizer_bytes
+            + self.transaction_bytes
         )
 
     def assert_reconciled(
@@ -394,6 +396,7 @@ class ReplicaOptimizerGroup:
             for lane in range(count)
         )
         self.versions = torch.zeros(count, dtype=torch.int64)
+        self._transaction_versions: Tensor | None = None
         modules.assert_zero_copy()
 
     def memory_report(self) -> ReplicaMemoryReport:
@@ -411,7 +414,46 @@ class ReplicaOptimizerGroup:
                 self.exp_avg.numel() * self.exp_avg.element_size()
                 + self.exp_avg_sq.numel() * self.exp_avg_sq.element_size()
             ),
+            transaction_bytes=sum(
+                optimizer.transaction_bytes
+                for optimizer in self.optimizers
+            ),
         )
+
+    def begin_transaction(self) -> None:
+        """Create one rollback point spanning every learner lane."""
+
+        if self._transaction_versions is not None:
+            raise ReplicaError("replica optimizer transaction is already active")
+        begun: list[DenseAdam] = []
+        try:
+            for optimizer in self.optimizers:
+                optimizer.begin_transaction()
+                begun.append(optimizer)
+        except Exception:
+            for optimizer in reversed(begun):
+                optimizer.rollback_transaction()
+            raise
+        self._transaction_versions = self.versions.clone()
+
+    def rollback_transaction(self) -> None:
+        """Restore all lanes after any local or rank-common learner failure."""
+
+        if self._transaction_versions is None:
+            raise ReplicaError("replica optimizer transaction is not active")
+        for optimizer in self.optimizers:
+            optimizer.rollback_transaction()
+        self.versions.copy_(self._transaction_versions)
+        self._transaction_versions = None
+
+    def commit_transaction(self) -> None:
+        """Publish every lane transition together."""
+
+        if self._transaction_versions is None:
+            raise ReplicaError("replica optimizer transaction is not active")
+        for optimizer in self.optimizers:
+            optimizer.commit_transaction()
+        self._transaction_versions = None
 
     def _mask(self, lanes: Sequence[int]) -> Tensor:
         mask = torch.zeros(
@@ -450,6 +492,10 @@ class ReplicaOptimizerGroup:
         return tuple(result)
 
     def state_dict(self) -> dict[str, object]:
+        if self._transaction_versions is not None:
+            raise ReplicaError(
+                "cannot checkpoint an active replica optimizer transaction"
+            )
         return {
             "schema": "pbg-queued-replica-optimizer-v1",
             "n_replica": self.modules.n_replica,
@@ -461,6 +507,10 @@ class ReplicaOptimizerGroup:
         }
 
     def load_state_dict(self, state: Mapping[str, object]) -> None:
+        if self._transaction_versions is not None:
+            raise ReplicaError(
+                "cannot restore an active replica optimizer transaction"
+            )
         expected = {"schema", "n_replica", "versions", "lanes", "scalers"}
         if (
             set(state) != expected

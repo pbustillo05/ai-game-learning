@@ -194,10 +194,21 @@ class DenseAdam:
         self.config = config
         self.gradients = DenseGradientOwner(module, flat=gradient_flat)
         self.parameters = self.gradients.parameters
+        self.buffers = tuple(module.buffers())
         self.exp_avg = self._state_vector(exp_avg, "exp_avg")
         self.exp_avg_sq = self._state_vector(exp_avg_sq, "exp_avg_sq")
         self.step_count = 0
         self.scaler = LossScaler() if scaler is None else scaler
+        self._parameter_snapshot = torch.empty_like(self.gradients.flat)
+        self._parameter_snapshot_views = self._flat_views(
+            self._parameter_snapshot
+        )
+        self._buffer_snapshots = tuple(
+            torch.empty_like(buffer) for buffer in self.buffers
+        )
+        self._exp_avg_snapshot = torch.empty_like(self.exp_avg)
+        self._exp_avg_sq_snapshot = torch.empty_like(self.exp_avg_sq)
+        self._transaction_state: tuple[int, dict[str, object]] | None = None
 
     def _state_vector(self, value: Tensor | None, name: str) -> Tensor:
         if value is None:
@@ -223,6 +234,63 @@ class DenseAdam:
             result.append(value[offset:end].view_as(parameter))
             offset = end
         return tuple(result)
+
+    @property
+    def transaction_bytes(self) -> int:
+        """Resident accelerator bytes reserved for exact update rollback."""
+
+        tensors = (
+            self._parameter_snapshot,
+            self._exp_avg_snapshot,
+            self._exp_avg_sq_snapshot,
+            *self._buffer_snapshots,
+        )
+        return sum(value.numel() * value.element_size() for value in tensors)
+
+    @torch.no_grad()
+    def begin_transaction(self) -> None:
+        """Snapshot every mutable learner tensor before the first transition."""
+
+        if self._transaction_state is not None:
+            raise OptimizationError("dense optimizer transaction is already active")
+        self.gradients.assert_bound()
+        torch._foreach_copy_(self._parameter_snapshot_views, self.parameters)
+        for destination, source in zip(
+            self._buffer_snapshots, self.buffers, strict=True
+        ):
+            destination.copy_(source)
+        self._exp_avg_snapshot.copy_(self.exp_avg)
+        self._exp_avg_sq_snapshot.copy_(self.exp_avg_sq)
+        self._transaction_state = (
+            self.step_count,
+            self.scaler.state_dict(),
+        )
+
+    @torch.no_grad()
+    def rollback_transaction(self) -> None:
+        """Restore the exact pre-transaction model, optimizer, and scaler."""
+
+        if self._transaction_state is None:
+            raise OptimizationError("dense optimizer transaction is not active")
+        torch._foreach_copy_(self.parameters, self._parameter_snapshot_views)
+        for destination, source in zip(
+            self.buffers, self._buffer_snapshots, strict=True
+        ):
+            destination.copy_(source)
+        self.exp_avg.copy_(self._exp_avg_snapshot)
+        self.exp_avg_sq.copy_(self._exp_avg_sq_snapshot)
+        step_count, scaler_state = self._transaction_state
+        self.step_count = step_count
+        self.scaler = LossScaler.from_state_dict(scaler_state)
+        self._transaction_state = None
+        self.zero_grad()
+
+    def commit_transaction(self) -> None:
+        """Publish all transitions by discarding the rollback point."""
+
+        if self._transaction_state is None:
+            raise OptimizationError("dense optimizer transaction is not active")
+        self._transaction_state = None
 
     @torch.no_grad()
     def step(self) -> OptimizerStep:
@@ -288,6 +356,10 @@ class DenseAdam:
         self.gradients.zero_()
 
     def state_dict(self) -> dict[str, object]:
+        if self._transaction_state is not None:
+            raise OptimizationError(
+                "cannot checkpoint an active optimizer transaction"
+            )
         return {
             "schema": "queued-dense-adam-v1",
             "config": {
@@ -300,6 +372,10 @@ class DenseAdam:
         }
 
     def load_state_dict(self, state: Mapping[str, object]) -> None:
+        if self._transaction_state is not None:
+            raise OptimizationError(
+                "cannot restore an active optimizer transaction"
+            )
         expected = {"schema", "config", "step", "exp_avg", "exp_avg_sq"}
         if set(state) != expected or state["schema"] != "queued-dense-adam-v1":
             raise ValueError("queued optimizer state schema is invalid")

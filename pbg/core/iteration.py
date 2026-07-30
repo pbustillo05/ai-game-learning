@@ -18,7 +18,6 @@ from pbg.core.branching import (
 )
 from pbg.core.capacity import ExecutionPhase, GeneratedOwners, StoragePlan
 from pbg.core.contracts import ModeSchema, validate_replica_group
-from pbg.core.optimization import OptimizerStep
 from pbg.core.persistence import RunState
 from pbg.core.rollout import (
     AsyncTopologyPublisher,
@@ -196,22 +195,6 @@ class IterationHooks(Protocol):
 
 
 _PHASES = tuple(ExecutionPhase)
-
-
-class LearnerPreflightOptimizer:
-    """Exercise learner batches without permitting a parameter transition."""
-
-    def __init__(self, optimizer: object) -> None:
-        self.optimizer = optimizer
-        self.scaler = optimizer.scaler
-
-    def zero_grad(self) -> None:
-        self.optimizer.zero_grad()
-
-    def step(self) -> OptimizerStep:
-        self.optimizer.zero_grad()
-        scale = self.scaler.scale
-        return OptimizerStep(False, True, 0.0, 1.0, scale, scale, 0)
 
 
 class IterationEngine:
@@ -427,51 +410,6 @@ class IterationEngine:
             for lane in active_lanes:
                 outstanding[lane] -= rows
         completion.release()
-
-    @staticmethod
-    def preflight_learners(
-        *,
-        generators: Sequence[torch.Generator],
-        validate_lane: Callable[[int], None],
-        clear_gradients: Callable[[], None],
-        distributed: object | None,
-        device: torch.device,
-        error_type: Callable[[str], Exception],
-    ) -> None:
-        """Validate all lanes transactionally before any optimizer transition."""
-
-        generator_states = tuple(
-            generator.get_state() for generator in generators
-        )
-        preflight_error: Exception | None = None
-        try:
-            for lane in range(len(generators)):
-                validate_lane(lane)
-        except Exception as exc:  # noqa: BLE001 - transaction-wide abort
-            preflight_error = exc
-        finally:
-            for generator, state in zip(
-                generators, generator_states, strict=True
-            ):
-                generator.set_state(state)
-            clear_gradients()
-        if distributed is not None:
-            local = torch.zeros(
-                len(generators),
-                dtype=torch.bool,
-                device=device,
-            )
-            if preflight_error is not None:
-                local.fill_(True)
-            common = distributed.agree_failures(local)
-            if bool(common.any()) and preflight_error is None:
-                preflight_error = error_type(
-                    "replica learner preflight failed on another rank"
-                )
-        if preflight_error is not None:
-            raise error_type(
-                "replica learner preflight failed before optimizer transition"
-            ) from preflight_error
 
     @staticmethod
     def _failure_from_device(
@@ -720,7 +658,6 @@ __all__ = [
     "IterationError",
     "IterationHooks",
     "LaneContext",
-    "LearnerPreflightOptimizer",
     "RolloutLoop",
     "RolloutSubmission",
     "SealedTopology",

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import copy
 import signal
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Protocol
 
 import torch
-from torch import Tensor, nn
+from torch import Tensor
 
 from pbg.core.learner import (
     BranchedBatchSampler,
@@ -100,18 +102,14 @@ class LearnerIteration:
     def __init__(
         self,
         *,
-        model: nn.Module,
         learner: LearnerOperation,
         optimizer: DenseAdam,
-        run_state: RunState | None = None,
         physical_batch_cap: int | Mapping[str, int] | None = None,
         sigma_pack_cap: int | None = None,
         action_pack_cap: int | None = None,
     ) -> None:
-        self.model = model
         self.learner = learner
         self.optimizer = optimizer
-        self.run_state = run_state
         if isinstance(physical_batch_cap, Mapping):
             caps = dict(physical_batch_cap)
             if not caps or any(
@@ -294,23 +292,208 @@ class LearnerIteration:
             if metric_rows
             else ()
         )
-        if self.run_state is not None:
-            self.run_state.logical_work["minibatches"] += len(steps)
-            self.run_state.logical_work["optimizer_steps"] += sum(
-                int(step.applied) for step in steps
-            )
-            self.run_state.iteration = iteration + 1
-            self.run_state.metrics_prefix.append(
-                {
-                    "iteration": iteration,
-                    "statistical_presentations": presentations,
-                    "minibatches": len(steps),
-                    "optimizer_steps": sum(
-                        int(step.applied) for step in steps
-                    ),
-                }
-            )
         return IterationResult(losses, tuple(steps), presentations)
+
+    @staticmethod
+    def commit_run_state(
+        run_state: RunState,
+        result: IterationResult,
+        *,
+        iteration: int,
+    ) -> None:
+        """Publish counters only after the complete learner transaction succeeds."""
+
+        if run_state.iteration != iteration:
+            raise TrainingError("learner run state is outside the commit iteration")
+        applied = sum(int(step.applied) for step in result.optimizer_steps)
+        run_state.logical_work["minibatches"] += len(result.optimizer_steps)
+        run_state.logical_work["optimizer_steps"] += applied
+        run_state.iteration = iteration + 1
+        run_state.metrics_prefix.append(
+            {
+                "iteration": iteration,
+                "statistical_presentations": result.statistical_presentations,
+                "minibatches": len(result.optimizer_steps),
+                "optimizer_steps": applied,
+            }
+        )
+
+
+class TransactionalOptimizer(Protocol):
+    """Mutable optimizer owner with one accelerator-resident rollback point."""
+
+    def begin_transaction(self) -> None: ...
+
+    def rollback_transaction(self) -> None: ...
+
+    def commit_transaction(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class PreparedLearner:
+    """One presentation-specific sampler plugged into the common learner."""
+
+    iteration: LearnerIteration
+    sampler: SequentialBatchSampler | BranchedBatchSampler
+    reference_operation: object | None = None
+    reference_caches: Mapping[str, ReferenceOutputCache] | None = None
+    release: Callable[[], None] = lambda: None
+
+    def optimize(self, *, iteration: int) -> IterationResult:
+        return self.iteration.optimize(
+            self.sampler,
+            iteration=iteration,
+            reference_operation=self.reference_operation,
+            reference_caches=self.reference_caches,
+        )
+
+
+class LearnerTransaction:
+    """One real learner pass per lane with all-or-nothing publication."""
+
+    def __init__(
+        self,
+        *,
+        optimizer: TransactionalOptimizer,
+        generators: Sequence[torch.Generator],
+        run_states: Sequence[RunState | None],
+        distributed: object | None = None,
+        device: torch.device,
+        error_type: type[Exception] = TrainingError,
+    ) -> None:
+        self.optimizer = optimizer
+        self.generators = tuple(generators)
+        self.run_states = tuple(run_states)
+        self.distributed = distributed
+        self.device = device
+        self.error_type = error_type
+        if (
+            not self.generators
+            or len(self.generators) != len(self.run_states)
+            or any(generator.device != device for generator in self.generators)
+        ):
+            raise ValueError(
+                "learner transaction requires aligned device-local lanes"
+            )
+
+    def _common_failure(self, lane: int, failed: bool) -> bool:
+        if self.distributed is None:
+            return failed
+        local = torch.zeros(
+            len(self.generators),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        local[lane] = failed
+        return bool(self.distributed.agree_failures(local).any())
+
+    @staticmethod
+    def _restore_run_state(
+        destination: RunState,
+        state: Mapping[str, object],
+    ) -> None:
+        restored = RunState(**copy.deepcopy(dict(state)))
+        for name in destination.__dataclass_fields__:
+            setattr(destination, name, getattr(restored, name))
+
+    def optimize(
+        self,
+        prepare_lane: Callable[[int], PreparedLearner],
+        *,
+        iteration: int,
+    ) -> tuple[IterationResult, ...]:
+        """Execute each lane once and commit only after every lane/rank succeeds."""
+
+        generator_states = tuple(
+            generator.get_state() for generator in self.generators
+        )
+        run_state_snapshots = tuple(
+            None if state is None else copy.deepcopy(state.state_dict())
+            for state in self.run_states
+        )
+        prepared: list[PreparedLearner | None] = [
+            None for _ in self.generators
+        ]
+        results: list[IterationResult] = []
+        transaction_open = False
+        failure: Exception | None = None
+        try:
+            self.optimizer.begin_transaction()
+            transaction_open = True
+            for lane in range(len(prepared)):
+                local_failure: Exception | None = None
+                try:
+                    prepared[lane] = prepare_lane(lane)
+                except Exception as exc:  # noqa: BLE001 - lane transaction
+                    local_failure = exc
+                if self._common_failure(lane, local_failure is not None):
+                    failure = (
+                        local_failure
+                        if local_failure is not None
+                        else TrainingError(
+                            "learner preparation failed on another rank"
+                        )
+                    )
+                    break
+            if failure is None:
+                for lane, work in enumerate(prepared):
+                    if work is None:
+                        raise TrainingError(
+                            "learner transaction omitted a prepared lane"
+                        )
+                    local_failure = None
+                    result: IterationResult | None = None
+                    try:
+                        result = work.optimize(iteration=iteration)
+                    except Exception as exc:  # noqa: BLE001 - lane transaction
+                        local_failure = exc
+                    if self._common_failure(lane, local_failure is not None):
+                        failure = (
+                            local_failure
+                            if local_failure is not None
+                            else TrainingError(
+                                "learner execution failed on another rank"
+                            )
+                        )
+                        break
+                    if result is None:
+                        raise TrainingError(
+                            "successful learner lane omitted its result"
+                        )
+                    results.append(result)
+            if failure is not None:
+                raise failure
+            for state, result in zip(
+                self.run_states, results, strict=True
+            ):
+                if state is not None:
+                    LearnerIteration.commit_run_state(
+                        state,
+                        result,
+                        iteration=iteration,
+                    )
+            self.optimizer.commit_transaction()
+            transaction_open = False
+            return tuple(results)
+        except Exception as exc:
+            if transaction_open:
+                self.optimizer.rollback_transaction()
+            for generator, state in zip(
+                self.generators, generator_states, strict=True
+            ):
+                generator.set_state(state)
+            for run_state, snapshot in zip(
+                self.run_states, run_state_snapshots, strict=True
+            ):
+                if run_state is not None and snapshot is not None:
+                    self._restore_run_state(run_state, snapshot)
+            raise self.error_type(
+                "learner transaction failed; every transition was rolled back"
+            ) from exc
+        finally:
+            for work in prepared:
+                if work is not None:
+                    work.release()
 
 
 class PreemptionNotice:
@@ -342,8 +525,10 @@ __all__ = [
     "AttemptAddress",
     "IterationResult",
     "LearnerIteration",
+    "LearnerTransaction",
     "OverflowRecoveryRecord",
     "PreemptionNotice",
+    "PreparedLearner",
     "RecoverableOverflow",
     "TrainingError",
 ]
