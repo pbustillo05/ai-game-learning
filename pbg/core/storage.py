@@ -586,9 +586,16 @@ class MonotoneSlab:
         *,
         failure_state: DeviceFailureState,
         label: str | None = None,
+        allow_empty: bool = False,
     ) -> None:
         self.schema = schema
-        self.capacity = _positive_integer(capacity, "slab capacity")
+        if type(allow_empty) is not bool:
+            raise TypeError("allow_empty must be bool")
+        self.capacity = (
+            _nonnegative_integer(capacity, "slab capacity")
+            if allow_empty
+            else _positive_integer(capacity, "slab capacity")
+        )
         self.n_replica = _positive_integer(n_replica, "n_replica")
         self.device = torch.device(device)
         if failure_state.n_replica != self.n_replica:
@@ -620,6 +627,7 @@ class MonotoneSlab:
     def analytical_bytes(
         cls, schema: SoASchema, capacity: int, n_replica: int
     ) -> int:
+        capacity = _nonnegative_integer(capacity, "slab capacity")
         return schema.allocation_bytes(capacity, n_replica) + cls.state_bytes(n_replica)
 
     @property
@@ -1267,10 +1275,6 @@ class _DevicePublicationTransaction:
                     )
             if max_rows is None or max_rows <= 0:
                 raise ValueError("device destinations need a positive pack bound")
-            if max_rows > slab.capacity:
-                raise ValueError(
-                    f"{slab.label} device pack exceeds destination capacity"
-                )
 
     def _record_failures(self) -> None:
         if len(self.requests) == 1:

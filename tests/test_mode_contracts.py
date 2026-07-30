@@ -103,18 +103,23 @@ def test_rows_and_nested_owner_data_are_immutable() -> None:
 def test_inapplicable_fields_are_absent() -> None:
     for schema in MODE_SCHEMAS:
         family = _fields(schema, "FamilyWork")
+        retained = _fields(schema, "FamilyRetained")
         leaf = _fields(schema, "Leaf")
         sigma_head = _fields(schema, "SigmaHead")
         sigma_target = _fields(schema, "SigmaTarget")
         action_target = _fields(schema, "ActionTarget")
-        learner_index = _fields(schema, "LearnerIndex")
 
         is_response = schema.training_regime is TrainingRegime.BEST_RESPONSE
         is_sampled = schema.private_estimator is PrivateEstimator.SAMPLED
         is_branched = schema.rollout_mode.is_branched
 
         assert ("role_selector" in family) is is_response
-        assert ("sampled_private_state" in family) is is_sampled
+        assert not {"model_input", "sampled_private_state", "owner"} & family
+        assert ("sampled_private_state" in retained) is is_sampled
+        assert {"model_input", "owner"} <= retained
+        assert ("LearnerRetained" in {owner.name for owner in schema.owners}) is (
+            is_response
+        )
         assert ("leaf_private_profile" in leaf) is is_sampled
         assert ("range_weights" in leaf) is (not is_sampled)
         assert ("seed" in leaf) is (not is_sampled)
@@ -124,9 +129,18 @@ def test_inapplicable_fields_are_absent() -> None:
         assert ("trace_target" in sigma_target) is is_branched
         assert ("cost_target" in sigma_target) is is_branched
         assert ("posterior" in action_target) is (not is_sampled)
-        assert ("action_begin" in learner_index) is is_branched
-        assert ("action_count" in learner_index) is is_branched
-        assert ("log_sampling_weight" in learner_index) is is_branched
+        if is_branched:
+            assert _fields(schema, "LearnerIndex") == {
+                "family_row",
+                "target_degree",
+                "action_begin",
+                "action_count",
+                "log_sampling_weight",
+            }
+        else:
+            assert "LearnerIndex" not in {
+                owner.name for owner in schema.owners
+            }
 
         assert ("frozen_profile" in schema.applicable_config) is is_response
         assert ("completion_samples" in schema.applicable_config) is (

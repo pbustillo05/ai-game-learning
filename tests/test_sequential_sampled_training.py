@@ -1286,6 +1286,7 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
     row_counts = {"pre": 5, "post_2": 3}
     for partition, rows in row_counts.items():
         family = owners.slab("FamilyWork", partition)
+        retained = owners.slab("FamilyRetained", partition)
         family_values = {
             field.name: torch.full(
                 (rows, *field.shape),
@@ -1295,12 +1296,22 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
             )
             for field in family.schema.fields
         }
-        family_values["model_input"].normal_(generator=generator)
-        family_values["sampled_private_state"][:] = torch.tensor(
+        retained_values = {
+            field.name: torch.full(
+                (rows, *field.shape),
+                field.fill,
+                dtype=field.dtype,
+                device=device,
+            )
+            for field in retained.schema.fields
+        }
+        retained_values["model_input"].normal_(generator=generator)
+        retained_values["sampled_private_state"][:] = torch.tensor(
             [0, 1], dtype=torch.int32, device=device
         )
-        family_values["owner"][:] = torch.arange(rows, device=device) % 2
+        retained_values["owner"][:] = torch.arange(rows, device=device) % 2
         _publish_rows(family, rows, family_values)
+        _publish_rows(retained, rows, retained_values)
         sigma = owners.slab("SigmaHead", partition)
         _publish_rows(
             sigma,
@@ -1320,6 +1331,7 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
                 ),
             },
         )
+    owners.bind_empty_layer_work_for_abort()
     owners.release_after(ExecutionPhase.ROLLOUT)
     owners.enter_phase(ExecutionPhase.QUEUE_DRAIN)
     owners.release_after(ExecutionPhase.QUEUE_DRAIN)
@@ -1329,11 +1341,20 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
     sealed_inputs = {
         partition: SealedSequentialInputs.seal(
             owners.slab("FamilyWork", partition),
-            owners.slab("LearnerIndex", partition),
+            owners.slab("FamilyRetained", partition),
             input_type=partition,
         )
         for partition in row_counts
     }
+    for partition, sealed in sealed_inputs.items():
+        retained = owners.slab("FamilyRetained", partition)
+        assert sealed.slab is retained
+        assert (
+            sealed.columns["model_input"].data_ptr()
+            == retained.columns["model_input"][0].data_ptr()
+        )
+        with pytest.raises(Exception, match="no generated|not live"):
+            owners.slab("LearnerIndex", partition)
     owners.release_after(ExecutionPhase.ALIGN_AND_SEAL)
     owners.enter_phase(ExecutionPhase.TARGETS)
     for partition, rows in row_counts.items():

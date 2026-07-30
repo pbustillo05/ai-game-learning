@@ -818,6 +818,7 @@ def test_folded_owner_refreshes_model_input_and_releases_at_seal() -> None:
             name,
             partitions,
             owners.slab("FamilyWork", name),
+            owners.slab("FamilyRetained", name),
             owners.slab("QueueMetadata", name),
         )
         for name in ("pre", "post_2")
@@ -897,6 +898,7 @@ def test_folded_owner_refreshes_model_input_and_releases_at_seal() -> None:
     ).any(0).any(-1)
     assert torch.isneginf(chance_reach[0, 0, conflict]).all()
     owners.release_after(ExecutionPhase.ROLLOUT)
+    owners.bind_empty_layer_work_for_abort()
     for phase in (
         ExecutionPhase.QUEUE_DRAIN,
         ExecutionPhase.COMPLETION,

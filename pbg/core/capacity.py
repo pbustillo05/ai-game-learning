@@ -352,6 +352,14 @@ class StoragePlan:
 _LIFETIMES: Mapping[str, tuple[ExecutionPhase, ExecutionPhase]] = MappingProxyType(
     {
         "FamilyWork": (ExecutionPhase.ROLLOUT, ExecutionPhase.ALIGN_AND_SEAL),
+        "FamilyRetained": (
+            ExecutionPhase.ROLLOUT,
+            ExecutionPhase.FINAL_BACKWARD,
+        ),
+        "LearnerRetained": (
+            ExecutionPhase.ALIGN_AND_SEAL,
+            ExecutionPhase.FINAL_BACKWARD,
+        ),
         "SigmaHead": (ExecutionPhase.ROLLOUT, ExecutionPhase.FINAL_BACKWARD),
         "ActionHead": (ExecutionPhase.ROLLOUT, ExecutionPhase.FINAL_BACKWARD),
         "Leaf": (ExecutionPhase.ROLLOUT, ExecutionPhase.COMPLETION),
@@ -442,12 +450,20 @@ def _field(
         "ready_tail",
         "reserved_tail",
         "controller_state",
+        "family_row",
         "action_begin",
         "action_count",
     ):
         fill = (
             integer_fill
-            if field_name in ("owner", "action", "trained_actor", "action_begin")
+            if field_name
+            in (
+                "owner",
+                "action",
+                "trained_actor",
+                "family_row",
+                "action_begin",
+            )
             else 0
         )
         shape = (4,) if field_name == "controller_state" else ()
@@ -537,9 +553,14 @@ def _owner_capacity(
     partition: Partition | None,
     manifest: CapacityManifest,
 ) -> int:
-    if owner == "FamilyWork":
+    if owner in ("FamilyWork", "FamilyRetained"):
         source = "player_node_cap"
-    elif owner in ("SigmaHead", "SigmaTarget", "LearnerIndex"):
+    elif owner in (
+        "SigmaHead",
+        "SigmaTarget",
+        "LearnerIndex",
+        "LearnerRetained",
+    ):
         source = "trained_player_cap"
     elif owner in ("ActionHead", "ActionTarget"):
         source = "action_cap"
@@ -770,6 +791,11 @@ def build_storage_plan(
             start_phase, last_consumer = _LIFETIMES[owner.name]
         except KeyError as exc:
             raise CapacityError(f"owner {owner.name!r} has no lifetime plan") from exc
+        if (
+            owner.name == "FamilyRetained"
+            and mode.training_regime is TrainingRegime.BEST_RESPONSE
+        ):
+            last_consumer = ExecutionPhase.ALIGN_AND_SEAL
         for partition in _axis_partitions(owner.partition_axis, partitions):
             if rollout_only and start_phase is not ExecutionPhase.ROLLOUT:
                 continue
@@ -825,15 +851,42 @@ def build_storage_plan(
             required_bytes=required,
             configured_budget_bytes=manifest.hardware.memory_budget_bytes,
         )
-        if required > manifest.hardware.memory_budget_bytes:
+        deferred_layer_work = (
+            ExecutionPhase.COMPLETION
+            <= phase
+            <= ExecutionPhase.TARGETS
+        )
+        deferred_bytes = (
+            sum(
+                allocation.analytical_bytes
+                for allocation in allocations
+                if allocation.key.owner == "LayerWork"
+                and allocation.start_phase <= phase <= allocation.last_consumer
+            )
+            if deferred_layer_work
+            else 0
+        )
+        if (
+            required - deferred_bytes
+            > manifest.hardware.memory_budget_bytes
+        ):
             raise AdmissionError(
-                f"{phase.name} requires {required} bytes but immutable budget is "
+                f"{phase.name} non-deferred owners require "
+                f"{required - deferred_bytes} bytes but immutable budget is "
                 f"{manifest.hardware.memory_budget_bytes}"
             )
         admissions.append(admission)
 
     free_bytes, _ = torch.cuda.mem_get_info(resolved)
-    peak_required = max(item.required_bytes for item in admissions)
+    peak_required = max(
+        item.required_bytes
+        for item in admissions
+        if not (
+            ExecutionPhase.COMPLETION
+            <= item.phase
+            <= ExecutionPhase.TARGETS
+        )
+    )
     if peak_required > int(free_bytes):
         raise AdmissionError(
             f"validated plan requires {peak_required} free bytes, selected device "
@@ -900,6 +953,116 @@ class GeneratedOwners:
         self._release_counts: dict[OwnerKey, int] = {}
         self._entered_phase: ExecutionPhase | None = None
         self._released_failure_state = False
+        self._realized_capacities: dict[OwnerKey, int] = {}
+        self._runtime_admissions: dict[ExecutionPhase, PhaseAdmission] = {}
+
+    @property
+    def layer_work_is_bound(self) -> bool:
+        expected = {
+            item.key
+            for item in self.plan.allocations
+            if item.key.owner == "LayerWork"
+        }
+        return expected == set(self._realized_capacities)
+
+    def bind_layer_work(
+        self,
+        output_names: tuple[str, ...],
+        arena_rows: tuple[tuple[int, ...], ...],
+    ) -> None:
+        """Bind the planner's exact immutable arena extents before completion."""
+
+        if self._entered_phase is not ExecutionPhase.ROLLOUT:
+            raise StorageError("LayerWork extents must bind during rollout sealing")
+        if self.layer_work_is_bound:
+            raise StorageError("LayerWork extents were already bound")
+        if (
+            len(arena_rows) != self.plan.manifest.n_replica
+            or any(len(rows) != len(output_names) for rows in arena_rows)
+        ):
+            raise StorageError("LayerWork extents have invalid replica partitions")
+        expected_names = tuple(item.name for item in self.plan.partitions.outputs)
+        if output_names != expected_names:
+            raise StorageError("LayerWork extents differ from output partitions")
+        for output, name in enumerate(output_names):
+            capacity = max(
+                (int(rows[output]) for rows in arena_rows),
+                default=0,
+            )
+            if capacity < 0 or capacity > self.plan.manifest.target_arena_cap:
+                raise AdmissionError(
+                    f"LayerWork.{name} exact extent exceeds target_arena_cap"
+                )
+            self._realized_capacities[OwnerKey("LayerWork", name)] = capacity
+        try:
+            self._build_runtime_admissions()
+        except BaseException:
+            self._realized_capacities.clear()
+            self._runtime_admissions.clear()
+            raise
+
+    def bind_empty_layer_work_for_abort(self) -> None:
+        """Bind zero extents solely so a pre-plan failed attempt can unwind."""
+
+        if self.layer_work_is_bound:
+            return
+        output_names = tuple(item.name for item in self.plan.partitions.outputs)
+        arena_rows = tuple(
+            tuple(0 for _name in output_names)
+            for _lane in range(self.plan.manifest.n_replica)
+        )
+        self.bind_layer_work(output_names, arena_rows)
+
+    def _allocation_capacity(self, allocation: OwnerAllocation) -> int:
+        return self._realized_capacities.get(
+            allocation.key, allocation.capacity
+        )
+
+    def _allocation_bytes(self, allocation: OwnerAllocation) -> int:
+        capacity = self._allocation_capacity(allocation)
+        if capacity == allocation.capacity:
+            return allocation.analytical_bytes
+        return MonotoneSlab.analytical_bytes(
+            allocation.schema,
+            capacity,
+            self.plan.manifest.n_replica,
+        )
+
+    def _build_runtime_admissions(self) -> None:
+        for phase in (
+            ExecutionPhase.COMPLETION,
+            ExecutionPhase.ALIGN_AND_SEAL,
+            ExecutionPhase.TARGETS,
+        ):
+            owner_bytes = DeviceFailureState.analytical_bytes(
+                self.plan.manifest.n_replica
+            ) + sum(
+                self._allocation_bytes(allocation)
+                for allocation in self.plan.allocations
+                if allocation.start_phase <= phase <= allocation.last_consumer
+            )
+            planned = self.plan.admission(phase)
+            required = (
+                owner_bytes
+                + planned.bounded_workspace_bytes
+                + planned.guard_bytes
+            )
+            if required > planned.configured_budget_bytes:
+                raise AdmissionError(
+                    f"{phase.name} exact LayerWork plan requires {required} bytes "
+                    f"but immutable budget is {planned.configured_budget_bytes}"
+                )
+            self._runtime_admissions[phase] = PhaseAdmission(
+                phase=phase,
+                owner_bytes=owner_bytes,
+                bounded_workspace_bytes=planned.bounded_workspace_bytes,
+                guard_bytes=planned.guard_bytes,
+                required_bytes=required,
+                configured_budget_bytes=planned.configured_budget_bytes,
+            )
+
+    def admission(self, phase: ExecutionPhase) -> PhaseAdmission:
+        return self._runtime_admissions.get(phase, self.plan.admission(phase))
 
     @property
     def live_keys(self) -> frozenset[OwnerKey]:
@@ -943,15 +1106,35 @@ class GeneratedOwners:
                     "have not been explicitly released"
                 )
 
+        if (
+            phase is ExecutionPhase.COMPLETION
+            and not self.layer_work_is_bound
+        ):
+            raise StorageError(
+                "LayerWork exact extents must be bound before completion"
+            )
         if phase is ExecutionPhase.COMPLETION:
             torch.cuda.synchronize(self.plan.device)
             torch.cuda.empty_cache()
-        admission = self.plan.admission(phase)
+        admission = self.admission(phase)
         if admission.required_bytes > admission.configured_budget_bytes:
             raise AdmissionError(f"{phase.name} failed immutable admission")
         starts = tuple(
             item for item in self.plan.allocations if item.start_phase is phase
         )
+        if phase is ExecutionPhase.COMPLETION:
+            free_bytes, _ = torch.cuda.mem_get_info(self.plan.device)
+            incremental = (
+                sum(self._allocation_bytes(item) for item in starts)
+                + admission.bounded_workspace_bytes
+                + admission.guard_bytes
+            )
+            if incremental > int(free_bytes):
+                raise AdmissionError(
+                    f"{phase.name} exact allocation and workspace require "
+                    f"{incremental} free bytes but selected device has "
+                    f"{int(free_bytes)}"
+                )
         created: list[OwnerKey] = []
         try:
             for allocation in starts:
@@ -959,11 +1142,12 @@ class GeneratedOwners:
                     failure_injector(allocation)
                 self._live[allocation.key] = MonotoneSlab(
                     allocation.schema,
-                    allocation.capacity,
+                    self._allocation_capacity(allocation),
                     self.plan.manifest.n_replica,
                     self.plan.device,
                     failure_state=self.failure_state,
                     label=allocation.key.label,
+                    allow_empty=allocation.key.owner == "LayerWork",
                 )
                 created.append(allocation.key)
         except BaseException:
@@ -1014,14 +1198,14 @@ class GeneratedOwners:
         if self._entered_phase is None:
             raise StorageError("no execution phase has been entered")
         torch.cuda.synchronize(self.plan.device)
-        admission = self.plan.admission(self._entered_phase)
+        admission = self.admission(self._entered_phase)
         allocated = self.failure_state.allocated_bytes + sum(
             slab.allocated_bytes for slab in self._live.values()
         )
         analytical = DeviceFailureState.analytical_bytes(
             self.plan.manifest.n_replica
         ) + sum(
-            allocation.analytical_bytes
+            self._allocation_bytes(allocation)
             for allocation in self.plan.allocations
             if allocation.key in self._live
         )

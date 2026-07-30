@@ -29,6 +29,7 @@ from pbg.core.storage import (
     DeviceDestinationRequest,
     MonotoneSlab,
     PublicationTransaction,
+    SoASchema,
 )
 from pbg.core.topology import (
     StagedTopologyPacket,
@@ -539,6 +540,105 @@ class FamilyBatch:
         return int(self.row.shape[1])
 
 
+class FamilyStorage:
+    """One logical family row split across hot and retained lifetimes."""
+
+    def __init__(self, hot: MonotoneSlab, retained: MonotoneSlab) -> None:
+        if not hot.schema.name.startswith("FamilyWork."):
+            raise RolloutError("family hot storage has the wrong owner")
+        input_type = hot.schema.name.split(".", 1)[1]
+        if retained.schema.name != f"FamilyRetained.{input_type}":
+            raise RolloutError("family retained storage has the wrong owner")
+        if (
+            hot.capacity != retained.capacity
+            or hot.n_replica != retained.n_replica
+            or hot.device != retained.device
+            or hot.failure_state is not retained.failure_state
+        ):
+            raise RolloutError("family lifetime owners are physically incompatible")
+        names = tuple(field.name for field in (*hot.schema.fields, *retained.schema.fields))
+        if len(set(names)) != len(names):
+            raise RolloutError("family lifetime owners overlap fields")
+        self.hot = hot
+        self.retained = retained
+        self.schema = SoASchema(
+            name=hot.schema.name,
+            fields=(*hot.schema.fields, *retained.schema.fields),
+            lifetime="root_commit_to_final_family_consumer",
+        )
+        self.capacity = hot.capacity
+        self.n_replica = hot.n_replica
+        self.device = hot.device
+        self.failure_state = hot.failure_state
+        self.label = hot.label
+
+    @property
+    def columns(self) -> Mapping[str, Tensor]:
+        return MappingProxyType(
+            {**dict(self.hot.columns), **dict(self.retained.columns)}
+        )
+
+    @property
+    def _state(self) -> Tensor:
+        return self.hot._state
+
+    def _assert_aligned(self) -> None:
+        torch._assert_async(
+            (
+                self.hot._state[:, :2]
+                == self.retained._state[:, :2]
+            ).all(),
+            "family hot and retained tails diverged",
+        )
+
+    def tail(self, lane: int) -> int:
+        hot_tail = self.hot.tail(lane)
+        if self.retained.tail(lane) != hot_tail:
+            raise RolloutError("family hot and retained tails diverged")
+        return hot_tail
+
+    def reserved_tails_device(self) -> Tensor:
+        self._assert_aligned()
+        return self.hot.reserved_tails_device()
+
+    def destination_requests(
+        self,
+        counts: Tensor,
+        values: Mapping[str, Tensor],
+        input_type: str,
+        logical_address: Tensor,
+    ) -> tuple[DeviceDestinationRequest, DeviceDestinationRequest]:
+        self._assert_aligned()
+        if tuple(values) != tuple(field.name for field in self.schema.fields):
+            raise RolloutError("family publication fields differ from its schema")
+        return (
+            DeviceDestinationRequest(
+                self.hot,
+                counts,
+                MappingProxyType(
+                    {
+                        field.name: values[field.name]
+                        for field in self.hot.schema.fields
+                    }
+                ),
+                input_type,
+                logical_address,
+            ),
+            DeviceDestinationRequest(
+                self.retained,
+                counts,
+                MappingProxyType(
+                    {
+                        field.name: values[field.name]
+                        for field in self.retained.schema.fields
+                    }
+                ),
+                input_type,
+                logical_address,
+            ),
+        )
+
+
 class SemanticFamilyFIFO:
     """FIFO view over one declared ``FamilyWork[input_type]`` slab."""
 
@@ -547,26 +647,31 @@ class SemanticFamilyFIFO:
         input_type: str,
         partitions: PartitionContract,
         family: MonotoneSlab,
+        retained: MonotoneSlab,
         metadata: MonotoneSlab,
     ) -> None:
         declared = tuple(item.name for item in partitions.inputs)
         if input_type not in declared:
             raise RolloutError(f"undeclared queue family {input_type!r}")
-        if family.schema.name != f"FamilyWork.{input_type}":
+        family_storage = FamilyStorage(family, retained)
+        if family_storage.schema.name != f"FamilyWork.{input_type}":
             raise RolloutError("family FIFO is bound to the wrong owner")
         if metadata.schema.name != f"QueueMetadata.{input_type}":
             raise RolloutError("family FIFO metadata is bound to the wrong owner")
-        if family.n_replica != metadata.n_replica or family.device != metadata.device:
+        if (
+            family_storage.n_replica != metadata.n_replica
+            or family_storage.device != metadata.device
+        ):
             raise RolloutError("family FIFO owners disagree on replica/device")
         required = {"head", "ready_tail", "reserved_tail"}
         if not required.issubset(metadata.columns):
             raise RolloutError("queue metadata is missing its closed tail fields")
         self.input_type = input_type
         self.partitions = partitions
-        self.family = family
+        self.family = family_storage
         self.metadata = metadata
-        self.device = family.device
-        self.n_replica = family.n_replica
+        self.device = family_storage.device
+        self.n_replica = family_storage.n_replica
         self._all_lanes = torch.arange(
             self.n_replica, dtype=torch.int64, device=self.device
         )
@@ -660,6 +765,7 @@ class SemanticFamilyFIFO:
             or active.device != self.device
         ):
             raise ValueError("queue publication mask must be bool [n_replica]")
+        self.family._assert_aligned()
         published = self.family._state[:, MonotoneSlab._PUBLISHED].to(
             torch.int32
         )
@@ -1000,7 +1106,13 @@ class RolloutOwnerRegistry:
         result.plan = plan
         return result
 
-    def require(self, slab: MonotoneSlab) -> None:
+    def require(self, slab: MonotoneSlab | FamilyStorage) -> None:
+        if isinstance(slab, FamilyStorage):
+            if id(slab.hot) not in self._ids or id(slab.retained) not in self._ids:
+                raise RolloutError(
+                    f"{slab.schema.name} is outside the generated rollout owner set"
+                )
+            return
         if id(slab) not in self._ids:
             raise RolloutError(
                 f"{slab.schema.name} is outside the generated rollout owner set"
@@ -1606,18 +1718,28 @@ class RolloutTransaction:
                 descriptor_cap=self.owners.descriptor_cap,
                 workspace_byte_cap=self.owners.workspace_byte_cap,
             )
-            destinations = tuple(
-                DeviceDestinationRequest(
-                    slab=request.slab,
-                    counts=count,
-                    values=request.values,
-                    input_type=request.input_type,
-                    logical_address=request.logical_address,
-                )
-                for request, count in zip(
-                    plan.destinations, realized_counts
-                )
-            )
+            destinations_list: list[DeviceDestinationRequest] = []
+            for request, count in zip(plan.destinations, realized_counts):
+                if isinstance(request.slab, FamilyStorage):
+                    destinations_list.extend(
+                        request.slab.destination_requests(
+                            count,
+                            request.values,
+                            request.input_type,
+                            request.logical_address,
+                        )
+                    )
+                else:
+                    destinations_list.append(
+                        DeviceDestinationRequest(
+                            slab=request.slab,
+                            counts=count,
+                            values=request.values,
+                            input_type=request.input_type,
+                            logical_address=request.logical_address,
+                        )
+                    )
+            destinations = tuple(destinations_list)
             sample_ready = torch.cuda.Event(blocking=False)
             sample_ready.record(self.model_stream)
             device_failure = plan.device_failure
@@ -1694,7 +1816,7 @@ class RolloutTransaction:
                     request_index = next(
                         index
                         for index, request in enumerate(destinations)
-                        if request.slab is queue.family
+                        if request.slab is queue.family.hot
                     )
                     end = transaction.ends[request_index].to(torch.int32)
                     queue.ready_tail.copy_(
@@ -1992,7 +2114,10 @@ class CompletionFIFO:
                 logical_address=request.logical_address,
             )
             for request, count in zip(plan.destinations, realized_counts)
+            if request.slab.capacity > 0
         )
+        if not destinations:
+            raise RolloutError("completion batch has no realized LayerWork output")
         transaction = PublicationTransaction.begin_device(
             destinations,
             phase="completion",
@@ -2039,6 +2164,7 @@ __all__ = [
     "FamilyBatch",
     "FamilyQueueState",
     "FamilyScheduler",
+    "FamilyStorage",
     "ModelWorkspace",
     "RolloutCommit",
     "RolloutError",

@@ -299,13 +299,9 @@ def _owners(
         "folded_range_row",
         "reservation_state",
         "publication_state",
-        "model_input",
-        "owner",
     ]
     if response:
         family_fields.append("role_selector")
-    if sampled:
-        family_fields.append("sampled_private_state")
     if branched:
         family_fields.extend(
             (
@@ -319,6 +315,10 @@ def _owners(
                 "frontier_cost_contribution",
             )
         )
+
+    retained_fields = ["model_input", "owner"]
+    if sampled:
+        retained_fields.insert(1, "sampled_private_state")
 
     sigma_head_fields = ["old_value"]
     if branched:
@@ -349,28 +349,23 @@ def _owners(
     if not sampled:
         action_target_fields.insert(0, "posterior")
 
-    # Every sequential row retains the direct model input and owner in the
-    # generated align-to-backward handoff.  Sampled rows additionally retain
-    # their realized profile; RB rows stay in their natural output partition
-    # and therefore need no sampled private state in the learner.
-    learner_index_fields = ["model_input", "owner"]
-    if sampled:
-        learner_index_fields.insert(1, "sampled_private_state")
-    if branched:
-        learner_index_fields.extend(
-            (
-                "target_degree",
-                "action_begin",
-                "action_count",
-                "log_sampling_weight",
-            )
+    learner_index_fields = (
+        (
+            "family_row",
+            "target_degree",
+            "action_begin",
+            "action_count",
+            "log_sampling_weight",
         )
+        if branched
+        else ()
+    )
 
     queue_fields = ["head", "ready_tail", "reserved_tail"]
     if branched:
         queue_fields.extend(("frontier_cost", "controller_state"))
 
-    return (
+    owners = [
         _owner(
             "FamilyWork",
             "input",
@@ -378,77 +373,104 @@ def _owners(
             "root_commit_to_align_and_seal",
         ),
         _owner(
-            "SigmaHead",
+            "FamilyRetained",
             "input",
-            tuple(sigma_head_fields),
-            "model_commit_to_final_backward",
-        ),
-        _owner(
-            "ActionHead",
-            "input" if not branched else "output",
-            ("action", "old_log_policy"),
-            "model_commit_to_final_backward",
-        ),
-        _owner("Leaf", "leaf", tuple(leaf_fields), "leaf_commit_to_completion"),
-        _owner(
-            "Topology",
-            "structural",
+            tuple(retained_fields),
             (
-                "parent",
-                "child_begin",
-                "executed_degree",
-                "nominal_degree",
-                "target_degree",
-                "owner",
-                "familywork_row",
-                "sigma_head_row",
-                "action_begin",
+                "root_commit_to_align_and_seal"
+                if response
+                else "root_commit_to_final_backward"
             ),
-            "topology_packet_to_layer_plan",
         ),
-        _owner(
-            "TopologyChild",
-            "structural_edge",
-            ("label", "path_length", "target_kind", "target_row"),
-            "topology_packet_to_layer_plan",
-        ),
-        _owner(
-            "FoldedRanges",
-            "folded",
-            ("range", "log_mass"),
-            "fold_event_to_align_and_seal",
-        ),
-        _owner(
-            "QueueMetadata",
-            "input",
-            tuple(queue_fields),
-            "root_commit_to_queue_drain",
-        ),
-        _owner(
-            "LayerWork",
-            "output",
-            tuple(layer_fields),
-            "completion_to_target_publication",
-        ),
-        _owner(
-            "SigmaTarget",
-            "input",
-            tuple(sigma_target_fields),
-            "target_publication_to_final_backward",
-        ),
-        _owner(
-            "ActionTarget",
-            "input" if not branched else "output",
-            tuple(action_target_fields),
-            "target_publication_to_final_backward",
-        ),
-        _owner(
-            "LearnerIndex",
-            "input",
-            tuple(learner_index_fields),
-            "align_and_seal_to_final_backward",
-        ),
+    ]
+    if response:
+        owners.append(
+            _owner(
+                "LearnerRetained",
+                "input",
+                tuple(retained_fields),
+                "align_and_seal_to_final_backward",
+            )
+        )
+    owners.extend(
+        (
+            _owner(
+                "SigmaHead",
+                "input",
+                tuple(sigma_head_fields),
+                "model_commit_to_final_backward",
+            ),
+            _owner(
+                "ActionHead",
+                "input" if not branched else "output",
+                ("action", "old_log_policy"),
+                "model_commit_to_final_backward",
+            ),
+            _owner("Leaf", "leaf", tuple(leaf_fields), "leaf_commit_to_completion"),
+            _owner(
+                "Topology",
+                "structural",
+                (
+                    "parent",
+                    "child_begin",
+                    "executed_degree",
+                    "nominal_degree",
+                    "target_degree",
+                    "owner",
+                    "familywork_row",
+                    "sigma_head_row",
+                    "action_begin",
+                ),
+                "topology_packet_to_layer_plan",
+            ),
+            _owner(
+                "TopologyChild",
+                "structural_edge",
+                ("label", "path_length", "target_kind", "target_row"),
+                "topology_packet_to_layer_plan",
+            ),
+            _owner(
+                "FoldedRanges",
+                "folded",
+                ("range", "log_mass"),
+                "fold_event_to_align_and_seal",
+            ),
+            _owner(
+                "QueueMetadata",
+                "input",
+                tuple(queue_fields),
+                "root_commit_to_queue_drain",
+            ),
+            _owner(
+                "LayerWork",
+                "output",
+                tuple(layer_fields),
+                "completion_to_target_publication",
+            ),
+            _owner(
+                "SigmaTarget",
+                "input",
+                tuple(sigma_target_fields),
+                "target_publication_to_final_backward",
+            ),
+            _owner(
+                "ActionTarget",
+                "input" if not branched else "output",
+                tuple(action_target_fields),
+                "target_publication_to_final_backward",
+            ),
+        )
     )
+    if branched:
+        owners.append(
+            _owner(
+                "LearnerIndex",
+                "input",
+                learner_index_fields,
+                "align_and_seal_to_final_backward",
+            )
+        )
+    return tuple(owners)
 
 
 def _build_schema(

@@ -539,7 +539,7 @@ class SequentialLearnerBatch:
 
 
 class SealedSequentialInputs:
-    """Generated retained learner-input owner after rollout-hot release."""
+    """Direct self-play payload or the one allowed best-response compaction."""
 
     def __init__(
         self,
@@ -555,8 +555,11 @@ class SealedSequentialInputs:
         )
         if tuple(slab.columns) != expected:
             raise LearnerError("sealed sequential input has the wrong field contract")
-        if slab.schema.name != f"LearnerIndex.{input_type}":
-            raise LearnerError("sealed input is not the generated learner owner")
+        if slab.schema.name not in (
+            f"FamilyRetained.{input_type}",
+            f"LearnerRetained.{input_type}",
+        ):
+            raise LearnerError("sealed input is not a generated retained owner")
         self.slab = slab
         self.input_type = input_type
         self.lane = lane
@@ -567,53 +570,63 @@ class SealedSequentialInputs:
     @classmethod
     def seal(
         cls,
-        family: MonotoneSlab,
-        destination: MonotoneSlab,
+        family_hot: MonotoneSlab,
+        retained: MonotoneSlab,
+        destination: MonotoneSlab | None = None,
         *,
         input_type: str,
         lane: int = 0,
     ) -> SealedSequentialInputs:
-        if family.schema.name != f"FamilyWork.{input_type}":
+        if family_hot.schema.name != f"FamilyWork.{input_type}":
             raise LearnerError("input sealing is bound to the wrong family owner")
-        if not 0 <= lane < family.n_replica:
+        if retained.schema.name != f"FamilyRetained.{input_type}":
+            raise LearnerError("input sealing is bound to the wrong retained owner")
+        if not 0 <= lane < family_hot.n_replica:
             raise LearnerError("input sealing lane is outside replicas")
-        by_name = family.schema.by_name
         fields = (
             ("model_input", "sampled_private_state", "owner")
-            if "sampled_private_state" in destination.columns
+            if "sampled_private_state" in retained.columns
             else ("model_input", "owner")
         )
-        missing = set(fields).difference(by_name)
-        if missing:
-            raise LearnerError(f"family input lacks fields {sorted(missing)}")
         if (
-            destination.schema.name != f"LearnerIndex.{input_type}"
-            or tuple(destination.columns) != fields
-            or destination.n_replica != family.n_replica
-            or destination.device != family.device
-            or destination.failure_state is not family.failure_state
+            tuple(retained.columns) != fields
+            or retained.n_replica != family_hot.n_replica
+            or retained.device != family_hot.device
+            or retained.failure_state is not family_hot.failure_state
         ):
-            raise LearnerError("generated learner-input owner is incompatible")
-        rows = family.tail(lane)
-        selected: Tensor | None = None
-        if "role_selector" in family.columns:
-            selected = torch.nonzero(
-                family.columns["role_selector"][lane, :rows].to(torch.int64)
-                == family.columns["owner"][lane, :rows].to(torch.int64),
-                as_tuple=False,
-            ).flatten()
-            rows = int(selected.numel())
+            raise LearnerError("generated retained owner is incompatible")
+        rows = family_hot.tail(lane)
+        if retained.tail(lane) != rows:
+            raise LearnerError("family hot and retained rows are not aligned")
+        if "role_selector" not in family_hot.columns:
+            if destination is not None:
+                raise LearnerError("self-play retained inputs must not be copied")
+            return cls(retained, input_type=input_type, lane=lane)
+        if destination is None:
+            raise LearnerError("best response requires trained-row compaction")
+        if (
+            destination.schema.name != f"LearnerRetained.{input_type}"
+            or tuple(destination.columns) != fields
+            or destination.n_replica != retained.n_replica
+            or destination.device != retained.device
+            or destination.failure_state is not retained.failure_state
+        ):
+            raise LearnerError("best-response retained destination is incompatible")
+        selected = torch.nonzero(
+            family_hot.columns["role_selector"][lane, :rows].to(torch.int64)
+            == retained.columns["owner"][lane, :rows].to(torch.int64),
+            as_tuple=False,
+        ).flatten()
+        rows = int(selected.numel())
         if rows <= 0:
             return cls(destination, input_type=input_type, lane=lane)
         values = {
-            name: (
-                family.columns[name][:, :rows]
-                if selected is None
-                else family.columns[name][lane, selected][None]
-            )
+            name: retained.columns[name][lane, selected][None]
             for name in fields
         }
-        counts = torch.zeros(family.n_replica, dtype=torch.int64, device=family.device)
+        counts = torch.zeros(
+            retained.n_replica, dtype=torch.int64, device=retained.device
+        )
         counts[lane] = rows
         address = torch.full_like(counts, torch.iinfo(torch.int64).max)
         address[lane] = 0
@@ -627,12 +640,14 @@ class SealedSequentialInputs:
                     address,
                 ),
             ),
-            phase="sequential_input_seal",
-            active=torch.arange(family.n_replica, device=family.device).eq(lane),
+            phase="sequential_retained_compaction",
+            active=torch.arange(
+                retained.n_replica, device=retained.device
+            ).eq(lane),
         )
         transaction.fill_all()
         success = transaction.publish()
-        torch._assert_async(success[lane], "sequential input seal failed")
+        torch._assert_async(success[lane], "sequential retained compaction failed")
         return cls(destination, input_type=input_type, lane=lane)
 
     @property
@@ -1052,40 +1067,54 @@ class BranchedLearnerBatch:
 
 
 class SealedBranchedInputs:
-    """Compacted retained inputs and ragged spans for one input partition."""
+    """Direct/compacted retained payload plus metadata-only ragged spans."""
 
     def __init__(
         self,
-        slab: MonotoneSlab,
+        retained: MonotoneSlab,
+        index: MonotoneSlab,
         *,
         input_type: str,
         lane: int,
     ) -> None:
-        if slab.schema.name != f"LearnerIndex.{input_type}":
+        if index.schema.name != f"LearnerIndex.{input_type}":
             raise LearnerError("branched input is not the generated learner owner")
         required = {
-            "model_input",
-            "owner",
+            "family_row",
             "target_degree",
             "action_begin",
             "action_count",
             "log_sampling_weight",
         }
-        if "sampled_private_state" in slab.columns:
-            required.add("sampled_private_state")
-        if set(slab.columns) != required:
-            raise LearnerError("sealed branched input has the wrong fields")
-        self.slab = slab
+        if set(index.columns) != required:
+            raise LearnerError("branched learner index is not metadata-only")
+        retained_fields = (
+            ("model_input", "sampled_private_state", "owner")
+            if "sampled_private_state" in retained.columns
+            else ("model_input", "owner")
+        )
+        if (
+            retained.schema.name
+            not in (
+                f"FamilyRetained.{input_type}",
+                f"LearnerRetained.{input_type}",
+            )
+            or tuple(retained.columns) != retained_fields
+        ):
+            raise LearnerError("branched retained payload is incompatible")
+        self.retained = retained
+        self.index = index
         self.input_type = input_type
         self.lane = lane
-        self.rows = slab.tail(lane)
-        self.device = slab.device
+        self.rows = index.tail(lane)
+        self.device = index.device
 
     @classmethod
     def seal(
         cls,
-        family: MonotoneSlab,
-        destination: MonotoneSlab,
+        family_retained: MonotoneSlab,
+        index_destination: MonotoneSlab,
+        payload_destination: MonotoneSlab | None = None,
         *,
         input_type: str,
         family_row: Tensor,
@@ -1095,12 +1124,20 @@ class SealedBranchedInputs:
         log_sampling_weight: Tensor,
         lane: int = 0,
     ) -> SealedBranchedInputs:
-        if family.schema.name != f"FamilyWork.{input_type}":
-            raise LearnerError("branched input sealing is bound to the wrong family")
-        if destination.schema.name != f"LearnerIndex.{input_type}":
+        if family_retained.schema.name != f"FamilyRetained.{input_type}":
+            raise LearnerError("branched sealing is bound to the wrong retained owner")
+        if index_destination.schema.name != f"LearnerIndex.{input_type}":
             raise LearnerError("branched input destination has the wrong identity")
+        if set(index_destination.columns) != {
+            "family_row",
+            "target_degree",
+            "action_begin",
+            "action_count",
+            "log_sampling_weight",
+        }:
+            raise LearnerError("branched learner index must contain metadata only")
         rows = int(family_row.numel())
-        device = family.device
+        device = family_retained.device
         for name, value in (
             ("family_row", family_row),
             ("action_begin", action_begin),
@@ -1110,12 +1147,10 @@ class SealedBranchedInputs:
         ):
             if value.device != device or value.shape != (rows,):
                 raise LearnerError(f"{name} must be device-local [trained rows]")
-        if rows == 0:
-            return cls(destination, input_type=input_type, lane=lane)
         torch._assert_async(
             (
                 family_row.ge(0)
-                & family_row.lt(family.tail(lane))
+                & family_row.lt(family_retained.tail(lane))
                 & action_begin.ge(0)
                 & action_count.ge(1)
                 & target_degree.eq(action_count)
@@ -1123,60 +1158,126 @@ class SealedBranchedInputs:
             ).all(),
             "branched seal metadata is invalid",
         )
-        selected = family_row.to(torch.int64)
+        retained_fields = (
+            ("model_input", "sampled_private_state", "owner")
+            if "sampled_private_state" in family_retained.columns
+            else ("model_input", "owner")
+        )
+        if payload_destination is None:
+            retained = family_retained
+            retained_row = family_row.to(torch.int32)
+        else:
+            if (
+                payload_destination.schema.name
+                != f"LearnerRetained.{input_type}"
+                or tuple(payload_destination.columns) != retained_fields
+                or payload_destination.n_replica
+                != family_retained.n_replica
+                or payload_destination.device != device
+                or payload_destination.failure_state
+                is not family_retained.failure_state
+            ):
+                raise LearnerError(
+                    "best-response retained destination is incompatible"
+                )
+            retained = payload_destination
+            retained_row = torch.arange(
+                rows, dtype=torch.int32, device=device
+            )
         lane_values = {
-            "model_input": family.columns["model_input"][lane, selected],
-            "owner": family.columns["owner"][lane, selected],
+            "family_row": retained_row,
             "target_degree": target_degree.to(torch.int32),
             "action_begin": action_begin.to(torch.int32),
             "action_count": action_count.to(torch.int32),
             "log_sampling_weight": log_sampling_weight.float(),
         }
-        if "sampled_private_state" in destination.columns:
-            if "sampled_private_state" not in family.columns:
-                raise LearnerError("sampled branched seal omitted private state")
-            lane_values["sampled_private_state"] = family.columns[
-                "sampled_private_state"
-            ][lane, selected]
-        values = {
+        index_values = {
             field.name: torch.full(
-                (destination.n_replica, rows, *field.shape),
+                (index_destination.n_replica, max(rows, 1), *field.shape),
                 field.fill,
                 dtype=field.dtype,
                 device=device,
             )
-            for field in destination.schema.fields
+            for field in index_destination.schema.fields
         }
         for name, value in lane_values.items():
-            values[name][lane].copy_(value)
-        counts = torch.zeros(family.n_replica, dtype=torch.int64, device=device)
+            index_values[name][lane, :rows].copy_(value)
+        counts = torch.zeros(
+            family_retained.n_replica, dtype=torch.int64, device=device
+        )
         counts[lane] = rows
         logical = torch.full_like(counts, torch.iinfo(torch.int64).max)
         logical[lane] = 0
-        transaction = PublicationTransaction.begin_device(
-            (
+        requests = [
+            DeviceDestinationRequest(
+                index_destination,
+                counts,
+                index_values,
+                input_type,
+                logical,
+            )
+        ]
+        if payload_destination is not None:
+            selected = family_row.to(torch.int64)
+            payload_values = {
+                field.name: torch.full(
+                    (
+                        payload_destination.n_replica,
+                        max(rows, 1),
+                        *field.shape,
+                    ),
+                    field.fill,
+                    dtype=field.dtype,
+                    device=device,
+                )
+                for field in payload_destination.schema.fields
+            }
+            for name in retained_fields:
+                payload_values[name][lane, :rows].copy_(
+                    family_retained.columns[name][lane, selected]
+                )
+            requests.append(
                 DeviceDestinationRequest(
-                    destination,
+                    payload_destination,
                     counts,
-                    values,
+                    payload_values,
                     input_type,
                     logical,
-                ),
-            ),
-            phase="branched_input_seal",
-            active=torch.arange(family.n_replica, device=device).eq(lane),
+                )
+            )
+        transaction = PublicationTransaction.begin_device(
+            tuple(requests),
+            phase="branched_retained_seal",
+            active=torch.arange(
+                family_retained.n_replica, device=device
+            ).eq(lane),
         )
         transaction.fill_all()
         success = transaction.publish()
         torch._assert_async(success[lane], "branched input seal failed")
-        return cls(destination, input_type=input_type, lane=lane)
+        return cls(
+            retained,
+            index_destination,
+            input_type=input_type,
+            lane=lane,
+        )
 
     @property
     def columns(self) -> Mapping[str, Tensor]:
         return MappingProxyType(
             {
                 name: value[self.lane, : self.rows]
-                for name, value in self.slab.columns.items()
+                for name, value in self.index.columns.items()
+            }
+        )
+
+    @property
+    def aligned_payload_columns(self) -> Mapping[str, Tensor]:
+        row = self.columns["family_row"].to(torch.int64)
+        return MappingProxyType(
+            {
+                name: value[self.lane].index_select(0, row)
+                for name, value in self.retained.columns.items()
             }
         )
 
@@ -1287,11 +1388,19 @@ class RaggedBranchedStore:
             count,
             output_size=expected_action_rows,
         )
+        retained_row = index["family_row"][selected].to(torch.int64)
         sigma_fields: dict[str, Tensor] = {
-            name: value[selected]
-            for name, value in index.items()
-            if name not in ("action_begin", "action_count")
+            name: value[self.lane, retained_row]
+            for name, value in self.sealed_inputs.retained.columns.items()
         }
+        sigma_fields.update(
+            {
+                name: value[selected]
+                for name, value in index.items()
+                if name
+                not in ("family_row", "action_begin", "action_count")
+            }
+        )
         for slab in self.sigma_slabs.values():
             for name, value in slab.columns.items():
                 if name in sigma_fields:

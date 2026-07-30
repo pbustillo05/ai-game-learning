@@ -746,6 +746,11 @@ class IterationEngine:
         entered_index: int,
         failure_lane: int | None = None,
     ) -> None:
+        if (
+            isinstance(owners, GeneratedOwners)
+            and not owners.layer_work_is_bound
+        ):
+            owners.bind_empty_layer_work_for_abort()
         failure_lanes = (
             range(owners.plan.manifest.n_replica)
             if failure_lane is None
@@ -819,15 +824,12 @@ class IterationEngine:
         device = owners.plan.device
         counts = torch.tensor(roots, dtype=torch.int64, device=device)
         transaction = PublicationTransaction.begin_device(
-            (
-                DeviceDestinationRequest(
-                    queue.family,
-                    counts,
-                    values,
-                    queue.input_type,
-                    torch.tensor(
-                        logical_bases, dtype=torch.int64, device=device
-                    ),
+            queue.family.destination_requests(
+                counts,
+                values,
+                queue.input_type,
+                torch.tensor(
+                    logical_bases, dtype=torch.int64, device=device
                 ),
             ),
             phase="root_commit",
@@ -871,14 +873,11 @@ class IterationEngine:
             count.numel(), device=queue.family.device
         ).eq(lane)
         transaction = PublicationTransaction.begin_device(
-            (
-                DeviceDestinationRequest(
-                    queue.family,
-                    count,
-                    values,
-                    queue.input_type,
-                    address,
-                ),
+            queue.family.destination_requests(
+                count,
+                values,
+                queue.input_type,
+                address,
             ),
             phase="root_refill",
             active=active,
@@ -928,6 +927,7 @@ class IterationEngine:
                 name,
                 owners.plan.partitions,
                 owners.slab("FamilyWork", name),
+                owners.slab("FamilyRetained", name),
                 owners.slab("QueueMetadata", name),
             )
             for name in input_names
@@ -1097,6 +1097,10 @@ class IterationEngine:
         if last_event is None:
             raise IterationError("rollout produced no commit event")
         topology = self.seal_topology(publisher)
+        owners.bind_layer_work(
+            topology.plan.output_names,
+            topology.plan.arena_rows,
+        )
         counterfactual: list[float] = []
         for lane, sampled in enumerate(topology.sampled_nodes):
             if pre_refill_nodes[lane] is None:
@@ -1224,7 +1228,13 @@ class IterationEngine:
                 {
                     (lane, name): SealedSequentialInputs.seal(
                         owners.slab("FamilyWork", name),
-                        owners.slab("LearnerIndex", name),
+                        owners.slab("FamilyRetained", name),
+                        (
+                            owners.slab("LearnerRetained", name)
+                            if owners.plan.mode.training_regime.value
+                            == "best_response"
+                            else None
+                        ),
                         input_type=name,
                         lane=lane,
                     )
@@ -1267,8 +1277,14 @@ class IterationEngine:
                     dtype=torch.int64,
                 )
                 sealed[(lane, name)] = SealedBranchedInputs.seal(
-                    owners.slab("FamilyWork", name),
+                    owners.slab("FamilyRetained", name),
                     owners.slab("LearnerIndex", name),
+                    (
+                        owners.slab("LearnerRetained", name)
+                        if self.config.lanes[lane].mode.training_regime.value
+                        == "best_response"
+                        else None
+                    ),
                     input_type=name,
                     family_row=topology.familywork_row[selected].to(
                         owners.plan.device
@@ -1350,7 +1366,7 @@ class IterationEngine:
         budget = owners.plan.layout.reference_cache_bytes
         for name, store in stores.items():
             columns = (
-                store.sealed_inputs.columns
+                store.sealed_inputs.aligned_payload_columns
                 if isinstance(store, RaggedBranchedStore)
                 else store.sealed_inputs.columns
             )

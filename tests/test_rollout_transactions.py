@@ -65,6 +65,14 @@ def _family_schema(name: str = "pre") -> SoASchema:
         f"FamilyWork.{name}",
         (
             SoAField("logical_rng_key", torch.int64, (2,)),
+        ),
+    )
+
+
+def _retained_schema(name: str = "pre") -> SoASchema:
+    return _schema(
+        f"FamilyRetained.{name}",
+        (
             SoAField("model_input", torch.float32, (2,)),
             SoAField("owner", torch.int32, fill=-1),
         ),
@@ -131,6 +139,27 @@ def _request(
             logical + slab.n_replica,
             dtype=torch.int64,
             device=slab.device,
+        ),
+    )
+
+
+def _family_request(
+    fifo: SemanticFamilyFIFO,
+    counts: torch.Tensor,
+    *,
+    max_rows: int,
+    logical: int = 10,
+) -> DeviceDestinationRequest:
+    return DeviceDestinationRequest(
+        slab=fifo.family,  # type: ignore[arg-type]
+        counts=counts,
+        values=_values(fifo.family, max_rows),
+        input_type=fifo.input_type,
+        logical_address=torch.arange(
+            logical,
+            logical + fifo.family.n_replica,
+            dtype=torch.int64,
+            device=fifo.family.device,
         ),
     )
 
@@ -656,16 +685,19 @@ def test_one_model_sample_commit_path_serves_sequential_and_branched(
     device = torch.device("cuda", 0)
     failures = DeviceFailureState(3, device)
     family = _slab(_family_schema(), 8, failures)
+    retained = _slab(_retained_schema(), 8, failures)
     metadata = _slab(_metadata_schema(), 1, failures)
     leaf = _slab(
         _schema("Leaf", (SoAField("result", torch.int32),)),
         8,
         failures,
     )
-    fifo = SemanticFamilyFIFO("pre", _partitions(), family, metadata)
+    fifo = SemanticFamilyFIFO(
+        "pre", _partitions(), family, retained, metadata
+    )
     fifo.initialize()
     counts = torch.tensor([2, 0, 2], dtype=torch.int64, device=device)
-    family_values = _values(family, 2)
+    family_values = _values(fifo.family, 2)
     family_values["logical_rng_key"] = torch.tensor(
         [
             [[10, 0], [10, 1]],
@@ -676,14 +708,11 @@ def test_one_model_sample_commit_path_serves_sequential_and_branched(
         device=device,
     )
     roots = PublicationTransaction.begin_device(
-        (
-            DeviceDestinationRequest(
-                family,
-                counts,
-                family_values,
-                "pre",
-                torch.tensor([10, 0, 20], dtype=torch.int64, device=device),
-            ),
+        fifo.family.destination_requests(
+            counts,
+            family_values,
+            "pre",
+            torch.tensor([10, 0, 20], dtype=torch.int64, device=device),
         ),
         phase="root_commit",
         active=torch.tensor([True, False, True], device=device),
@@ -702,7 +731,9 @@ def test_one_model_sample_commit_path_serves_sequential_and_branched(
         states, allow_partial=True
     )
     assert scheduled is not None
-    owners = _registry((family, metadata, leaf), family_pack_cap=2)
+    owners = _registry(
+        (family, retained, metadata, leaf), family_pack_cap=2
+    )
     publisher = _publisher(owners)
     seen: dict[str, object] = {}
 
@@ -768,6 +799,7 @@ def test_one_model_sample_commit_path_serves_sequential_and_branched(
     publisher.assert_drained()
 
     family.release()
+    retained.release()
     metadata.release()
     leaf.release()
     failures.release()
@@ -778,17 +810,25 @@ def test_sample_cannot_publish_retained_storage() -> None:
     device = torch.device("cuda", 0)
     failures = DeviceFailureState(1, device)
     family = _slab(_family_schema(), 4, failures)
+    retained = _slab(_retained_schema(), 4, failures)
     metadata = _slab(_metadata_schema(), 1, failures)
     leaf = _slab(
         _schema("Leaf", (SoAField("result", torch.int32),)),
         4,
         failures,
     )
-    fifo = SemanticFamilyFIFO("pre", _partitions(), family, metadata)
+    fifo = SemanticFamilyFIFO(
+        "pre", _partitions(), family, retained, metadata
+    )
     fifo.initialize()
     counts = torch.ones(1, dtype=torch.int64, device=device)
     root = PublicationTransaction.begin_device(
-        (_request(family, counts, max_rows=1),),
+        fifo.family.destination_requests(
+            counts,
+            _values(fifo.family, 1),
+            "pre",
+            torch.zeros(1, dtype=torch.int64, device=device),
+        ),
         phase="root_commit",
         active=torch.ones(1, dtype=torch.bool, device=device),
     )
@@ -816,7 +856,9 @@ def test_sample_cannot_publish_retained_storage() -> None:
         def transition(self, request):
             raise AssertionError("transition must not run")
 
-    owners = _registry((family, metadata, leaf), family_pack_cap=1)
+    owners = _registry(
+        (family, retained, metadata, leaf), family_pack_cap=1
+    )
     failure_guard = owners.guard()
     failures._records[0, 0].fill_(1)
     with pytest.raises(Exception, match="failure records"):
@@ -839,6 +881,7 @@ def test_sample_cannot_publish_retained_storage() -> None:
     torch.cuda.synchronize(device)
     leaf._state[:, MonotoneSlab._PUBLISHED].zero_()
     family.release()
+    retained.release()
     metadata.release()
     leaf.release()
     failures.release()
@@ -849,20 +892,35 @@ def test_branched_fanout_publishes_a_declared_cross_family_fifo() -> None:
     device = torch.device("cuda", 0)
     failures = DeviceFailureState(1, device)
     source_family = _slab(_family_schema("pre"), 4, failures)
+    source_retained = _slab(_retained_schema("pre"), 4, failures)
     source_metadata = _slab(_metadata_schema("pre"), 1, failures)
     target_family = _slab(_family_schema("post2"), 4, failures)
+    target_retained = _slab(_retained_schema("post2"), 4, failures)
     target_metadata = _slab(_metadata_schema("post2"), 1, failures)
     source = SemanticFamilyFIFO(
-        "pre", _partitions(), source_family, source_metadata
+        "pre",
+        _partitions(),
+        source_family,
+        source_retained,
+        source_metadata,
     )
     target = SemanticFamilyFIFO(
-        "post2", _partitions(), target_family, target_metadata
+        "post2",
+        _partitions(),
+        target_family,
+        target_retained,
+        target_metadata,
     )
     source.initialize()
     target.initialize()
     one = torch.ones(1, dtype=torch.int64, device=device)
     root = PublicationTransaction.begin_device(
-        (_request(source_family, one, max_rows=1),),
+        source.family.destination_requests(
+            one,
+            _values(source.family, 1),
+            "pre",
+            torch.zeros(1, dtype=torch.int64, device=device),
+        ),
         phase="root",
         active=torch.ones(1, dtype=torch.bool, device=device),
     )
@@ -878,8 +936,10 @@ def test_branched_fanout_publishes_a_declared_cross_family_fifo() -> None:
     owners = _registry(
         (
             source_family,
+            source_retained,
             source_metadata,
             target_family,
+            target_retained,
             target_metadata,
         ),
         family_pack_cap=1,
@@ -889,12 +949,7 @@ def test_branched_fanout_publishes_a_declared_cross_family_fifo() -> None:
     with pytest.raises(ValueError, match="repeats a published queue"):
         CommitPlan(
             (
-                _request(
-                    target_family,
-                    one,
-                    max_rows=1,
-                    input_type="post2",
-                ),
+                _family_request(target, one, max_rows=1),
             ),
             duplicate_coverage,
             published_queues=(target, target),
@@ -927,12 +982,7 @@ def test_branched_fanout_publishes_a_declared_cross_family_fifo() -> None:
             )
             return CommitPlan(
                 (
-                    _request(
-                        target_family,
-                        counts,
-                        max_rows=2,
-                        input_type="post2",
-                    ),
+                    _family_request(target, counts, max_rows=2),
                 ),
                 coverage,
                 published_queues=(target,),
@@ -955,8 +1005,10 @@ def test_branched_fanout_publishes_a_declared_cross_family_fifo() -> None:
     assert target.ready_tail.tolist() == [2]
     assert target_family.tail(0) == 2
     source_family.release()
+    source_retained.release()
     source_metadata.release()
     target_family.release()
+    target_retained.release()
     target_metadata.release()
     failures.release()
 
@@ -966,17 +1018,25 @@ def test_post_publish_exception_rolls_back_destination_and_source_visibility() -
     device = torch.device("cuda", 0)
     failures = DeviceFailureState(1, device)
     family = _slab(_family_schema(), 2, failures)
+    retained = _slab(_retained_schema(), 2, failures)
     metadata = _slab(_metadata_schema(), 1, failures)
     leaf = _slab(
         _schema("Leaf", (SoAField("result", torch.int32),)),
         2,
         failures,
     )
-    fifo = SemanticFamilyFIFO("pre", _partitions(), family, metadata)
+    fifo = SemanticFamilyFIFO(
+        "pre", _partitions(), family, retained, metadata
+    )
     fifo.initialize()
     counts = torch.ones(1, dtype=torch.int64, device=device)
     root = PublicationTransaction.begin_device(
-        (_request(family, counts, max_rows=1),),
+        fifo.family.destination_requests(
+            counts,
+            _values(fifo.family, 1),
+            "pre",
+            torch.zeros(1, dtype=torch.int64, device=device),
+        ),
         phase="root",
         active=torch.ones(1, dtype=torch.bool, device=device),
     )
@@ -990,7 +1050,7 @@ def test_post_publish_exception_rolls_back_destination_and_source_visibility() -
     )
     assert scheduled is not None
     owners = _registry(
-        (family, metadata, leaf),
+        (family, retained, metadata, leaf),
         family_pack_cap=1,
         completion_pack_cap=1,
     )
@@ -1034,11 +1094,12 @@ def test_post_publish_exception_rolls_back_destination_and_source_visibility() -
     assert failure is not None
     assert failure.failure_code == "transaction_rollback"
     publisher.assert_drained()
-    for slab in (family, metadata, leaf):
+    for slab in (family, retained, metadata, leaf):
         slab.reset_failed_lane(0)
     failures.clear_lane(0)
     assert family.epoch(0) == metadata.epoch(0) == leaf.epoch(0) == 1
     family.release()
+    retained.release()
     metadata.release()
     leaf.release()
     failures.release()

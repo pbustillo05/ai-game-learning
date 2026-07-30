@@ -31,7 +31,12 @@ from pbg.core.contracts import (
     TrainingRegime,
     mode_schema,
 )
-from pbg.core.storage import DestinationRequest, PublicationTransaction, SoAField
+from pbg.core.storage import (
+    DestinationRequest,
+    MonotoneSlab,
+    PublicationTransaction,
+    SoAField,
+)
 from pbg.core.targets import (
     ConversionMap,
     DeviceLayerPlan,
@@ -544,6 +549,7 @@ def _enter_through_targets(
     head_rows: int,
 ):
     owners.enter_phase(ExecutionPhase.ROLLOUT)
+    owners.bind_layer_work(plan.output_names, plan.arena_rows)
     if head_rows:
         for lane in range(owners.plan.manifest.n_replica):
             _fill_heads(owners, mode, head_rows, lane=lane)
@@ -551,6 +557,17 @@ def _enter_through_targets(
     owners.enter_phase(ExecutionPhase.QUEUE_DRAIN)
     owners.release_after(ExecutionPhase.QUEUE_DRAIN)
     owners.enter_phase(ExecutionPhase.COMPLETION)
+    for output, name in enumerate(plan.output_names):
+        work = owners.slab("LayerWork", name)
+        exact_rows = max(
+            rows[output] for rows in plan.arena_rows
+        )
+        assert work.capacity == exact_rows
+        assert work.allocated_bytes == MonotoneSlab.analytical_bytes(
+            work.schema,
+            exact_rows,
+            owners.plan.manifest.n_replica,
+        )
     initialize_work_arenas(owners, plan, completion)
     owners.release_after(ExecutionPhase.COMPLETION)
     owners.enter_phase(ExecutionPhase.ALIGN_AND_SEAL)

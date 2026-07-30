@@ -294,6 +294,8 @@ def test_all_twelve_modes_allocate_only_their_generated_cuda_owners() -> None:
         seen: set = set()
         for phase in ExecutionPhase:
             owners.enter_phase(phase)
+            if phase is ExecutionPhase.ROLLOUT:
+                owners.bind_empty_layer_work_for_abort()
             seen.update(owners.live_keys)
             report = owners.memory_report()
             report.assert_reconciled()
@@ -524,16 +526,27 @@ def test_generated_owner_retry_discards_whole_lane_attempt_only() -> None:
     owners = GeneratedOwners(plan)
     owners.enter_phase(ExecutionPhase.ROLLOUT)
     family = owners.slab("FamilyWork", "pre")
-    completed = family.reserve(
+    retained = owners.slab("FamilyRetained", "pre")
+    completed_hot = family.reserve(
         1,
         1,
         phase="commit",
         input_type="pre",
         logical_address=1,
     )
-    completed.fill(_values(family, 1, 3))
-    PublicationTransaction((completed,)).publish()
-    lane_one_before = family.published(1, "model_input").clone()
+    completed_retained = retained.reserve(
+        1,
+        1,
+        phase="commit",
+        input_type="pre",
+        logical_address=1,
+    )
+    completed_hot.fill(_values(family, 1, 3))
+    completed_retained.fill(_values(retained, 1, 3))
+    PublicationTransaction(
+        (completed_hot, completed_retained)
+    ).publish()
+    lane_one_before = retained.published(1, "model_input").clone()
 
     leaf = owners.slab("Leaf")
     with pytest.raises(StorageOverflow):
@@ -552,8 +565,11 @@ def test_generated_owner_retry_discards_whole_lane_attempt_only() -> None:
         assert slab.tail(0) == 0
     assert family.epoch(1) == 0
     assert family.tail(1) == 1
-    assert torch.equal(family.published(1, "model_input"), lane_one_before)
+    assert torch.equal(
+        retained.published(1, "model_input"), lane_one_before
+    )
 
+    owners.bind_empty_layer_work_for_abort()
     owners.release_after(ExecutionPhase.ROLLOUT)
     for phase in tuple(ExecutionPhase)[1:]:
         owners.enter_phase(phase)
@@ -663,6 +679,7 @@ def test_phase_allocation_is_transactional_and_release_is_at_last_consumer() -> 
     assert owners.live_keys == frozenset()
 
     owners.enter_phase(ExecutionPhase.ROLLOUT)
+    owners.bind_empty_layer_work_for_abort()
     queue_key = next(
         item.key for item in plan.allocations if item.key.owner == "QueueMetadata"
     )
