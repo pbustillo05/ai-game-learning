@@ -9,6 +9,59 @@ import pytest
 import torch
 from torch import nn
 
+from pbg.core.capacity import (
+    CapacityManifest,
+    ExecutionGeometry,
+    ExecutionPhase,
+    ExternalWorkspaceBounds,
+    GeneratedOwners,
+    HardwareLimits,
+    NamedShape,
+    PartitionRows,
+    PhysicalLayout,
+    build_storage_plan,
+)
+from pbg.core.contracts import MODE_SCHEMAS
+from pbg.core.iteration import IterationError
+from pbg.core.learner import (
+    AlignedSequentialStore,
+    LearnerOperation,
+    LearnerSchedule,
+    LossConfig,
+    ModelEvaluation,
+    ReferenceOutputCache,
+    ReferenceState,
+    SealedSequentialInputs,
+    SequentialBatchSampler,
+    SequentialLearnerBatch,
+    allocate_statistical_counts,
+)
+from pbg.core.optimization import DenseAdam, LossScaler, OptimizerConfig
+from pbg.core.persistence import (
+    RunState,
+    load_checkpoint,
+    save_checkpoint,
+    sha256_file,
+)
+from pbg.core.rollout import CompletionBatch
+from pbg.core.storage import (
+    DestinationRequest,
+    DeviceFailureState,
+    MonotoneSlab,
+    PublicationTransaction,
+    SoAField,
+    SoASchema,
+)
+from pbg.core.training import (
+    LearnerIteration,
+    RecoverableOverflow,
+)
+from pbg.games.poker.cards import DeckGeometry
+from pbg.games.poker.model.capacity import max_policy_partition_sequence_tokens
+from pbg.games.poker.queued.config import PokerScientificConfig
+from pbg.games.poker.queued.folded import (
+    sequential_family_workspace_row_bytes,
+)
 from pbg.games.poker.queued.hooks import (
     NLHEGeometry,
     PokerStateMachine,
@@ -23,64 +76,10 @@ from pbg.games.poker.queued.policy import (
     PokerLegality,
     PokerPolicyOperator,
 )
-from pbg.games.poker.queued.folded import (
-    sequential_family_workspace_row_bytes,
-)
 from tests.iteration_support import (
     EngineDrivenSequentialAttempt,
     SequentialRecoveryHarness,
 )
-from pbg.games.poker.queued.config import PokerScientificConfig
-from pbg.core.capacity import (
-    CapacityManifest,
-    ExecutionGeometry,
-    ExecutionPhase,
-    ExternalWorkspaceBounds,
-    GeneratedOwners,
-    HardwareLimits,
-    NamedShape,
-    PartitionRows,
-    PhysicalLayout,
-    build_storage_plan,
-)
-from pbg.core.contracts import MODE_SCHEMAS
-from pbg.core.learner import (
-    AlignedSequentialStore,
-    LearnerOperation,
-    LearnerSchedule,
-    LossConfig,
-    ModelEvaluation,
-    ReferenceOutputCache,
-    ReferenceState,
-    SealedSequentialInputs,
-    SequentialBatchSampler,
-    SequentialLearnerBatch,
-    allocate_statistical_counts,
-)
-from pbg.core.iteration import IterationError
-from pbg.core.optimization import DenseAdam, LossScaler, OptimizerConfig
-from pbg.core.persistence import (
-    RunState,
-    load_checkpoint,
-    save_checkpoint,
-    sha256_file,
-)
-from pbg.core.rollout import CompletionBatch
-from pbg.core.storage import (
-    DestinationRequest,
-    DeviceFailureState,
-    PublicationTransaction,
-    SoAField,
-    SoASchema,
-)
-from pbg.core.training import (
-    RecoverableOverflow,
-    LearnerIteration,
-)
-from pbg.core.storage import MonotoneSlab
-from pbg.games.poker.cards import DeckGeometry
-from pbg.games.poker.model.capacity import max_policy_partition_sequence_tokens
-
 
 CUDA = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Phase 5 training requires CUDA"
@@ -1137,8 +1136,8 @@ def test_end_to_end_overflow_exposes_no_failed_attempt_rows() -> None:
             run_state=run_state,
         ).run(iteration=0)
     assert raised.value.failure.failure_code == "capacity_overflow"
-    assert not owners.live_keys
-    assert len(owners.released_keys) == len(owners.plan.allocations)
+    assert not owners._live
+    assert len(owners._released) == len(owners.plan.allocations)
 
 
 @CUDA
@@ -1243,24 +1242,26 @@ def test_end_to_end_overflow_rejects_retry_capacity_drift() -> None:
         device, geometry.private_hands, check_down=True
     )
     run_state = RunState("phase5-cap-drift", root_count=2)
-    with pytest.warns(RuntimeWarning, match="RECOVERED_SEQUENTIAL_OVERFLOW"):
-        with pytest.raises(IterationError, match="immutable storage plan"):
-            SequentialRecoveryHarness(
-                owner_factory=lambda: GeneratedOwners(next(attempts)),
-                plan=plan,
-                minimum_root_count=1,
-                geometry=geometry,
-                mode=mode,
-                model=model,
-                model_operation=model.evaluate,
-                optimizer=DenseAdam(model, OptimizerConfig()),
-                loss=LossConfig(),
-                schedule=LearnerSchedule(batch_size=1),
-                generator=torch.Generator(device=device).manual_seed(31),
-                seed=31,
-                lambda_=0.95,
-                run_state=run_state,
-            ).run(iteration=0)
+    with (
+        pytest.warns(RuntimeWarning, match="RECOVERED_SEQUENTIAL_OVERFLOW"),
+        pytest.raises(IterationError, match="immutable storage plan"),
+    ):
+        SequentialRecoveryHarness(
+            owner_factory=lambda: GeneratedOwners(next(attempts)),
+            plan=plan,
+            minimum_root_count=1,
+            geometry=geometry,
+            mode=mode,
+            model=model,
+            model_operation=model.evaluate,
+            optimizer=DenseAdam(model, OptimizerConfig()),
+            loss=LossConfig(),
+            schedule=LearnerSchedule(batch_size=1),
+            generator=torch.Generator(device=device).manual_seed(31),
+            seed=31,
+            lambda_=0.95,
+            run_state=run_state,
+        ).run(iteration=0)
 
 
 @CUDA
@@ -1672,7 +1673,7 @@ def test_checkpoint_resume_is_strict_and_execution_drift_is_allowed(
     model.weight.data.zero_()
     reference.weight.data.zero_()
     optimizer.exp_avg.zero_()
-    scaler, reference_state, resumed, execution = load_checkpoint(
+    _scaler, reference_state, resumed, execution = load_checkpoint(
         path,
         model=model,
         optimizer=optimizer,

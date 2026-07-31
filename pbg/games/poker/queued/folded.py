@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Mapping
 
 import torch
 from torch import Tensor
 
-from pbg.games.poker.queued.hooks import FOLDED, NLHEGeometry, PAD_CARD
+from pbg.games.poker.queued.hooks import FOLDED, PAD_CARD, NLHEGeometry
 
 
 class FoldedStatisticsError(ValueError):

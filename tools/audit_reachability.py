@@ -11,16 +11,15 @@ from __future__ import annotations
 
 import argparse
 import ast
-from collections import Counter, defaultdict, deque
-from dataclasses import dataclass, field
 import importlib.util
 import json
-from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import Iterable, Iterator
-
+from collections import Counter, defaultdict, deque
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
 
 # Public library surfaces which are not necessarily reached by an installed CLI.
 # Keep this short: an obsolete root hides everything below it from this audit.
@@ -30,6 +29,10 @@ DECLARED_PUBLIC_ROOTS = (
     "pbg.config.load_config_mapping",
     "pbg.eval.br_probe.evaluate_br_probe",
     "pbg.inference.PokerInferenceSession",
+    "pbg.inference.PokerInferenceSession.predict",
+    "pbg.inference.PokerInferenceSession.full_strategy",
+    "pbg.inference.PokerInferenceSession.advance_many",
+    "pbg.inference.PokerInferenceSession.deal_many",
     "pbg.inference.parse_card",
     "pbg.inference_artifact.load_inference_source",
     "pbg.inference_artifact.export_inference_artifact",
@@ -39,6 +42,32 @@ DECLARED_PUBLIC_ROOTS = (
 
 MAIN_GUARD_RE = re.compile(r"^pbg(?:\.[A-Za-z_]\w*)+$")
 DOC_SUFFIXES = {".md", ".rst", ".tex", ".txt"}
+
+# Python and framework protocols invoke these methods without a source-level
+# ``object.method(...)`` call.  Keep the list explicit and deliberately short:
+# adding a name weakens the method-level deletion screen for every reachable
+# class that defines it.
+IMPLICIT_METHOD_NAMES = frozenset(
+    {
+        "__call__",
+        "__deepcopy__",
+        "__enter__",
+        "__eq__",
+        "__exit__",
+        "__getitem__",
+        "__hash__",
+        "__init__",
+        "__iter__",
+        "__len__",
+        "__new__",
+        "__next__",
+        "__post_init__",
+        "__repr__",
+        "__setitem__",
+        "__str__",
+        "forward",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -110,7 +139,6 @@ def import_target(node: ast.ImportFrom, package: str) -> str:
 
 def collect_definitions(modules: dict[str, ModuleInfo]) -> dict[str, Definition]:
     definitions: dict[str, Definition] = {}
-    module_names = set(modules)
     for module in modules.values():
         for statement in module.tree.body:
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -119,6 +147,20 @@ def collect_definitions(modules: dict[str, ModuleInfo]) -> dict[str, Definition]
                     qname, module.name, statement.name,
                     type(statement).__name__, module.path, statement.lineno, statement,
                 )
+                if isinstance(statement, ast.ClassDef):
+                    for member in statement.body:
+                        if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            continue
+                        method_qname = f"{qname}.{member.name}"
+                        definitions[method_qname] = Definition(
+                            method_qname,
+                            module.name,
+                            member.name,
+                            "method",
+                            module.path,
+                            member.lineno,
+                            member,
+                        )
             elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
                 for target_node in targets:
@@ -139,8 +181,7 @@ def collect_definitions(modules: dict[str, ModuleInfo]) -> dict[str, Definition]
                 for alias in node.names:
                     if alias.name == "*":
                         continue
-                    candidate = f"{base}.{alias.name}" if base else alias.name
-                    target = candidate if candidate in module_names else candidate
+                    target = f"{base}.{alias.name}" if base else alias.name
                     module.bindings.setdefault(alias.asname or alias.name, target)
     return definitions
 
@@ -162,17 +203,36 @@ class ReferenceVisitor(ast.NodeVisitor):
         module: ModuleInfo,
         definitions: dict[str, Definition],
         modules: dict[str, ModuleInfo],
+        *,
+        current_class: str | None = None,
     ) -> None:
         self.module = module
         self.definitions = definitions
         self.modules = modules
+        self.current_class = current_class
+        self.methods_by_name: dict[str, tuple[str, ...]] = defaultdict(tuple)
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for qname, definition in definitions.items():
+            if definition.kind == "method":
+                grouped[definition.name].append(qname)
+        self.methods_by_name = {
+            name: tuple(symbols) for name, symbols in grouped.items()
+        }
         self.references: set[str] = set()
         self.hazards: list[str] = []
 
     def resolve_parts(self, parts: list[str]) -> str | None:
         first, *rest = parts
+        if first in {"self", "cls"} and self.current_class and rest:
+            target = ".".join((self.current_class, *rest))
+            if target in self.definitions:
+                return target
         local = f"{self.module.name}.{first}"
         if local in self.definitions:
+            if rest:
+                target = ".".join((local, *rest))
+                if target in self.definitions:
+                    return target
             return local
         if first in self.module.bindings:
             target = self.module.bindings[first]
@@ -191,8 +251,11 @@ class ReferenceVisitor(ast.NodeVisitor):
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         parts = attribute_parts(node)
+        resolved = self.resolve_parts(parts) if parts else None
         if parts:
-            self.add_target(self.resolve_parts(parts))
+            self.add_target(resolved)
+        if resolved is None and isinstance(node.ctx, ast.Load):
+            self.references.update(self.methods_by_name.get(node.attr, ()))
         self.generic_visit(node)
 
     def visit_Import(self, node: ast.Import) -> None:
@@ -211,7 +274,10 @@ class ReferenceVisitor(ast.NodeVisitor):
                 attr = node.args[1].value
                 parts = attribute_parts(node.args[0])
                 if isinstance(attr, str) and parts:
-                    self.add_target(self.resolve_parts([*parts, attr]))
+                    target = self.resolve_parts([*parts, attr])
+                    self.add_target(target)
+                    if target is None:
+                        self.references.update(self.methods_by_name.get(attr, ()))
             else:
                 self.hazards.append(f"dynamic {node.func.id} at line {node.lineno}")
         elif isinstance(node.func, ast.Name) and node.func.id in {"eval", "exec", "__import__"}:
@@ -257,8 +323,29 @@ def build_graph(
         hazards[module.name].extend(init_visitor.hazards)
 
     for definition in definitions.values():
-        visitor = ReferenceVisitor(modules[definition.module], definitions, modules)
-        visitor.visit(definition.node)
+        class_qname = (
+            definition.qname.rpartition(".")[0]
+            if definition.kind == "method"
+            else None
+        )
+        visitor = ReferenceVisitor(
+            modules[definition.module],
+            definitions,
+            modules,
+            current_class=class_qname,
+        )
+        if isinstance(definition.node, ast.ClassDef):
+            for runtime_node in definition_runtime_nodes(definition.node):
+                visitor.visit(runtime_node)
+            for statement in definition.node.body:
+                if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    visitor.visit(statement)
+            for method_name in IMPLICIT_METHOD_NAMES:
+                method = f"{definition.qname}.{method_name}"
+                if method in definitions:
+                    visitor.references.add(method)
+        else:
+            visitor.visit(definition.node)
         edges[definition.qname].update(visitor.references - {definition.qname})
         # Importing/reaching a symbol necessarily executes its module initializer.
         edges[definition.qname].add(definition.module)
@@ -564,6 +651,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     result.add_argument("--git", action="store_true", help="add line-level git blame (slower)")
     result.add_argument("--fail-on-high", action="store_true", help="exit 1 if HIGH candidates exist")
+    result.add_argument(
+        "--fail-on-candidates",
+        action="store_true",
+        help="exit 1 if any production-unreachable definition exists",
+    )
     return result
 
 
@@ -593,7 +685,10 @@ def main(argv: list[str] | None = None) -> int:
         retention_evidence_closure(result),
     )
     high = any(candidate_level(result, item, retention) == "HIGH" for item in result.unreachable)
-    return 1 if args.fail_on_high and high else 0
+    failed = (args.fail_on_high and high) or (
+        args.fail_on_candidates and bool(result.unreachable)
+    )
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

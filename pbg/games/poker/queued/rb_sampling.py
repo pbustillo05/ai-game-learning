@@ -7,8 +7,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from pbg.games.poker.queued.hooks import NLHEGeometry, PAD_CARD
 from pbg.core.rollout import DrawPurpose, logical_rng_keys, logical_uniform
+from pbg.games.poker.queued.hooks import PAD_CARD, NLHEGeometry
 
 
 class PosteriorSamplingError(RuntimeError):
@@ -36,7 +36,7 @@ def _fixed_upper_bound(
         raise PosteriorSamplingError(
             "CDF search requires [G,P,H] and [G,A,P]"
         )
-    parents, players, width = cdf.shape
+    _parents, players, width = cdf.shape
     rows = target.shape[0]
     if target.shape[2] != players or source.shape != (rows,):
         raise PosteriorSamplingError("CDF targets are not row aligned")

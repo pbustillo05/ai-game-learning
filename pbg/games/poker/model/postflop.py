@@ -157,7 +157,7 @@ class PostflopNet(nn.Module):
         geometry = self.combo_two_hot[combo_ids].to(dtype)
         fields: Mapping[str, Tensor] | None
         if hasattr(summary, "fields"):
-            fields = getattr(summary, "fields")
+            fields = summary.fields
             if not isinstance(fields, Mapping):
                 raise TypeError("evaluator summary fields must be a mapping")
         elif isinstance(summary, Mapping):
@@ -223,7 +223,7 @@ class PostflopNet(nn.Module):
         """Build per-card pressure, per-folder seat context, and products."""
 
         if hasattr(summary, "fields"):
-            fields = getattr(summary, "fields")
+            fields = summary.fields
             if not isinstance(fields, Mapping):
                 raise TypeError("evaluator summary fields must be a mapping")
         elif isinstance(summary, Mapping):
@@ -834,48 +834,3 @@ class PostflopNet(nn.Module):
             )
             t, cost = self.branching_heads(branching_public)
         return PolicyOutput(raw=raw, v=full_value, t=t, c=cost)
-
-    def prepare_forward(
-        self,
-        pub: PokerPublicBatch,
-        combo_ranges: Tensor,
-        actor_seat: Tensor | None = None,
-        masks: PostflopMasks | None = None,
-    ) -> tuple[
-        Tensor,
-        Tensor,
-        Tensor,
-        Tensor,
-        Tensor,
-        Tensor,
-        CompactMap,
-    ]:
-        """Validate one ordinary pack and construct its compact execution map."""
-
-        if masks is None:
-            raise ValueError("postflop forward requires supplied compatibility")
-        return self._validate(pub, combo_ranges, actor_seat, masks)
-
-    def forward_prevalidated(
-        self,
-        pub: PokerPublicBatch,
-        combo_ranges: Tensor,
-        masks: PostflopMasks,
-        prepared_metadata: tuple[
-            Tensor,
-            Tensor,
-            Tensor,
-            Tensor,
-            Tensor,
-            Tensor,
-            CompactMap,
-        ],
-    ) -> PolicyOutput:
-        """Run tensor math after :meth:`prepare_forward` validated the pack."""
-
-        return self.forward(
-            pub,
-            combo_ranges,
-            masks=masks,
-            _prepared_metadata=prepared_metadata,
-        )

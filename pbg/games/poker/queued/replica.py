@@ -102,32 +102,6 @@ class PokerReplicaInference:
         )
         return decode_model_evaluation(encoded)
 
-    def rollout_mapping(
-        self,
-        input_type: str,
-        model_input: Tensor,
-        private_state: Tensor,
-        owner: Tensor,
-        *,
-        active_lanes: Tensor,
-    ) -> Mapping[str, Tensor]:
-        evaluation = self(
-            input_type,
-            model_input,
-            private_state,
-            owner,
-            active_lanes=active_lanes,
-        )
-        return MappingProxyType(
-            {
-                **{
-                    name: value.float() for name, value in evaluation.policy_raw.items()
-                },
-                "value": evaluation.value.float(),
-            }
-        )
-
-
 __all__ = [
     "PokerReplicaInference",
     "decode_model_evaluation",

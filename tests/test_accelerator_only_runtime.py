@@ -11,7 +11,6 @@ from pbg.config import load_config
 from pbg.devices import resolve_execution_device, validate_workload_capabilities
 from pbg.inference import PokerInferenceSession
 
-
 ROOT = Path(__file__).parents[1]
 CONFIG = ROOT / "configs/train/nlhe_hu_8bb_normal_smoke.yaml"
 

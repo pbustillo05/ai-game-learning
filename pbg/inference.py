@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from pbg.devices import assert_module_device, resolve_execution_device
+from pbg.games.poker.queued.evaluator import bound_evaluator
 from pbg.games.poker.queued.hooks import (
     FOLDED,
     LIVE,
@@ -26,7 +27,6 @@ from pbg.games.poker.queued.policy import (
     FOLD,
     PokerPolicyOperator,
 )
-from pbg.games.poker.queued.evaluator import bound_evaluator
 from pbg.inference_artifact import load_inference_source
 
 _RANKS = "23456789TJQKA"
@@ -118,7 +118,9 @@ class PokerInferenceSession:
             raise ValueError("max_batch_rows must be positive")
         scientific = source.get("scientific_config")
         if not isinstance(scientific, dict):
-            raise RuntimeError("inference source has no scientific configuration")
+            raise RuntimeError(  # noqa: TRY004 - invalid artifact, not caller type
+                "inference source has no scientific configuration"
+            )
         game = scientific["game"]
         self.geometry = NLHEGeometry(
             game["players"], game["stack_bb"], game["rank_count"]
@@ -154,7 +156,7 @@ class PokerInferenceSession:
         precision: str = "fp32",
         mode: str = "latency",
         max_batch_rows: int | None = None,
-    ) -> "PokerInferenceSession":
+    ) -> PokerInferenceSession:
         return cls(
             load_inference_source(path),
             device=device,
@@ -549,11 +551,14 @@ class PokerInferenceSession:
             item.state, event_tensor, item.history
         )
         item.state = self.machine.step_player(item.state, event_tensor)
-        if self.device.type == "mps" and item.state.status.eq(FOLDED).any():
-            if not bool(item.state.terminal[0]):
-                raise RuntimeError(
-                    "MPS folded-state inference is unsupported before CPU staging"
-                )
+        if (
+            self.device.type == "mps"
+            and item.state.status.eq(FOLDED).any()
+            and not bool(item.state.terminal[0])
+        ):
+            raise RuntimeError(
+                "MPS folded-state inference is unsupported before CPU staging"
+            )
 
     def deal_keyed(
         self,

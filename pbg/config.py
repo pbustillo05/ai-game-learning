@@ -12,16 +12,16 @@ import yaml
 
 from pbg.core.capacity import (
     CapacityManifest,
-    ExternalWorkspaceBounds,
     ExecutionGeometry,
+    ExternalWorkspaceBounds,
     HardwareLimits,
     NamedShape,
     PartitionRows,
     PhysicalLayout,
 )
+from pbg.core.storage import SoAField
 from pbg.games.poker.queued.config import BranchedModeConfig, SequentialModeConfig
 from pbg.games.poker.queued.hooks import NLHEGeometry
-from pbg.core.storage import SoAField
 
 
 class ConfigError(ValueError):

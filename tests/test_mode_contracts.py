@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
+
 from pbg.core.contracts import (
     CAPACITY_VOCABULARY,
     MODE_SCHEMAS,
@@ -22,9 +23,9 @@ from tests.static_gates import (
     accepted_root_violations,
     core_firewall_violations,
     forbidden_literal_violations,
+    generated_field_flow_violations,
     stale_cutover_violations,
 )
-
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 CORE_PACKAGE = REPOSITORY / "pbg" / "core"
@@ -45,6 +46,60 @@ PRODUCTION_ROOTS = (
     "pbg.cli.benchmark_replica_learner",
 )
 
+GENERATED_FIELD_FLOWS = {
+    "FamilyWork": (
+        (
+            "pbg.games.poker.queued.hooks",
+            "pbg.games.poker.queued.branching",
+            "pbg.games.poker.queued.operations",
+        ),
+        (
+            "pbg.core.iteration",
+            "pbg.core.learner",
+            "pbg.games.poker.queued.hooks",
+            "pbg.games.poker.queued.branching",
+        ),
+    ),
+    "FamilyRetained": (
+        (
+            "pbg.games.poker.queued.hooks",
+            "pbg.games.poker.queued.branching",
+            "pbg.games.poker.queued.operations",
+        ),
+        ("pbg.core.iteration", "pbg.core.learner"),
+    ),
+    "LearnerRetained": (("pbg.core.learner",), ("pbg.core.learner",)),
+    "SigmaHead": (
+        ("pbg.games.poker.queued.hooks", "pbg.games.poker.queued.branching"),
+        ("pbg.core.targets", "pbg.core.learner", "pbg.core.iteration"),
+    ),
+    "ActionHead": (
+        ("pbg.games.poker.queued.hooks", "pbg.games.poker.queued.branching"),
+        ("pbg.core.targets", "pbg.core.learner"),
+    ),
+    "Leaf": (
+        ("pbg.games.poker.queued.hooks", "pbg.games.poker.queued.branching"),
+        ("pbg.games.poker.queued.hooks", "pbg.core.iteration"),
+    ),
+    "Topology": (("pbg.core.topology",), ("pbg.core.targets", "pbg.core.iteration")),
+    "TopologyChild": (("pbg.core.topology",), ("pbg.core.topology",)),
+    "FoldedRanges": (
+        ("pbg.games.poker.queued.hooks", "pbg.games.poker.queued.branching"),
+        ("pbg.games.poker.queued.hooks", "pbg.games.poker.queued.branching"),
+    ),
+    "QueueMetadata": (
+        ("pbg.core.rollout",),
+        ("pbg.core.rollout", "pbg.core.iteration"),
+    ),
+    "LayerWork": (("pbg.games.poker.queued.hooks",), ("pbg.core.targets",)),
+    "SigmaTarget": (
+        ("pbg.core.targets",),
+        ("pbg.core.learner", "pbg.core.iteration"),
+    ),
+    "ActionTarget": (("pbg.core.targets",), ("pbg.core.learner",)),
+    "LearnerIndex": (("pbg.core.learner",), ("pbg.core.learner",)),
+}
+
 
 def _fields(schema, owner: str) -> frozenset[str]:
     return frozenset(schema.owner(owner).fields)
@@ -60,12 +115,12 @@ def test_exact_twelve_row_product_and_lookup_identity() -> None:
         )
         for schema in MODE_SCHEMAS
     }
-    assert identities == set(
+    assert identities == {
         (regime, rollout, estimator)
         for regime in TrainingRegime
         for rollout in RolloutMode
         for estimator in PrivateEstimator
-    )
+    }
     for schema in MODE_SCHEMAS:
         assert (
             mode_schema(
@@ -129,6 +184,11 @@ def test_inapplicable_fields_are_absent() -> None:
         assert ("trace_target" in sigma_target) is is_branched
         assert ("cost_target" in sigma_target) is is_branched
         assert ("posterior" in action_target) is (not is_sampled)
+        assert not {
+            "reservation_state",
+            "publication_state",
+            "controller_state",
+        } & {field for owner in schema.owners for field in owner.fields}
         if is_branched:
             assert _fields(schema, "LearnerIndex") == {
                 "family_row",
@@ -152,6 +212,22 @@ def test_inapplicable_fields_are_absent() -> None:
         assert ("kkt_controller" in schema.applicable_config) is (
             schema.rollout_mode is RolloutMode.BRANCHED_KKT
         )
+
+
+def test_every_generated_field_has_declared_producer_and_consumer_evidence() -> None:
+    owner_fields: dict[str, set[str]] = {}
+    for schema in MODE_SCHEMAS:
+        for owner in schema.owners:
+            owner_fields.setdefault(owner.name, set()).update(owner.fields)
+
+    assert generated_field_flow_violations(
+        REPOSITORY, owner_fields, GENERATED_FIELD_FLOWS
+    ) == ()
+    stale = {name: set(fields) for name, fields in owner_fields.items()}
+    stale["FamilyWork"].add("stale_generated_field")
+    assert generated_field_flow_violations(
+        REPOSITORY, stale, GENERATED_FIELD_FLOWS
+    ) == ("FamilyWork.stale_generated_field:missing producer evidence", "FamilyWork.stale_generated_field:missing consumer evidence")
 
 
 def test_fixed_and_kkt_lanes_share_physical_schema_but_keep_identity() -> None:

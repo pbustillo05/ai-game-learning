@@ -1645,21 +1645,6 @@ class LossResult:
     approximate_kl: Tensor
     clip_fraction: Tensor
 
-    def detached_metrics(self) -> dict[str, float]:
-        return {
-            name: float(getattr(self, name).detach())
-            for name in (
-                "total",
-                "policy",
-                "value",
-                "entropy",
-                "reference_kl",
-                "approximate_kl",
-                "clip_fraction",
-            )
-        }
-
-
 def _scalar_private_row(value: Tensor, private: Tensor, owner: Tensor) -> Tensor:
     """Select owner-combo values when a model exposes ``[B,H]`` rows."""
 

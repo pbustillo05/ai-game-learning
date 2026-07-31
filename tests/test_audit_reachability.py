@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "tools" / "audit_reachability.py"
 
@@ -82,3 +81,36 @@ def test_main_guard_is_discovered_without_treating_error_print_as_root(tmp_path:
     assert result.missing_roots == []
     assert "demo.cli.main" in result.reachable
     assert "demo.cli.work" in result.reachable
+
+
+def test_method_reachability_does_not_retain_an_entire_class(tmp_path: Path) -> None:
+    audit = _audit_module()
+    package = tmp_path / "demo"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "live.py").write_text(
+        "class Worker:\n"
+        "    def live(self):\n"
+        "        return 1\n\n"
+        "    def stale(self):\n"
+        "        return 2\n\n"
+        "def entry():\n"
+        "    return Worker().live()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        '[project.scripts]\ndemo = "demo.live:entry"\n', encoding="utf-8"
+    )
+
+    result = audit.audit_repository(tmp_path, package="demo", include_public_roots=False)
+
+    assert "demo.live.Worker.live" in result.reachable
+    assert "demo.live.Worker.stale" not in result.reachable
+
+
+def test_production_method_and_definition_gate_has_no_candidates() -> None:
+    audit = _audit_module()
+    result = audit.audit_repository(ROOT)
+
+    assert result.missing_roots == []
+    assert result.unreachable == []

@@ -7,12 +7,10 @@ This module deliberately contains no hand evaluation.  A card id is
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from fractions import Fraction
 import math
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Mapping
-
 
 CATEGORY_NAMES = (
     "high_card",
@@ -35,12 +33,6 @@ class CategoryProfile:
     denominator: int
     numerators: Mapping[str, int]
     strength_order: tuple[str, ...]
-
-    def probability(self, category: str) -> Fraction:
-        """Return the exact probability of containing ``category``."""
-
-        return Fraction(self.numerators[category], self.denominator)
-
 
 def category_profile(rank_count: int) -> CategoryProfile:
     """Return exact cumulative category counts and rarity-consistent strength.

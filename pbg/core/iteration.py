@@ -1123,9 +1123,6 @@ class IterationEngine:
             rollout_seconds = time.perf_counter() - benchmark_started
         # These objects own rollout hooks, queues, registry references, and
         # game state.  Completion is serialized after their exact last use.
-        del rollout
-        del queues
-        del publisher
         del registry
         return _IterationState(
             input_names,
@@ -1943,8 +1940,8 @@ __all__ = [
     "LaneIterationResult",
     "RolloutOperationRequest",
     "RolloutSubmission",
-    "RootPayload",
     "RootDestination",
+    "RootPayload",
     "RootRequest",
     "SealedTopology",
 ]

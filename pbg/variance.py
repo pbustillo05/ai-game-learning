@@ -11,8 +11,8 @@ import torch
 from torch import Tensor, nn
 
 from pbg.config import RootConfig, load_config_mapping
-from pbg.identity import accelerator_identity, code_identity
 from pbg.core.persistence import model_state_sha256, sha256_file
+from pbg.identity import accelerator_identity, code_identity
 from pbg.runtime import TrainingSession
 
 

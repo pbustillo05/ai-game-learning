@@ -747,33 +747,3 @@ class PreflopNet(nn.Module):
             t=t,
             c=cost,
         )
-
-    def prepare_forward(
-        self,
-        pub: PokerPublicBatch,
-        class_ranges: Tensor,
-        actor_seat: Tensor | None = None,
-        masks: PreflopMasks | Mapping[str, Tensor] | Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Validate one ordinary pack and return its parameter-free metadata."""
-
-        self._validate_public(pub, class_ranges)
-        return self._metadata(pub, class_ranges, actor_seat, masks)
-
-    def forward_prevalidated(
-        self,
-        pub: PokerPublicBatch,
-        class_ranges: Tensor,
-        prepared_metadata: tuple[
-            Tensor, Tensor, Tensor, Tensor, Tensor, Tensor
-        ],
-        masks: PreflopMasks | Mapping[str, Tensor] | Tensor | None = None,
-    ) -> PolicyOutput:
-        """Run tensor math after :meth:`prepare_forward` validated the pack."""
-
-        return self.forward(
-            pub,
-            class_ranges,
-            masks=masks,
-            _prepared_metadata=prepared_metadata,
-        )

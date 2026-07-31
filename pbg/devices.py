@@ -7,7 +7,6 @@ from typing import Literal
 
 import torch
 
-
 ExecutionDevice = Literal["cuda", "mps"]
 SUPPORTED_EXECUTION_DEVICES = ("cuda", "mps")
 
@@ -93,8 +92,8 @@ def assert_module_device(
 
 
 __all__ = [
-    "ExecutionDevice",
     "SUPPORTED_EXECUTION_DEVICES",
+    "ExecutionDevice",
     "assert_module_device",
     "resolve_execution_device",
     "validate_workload_capabilities",

@@ -7,6 +7,39 @@ import pytest
 import torch
 from torch import nn
 
+from pbg.core.capacity import (
+    ExecutionGeometry,
+    ExecutionPhase,
+    GeneratedOwners,
+    NamedShape,
+    PartitionRows,
+    PhysicalLayout,
+    build_storage_plan,
+)
+from pbg.core.contracts import mode_schema
+from pbg.core.learner import (
+    LearnerOperation,
+    LearnerSchedule,
+    LossConfig,
+    ModelEvaluation,
+    PolicyEvaluation,
+    SequentialLearnerBatch,
+)
+from pbg.core.optimization import DenseAdam, OptimizerConfig
+from pbg.core.rollout import (
+    AsyncTopologyPublisher,
+    RolloutOwnerRegistry,
+    SemanticFamilyFIFO,
+)
+from pbg.core.storage import SoAField
+from pbg.core.targets import (
+    ConversionMap,
+    TargetAlgebra,
+    rb_conversion_library_workspace_bytes,
+    rb_conversion_mask_bytes,
+    rb_conversion_workspace_row_bytes,
+)
+from pbg.games.poker.queued.config import SequentialModeConfig
 from pbg.games.poker.queued.folded import (
     folded_statistics,
     folded_statistics_workspace_row_bytes,
@@ -16,8 +49,8 @@ from pbg.games.poker.queued.folded import (
 from pbg.games.poker.queued.hooks import (
     FOLD,
     FOLDED,
-    NLHEGeometry,
     PAD_CARD,
+    NLHEGeometry,
     PokerForwardInput,
     PokerStateMachine,
     SequentialPokerHooks,
@@ -31,45 +64,12 @@ from pbg.games.poker.queued.model import (
     build_model_from_config,
 )
 from pbg.games.poker.queued.operations import PokerOperations
-from tests.iteration_support import EngineDrivenSequentialAttempt
 from pbg.games.poker.queued.response import (
     SequentialSharedResponseEvaluator,
     balanced_evaluation_probe_seats,
     paired_probe_statistics,
 )
-from pbg.core.capacity import (
-    ExecutionGeometry,
-    GeneratedOwners,
-    NamedShape,
-    PartitionRows,
-    PhysicalLayout,
-    build_storage_plan,
-)
-from pbg.games.poker.queued.config import SequentialModeConfig
-from pbg.core.contracts import mode_schema
-from pbg.core.learner import (
-    LearnerSchedule,
-    LearnerOperation,
-    LossConfig,
-    ModelEvaluation,
-    PolicyEvaluation,
-    SequentialLearnerBatch,
-)
-from pbg.core.targets import (
-    ConversionMap,
-    TargetAlgebra,
-    rb_conversion_library_workspace_bytes,
-    rb_conversion_mask_bytes,
-    rb_conversion_workspace_row_bytes,
-)
-from pbg.core.optimization import DenseAdam, OptimizerConfig
-from pbg.core.rollout import (
-    AsyncTopologyPublisher,
-    RolloutOwnerRegistry,
-    SemanticFamilyFIFO,
-)
-from pbg.core.storage import SoAField
-from pbg.core.capacity import ExecutionPhase
+from tests.iteration_support import EngineDrivenSequentialAttempt
 from tests.test_sequential_sampled_training import (
     _PartitionNetwork,
     _phase5_layout,
@@ -271,11 +271,7 @@ def test_probe_is_the_ordinary_best_response_rb_schema() -> None:
         "initial_model_sha256": "c" * 64,
     }
     assert mode_schema(
-        **{
-            "training_regime": config.mode["training_regime"],
-            "rollout_mode": config.mode["rollout_mode"],
-            "private_estimator": config.mode["private_estimator"],
-        }
+        training_regime=config.mode["training_regime"], rollout_mode=config.mode["rollout_mode"], private_estimator=config.mode["private_estimator"]
     ).key == "best_response/sequential/rao_blackwell"
     keys = torch.arange(12, dtype=torch.int64)
     seats = balanced_evaluation_probe_seats(keys, 3)
@@ -502,14 +498,14 @@ def test_repository_folded_statistics_are_deterministic_fp32() -> None:
             geometry.private_hands, dtype=torch.int32, device=device
         )
     )
-    arguments = dict(
-        board_cards=state.board_cards,
-        range_weights=weights,
-        status=status,
-        combo_cards=combo_cards,
-        beta_rank=4,
-        line_dim=3,
-        line_metadata=torch.tensor(
+    arguments = {
+        "board_cards": state.board_cards,
+        "range_weights": weights,
+        "status": status,
+        "combo_cards": combo_cards,
+        "beta_rank": 4,
+        "line_dim": 3,
+        "line_metadata": torch.tensor(
             [
                 [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 2.0, 3.0]],
                 [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 2.0, 3.0]],
@@ -517,7 +513,7 @@ def test_repository_folded_statistics_are_deterministic_fp32() -> None:
             dtype=torch.float32,
             device=device,
         ),
-    )
+    }
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         first = folded_statistics(geometry, **arguments)
         second = folded_statistics(geometry, **arguments)

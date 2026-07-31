@@ -14,9 +14,9 @@ from types import MappingProxyType
 import torch
 from torch import Tensor
 
-from pbg.games.poker.model.primitives import accelerator_assert
 from pbg.core.learner import PolicyEvaluation
 from pbg.core.rollout import logical_categorical
+from pbg.games.poker.model.primitives import accelerator_assert
 
 FOLD = 0
 CHECK_CALL = 1

@@ -271,7 +271,7 @@ class ModeSchema:
             ),
         )
 
-    def physically_compatible_with(self, other: "ModeSchema") -> bool:
+    def physically_compatible_with(self, other: ModeSchema) -> bool:
         return self.physical_signature == other.physical_signature
 
 
@@ -297,8 +297,6 @@ def _owners(
         "logical_rng_key",
         "true_profile",
         "folded_range_row",
-        "reservation_state",
-        "publication_state",
     ]
     if response:
         family_fields.append("role_selector")
@@ -363,7 +361,7 @@ def _owners(
 
     queue_fields = ["head", "ready_tail", "reserved_tail"]
     if branched:
-        queue_fields.extend(("frontier_cost", "controller_state"))
+        queue_fields.append("frontier_cost")
 
     owners = [
         _owner(

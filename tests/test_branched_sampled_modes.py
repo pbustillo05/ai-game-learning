@@ -9,27 +9,6 @@ import pytest
 import torch
 from torch import nn
 
-from tests.iteration_support import (
-    BranchedRecoveryHarness,
-    EngineDrivenBranchedAttempt,
-    discard_attempt as _discard_attempt,
-)
-from pbg.games.poker.queued.hooks import (
-    FOLDED,
-    NLHEGeometry,
-    PokerStateMachine,
-    sampled_partitions,
-)
-from pbg.games.poker.queued.branching import (
-    sampled_branched_chance_frontier_row_bytes,
-    sampled_branched_topology_packet_row_bytes,
-)
-from pbg.core.topology import (
-    StagedTopologyPacket,
-    TopologyExpansionRecord,
-    TopologyPacketStager,
-)
-from pbg.games.poker.queued.config import BranchedModeConfig
 from pbg.core.branching import (
     CostSafeguardController,
     FixedBranchController,
@@ -41,8 +20,8 @@ from pbg.core.branching import (
     log_kkt_intensity,
     randomized_round,
 )
-from pbg.core.iteration import IterationEngine, LaneContext
 from pbg.core.capacity import (
+    BRANCHED_ALIAS_PEAK_ROW_BYTES,
     CapacityManifest,
     ExecutionGeometry,
     ExecutionPhase,
@@ -54,11 +33,13 @@ from pbg.core.capacity import (
     build_storage_plan,
 )
 from pbg.core.contracts import mode_schema
+from pbg.core.iteration import IterationEngine, LaneContext
 from pbg.core.learner import (
     LearnerSchedule,
     LossConfig,
     ModelEvaluation,
     ReferenceState,
+    _alias_table,
 )
 from pbg.core.optimization import DenseAdam, OptimizerConfig
 from pbg.core.persistence import (
@@ -66,10 +47,28 @@ from pbg.core.persistence import (
     load_checkpoint,
     save_checkpoint,
 )
-from pbg.core.capacity import BRANCHED_ALIAS_PEAK_ROW_BYTES
-from pbg.core.learner import _alias_table
 from pbg.core.storage import DeviceFailure, StorageError
+from pbg.core.topology import (
+    StagedTopologyPacket,
+    TopologyExpansionRecord,
+    TopologyPacketStager,
+)
 from pbg.core.training import RecoverableOverflow
+from pbg.games.poker.queued.config import BranchedModeConfig
+from pbg.games.poker.queued.folded import folded_statistics_workspace_row_bytes
+from pbg.games.poker.queued.hooks import (
+    FOLDED,
+    NLHEGeometry,
+    PokerStateMachine,
+    sampled_partitions,
+)
+from tests.iteration_support import (
+    BranchedRecoveryHarness,
+    EngineDrivenBranchedAttempt,
+)
+from tests.iteration_support import (
+    discard_attempt as _discard_attempt,
+)
 from tests.test_sequential_sampled_training import (
     _EndToEndPokerModel,
     _phase5_layout,
@@ -163,15 +162,35 @@ def _manifest(
     )
 
 
+_TOPOLOGY_PACKET_ROW_BYTES = 95
+
+
+def _sampled_chance_frontier_row_bytes(geometry: NLHEGeometry) -> int:
+    players = geometry.players
+    hands = geometry.private_hands
+    history = (
+        geometry.postflop_base_model_input_width
+        - 8
+        - 10 * players
+        - players * hands
+    ) // 10
+    return (
+        512
+        + 8 * geometry.postflop_model_input_width
+        + 16 * players * hands
+        + 128 * history
+        + 64 * geometry.deck_cards
+        + 128 * players
+        + 3 * _TOPOLOGY_PACKET_ROW_BYTES
+        + folded_statistics_workspace_row_bytes(geometry)
+    )
+
+
 def _phase7_layout(geometry: NLHEGeometry):
     return replace(
         _phase5_layout(geometry),
-        chance_frontier_row_bytes=(
-            sampled_branched_chance_frontier_row_bytes(geometry)
-        ),
-        topology_packet_row_bytes=(
-            sampled_branched_topology_packet_row_bytes(geometry)
-        ),
+        chance_frontier_row_bytes=_sampled_chance_frontier_row_bytes(geometry),
+        topology_packet_row_bytes=_TOPOLOGY_PACKET_ROW_BYTES,
     )
 
 
@@ -384,11 +403,11 @@ def test_phase7_admission_covers_fixed_and_full_decision_workspaces() -> None:
     )
     assert (
         layout.chance_frontier_row_bytes
-        == sampled_branched_chance_frontier_row_bytes(geometry)
+        == _sampled_chance_frontier_row_bytes(geometry)
     )
     assert (
         layout.topology_packet_row_bytes
-        == sampled_branched_topology_packet_row_bytes(geometry)
+        == _TOPOLOGY_PACKET_ROW_BYTES
     )
     with pytest.raises(ValueError, match="root count"):
         BranchedRecoveryHarness(
@@ -905,7 +924,7 @@ def test_failed_branched_attempt_releases_every_generated_owner() -> None:
         )
     )
     _discard_attempt(owners)
-    assert owners.released_keys == {
+    assert frozenset(owners._released) == {
         allocation.key for allocation in plan.allocations
     }
     with pytest.raises(StorageError, match="released"):
@@ -927,7 +946,7 @@ def test_healthy_branched_attempt_discard_releases_without_failure_record() -> N
     owners = GeneratedOwners(plan)
     owners.enter_phase(ExecutionPhase.ROLLOUT)
     _discard_attempt(owners)
-    assert owners.released_keys == {
+    assert frozenset(owners._released) == {
         allocation.key for allocation in plan.allocations
     }
 

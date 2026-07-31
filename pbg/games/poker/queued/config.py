@@ -152,11 +152,6 @@ class PokerModelConfig:
             )
             raise ValueError(f"{field} must be finite and positive")
 
-    @property
-    def action_head_width(self) -> int:
-        return 3 + self.m_raise
-
-
 @dataclass(frozen=True)
 class ReferenceConfig:
     interval_iterations: int | None = 100

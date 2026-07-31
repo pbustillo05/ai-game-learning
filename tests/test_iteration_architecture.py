@@ -45,7 +45,6 @@ from pbg.core.storage import DeviceDestinationRequest, SoAField
 from pbg.core.targets import TargetAlgebra
 from pbg.core.topology import TopologyExpansionRecord
 
-
 REPOSITORY = Path(__file__).resolve().parents[1]
 CORE = REPOSITORY / "pbg/core"
 POKER = REPOSITORY / "pbg/games/poker/queued"

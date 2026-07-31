@@ -15,10 +15,10 @@ storage conversion in this module.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Callable, Mapping, Sequence
 
 import torch
 from torch import Tensor
@@ -31,7 +31,7 @@ class StorageError(RuntimeError):
 class StorageOverflow(MemoryError):
     """A fixed-capacity reservation failed before any tail advanced."""
 
-    def __init__(self, failure: "DeviceFailure") -> None:
+    def __init__(self, failure: DeviceFailure) -> None:
         self.failure = failure
         super().__init__(
             f"{failure.phase} overflow at logical address "
@@ -173,11 +173,6 @@ class SoASchema:
         final = extents[-1].offset_bytes + extents[-1].size_bytes
         return _align(final, self.alignment) if final else 0
 
-    def payload_bytes(self, rows: int, n_replica: int = 1) -> int:
-        rows = _nonnegative_integer(rows, "rows")
-        n_replica = _positive_integer(n_replica, "n_replica")
-        return n_replica * rows * sum(field.row_bytes for field in self.fields)
-
     def allocate(
         self,
         rows: int,
@@ -224,30 +219,6 @@ class SoASchema:
             typed.fill_(field.fill)
             columns[field.name] = typed
         return backing, MappingProxyType(columns)
-
-    def validate_columns(
-        self,
-        columns: Mapping[str, Tensor],
-        rows: int,
-        n_replica: int,
-        device: torch.device | str,
-    ) -> None:
-        if tuple(columns) != tuple(field.name for field in self.fields):
-            raise StorageError(f"{self.name} columns do not match its schema")
-        resolved = torch.device(device)
-        for field in self.fields:
-            value = columns[field.name]
-            expected = (n_replica, rows, *field.shape)
-            if (
-                tuple(value.shape) != expected
-                or value.dtype != field.dtype
-                or value.device != resolved
-                or not value.is_contiguous()
-            ):
-                raise StorageError(
-                    f"{self.name}.{field.name} must be contiguous {expected} "
-                    f"{field.dtype} on {resolved}"
-                )
 
 
 @dataclass(frozen=True, order=True)
@@ -510,7 +481,7 @@ class SlabReservation:
 
     def __init__(
         self,
-        slab: "MonotoneSlab",
+        slab: MonotoneSlab,
         lane: int,
         address: ReservationAddress,
         token: int,
@@ -824,12 +795,6 @@ class MonotoneSlab:
         reservation._closed = True
         del self._tokens[reservation._token]
 
-    def published(self, lane: int, field: str) -> Tensor:
-        tail = self.tail(lane)
-        if field not in self._columns:
-            raise KeyError(f"{self.schema.name} has no field {field!r}")
-        return self._columns[field][lane, :tail]
-
     def _prepare_reset_failed_lane(self, lane: int) -> list[int]:
         state = self._lane_state(lane)
         if not state[self._POISONED] and self.failure_state.snapshot(lane) is None:
@@ -908,7 +873,7 @@ class PublicationTransaction:
         *,
         phase: str,
         sampler_attempt_count: int = 0,
-    ) -> "PublicationTransaction":
+    ) -> PublicationTransaction:
         if not requests:
             raise ValueError("a publication transaction requires destinations")
         if not phase:
@@ -986,13 +951,13 @@ class PublicationTransaction:
     @classmethod
     def begin_device(
         cls,
-        requests: Sequence["DeviceDestinationRequest"],
+        requests: Sequence[DeviceDestinationRequest],
         *,
         phase: str,
         active: Tensor,
         sampler_attempt_count: Tensor | None = None,
         blocked: Tensor | None = None,
-    ) -> "_DevicePublicationTransaction":
+    ) -> _DevicePublicationTransaction:
         """Begin the sole device-counted form of a publication transaction."""
 
         return _DevicePublicationTransaction(
@@ -1187,7 +1152,7 @@ class _DevicePublicationTransaction:
         active: Tensor,
         sampler_attempt_count: Tensor | None = None,
         blocked: Tensor | None = None,
-    ) -> "_DevicePublicationTransaction":
+    ) -> _DevicePublicationTransaction:
         return cls(
             tuple(requests),
             phase=phase,
@@ -1195,12 +1160,6 @@ class _DevicePublicationTransaction:
             sampler_attempt_count=sampler_attempt_count,
             blocked=blocked,
         )
-
-    @property
-    def begins(self) -> tuple[Tensor, ...]:
-        """Device-resident reservation beginnings, one per request."""
-
-        return self._begins
 
     @property
     def ends(self) -> tuple[Tensor, ...]:
@@ -1512,16 +1471,15 @@ class _DevicePublicationTransaction:
             raise TransactionError("device transaction is closed")
         if not all(self._filled):
             raise TransactionError("every device destination must be filled")
-        if commit_marker is not None:
-            if (
-                commit_marker.shape != (self.n_replica,)
-                or commit_marker.dtype != torch.int64
-                or commit_marker.device != self.device
-                or sequence is None
-            ):
-                raise ValueError(
-                    "commit marker must be CUDA int64 [n_replica] with sequence"
-                )
+        if commit_marker is not None and (
+            commit_marker.shape != (self.n_replica,)
+            or commit_marker.dtype != torch.int64
+            or commit_marker.device != self.device
+            or sequence is None
+        ):
+            raise ValueError(
+                "commit marker must be CUDA int64 [n_replica] with sequence"
+            )
         try:
             if failure_injector is not None:
                 failure_injector()
@@ -1739,10 +1697,6 @@ class ExactBlock:
     def allocated_bytes(self) -> int:
         self._check_live()
         return int(self._backing.untyped_storage().nbytes())
-
-    @property
-    def payload_bytes(self) -> int:
-        return self.schema.payload_bytes(self.rows)
 
     def _check_live(self) -> None:
         if self._released:

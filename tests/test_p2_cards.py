@@ -6,7 +6,6 @@ from pbg.games.poker.cards import (
     DeckGeometry,
 )
 
-
 GEOMETRY = DeckGeometry(13)
 
 

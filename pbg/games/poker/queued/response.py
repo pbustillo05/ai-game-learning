@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import math
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor
-
 
 SHARED_RESPONSE_SEMANTICS = "shared_seat_approximate_response_v1"
 
@@ -310,8 +309,8 @@ class SequentialSharedResponseEvaluator:
 
 
 __all__ = [
-    "PairedProbeStatistics",
     "SHARED_RESPONSE_SEMANTICS",
+    "PairedProbeStatistics",
     "SequentialSharedResponseEvaluator",
     "SharedResponseEvaluationReport",
     "balanced_evaluation_probe_seats",

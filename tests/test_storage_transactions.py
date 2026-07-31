@@ -44,7 +44,7 @@ from pbg.core.storage import (
     StorageOverflow,
 )
 from tests.static_gates import core_firewall_violations
-
+from tests.storage_support import published_rows
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 CUDA = pytest.mark.skipif(
@@ -172,7 +172,7 @@ def _manifest(
 
 
 def _values(
-    slab: MonotoneSlab, count: int, value: int | float = 1
+    slab: MonotoneSlab, count: int, value: float = 1
 ) -> dict[str, torch.Tensor]:
     return {
         field.name: torch.full(
@@ -254,8 +254,9 @@ def test_schema_and_capacity_records_are_deeply_immutable() -> None:
     with pytest.raises(FrozenInstanceError):
         schema.fields[0].shape = (2,)  # type: ignore[misc]
 
-    assert schema.payload_bytes(7, 2) == 7 * 2 * (4 + 3 * 4)
-    assert schema.allocation_bytes(7, 2) >= schema.payload_bytes(7, 2)
+    payload_bytes = 7 * 2 * sum(field.row_bytes for field in schema.fields)
+    assert payload_bytes == 7 * 2 * (4 + 3 * 4)
+    assert schema.allocation_bytes(7, 2) >= payload_bytes
     assert schema.allocation_bytes(7, 2) % schema.alignment == 0
 
 
@@ -271,18 +272,11 @@ def test_all_twelve_modes_allocate_only_their_generated_cuda_owners() -> None:
             _layout(),
             device,
         )
-        assert manifest.configured_names == frozenset(
-            (
-                *CAPACITY_VOCABULARY.partitioned_rows,
-                *CAPACITY_VOCABULARY.scalar_rows,
-                *CAPACITY_VOCABULARY.pack_limits,
-                *CAPACITY_VOCABULARY.workspaces,
-            )
-        )
         declared = {owner.name for owner in mode.owners}
-        assert plan.cuda_owner_names == declared - {"Topology", "TopologyChild"}
+        cuda_owner_names = {item.key.owner for item in plan.allocations}
+        assert cuda_owner_names == declared - {"Topology", "TopologyChild"}
         assert set(plan.deferred_cpu_owners) == {"Topology", "TopologyChild"}
-        assert plan.cuda_owner_names | set(plan.deferred_cpu_owners) == declared
+        assert cuda_owner_names | set(plan.deferred_cpu_owners) == declared
         assert len({item.key for item in plan.allocations}) == len(plan.allocations)
         for allocation in plan.allocations:
             owner = mode.owner(allocation.key.owner)
@@ -296,12 +290,12 @@ def test_all_twelve_modes_allocate_only_their_generated_cuda_owners() -> None:
             owners.enter_phase(phase)
             if phase is ExecutionPhase.ROLLOUT:
                 owners.bind_empty_layer_work_for_abort()
-            seen.update(owners.live_keys)
+            seen.update(owners._live)
             report = owners.memory_report()
             report.assert_reconciled()
             owners.release_after(phase)
         assert seen == {item.key for item in plan.allocations}
-        assert owners.released_keys == seen
+        assert frozenset(owners._released) == seen
         owners.close()
 
 
@@ -346,7 +340,7 @@ def test_monotone_slab_uses_one_aligned_arena_and_never_repeats_addresses() -> N
     assert second.address == (second.address.__class__)(0, 2, 5)
     assert slab.tail(0) == slab.reserved_tail(0) == slab.high_water(0) == 5
     assert torch.equal(
-        slab.published(0, "index"),
+        published_rows(slab, 0, "index"),
         torch.tensor([3, 3, 4, 4, 4], dtype=torch.int32, device=device),
     )
     with pytest.raises(ValueError, match="positive"):
@@ -403,8 +397,8 @@ def test_transaction_failure_injection_publishes_every_destination_or_none() -> 
     committed.fill(1, _values(right, 1, 8))
     committed.publish()
     assert left.tail(0) == right.tail(0) == 1
-    assert int(left.published(0, "index")[0]) == 7
-    assert int(right.published(0, "index")[0]) == 8
+    assert int(published_rows(left, 0, "index")[0]) == 7
+    assert int(published_rows(right, 0, "index")[0]) == 8
     left.release()
     right.release()
     failures.release()
@@ -481,7 +475,7 @@ def test_failed_lane_retry_does_not_corrupt_completed_lane() -> None:
     )
     completed.fill(_values(slab, 2, 9))
     PublicationTransaction((completed,)).publish()
-    lane_one_before = slab.published(1, "value").clone()
+    lane_one_before = published_rows(slab, 1, "value").clone()
 
     with pytest.raises(StorageOverflow):
         slab.reserve(
@@ -496,7 +490,7 @@ def test_failed_lane_retry_does_not_corrupt_completed_lane() -> None:
     assert slab.epoch(0) == 1
     assert slab.tail(0) == 0
     assert slab.tail(1) == 2
-    assert torch.equal(slab.published(1, "value"), lane_one_before)
+    assert torch.equal(published_rows(slab, 1, "value"), lane_one_before)
     retry = slab.reserve(
         0,
         1,
@@ -546,7 +540,7 @@ def test_generated_owner_retry_discards_whole_lane_attempt_only() -> None:
     PublicationTransaction(
         (completed_hot, completed_retained)
     ).publish()
-    lane_one_before = retained.published(1, "model_input").clone()
+    lane_one_before = published_rows(retained, 1, "model_input").clone()
 
     leaf = owners.slab("Leaf")
     with pytest.raises(StorageOverflow):
@@ -559,14 +553,14 @@ def test_generated_owner_retry_discards_whole_lane_attempt_only() -> None:
         )
     failure = owners.abort_failed_lane(0)
     assert failure.logical_address == 8
-    for key in owners.live_keys:
+    for key in owners._live:
         slab = owners.slab(key.owner, key.partition)
         assert slab.epoch(0) == 1
         assert slab.tail(0) == 0
     assert family.epoch(1) == 0
     assert family.tail(1) == 1
     assert torch.equal(
-        retained.published(1, "model_input"), lane_one_before
+        published_rows(retained, 1, "model_input"), lane_one_before
     )
 
     owners.bind_empty_layer_work_for_abort()
@@ -585,7 +579,6 @@ def test_exact_block_has_immutable_extent_exact_bytes_and_explicit_release() -> 
         block.rows = 4  # type: ignore[misc]
     assert block.rows == 3
     assert block.allocated_bytes == block.schema.allocation_bytes(3)
-    assert block.payload_bytes == block.schema.payload_bytes(3)
     assert len(
         {value.untyped_storage().data_ptr() for value in block.columns.values()}
     ) == 1
@@ -676,7 +669,7 @@ def test_phase_allocation_is_transactional_and_release_is_at_last_consumer() -> 
 
     with pytest.raises(RuntimeError, match="injected allocation"):
         owners.enter_phase(ExecutionPhase.ROLLOUT, failure_injector=fail_third)
-    assert owners.live_keys == frozenset()
+    assert not owners._live
 
     owners.enter_phase(ExecutionPhase.ROLLOUT)
     owners.bind_empty_layer_work_for_abort()

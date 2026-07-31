@@ -265,18 +265,6 @@ class CapacityManifest:
             {item.name: item.rows for item in getattr(self, name)}
         )
 
-    @property
-    def configured_names(self) -> frozenset[str]:
-        return frozenset(
-            (
-                *CAPACITY_VOCABULARY.partitioned_rows,
-                *CAPACITY_VOCABULARY.scalar_rows,
-                *CAPACITY_VOCABULARY.pack_limits,
-                *CAPACITY_VOCABULARY.workspaces,
-            )
-        )
-
-
 class ExecutionPhase(IntEnum):
     """Ordered allocation and last-consumer boundaries."""
 
@@ -334,19 +322,8 @@ class StoragePlan:
     admissions: tuple[PhaseAdmission, ...]
     device: torch.device
 
-    def allocation(self, owner: str, partition: str = "") -> OwnerAllocation:
-        key = OwnerKey(owner, partition)
-        for allocation in self.allocations:
-            if allocation.key == key:
-                return allocation
-        raise KeyError(f"no generated CUDA owner {key.label!r}")
-
     def admission(self, phase: ExecutionPhase) -> PhaseAdmission:
         return self.admissions[int(phase)]
-
-    @property
-    def cuda_owner_names(self) -> frozenset[str]:
-        return frozenset(item.key.owner for item in self.allocations)
 
 
 _LIFETIMES: Mapping[str, tuple[ExecutionPhase, ExecutionPhase]] = MappingProxyType(
@@ -381,7 +358,6 @@ _LIFETIMES: Mapping[str, tuple[ExecutionPhase, ExecutionPhase]] = MappingProxyTy
 _CPU_OWNERS = ("Topology", "TopologyChild")
 BRANCHED_ALIAS_PEAK_ROW_BYTES = 44
 BRANCHED_LOG_MASS_ROW_BYTES = 12
-BRANCHED_TOPOLOGY_PACKET_ROW_BYTES = 95
 
 
 def _output_width(partitions: PartitionContract, input_name: str) -> int:
@@ -424,8 +400,6 @@ def _field(
     if field_name == "folded_range_row":
         return SoAField(field_name, torch.int32, (players,), alignment, integer_fill)
     if field_name in (
-        "reservation_state",
-        "publication_state",
         "role_selector",
         "response_cutoff",
     ):
@@ -449,7 +423,6 @@ def _field(
         "head",
         "ready_tail",
         "reserved_tail",
-        "controller_state",
         "family_row",
         "action_begin",
         "action_count",
@@ -466,8 +439,7 @@ def _field(
             )
             else 0
         )
-        shape = (4,) if field_name == "controller_state" else ()
-        return SoAField(field_name, torch.int32, shape, alignment, fill)
+        return SoAField(field_name, torch.int32, (), alignment, fill)
     if field_name == "stratum_level":
         return SoAField(field_name, torch.int32, (players,), alignment, integer_fill)
     if field_name == "payoff_baseline":
@@ -1065,10 +1037,6 @@ class GeneratedOwners:
         return self._runtime_admissions.get(phase, self.plan.admission(phase))
 
     @property
-    def live_keys(self) -> frozenset[OwnerKey]:
-        return frozenset(self._live)
-
-    @property
     def live_slabs(self) -> tuple[MonotoneSlab, ...]:
         """All sanctioned live retained owners in stable allocation order."""
 
@@ -1076,10 +1044,6 @@ class GeneratedOwners:
             self._live[key]
             for key in sorted(self._live, key=lambda item: item.label)
         )
-
-    @property
-    def released_keys(self) -> frozenset[OwnerKey]:
-        return frozenset(self._released)
 
     def enter_phase(
         self,
@@ -1262,13 +1226,12 @@ class GeneratedOwners:
 __all__ = [
     "BRANCHED_ALIAS_PEAK_ROW_BYTES",
     "BRANCHED_LOG_MASS_ROW_BYTES",
-    "BRANCHED_TOPOLOGY_PACKET_ROW_BYTES",
     "AdmissionError",
     "CapacityError",
     "CapacityManifest",
+    "ExecutionGeometry",
     "ExecutionPhase",
     "ExternalWorkspaceBounds",
-    "ExecutionGeometry",
     "GeneratedOwners",
     "HardwareLimits",
     "MemoryReport",

@@ -6,22 +6,6 @@ from dataclasses import replace
 import pytest
 import torch
 
-from pbg.games.poker.queued.branching import (
-    BranchedPosteriorExhaustion,
-    action_conditioned_log_reach,
-    branched_rb_chance_frontier_row_bytes,
-)
-from tests.iteration_support import BranchedRecoveryHarness
-from pbg.games.poker.queued.hooks import (
-    NLHEGeometry,
-    rb_partitions,
-)
-from pbg.games.poker.queued.rb_sampling import (
-    CollisionConditionedProfileSampler,
-    RejectionObservation,
-)
-from pbg.games.poker.queued.model import build_model_from_config
-from pbg.games.poker.queued.config import BranchedModeConfig
 from pbg.core.branching import (
     CostSafeguardController,
     FixedBranchController,
@@ -37,9 +21,25 @@ from pbg.core.learner import (
 from pbg.core.optimization import DenseAdam, OptimizerConfig
 from pbg.core.persistence import RunState
 from pbg.core.targets import rb_conversion_library_workspace_bytes
+from pbg.games.poker.queued.branching import (
+    BranchedPosteriorExhaustion,
+    action_conditioned_log_reach,
+)
+from pbg.games.poker.queued.config import BranchedModeConfig
+from pbg.games.poker.queued.hooks import (
+    NLHEGeometry,
+    rb_partitions,
+)
+from pbg.games.poker.queued.model import build_model_from_config
+from pbg.games.poker.queued.rb_sampling import (
+    CollisionConditionedProfileSampler,
+    RejectionObservation,
+)
+from tests.iteration_support import BranchedRecoveryHarness
 from tests.test_branched_sampled_modes import (
     _manifest,
     _phase7_layout,
+    _sampled_chance_frontier_row_bytes,
     _scientific_config,
 )
 
@@ -77,8 +77,16 @@ def _plan(
     layout = replace(
         _phase7_layout(geometry),
         evaluator_private_width=geometry.private_hands,
-        chance_frontier_row_bytes=branched_rb_chance_frontier_row_bytes(
-            geometry, max_attempts=16
+        chance_frontier_row_bytes=(
+            _sampled_chance_frontier_row_bytes(geometry)
+            + 4 * geometry.players * geometry.private_hands
+            + 16
+            * (
+                4 * geometry.players
+                + 2 * geometry.deck_cards
+                + geometry.players
+            )
+            + 32
         ),
         completion_workspace_row_bytes=8192,
         learner_sigma_workspace_row_bytes=8192,

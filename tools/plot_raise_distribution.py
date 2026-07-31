@@ -19,7 +19,6 @@ from pathlib import Path
 
 import numpy as np
 
-
 N_TICKS = 32
 
 

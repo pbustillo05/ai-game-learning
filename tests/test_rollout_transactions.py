@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import ast
 import inspect
-from pathlib import Path
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 from types import MappingProxyType
 
 import pytest
@@ -19,6 +19,7 @@ from pbg.core.contracts import (
 )
 from pbg.core.rollout import (
     _OWNER_REGISTRY_TOKEN,
+    LOGICAL_RNG_VERSION,
     AsyncTopologyPublisher,
     BoundedChanceClosure,
     CommitCoverage,
@@ -28,9 +29,8 @@ from pbg.core.rollout import (
     DrawPurpose,
     FamilyQueueState,
     FamilyScheduler,
-    LOGICAL_RNG_VERSION,
-    RolloutTransaction,
     RolloutOwnerRegistry,
+    RolloutTransaction,
     SampleWorkspace,
     SemanticFamilyFIFO,
     child_path_keys,
@@ -49,7 +49,7 @@ from pbg.core.storage import (
     SoASchema,
     StorageError,
 )
-
+from tests.storage_support import published_rows
 
 CUDA = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="queued rollout requires CUDA"
@@ -316,18 +316,18 @@ def test_device_counts_scans_reservations_and_publication_is_lane_atomic() -> No
     assert marker.tolist() == [11, -1, 11]
     assert [left.tail(lane) for lane in range(3)] == [2, 0, 1]
     assert [right.tail(lane) for lane in range(3)] == [2, 1, 1]
-    assert left.published(0, "value").tolist() == [5, 5]
-    assert left.published(2, "value").tolist() == [5]
-    assert right.published(0, "value").tolist() == [7, 7]
-    assert right.published(2, "value").tolist() == [7]
+    assert published_rows(left, 0, "value").tolist() == [5, 5]
+    assert published_rows(left, 2, "value").tolist() == [5]
+    assert published_rows(right, 0, "value").tolist() == [7, 7]
+    assert published_rows(right, 2, "value").tolist() == [7]
     failure = failures.snapshot(1)
     assert failure is not None
     assert failure.logical_address == 11
     assert failure.requested_extent == 4
     assert failure.available_extent == 3
     assert failure.input_type == "pre"
-    assert left.published(1, "value").numel() == 0
-    assert right.published(1, "value").tolist() == [3]
+    assert published_rows(left, 1, "value").numel() == 0
+    assert published_rows(right, 1, "value").tolist() == [3]
 
     left.reset_failed_lane(1)
     right.reset_failed_lane(1)
@@ -382,7 +382,7 @@ def test_device_counts_scans_reservations_and_publication_is_lane_atomic() -> No
     )
     final.fill_all()
     final.publish()
-    assert boundary.published(0, "value").tolist() == [3, 3, 9, 9]
+    assert published_rows(boundary, 0, "value").tolist() == [3, 3, 9, 9]
     boundary.release()
     boundary_failures.release()
 
@@ -794,8 +794,8 @@ def test_one_model_sample_commit_path_serves_sequential_and_branched(
     assert fifo.head.tolist() == [2, 0, 2]
     assert [leaf.tail(lane) for lane in range(3)] == [2, 0, 2]
     expected = (seen["keys"] & 7).to(torch.int32)
-    assert torch.equal(leaf.published(0, "result"), expected[0])
-    assert torch.equal(leaf.published(2, "result"), expected[1])
+    assert torch.equal(published_rows(leaf, 0, "result"), expected[0])
+    assert torch.equal(published_rows(leaf, 2, "result"), expected[1])
     publisher.assert_drained()
 
     family.release()

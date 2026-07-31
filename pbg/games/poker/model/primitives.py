@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
+
 def accelerator_assert(condition: Tensor, message: str) -> None:
     """Issue an asynchronous check unless an enclosing transform owns it."""
 

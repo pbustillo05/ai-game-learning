@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import ast
 from collections import deque
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Iterable
 
 
 def _source_package(path: Path) -> tuple[str, ...]:
@@ -68,6 +68,61 @@ def forbidden_literal_violations(
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and node.value in blocked:
                 violations.append(f"{path}:{node.lineno}:{node.value}")
+    return tuple(violations)
+
+
+def _module_field_tokens(path: Path) -> frozenset[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tokens: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            tokens.add(node.attr)
+        elif isinstance(node, ast.keyword) and node.arg is not None:
+            tokens.add(node.arg)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            tokens.add(node.value)
+    return frozenset(tokens)
+
+
+def generated_field_flow_violations(
+    root: Path,
+    owner_fields: Mapping[str, Iterable[str]],
+    flows: Mapping[str, tuple[Iterable[str], Iterable[str]]],
+) -> tuple[str, ...]:
+    """Require declared producer and consumer evidence for every schema field.
+
+    The flow map is intentionally owner-specific.  A coincidental use of a
+    generic name such as ``owner`` elsewhere in production cannot retain a
+    generated column, and adding an owner or field without declaring both ends
+    fails this gate.
+    """
+
+    module_tokens = {
+        _module_name(root, path): _module_field_tokens(path)
+        for path in sorted((root / "pbg").rglob("*.py"))
+    }
+    violations: list[str] = []
+    for owner, fields in sorted(owner_fields.items()):
+        if owner not in flows:
+            violations.append(f"{owner}:missing flow declaration")
+            continue
+        producers, consumers = flows[owner]
+        producer_modules = tuple(producers)
+        consumer_modules = tuple(consumers)
+        for label, modules in (
+            ("producer", producer_modules),
+            ("consumer", consumer_modules),
+        ):
+            missing = sorted(module for module in modules if module not in module_tokens)
+            if missing:
+                violations.append(f"{owner}:{label} modules missing: {missing}")
+        for field in sorted(fields):
+            if not any(field in module_tokens.get(module, ()) for module in producer_modules):
+                violations.append(f"{owner}.{field}:missing producer evidence")
+            if not any(field in module_tokens.get(module, ()) for module in consumer_modules):
+                violations.append(f"{owner}.{field}:missing consumer evidence")
+    undeclared = sorted(set(flows) - set(owner_fields))
+    violations.extend(f"{owner}:flow declared for absent owner" for owner in undeclared)
     return tuple(violations)
 
 
@@ -156,6 +211,7 @@ __all__ = [
     "accepted_root_violations",
     "core_firewall_violations",
     "forbidden_literal_violations",
+    "generated_field_flow_violations",
     "local_import_graph",
     "module_imports",
     "reachable_modules",

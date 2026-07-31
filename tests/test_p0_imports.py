@@ -11,7 +11,6 @@ from tests.static_gates import (
     stale_cutover_violations,
 )
 
-
 ROOT = Path(__file__).parents[1]
 
 

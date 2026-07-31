@@ -11,7 +11,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-
 CAPS = {
     "total": 150_000,
     "pre": 2_000,
@@ -193,7 +192,7 @@ def main() -> None:
         values = [int(record[name]) for record in successes]
         median = float(np.median(values))
         maximum = max(values)
-        bins = min(12, max(5, int(round(np.sqrt(len(values))))))
+        bins = min(12, max(5, round(np.sqrt(len(values)))))
         axis.hist(values, bins=bins, color=colors[name], alpha=0.95)
         axis.axvline(
             median,

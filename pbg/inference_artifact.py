@@ -11,7 +11,6 @@ from typing import Any
 
 import torch
 
-from pbg.games.poker.queued.config import BranchedModeConfig, SequentialModeConfig
 from pbg.core.persistence import (
     CHECKPOINT_SCHEMA,
     DISTRIBUTED_CHECKPOINT_SCHEMA,
@@ -21,6 +20,7 @@ from pbg.core.persistence import (
     sha256_file,
     validate_checkpoint_payload,
 )
+from pbg.games.poker.queued.config import BranchedModeConfig, SequentialModeConfig
 
 INFERENCE_ARTIFACT_SCHEMA_VERSION = "pbg-queued-inference-v1"
 _FIELDS = {
@@ -69,7 +69,9 @@ def _load_artifact(path: Path) -> dict[str, Any]:
     if not isinstance(scientific, dict) or not isinstance(
         scientific.get("mode"), dict
     ):
-        raise RuntimeError("inference artifact scientific configuration is invalid")
+        raise RuntimeError(  # noqa: TRY004 - malformed serialized artifact
+            "inference artifact scientific configuration is invalid"
+        )
     try:
         parsed = (
             SequentialModeConfig.from_mapping(scientific)
@@ -85,7 +87,9 @@ def _load_artifact(path: Path) -> dict[str, Any]:
             "inference artifact scientific configuration is not canonical"
         )
     if not isinstance(value["model"], dict):
-        raise RuntimeError("inference artifact model state is invalid")
+        raise RuntimeError(  # noqa: TRY004 - malformed serialized artifact
+            "inference artifact model state is invalid"
+        )
     for name in ("source_checkpoint_sha256", "model_sha256", "payload_sha256"):
         digest = value[name]
         if (
@@ -188,7 +192,9 @@ def export_inference_artifact(
     if not isinstance(run_state, dict) or not isinstance(
         run_state.get("iteration"), int
     ):
-        raise RuntimeError("queued checkpoint run state is invalid")
+        raise RuntimeError(  # noqa: TRY004 - malformed serialized checkpoint
+            "queued checkpoint run state is invalid"
+        )
     model = {
         name: tensor.detach().cpu().contiguous()
         for name, tensor in model_state.items()

@@ -7,21 +7,21 @@ and it performs no device-to-host read between layers.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping, Sequence
 
 import torch
 from torch import Tensor
 
 from pbg.core.capacity import GeneratedOwners
-from pbg.core.cuda_layer import layered_target_cuda
 from pbg.core.contracts import (
     ModeSchema,
     PartitionContract,
     PrivateEstimator,
     TrainingRegime,
 )
+from pbg.core.cuda_layer import layered_target_cuda
 from pbg.core.storage import (
     DestinationRequest,
     DeviceFailure,
@@ -32,7 +32,6 @@ from pbg.core.storage import (
     StorageError,
 )
 from pbg.core.topology import LayerPlan
-
 
 RB_GEMM_LIBRARY_WORKSPACE_BYTES = 8 << 20
 CUDA_LIBRARY_ALLOCATION_ALIGNMENT = 64 << 10
@@ -149,7 +148,7 @@ class TargetAlgebra:
             masks[(source, destination)] = mask
         self._cpu_masks = MappingProxyType(masks)
 
-    def device(self, device: torch.device | str) -> "_DeviceAlgebra":
+    def device(self, device: torch.device | str) -> _DeviceAlgebra:
         resolved = torch.device(device)
         if resolved.type != "cuda":
             raise TargetError("queued targets require CUDA")

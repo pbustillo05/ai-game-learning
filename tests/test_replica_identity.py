@@ -11,18 +11,6 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.iteration_support import (
-    EngineDrivenReplicaBranchedAttempt,
-    EngineDrivenSequentialAttempt,
-)
-from pbg.games.poker.queued.hooks import (
-    NLHEGeometry,
-    PokerForwardInput,
-    sampled_partitions,
-)
-from pbg.games.poker.queued.model import QueuedPokerModel, build_model_from_config
-from pbg.games.poker.queued.replica import PokerReplicaInference
-from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
 from pbg.core.branching import (
     CostSafeguardController,
     FixedBranchController,
@@ -66,16 +54,28 @@ from pbg.core.replica import (
 )
 from pbg.core.storage import SoAField
 from pbg.core.training import LearnerIteration, TrainingError
-from tests.test_branched_sampled_modes import (
-    _manifest as _branched_manifest,
+from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
+from pbg.games.poker.queued.hooks import (
+    NLHEGeometry,
+    PokerForwardInput,
+    sampled_partitions,
 )
-from tests.test_branched_sampled_modes import _phase7_layout
+from pbg.games.poker.queued.model import QueuedPokerModel, build_model_from_config
+from pbg.games.poker.queued.replica import PokerReplicaInference
+from tests.iteration_support import (
+    EngineDrivenReplicaBranchedAttempt,
+    EngineDrivenSequentialAttempt,
+)
 from tests.test_branched_rb_modes import (
     _config as _branched_rb_config,
 )
 from tests.test_branched_rb_modes import (
     _plan as _branched_rb_plan,
 )
+from tests.test_branched_sampled_modes import (
+    _manifest as _branched_manifest,
+)
+from tests.test_branched_sampled_modes import _phase7_layout
 
 CUDA = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="queued replica execution is CUDA-only"

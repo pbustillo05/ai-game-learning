@@ -6,7 +6,6 @@ import math
 
 from pbg.games.poker.cards import DeckGeometry
 
-
 STREET_SEPARATOR_COUNT = 3
 
 

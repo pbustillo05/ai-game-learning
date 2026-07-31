@@ -56,7 +56,7 @@ from pbg.core.topology import (
     build_layer_plan,
 )
 from tests.static_gates import core_firewall_violations
-
+from tests.storage_support import published_rows
 
 CUDA = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="queued targets require CUDA"
@@ -696,9 +696,11 @@ def test_protected_root_prefix_is_numerical_and_ignores_refill_child() -> None:
     result = LayeredTargetExecutor(
         mode, _algebra(mode.private_estimator), lambda_=1.0
     ).execute(owners, plan)
-    sigma = owners.slab("SigmaTarget", "pre").published(0, "value_target")
-    action = owners.slab("ActionTarget", "all").published(
-        0, "advantage_target"
+    sigma = published_rows(
+        owners.slab("SigmaTarget", "pre"), 0, "value_target"
+    )
+    action = published_rows(
+        owners.slab("ActionTarget", "all"), 0, "advantage_target"
     )
     assert torch.equal(sigma[0], torch.tensor([3.0], device=device))
     assert action.shape[0] == 2
@@ -1110,7 +1112,9 @@ def test_signed_sampled_return_is_valid() -> None:
     ).execute(owners, plan)
     assert result.published_lanes == (0,)
     assert torch.equal(
-        owners.slab("SigmaTarget", "pre").published(0, "value_target")[0],
+        published_rows(
+            owners.slab("SigmaTarget", "pre"), 0, "value_target"
+        )[0],
         torch.tensor([-3.0], device=device),
     )
     _close(owners)
@@ -1231,11 +1235,13 @@ def test_all_twelve_modes_match_direct_one_node_reference(
         mode, _algebra(estimator), lambda_=0.5
     ).required_scratch_bytes(plan, manifest.n_replica)
     assert result.counters.scratch_bytes <= manifest.movement_scratch_bytes
-    sigma = owners.slab("SigmaTarget", "pre").published(0, "value_target")
+    sigma = published_rows(
+        owners.slab("SigmaTarget", "pre"), 0, "value_target"
+    )
     action_name = "pre" if not rollout.is_branched else plan.output_names[0]
-    advantage = owners.slab(
-        "ActionTarget", action_name
-    ).published(0, "advantage_target")
+    advantage = published_rows(
+        owners.slab("ActionTarget", action_name), 0, "advantage_target"
+    )
     if estimator is PrivateEstimator.SAMPLED:
         owner_payoff = payoff[:, 0]
         assert torch.allclose(sigma[0], owner_payoff.mean().reshape(1))
@@ -1253,9 +1259,9 @@ def test_all_twelve_modes_match_direct_one_node_reference(
     else:
         owner_value = value[:, 0]
         assert torch.allclose(sigma[0], owner_value.mean(0))
-        posterior = owners.slab(
-            "ActionTarget", action_name
-        ).published(0, "posterior")
+        posterior = published_rows(
+            owners.slab("ActionTarget", action_name), 0, "posterior"
+        )
         assert torch.equal(posterior, torch.ones_like(posterior))
         expected = []
         for child in range(leaves):
@@ -1268,11 +1274,11 @@ def test_all_twelve_modes_match_direct_one_node_reference(
             expected.append(owner_value[child] - baseline)
         assert torch.allclose(advantage, torch.stack(expected))
     if rollout.is_branched:
-        trace = owners.slab("SigmaTarget", "pre").published(
-            0, "trace_target"
+        trace = published_rows(
+            owners.slab("SigmaTarget", "pre"), 0, "trace_target"
         )
-        cost = owners.slab("SigmaTarget", "pre").published(
-            0, "cost_target"
+        cost = published_rows(
+            owners.slab("SigmaTarget", "pre"), 0, "cost_target"
         )
         trace_vector = payload.trace_vector
         assert trace_vector is not None
@@ -1331,7 +1337,9 @@ def test_unbalanced_last_consumer_slots_match_reference_without_copy_traffic() -
     assert len(layer_kernels) == plan.layer_count
     assert not hasattr(result.counters, "carry_count")
     assert not hasattr(result.counters, "carry_payload_bytes")
-    sigma = owners.slab("SigmaTarget", "pre").published(0, "value_target")
+    sigma = published_rows(
+        owners.slab("SigmaTarget", "pre"), 0, "value_target"
+    )
     # Node 1 is mean(4,8)=6, root is mean(2,6)=4.
     assert torch.equal(sigma[:, 0], torch.tensor([4.0, 6.0], device=device))
     _close(owners)
@@ -1378,7 +1386,9 @@ def test_unbalanced_rb_two_layer_recurrence_matches_direct_reference() -> None:
         mode, _algebra(mode.private_estimator), lambda_=1.0
     ).execute(owners, plan)
     assert result.published_lanes == (0,)
-    sigma = owners.slab("SigmaTarget", "pre").published(0, "value_target")
+    sigma = published_rows(
+        owners.slab("SigmaTarget", "pre"), 0, "value_target"
+    )
     assert torch.equal(
         sigma,
         torch.tensor([[4.0, 4.0], [6.0, 6.0]], device=device),
@@ -1438,10 +1448,12 @@ def test_sequential_two_level_player_clock_specialization() -> None:
         mode, _algebra(mode.private_estimator), lambda_=0.5
     ).execute(owners, plan)
     assert result.counters.layer_count == 2
-    sigma = owners.slab("SigmaTarget", "pre").published(0, "value_target")
-    advantage = owners.slab(
-        "ActionTarget", "pre"
-    ).published(0, "advantage_target")
+    sigma = published_rows(
+        owners.slab("SigmaTarget", "pre"), 0, "value_target"
+    )
+    advantage = published_rows(
+        owners.slab("ActionTarget", "pre"), 0, "advantage_target"
+    )
     # Descendant target is 10, then propagation bootstraps to 6 for its parent.
     assert torch.equal(sigma[:, 0], torch.tensor([6.0, 10.0], device=device))
     assert torch.equal(
@@ -1572,8 +1584,12 @@ def test_internal_layer_post_to_pre_conversion_is_deterministic() -> None:
         mode, _algebra(mode.private_estimator), lambda_=1.0
     ).execute(owners, plan)
     assert result.published_lanes == (0,)
-    sigma = owners.slab("SigmaTarget", "pre").published(0, "value_target")
-    posterior = owners.slab("ActionTarget", "pre").published(0, "posterior")
+    sigma = published_rows(
+        owners.slab("SigmaTarget", "pre"), 0, "value_target"
+    )
+    posterior = published_rows(
+        owners.slab("ActionTarget", "pre"), 0, "posterior"
+    )
     assert torch.equal(sigma[0], torch.tensor([4.0, 0.0], device=device))
     assert torch.equal(posterior[0], torch.tensor([4.0, 0.0], device=device))
     _close(owners)
@@ -1744,9 +1760,9 @@ def test_cuda_executor_uses_direct_sibling_sum_for_concentrated_rows() -> None:
     LayeredTargetExecutor(
         mode, _algebra(mode.private_estimator), lambda_=1.0
     ).execute(owners, plan)
-    advantage = owners.slab(
-        "ActionTarget", "all"
-    ).published(0, "advantage_target")
+    advantage = published_rows(
+        owners.slab("ActionTarget", "all"), 0, "advantage_target"
+    )
     assert float(advantage[1, 0]) == 1.0
     _close(owners)
 

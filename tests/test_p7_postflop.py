@@ -1,8 +1,8 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-import torch
 import pytest
+import torch
 
 from pbg.games.poker.model.incidence import (
     IncidenceResidual,

@@ -14,6 +14,14 @@ import yaml
 
 from pbg.benchmark import benchmark_training
 from pbg.config import ConfigError, load_config, load_config_mapping
+from pbg.core.persistence import (
+    CHECKPOINT_SCHEMA,
+    RunState,
+    load_distributed_checkpoint_manifest,
+    model_state_sha256,
+    save_distributed_checkpoint_manifest,
+    sha256_file,
+)
 from pbg.devices import resolve_execution_device, validate_workload_capabilities
 from pbg.eval.br_probe import _play_one, evaluate_br_probe
 from pbg.games.poker.queued.evaluator import bound_evaluator
@@ -22,20 +30,14 @@ from pbg.inference_artifact import (
     export_inference_artifact,
     load_inference_source,
 )
-from pbg.core.persistence import RunState, model_state_sha256, sha256_file
-from pbg.core.persistence import (
-    CHECKPOINT_SCHEMA,
-    load_distributed_checkpoint_manifest,
-    save_distributed_checkpoint_manifest,
-)
+from pbg.runtime import TrainingSession
+from pbg.variance import estimate_update_variance
 from tests.static_gates import (
     accepted_root_violations,
     local_import_graph,
     reachable_modules,
     stale_cutover_violations,
 )
-from pbg.runtime import TrainingSession
-from pbg.variance import estimate_update_variance
 
 ROOT = Path(__file__).parents[1]
 CONFIG = ROOT / "configs/train/nlhe_hu_8bb_normal_smoke.yaml"

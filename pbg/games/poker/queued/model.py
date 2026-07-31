@@ -8,6 +8,8 @@ from types import MappingProxyType
 import torch
 from torch import Tensor, nn
 
+from pbg.core.contracts import mode_schema
+from pbg.core.learner import ModelEvaluation
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.model.capacity import max_public_history_tokens
 from pbg.games.poker.model.postflop import PostflopMasks, PostflopNet
@@ -30,8 +32,6 @@ from pbg.games.poker.queued.hooks import (
     PokerState,
     PokerStateMachine,
 )
-from pbg.core.contracts import mode_schema
-from pbg.core.learner import ModelEvaluation
 
 
 class PokerModelError(RuntimeError):
