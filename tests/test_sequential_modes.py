@@ -115,7 +115,7 @@ def _config(regime: str, estimator: str) -> dict[str, object]:
         "seed": 7,
     }
     if estimator == "rao_blackwell":
-        value["completion"] = {"n_samples": 8, "strata": "default"}
+        value["completion"] = {"n_samples": 8}
     if regime == "best_response":
         value["frozen_profile"] = {"sha256": "a" * 64}
         value["response_initialization"] = "random"
@@ -335,7 +335,7 @@ def test_probe_is_the_ordinary_best_response_rb_schema() -> None:
 
 def test_sequential_config_rejects_inapplicable_mode_fields() -> None:
     sampled = _config("self_play", "sampled")
-    sampled["completion"] = {"n_samples": 8, "strata": "default"}
+    sampled["completion"] = {"n_samples": 8}
     with pytest.raises(ValueError, match="inapplicable"):
         SequentialModeConfig.from_mapping(sampled)
     self_play = _config("self_play", "rao_blackwell")

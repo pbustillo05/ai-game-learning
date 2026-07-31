@@ -1,0 +1,385 @@
+"""Deterministic compilation of a small NLHE run specification.
+
+Normal configuration files never contain the objects produced here.  The
+compiler is the sole authority for fixed storage addresses, physical shapes,
+workspace bounds, and accelerator admission facts.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+
+import torch
+
+from pbg.core.capacity import (
+    CapacityManifest,
+    ExecutionGeometry,
+    ExternalWorkspaceBounds,
+    HardwareLimits,
+    NamedShape,
+    PartitionRows,
+    PhysicalLayout,
+)
+from pbg.core.contracts import ModeSchema, TrainingRegime
+from pbg.core.storage import SoAField
+from pbg.core.targets import (
+    rb_conversion_library_workspace_bytes,
+    rb_conversion_workspace_row_bytes,
+)
+from pbg.games.poker.model.capacity import max_policy_partition_sequence_tokens
+from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
+from pbg.games.poker.queued.hooks import NLHEGeometry, poker_partitions
+
+CAPACITY_DERIVATION_VERSION = "nlhe_capacity_v1"
+FIELD_ALIGNMENT = 64
+_CUBLAS_WORKSPACE_BYTES = 8 << 20
+_POSTERIOR_MAX_ATTEMPTS = 256
+
+
+@dataclass(frozen=True)
+class WorkloadSpec:
+    """The small workload/performance input accepted by the compiler."""
+
+    roots: int
+    replicas: int
+    tree_nodes: int | None
+    reserve_bytes: int
+    rollout_microbatch: int | None
+    completion_microbatch: int | None
+    learner_microbatch: int | None
+    reference_cache_bytes: int
+
+
+@dataclass(frozen=True)
+class CompiledCapacity:
+    """One immutable resolved runtime product."""
+
+    manifest: CapacityManifest
+    layout: PhysicalLayout
+    observed_total_memory_bytes: int
+    derivations: Mapping[str, str]
+
+
+def _align(value: int, alignment: int = 256) -> int:
+    return ((int(value) + alignment - 1) // alignment) * alignment
+
+
+def _device_total_memory(device: torch.device) -> int:
+    if device.type != "cuda":
+        raise ValueError("capacity compilation requires an explicit CUDA device")
+    if not torch.cuda.is_available():
+        raise ValueError("capacity compilation requires available CUDA")
+    return int(torch.cuda.get_device_properties(device).total_memory)
+
+
+def _seat_occurrence_bound(geometry: NLHEGeometry) -> int:
+    """Symmetric per-seat envelope used to prove BR trained-row capacity."""
+
+    # A seat can act once on entry to each street and at most once per whole-bb
+    # stack decrement.  This deliberately symmetric decomposition covers the
+    # documented aggregate player-node bound and makes a selected seat's bound
+    # independent of its label.
+    bound = math.ceil(geometry.stack_bb) + 4
+    if geometry.players * bound < geometry.player_node_bound:
+        raise AssertionError("per-seat occurrence proof does not cover geometry")
+    return bound
+
+
+def _learner_workspace_row_bytes(
+    geometry: NLHEGeometry,
+    *,
+    d_model: int,
+    n_layers_pre: int,
+    n_layers_post: int,
+    model_dtype: torch.dtype,
+    token_bound: int,
+    action_width: int,
+) -> int:
+    """Conservative concurrent forward/backward tensors for one learner row."""
+
+    element_bytes = torch.empty((), dtype=model_dtype).element_size()
+    layers = max(n_layers_pre, n_layers_post)
+    transformer_values = token_bound * d_model * (4 + 3 * layers)
+    output_values = geometry.private_hands * (action_width + 3)
+    fp32_control = geometry.private_hands * (2 * action_width + 8)
+    return _align(
+        element_bytes * (transformer_values + output_values) + 4 * fp32_control
+    )
+
+
+def _chance_frontier_row_bytes(
+    geometry: NLHEGeometry,
+    *,
+    rao_blackwell: bool,
+) -> int:
+    """Derived transient bytes for one chance-frontier row."""
+
+    players = geometry.players
+    hands = geometry.private_hands
+    if rao_blackwell:
+        # Posterior collision attempts plus accepted profile and legality masks.
+        return _align(
+            4 * (players * hands + _POSTERIOR_MAX_ATTEMPTS * players)
+            + _POSTERIOR_MAX_ATTEMPTS * players
+            + 8 * _POSTERIOR_MAX_ATTEMPTS
+        )
+    return _align(4 * players * hands + 16 * players + 64)
+
+
+def _completion_workspace_row_bytes(
+    geometry: NLHEGeometry,
+    *,
+    rao_blackwell: bool,
+    completion_samples: int,
+) -> int:
+    if not rao_blackwell:
+        return _align(16 * geometry.players + 64)
+    conversion = rb_conversion_workspace_row_bytes(
+        geometry.private_hands, geometry.private_classes
+    )
+    evaluator_world = completion_samples * geometry.players * 16
+    evaluator_outputs = geometry.private_hands * 3 * 4
+    return _align(conversion + evaluator_world + evaluator_outputs)
+
+
+def compile_capacity(
+    *,
+    mode: ModeSchema,
+    geometry: NLHEGeometry,
+    model: object,
+    precision: str,
+    device: torch.device,
+    workload: WorkloadSpec,
+    batch_size: int,
+    beta_max: int,
+    completion_samples: int,
+) -> CompiledCapacity:
+    """Compile all derived storage/layout values from one canonical source."""
+
+    total_memory = _device_total_memory(device)
+    if not 0 <= workload.reserve_bytes < total_memory:
+        raise ValueError("memory reserve must be nonnegative and below device memory")
+    if workload.roots <= 0 or workload.replicas <= 0:
+        raise ValueError("workload roots and replicas must be positive")
+    if beta_max <= 0:
+        raise ValueError("branch degree bound must be positive")
+
+    partitions = poker_partitions(geometry, mode)
+    input_names = tuple(item.name for item in partitions.inputs)
+    output_names = tuple(
+        item.name
+        for item in (
+            partitions.inputs
+            if mode.action_partition_axis == "input"
+            else partitions.outputs
+        )
+    )
+    seat_bound = _seat_occurrence_bound(geometry)
+    sequential_structural = workload.roots * geometry.players * seat_bound
+    if mode.rollout_mode.is_branched:
+        if workload.tree_nodes is None:
+            raise ValueError("branched workloads require one tree_nodes budget")
+        topology_cap = workload.tree_nodes
+        if topology_cap < workload.roots:
+            raise ValueError("tree_nodes must cover every root")
+    else:
+        if workload.tree_nodes is not None:
+            raise ValueError("tree_nodes is inapplicable to sequential rollout")
+        topology_cap = sequential_structural
+
+    # A beta-bounded forest with T structural vertices and Q roots has at most
+    # (beta-1)T+Q terminal leaves.  These jointly imply E=(T-Q)+L.
+    leaf_cap = (beta_max - 1) * topology_cap + workload.roots
+    topology_edge_cap = topology_cap - workload.roots + leaf_cap
+    target_arena_cap = topology_cap + leaf_cap
+
+    player_cap = topology_cap
+    player_rows = tuple(PartitionRows(name, player_cap) for name in input_names)
+    if (
+        mode.training_regime is TrainingRegime.SELF_PLAY
+        or mode.rollout_mode.is_branched
+    ):
+        # The tree budget is an aggregate cap, but a branched tree can direct
+        # every retained decision through the response seat.  Keep the full
+        # bound until the tree builder exposes a stronger per-seat invariant.
+        trained_cap = player_cap
+    else:
+        # Maximal-even root roles plus the symmetric seat occurrence proof.
+        trained_cap = min(player_cap, workload.roots * seat_bound)
+    trained_rows = tuple(PartitionRows(name, trained_cap) for name in input_names)
+    if mode.rollout_mode.is_branched:
+        total_trained = trained_cap * len(input_names)
+        action_cap = max(beta_max, total_trained * beta_max)
+        action_rows = tuple(PartitionRows(name, action_cap) for name in output_names)
+    else:
+        # Sequential target degree is exactly one, including row identity.
+        action_rows = tuple(
+            PartitionRows(item.name, item.rows) for item in trained_rows
+        )
+
+    folded_cap = 1 if geometry.players == 2 else topology_cap
+    folded_rows = tuple(
+        PartitionRows(item.name, folded_cap) for item in partitions.folded
+    )
+
+    action_width = 3 + int(model.m_raise)
+    token_bounds = max_policy_partition_sequence_tokens(
+        n_players=geometry.players,
+        stack_bb=geometry.stack_bb,
+        rank_count=geometry.rank_count,
+        k_act=action_width,
+    )
+    token_bound = max(token_bounds.values())
+    pair_bound = token_bound * token_bound
+
+    family_rows = sum(item.rows for item in player_rows)
+    trained_total = sum(item.rows for item in trained_rows)
+    action_total = sum(item.rows for item in action_rows)
+    auto_pack = max(1, min(batch_size, 64))
+    family_pack = min(workload.rollout_microbatch or auto_pack, family_rows)
+    completion_pack = min(
+        workload.completion_microbatch or auto_pack,
+        leaf_cap,
+    )
+    learner_pack = min(
+        workload.learner_microbatch or batch_size,
+        trained_total,
+    )
+    chance_pack = min(family_pack * beta_max, family_rows + leaf_cap)
+    topology_packet = min(
+        family_pack * (beta_max + 1),
+        topology_cap + topology_edge_cap,
+    )
+
+    dtype = {
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }[precision]
+    rao_blackwell = mode.private_estimator.value == "rao_blackwell"
+    family_workspace = sequential_family_workspace_row_bytes(
+        geometry, int(model.m_raise)
+    )
+    chance_workspace = _chance_frontier_row_bytes(geometry, rao_blackwell=rao_blackwell)
+    completion_workspace = _completion_workspace_row_bytes(
+        geometry,
+        rao_blackwell=rao_blackwell,
+        completion_samples=completion_samples,
+    )
+    learner_workspace = _learner_workspace_row_bytes(
+        geometry,
+        d_model=int(model.d_model),
+        n_layers_pre=int(model.n_layers_pre),
+        n_layers_post=int(model.n_layers_post),
+        model_dtype=dtype,
+        token_bound=token_bound,
+        action_width=action_width,
+    )
+    movement_scratch = _align(
+        64 * workload.replicas * (12 * topology_cap + 4 * topology_edge_cap + leaf_cap)
+        + 4 * len(partitions.outputs) ** 2 * geometry.private_hands
+    )
+    library_workspace = _CUBLAS_WORKSPACE_BYTES + (
+        rb_conversion_library_workspace_bytes(
+            geometry.private_hands, geometry.private_classes
+        )
+        if rao_blackwell
+        else 0
+    )
+
+    manifest = CapacityManifest(
+        geometry=ExecutionGeometry(
+            geometry.players,
+            geometry.player_node_bound,
+            token_bound,
+            pair_bound,
+        ),
+        root_count=workload.roots,
+        n_replica=workload.replicas,
+        beta_max=beta_max,
+        player_node_cap=player_rows,
+        trained_player_cap=trained_rows,
+        action_cap=action_rows,
+        folded_range_cap=folded_rows,
+        leaf_cap=leaf_cap,
+        topology_cap=topology_cap,
+        topology_edge_cap=topology_edge_cap,
+        family_pack_cap=family_pack,
+        chance_frontier_cap=chance_pack,
+        completion_pack_cap=completion_pack,
+        learner_sigma_pack_cap=learner_pack,
+        learner_action_pack_cap=(
+            learner_pack
+            if not mode.rollout_mode.is_branched
+            else min(action_total, learner_pack * beta_max)
+        ),
+        topology_packet_cap=topology_packet,
+        target_arena_cap=target_arena_cap,
+        movement_scratch_bytes=movement_scratch,
+        library_workspace_bytes=library_workspace,
+        evaluator_workspace_bytes=0,
+        memory_guard_bytes=workload.reserve_bytes,
+        hardware=HardwareLimits(
+            total_memory_bytes=total_memory,
+            memory_budget_bytes=total_memory,
+            training_max_tokens=learner_pack * token_bound,
+            training_max_token_pairs=learner_pack * pair_bound,
+            query_chunk_size=token_bound,
+        ),
+        required_external=ExternalWorkspaceBounds(0, 0),
+    )
+    layout = PhysicalLayout(
+        model_input_shapes=tuple(
+            NamedShape(name, (geometry.model_input_width(name),))
+            for name in input_names
+        ),
+        player_count=geometry.players,
+        stratum_count=geometry.players,
+        evaluator_private_width=(geometry.private_hands if rao_blackwell else 1),
+        family_workspace_row_bytes=family_workspace,
+        chance_frontier_row_bytes=chance_workspace,
+        completion_workspace_row_bytes=completion_workspace,
+        learner_sigma_workspace_row_bytes=learner_workspace,
+        learner_action_workspace_row_bytes=learner_workspace,
+        topology_packet_row_bytes=_align(95, 8),
+        reference_cache_bytes=workload.reference_cache_bytes,
+        field_alignment=FIELD_ALIGNMENT,
+        model_dtype=dtype,
+        opaque_fields=(
+            SoAField("leaf_public_state", torch.uint8, (5,), FIELD_ALIGNMENT, 255),
+            SoAField(
+                "leaf_private_profile",
+                torch.int32,
+                (geometry.players,),
+                FIELD_ALIGNMENT,
+                -1,
+            ),
+        ),
+    )
+    return CompiledCapacity(
+        manifest,
+        layout,
+        total_memory,
+        MappingProxyType(
+            {
+                "schema": CAPACITY_DERIVATION_VERSION,
+                "geometry": "NLHEGeometry",
+                "tokens": "max_policy_partition_sequence_tokens",
+                "forest": "beta_bounded_forest_v1",
+                "best_response": "branched_full_or_sequential_symmetric_bound_v1",
+                "workspace": "implementation_concurrent_tensors_v1",
+                "device_memory": "torch.cuda.get_device_properties",
+            }
+        ),
+    )
+
+
+__all__ = [
+    "CAPACITY_DERIVATION_VERSION",
+    "CompiledCapacity",
+    "WorkloadSpec",
+    "compile_capacity",
+]

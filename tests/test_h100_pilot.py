@@ -30,27 +30,19 @@ def test_h100_plan_keeps_batch_fixed_and_sweeps_replicas() -> None:
     assert plan["production_precision"] == "bf16"
     for mode in ("normal", "rb"):
         scaling = [
-            arm
-            for arm in arms
-            if arm.mode == mode and arm.stage == "replica_scaling"
+            arm for arm in arms if arm.mode == mode and arm.stage == "replica_scaling"
         ]
         assert tuple(arm.replicas for arm in scaling) == REPLICA_COUNTS
         for arm in scaling:
             mapping = pilot_config_mapping(arm, output_dir="/tmp/pilot")
             scientific = mapping["scientific"]
-            execution = mapping["execution"]
-            assert scientific["schedule"] == {
-                "batch_size": 256,
-                "epochs": 1,
-                "gradient_steps": 116,
-            }
-            assert scientific["precision"] == {"name": "bf16"}
-            assert execution["layout"]["model_dtype"] == "bfloat16"
-            assert execution["manifest"]["n_replica"] == arm.replicas
-            assert (
-                execution["manifest"]["hardware"]["memory_budget_bytes"]
-                == H100_MEMORY_BUDGET_BYTES
-            )
+            execution = mapping["run"]["execution"]
+            assert scientific["schedule"] == {"batch_size": 256, "steps": 116}
+            assert execution["precision"] == "bf16"
+            assert "manifest" not in mapping["run"]
+            resolved = load_config_mapping(mapping)
+            assert resolved.execution.layout.model_dtype == torch.bfloat16
+            assert resolved.execution.manifest.n_replica == arm.replicas
 
 
 def test_local_smoke_changes_only_execution_scale_and_precision() -> None:
@@ -69,7 +61,6 @@ def test_local_smoke_changes_only_execution_scale_and_precision() -> None:
         arm,
         output_dir="/tmp/pilot",
         hardware="local",
-        local_total_memory_bytes=11_346_575_360,
     )
     scientific = mapping["scientific"]
     assert scientific["game"] == {
@@ -78,14 +69,11 @@ def test_local_smoke_changes_only_execution_scale_and_precision() -> None:
         "rank_count": 13,
     }
     assert scientific["model"]["d_model"] == 128
-    assert scientific["schedule"] == {
-        "batch_size": 8,
-        "epochs": 1,
-        "gradient_steps": 1,
-    }
-    assert scientific["precision"] == {"name": "fp32"}
-    assert scientific["completion"]["n_samples"] == 4
-    assert set(mapping["execution"]["manifest"]["action_cap"]) == {
+    assert scientific["schedule"] == {"batch_size": 8, "steps": 1}
+    assert mapping["run"]["execution"]["precision"] == "fp32"
+    assert scientific["completion"]["samples"] == 4
+    resolved = load_config_mapping(mapping)
+    assert set(resolved.execution.manifest.partition_rows("action_cap")) == {
         "pre",
         "post_2",
     }
@@ -144,7 +132,6 @@ def test_replica_selection_requires_a_material_gain() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_model_only_initializer_reaches_every_replica_and_reference() -> None:
-    total = int(torch.cuda.get_device_properties(0).total_memory)
     source_arm = Arm(
         "nlhe_hu_32bb_normal_initializer_source",
         "local_smoke",
@@ -160,7 +147,6 @@ def test_model_only_initializer_reaches_every_replica_and_reference() -> None:
         source_arm,
         output_dir="/tmp/nlhe_hu_32bb_normal_initializer_source",
         hardware="local",
-        local_total_memory_bytes=total,
     )
     source = TrainingSession(load_config_mapping(source_config))
     try:
@@ -186,7 +172,6 @@ def test_model_only_initializer_reaches_every_replica_and_reference() -> None:
         target_arm,
         output_dir="/tmp/nlhe_hu_32bb_normal_initializer_target",
         hardware="local",
-        local_total_memory_bytes=total,
     )
     target = TrainingSession(
         load_config_mapping(target_config),
@@ -208,7 +193,6 @@ def test_model_only_initializer_reaches_every_replica_and_reference() -> None:
 def test_runtime_separates_rb_rollout_and_natural_learner_domains(
     replicas: int,
 ) -> None:
-    total = int(torch.cuda.get_device_properties(0).total_memory)
     arm = Arm(
         f"nlhe_hu_32bb_rb_runtime_domain_k{replicas}",
         "local_smoke",
@@ -225,20 +209,17 @@ def test_runtime_separates_rb_rollout_and_natural_learner_domains(
             arm,
             output_dir=f"/tmp/{arm.name}",
             hardware="local",
-            local_total_memory_bytes=total,
         )
     )
     session = TrainingSession(config)
     try:
-        assert {
-            operation.__name__ for operation in session.model_operations
-        } == {"rb_learner_operation"}
-        assert {
-            operation.__name__ for operation in session.reference_operations
-        } == {"rb_learner_operation"}
+        assert {operation.__name__ for operation in session.model_operations} == {
+            "rb_learner_operation"
+        }
+        assert {operation.__name__ for operation in session.reference_operations} == {
+            "rb_learner_operation"
+        }
         session.step()
-        assert tuple(state.iteration for state in session.run_states) == (
-            1,
-        ) * replicas
+        assert tuple(state.iteration for state in session.run_states) == (1,) * replicas
     finally:
         session.close()

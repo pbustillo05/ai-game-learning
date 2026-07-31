@@ -62,6 +62,7 @@ from pbg.games.poker.queued.hooks import (
     PokerStateMachine,
     sampled_partitions,
 )
+from pbg.games.poker.queued.operations import balanced_response_roles
 from tests.iteration_support import (
     BranchedRecoveryHarness,
     EngineDrivenBranchedAttempt,
@@ -273,7 +274,7 @@ def test_phase7_config_is_closed_for_exactly_four_sampled_modes(
     config = BranchedModeConfig.from_mapping(value)
     assert config.scientific_mapping()["mode"] == value["mode"]
     bad = dict(value)
-    bad["completion"] = {"n_samples": 2, "strata": {}}
+    bad["completion"] = {"n_samples": 2, "unexpected": {}}
     with pytest.raises(ValueError, match="root.completion"):
         BranchedModeConfig.from_mapping(bad)
     if rollout == "branched.KKT":
@@ -1455,8 +1456,52 @@ def test_multiplayer_best_response_root_uses_frozen_opponent_model() -> None:
         lambda_=0.95,
     ).run(iteration=0)
     assert frozen.rollout_owners
-    assert int(frozen.rollout_owners[0][0]) == 3
-    assert not learned.rollout_owners or int(learned.rollout_owners[0][0]) != 3
+    role = int(
+        balanced_response_roles(
+            torch.tensor([0], dtype=torch.int64, device=device),
+            players=geometry.players,
+            seed=703,
+            iteration=0,
+            retry_epoch=0,
+            lane=0,
+        )[0]
+    )
+    assert int(frozen.rollout_owners[0][0]) != role
+    assert not learned.rollout_owners or int(learned.rollout_owners[0][0]) == role
+
+
+@CUDA
+@pytest.mark.parametrize("players", range(2, 7))
+@pytest.mark.parametrize("roots", (1, 2, 5, 13))
+def test_best_response_roles_are_maximally_even_and_logical(
+    players: int, roots: int
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    logical = torch.arange(91, 91 + roots, dtype=torch.int64, device=device)
+    roles = balanced_response_roles(
+        logical,
+        players=players,
+        seed=1701,
+        iteration=4,
+        retry_epoch=2,
+        lane=1,
+    )
+    counts = torch.bincount(roles.long(), minlength=players)
+    quotient, remainder = divmod(roots, players)
+    assert int(counts.min()) == quotient
+    assert int(counts.max()) == quotient + int(remainder > 0)
+    assert int(counts.eq(quotient + 1).sum()) == remainder
+
+    physical = torch.randperm(roots, device=device)
+    permuted = balanced_response_roles(
+        logical[physical],
+        players=players,
+        seed=1701,
+        iteration=4,
+        retry_epoch=2,
+        lane=1,
+    )
+    torch.testing.assert_close(permuted, roles[physical])
 
 
 @CUDA

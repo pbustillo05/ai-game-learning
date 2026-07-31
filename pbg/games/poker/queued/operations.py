@@ -31,6 +31,7 @@ from pbg.core.learner import (
     PolicyOperation,
     compact_best_response_evaluation,
 )
+from pbg.core.rollout import DrawPurpose, logical_rng_keys
 from pbg.core.storage import DeviceFailure
 from pbg.core.targets import ConversionMap, TargetAlgebra
 from pbg.games.poker.model.capacity import (
@@ -59,6 +60,50 @@ from pbg.games.poker.queued.replica import PokerReplicaInference
 
 class PokerOperationsError(RuntimeError):
     """A semantic poker operation violated its closed contract."""
+
+
+def balanced_response_roles(
+    logical_roots: Tensor,
+    *,
+    players: int,
+    seed: int,
+    iteration: int,
+    retry_epoch: int,
+    lane: int,
+) -> Tensor:
+    """Assign maximally even, logically randomized BR seats.
+
+    A logical-root interval receives a single RNG-selected seat permutation.
+    Cycling through that permutation gives every seat ``floor(N/P)`` roots and
+    gives the remainder to distinct seats without replacement. Role identity
+    follows logical roots and is invariant to physical row order.
+    """
+
+    if logical_roots.dtype != torch.int64 or logical_roots.ndim != 1:
+        raise TypeError("logical roots must be a one-dimensional int64 tensor")
+    if logical_roots.numel() == 0:
+        raise ValueError("logical roots must be nonempty")
+    if isinstance(players, bool) or not isinstance(players, int) or players < 2:
+        raise ValueError("players must be an integer of at least two")
+    base = logical_roots.amin()
+    ordinal = logical_roots - base
+    if int(ordinal.amax()) + 1 != logical_roots.numel() or int(
+        torch.unique(logical_roots).numel()
+    ) != logical_roots.numel():
+        raise ValueError("logical roots must form one contiguous interval")
+    seats = torch.arange(players, dtype=torch.int64, device=logical_roots.device)
+    keys = logical_rng_keys(
+        seed=seed,
+        iteration=iteration,
+        root=base.expand(players),
+        path=seats,
+        draw=0,
+        purpose=DrawPurpose.ROLE_SELECTION,
+        lane=lane,
+        retry_epoch=retry_epoch,
+    )
+    permutation = torch.argsort(keys, stable=True)
+    return permutation[ordinal.remainder(players)].to(torch.uint8)
 
 
 class PokerOperations:
@@ -448,9 +493,14 @@ class PokerOperations:
             request.plan.mode.training_regime
             is TrainingRegime.BEST_RESPONSE
         ):
-            values["role_selector"] = logical.remainder(
-                self.geometry.players
-            ).to(torch.uint8)
+            values["role_selector"] = balanced_response_roles(
+                logical,
+                players=self.geometry.players,
+                seed=self.seed,
+                iteration=request.iteration,
+                retry_epoch=request.retry_epoch,
+                lane=request.lane,
+            )
         frontier_cost = None
         if request.plan.mode.rollout_mode.is_branched:
             values.update(

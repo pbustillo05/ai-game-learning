@@ -1,3 +1,4 @@
+kind: nlhe_run_v1
 scientific:
   mode:
     training_regime: self_play
@@ -10,30 +11,32 @@ scientific:
   model:
     d_model: 128
     n_heads: 4
-    n_layers_pre: 4
-    n_layers_post: 6
-    m_raise: 2
-    s_min: 0.02
-    max_players: 2
+    layers:
+      pre: 4
+      post: 6
+    raises:
+      components: 2
+      minimum_scale: 0.02
     class_embedding_dim: 32
-    ffn_hidden: null
     folder_beta_rank: 0
     folder_line_dim: 8
     epsilon: 1.0e-08
-  loss:
-    clip_epsilon: 0.2
-    value_clip_epsilon: 0.2
-    value_coefficient: 0.125
-    entropy_coefficient: 0.025
-    reference_kl_coefficient: 0.05
-    value_loss: clipped
-    entropy_schedule: linear_decay
-    entropy_decay_iterations: 500
-    trace_coefficient: 0.0
-    cost_coefficient: 0.0
-    trace_epsilon: 1.0e-08
+  objective:
+    policy_clip: 0.2
+    value:
+      kind: clipped
+      epsilon: 0.2
+      coefficient: 0.125
+    entropy:
+      kind: linear_decay
+      coefficient: 0.025
+      iterations: 500
+    reference_kl:
+      coefficient: 0.05
+      refresh:
+        effective_hands: 172800000.0
   optimizer:
-    name: adamw
+    kind: adamw
     learning_rate: 5.0e-05
     beta1: 0.9
     beta2: 0.999
@@ -42,89 +45,27 @@ scientific:
     grad_clip: 0.5
   schedule:
     batch_size: 256
-    epochs: 1
-    gradient_steps: 116
-  precision:
-    name: bf16
-  reference:
-    interval_iterations: null
-    interval_effective_hands: 172800000.0
-    cache_outputs: false
+    steps: 116
   lambda: 0.95
-  root_count: 512
-  root_count_minimum: 512
+  completion:
+    samples: 1024
+run:
   seed: 104830
   reproducibility: throughput
   utility: stack_normalized
-  completion:
-    n_samples: 1024
-    strata: default
-execution:
-  device: cuda:0
+  workload:
+    roots: 512
+    replicas: 8
+  execution:
+    device: cuda:0
+    precision: bf16
+    attention: sdpa
+    memory:
+      reserve_bytes: 10737418240
+    microbatch:
+      rollout_rows: 84
+      completion_rows: 256
+      learner_rows: 84
   iterations: 1
   checkpoint_every: 1
   output_dir: runs/experiments/nlhe_hu_32bb_h100_pilot/runtime/nlhe_hu_32bb_rb_h100_replica_k8
-  run_id: nlhe_hu_32bb_rb_h100_replica_k8
-  distributed: false
-  frozen_checkpoint: null
-  attention_backend: sdpa
-  query_chunk_size: 128
-  manifest:
-    model_token_bound: 2555
-    model_token_pair_bound: 6528025
-    root_count: 512
-    n_replica: 8
-    beta_max: 1
-    player_node_cap:
-      pre: 4096
-      post_2: 16384
-    trained_player_cap:
-      pre: 4096
-      post_2: 16384
-    action_cap:
-      pre: 4096
-      post_2: 16384
-    folded_range_cap:
-      pre: 512
-      post: 512
-    leaf_cap: 1024
-    topology_cap: 21504
-    topology_edge_cap: 20992
-    family_pack_cap: 84
-    chance_frontier_cap: 168
-    completion_pack_cap: 256
-    learner_sigma_pack_cap: 84
-    learner_action_pack_cap: 84
-    topology_packet_cap: 336
-    target_arena_cap: 22528
-    movement_scratch_bytes: 268435456
-    library_workspace_bytes: 9306112
-    evaluator_workspace_bytes: 536870912
-    memory_guard_bytes: 10737418240
-    hardware:
-      total_memory_bytes: 80000000000
-      memory_budget_bytes: 75161927680
-      training_max_tokens: 214620
-      training_max_token_pairs: 548354100
-      query_chunk_size: 128
-    required_external:
-      library_bytes: 0
-      evaluator_bytes: 0
-  layout:
-    model_input_shapes:
-      pre:
-      - 3100
-      post_2:
-      - 3100
-    player_count: 2
-    stratum_count: 2
-    evaluator_private_width: 1326
-    family_workspace_row_bytes: 203672
-    chance_frontier_row_bytes: 131072
-    completion_workspace_row_bytes: 17264
-    learner_sigma_workspace_row_bytes: 33554432
-    learner_action_workspace_row_bytes: 33554432
-    topology_packet_row_bytes: 128
-    reference_cache_bytes: 0
-    field_alignment: 64
-    model_dtype: bfloat16

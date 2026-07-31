@@ -252,7 +252,7 @@ class CapacityManifest:
             "evaluator_workspace_bytes",
         ):
             _nonnegative_int(getattr(self, name), name)
-        _positive_int(self.memory_guard_bytes, "memory_guard_bytes")
+        _nonnegative_int(self.memory_guard_bytes, "memory_guard_bytes")
         if self.library_workspace_bytes < self.required_external.library_bytes:
             raise CapacityError("library workspace does not cover its versioned bound")
         if self.evaluator_workspace_bytes < self.required_external.evaluator_bytes:
@@ -658,10 +658,8 @@ def _validate_manifest(
         raise CapacityError("game geometry exceeds the hardware token-pair limit")
     properties = torch.cuda.get_device_properties(device)
     actual_total = int(properties.total_memory)
-    if manifest.hardware.total_memory_bytes > actual_total:
-        raise CapacityError(
-            "hardware profile declares more memory than the selected CUDA device"
-        )
+    if manifest.hardware.total_memory_bytes != actual_total:
+        raise CapacityError("resolved manifest device memory is stale")
     if manifest.hardware.memory_budget_bytes > actual_total:
         raise CapacityError("memory budget exceeds selected CUDA device memory")
 

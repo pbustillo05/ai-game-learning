@@ -98,17 +98,13 @@ def estimate_update_variance(
     del base
     samples: list[dict[str, object]] = []
     base_scientific = cfg.scientific_mapping()
+    base_source = cfg.source_mapping()
     for repeat in range(repeats):
-        scientific = copy.deepcopy(base_scientific)
-        scientific["seed"] = (
-            int(base_scientific["seed"]) + repeat * seed_stride
+        source = copy.deepcopy(base_source)
+        source["run"]["seed"] = (
+            int(base_source["run"]["seed"]) + repeat * seed_stride
         )
-        local = load_config_mapping(
-            {
-                "scientific": scientific,
-                "execution": cfg.execution.mapping(),
-            }
-        )
+        local = load_config_mapping(source)
         session = TrainingSession(local)
         session.modules.load_state_dict(model_state)
         session.reference_modules.load_state_dict(reference_model_state)
@@ -144,7 +140,7 @@ def estimate_update_variance(
         samples.append(
             {
                 "repeat": repeat,
-                "scientific_seed": scientific["seed"],
+                "scientific_seed": source["run"]["seed"],
                 "lanes": lane_rows,
                 "logical_work": tuple(
                     dict(state.logical_work) for state in session.run_states

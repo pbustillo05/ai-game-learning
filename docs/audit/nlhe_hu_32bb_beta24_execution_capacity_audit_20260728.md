@@ -4,7 +4,7 @@
 
 The guarded fixed-branched beta-2.4 workload is stable in the measured
 32-seed sample with the execution manifest now written to
-`configs/experiments/nlhe_hu_32bb_branched_fixed_beta_testing.yaml`.
+`configs/profiles/nlhe_hu_32bb_branching_profile_v1.yaml`.
 
 The recommended settings are:
 

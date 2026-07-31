@@ -116,7 +116,6 @@ def _invoke_arm(
     configs_directory: Path,
     initializer: Path,
     hardware: str,
-    local_total_memory_bytes: int | None,
     timeout_seconds: float | None,
 ) -> dict[str, object]:
     config = configs_directory / f"{arm.name}.yaml"
@@ -126,7 +125,6 @@ def _invoke_arm(
         config,
         output_dir=directory / "runtime" / arm.name,
         hardware=hardware,
-        local_total_memory_bytes=local_total_memory_bytes,
     )
     command = [
         sys.executable,
@@ -228,7 +226,6 @@ def _run(args: argparse.Namespace) -> None:
                 configs_directory=configs_directory,
                 initializer=initializer_paths[arm.mode],
                 hardware="h100",
-                local_total_memory_bytes=None,
                 timeout_seconds=remaining,
             )
         except (OSError, subprocess.SubprocessError, PilotError) as error:
@@ -310,7 +307,6 @@ def _local_smoke(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise PilotError("local smoke requires CUDA")
     device = torch.device("cuda:0")
-    total = int(torch.cuda.get_device_properties(device).total_memory)
     directory = Path(args.directory)
     configs_directory = Path(args.configs_directory)
     initializer_paths = {
@@ -333,7 +329,6 @@ def _local_smoke(args: argparse.Namespace) -> None:
                     configs_directory=configs_directory,
                     initializer=initializer_paths[arm.mode],
                     hardware="local",
-                    local_total_memory_bytes=total,
                     timeout_seconds=args.timeout_minutes * 60.0,
                 )["summary"]
             )

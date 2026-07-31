@@ -66,14 +66,9 @@ def test_public_config_is_one_closed_three_axis_composition() -> None:
         "pre": (240,),
         "post_2": (448,),
     }
-    raw = {
-        "scientific": config.scientific_mapping(),
-        "execution": {
-            **config.execution.mapping(),
-            "frozen_checkpoint": None,
-        },
-    }
-    assert load_config_mapping(raw) == config
+    assert load_config_mapping(config.source_mapping()).source_mapping() == (
+        config.source_mapping()
+    )
 
 
 def test_run_state_requires_the_exact_nested_logical_work_schema() -> None:
@@ -99,9 +94,7 @@ def test_every_accepted_root_reaches_the_final_core() -> None:
     for root in ROOTS:
         reached = reachable_modules(graph, root)
         assert any(
-            module == "pbg.core"
-            or module.startswith("pbg.core.")
-            for module in reached
+            module == "pbg.core" or module.startswith("pbg.core.") for module in reached
         ), root
 
 
@@ -161,9 +154,7 @@ def test_inference_export_accepts_only_queued_schema(tmp_path: Path) -> None:
                 },
                 "recovered_overflow": False,
                 "overflow_recoveries": [],
-                "metrics_prefix": [
-                    {"iteration": value} for value in range(3)
-                ],
+                "metrics_prefix": [{"iteration": value} for value in range(3)],
                 "branch_controller_state": None,
                 "cost_safeguard_state": None,
             },
@@ -189,7 +180,6 @@ def test_inference_export_accepts_only_queued_schema(tmp_path: Path) -> None:
     torch.save(payload, permissive)
     with pytest.raises(RuntimeError, match="scientific configuration"):
         load_inference_source(permissive)
-
 
 
 def test_distributed_manifest_is_strict_and_content_addressed(
@@ -230,11 +220,13 @@ def test_real_replica_consumer_and_reference_cadence_resume(
     tmp_path: Path,
 ) -> None:
     raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
-    raw["execution"]["manifest"]["n_replica"] = 2
-    raw["execution"]["output_dir"] = str(tmp_path / "replica")
-    raw["execution"]["run_id"] = "nlhe_hu_8bb_normal_replica_test"
-    raw["scientific"]["reference"]["interval_iterations"] = None
-    raw["scientific"]["reference"]["interval_effective_hands"] = 0.5
+    raw["run"]["workload"]["replicas"] = 2
+    raw["run"]["output_dir"] = str(tmp_path / "replica")
+    raw["run"]["run_id"] = "nlhe_hu_8bb_normal_replica_test"
+    raw["scientific"]["objective"]["reference_kl"] = {
+        "coefficient": 0.05,
+        "refresh": {"effective_hands": 0.5},
+    }
     config = load_config_mapping(raw)
     session = TrainingSession(config)
     result = session.step()
@@ -249,12 +241,8 @@ def test_real_replica_consumer_and_reference_cadence_resume(
         assert metrics["kl_ref_effective_hands_rollout_overshoot"] > 0.0
         assert metrics["kl_ref_effective_hands_rollout_after"] == 0.0
         assert metrics["reference_iteration_next"] == 1
-        assert metrics["per_rank_lane_logical_work"][0][lane] == (
-            state.logical_work
-        )
-        assert metrics["global_lane_logical_work"][lane] == (
-            state.logical_work
-        )
+        assert metrics["per_rank_lane_logical_work"][0][lane] == (state.logical_work)
+        assert metrics["global_lane_logical_work"][lane] == (state.logical_work)
         assert metrics["global_logical_work"]["trajectories"] == 2
     session.reference_states[0].reference_iteration = 7
     session.reference_states[0].effective_hands_rollout = 13.5
@@ -282,9 +270,9 @@ def test_real_replica_consumer_and_reference_cadence_resume(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_target_initialization_and_metrics_suffix_resume(tmp_path: Path) -> None:
     raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
-    raw["execution"]["iterations"] = 2
-    raw["execution"]["output_dir"] = str(tmp_path / "ordinary")
-    raw["execution"]["run_id"] = "nlhe_hu_8bb_normal_resume_test"
+    raw["run"]["iterations"] = 2
+    raw["run"]["output_dir"] = str(tmp_path / "ordinary")
+    raw["run"]["run_id"] = "nlhe_hu_8bb_normal_resume_test"
     ordinary = load_config_mapping(raw)
     session = TrainingSession(ordinary)
     target = tmp_path / "target.pt"
@@ -292,21 +280,19 @@ def test_target_initialization_and_metrics_suffix_resume(tmp_path: Path) -> None
 
     response_raw = copy.deepcopy(raw)
     response_raw["scientific"]["mode"]["training_regime"] = "best_response"
-    response_raw["scientific"]["frozen_profile"] = {
-        "sha256": sha256_file(target)
-    }
     response_raw["scientific"]["response_initialization"] = "target"
-    response_raw["execution"]["frozen_checkpoint"] = str(target)
-    response_raw["execution"]["iterations"] = 1
+    response_raw["run"]["frozen"] = {
+        "path": str(target),
+        "sha256": sha256_file(target),
+    }
+    response_raw["run"]["iterations"] = 1
     response = TrainingSession(load_config_mapping(response_raw))
     target_payload = torch.load(target, map_location="cpu", weights_only=False)
     for name, value in response.modules.lane_module(0).state_dict().items():
         torch.testing.assert_close(value.cpu(), target_payload["model"][name])
 
     session.run()
-    checkpoint_one = (
-        ordinary.execution.output_dir / "checkpoint_00000001.pt"
-    )
+    checkpoint_one = ordinary.execution.output_dir / "checkpoint_00000001.pt"
     metrics = ordinary.execution.output_dir / "metrics.jsonl"
     before = [
         json.loads(line)["iteration"]
@@ -320,16 +306,15 @@ def test_target_initialization_and_metrics_suffix_resume(tmp_path: Path) -> None
     ]
     assert after == [0, 1]
     assert (
-        ordinary.execution.output_dir
-        / "metrics.jsonl.before_resume_0000001.bak"
+        ordinary.execution.output_dir / "metrics.jsonl.before_resume_0000001.bak"
     ).is_file()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_end_to_end_br_and_variance_consumers(tmp_path: Path) -> None:
     raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
-    raw["execution"]["output_dir"] = str(tmp_path / "target")
-    raw["execution"]["run_id"] = "nlhe_hu_8bb_normal_br_target"
+    raw["run"]["output_dir"] = str(tmp_path / "target")
+    raw["run"]["run_id"] = "nlhe_hu_8bb_normal_br_target"
     target_config = load_config_mapping(raw)
     target_checkpoint = tmp_path / "target.pt"
     target_session = TrainingSession(target_config)
@@ -345,19 +330,18 @@ def test_end_to_end_br_and_variance_consumers(tmp_path: Path) -> None:
         "rollout_mode": "sequential",
         "private_estimator": "rao_blackwell",
     }
-    probe_raw["scientific"]["completion"] = {
-        "n_samples": 4,
-        "strata": "default",
-    }
-    probe_raw["scientific"]["frozen_profile"] = {"sha256": target_hash}
+    probe_raw["scientific"]["completion"] = {"samples": 4}
     probe_raw["scientific"]["response_initialization"] = "target"
     probe_raw["scientific"]["probe"] = {
         "target_sha256": target_hash,
         "initial_model_sha256": initial_hash,
     }
-    probe_raw["execution"]["frozen_checkpoint"] = str(target_checkpoint)
-    probe_raw["execution"]["output_dir"] = str(tmp_path / "probe")
-    probe_raw["execution"]["run_id"] = "nlhe_hu_8bb_rb_br_probe"
+    probe_raw["run"]["frozen"] = {
+        "path": str(target_checkpoint),
+        "sha256": target_hash,
+    }
+    probe_raw["run"]["output_dir"] = str(tmp_path / "probe")
+    probe_raw["run"]["run_id"] = "nlhe_hu_8bb_rb_br_probe"
     probe_checkpoint = tmp_path / "probe.pt"
     TrainingSession(load_config_mapping(probe_raw)).checkpoint(probe_checkpoint)
     probe_artifact = tmp_path / "probe_inference.pt"
@@ -394,9 +378,7 @@ def test_paired_br_chance_address_is_independent_of_action_path() -> None:
         def new_hand(self, _button: int) -> dict[str, int]:
             return {"phase": 0}
 
-        def private_cards(
-            self, _hand: object, seat: int
-        ) -> tuple[int, int]:
+        def private_cards(self, _hand: object, seat: int) -> tuple[int, int]:
             return (seat, seat + 2)
 
         def is_terminal(self, hand: dict[str, int]) -> bool:
@@ -408,9 +390,7 @@ def test_paired_br_chance_address_is_independent_of_action_path() -> None:
         def actor(self, _hand: object) -> int:
             return 0
 
-        def policy_table(
-            self, _hand: object
-        ) -> tuple[tuple[Action], torch.Tensor]:
+        def policy_table(self, _hand: object) -> tuple[tuple[Action], torch.Tensor]:
             return (Action(),), torch.ones((4, 1))
 
         def private_hand_id(self, _hand: object, _actor: int) -> int:
@@ -447,14 +427,17 @@ def test_paired_br_chance_address_is_independent_of_action_path() -> None:
 
     probe = Session()
     target = Session()
-    assert _play_one(
-        probe,  # type: ignore[arg-type]
-        target,  # type: ignore[arg-type]
-        trajectory_id=5,
-        probe_seat=0,
-        seed=17,
-        mixed=True,
-    ) == 0.0
+    assert (
+        _play_one(
+            probe,  # type: ignore[arg-type]
+            target,  # type: ignore[arg-type]
+            trajectory_id=5,
+            probe_seat=0,
+            seed=17,
+            mixed=True,
+        )
+        == 0.0
+    )
     assert target.deal_addresses == [0]
     assert probe.deal_addresses == [0]
 
@@ -490,7 +473,7 @@ def test_benchmark_reuses_process_workspaces_across_repeats(
     tmp_path: Path,
 ) -> None:
     raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
-    raw["execution"]["output_dir"] = str(tmp_path / "benchmark")
+    raw["run"]["output_dir"] = str(tmp_path / "benchmark")
     cfg = load_config_mapping(raw)
     report = benchmark_training(cfg, warmup=1, repeats=3)
     peaks = [sample["peak_allocated_bytes"] for sample in report["samples"]]

@@ -51,7 +51,7 @@ CUDA = pytest.mark.skipif(
 def _config(regime: str, rollout: str) -> dict[str, object]:
     result = _scientific_config(regime, rollout)
     result["mode"]["private_estimator"] = "rao_blackwell"
-    result["completion"] = {"n_samples": 4, "strata": "default"}
+    result["completion"] = {"n_samples": 4}
     return result
 
 

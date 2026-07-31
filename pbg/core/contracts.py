@@ -493,7 +493,7 @@ def _build_schema(
     if response:
         config.extend(("frozen_profile", "response_initialization"))
     if not sampled:
-        config.extend(("completion_samples", "completion_strata"))
+        config.append("completion_samples")
     if branched:
         config.extend(("beta_max", "minimum_tree_size", "safe_tree_size"))
         if rollout is RolloutMode.BRANCHED_FIXED:

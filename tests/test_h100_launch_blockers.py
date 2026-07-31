@@ -10,13 +10,10 @@ from pbg.config import load_config_mapping
 from pbg.games.poker.queued.hooks import QueuedPokerError, SequentialPokerHooks
 from pbg.h100_pilot import (
     Arm,
-    cumulative_folded_range_rows,
     pilot_config_mapping,
 )
 
-CUDA = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA is required"
-)
+CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
 @pytest.mark.parametrize(
@@ -30,14 +27,10 @@ def test_route_casts_only_model_input_at_bf16_storage_boundary(
     device_type: str,
 ) -> None:
     device = torch.device(
-        "cpu"
-        if device_type == "cpu"
-        else f"cuda:{torch.cuda.current_device()}"
+        "cpu" if device_type == "cpu" else f"cuda:{torch.cuda.current_device()}"
     )
     destination = {
-        "model_input": torch.zeros(
-            (2, 2, 3), dtype=torch.bfloat16, device=device
-        )
+        "model_input": torch.zeros((2, 2, 3), dtype=torch.bfloat16, device=device)
     }
     source = {
         "model_input": torch.tensor(
@@ -77,12 +70,8 @@ def test_route_keeps_every_other_dtype_mismatch_fatal(
     destination_dtype: torch.dtype,
 ) -> None:
     device = torch.device("cuda", torch.cuda.current_device())
-    destination = {
-        name: torch.zeros((1, 1), dtype=destination_dtype, device=device)
-    }
-    source = {
-        name: torch.ones((1, 1), dtype=source_dtype, device=device)
-    }
+    destination = {name: torch.zeros((1, 1), dtype=destination_dtype, device=device)}
+    source = {name: torch.ones((1, 1), dtype=source_dtype, device=device)}
 
     with pytest.raises(QueuedPokerError, match="has dtype"):
         SequentialPokerHooks._gather_route(
@@ -94,7 +83,7 @@ def test_route_keeps_every_other_dtype_mismatch_fatal(
 
 
 @pytest.mark.parametrize("mode", ("normal", "rb"))
-def test_512_root_configs_size_folded_ranges_cumulatively(mode: str) -> None:
+def test_512_root_configs_compile_all_capacity_from_workload(mode: str) -> None:
     arm = Arm(
         f"nlhe_hu_32bb_{mode}_h100_roots512",
         "geometry",
@@ -106,31 +95,31 @@ def test_512_root_configs_size_folded_ranges_cumulatively(mode: str) -> None:
 
     mapping = pilot_config_mapping(arm, output_dir="/tmp/h100-roots512")
 
-    assert mapping["execution"]["manifest"]["folded_range_cap"] == {
-        "pre": 512,
-        "post": 512,
+    assert "manifest" not in mapping["run"]
+    config = load_config_mapping(mapping)
+    assert config.execution.manifest.family_pack_cap == 84
+    assert config.execution.manifest.partition_rows("folded_range_cap") == {
+        "pre": 1,
+        "post": 1,
     }
-    assert mapping["execution"]["manifest"]["family_pack_cap"] == 84
-
-
-def test_multiplayer_folded_range_bound_covers_every_possible_folder() -> None:
-    assert cumulative_folded_range_rows(512, 2) == 512
-    assert cumulative_folded_range_rows(512, 6) == 2560
 
 
 @pytest.mark.parametrize("mode", ("normal", "rb"))
-def test_checked_in_512_root_k1_config_uses_cumulative_folded_storage(
+def test_checked_in_512_root_k1_config_has_no_authored_capacity(
     mode: str,
 ) -> None:
-    path = Path(
-        "configs/experiments/nlhe_hu_32bb_h100_pilot"
-    ) / f"nlhe_hu_32bb_{mode}_h100_replica_k1.yaml"
+    path = (
+        Path("configs/experiments/nlhe_hu_32bb_h100_pilot")
+        / f"nlhe_hu_32bb_{mode}_h100_replica_k1.yaml"
+    )
     mapping = yaml.safe_load(path.read_text(encoding="utf-8"))
 
     config = load_config_mapping(mapping)
 
+    assert "manifest" not in mapping["run"]
+    assert "layout" not in mapping["run"]
     assert config.scientific.common.root_count == 512
     assert config.execution.manifest.partition_rows("folded_range_cap") == {
-        "pre": 512,
-        "post": 512,
+        "pre": 1,
+        "post": 1,
     }

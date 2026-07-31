@@ -15,17 +15,6 @@ import yaml
 
 from pbg.config import RootConfig, load_config_mapping
 from pbg.core.persistence import model_state_sha256, sha256_file
-from pbg.core.targets import (
-    rb_conversion_library_workspace_bytes,
-    rb_conversion_workspace_row_bytes,
-)
-from pbg.games.poker.model.capacity import (
-    max_policy_partition_sequence_tokens,
-)
-from pbg.games.poker.queued.folded import (
-    sequential_family_workspace_row_bytes,
-)
-from pbg.games.poker.queued.hooks import NLHEGeometry
 
 INITIALIZER_SCHEMA = "pbg-h100-pilot-initializer-v1"
 PLAN_SCHEMA = "pbg-h100-pilot-plan-v1"
@@ -158,9 +147,7 @@ def load_model_initializer(
 def _scientific_mapping(
     *,
     mode: str,
-    roots: int,
     completion_samples: int | None,
-    precision: str,
     batch_size: int,
     gradient_steps: int,
 ) -> dict[str, object]:
@@ -168,40 +155,38 @@ def _scientific_mapping(
         "mode": {
             "training_regime": "self_play",
             "rollout_mode": "sequential",
-            "private_estimator": (
-                "sampled" if mode == "normal" else "rao_blackwell"
-            ),
+            "private_estimator": ("sampled" if mode == "normal" else "rao_blackwell"),
         },
         "game": {"players": 2, "stack_bb": 32.0, "rank_count": 13},
         "model": {
             "d_model": 128,
             "n_heads": 4,
-            "n_layers_pre": 4,
-            "n_layers_post": 6,
-            "m_raise": 2,
-            "s_min": 0.02,
-            "max_players": 2,
+            "layers": {"pre": 4, "post": 6},
+            "raises": {"components": 2, "minimum_scale": 0.02},
             "class_embedding_dim": 32,
-            "ffn_hidden": None,
             "folder_beta_rank": 0,
             "folder_line_dim": 8,
             "epsilon": 1.0e-8,
         },
-        "loss": {
-            "clip_epsilon": 0.2,
-            "value_clip_epsilon": 0.2,
-            "value_coefficient": 0.125,
-            "entropy_coefficient": 0.025,
-            "reference_kl_coefficient": 0.05,
-            "value_loss": "clipped",
-            "entropy_schedule": "linear_decay",
-            "entropy_decay_iterations": 500,
-            "trace_coefficient": 0.0,
-            "cost_coefficient": 0.0,
-            "trace_epsilon": 1.0e-8,
+        "objective": {
+            "policy_clip": 0.2,
+            "value": {"kind": "clipped", "epsilon": 0.2, "coefficient": 0.125},
+            "entropy": {
+                "kind": "linear_decay",
+                "coefficient": 0.025,
+                "iterations": 500,
+            },
+            "reference_kl": {
+                "coefficient": 0.05,
+                "refresh": {
+                    "effective_hands": (
+                        900_000.0 if mode == "normal" else 172_800_000.0
+                    )
+                },
+            },
         },
         "optimizer": {
-            "name": "adamw",
+            "kind": "adamw",
             "learning_rate": 5.0e-5,
             "beta1": 0.9,
             "beta2": 0.999,
@@ -209,46 +194,12 @@ def _scientific_mapping(
             "weight_decay": 0.0,
             "grad_clip": 0.5,
         },
-        "schedule": {
-            "batch_size": batch_size,
-            "epochs": 1,
-            "gradient_steps": gradient_steps,
-        },
-        "precision": {"name": precision},
-        "reference": {
-            "interval_iterations": None,
-            "interval_effective_hands": (
-                900_000.0 if mode == "normal" else 172_800_000.0
-            ),
-            "cache_outputs": False,
-        },
+        "schedule": {"batch_size": batch_size, "steps": gradient_steps},
         "lambda": 0.95,
-        "root_count": roots,
-        "root_count_minimum": roots,
-        "seed": 104830,
-        "reproducibility": "throughput",
-        "utility": "stack_normalized",
     }
     if mode == "rb":
-        scientific["completion"] = {
-            "n_samples": completion_samples,
-            "strata": "default",
-        }
+        scientific["completion"] = {"samples": completion_samples}
     return scientific
-
-
-def cumulative_folded_range_rows(roots: int, players: int) -> int:
-    """Return the per-partition folded-row bound for a root batch."""
-
-    if isinstance(roots, bool) or not isinstance(roots, int) or roots <= 0:
-        raise ValueError("roots must be a positive integer")
-    if (
-        isinstance(players, bool)
-        or not isinstance(players, int)
-        or not 2 <= players <= 6
-    ):
-        raise ValueError("players must be an integer in [2,6]")
-    return roots * (players - 1)
 
 
 def pilot_config_mapping(
@@ -257,7 +208,6 @@ def pilot_config_mapping(
     output_dir: str | Path,
     device: str = "cuda:0",
     hardware: str = "h100",
-    local_total_memory_bytes: int | None = None,
 ) -> dict[str, object]:
     """Build one strict config for either the H100 pilot or local CUDA smoke."""
 
@@ -267,137 +217,39 @@ def pilot_config_mapping(
     precision = "bf16" if h100 else "fp32"
     batch_size = 256 if h100 else 8
     gradient_steps = 116 if h100 else 1
-    geometry = NLHEGeometry(2, 32.0, 13)
-    token_bounds = max_policy_partition_sequence_tokens(
-        n_players=2,
-        stack_bb=32.0,
-        rank_count=13,
-        k_act=5,
-    )
-    token_bound = max(token_bounds.values())
-    pair_bound = token_bound * token_bound
-    pre_rows = 8 * arm.roots
-    post_rows = 32 * arm.roots
-    leaf_cap = 2 * arm.roots
-    topology_cap = 42 * arm.roots
-    topology_edge_cap = topology_cap - arm.roots
-    folded_rows = cumulative_folded_range_rows(arm.roots, geometry.players)
     learner_pack = min(arm.family_pack, batch_size)
-    completion_pack = min(256 if h100 else 8, leaf_cap)
-    chance_pack = min(max(2 * arm.family_pack, 8), pre_rows + post_rows + leaf_cap)
-    topology_packet = min(
-        max(4 * arm.family_pack, 8),
-        topology_cap + topology_edge_cap,
-    )
-    if h100:
-        total_memory = H100_DECLARED_TOTAL_BYTES
-        memory_budget = H100_MEMORY_BUDGET_BYTES
-        memory_guard = H100_MEMORY_GUARD_BYTES
-        movement_scratch = 256 << 20
-        evaluator_workspace = 512 << 20
-        learner_workspace = 32 << 20
-    else:
-        if local_total_memory_bytes is None or local_total_memory_bytes <= 0:
-            raise ValueError("local profile requires positive device memory")
-        total_memory = local_total_memory_bytes
-        memory_budget = min(9 * GIB, total_memory - 512 * 1024**2)
-        if memory_budget <= 0:
-            raise ValueError("local CUDA device is too small for the smoke profile")
-        memory_guard = 256 << 20
-        movement_scratch = 16 << 20
-        evaluator_workspace = 64 << 20
-        learner_workspace = 4 << 20
-    rb = arm.mode == "rb"
-    library_workspace = (
-        rb_conversion_library_workspace_bytes(
-            geometry.private_hands, geometry.rank_count**2
-        )
-        if rb
-        else 8 << 20
-    )
-    action_cap = {"pre": pre_rows, "post_2": post_rows}
-    run_id = arm.name
     result: dict[str, object] = {
+        "kind": "nlhe_run_v1",
         "scientific": _scientific_mapping(
             mode=arm.mode,
-            roots=arm.roots,
             completion_samples=arm.completion_samples,
-            precision=precision,
             batch_size=batch_size,
             gradient_steps=gradient_steps,
         ),
-        "execution": {
-            "device": device,
+        "run": {
+            "seed": 104830,
+            "reproducibility": "throughput",
+            "utility": "stack_normalized",
+            "workload": {
+                "roots": arm.roots,
+                **({"replicas": arm.replicas} if arm.replicas != 1 else {}),
+            },
+            "execution": {
+                "device": device,
+                "precision": precision,
+                "attention": "sdpa",
+                "memory": {
+                    "reserve_bytes": (H100_MEMORY_GUARD_BYTES if h100 else 256 << 20)
+                },
+                "microbatch": {
+                    "rollout_rows": arm.family_pack,
+                    "completion_rows": 256 if h100 else 8,
+                    "learner_rows": learner_pack,
+                },
+            },
             "iterations": 1,
             "checkpoint_every": 1,
             "output_dir": str(output_dir),
-            "run_id": run_id,
-            "distributed": False,
-            "frozen_checkpoint": None,
-            "attention_backend": "sdpa",
-            "query_chunk_size": 128,
-            "manifest": {
-                "model_token_bound": token_bound,
-                "model_token_pair_bound": pair_bound,
-                "root_count": arm.roots,
-                "n_replica": arm.replicas,
-                "beta_max": 1,
-                "player_node_cap": {"pre": pre_rows, "post_2": post_rows},
-                "trained_player_cap": {"pre": pre_rows, "post_2": post_rows},
-                "action_cap": action_cap,
-                "folded_range_cap": {"pre": folded_rows, "post": folded_rows},
-                "leaf_cap": leaf_cap,
-                "topology_cap": topology_cap,
-                "topology_edge_cap": topology_edge_cap,
-                "family_pack_cap": min(arm.family_pack, pre_rows + post_rows),
-                "chance_frontier_cap": chance_pack,
-                "completion_pack_cap": completion_pack,
-                "learner_sigma_pack_cap": learner_pack,
-                "learner_action_pack_cap": learner_pack,
-                "topology_packet_cap": topology_packet,
-                "target_arena_cap": leaf_cap + topology_cap,
-                "movement_scratch_bytes": movement_scratch,
-                "library_workspace_bytes": library_workspace,
-                "evaluator_workspace_bytes": evaluator_workspace,
-                "memory_guard_bytes": memory_guard,
-                "hardware": {
-                    "total_memory_bytes": total_memory,
-                    "memory_budget_bytes": memory_budget,
-                    "training_max_tokens": learner_pack * token_bound,
-                    "training_max_token_pairs": learner_pack * pair_bound,
-                    "query_chunk_size": 128,
-                },
-                "required_external": {
-                    "library_bytes": 0,
-                    "evaluator_bytes": 0,
-                },
-            },
-            "layout": {
-                "model_input_shapes": {
-                    "pre": [geometry.preflop_model_input_width],
-                    "post_2": [geometry.postflop_model_input_width],
-                },
-                "player_count": 2,
-                "stratum_count": 2,
-                "evaluator_private_width": geometry.private_hands,
-                "family_workspace_row_bytes": (
-                    sequential_family_workspace_row_bytes(geometry, 2)
-                ),
-                "chance_frontier_row_bytes": 128 << 10,
-                "completion_workspace_row_bytes": (
-                    rb_conversion_workspace_row_bytes(
-                        geometry.private_hands, geometry.rank_count**2
-                    )
-                    if rb
-                    else 4096
-                ),
-                "learner_sigma_workspace_row_bytes": learner_workspace,
-                "learner_action_workspace_row_bytes": learner_workspace,
-                "topology_packet_row_bytes": 128,
-                "reference_cache_bytes": 0,
-                "field_alignment": 64,
-                "model_dtype": "bfloat16" if h100 else "float32",
-            },
         },
     }
     load_config_mapping(result)
@@ -410,14 +262,12 @@ def write_arm_config(
     *,
     output_dir: str | Path,
     hardware: str = "h100",
-    local_total_memory_bytes: int | None = None,
 ) -> RootConfig:
     target = Path(destination)
     mapping = pilot_config_mapping(
         arm,
         output_dir=output_dir,
         hardware=hardware,
-        local_total_memory_bytes=local_total_memory_bytes,
     )
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
@@ -438,8 +288,26 @@ def geometry_roots(replicas: int) -> tuple[int, ...]:
 
 def base_plan() -> dict[str, object]:
     arms: list[Arm] = [
-        Arm("nlhe_hu_32bb_normal_h100_bf16_smoke", "smoke", "normal", 1, 4, None, warmup=0, repeats=1),
-        Arm("nlhe_hu_32bb_rb_h100_bf16_smoke", "smoke", "rb", 1, 4, 16, warmup=0, repeats=1),
+        Arm(
+            "nlhe_hu_32bb_normal_h100_bf16_smoke",
+            "smoke",
+            "normal",
+            1,
+            4,
+            None,
+            warmup=0,
+            repeats=1,
+        ),
+        Arm(
+            "nlhe_hu_32bb_rb_h100_bf16_smoke",
+            "smoke",
+            "rb",
+            1,
+            4,
+            16,
+            warmup=0,
+            repeats=1,
+        ),
     ]
     arms.extend(
         Arm(
@@ -559,10 +427,7 @@ def benchmark_summary(
                 or any(int(value) != 0 for value in lane_before.values())
                 or int(lane_after["trajectories"]) != arm.roots
                 or int(lane_after["optimizer_steps"]) != gradient_steps
-                or (
-                    arm.mode == "rb"
-                    and int(lane_after["completion_samples"]) <= 0
-                )
+                or (arm.mode == "rb" and int(lane_after["completion_samples"]) <= 0)
             ):
                 raise PilotError(
                     "benchmark lane did not complete its declared fresh work"
@@ -587,9 +452,7 @@ def benchmark_summary(
         "seconds": float(median["seconds"]),
         "peak_allocated_bytes": int(median["peak_allocated_bytes"]),
         "peak_reserved_bytes": int(median["peak_reserved_bytes"]),
-        "initializer_model_sha256": benchmark["identity"][
-            "initializer_model_sha256"
-        ],
+        "initializer_model_sha256": benchmark["identity"]["initializer_model_sha256"],
     }
 
 
@@ -614,7 +477,6 @@ __all__ = [
     "PilotError",
     "base_plan",
     "benchmark_summary",
-    "cumulative_folded_range_rows",
     "export_model_initializer",
     "geometry_roots",
     "h100_preflight",

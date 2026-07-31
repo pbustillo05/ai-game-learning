@@ -47,7 +47,7 @@ def main() -> None:
             "./tools/poker-python",
             "tools/profile-queued-branching.py",
             "--config",
-            "configs/experiments/nlhe_hu_32bb_branched_fixed_beta_testing.yaml",
+            "configs/profiles/nlhe_hu_32bb_branching_profile_v1.yaml",
             "--scenario",
             "successful_seed104830",
             "--seed",
@@ -66,7 +66,6 @@ def main() -> None:
             "3",
             "--safe-tree-size",
             "120000",
-            "--large-tree-manifest",
             "--output",
             str(output),
         ]

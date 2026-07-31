@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 
 import pytest
+import torch
 import yaml
 
 from pbg.config import ConfigError, load_config, load_config_mapping
@@ -19,7 +21,7 @@ def _raw() -> dict[str, object]:
     return value
 
 
-def test_public_config_loads_complete_scientific_and_execution_contract() -> None:
+def test_public_config_compiles_one_resolved_runtime_contract() -> None:
     cfg = load_config(CONFIG)
     assert isinstance(cfg.scientific, SequentialModeConfig)
     assert cfg.mode == {
@@ -27,47 +29,42 @@ def test_public_config_loads_complete_scientific_and_execution_contract() -> Non
         "rollout_mode": "sequential",
         "private_estimator": "sampled",
     }
-    assert cfg.scientific.common.game.players == 2
-    assert cfg.scientific.common.game.stack_bb == 8.0
-    assert cfg.scientific.common.game.rank_count == 4
-    assert cfg.scientific.common.model.d_model == 16
-    assert cfg.scientific.common.loss.value_loss == "mse"
-    assert cfg.scientific.common.optimizer.name == "adamw"
-    assert cfg.scientific.common.reproducibility == "strict"
-    assert cfg.execution.device == "cuda:0"
-    assert cfg.execution.manifest.root_count == 1
     assert cfg.execution.layout.input_shapes == {
         "pre": (240,),
         "post_2": (448,),
     }
-
-
-def test_public_config_round_trip_is_exact() -> None:
-    cfg = load_config(CONFIG)
-    rebuilt = load_config_mapping(
-        {
-            "scientific": cfg.scientific_mapping(),
-            "execution": cfg.execution.mapping(),
-        }
+    manifest = cfg.execution.manifest
+    assert manifest.topology_edge_cap == (
+        manifest.topology_cap - manifest.root_count + manifest.leaf_cap
     )
-    assert rebuilt == cfg
+    assert manifest.target_arena_cap == manifest.topology_cap + manifest.leaf_cap
+    assert manifest.partition_rows("action_cap") == manifest.partition_rows(
+        "trained_player_cap"
+    )
+    assert (
+        manifest.hardware.total_memory_bytes
+        == torch.cuda.get_device_properties(0).total_memory
+    )
 
 
-@pytest.mark.parametrize("legacy_root", ["game", "rollout", "training", "hardware"])
-def test_legacy_root_shapes_are_rejected_with_dotted_paths(
-    legacy_root: str,
-) -> None:
+def test_source_round_trip_and_resolved_hash_are_deterministic() -> None:
+    cfg = load_config(CONFIG)
+    rebuilt = load_config_mapping(cfg.source_mapping())
+    assert rebuilt.source_mapping() == cfg.source_mapping()
+    assert rebuilt.execution.mapping() == cfg.execution.mapping()
+    resolved = cfg.execution.mapping()
+    assert resolved["schema"] == "pbg_resolved_execution_v1"
+    assert resolved["derivation_version"] == "nlhe_capacity_v1"
+    assert len(resolved["resolved_sha256"]) == 64
+    json.dumps(resolved, sort_keys=True, allow_nan=False)
+
+
+@pytest.mark.parametrize("legacy_root", ["execution", "game", "hardware", "training"])
+def test_legacy_root_shapes_are_rejected(legacy_root: str) -> None:
     raw = _raw()
     raw[legacy_root] = {}
     with pytest.raises(ConfigError, match=rf"root\.{legacy_root}"):
         load_config_mapping(raw)
-
-
-def test_runtime_hardware_overlay_is_rejected() -> None:
-    with pytest.raises(TypeError, match="hardware_profile"):
-        load_config(  # type: ignore[call-arg]
-            CONFIG, hardware_profile="local_3x2080ti"
-        )
 
 
 @pytest.mark.parametrize(
@@ -77,17 +74,15 @@ def test_runtime_hardware_overlay_is_rejected() -> None:
         (("scientific", "mode"), "legacy_mode"),
         (("scientific", "game"), "ante"),
         (("scientific", "model"), "unknown_head"),
-        (("scientific", "loss"), "ignored_coefficient"),
+        (("scientific", "objective"), "ignored_coefficient"),
         (("scientific", "optimizer"), "momentum"),
-        (("execution",), "auto_device"),
-        (("execution", "manifest"), "capacity_growth"),
-        (("execution", "manifest", "hardware"), "profile"),
-        (("execution", "layout"), "cpu_staging"),
+        (("run",), "manifest"),
+        (("run", "execution"), "layout"),
+        (("run", "execution", "memory"), "total_memory_bytes"),
     ],
 )
 def test_unknown_nested_key_reports_full_path(
-    path: tuple[str, ...],
-    field: str,
+    path: tuple[str, ...], field: str
 ) -> None:
     raw = _raw()
     target = raw
@@ -102,50 +97,23 @@ def test_unknown_nested_key_reports_full_path(
 @pytest.mark.parametrize("device", ["cpu", "mps", "auto", ""])
 def test_training_device_must_be_explicit_cuda(device: str) -> None:
     raw = _raw()
-    raw["execution"]["device"] = device  # type: ignore[index]
-    with pytest.raises(ConfigError, match=r"root\.execution\.device"):
+    raw["run"]["execution"]["device"] = device  # type: ignore[index]
+    with pytest.raises((ConfigError, RuntimeError), match=r"device|CUDA"):
         load_config_mapping(raw)
 
 
 @pytest.mark.parametrize(
     ("path", "value", "pattern"),
     [
-        (("execution", "iterations"), 0, r"root\.execution\.iterations"),
+        (("run", "iterations"), 0, r"root\.run\.iterations"),
+        (("run", "checkpoint_every"), 0, r"root\.run\.checkpoint_every"),
+        (("run", "workload", "roots"), 0, r"root\.run\.workload\.roots"),
         (
-            ("execution", "checkpoint_every"),
-            0,
-            r"root\.execution\.checkpoint_every",
+            ("run", "execution", "memory", "reserve_bytes"),
+            -1,
+            r"root\.run\.execution\.memory\.reserve_bytes",
         ),
-        (
-            ("execution", "query_chunk_size"),
-            0,
-            r"root\.execution\.query_chunk_size",
-        ),
-        (
-            ("execution", "manifest", "root_count"),
-            0,
-            r"root\.execution\.manifest",
-        ),
-        (
-            ("execution", "manifest", "family_pack_cap"),
-            0,
-            r"root\.execution\.manifest",
-        ),
-        (
-            ("execution", "layout", "field_alignment"),
-            0,
-            r"root\.execution\.layout",
-        ),
-        (
-            ("scientific", "root_count"),
-            0,
-            r"root\.scientific\.root_count",
-        ),
-        (
-            ("scientific", "lambda"),
-            -0.01,
-            r"root\.scientific\.lambda",
-        ),
+        (("scientific", "lambda"), -0.01, r"root\.scientific\.lambda"),
         (
             ("scientific", "optimizer", "learning_rate"),
             -1.0,
@@ -159,9 +127,7 @@ def test_training_device_must_be_explicit_cuda(device: str) -> None:
     ],
 )
 def test_numeric_boundaries_reject_with_dotted_paths(
-    path: tuple[str, ...],
-    value: object,
-    pattern: str,
+    path: tuple[str, ...], value: object, pattern: str
 ) -> None:
     raw = _raw()
     target = raw
@@ -172,18 +138,40 @@ def test_numeric_boundaries_reject_with_dotted_paths(
         load_config_mapping(raw)
 
 
-def test_manifest_root_count_must_match_scientific_root_count() -> None:
+def test_discriminated_unions_reject_inapplicable_placeholders() -> None:
     raw = _raw()
-    raw["execution"]["manifest"]["root_count"] = 2  # type: ignore[index]
-    with pytest.raises(ConfigError, match="differs from scientific root_count"):
+    raw["scientific"]["objective"]["value"]["epsilon"] = 0.2  # type: ignore[index]
+    with pytest.raises(ConfigError, match=r"objective\.value\.epsilon"):
+        load_config_mapping(raw)
+    raw = _raw()
+    raw["scientific"]["schedule"]["steps"] = 1  # type: ignore[index]
+    with pytest.raises(ConfigError, match="select exactly one"):
+        load_config_mapping(raw)
+    raw = _raw()
+    raw["run"]["execution"]["attention"] = {  # type: ignore[index]
+        "kind": "sdpa",
+        "query_rows": 128,
+    }
+    with pytest.raises(ConfigError, match="chunked_dense"):
         load_config_mapping(raw)
 
 
 def test_self_play_rejects_frozen_target() -> None:
     raw = _raw()
-    raw["execution"]["frozen_checkpoint"] = "target.pt"  # type: ignore[index]
-    with pytest.raises(ConfigError, match="inapplicable to self play"):
+    raw["run"]["frozen"] = {"path": "target.pt", "sha256": "0" * 64}  # type: ignore[index]
+    with pytest.raises(ConfigError, match="response fields require best_response"):
         load_config_mapping(raw)
+
+
+def test_distributed_policy_must_match_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = _raw()
+    raw["run"]["execution"]["distributed"] = True  # type: ignore[index]
+    with pytest.raises(ConfigError, match="WORLD_SIZE"):
+        load_config_mapping(raw)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    load_config_mapping(raw)
 
 
 def test_input_mapping_is_copied_not_mutated() -> None:
@@ -191,3 +179,14 @@ def test_input_mapping_is_copied_not_mutated() -> None:
     before = copy.deepcopy(raw)
     load_config_mapping(raw)
     assert raw == before
+
+
+def test_resolved_manifest_is_not_a_second_source_schema() -> None:
+    cfg = load_config(CONFIG)
+    with pytest.raises(ConfigError, match=r"root\.execution"):
+        load_config_mapping(
+            {
+                "scientific": cfg.scientific_mapping(),
+                "execution": cfg.execution.mapping(),
+            }
+        )

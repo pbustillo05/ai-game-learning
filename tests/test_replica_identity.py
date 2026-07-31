@@ -866,11 +866,11 @@ def test_shared_owner_branched_poker_preserves_fixed_kkt_lane_identity(
         * 2,
         schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
         generators=tuple(
-            torch.Generator(device=device).manual_seed(919 + lane)
+            torch.Generator(device=device).manual_seed(900 + lane)
             for lane in range(2)
         ),
         run_states=run_states,
-        seed=919,
+        seed=900,
         lambda_=0.95,
         completion_samples=4 if estimator == "rao_blackwell" else 0,
         posterior_max_attempts=16,

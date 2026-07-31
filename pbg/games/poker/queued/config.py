@@ -355,10 +355,8 @@ class SequentialModeConfig:
         applicable: dict[str, object] = {}
         if rb:
             completion = dict(_mapping(source.get("completion"), "root.completion"))
-            if set(completion) != {"n_samples", "strata"}:
-                raise ValueError(
-                    "root.completion: RB requires exactly n_samples and strata"
-                )
+            if set(completion) != {"n_samples"}:
+                raise ValueError("root.completion: RB requires exactly n_samples")
             if (
                 isinstance(completion["n_samples"], bool)
                 or not isinstance(completion["n_samples"], int)
@@ -612,10 +610,8 @@ class BranchedModeConfig:
             completion = dict(
                 _mapping(source.get("completion"), "root.completion")
             )
-            if set(completion) != {"n_samples", "strata"}:
-                raise ValueError(
-                    "root.completion: RB requires exactly n_samples and strata"
-                )
+            if set(completion) != {"n_samples"}:
+                raise ValueError("root.completion: RB requires exactly n_samples")
             if (
                 isinstance(completion["n_samples"], bool)
                 or not isinstance(completion["n_samples"], int)
