@@ -74,7 +74,7 @@ def estimate_update_variance(
     )
     means = tuple(torch.zeros_like(value) for value in initial)
     m2 = tuple(torch.zeros_like(value) for value in initial)
-    budget = base.plan.manifest.hardware.memory_budget_bytes
+    budget = base.plan.manifest.hardware.usable_memory_bytes
     admitted_peak = max(
         admission.required_bytes for admission in base.plan.admissions
     )

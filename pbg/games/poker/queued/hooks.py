@@ -1360,6 +1360,8 @@ class SequentialPokerHooks:
         log_reach, history = self.machine.exact_model_context(
             batch.input_type, model_input
         )
+        if self.geometry.players == 2:
+            return log_reach, history
         log_reach = log_reach.clone()
         rows = torch.arange(model_input.shape[0], device=model_input.device)
         classes = self._combo_class()
@@ -1889,7 +1891,8 @@ class SequentialPokerHooks:
         )
         folded_partition = "pre" if batch.input_type == "pre" else "post"
         folded_slab = self._owner_slab("FoldedRanges", folded_partition)
-        fold_matrix = fold.reshape(lane_count, rows)
+        stored_fold = fold if self.geometry.players > 2 else torch.zeros_like(fold)
+        fold_matrix = stored_fold.reshape(lane_count, rows)
         fold_order = torch.argsort(~fold_matrix, dim=1, stable=True)
         folded_rows = actor_weight
         if folded_partition == "pre":
@@ -1955,7 +1958,7 @@ class SequentialPokerHooks:
             1,
             actor[:, None],
             torch.where(
-                fold,
+                stored_fold,
                 encoded_reference,
                 folded_reference.gather(1, actor[:, None]).squeeze(1),
             )[:, None],
@@ -2037,16 +2040,18 @@ class SequentialPokerHooks:
             )
             published_queues.append(queue)
 
-        folded_destination = len(destinations)
-        destinations.append(
-            DeviceDestinationRequest(
-                folded_slab,
-                fold_counts,
-                folded_values,
-                batch.input_type,
-                address,
+        folded_destination = 0
+        if self.geometry.players > 2:
+            folded_destination = len(destinations)
+            destinations.append(
+                DeviceDestinationRequest(
+                    folded_slab,
+                    fold_counts,
+                    folded_values,
+                    batch.input_type,
+                    address,
+                )
             )
-        )
 
         extent = 4 * rows
         valid = torch.zeros((n_replica, extent), dtype=torch.bool, device=state.device)
@@ -2060,7 +2065,7 @@ class SequentialPokerHooks:
             valid[lane, 2::4].fill_(True)
             valid[lane, 0::4].copy_(trained[local_lane])
             valid[lane, 1::4].copy_(trained[local_lane])
-            valid[lane, 3::4].copy_(fold.reshape(lane_count, rows)[local_lane])
+            valid[lane, 3::4].copy_(fold_matrix[local_lane])
             source_ordinal[lane, 0::4].copy_(ordinal)
             source_ordinal[lane, 1::4].copy_(ordinal)
             source_ordinal[lane, 2::4].copy_(ordinal)

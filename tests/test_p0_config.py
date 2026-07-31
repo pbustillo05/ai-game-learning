@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import runpy
 from pathlib import Path
 
 import pytest
@@ -9,10 +10,16 @@ import torch
 import yaml
 
 from pbg.config import ConfigError, load_config, load_config_mapping
+from pbg.core.execution_manifest import (
+    ExecutionManifestError,
+    seal_execution_manifest,
+    validate_execution_manifest,
+)
 from pbg.games.poker.queued.config import SequentialModeConfig
 
 ROOT = Path(__file__).parents[1]
 CONFIG = ROOT / "configs/train/nlhe_hu_8bb_normal_smoke.yaml"
+PROFILE = ROOT / "configs/profiles/nlhe_hu_32bb_branching_profile_v1.yaml"
 
 
 def _raw() -> dict[str, object]:
@@ -57,6 +64,56 @@ def test_source_round_trip_and_resolved_hash_are_deterministic() -> None:
     assert resolved["derivation_version"] == "nlhe_capacity_v1"
     assert len(resolved["resolved_sha256"]) == 64
     json.dumps(resolved, sort_keys=True, allow_nan=False)
+
+
+def _mutated_leaf(value: object, path: tuple[object, ...]) -> object:
+    if not path:
+        if isinstance(value, bool):
+            return not value
+        if isinstance(value, int):
+            return value + 1
+        if isinstance(value, float):
+            return value + 0.5
+        if isinstance(value, str):
+            return value + "_mutated"
+        raise AssertionError(f"unsupported resolved leaf {type(value)}")
+    head, *tail = path
+    if isinstance(value, dict):
+        return {**value, head: _mutated_leaf(value[head], tuple(tail))}
+    if isinstance(value, list):
+        result = list(value)
+        result[int(head)] = _mutated_leaf(result[int(head)], tuple(tail))
+        return result
+    raise AssertionError("resolved path did not reach a container")
+
+
+def _leaf_paths(value: object, prefix: tuple[object, ...] = ()) -> list[tuple[object, ...]]:
+    if isinstance(value, dict):
+        return [
+            path
+            for name, item in value.items()
+            for path in _leaf_paths(item, (*prefix, name))
+        ]
+    if isinstance(value, list):
+        return [
+            path
+            for index, item in enumerate(value)
+            for path in _leaf_paths(item, (*prefix, index))
+        ]
+    return [prefix]
+
+
+def test_every_resolved_leaf_is_hash_bound_and_resume_identity_bound() -> None:
+    resolved = load_config(CONFIG).execution.mapping()
+    payload = {name: value for name, value in resolved.items() if name != "resolved_sha256"}
+    for path in _leaf_paths(payload):
+        mutated_payload = _mutated_leaf(payload, path)
+        tampered = {**mutated_payload, "resolved_sha256": resolved["resolved_sha256"]}
+        with pytest.raises(ExecutionManifestError, match="hash"):
+            validate_execution_manifest(tampered)
+        resealed = seal_execution_manifest(mutated_payload)
+        with pytest.raises(ExecutionManifestError, match="drifted"):
+            validate_execution_manifest(resealed, expected=resolved)
 
 
 @pytest.mark.parametrize("legacy_root", ["execution", "game", "hardware", "training"])
@@ -190,3 +247,16 @@ def test_resolved_manifest_is_not_a_second_source_schema() -> None:
                 "execution": cfg.execution.mapping(),
             }
         )
+
+
+def test_profiler_scenarios_compile_without_mutation_or_null_placeholders() -> None:
+    before = PROFILE.read_text(encoding="utf-8")
+    loader = runpy.run_path(str(ROOT / "tools/profile-queued-branching.py"))[
+        "_load_profile_config"
+    ]
+    successful = loader(PROFILE, "successful_seed104830")
+    failed = loader(PROFILE, "failed_beta3_capacity")
+    assert successful.root.source_mapping()["kind"] == "nlhe_run_v1"
+    assert failed.scenario.cost_safeguard is None
+    assert PROFILE.read_text(encoding="utf-8") == before
+    assert ": null" not in before

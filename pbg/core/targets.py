@@ -459,9 +459,9 @@ class LayeredTargetExecutor:
             raise TargetError("LayerPlan owner slot is outside P_train")
         max_width = max(self.algebra.widths)
         required_scratch = self.required_scratch_bytes(plan, n_replica)
-        if required_scratch > owners.plan.manifest.movement_scratch_bytes:
+        if required_scratch > owners.plan.manifest.target_workspace_bytes:
             raise TargetError(
-                "layer executor scratch exceeds admitted movement scratch bytes"
+                "layer executor scratch exceeds target-phase workspace admission"
             )
         for output, name in enumerate(plan.output_names):
             slab = owners.slab("LayerWork", name)

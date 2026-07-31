@@ -6,6 +6,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from pbg.config import load_config_mapping
 from pbg.core.branching import (
     CostSafeguardController,
     FixedBranchController,
@@ -20,7 +21,6 @@ from pbg.core.learner import (
 )
 from pbg.core.optimization import DenseAdam, OptimizerConfig
 from pbg.core.persistence import RunState
-from pbg.core.targets import rb_conversion_library_workspace_bytes
 from pbg.games.poker.queued.branching import (
     BranchedPosteriorExhaustion,
     action_conditioned_log_reach,
@@ -39,7 +39,6 @@ from tests.iteration_support import BranchedRecoveryHarness
 from tests.test_branched_sampled_modes import (
     _manifest,
     _phase7_layout,
-    _sampled_chance_frontier_row_bytes,
     _scientific_config,
 )
 
@@ -50,8 +49,8 @@ CUDA = pytest.mark.skipif(
 
 def _config(regime: str, rollout: str) -> dict[str, object]:
     result = _scientific_config(regime, rollout)
-    result["mode"]["private_estimator"] = "rao_blackwell"
-    result["completion"] = {"n_samples": 4}
+    result["scientific"]["mode"]["private_estimator"] = "rao_blackwell"
+    result["scientific"]["completion"] = {"samples": 4}
     return result
 
 
@@ -70,27 +69,12 @@ def _plan(
             PartitionRows("pre", 2048),
             PartitionRows("post", 2048),
         ),
-        library_workspace_bytes=rb_conversion_library_workspace_bytes(
-            geometry.private_hands, geometry.rank_count**2
-        ),
+        completion_workspace_bytes=16 << 20,
+        learner_workspace_bytes=24 << 20,
     )
     layout = replace(
         _phase7_layout(geometry),
         evaluator_private_width=geometry.private_hands,
-        chance_frontier_row_bytes=(
-            _sampled_chance_frontier_row_bytes(geometry)
-            + 4 * geometry.players * geometry.private_hands
-            + 16
-            * (
-                4 * geometry.players
-                + 2 * geometry.deck_cards
-                + geometry.players
-            )
-            + 32
-        ),
-        completion_workspace_row_bytes=8192,
-        learner_sigma_workspace_row_bytes=8192,
-        learner_action_workspace_row_bytes=8192,
     )
     return build_storage_plan(
         mode, partitions, manifest, layout, device
@@ -103,15 +87,14 @@ def test_phase8_config_closes_all_four_rb_modes(
     regime: str, rollout: str
 ) -> None:
     value = _config(regime, rollout)
-    assert (
-        BranchedModeConfig.from_mapping(value)
-        .scientific_mapping()["mode"]
-        == value["mode"]
-    )
+    configured = load_config_mapping(value).scientific
+    assert isinstance(configured, BranchedModeConfig)
+    assert dict(configured.mode) == value["scientific"]["mode"]
     missing = dict(value)
-    del missing["completion"]
-    with pytest.raises(ValueError, match="root.completion"):
-        BranchedModeConfig.from_mapping(missing)
+    missing["scientific"] = dict(value["scientific"])
+    del missing["scientific"]["completion"]
+    with pytest.raises(ValueError, match="root.scientific.completion"):
+        load_config_mapping(missing)
 
 
 
@@ -280,7 +263,7 @@ def test_root_refill_uses_fresh_posterior_ordinals(
         observe,
     )
     model = build_model_from_config(
-        _config("self_play", "branched.fixed"), device
+        _config("self_play", "branched.fixed")["scientific"], device
     )
     result = BranchedRecoveryHarness(
         owner_factory=lambda: GeneratedOwners(plan),
@@ -609,7 +592,7 @@ def test_rejection_exhaustion_blocks_commit_and_publishes_device_failure(
         exhaust,
     )
     model = build_model_from_config(
-        _config("self_play", "branched.fixed"), device
+        _config("self_play", "branched.fixed")["scientific"], device
     )
     with pytest.raises(BranchedPosteriorExhaustion) as raised:
         BranchedRecoveryHarness(
@@ -699,7 +682,7 @@ def test_safe_tree_uses_only_inherited_profiles_for_rb_player_and_chance(
     safeguard = CostSafeguardController(1.0, 2.0, 1)
     safeguard.observe(0.1, 1.1, 1)
     model = build_model_from_config(
-        _config("self_play", "branched.fixed"), device
+        _config("self_play", "branched.fixed")["scientific"], device
     )
     result = BranchedRecoveryHarness(
         owner_factory=lambda: GeneratedOwners(plan),
@@ -750,9 +733,9 @@ def test_four_branched_rb_modes_complete_optimizer_step(
     geometry = NLHEGeometry(2, 8.0, 4)
     mode = mode_schema(regime, rollout, "rao_blackwell")
     plan = _plan(device, mode, geometry)
-    model = build_model_from_config(_config(regime, rollout), device)
+    model = build_model_from_config(_config(regime, rollout)["scientific"], device)
     frozen = (
-        build_model_from_config(_config("self_play", rollout), device)
+        build_model_from_config(_config("self_play", rollout)["scientific"], device)
         if regime == "best_response"
         else None
     )

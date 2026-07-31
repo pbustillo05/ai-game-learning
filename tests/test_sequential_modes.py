@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
 import torch
+import yaml
 from torch import nn
 
+from pbg.config import load_config_mapping
 from pbg.core.capacity import (
     ExecutionGeometry,
     ExecutionPhase,
@@ -74,7 +77,6 @@ from tests.test_sequential_sampled_training import (
     _PartitionNetwork,
     _phase5_layout,
     _phase5_manifest,
-    _publish_rows,
 )
 
 
@@ -91,35 +93,32 @@ CUDA = pytest.mark.skipif(
 
 
 def _config(regime: str, estimator: str) -> dict[str, object]:
-    value: dict[str, object] = {
-        "mode": {
-            "training_regime": regime,
-            "rollout_mode": "sequential",
-            "private_estimator": estimator,
-        },
-        "game": {"players": 2, "stack_bb": 8.0, "rank_count": 4},
-        "model": {
-            "d_model": 4,
-            "n_heads": 1,
-            "max_players": 2,
-            "epsilon": 1.0e-8,
-        },
-        "loss": {},
-        "optimizer": {},
-        "schedule": {"batch_size": 2},
-        "precision": {},
-        "reference": {},
-        "lambda": 0.95,
-        "root_count": 2,
-        "root_count_minimum": 1,
-        "seed": 7,
+    raw = yaml.safe_load(
+        (Path(__file__).parents[1] / "configs/train/nlhe_hu_8bb_normal_smoke.yaml")
+        .read_text(encoding="utf-8")
+    )
+    value = raw["scientific"]
+    value["mode"] = {
+        "training_regime": regime,
+        "rollout_mode": "sequential",
+        "private_estimator": estimator,
     }
     if estimator == "rao_blackwell":
-        value["completion"] = {"n_samples": 8}
+        value["completion"] = {"samples": 8}
     if regime == "best_response":
-        value["frozen_profile"] = {"sha256": "a" * 64}
         value["response_initialization"] = "random"
     return value
+
+
+def _run_config(regime: str, estimator: str) -> dict[str, object]:
+    raw = yaml.safe_load(
+        (Path(__file__).parents[1] / "configs/train/nlhe_hu_8bb_normal_smoke.yaml")
+        .read_text(encoding="utf-8")
+    )
+    raw["scientific"] = _config(regime, estimator)
+    if regime == "best_response":
+        raw["run"]["frozen"] = {"path": "target.pt", "sha256": "a" * 64}
+    return raw
 
 
 @pytest.mark.parametrize(
@@ -134,8 +133,9 @@ def _config(regime: str, estimator: str) -> dict[str, object]:
 def test_all_sequential_public_configs_are_closed(
     regime: str, estimator: str
 ) -> None:
-    config = SequentialModeConfig.from_mapping(_config(regime, estimator))
-    assert config.scientific_mapping()["mode"] == {
+    config = load_config_mapping(_run_config(regime, estimator)).scientific
+    assert isinstance(config, SequentialModeConfig)
+    assert dict(config.mode) == {
         "training_regime": regime,
         "rollout_mode": "sequential",
         "private_estimator": estimator,
@@ -154,9 +154,9 @@ def test_native_postflop_model_consumes_signed_folded_summary() -> None:
     scientific["model"] = {
         "d_model": 8,
         "n_heads": 1,
-        "n_layers_pre": 1,
-        "n_layers_post": 1,
-        "max_players": 3,
+        "layers": {"pre": 1, "post": 1},
+        "raises": {"components": 4, "minimum_scale": 0.02},
+        "seat_capacity": 3,
         "class_embedding_dim": 4,
         "ffn_hidden": 16,
         "folder_beta_rank": 4,
@@ -260,12 +260,13 @@ def test_native_postflop_model_consumes_signed_folded_summary() -> None:
 
 
 def test_probe_is_the_ordinary_best_response_rb_schema() -> None:
-    value = _config("best_response", "rao_blackwell")
-    value["probe"] = {
+    value = _run_config("best_response", "rao_blackwell")
+    value["scientific"]["probe"] = {
         "target_sha256": "a" * 64,
         "initial_model_sha256": "c" * 64,
     }
-    config = SequentialModeConfig.from_mapping(value)
+    config = load_config_mapping(value).scientific
+    assert isinstance(config, SequentialModeConfig)
     assert config.applicable["probe"] == {
         "target_sha256": "a" * 64,
         "initial_model_sha256": "c" * 64,
@@ -334,21 +335,21 @@ def test_probe_is_the_ordinary_best_response_rb_schema() -> None:
 
 
 def test_sequential_config_rejects_inapplicable_mode_fields() -> None:
-    sampled = _config("self_play", "sampled")
-    sampled["completion"] = {"n_samples": 8}
+    sampled = _run_config("self_play", "sampled")
+    sampled["scientific"]["completion"] = {"samples": 8}
     with pytest.raises(ValueError, match="inapplicable"):
-        SequentialModeConfig.from_mapping(sampled)
-    self_play = _config("self_play", "rao_blackwell")
-    self_play["frozen_profile"] = {"sha256": "a" * 64}
+        load_config_mapping(sampled)
+    self_play = _run_config("self_play", "rao_blackwell")
+    self_play["run"]["frozen"] = {"path": "target.pt", "sha256": "a" * 64}
     with pytest.raises(ValueError, match="best_response"):
-        SequentialModeConfig.from_mapping(self_play)
-    sampled_response = _config("best_response", "sampled")
-    sampled_response["probe"] = {
+        load_config_mapping(self_play)
+    sampled_response = _run_config("best_response", "sampled")
+    sampled_response["scientific"]["probe"] = {
         "target_sha256": "a" * 64,
         "initial_model_sha256": "c" * 64,
     }
     with pytest.raises(ValueError, match="requires sequential RB"):
-        SequentialModeConfig.from_mapping(sampled_response)
+        load_config_mapping(sampled_response)
 
 
 
@@ -834,19 +835,7 @@ def test_folded_owner_refreshes_model_input_and_releases_at_seal() -> None:
         mode=mode,
         topology_stagers=publisher.stagers,
     )
-    folded = owners.slab("FoldedRanges", "pre")
-    class_range = torch.arange(
-        1, geometry.rank_count**2 + 1, dtype=torch.float32, device=device
-    )
-    class_range /= class_range.sum()
-    _publish_rows(
-        folded,
-        1,
-        {
-            "range": class_range[None],
-            "log_mass": torch.zeros((1,), device=device),
-        },
-    )
+    assert owners.slab("FoldedRanges", "pre").capacity == 0
     machine = PokerStateMachine(geometry)
     state = machine.initial_roots(
         1, seed=5, iteration=0, retry_epoch=0, device=device
@@ -856,43 +845,15 @@ def test_folded_owner_refreshes_model_input_and_releases_at_seal() -> None:
         fields={
             "model_input": machine.direct_model_input("pre", state)[None],
             "folded_range_row": torch.tensor(
-                [[[0, -1]]], dtype=torch.int32, device=device
+                [[[17, -9]]], dtype=torch.int32, device=device
             ),
         }
     )
     reach, _ = hooks._resolved_model_context(batch)
-    weights = reach[:, 0].exp()
-    classes = hooks._combo_class()
-    reconstructed = torch.zeros_like(class_range)
-    reconstructed.scatter_add_(0, classes, weights[0])
-    torch.testing.assert_close(reconstructed, class_range)
+    assert reach.shape == (1, geometry.players, geometry.private_hands)
+    assert torch.isfinite(reach).all()
     second_reach, _ = hooks._resolved_model_context(batch)
     assert torch.equal(reach, second_reach)
-    board = torch.tensor(
-        [[geometry.first_card, geometry.first_card + 1, geometry.first_card + 2,
-          PAD_CARD, PAD_CARD]],
-        dtype=torch.uint8,
-        device=device,
-    )
-    post_state = replace(
-        state,
-        street=torch.ones_like(state.street),
-        board_cards=board,
-    )
-    batch.fields["model_input"] = machine.direct_model_input(
-        "post_2", post_state
-    )[None]
-    batch.input_type = "post_2"
-    chance_reach, _ = hooks._resolved_model_context(batch)
-    combo_cards = machine.combo_cards(
-        torch.arange(
-            geometry.private_hands, dtype=torch.int32, device=device
-        )
-    )
-    conflict = combo_cards[None].eq(
-        board[0, :3, None, None]
-    ).any(0).any(-1)
-    assert torch.isneginf(chance_reach[0, 0, conflict]).all()
     owners.release_after(ExecutionPhase.ROLLOUT)
     owners.bind_empty_layer_work_for_abort()
     for phase in (
@@ -1052,24 +1013,14 @@ def test_all_four_sequential_modes_complete_an_optimizer_step(
     geometry = NLHEGeometry(2, 8.0, 4)
     mode = mode_schema(regime, "sequential", estimator)
     rb = estimator == "rao_blackwell"
-    layout = replace(
-        _phase5_layout(),
-        family_workspace_row_bytes=sequential_family_workspace_row_bytes(
-            geometry, 1
-        ),
-    )
+    layout = _phase5_layout()
     manifest = _phase5_manifest(device)
     if rb:
-        layout = replace(
-            layout,
-            evaluator_private_width=geometry.private_hands,
-            completion_workspace_row_bytes=4096,
-        )
+        layout = replace(layout, evaluator_private_width=geometry.private_hands)
         manifest = replace(
             manifest,
-            library_workspace_bytes=rb_conversion_library_workspace_bytes(
-                geometry.private_hands, geometry.rank_count**2
-            ),
+            completion_workspace_bytes=8 << 20,
+            learner_workspace_bytes=8 << 20,
         )
     owners = GeneratedOwners(
         build_storage_plan(
@@ -1159,17 +1110,16 @@ def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
         player_node_cap=tuple(PartitionRows(name, 40) for name in inputs),
         trained_player_cap=tuple(PartitionRows(name, 40) for name in inputs),
         action_cap=tuple(PartitionRows(name, 40) for name in inputs),
+        folded_range_cap=(
+            PartitionRows("pre", 40),
+            PartitionRows("post", 40),
+        ),
         leaf_cap=32,
         topology_cap=64,
         topology_edge_cap=64,
         target_arena_cap=128,
-        library_workspace_bytes=(
-            rb_conversion_library_workspace_bytes(
-                geometry.private_hands, geometry.rank_count**2
-            )
-            if estimator == "rao_blackwell"
-            else base_manifest.library_workspace_bytes
-        ),
+        completion_workspace_bytes=8 << 20,
+        learner_workspace_bytes=8 << 20,
     )
     layout = PhysicalLayout(
         model_input_shapes=tuple(
@@ -1179,14 +1129,6 @@ def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
         player_count=3,
         stratum_count=3,
         evaluator_private_width=geometry.private_hands,
-        family_workspace_row_bytes=sequential_family_workspace_row_bytes(
-            geometry, 1
-        ),
-        chance_frontier_row_bytes=32,
-        completion_workspace_row_bytes=4096,
-        learner_sigma_workspace_row_bytes=4096,
-        learner_action_workspace_row_bytes=4096,
-        topology_packet_row_bytes=88,
         opaque_fields=(
             SoAField("leaf_public_state", torch.uint8, (5,), fill=255),
             SoAField("leaf_private_profile", torch.int32, (3,), fill=-1),

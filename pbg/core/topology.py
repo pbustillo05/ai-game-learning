@@ -1339,8 +1339,8 @@ class LayerPlan:
             for rows in lane_rows
         ):
             raise TopologyError("realized LayerPlan exceeds target_arena_cap")
-        if self.nbytes > manifest.movement_scratch_bytes:
-            raise TopologyError("LayerPlan upload exceeds movement scratch admission")
+        if self.nbytes > manifest.align_workspace_bytes:
+            raise TopologyError("LayerPlan upload exceeds align-phase admission")
         n_replica = manifest.n_replica
         input_count = len(self.input_names)
         output_count = len(self.output_names)
@@ -1562,7 +1562,7 @@ class LayerPlan:
         expected_index_bytes = max(group_counts.values(), default=0) * 8
         if self.movement_index_bytes != expected_index_bytes:
             raise TopologyError("LayerPlan movement scratch summary is inconsistent")
-        if self.movement_index_bytes > manifest.movement_scratch_bytes:
+        if self.movement_index_bytes > manifest.align_workspace_bytes:
             raise TopologyError("LayerPlan movement indices exceed admitted scratch")
         for lane, sources in enumerate(movement_sources):
             if sources != set(range(self.leaf_rows[lane])):

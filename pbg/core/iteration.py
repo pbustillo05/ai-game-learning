@@ -1521,10 +1521,6 @@ class IterationEngine:
                 global_cap = min(
                     owners.plan.manifest.learner_sigma_pack_cap,
                     owners.plan.manifest.learner_action_pack_cap,
-                    owners.plan.manifest.hardware.training_max_tokens
-                    // owners.plan.manifest.geometry.model_token_bound,
-                    owners.plan.manifest.hardware.training_max_token_pairs
-                    // owners.plan.manifest.geometry.model_token_pair_bound,
                 )
                 costs = self.operations.model_costs(lane)
                 physical_caps: int | Mapping[str, int] = global_cap
@@ -1542,10 +1538,6 @@ class IterationEngine:
                         name: min(
                             owners.plan.manifest.learner_sigma_pack_cap,
                             owners.plan.manifest.learner_action_pack_cap,
-                            owners.plan.manifest.hardware.training_max_tokens
-                            // tokens,
-                            owners.plan.manifest.hardware.training_max_token_pairs
-                            // (tokens * tokens),
                         )
                         for name, tokens in costs.items()
                     }

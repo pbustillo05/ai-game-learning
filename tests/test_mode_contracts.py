@@ -202,7 +202,7 @@ def test_inapplicable_fields_are_absent() -> None:
                 owner.name for owner in schema.owners
             }
 
-        assert ("frozen_profile" in schema.applicable_config) is is_response
+        assert ("frozen_sha256" in schema.applicable_config) is is_response
         assert ("completion_samples" in schema.applicable_config) is (
             not is_sampled
         )
@@ -287,11 +287,11 @@ def test_capacity_manifest_vocabulary_is_closed_and_nonoverlapping() -> None:
         CAPACITY_VOCABULARY.workspaces,
     )
     names = tuple(name for group in groups for name in group)
-    assert len(names) == len(set(names)) == 18
+    assert len(names) == len(set(names)) == 20
     assert "player_node_cap" in names
     assert "topology_edge_cap" in names
-    assert "evaluator_workspace_bytes" in names
-    assert "memory_guard_bytes" in names
+    assert "completion_workspace_bytes" in names
+    assert "learner_workspace_bytes" in names
 
 
 def test_core_import_and_vocabulary_firewalls(tmp_path: Path) -> None:

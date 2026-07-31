@@ -208,7 +208,12 @@ CAPACITY_VOCABULARY = CapacityVocabulary(
         "action_cap",
         "folded_range_cap",
     ),
-    scalar_rows=("leaf_cap", "topology_cap", "topology_edge_cap"),
+    scalar_rows=(
+        "leaf_cap",
+        "topology_cap",
+        "topology_edge_cap",
+        "target_arena_cap",
+    ),
     pack_limits=(
         "family_pack_cap",
         "chance_frontier_cap",
@@ -218,11 +223,12 @@ CAPACITY_VOCABULARY = CapacityVocabulary(
         "topology_packet_cap",
     ),
     workspaces=(
-        "target_arena_cap",
-        "movement_scratch_bytes",
-        "library_workspace_bytes",
-        "evaluator_workspace_bytes",
-        "memory_guard_bytes",
+        "rollout_workspace_bytes",
+        "queue_drain_workspace_bytes",
+        "completion_workspace_bytes",
+        "align_workspace_bytes",
+        "target_workspace_bytes",
+        "learner_workspace_bytes",
     ),
 )
 
@@ -491,7 +497,7 @@ def _build_schema(
         "reproducibility",
     ]
     if response:
-        config.extend(("frozen_profile", "response_initialization"))
+        config.extend(("frozen_sha256", "response_initialization"))
     if not sampled:
         config.append("completion_samples")
     if branched:

@@ -7,8 +7,10 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 import torch
+import yaml
 from torch import nn
 
+from pbg.config import load_config_mapping
 from pbg.core.branching import (
     CostSafeguardController,
     FixedBranchController,
@@ -25,7 +27,6 @@ from pbg.core.capacity import (
     CapacityManifest,
     ExecutionGeometry,
     ExecutionPhase,
-    ExternalWorkspaceBounds,
     GeneratedOwners,
     HardwareLimits,
     NamedShape,
@@ -33,6 +34,7 @@ from pbg.core.capacity import (
     build_storage_plan,
 )
 from pbg.core.contracts import mode_schema
+from pbg.core.execution_manifest import seal_execution_manifest
 from pbg.core.iteration import IterationEngine, LaneContext
 from pbg.core.learner import (
     LearnerSchedule,
@@ -55,7 +57,6 @@ from pbg.core.topology import (
 )
 from pbg.core.training import RecoverableOverflow
 from pbg.games.poker.queued.config import BranchedModeConfig
-from pbg.games.poker.queued.folded import folded_statistics_workspace_row_bytes
 from pbg.games.poker.queued.hooks import (
     FOLDED,
     NLHEGeometry,
@@ -135,8 +136,8 @@ def _manifest(
             PartitionRows("all", 2048 * max(1, geometry.players - 1)),
         ),
         folded_range_cap=(
-            PartitionRows("pre", 1024),
-            PartitionRows("post", 1024),
+            PartitionRows("pre", 0 if geometry.players == 2 else 1024),
+            PartitionRows("post", 0 if geometry.players == 2 else 1024),
         ),
         leaf_cap=1024,
         topology_cap=1024,
@@ -148,108 +149,56 @@ def _manifest(
         learner_action_pack_cap=16,
         topology_packet_cap=64,
         target_arena_cap=2048,
-        movement_scratch_bytes=8 << 20,
-        library_workspace_bytes=1 << 20,
-        evaluator_workspace_bytes=8 << 20,
-        memory_guard_bytes=1 << 20,
+        rollout_workspace_bytes=16 << 20,
+        queue_drain_workspace_bytes=1 << 20,
+        completion_workspace_bytes=9 << 20,
+        align_workspace_bytes=9 << 20,
+        target_workspace_bytes=9 << 20,
+        learner_workspace_bytes=16 << 20,
         hardware=HardwareLimits(
             torch.cuda.get_device_properties(device).total_memory,
             512 << 20,
-            4096,
-            16_000_000,
-            256,
         ),
-        required_external=ExternalWorkspaceBounds(0, 0),
-    )
-
-
-_TOPOLOGY_PACKET_ROW_BYTES = 95
-
-
-def _sampled_chance_frontier_row_bytes(geometry: NLHEGeometry) -> int:
-    players = geometry.players
-    hands = geometry.private_hands
-    history = (
-        geometry.postflop_base_model_input_width
-        - 8
-        - 10 * players
-        - players * hands
-    ) // 10
-    return (
-        512
-        + 8 * geometry.postflop_model_input_width
-        + 16 * players * hands
-        + 128 * history
-        + 64 * geometry.deck_cards
-        + 128 * players
-        + 3 * _TOPOLOGY_PACKET_ROW_BYTES
-        + folded_statistics_workspace_row_bytes(geometry)
     )
 
 
 def _phase7_layout(geometry: NLHEGeometry):
-    return replace(
-        _phase5_layout(geometry),
-        chance_frontier_row_bytes=_sampled_chance_frontier_row_bytes(geometry),
-        topology_packet_row_bytes=_TOPOLOGY_PACKET_ROW_BYTES,
-    )
+    return _phase5_layout(geometry)
 
 
 def _scientific_config(regime: str, rollout: str) -> dict[str, object]:
-    value: dict[str, object] = {
-        "mode": {
+    value = yaml.safe_load(
+        (Path(__file__).parents[1] / "configs/train/nlhe_hu_8bb_normal_smoke.yaml")
+        .read_text(encoding="utf-8")
+    )
+    scientific = value["scientific"]
+    scientific["mode"] = {
             "training_regime": regime,
             "rollout_mode": rollout,
             "private_estimator": "sampled",
-        },
-        "game": {"players": 2, "stack_bb": 8.0, "rank_count": 4},
-        "model": {
-            "d_model": 4,
-            "n_heads": 1,
-            "n_layers_pre": 1,
-            "n_layers_post": 1,
-            "m_raise": 2,
-            "max_players": 2,
-            "class_embedding_dim": 2,
-            "ffn_hidden": 8,
-            "folder_beta_rank": 0,
-            "folder_line_dim": 2,
-            "epsilon": 1.0e-8,
-        },
-        "loss": {
-            "reference_kl_coefficient": 0.0,
-            "trace_coefficient": 0.1,
-            "cost_coefficient": 0.1,
-        },
-        "optimizer": {"name": "adamw", "grad_clip": 5.0},
-        "schedule": {"batch_size": 2, "gradient_steps": 1},
-        "precision": {"name": "fp32"},
-        "reference": {
-            "interval_iterations": 1,
-            "interval_effective_hands": None,
-            "cache_outputs": False,
-        },
-        "lambda": 0.95,
-        "root_count": 1,
-        "root_count_minimum": 1,
-        "seed": 991,
-        "branching": {
+    }
+    scientific["objective"]["branching"] = {
+        "trace_coefficient": 0.1,
+        "cost_coefficient": 0.1,
+        "trace_epsilon": 1.0e-6,
+    }
+    scientific["branching"] = {
             "fixed_beta": {"player": 1.5, "chance": 1.25},
             "beta_max": 3,
             "minimum_tree_size": 16,
-            "minimum_scale": 0.25,
-            "backoff_factor": 0.5,
-            "safe_tree_size": 512.0,
-        },
-        "cost_safeguard": {
-            "gamma_deviance_max": 0.2,
-            "p95_underprediction_max": 1.5,
-            "consecutive_iterations": 4,
-        },
+            "cost_safeguard": {
+                "gamma_deviance_max": 0.2,
+                "p95_underprediction_max": 1.5,
+                "consecutive_iterations": 4,
+            },
+    }
+    value["run"]["workload"]["tree_nodes"] = 512
+    value["run"]["recovery"] = {
+        "minimum_branch_scale": 0.25,
+        "branch_backoff_factor": 0.5,
     }
     if rollout == "branched.KKT":
-        value["branching"].update(
-            {
+        scientific["branching"]["kkt"] = {
                 "warmup_iterations": 5,
                 "target_tree_size": 256.0,
                 "gamma_kappa": 0.2,
@@ -257,11 +206,10 @@ def _scientific_config(regime: str, rollout: str) -> dict[str, object]:
                 "kappa_min": 0.25,
                 "kappa_max": 4.0,
                 "log_kappa": 0.0,
-            }
-        )
+        }
     if regime == "best_response":
-        value["frozen_profile"] = {"sha256": "a" * 64}
-        value["response_initialization"] = "target"
+        scientific["response_initialization"] = "target"
+        value["run"]["frozen"] = {"path": "target.pt", "sha256": "a" * 64}
     return value
 
 
@@ -271,32 +219,39 @@ def test_phase7_config_is_closed_for_exactly_four_sampled_modes(
     regime: str, rollout: str
 ) -> None:
     value = _scientific_config(regime, rollout)
-    config = BranchedModeConfig.from_mapping(value)
-    assert config.scientific_mapping()["mode"] == value["mode"]
+    config = load_config_mapping(value).scientific
+    assert isinstance(config, BranchedModeConfig)
+    assert dict(config.mode) == value["scientific"]["mode"]
     bad = dict(value)
-    bad["completion"] = {"n_samples": 2, "unexpected": {}}
-    with pytest.raises(ValueError, match="root.completion"):
-        BranchedModeConfig.from_mapping(bad)
+    bad["scientific"] = {**value["scientific"], "completion": {"samples": 2}}
+    with pytest.raises(ValueError, match="root.scientific.completion"):
+        load_config_mapping(bad)
     if rollout == "branched.KKT":
         bad_kkt = {
             **value,
-            "branching": {
-                **value["branching"],
-                "target_tree_size": 0,
+            "scientific": {
+                **value["scientific"],
+                "branching": {
+                    **value["scientific"]["branching"],
+                    "kkt": {
+                        **value["scientific"]["branching"]["kkt"],
+                        "target_tree_size": 0,
+                    },
+                },
             },
         }
-        with pytest.raises(ValueError, match="KKT controller bounds"):
-            BranchedModeConfig.from_mapping(bad_kkt)
+        with pytest.raises(ValueError, match="target_tree_size"):
+            load_config_mapping(bad_kkt)
 
 
 def test_branch_controller_requires_integral_capacity_bound() -> None:
     invalid = _scientific_config("self_play", "branched.fixed")
-    invalid["branching"] = {
-        **invalid["branching"],
+    invalid["scientific"]["branching"] = {
+        **invalid["scientific"]["branching"],
         "beta_max": 2.5,
     }
-    with pytest.raises(ValueError, match="controller bounds"):
-        BranchedModeConfig.from_mapping(invalid)
+    with pytest.raises(ValueError, match="positive integer"):
+        load_config_mapping(invalid)
     with pytest.raises(ValueError, match="positive integer"):
         FixedBranchController(
             {"player": 1.0, "chance": 1.0},
@@ -318,8 +273,8 @@ def test_branch_controller_requires_integral_capacity_bound() -> None:
 
 def test_fixed_config_accepts_stage_specific_player_beta_only() -> None:
     value = _scientific_config("self_play", "branched.fixed")
-    value["branching"] = {
-        **value["branching"],
+    value["scientific"]["branching"] = {
+        **value["scientific"]["branching"],
         "fixed_beta": {
             "player_pre": 14.0,
             "player_post": 2.0,
@@ -331,7 +286,8 @@ def test_fixed_config_accepts_stage_specific_player_beta_only() -> None:
             "chance": 3,
         },
     }
-    configured = BranchedModeConfig.from_mapping(value)
+    configured = load_config_mapping(value).scientific
+    assert isinstance(configured, BranchedModeConfig)
     assert dict(configured.branching["fixed_beta"]) == {
         "player_pre": 14.0,
         "player_post": 2.0,
@@ -343,16 +299,16 @@ def test_fixed_config_accepts_stage_specific_player_beta_only() -> None:
         "chance": 3,
     }
     value = _scientific_config("self_play", "branched.KKT")
-    value["branching"] = {
-        **value["branching"],
+    value["scientific"]["branching"] = {
+        **value["scientific"]["branching"],
         "fixed_beta": {
             "player_pre": 3.0,
             "player_post": 2.0,
             "chance": 2.4,
         },
     }
-    with pytest.raises(ValueError, match="KKT requires player/chance"):
-        BranchedModeConfig.from_mapping(value)
+    with pytest.raises(ValueError, match="invalid branch classes"):
+        load_config_mapping(value)
 
 
 @CUDA
@@ -375,22 +331,11 @@ def test_phase7_admission_covers_fixed_and_full_decision_workspaces() -> None:
         layout,
         device,
     )
-    trained_rows = sum(
-        manifest.partition_rows("trained_player_cap").values()
-    )
-    expected_learner = (
-        manifest.learner_sigma_pack_cap
-        * layout.learner_sigma_workspace_row_bytes
-        + manifest.learner_action_pack_cap
-        * layout.learner_action_workspace_row_bytes
-        + manifest.library_workspace_bytes
-        + trained_rows * BRANCHED_ALIAS_PEAK_ROW_BYTES
-    )
     assert (
         self_plan.admission(
             ExecutionPhase.LEARNER
         ).bounded_workspace_bytes
-        == expected_learner
+        == manifest.learner_workspace_bytes
     )
     self_rollout = self_plan.admission(
         ExecutionPhase.ROLLOUT
@@ -398,17 +343,10 @@ def test_phase7_admission_covers_fixed_and_full_decision_workspaces() -> None:
     response_rollout = response_plan.admission(
         ExecutionPhase.ROLLOUT
     ).bounded_workspace_bytes
-    assert (
-        response_rollout - self_rollout
-        == manifest.family_pack_cap * layout.family_workspace_row_bytes
-    )
-    assert (
-        layout.chance_frontier_row_bytes
-        == _sampled_chance_frontier_row_bytes(geometry)
-    )
-    assert (
-        layout.topology_packet_row_bytes
-        == _TOPOLOGY_PACKET_ROW_BYTES
+    assert response_rollout == self_rollout == manifest.rollout_workspace_bytes
+    assert manifest.learner_workspace_bytes >= (
+        sum(manifest.partition_rows("trained_player_cap").values())
+        * BRANCHED_ALIAS_PEAK_ROW_BYTES
     )
     with pytest.raises(ValueError, match="root count"):
         BranchedRecoveryHarness(
@@ -847,6 +785,9 @@ def test_branched_checkpoint_round_trip_preserves_controllers(
     )
     generator = torch.Generator(device=device).manual_seed(881)
     scientific = {"mode": "self_play/branched.KKT/sampled", "seed": 881}
+    execution_manifest = seal_execution_manifest(
+        {"schema": "test_resolved_execution_v1", "checkpoint_every": 1}
+    )
     path = tmp_path / "phase7.pt"
     save_checkpoint(
         path,
@@ -860,7 +801,7 @@ def test_branched_checkpoint_round_trip_preserves_controllers(
         ),
         run_state=run,
         scientific_config=scientific,
-        execution_config={"checkpoint_every": 1},
+        execution_config=execution_manifest,
         generator=generator,
     )
     _, _, resumed, _ = load_checkpoint(
@@ -869,6 +810,7 @@ def test_branched_checkpoint_round_trip_preserves_controllers(
         optimizer=optimizer,
         reference_model=reference,
         expected_scientific_config=scientific,
+        expected_execution_config=execution_manifest,
         generator=generator,
     )
     assert (
@@ -894,6 +836,7 @@ def test_branched_checkpoint_round_trip_preserves_controllers(
             optimizer=optimizer,
             reference_model=reference,
             expected_scientific_config=scientific,
+            expected_execution_config=execution_manifest,
             generator=generator,
         )
 

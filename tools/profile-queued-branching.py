@@ -10,7 +10,6 @@ conservative capacities.
 from __future__ import annotations
 
 import argparse
-import copy
 import hashlib
 import json
 import math
@@ -292,7 +291,7 @@ class ProfileScenario:
     output: Path
     fixed_beta: Mapping[str, float]
     minimum_tree_size: int
-    safe_tree_size: float | None
+    safe_tree_size: float
     cost_safeguard: Mapping[str, object] | None
     completion_samples: int
     posterior_max_attempts: int
@@ -323,8 +322,8 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
         raise ValueError("profile config requires exactly kind, run, and profile")
     if document["kind"] != "branching_profile_v1":
         raise ValueError("profile kind must be branching_profile_v1")
-    source = copy.deepcopy(document["run"])
-    if not isinstance(source, dict):
+    base_source = document["run"]
+    if not isinstance(base_source, Mapping):
         raise TypeError("profile run must be an ordinary run specification")
     profile_raw = document["profile"]
     if not isinstance(profile_raw, Mapping):
@@ -360,12 +359,11 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
     if not isinstance(scenario_raw, Mapping):
         raise TypeError(f"profile.scenarios.{scenario_name}: expected an object")
     scenario = dict(scenario_raw)
-    expected_scenario = {
+    required_scenario = {
         "output",
         "fixed_beta",
         "minimum_tree_size",
         "safe_tree_size",
-        "cost_safeguard",
         "completion_samples",
         "posterior_max_attempts",
         "seed",
@@ -374,9 +372,10 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
         "historical_physical_gpu",
         "expected_outcome",
     }
-    if set(scenario) != expected_scenario:
-        unknown = sorted(set(scenario).difference(expected_scenario))
-        missing = sorted(expected_scenario.difference(scenario))
+    allowed_scenario = required_scenario | {"cost_safeguard"}
+    if not required_scenario.issubset(scenario) or not set(scenario).issubset(allowed_scenario):
+        unknown = sorted(set(scenario).difference(allowed_scenario))
+        missing = sorted(required_scenario.difference(scenario))
         name = unknown[0] if unknown else missing[0]
         detail = "unknown" if unknown else "missing"
         raise ValueError(f"profile.scenarios.{scenario_name}.{name}: {detail} field")
@@ -439,7 +438,7 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
             "must be nonempty strings"
         )
     safe_tree_size = scenario["safe_tree_size"]
-    if safe_tree_size is not None and (
+    if (
         isinstance(safe_tree_size, bool)
         or not isinstance(safe_tree_size, (int, float))
         or float(safe_tree_size) < 1
@@ -447,7 +446,7 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
         raise ValueError(
             f"profile.scenarios.{scenario_name}.safe_tree_size: invalid bound"
         )
-    safeguard_raw = scenario["cost_safeguard"]
+    safeguard_raw = scenario.get("cost_safeguard")
     safeguard: Mapping[str, object] | None
     if safeguard_raw is None:
         safeguard = None
@@ -470,19 +469,12 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
         safeguard = values
     else:
         raise ValueError(
-            f"profile.scenarios.{scenario_name}.cost_safeguard: expected object or null"
+            f"profile.scenarios.{scenario_name}.cost_safeguard: expected object"
         )
-    scientific = source["scientific"]
-    run = source["run"]
-    scientific["branching"]["fixed_beta"] = dict(fixed_beta_raw)
-    scientific["branching"]["minimum_tree_size"] = int(scenario["minimum_tree_size"])
-    scientific["completion"]["samples"] = int(scenario["completion_samples"])
-    run["seed"] = int(scenario["seed"])
-    run["output_dir"] = str(Path(str(scenario["output"])).parent)
-    if safe_tree_size is not None:
-        run["workload"]["tree_nodes"] = int(safe_tree_size)
-    if isinstance(safeguard, Mapping):
-        scientific["branching"]["cost_safeguard"] = {
+    scientific = dict(base_source["scientific"])
+    base_branching = dict(scientific["branching"])
+    scenario_safeguard = (
+        {
             name: safeguard[name]
             for name in (
                 "gamma_deviance_max",
@@ -490,6 +482,33 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
                 "consecutive_iterations",
             )
         }
+        if isinstance(safeguard, Mapping)
+        else base_branching["cost_safeguard"]
+    )
+    source = {
+        **dict(base_source),
+        "scientific": {
+            **scientific,
+            "branching": {
+                **base_branching,
+                "fixed_beta": dict(fixed_beta_raw),
+                "minimum_tree_size": int(scenario["minimum_tree_size"]),
+                "cost_safeguard": scenario_safeguard,
+            },
+            "completion": {
+                "samples": int(scenario["completion_samples"]),
+            },
+        },
+        "run": {
+            **dict(base_source["run"]),
+            "seed": int(scenario["seed"]),
+            "output_dir": str(Path(str(scenario["output"])).parent),
+            "workload": {
+                **dict(base_source["run"]["workload"]),
+                "tree_nodes": int(safe_tree_size),
+            },
+        },
+    }
     root = load_config_mapping(source)
     if (
         not isinstance(root.scientific, BranchedModeConfig)
@@ -515,7 +534,7 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
             output=Path(str(scenario["output"])).resolve(),
             fixed_beta={name: float(value) for name, value in fixed_beta_raw.items()},
             minimum_tree_size=int(scenario["minimum_tree_size"]),
-            safe_tree_size=(None if safe_tree_size is None else float(safe_tree_size)),
+            safe_tree_size=float(safe_tree_size),
             cost_safeguard=safeguard,
             completion_samples=int(scenario["completion_samples"]),
             posterior_max_attempts=int(scenario["posterior_max_attempts"]),

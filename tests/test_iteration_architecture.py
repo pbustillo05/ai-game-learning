@@ -12,7 +12,6 @@ from pbg.core.capacity import (
     CapacityManifest,
     ExecutionGeometry,
     ExecutionPhase,
-    ExternalWorkspaceBounds,
     GeneratedOwners,
     HardwareLimits,
     NamedShape,
@@ -231,22 +230,17 @@ def _neutral_plan(device: torch.device):
         learner_action_pack_cap=2,
         topology_packet_cap=4,
         target_arena_cap=8,
-        movement_scratch_bytes=4096,
-        library_workspace_bytes=4096,
-        evaluator_workspace_bytes=4096,
-        memory_guard_bytes=4096,
+        rollout_workspace_bytes=8192,
+        queue_drain_workspace_bytes=4096,
+        completion_workspace_bytes=8192,
+        align_workspace_bytes=8192,
+        target_workspace_bytes=8192,
+        learner_workspace_bytes=8192,
         hardware=HardwareLimits(
             total_memory_bytes=torch.cuda.get_device_properties(
                 device
             ).total_memory,
-            memory_budget_bytes=64 * 1024 * 1024,
-            training_max_tokens=16,
-            training_max_token_pairs=256,
-            query_chunk_size=4,
-        ),
-        required_external=ExternalWorkspaceBounds(
-            library_bytes=0,
-            evaluator_bytes=0,
+            usable_memory_bytes=64 * 1024 * 1024,
         ),
     )
     layout = PhysicalLayout(
@@ -254,12 +248,6 @@ def _neutral_plan(device: torch.device):
         player_count=1,
         stratum_count=1,
         evaluator_private_width=1,
-        family_workspace_row_bytes=256,
-        chance_frontier_row_bytes=256,
-        completion_workspace_row_bytes=256,
-        learner_sigma_workspace_row_bytes=256,
-        learner_action_workspace_row_bytes=256,
-        topology_packet_row_bytes=256,
         opaque_fields=(
             SoAField("leaf_public_state", torch.float32, (1,)),
             SoAField("leaf_private_profile", torch.int32, (1,), fill=-1),

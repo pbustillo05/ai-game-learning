@@ -13,7 +13,6 @@ from pbg.core.capacity import (
     CapacityManifest,
     ExecutionGeometry,
     ExecutionPhase,
-    ExternalWorkspaceBounds,
     GeneratedOwners,
     HardwareLimits,
     NamedShape,
@@ -22,6 +21,7 @@ from pbg.core.capacity import (
     build_storage_plan,
 )
 from pbg.core.contracts import MODE_SCHEMAS
+from pbg.core.execution_manifest import seal_execution_manifest
 from pbg.core.iteration import IterationError
 from pbg.core.learner import (
     AlignedSequentialStore,
@@ -59,9 +59,6 @@ from pbg.core.training import (
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.model.capacity import max_policy_partition_sequence_tokens
 from pbg.games.poker.queued.config import PokerScientificConfig
-from pbg.games.poker.queued.folded import (
-    sequential_family_workspace_row_bytes,
-)
 from pbg.games.poker.queued.hooks import (
     NLHEGeometry,
     PokerStateMachine,
@@ -726,8 +723,8 @@ def _phase5_manifest(device: torch.device) -> CapacityManifest:
             PartitionRows("post_2", 20),
         ),
         folded_range_cap=(
-            PartitionRows("pre", 2),
-            PartitionRows("post", 2),
+            PartitionRows("pre", 0),
+            PartitionRows("post", 0),
         ),
         leaf_cap=8,
         topology_cap=8,
@@ -739,18 +736,16 @@ def _phase5_manifest(device: torch.device) -> CapacityManifest:
         learner_action_pack_cap=8,
         topology_packet_cap=8,
         target_arena_cap=16,
-        movement_scratch_bytes=1 << 20,
-        library_workspace_bytes=1024,
-        evaluator_workspace_bytes=1024,
-        memory_guard_bytes=1024,
+        rollout_workspace_bytes=1 << 20,
+        queue_drain_workspace_bytes=1024,
+        completion_workspace_bytes=2048,
+        align_workspace_bytes=(1 << 20) + 1024,
+        target_workspace_bytes=(1 << 20) + 1024,
+        learner_workspace_bytes=1 << 20,
         hardware=HardwareLimits(
             torch.cuda.get_device_properties(device).total_memory,
             64 << 20,
-            1024,
-            1_000_000,
-            64,
         ),
-        required_external=ExternalWorkspaceBounds(0, 0),
     )
 
 
@@ -768,14 +763,6 @@ def _phase5_layout(
         player_count=2,
         stratum_count=2,
         evaluator_private_width=4,
-        family_workspace_row_bytes=sequential_family_workspace_row_bytes(
-            geometry, 4
-        ),
-        chance_frontier_row_bytes=32,
-        completion_workspace_row_bytes=64,
-        learner_sigma_workspace_row_bytes=64,
-        learner_action_workspace_row_bytes=64,
-        topology_packet_row_bytes=88,
         opaque_fields=(
             SoAField("leaf_public_state", torch.uint8, (5,), fill=255),
             SoAField(
@@ -1010,11 +997,9 @@ def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
             "model": {
                 "d_model": 4,
                 "n_heads": 1,
-                "n_layers_pre": 1,
-                "n_layers_post": 1,
-                "m_raise": 2,
-                "s_min": 0.02,
-                "max_players": 2,
+                "layers": {"pre": 1, "post": 1},
+                "raises": {"components": 2, "minimum_scale": 0.02},
+                "seat_capacity": 2,
                 "class_embedding_dim": 2,
                 "ffn_hidden": 8,
                 "folder_beta_rank": 0,
@@ -1024,10 +1009,10 @@ def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
         },
         device,
     )
-    model.configure_execution("sdpa", 64)
+    model.configure_execution("sdpa")
     assert all(
         attention.attention_backend == "sdpa"
-        and attention.query_chunk_size == 64
+        and attention.query_chunk_size is None
         for attention in (
             *model.preflop.attentions,
             *model.postflop.attentions,
@@ -1051,11 +1036,6 @@ def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
         _phase5_manifest(device),
         geometry=ExecutionGeometry(
             2, 15, token_bound, token_bound * token_bound
-        ),
-        hardware=replace(
-            _phase5_manifest(device).hardware,
-            training_max_tokens=token_bound,
-            training_max_token_pairs=token_bound * token_bound,
         ),
         topology_cap=16,
         topology_edge_cap=16,
@@ -1655,6 +1635,9 @@ def test_checkpoint_resume_is_strict_and_execution_drift_is_allowed(
     )
     scientific = {"mode": "self_play/sequential/sampled", "seed": 41}
     path = tmp_path / "checkpoint.pt"
+    execution_manifest = seal_execution_manifest(
+        {"schema": "test_resolved_execution_v1", "checkpoint_every": 5}
+    )
     digest = save_checkpoint(
         path,
         model=model,
@@ -1666,7 +1649,7 @@ def test_checkpoint_resume_is_strict_and_execution_drift_is_allowed(
         ),
         run_state=run,
         scientific_config=scientific,
-        execution_config={"checkpoint_every": 5},
+        execution_config=execution_manifest,
         generator=generator,
     )
     assert digest == sha256_file(path)
@@ -1679,13 +1662,14 @@ def test_checkpoint_resume_is_strict_and_execution_drift_is_allowed(
         optimizer=optimizer,
         reference_model=reference,
         expected_scientific_config=scientific,
+        expected_execution_config=execution_manifest,
         generator=generator,
     )
     torch.testing.assert_close(model.weight, torch.tensor([0.4, -0.8, 1.2], device=device))
     torch.testing.assert_close(optimizer.exp_avg, torch.full((3,), 0.3, device=device))
     assert resumed.recovered_overflow and resumed.iteration == 6
     assert reference_state.interval_iterations == 3
-    assert execution == {"checkpoint_every": 5}
+    assert execution == execution_manifest
     assert torch.equal(generator.get_state(), generator_state)
     with pytest.raises(Exception, match="scientific"):
         load_checkpoint(
@@ -1694,33 +1678,11 @@ def test_checkpoint_resume_is_strict_and_execution_drift_is_allowed(
             optimizer=optimizer,
             reference_model=reference,
             expected_scientific_config={**scientific, "seed": 42},
+            expected_execution_config=execution_manifest,
             generator=generator,
         )
 
 
 
-def test_strict_phase5_config_reports_dotted_unknown_path() -> None:
-    value = {
-        "mode": {
-            "training_regime": "self_play",
-            "rollout_mode": "sequential",
-            "private_estimator": "sampled",
-        },
-        "game": {"players": 2, "stack_bb": 8.0, "rank_count": 13},
-        "model": {},
-        "loss": {},
-        "optimizer": {},
-        "schedule": {"batch_size": 4},
-        "precision": {},
-        "reference": {},
-        "lambda": 0.95,
-        "root_count": 8,
-        "root_count_minimum": 2,
-        "seed": 7,
-    }
-    config = PokerScientificConfig.from_mapping(value)
-    assert config.root_count == 8
-    with pytest.raises(ValueError, match=r"root\.game\.ranks"):
-        PokerScientificConfig.from_mapping(
-            {**value, "game": {**value["game"], "ranks": 13}}
-        )
+def test_runtime_scientific_product_has_no_legacy_mapping_parser() -> None:
+    assert not hasattr(PokerScientificConfig, "from_mapping")

@@ -12,7 +12,6 @@ from pbg.core.capacity import (
     CapacityManifest,
     ExecutionGeometry,
     ExecutionPhase,
-    ExternalWorkspaceBounds,
     GeneratedOwners,
     HardwareLimits,
     NamedShape,
@@ -92,12 +91,6 @@ def _layout() -> PhysicalLayout:
         player_count=2,
         stratum_count=3,
         evaluator_private_width=28,
-        family_workspace_row_bytes=64,
-        chance_frontier_row_bytes=48,
-        completion_workspace_row_bytes=96,
-        learner_sigma_workspace_row_bytes=64,
-        learner_action_workspace_row_bytes=48,
-        topology_packet_row_bytes=32,
         opaque_fields=(
             SoAField("leaf_public_state", torch.uint8, (5,), fill=255),
             SoAField("leaf_private_profile", torch.int32, (2,), fill=-1),
@@ -109,7 +102,7 @@ def _manifest(
     mode,
     *,
     device: torch.device,
-    memory_budget_bytes: int = 64 * 1024 * 1024,
+    usable_memory_bytes: int = 64 * 1024 * 1024,
 ) -> CapacityManifest:
     action_names = (
         ("pre", "post2")
@@ -140,8 +133,8 @@ def _manifest(
             PartitionRows(name, action_rows) for name in action_names
         ),
         folded_range_cap=(
-            PartitionRows("pre", 4),
-            PartitionRows("post", 4),
+            PartitionRows("pre", 0),
+            PartitionRows("post", 0),
         ),
         leaf_cap=8,
         topology_cap=8,
@@ -153,20 +146,15 @@ def _manifest(
         learner_action_pack_cap=8,
         topology_packet_cap=8,
         target_arena_cap=16,
-        movement_scratch_bytes=4096,
-        library_workspace_bytes=2048,
-        evaluator_workspace_bytes=2048,
-        memory_guard_bytes=4096,
+        rollout_workspace_bytes=8192,
+        queue_drain_workspace_bytes=2048,
+        completion_workspace_bytes=4096,
+        align_workspace_bytes=6144,
+        target_workspace_bytes=6144,
+        learner_workspace_bytes=8192,
         hardware=HardwareLimits(
             total_memory_bytes=torch.cuda.get_device_properties(device).total_memory,
-            memory_budget_bytes=memory_budget_bytes,
-            training_max_tokens=1024,
-            training_max_token_pairs=1_000_000,
-            query_chunk_size=128,
-        ),
-        required_external=ExternalWorkspaceBounds(
-            library_bytes=1024,
-            evaluator_bytes=1024,
+            usable_memory_bytes=usable_memory_bytes,
         ),
     )
 
@@ -624,24 +612,24 @@ def test_manifest_rejects_uncovered_geometry_hardware_and_workspaces() -> None:
             layout,
             device,
         )
-    with pytest.raises(CapacityError, match="token limit"):
+    with pytest.raises(CapacityError, match="device memory"):
         build_storage_plan(
             mode,
             partitions,
             replace(
                 manifest,
-                hardware=replace(manifest.hardware, training_max_tokens=50),
+                hardware=replace(manifest.hardware, total_memory_bytes=50),
             ),
             layout,
             device,
         )
     with pytest.raises(CapacityError, match="workspace"):
-        replace(manifest, evaluator_workspace_bytes=512)
+        replace(manifest, completion_workspace_bytes=-1)
     with pytest.raises(AdmissionError):
         build_storage_plan(
             mode,
             partitions,
-            _manifest(mode, device=device, memory_budget_bytes=1024),
+            _manifest(mode, device=device, usable_memory_bytes=1024),
             layout,
             device,
         )
@@ -693,9 +681,9 @@ def test_phase_allocation_is_transactional_and_release_is_at_last_consumer() -> 
 
 def test_manifest_vocabulary_and_firewall_remain_closed() -> None:
     assert len(CAPACITY_VOCABULARY.partitioned_rows) == 4
-    assert len(CAPACITY_VOCABULARY.scalar_rows) == 3
+    assert len(CAPACITY_VOCABULARY.scalar_rows) == 4
     assert len(CAPACITY_VOCABULARY.pack_limits) == 6
-    assert len(CAPACITY_VOCABULARY.workspaces) == 5
+    assert len(CAPACITY_VOCABULARY.workspaces) == 6
     names = frozenset(
         (
             *CAPACITY_VOCABULARY.partitioned_rows,
@@ -704,7 +692,7 @@ def test_manifest_vocabulary_and_firewall_remain_closed() -> None:
             *CAPACITY_VOCABULARY.workspaces,
         )
     )
-    assert len(names) == 18
+    assert len(names) == 20
     assert core_firewall_violations(REPOSITORY / "pbg" / "core") == ()
     source = (REPOSITORY / "pbg" / "core" / "storage.py").read_text(
         encoding="utf-8"

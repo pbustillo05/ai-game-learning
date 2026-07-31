@@ -406,7 +406,7 @@ def benchmark_summary(
         or not isinstance(scientific.get("schedule"), Mapping)
     ):
         raise PilotError("benchmark report is incomplete")
-    gradient_steps = int(scientific["schedule"]["gradient_steps"])
+    gradient_steps = int(scientific["schedule"]["steps"])
     for sample in samples:
         if not isinstance(sample, Mapping):
             raise PilotError("benchmark sample is not an object")

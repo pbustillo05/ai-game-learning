@@ -74,6 +74,60 @@ class BranchedPosteriorExhaustion(BranchedPokerError):
         self.failure = failure
 
 
+BRANCHED_TOPOLOGY_PACKET_ROW_BYTES = 95
+
+
+def sampled_branched_chance_frontier_row_bytes(
+    geometry: NLHEGeometry,
+) -> int:
+    """Concurrent tensors retained by one sampled branched frontier row."""
+
+    from pbg.games.poker.queued.folded import folded_statistics_workspace_row_bytes
+
+    players = geometry.players
+    hands = geometry.private_hands
+    history = (
+        geometry.postflop_base_model_input_width
+        - 8
+        - 10 * players
+        - players * hands
+    ) // 10
+    return (
+        512
+        + 8 * geometry.postflop_model_input_width
+        + 16 * players * hands
+        + 128 * history
+        + 64 * geometry.deck_cards
+        + 128 * players
+        + 3 * BRANCHED_TOPOLOGY_PACKET_ROW_BYTES
+        + folded_statistics_workspace_row_bytes(geometry)
+    )
+
+
+def branched_rb_chance_frontier_row_bytes(
+    geometry: NLHEGeometry,
+    *,
+    max_attempts: int = 256,
+) -> int:
+    """Add the bounded posterior sampler tensors to the shared frontier."""
+
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be positive")
+    return (
+        sampled_branched_chance_frontier_row_bytes(geometry)
+        + 4 * geometry.players * geometry.private_hands
+        + max_attempts
+        * (4 * geometry.players + 2 * geometry.deck_cards + geometry.players)
+        + 32
+    )
+
+
+def branched_topology_packet_row_bytes() -> int:
+    """Exact compact topology packet payload retained per admitted row."""
+
+    return BRANCHED_TOPOLOGY_PACKET_ROW_BYTES
+
+
 def action_conditioned_log_reach(
     log_reach: Tensor,
     selected_log_policy: Tensor,
@@ -1061,6 +1115,8 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             include_self=True,
         )
         stored_fold = fold & fold_consumed.gt(0)
+        if self.geometry.players == 2:
+            stored_fold.zero_()
         finite_fold = torch.isfinite(fold_log_reach)
         fold_gauge = fold_log_reach.masked_fill(
             ~finite_fold, -torch.inf
@@ -1289,16 +1345,18 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             published.append(queue)
             queue_cost_additions.append(cost_addition)
 
-        folded_destination = len(destinations)
-        destinations.append(
-            DeviceDestinationRequest(
-                folded_slab,
-                fold_count,
-                folded_values,
-                batch.input_type,
-                address,
+        folded_destination = 0
+        if self.geometry.players > 2:
+            folded_destination = len(destinations)
+            destinations.append(
+                DeviceDestinationRequest(
+                    folded_slab,
+                    fold_count,
+                    folded_values,
+                    batch.input_type,
+                    address,
+                )
             )
-        )
         descriptor_source: list[Tensor] = []
         descriptor_destination: list[Tensor] = []
         descriptor_ordinal: list[Tensor] = []
@@ -1588,4 +1646,7 @@ __all__ = [
     "BranchedPosteriorExhaustion",
     "BranchedSampledPokerHooks",
     "action_conditioned_log_reach",
+    "branched_rb_chance_frontier_row_bytes",
+    "branched_topology_packet_row_bytes",
+    "sampled_branched_chance_frontier_row_bytes",
 ]

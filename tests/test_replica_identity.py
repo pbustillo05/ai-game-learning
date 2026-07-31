@@ -19,7 +19,6 @@ from pbg.core.branching import (
 from pbg.core.capacity import (
     CapacityManifest,
     ExecutionGeometry,
-    ExternalWorkspaceBounds,
     GeneratedOwners,
     HardwareLimits,
     NamedShape,
@@ -28,6 +27,7 @@ from pbg.core.capacity import (
     build_storage_plan,
 )
 from pbg.core.contracts import mode_schema
+from pbg.core.execution_manifest import seal_execution_manifest
 from pbg.core.iteration import IterationBatchResult
 from pbg.core.learner import (
     LearnerDTypes,
@@ -54,7 +54,6 @@ from pbg.core.replica import (
 )
 from pbg.core.storage import SoAField
 from pbg.core.training import LearnerIteration, TrainingError
-from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
 from pbg.games.poker.queued.hooks import (
     NLHEGeometry,
     PokerForwardInput,
@@ -345,8 +344,8 @@ def _poker_manifest(
             PartitionRows("post_2", 20),
         ),
         folded_range_cap=(
-            PartitionRows("pre", 2),
-            PartitionRows("post", 2),
+            PartitionRows("pre", 0),
+            PartitionRows("post", 0),
         ),
         leaf_cap=8,
         topology_cap=8 * n_replica,
@@ -358,18 +357,16 @@ def _poker_manifest(
         learner_action_pack_cap=8,
         topology_packet_cap=8,
         target_arena_cap=16 * n_replica,
-        movement_scratch_bytes=1 << 20,
-        library_workspace_bytes=1024,
-        evaluator_workspace_bytes=1024,
-        memory_guard_bytes=1024,
+        rollout_workspace_bytes=8 << 20,
+        queue_drain_workspace_bytes=1024,
+        completion_workspace_bytes=8 << 20,
+        align_workspace_bytes=(1 << 20) + 1024,
+        target_workspace_bytes=(1 << 20) + 1024,
+        learner_workspace_bytes=1 << 20,
         hardware=HardwareLimits(
             torch.cuda.get_device_properties(device).total_memory,
             64 << 20,
-            1024,
-            1_000_000,
-            64,
         ),
-        required_external=ExternalWorkspaceBounds(0, 0),
     )
 
 
@@ -382,14 +379,6 @@ def _poker_layout(geometry: NLHEGeometry) -> PhysicalLayout:
         player_count=2,
         stratum_count=2,
         evaluator_private_width=4,
-        family_workspace_row_bytes=sequential_family_workspace_row_bytes(
-            geometry, 1
-        ),
-        chance_frontier_row_bytes=32,
-        completion_workspace_row_bytes=64,
-        learner_sigma_workspace_row_bytes=64,
-        learner_action_workspace_row_bytes=64,
-        topology_packet_row_bytes=88,
         opaque_fields=(
             SoAField("leaf_public_state", torch.uint8, (5,), fill=255),
             SoAField("leaf_private_profile", torch.int32, (2,), fill=-1),
@@ -783,11 +772,11 @@ def test_shared_owner_branched_poker_preserves_fixed_kkt_lane_identity(
         if estimator == "rao_blackwell":
             return (
                 build_model_from_config(
-                    _branched_rb_config(selected_regime, "branched.fixed"),
+                    _branched_rb_config(selected_regime, "branched.fixed")["scientific"],
                     device,
                 ),
                 build_model_from_config(
-                    _branched_rb_config(selected_regime, "branched.KKT"),
+                    _branched_rb_config(selected_regime, "branched.KKT")["scientific"],
                     device,
                 ),
             )
@@ -1360,13 +1349,16 @@ def test_replica_checkpoint_round_trip_preserves_every_lane(tmp_path: Path) -> N
     optimizer_before = copy.deepcopy(optimizers.state_dict())
     rng_before = tuple(generator.get_state() for generator in generators)
     path = tmp_path / "replicas.pt"
+    execution_manifest = seal_execution_manifest(
+        {"schema": "test_resolved_execution_v1", "hardware": "test"}
+    )
     save_replica_checkpoint(
         path,
         modules=modules,
         optimizers=optimizers,
         run_states=runs,
         scientific_configs=scientific,
-        execution_config={"hardware": "test"},
+        execution_config=execution_manifest,
         generators=generators,
     )
     with torch.no_grad():
@@ -1379,10 +1371,11 @@ def test_replica_checkpoint_round_trip_preserves_every_lane(tmp_path: Path) -> N
         modules=modules,
         optimizers=optimizers,
         expected_scientific_configs=scientific,
+        expected_execution_config=execution_manifest,
         generators=generators,
         restore_ambient_rng=False,
     )
-    assert execution == {"hardware": "test"}
+    assert execution == execution_manifest
     assert tuple(run.run_id for run in restored_runs) == (
         "replica-lane-0",
         "replica-lane-1",

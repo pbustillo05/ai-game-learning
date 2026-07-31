@@ -81,7 +81,7 @@ def _frozen_state(cfg: RootConfig) -> dict[str, torch.Tensor] | None:
     if path is None:
         return None
     payload = _checkpoint_payload(path)
-    expected = cfg.scientific.applicable["frozen_profile"]["sha256"]
+    expected = cfg.scientific.applicable["frozen_sha256"]
     if sha256_file(path) != expected:
         raise RuntimeError("frozen checkpoint content hash differs from configuration")
     model = payload.get("model")
@@ -393,34 +393,38 @@ class TrainingSession:
 
     def _resume(self, path: Path) -> None:
         scientific = self.config.scientific_mapping()
+        execution = self.config.execution.mapping()
         if self.distributed is not None and dist.get_world_size() > 1:
             rank_paths = load_distributed_checkpoint_manifest(
                 path,
                 expected_scientific_config=scientific,
+                expected_execution_config=execution,
                 world_size=dist.get_world_size(),
             )
             path = rank_paths[dist.get_rank()]
         if self.plan.manifest.n_replica == 1:
             optimizer = self.optimizers.optimizers[0]
-            scaler, reference, state, _execution = load_checkpoint(
+            scaler, reference, state, _ = load_checkpoint(
                 path,
                 model=self.modules.lane_module(0),
                 optimizer=optimizer,
                 reference_model=self.reference_modules.lane_module(0),
                 expected_scientific_config=scientific,
+                expected_execution_config=execution,
                 generator=self.generators[0],
             )
             optimizer.scaler = scaler
             self.reference_states = (reference,)
             self.run_states = (state,)
         else:
-            references, states, _execution = load_replica_checkpoint(
+            references, states, _ = load_replica_checkpoint(
                 path,
                 modules=self.modules,
                 optimizers=self.optimizers,
                 expected_scientific_configs=tuple(
                     scientific for _ in self.run_states
                 ),
+                expected_execution_config=execution,
                 generators=self.generators,
                 reference_modules=self.reference_modules,
             )
@@ -515,7 +519,9 @@ class TrainingSession:
         models = tuple(
             self.modules.lane_module(lane) for lane in range(count)
         )
-        completion = self.config.scientific.applicable.get("completion", {})
+        completion_samples = int(
+            self.config.scientific.applicable.get("completion_samples", 0)
+        )
         shared_inference = count > 1 or self.distributed is not None
         return PokerOperations(
             geometry=self.geometry,
@@ -536,7 +542,7 @@ class TrainingSession:
             seed=self.config.scientific.common.seed,
             precision=self.config.scientific.common.precision.name,
             utility=self.config.scientific.common.utility,
-            completion_samples=int(completion.get("n_samples", 0)),
+            completion_samples=completion_samples,
             response_cutoff="probe" in self.config.scientific.applicable,
             inference=self.inference if shared_inference else None,
             frozen_inference=(
@@ -635,9 +641,7 @@ class TrainingSession:
         ]
         local_total = sum(local_nodes)
         samples_per_leaf = int(
-            self.config.scientific.applicable.get("completion", {}).get(
-                "n_samples", 0
-            )
+            self.config.scientific.applicable.get("completion_samples", 0)
         )
         local_effective = [
             float(
@@ -860,8 +864,8 @@ class TrainingSession:
                         "leaf_rows": int(getattr(lane_result, "leaves", 0)),
                         "samples_per_leaf": int(
                             self.config.scientific.applicable.get(
-                                "completion", {}
-                            ).get("n_samples", 0)
+                                "completion_samples", 0
+                            )
                         ),
                         "logical_samples": int(
                             state.logical_work["completion_samples"]
@@ -874,7 +878,7 @@ class TrainingSession:
                     },
                     "memory": {
                         "configured_budget_bytes": (
-                            self.plan.manifest.hardware.memory_budget_bytes
+                            self.plan.manifest.hardware.usable_memory_bytes
                         ),
                         "admitted_phase_required_bytes": {
                             admission.phase.name: admission.required_bytes

@@ -11,6 +11,7 @@ from typing import Any
 
 import torch
 
+from pbg.config import ConfigError, validate_scientific_mapping
 from pbg.core.persistence import (
     CHECKPOINT_SCHEMA,
     DISTRIBUTED_CHECKPOINT_SCHEMA,
@@ -20,7 +21,6 @@ from pbg.core.persistence import (
     sha256_file,
     validate_checkpoint_payload,
 )
-from pbg.games.poker.queued.config import BranchedModeConfig, SequentialModeConfig
 
 INFERENCE_ARTIFACT_SCHEMA_VERSION = "pbg-queued-inference-v1"
 _FIELDS = {
@@ -66,23 +66,17 @@ def _load_artifact(path: Path) -> dict[str, Any]:
     ):
         raise RuntimeError("runtime accepts only strict queued inference artifacts")
     scientific = value["scientific_config"]
-    if not isinstance(scientific, dict) or not isinstance(
-        scientific.get("mode"), dict
-    ):
+    if not isinstance(scientific, dict):
         raise RuntimeError(  # noqa: TRY004 - malformed serialized artifact
             "inference artifact scientific configuration is invalid"
         )
     try:
-        parsed = (
-            SequentialModeConfig.from_mapping(scientific)
-            if scientific["mode"].get("rollout_mode") == "sequential"
-            else BranchedModeConfig.from_mapping(scientific)
-        )
-    except (TypeError, ValueError) as exc:
+        parsed = validate_scientific_mapping(scientific)
+    except (ConfigError, TypeError, ValueError) as exc:
         raise RuntimeError(
             f"inference artifact scientific configuration is invalid: {exc}"
         ) from exc
-    if parsed.scientific_mapping() != scientific:
+    if parsed != scientific:
         raise RuntimeError(
             "inference artifact scientific configuration is not canonical"
         )
@@ -156,6 +150,7 @@ def export_inference_artifact(
         rank_paths = load_distributed_checkpoint_manifest(
             source,
             expected_scientific_config=checkpoint["scientific_config"],
+            expected_execution_config=checkpoint["execution_config"],
             world_size=int(checkpoint["world_size"]),
         )
         checkpoint = torch.load(

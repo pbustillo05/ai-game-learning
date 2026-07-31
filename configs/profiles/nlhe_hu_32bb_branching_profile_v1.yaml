@@ -140,7 +140,6 @@ profile:
         chance: 3.0
       minimum_tree_size: 1000
       safe_tree_size: 10000.0
-      cost_safeguard: null
       completion_samples: 1024
       posterior_max_attempts: 256
       seed: 104830

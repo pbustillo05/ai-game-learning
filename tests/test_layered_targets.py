@@ -13,7 +13,6 @@ from pbg.core.capacity import (
     CapacityManifest,
     ExecutionGeometry,
     ExecutionPhase,
-    ExternalWorkspaceBounds,
     GeneratedOwners,
     HardwareLimits,
     NamedShape,
@@ -342,12 +341,6 @@ def _layout() -> PhysicalLayout:
         player_count=2,
         stratum_count=2,
         evaluator_private_width=4,
-        family_workspace_row_bytes=32,
-        chance_frontier_row_bytes=32,
-        completion_workspace_row_bytes=64,
-        learner_sigma_workspace_row_bytes=32,
-        learner_action_workspace_row_bytes=32,
-        topology_packet_row_bytes=64,
         opaque_fields=(
             SoAField("leaf_public_state", torch.uint8, (5,), fill=255),
             SoAField("leaf_private_profile", torch.int32, (2,), fill=-1),
@@ -379,8 +372,8 @@ def _manifest(mode, device: torch.device) -> CapacityManifest:
             for partition in action_partitions
         ),
         folded_range_cap=(
-            PartitionRows("pre", 2),
-            PartitionRows("post", 2),
+            PartitionRows("pre", 0),
+            PartitionRows("post", 0),
         ),
         leaf_cap=8,
         topology_cap=8,
@@ -392,18 +385,16 @@ def _manifest(mode, device: torch.device) -> CapacityManifest:
         learner_action_pack_cap=8,
         topology_packet_cap=8,
         target_arena_cap=16,
-        movement_scratch_bytes=1024 * 1024,
-        library_workspace_bytes=1024,
-        evaluator_workspace_bytes=1024,
-        memory_guard_bytes=1024,
+        rollout_workspace_bytes=1024 * 1024,
+        queue_drain_workspace_bytes=1024,
+        completion_workspace_bytes=2048,
+        align_workspace_bytes=1024 * 1024 + 1024,
+        target_workspace_bytes=1024 * 1024 + 1024,
+        learner_workspace_bytes=1024 * 1024,
         hardware=HardwareLimits(
             torch.cuda.get_device_properties(device).total_memory,
             64 * 1024 * 1024,
-            1024,
-            1_000_000,
-            64,
         ),
-        required_external=ExternalWorkspaceBounds(0, 0),
     )
 
 
@@ -1234,7 +1225,7 @@ def test_all_twelve_modes_match_direct_one_node_reference(
     assert result.counters.scratch_bytes == LayeredTargetExecutor(
         mode, _algebra(estimator), lambda_=0.5
     ).required_scratch_bytes(plan, manifest.n_replica)
-    assert result.counters.scratch_bytes <= manifest.movement_scratch_bytes
+    assert result.counters.scratch_bytes <= manifest.target_workspace_bytes
     sigma = published_rows(
         owners.slab("SigmaTarget", "pre"), 0, "value_target"
     )

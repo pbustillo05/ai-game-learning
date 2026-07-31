@@ -79,7 +79,7 @@ class MHA(nn.Module):
         self.w_o = nn.Linear(d_model, d_model)
         # Execution-only attributes are deliberately absent from state_dict.
         self.attention_backend = "sdpa"
-        self.query_chunk_size = 128
+        self.query_chunk_size: int | None = None
         # softplus(theta) + .5 == 1 at initialization.
         initial_theta = math.log(math.expm1(0.5))
         self.theta = nn.Parameter(torch.full((n_heads,), initial_theta))
@@ -151,15 +151,23 @@ class MHA(nn.Module):
             dropout_p=0.0,
         )
 
-    def configure_execution(self, backend: str, query_chunk_size: int) -> None:
+    def configure_execution(
+        self, backend: str, query_chunk_size: int | None = None
+    ) -> None:
         """Select a mathematically exact bounded-memory execution strategy."""
 
         if backend not in {"sdpa", "chunked_dense"}:
             raise ValueError("unknown attention backend")
-        if isinstance(query_chunk_size, bool) or query_chunk_size <= 0:
-            raise ValueError("query_chunk_size must be positive")
+        if backend == "sdpa" and query_chunk_size is not None:
+            raise ValueError("SDPA does not accept query rows")
+        if backend == "chunked_dense" and (
+            isinstance(query_chunk_size, bool)
+            or not isinstance(query_chunk_size, int)
+            or query_chunk_size <= 0
+        ):
+            raise ValueError("chunked attention requires positive query rows")
         self.attention_backend = backend
-        self.query_chunk_size = int(query_chunk_size)
+        self.query_chunk_size = query_chunk_size
 
     def _chunked_attention(
         self,
@@ -185,6 +193,8 @@ class MHA(nn.Module):
             return torch.matmul(probability.to(value.dtype), value)
 
         chunks: list[Tensor] = []
+        if self.query_chunk_size is None:
+            raise RuntimeError("chunked attention omitted its query-row bound")
         for start in range(0, q_head.shape[2], self.query_chunk_size):
             query_chunk = q_head[:, :, start : start + self.query_chunk_size]
             if self.training and torch.is_grad_enabled():

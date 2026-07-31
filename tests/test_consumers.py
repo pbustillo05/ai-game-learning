@@ -204,6 +204,7 @@ def test_distributed_manifest_is_strict_and_content_addressed(
     assert load_distributed_checkpoint_manifest(
         manifest,
         expected_scientific_config=config.scientific_mapping(),
+        expected_execution_config=config.execution.mapping(),
         world_size=2,
     ) == tuple(tmp_path / name for name in rank_files)
     (tmp_path / rank_files[1]).write_bytes(b"changed")
@@ -211,6 +212,7 @@ def test_distributed_manifest_is_strict_and_content_addressed(
         load_distributed_checkpoint_manifest(
             manifest,
             expected_scientific_config=config.scientific_mapping(),
+            expected_execution_config=config.execution.mapping(),
             world_size=2,
         )
 

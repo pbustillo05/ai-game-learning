@@ -13,6 +13,10 @@ from pathlib import Path
 import torch
 from torch import Tensor, nn
 
+from pbg.core.execution_manifest import (
+    ExecutionManifestError,
+    validate_execution_manifest,
+)
 from pbg.core.learner import ReferenceState
 from pbg.core.optimization import DenseAdam, LossScaler
 
@@ -184,11 +188,15 @@ def save_checkpoint(
 ) -> str:
     """Atomically persist the exact completed optimizer boundary."""
 
+    try:
+        resolved_execution = validate_execution_manifest(execution_config)
+    except ExecutionManifestError as exc:
+        raise PersistenceError(str(exc)) from exc
     state = {
         "checkpoint_schema": CHECKPOINT_SCHEMA,
         "scientific_config": dict(scientific_config),
         "scientific_sha256": _canonical_hash(scientific_config),
-        "execution_config": dict(execution_config),
+        "execution_config": resolved_execution,
         "model": _clone_cpu(model.state_dict()),
         "optimizer": _clone_cpu(optimizer.state_dict()),
         "scaler": scaler.state_dict(),
@@ -284,6 +292,10 @@ def validate_checkpoint_payload(state: object) -> dict[str, object]:
         for config, digest in zip(configs, hashes, strict=True)
     ):
         raise PersistenceError("checkpoint scientific configuration hash is invalid")
+    try:
+        validate_execution_manifest(state["execution_config"])
+    except ExecutionManifestError as exc:
+        raise PersistenceError(str(exc)) from exc
     for run in runs:
         _validate_run_state_mapping(run)
     return state
@@ -296,6 +308,7 @@ def load_checkpoint(
     optimizer: DenseAdam,
     reference_model: nn.Module,
     expected_scientific_config: Mapping[str, object],
+    expected_execution_config: Mapping[str, object],
     generator: torch.Generator,
     restore_ambient_rng: bool = True,
 ) -> tuple[LossScaler, ReferenceState, RunState, Mapping[str, object]]:
@@ -313,6 +326,12 @@ def load_checkpoint(
         "scientific_config"
     ] != dict(expected_scientific_config):
         raise PersistenceError("resume rejected scientific configuration drift")
+    try:
+        validate_execution_manifest(
+            state["execution_config"], expected=expected_execution_config
+        )
+    except ExecutionManifestError as exc:
+        raise PersistenceError(f"resume rejected execution drift: {exc}") from exc
     model.load_state_dict(state["model"], strict=True)
     reference_model.load_state_dict(state["reference_model"], strict=True)
     optimizer.load_state_dict(state["optimizer"])
@@ -381,6 +400,10 @@ def save_replica_checkpoint(
         for generator in generators
     ):
         raise ValueError("replica checkpoint RNG must be lane-local on one device")
+    try:
+        resolved_execution = validate_execution_manifest(execution_config)
+    except ExecutionManifestError as exc:
+        raise PersistenceError(str(exc)) from exc
     state = {
         "checkpoint_schema": REPLICA_CHECKPOINT_SCHEMA,
         "n_replica": count,
@@ -388,7 +411,7 @@ def save_replica_checkpoint(
         "scientific_sha256": tuple(
             _canonical_hash(value) for value in scientific_configs
         ),
-        "execution_config": dict(execution_config),
+        "execution_config": resolved_execution,
         "model": _clone_cpu(modules.state_dict()),
         "optimizer": _clone_cpu(optimizers.state_dict()),
         "reference_model": (
@@ -436,6 +459,7 @@ def load_replica_checkpoint(
     modules: object,
     optimizers: object,
     expected_scientific_configs: Sequence[Mapping[str, object]],
+    expected_execution_config: Mapping[str, object],
     generators: Sequence[torch.Generator],
     reference_modules: object | None = None,
     restore_ambient_rng: bool = True,
@@ -470,6 +494,12 @@ def load_replica_checkpoint(
         _canonical_hash(value) for value in expected
     ):
         raise PersistenceError("replica resume rejected scientific drift")
+    try:
+        validate_execution_manifest(
+            state["execution_config"], expected=expected_execution_config
+        )
+    except ExecutionManifestError as exc:
+        raise PersistenceError(f"replica resume rejected execution drift: {exc}") from exc
     modules.load_state_dict(state["model"])
     optimizers.load_state_dict(state["optimizer"])
     stored_reference = state["reference_model"]
@@ -536,12 +566,16 @@ def save_distributed_checkpoint_manifest(
         )
     ):
         raise PersistenceError("distributed checkpoint rank inventory is invalid")
+    try:
+        resolved_execution = validate_execution_manifest(execution_config)
+    except ExecutionManifestError as exc:
+        raise PersistenceError(str(exc)) from exc
     state = {
         "checkpoint_schema": DISTRIBUTED_CHECKPOINT_SCHEMA,
         "world_size": len(rank_files),
         "scientific_config": dict(scientific_config),
         "scientific_sha256": _canonical_hash(scientific_config),
-        "execution_config": dict(execution_config),
+        "execution_config": resolved_execution,
         "rank_files": tuple(rank_files),
         "rank_sha256": tuple(rank_sha256),
     }
@@ -554,6 +588,7 @@ def load_distributed_checkpoint_manifest(
     path: str | os.PathLike[str],
     *,
     expected_scientific_config: Mapping[str, object],
+    expected_execution_config: Mapping[str, object],
     world_size: int,
 ) -> tuple[Path, ...]:
     """Validate a distributed manifest and every content-addressed rank file."""
@@ -582,6 +617,12 @@ def load_distributed_checkpoint_manifest(
         or state["scientific_sha256"] != _canonical_hash(expected)
     ):
         raise PersistenceError("distributed resume rejected scientific drift")
+    try:
+        validate_execution_manifest(
+            state["execution_config"], expected=expected_execution_config
+        )
+    except ExecutionManifestError as exc:
+        raise PersistenceError(f"distributed resume rejected execution drift: {exc}") from exc
     files = state["rank_files"]
     hashes = state["rank_sha256"]
     if (

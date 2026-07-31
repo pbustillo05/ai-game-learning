@@ -173,7 +173,7 @@ class QueuedPokerModel(nn.Module):
         )
 
     def configure_execution(
-        self, attention_backend: str, query_chunk_size: int
+        self, attention_backend: str, query_chunk_size: int | None = None
     ) -> None:
         """Apply the admitted hardware execution profile to every attention."""
 
@@ -531,6 +531,23 @@ def build_model_from_config(
         raise ValueError("scientific.game is not a valid NLHE geometry") from exc
 
     model_values = dict(model)
+    layers = model_values.pop("layers", None)
+    if not isinstance(layers, Mapping) or set(layers) != {"pre", "post"}:
+        raise ValueError("scientific.model.layers is required and must be closed")
+    model_values["n_layers_pre"] = layers["pre"]
+    model_values["n_layers_post"] = layers["post"]
+    raises = model_values.pop("raises", None)
+    if not isinstance(raises, Mapping) or set(raises) != {
+        "components",
+        "minimum_scale",
+    }:
+        raise ValueError("scientific.model.raises is required and must be closed")
+    model_values["m_raise"] = raises["components"]
+    model_values["s_min"] = raises["minimum_scale"]
+    if "seat_capacity" in model_values:
+        model_values["max_players"] = model_values.pop("seat_capacity")
+    else:
+        model_values.setdefault("max_players", geometry.players)
     forbidden_derived = (
         "eps",
         "k_act",

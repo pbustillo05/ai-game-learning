@@ -128,7 +128,7 @@ class PokerInferenceSession:
         self.model = build_model_from_config(scientific, self.device)
         self.model.load_state_dict(source["model"], strict=True)
         self.model.eval().requires_grad_(False)
-        self.model.configure_execution("sdpa", 128)
+        self.model.configure_execution("sdpa")
         assert_module_device(self.model, self.device, "inference model")
         self.machine = PokerStateMachine(self.geometry)
         self.policy = PokerPolicyOperator()

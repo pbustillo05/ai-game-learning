@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -16,15 +17,27 @@ import yaml
 
 from pbg.core.capacity import CapacityManifest, PhysicalLayout
 from pbg.core.contracts import mode_schema
+from pbg.core.execution_manifest import seal_execution_manifest
+from pbg.core.learner import LearnerSchedule, LossConfig
+from pbg.core.optimization import OptimizerConfig
 from pbg.games.poker.queued.capacity_compiler import (
     CAPACITY_DERIVATION_VERSION,
     WorkloadSpec,
     compile_capacity,
 )
-from pbg.games.poker.queued.config import BranchedModeConfig, SequentialModeConfig
+from pbg.games.poker.queued.config import (
+    BranchedModeConfig,
+    PokerGameConfig,
+    PokerModelConfig,
+    PokerScientificConfig,
+    PrecisionConfig,
+    ReferenceConfig,
+    SequentialModeConfig,
+)
 from pbg.games.poker.queued.hooks import NLHEGeometry
 
 RUN_CONFIG_KIND = "nlhe_run_v1"
+SCIENTIFIC_CONFIG_SCHEMA = "nlhe_scientific_v1"
 RESOLVED_EXECUTION_SCHEMA = "pbg_resolved_execution_v1"
 
 
@@ -116,7 +129,7 @@ class ExecutionConfig:
     output_dir: Path
     run_id: str
     attention_backend: str
-    query_chunk_size: int
+    query_chunk_size: int | None
     manifest: CapacityManifest
     layout: PhysicalLayout
     derivations: Mapping[str, str]
@@ -137,8 +150,12 @@ class ExecutionConfig:
             raise ConfigError("root.run: iteration counts must be positive")
         if self.attention_backend not in ("sdpa", "chunked_dense"):
             raise ConfigError("root.run.execution.attention: invalid backend")
-        if self.query_chunk_size <= 0:
-            raise ConfigError("root.run.execution.attention: invalid query rows")
+        if self.attention_backend == "sdpa" and self.query_chunk_size is not None:
+            raise ConfigError("SDPA execution cannot carry query rows")
+        if self.attention_backend == "chunked_dense" and (
+            self.query_chunk_size is None or self.query_chunk_size <= 0
+        ):
+            raise ConfigError("chunked attention requires positive query rows")
 
     def _payload(self) -> dict[str, object]:
         manifest = self.manifest
@@ -183,10 +200,12 @@ class ExecutionConfig:
                         "learner_action_pack_cap",
                         "topology_packet_cap",
                         "target_arena_cap",
-                        "movement_scratch_bytes",
-                        "library_workspace_bytes",
-                        "evaluator_workspace_bytes",
-                        "memory_guard_bytes",
+                        "rollout_workspace_bytes",
+                        "queue_drain_workspace_bytes",
+                        "completion_workspace_bytes",
+                        "align_workspace_bytes",
+                        "target_workspace_bytes",
+                        "learner_workspace_bytes",
                     )
                 },
                 **{
@@ -202,10 +221,6 @@ class ExecutionConfig:
                     name: getattr(manifest.hardware, name)
                     for name in manifest.hardware.__dataclass_fields__
                 },
-                "required_external": {
-                    name: getattr(manifest.required_external, name)
-                    for name in manifest.required_external.__dataclass_fields__
-                },
             },
             "layout": {
                 "model_input_shapes": {
@@ -217,12 +232,6 @@ class ExecutionConfig:
                         "player_count",
                         "stratum_count",
                         "evaluator_private_width",
-                        "family_workspace_row_bytes",
-                        "chance_frontier_row_bytes",
-                        "completion_workspace_row_bytes",
-                        "learner_sigma_workspace_row_bytes",
-                        "learner_action_workspace_row_bytes",
-                        "topology_packet_row_bytes",
                         "reference_cache_bytes",
                         "field_alignment",
                     )
@@ -237,8 +246,7 @@ class ExecutionConfig:
     def mapping(self) -> dict[str, object]:
         """Serialize the generated immutable product for checkpoints/reports."""
 
-        payload = self._payload()
-        return {**payload, "resolved_sha256": _canonical_hash(payload)}
+        return seal_execution_manifest(self._payload())
 
 
 @dataclass(frozen=True)
@@ -254,9 +262,24 @@ class RootConfig:
         return self.scientific.mode
 
     def scientific_mapping(self) -> dict[str, object]:
-        """Fully resolved scientific identity used by checkpoints."""
+        """Return the canonical, placeholder-free checkpoint identity."""
 
-        return self.scientific.scientific_mapping()
+        source = self.source_mapping()
+        scientific = dict(source["scientific"])
+        run = dict(source["run"])
+        identity_run: dict[str, object] = {
+            name: _plain(run[name])
+            for name in ("seed", "reproducibility", "utility", "workload")
+        }
+        if "recovery" in run:
+            identity_run["recovery"] = _plain(run["recovery"])
+        if "frozen" in run:
+            identity_run["frozen_sha256"] = run["frozen"]["sha256"]
+        return {
+            "schema": SCIENTIFIC_CONFIG_SCHEMA,
+            **_plain(scientific),
+            "run": identity_run,
+        }
 
     def source_mapping(self) -> dict[str, object]:
         """Return the deterministic canonical user-specification mapping."""
@@ -468,6 +491,14 @@ def _parse_optimizer(value: object) -> tuple[dict[str, object], dict[str, object
     internal.pop("kind")
     if kind == "adam":
         internal["weight_decay"] = 0.0
+    try:
+        OptimizerConfig(**internal)
+    except (TypeError, ValueError) as exc:
+        field = next(
+            (name for name in expected if name in str(exc)),
+            "configuration",
+        )
+        raise ConfigError(f"root.scientific.optimizer.{field}: {exc}") from exc
     return internal, dict(source)
 
 
@@ -493,9 +524,9 @@ def _parse_schedule(value: object) -> tuple[dict[str, object], dict[str, object]
     }
 
 
-def _parse_attention(value: object) -> tuple[str, int, object]:
+def _parse_attention(value: object) -> tuple[str, int | None, object]:
     if value == "sdpa":
-        return "sdpa", 1, "sdpa"
+        return "sdpa", None, "sdpa"
     source = _object(value, "root.run.execution.attention")
     _closed(source, {"kind", "query_rows"}, "root.run.execution.attention")
     _required(source, {"kind", "query_rows"}, "root.run.execution.attention")
@@ -552,15 +583,43 @@ def _parse_branching(
         raise ConfigError(
             "root.scientific.branching.kkt: inapplicable to fixed branching"
         )
+    fixed_beta = _object(source["fixed_beta"], "root.scientific.branching.fixed_beta")
+    split_fixed = {"player_pre", "player_post", "chance"}
+    shared_fixed = {"player", "chance"}
+    expected_fixed = (
+        (shared_fixed, split_fixed)
+        if rollout_mode == "branched.fixed"
+        else (shared_fixed,)
+    )
+    if set(fixed_beta) not in expected_fixed:
+        raise ConfigError(
+            "root.scientific.branching.fixed_beta: invalid branch classes for mode"
+        )
+    for name, item in fixed_beta.items():
+        _number(
+            item,
+            f"root.scientific.branching.fixed_beta.{name}",
+            positive=True,
+        )
     beta = source["beta_max"]
     if isinstance(beta, Mapping):
         beta_values = dict(beta)
+        if set(fixed_beta) != split_fixed or set(beta_values) != split_fixed:
+            raise ConfigError(
+                "root.scientific.branching.beta_max: per-class bounds require split fixed beta"
+            )
         beta_max = max(
             _positive_int(item, f"root.scientific.branching.beta_max.{name}")
             for name, item in beta_values.items()
         )
     else:
         beta_max = _positive_int(beta, "root.scientific.branching.beta_max")
+        beta_values = {name: beta_max for name in fixed_beta}
+    for name, item in fixed_beta.items():
+        if float(item) < 1 or float(item) > int(beta_values[name]):
+            raise ConfigError(
+                f"root.scientific.branching.fixed_beta.{name}: outside [1,beta_max]"
+            )
     minimum_tree = _positive_int(
         source["minimum_tree_size"], "root.scientific.branching.minimum_tree_size"
     )
@@ -568,12 +627,24 @@ def _parse_branching(
         raise ConfigError(
             "root.scientific.branching.minimum_tree_size: exceeds tree_nodes"
         )
+    minimum_scale = _number(
+        recovery.get("minimum_branch_scale", 0.25),
+        "root.run.recovery.minimum_branch_scale",
+        positive=True,
+    )
+    backoff = _number(
+        recovery.get("branch_backoff_factor", 0.5),
+        "root.run.recovery.branch_backoff_factor",
+        positive=True,
+    )
+    if minimum_scale > 1 or backoff >= 1:
+        raise ConfigError("root.run.recovery: branch recovery factors must lie in (0,1]")
     internal: dict[str, object] = {
-        "fixed_beta": source["fixed_beta"],
-        "beta_max": source["beta_max"],
+        "fixed_beta": fixed_beta,
+        "beta_max": beta_values if isinstance(beta, Mapping) else beta_max,
         "minimum_tree_size": minimum_tree,
-        "minimum_scale": recovery.get("minimum_branch_scale", 0.25),
-        "backoff_factor": recovery.get("branch_backoff_factor", 0.5),
+        "minimum_scale": minimum_scale,
+        "backoff_factor": backoff,
         "safe_tree_size": float(tree_nodes),
     }
     canonical = {
@@ -594,6 +665,10 @@ def _parse_branching(
         }
         _closed(kkt, expected, "root.scientific.branching.kkt")
         _required(kkt, expected, "root.scientific.branching.kkt")
+        warmup = _nonnegative_int(
+            kkt["warmup_iterations"],
+            "root.scientific.branching.kkt.warmup_iterations",
+        )
         target = _number(
             kkt["target_tree_size"],
             "root.scientific.branching.kkt.target_tree_size",
@@ -603,8 +678,49 @@ def _parse_branching(
             raise ConfigError(
                 "root.scientific.branching.kkt.target_tree_size: must lie between minimum_tree_size and tree_nodes"
             )
-        internal.update(kkt)
-        canonical["kkt"] = dict(kkt)
+        gamma = _number(
+            kkt["gamma_kappa"],
+            "root.scientific.branching.kkt.gamma_kappa",
+            positive=True,
+        )
+        eta = _number(
+            kkt["eta_kappa"],
+            "root.scientific.branching.kkt.eta_kappa",
+            positive=True,
+        )
+        kappa_min = _number(
+            kkt["kappa_min"],
+            "root.scientific.branching.kkt.kappa_min",
+            positive=True,
+        )
+        kappa_max = _number(
+            kkt["kappa_max"],
+            "root.scientific.branching.kkt.kappa_max",
+            positive=True,
+        )
+        log_kappa = _number(
+            kkt["log_kappa"],
+            "root.scientific.branching.kkt.log_kappa",
+        )
+        if (
+            gamma > 1
+            or eta > 1
+            or kappa_min > kappa_max
+            or not math.log(kappa_min) <= log_kappa <= math.log(kappa_max)
+        ):
+            raise ConfigError("root.scientific.branching.kkt: controller bounds are invalid")
+        validated_kkt = {
+            **kkt,
+            "warmup_iterations": warmup,
+            "target_tree_size": target,
+            "gamma_kappa": gamma,
+            "eta_kappa": eta,
+            "kappa_min": kappa_min,
+            "kappa_max": kappa_max,
+            "log_kappa": log_kappa,
+        }
+        internal.update(validated_kkt)
+        canonical["kkt"] = validated_kkt
     safeguard = source.get(
         "cost_safeguard",
         {
@@ -629,7 +745,27 @@ def _parse_branching(
         expected_safeguard,
         "root.scientific.branching.cost_safeguard",
     )
-    canonical["cost_safeguard"] = dict(safeguard_mapping)
+    gamma_max = _number(
+        safeguard_mapping["gamma_deviance_max"],
+        "root.scientific.branching.cost_safeguard.gamma_deviance_max",
+    )
+    p95_max = _number(
+        safeguard_mapping["p95_underprediction_max"],
+        "root.scientific.branching.cost_safeguard.p95_underprediction_max",
+    )
+    consecutive = _positive_int(
+        safeguard_mapping["consecutive_iterations"],
+        "root.scientific.branching.cost_safeguard.consecutive_iterations",
+    )
+    if gamma_max < 0 or p95_max < 1:
+        raise ConfigError(
+            "root.scientific.branching.cost_safeguard: calibration bounds are invalid"
+        )
+    canonical["cost_safeguard"] = {
+        "gamma_deviance_max": gamma_max,
+        "p95_underprediction_max": p95_max,
+        "consecutive_iterations": consecutive,
+    }
     return internal, canonical, beta_max
 
 
@@ -803,6 +939,26 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
             raise ConfigError(
                 "root.scientific.response_initialization: expected random or target"
             )
+        if "probe" in scientific_source:
+            if not rb or branched:
+                raise ConfigError(
+                    "root.scientific.probe: requires sequential RB best response"
+                )
+            probe = _object(scientific_source["probe"], "root.scientific.probe")
+            probe_fields = {"target_sha256", "initial_model_sha256"}
+            _closed(probe, probe_fields, "root.scientific.probe")
+            _required(probe, probe_fields, "root.scientific.probe")
+            target_sha = _sha256(
+                probe["target_sha256"], "root.scientific.probe.target_sha256"
+            )
+            _sha256(
+                probe["initial_model_sha256"],
+                "root.scientific.probe.initial_model_sha256",
+            )
+            if target_sha != frozen_sha:
+                raise ConfigError(
+                    "root.scientific.probe.target_sha256: differs from frozen checkpoint"
+                )
     elif (
         "frozen" in run_source
         or "response_initialization" in scientific_source
@@ -885,40 +1041,57 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
         canonical_cache = {"budget_bytes": cache_bytes}
         reference["cache_outputs"] = True
 
-    internal_scientific: dict[str, object] = {
-        "mode": dict(mode),
-        "game": dict(game),
-        "model": model,
-        "loss": loss,
-        "optimizer": optimizer,
-        "schedule": schedule,
-        "precision": {"name": precision},
-        "reference": reference,
-        "lambda": scientific_source["lambda"],
-        "root_count": roots,
-        "root_count_minimum": minimum_roots,
-        "seed": run_source["seed"],
-        "reproducibility": run_source["reproducibility"],
-        "utility": run_source["utility"],
-    }
-    if completion_canonical is not None:
-        internal_scientific["completion"] = {"n_samples": completion_samples}
-    if branching_internal is not None:
-        internal_scientific["branching"] = branching_internal
-        internal_scientific["cost_safeguard"] = branching_canonical["cost_safeguard"]  # type: ignore[index]
-    if response:
-        internal_scientific["frozen_profile"] = {"sha256": frozen_sha}
-        internal_scientific["response_initialization"] = scientific_source[
-            "response_initialization"
-        ]
-        if "probe" in scientific_source:
-            internal_scientific["probe"] = scientific_source["probe"]
     try:
-        scientific = (
-            BranchedModeConfig.from_mapping(internal_scientific)
-            if branched
-            else SequentialModeConfig.from_mapping(internal_scientific)
+        common = PokerScientificConfig(
+            game=PokerGameConfig(**game),
+            model=PokerModelConfig(**model),
+            loss=LossConfig(**loss),
+            optimizer=OptimizerConfig(**optimizer),
+            schedule=LearnerSchedule(**schedule),
+            precision=PrecisionConfig(name=str(precision)),
+            reference=ReferenceConfig(**reference),
+            lambda_=scientific_source["lambda"],
+            root_count=roots,
+            root_count_minimum=minimum_roots,
+            seed=run_source["seed"],
+            reproducibility=run_source["reproducibility"],
+            utility=run_source["utility"],
         )
+        applicable: dict[str, object] = {}
+        if completion_canonical is not None:
+            applicable["completion_samples"] = completion_samples
+        if response:
+            applicable["frozen_sha256"] = frozen_sha
+            applicable["response_initialization"] = scientific_source[
+                "response_initialization"
+            ]
+            if "probe" in scientific_source:
+                applicable["probe"] = MappingProxyType(
+                    dict(_object(scientific_source["probe"], "root.scientific.probe"))
+                )
+        if branched:
+            assert branching_internal is not None
+            frozen_branching = {
+                name: (
+                    MappingProxyType(dict(value))
+                    if isinstance(value, Mapping)
+                    else value
+                )
+                for name, value in branching_internal.items()
+            }
+            scientific = BranchedModeConfig(
+                MappingProxyType(dict(mode)),
+                common,
+                MappingProxyType(frozen_branching),
+                MappingProxyType(dict(branching_canonical["cost_safeguard"])),
+                MappingProxyType(applicable),
+            )
+        else:
+            scientific = SequentialModeConfig(
+                MappingProxyType(dict(mode)),
+                common,
+                MappingProxyType(applicable),
+            )
     except (TypeError, ValueError) as exc:
         message = str(exc)
         if message.startswith("root."):
@@ -1034,11 +1207,7 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
         output_dir=output_dir,
         run_id=run_id,
         attention_backend=attention_backend,
-        query_chunk_size=(
-            compiled.manifest.geometry.model_token_bound
-            if attention_backend == "sdpa"
-            else query_rows
-        ),
+        query_chunk_size=query_rows,
         distributed=distributed,
         frozen_checkpoint=frozen_path,
         manifest=compiled.manifest,
@@ -1058,12 +1227,167 @@ def load_config(path: str | Path) -> RootConfig:
     return load_config_mapping(_object(raw, "root"))
 
 
+def validate_scientific_mapping(value: Mapping[str, object]) -> dict[str, object]:
+    """Validate the one versioned scientific product stored in artifacts."""
+
+    source = _object(value, "scientific")
+    allowed = {
+        "schema",
+        "mode",
+        "game",
+        "model",
+        "objective",
+        "optimizer",
+        "schedule",
+        "lambda",
+        "completion",
+        "branching",
+        "response_initialization",
+        "probe",
+        "run",
+    }
+    _closed(source, allowed, "scientific")
+    _required(
+        source,
+        {
+            "schema",
+            "mode",
+            "game",
+            "model",
+            "objective",
+            "optimizer",
+            "schedule",
+            "lambda",
+            "run",
+        },
+        "scientific",
+    )
+    if source["schema"] != SCIENTIFIC_CONFIG_SCHEMA:
+        raise ConfigError("scientific.schema: unsupported scientific schema")
+    mode = _object(source["mode"], "scientific.mode")
+    try:
+        schema = mode_schema(**mode)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"scientific.mode: {exc}") from exc
+    game = _object(source["game"], "scientific.game")
+    try:
+        geometry = NLHEGeometry(
+            game["players"], game["stack_bb"], game["rank_count"]  # type: ignore[arg-type]
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"scientific.game: {exc}") from exc
+    _, canonical_model = _parse_model(source["model"], players=geometry.players)
+    if canonical_model != source["model"]:
+        raise ConfigError("scientific.model: mapping is not canonical")
+    _, _, canonical_objective = _parse_objective(
+        source["objective"], branched=schema.rollout_mode.is_branched
+    )
+    if canonical_objective != source["objective"]:
+        raise ConfigError("scientific.objective: mapping is not canonical")
+    _, canonical_optimizer = _parse_optimizer(source["optimizer"])
+    if canonical_optimizer != source["optimizer"]:
+        raise ConfigError("scientific.optimizer: mapping is not canonical")
+    _, canonical_schedule = _parse_schedule(source["schedule"])
+    if canonical_schedule != source["schedule"]:
+        raise ConfigError("scientific.schedule: mapping is not canonical")
+    lambda_value = _number(source["lambda"], "scientific.lambda")
+    if not 0 <= lambda_value <= 1:
+        raise ConfigError("scientific.lambda: expected a value in [0,1]")
+    rb = schema.private_estimator.value == "rao_blackwell"
+    if rb:
+        completion = _object(source.get("completion"), "scientific.completion")
+        _closed(completion, {"samples"}, "scientific.completion")
+        _required(completion, {"samples"}, "scientific.completion")
+        _positive_int(completion["samples"], "scientific.completion.samples")
+    elif "completion" in source:
+        raise ConfigError("scientific.completion: inapplicable to sampled mode")
+    response = schema.training_regime.value == "best_response"
+    if response != ("response_initialization" in source):
+        raise ConfigError("scientific.response_initialization: mode applicability mismatch")
+    run = _object(source["run"], "scientific.run")
+    run_allowed = {
+        "seed",
+        "reproducibility",
+        "utility",
+        "workload",
+        "recovery",
+        "frozen_sha256",
+    }
+    _closed(run, run_allowed, "scientific.run")
+    _required(run, {"seed", "reproducibility", "utility", "workload"}, "scientific.run")
+    if isinstance(run["seed"], bool) or not isinstance(run["seed"], int):
+        raise ConfigError("scientific.run.seed: expected integer")
+    if run["reproducibility"] not in ("strict", "seeded", "throughput"):
+        raise ConfigError("scientific.run.reproducibility: invalid policy")
+    if run["utility"] not in ("raw_bb", "stack_normalized"):
+        raise ConfigError("scientific.run.utility: invalid utility")
+    workload = _object(run["workload"], "scientific.run.workload")
+    _closed(workload, {"roots", "replicas", "tree_nodes"}, "scientific.run.workload")
+    _required(workload, {"roots"}, "scientific.run.workload")
+    _positive_int(workload["roots"], "scientific.run.workload.roots")
+    if "replicas" in workload:
+        _positive_int(workload["replicas"], "scientific.run.workload.replicas")
+    tree_nodes = workload.get("tree_nodes")
+    if schema.rollout_mode.is_branched:
+        tree_count = _positive_int(tree_nodes, "scientific.run.workload.tree_nodes")
+    elif tree_nodes is not None:
+        raise ConfigError("scientific.run.workload.tree_nodes: inapplicable")
+    else:
+        tree_count = 0
+    recovery = _object(run.get("recovery", {}), "scientific.run.recovery")
+    recovery_allowed = {"minimum_roots"}
+    if schema.rollout_mode.is_branched:
+        recovery_allowed |= {"minimum_branch_scale", "branch_backoff_factor"}
+    _closed(recovery, recovery_allowed, "scientific.run.recovery")
+    if "minimum_roots" in recovery:
+        minimum_roots = _positive_int(
+            recovery["minimum_roots"], "scientific.run.recovery.minimum_roots"
+        )
+        if minimum_roots > int(workload["roots"]):
+            raise ConfigError("scientific.run.recovery.minimum_roots: exceeds roots")
+    if schema.rollout_mode.is_branched:
+        _, canonical_branching, _ = _parse_branching(
+            source.get("branching"),
+            rollout_mode=schema.rollout_mode.value,
+            tree_nodes=tree_count,
+            recovery=recovery,
+        )
+        if canonical_branching != source["branching"]:
+            raise ConfigError("scientific.branching: mapping is not canonical")
+    elif "branching" in source:
+        raise ConfigError("scientific.branching: mode applicability mismatch")
+    if response != ("frozen_sha256" in run):
+        raise ConfigError("scientific.run.frozen_sha256: mode applicability mismatch")
+    if "frozen_sha256" in run:
+        frozen_sha = _sha256(run["frozen_sha256"], "scientific.run.frozen_sha256")
+        if source["response_initialization"] not in ("random", "target"):
+            raise ConfigError("scientific.response_initialization: invalid policy")
+        if "probe" in source:
+            if not rb or schema.rollout_mode.is_branched:
+                raise ConfigError("scientific.probe: requires sequential RB")
+            probe = _object(source["probe"], "scientific.probe")
+            probe_fields = {"target_sha256", "initial_model_sha256"}
+            _closed(probe, probe_fields, "scientific.probe")
+            _required(probe, probe_fields, "scientific.probe")
+            if _sha256(probe["target_sha256"], "scientific.probe.target_sha256") != frozen_sha:
+                raise ConfigError("scientific.probe.target_sha256: differs from frozen")
+            _sha256(
+                probe["initial_model_sha256"],
+                "scientific.probe.initial_model_sha256",
+            )
+    elif "probe" in source:
+        raise ConfigError("scientific.probe: requires best response")
+    return _plain(source)  # type: ignore[return-value]
+
+
 __all__ = [
     "RESOLVED_EXECUTION_SCHEMA",
     "RUN_CONFIG_KIND",
+    "SCIENTIFIC_CONFIG_SCHEMA",
     "ConfigError",
     "ExecutionConfig",
     "RootConfig",
     "load_config",
     "load_config_mapping",
+    "validate_scientific_mapping",
 ]

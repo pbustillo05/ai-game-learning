@@ -203,12 +203,12 @@ def _validate_sources(
         raise RuntimeError("probe and target game geometry differ")
     if scientific.get("model") != target_scientific.get("model"):
         raise RuntimeError("probe and target model contracts differ")
-    frozen = scientific.get("frozen_profile")
+    run = scientific.get("run")
     metadata = scientific.get("probe")
     initialization = scientific.get("response_initialization")
     if (
-        not isinstance(frozen, dict)
-        or frozen.get("sha256") != target["source_checkpoint_sha256"]
+        not isinstance(run, dict)
+        or run.get("frozen_sha256") != target["source_checkpoint_sha256"]
         or not isinstance(metadata, dict)
         or metadata.get("target_sha256") != target["source_checkpoint_sha256"]
         or initialization not in ("random", "target")

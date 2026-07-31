@@ -99,8 +99,8 @@ def test_512_root_configs_compile_all_capacity_from_workload(mode: str) -> None:
     config = load_config_mapping(mapping)
     assert config.execution.manifest.family_pack_cap == 84
     assert config.execution.manifest.partition_rows("folded_range_cap") == {
-        "pre": 1,
-        "post": 1,
+        "pre": 0,
+        "post": 0,
     }
 
 
@@ -120,6 +120,6 @@ def test_checked_in_512_root_k1_config_has_no_authored_capacity(
     assert "layout" not in mapping["run"]
     assert config.scientific.common.root_count == 512
     assert config.execution.manifest.partition_rows("folded_range_cap") == {
-        "pre": 1,
-        "post": 1,
+        "pre": 0,
+        "post": 0,
     }

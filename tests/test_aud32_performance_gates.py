@@ -90,7 +90,7 @@ def test_performance_gate_rejects_identity_and_environment_mismatch() -> None:
         current, baseline, allow_environment_mismatch=True
     ) == []
     current = copy.deepcopy(baseline)
-    current["scientific_config"]["seed"] += 1
+    current["scientific_config"]["run"]["seed"] += 1
     assert "scientific_config identity differs" in compare_benchmark(
         current, baseline
     )

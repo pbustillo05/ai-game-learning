@@ -15,9 +15,10 @@ from types import MappingProxyType
 import torch
 
 from pbg.core.capacity import (
+    BRANCHED_ALIAS_PEAK_ROW_BYTES,
+    BRANCHED_LOG_MASS_ROW_BYTES,
     CapacityManifest,
     ExecutionGeometry,
-    ExternalWorkspaceBounds,
     HardwareLimits,
     NamedShape,
     PartitionRows,
@@ -30,6 +31,11 @@ from pbg.core.targets import (
     rb_conversion_workspace_row_bytes,
 )
 from pbg.games.poker.model.capacity import max_policy_partition_sequence_tokens
+from pbg.games.poker.queued.branching import (
+    branched_rb_chance_frontier_row_bytes,
+    branched_topology_packet_row_bytes,
+    sampled_branched_chance_frontier_row_bytes,
+)
 from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
 from pbg.games.poker.queued.hooks import NLHEGeometry, poker_partitions
 
@@ -133,16 +139,44 @@ def _completion_workspace_row_bytes(
     geometry: NLHEGeometry,
     *,
     rao_blackwell: bool,
-    completion_samples: int,
 ) -> int:
     if not rao_blackwell:
         return _align(16 * geometry.players + 64)
     conversion = rb_conversion_workspace_row_bytes(
         geometry.private_hands, geometry.private_classes
     )
-    evaluator_world = completion_samples * geometry.players * 16
-    evaluator_outputs = geometry.private_hands * 3 * 4
-    return _align(conversion + evaluator_world + evaluator_outputs)
+    publication = geometry.private_hands * 3 * 4
+    return _align(conversion + publication)
+
+
+def _evaluator_workspace_bytes(
+    geometry: NLHEGeometry,
+    *,
+    rows: int,
+    replicas: int,
+    completion_samples: int,
+    rao_blackwell: bool,
+) -> int:
+    """Bound every contract-v2 temporary and result owned during one call."""
+
+    if not rao_blackwell:
+        showdown_inputs = rows * replicas * geometry.players * (4 + 4 + 4)
+        showdown_outputs = rows * replicas * geometry.players * 4
+        return _align(showdown_inputs + showdown_outputs)
+    batch = rows * replicas
+    worlds = batch * completion_samples
+    sampled_profiles = worlds * geometry.players * 4
+    completed_boards = worlds * 5
+    hand_ranks = worlds * geometry.players * 4
+    weights_and_payoffs = worlds * (8 + 4 * geometry.players)
+    results = batch * geometry.private_hands * geometry.players * 2 * 4
+    return _align(
+        sampled_profiles
+        + completed_boards
+        + hand_ranks
+        + weights_and_payoffs
+        + results
+    )
 
 
 def compile_capacity(
@@ -220,7 +254,7 @@ def compile_capacity(
             PartitionRows(item.name, item.rows) for item in trained_rows
         )
 
-    folded_cap = 1 if geometry.players == 2 else topology_cap
+    folded_cap = 0 if geometry.players == 2 else topology_cap
     folded_rows = tuple(
         PartitionRows(item.name, folded_cap) for item in partitions.folded
     )
@@ -263,11 +297,20 @@ def compile_capacity(
     family_workspace = sequential_family_workspace_row_bytes(
         geometry, int(model.m_raise)
     )
-    chance_workspace = _chance_frontier_row_bytes(geometry, rao_blackwell=rao_blackwell)
+    chance_workspace = (
+        (
+            branched_rb_chance_frontier_row_bytes(
+                geometry, max_attempts=_POSTERIOR_MAX_ATTEMPTS
+            )
+            if rao_blackwell
+            else sampled_branched_chance_frontier_row_bytes(geometry)
+        )
+        if mode.rollout_mode.is_branched
+        else _chance_frontier_row_bytes(geometry, rao_blackwell=rao_blackwell)
+    )
     completion_workspace = _completion_workspace_row_bytes(
         geometry,
         rao_blackwell=rao_blackwell,
-        completion_samples=completion_samples,
     )
     learner_workspace = _learner_workspace_row_bytes(
         geometry,
@@ -288,6 +331,66 @@ def compile_capacity(
         )
         if rao_blackwell
         else 0
+    )
+    evaluator_workspace = _evaluator_workspace_bytes(
+        geometry,
+        rows=completion_pack,
+        replicas=workload.replicas,
+        completion_samples=completion_samples,
+        rao_blackwell=rao_blackwell,
+    )
+    completion_destinations = len(partitions.outputs)
+    completion_commit_workspace = _align(
+        workload.replicas
+        * completion_pack
+        * (25 + 8 + 16 * completion_destinations)
+        + workload.replicas * completion_destinations * 8
+    )
+    family_multiplier = int(
+        mode.rollout_mode.is_branched
+        and mode.training_regime is TrainingRegime.BEST_RESPONSE
+    ) + 1
+    topology_rows = topology_packet + int(mode.rollout_mode.is_branched)
+    rollout_workspace = (
+        workload.replicas * family_multiplier * family_pack * family_workspace
+        + workload.replicas * chance_pack * chance_workspace
+        + workload.replicas
+        * topology_rows
+        * _align(branched_topology_packet_row_bytes(), 8)
+        + library_workspace
+    )
+    completion_phase_workspace = (
+        workload.replicas * completion_pack * completion_workspace
+        + evaluator_workspace
+        + library_workspace
+        + completion_commit_workspace
+    )
+    align_workspace = (
+        movement_scratch
+        + library_workspace
+        + (
+            topology_cap * BRANCHED_LOG_MASS_ROW_BYTES
+            if mode.rollout_mode.is_branched
+            else 0
+        )
+    )
+    target_workspace = movement_scratch + library_workspace
+    alias_workspace = (
+        trained_total * BRANCHED_ALIAS_PEAK_ROW_BYTES
+        if mode.rollout_mode.is_branched
+        else 0
+    )
+    learner_phase_workspace = (
+        learner_pack * learner_workspace
+        + (
+            learner_pack
+            if not mode.rollout_mode.is_branched
+            else min(action_total, learner_pack * beta_max)
+        )
+        * learner_workspace
+        + library_workspace
+        + alias_workspace
+        + workload.reference_cache_bytes
     )
 
     manifest = CapacityManifest(
@@ -318,18 +421,17 @@ def compile_capacity(
         ),
         topology_packet_cap=topology_packet,
         target_arena_cap=target_arena_cap,
-        movement_scratch_bytes=movement_scratch,
-        library_workspace_bytes=library_workspace,
-        evaluator_workspace_bytes=0,
-        memory_guard_bytes=workload.reserve_bytes,
+        rollout_workspace_bytes=rollout_workspace,
+        queue_drain_workspace_bytes=library_workspace,
+        completion_workspace_bytes=completion_phase_workspace,
+        align_workspace_bytes=align_workspace,
+        target_workspace_bytes=target_workspace,
+        learner_workspace_bytes=learner_phase_workspace,
         hardware=HardwareLimits(
             total_memory_bytes=total_memory,
-            memory_budget_bytes=total_memory,
-            training_max_tokens=learner_pack * token_bound,
-            training_max_token_pairs=learner_pack * pair_bound,
-            query_chunk_size=token_bound,
+            usable_memory_bytes=total_memory - workload.reserve_bytes,
+            reserve_bytes=workload.reserve_bytes,
         ),
-        required_external=ExternalWorkspaceBounds(0, 0),
     )
     layout = PhysicalLayout(
         model_input_shapes=tuple(
@@ -339,12 +441,6 @@ def compile_capacity(
         player_count=geometry.players,
         stratum_count=geometry.players,
         evaluator_private_width=(geometry.private_hands if rao_blackwell else 1),
-        family_workspace_row_bytes=family_workspace,
-        chance_frontier_row_bytes=chance_workspace,
-        completion_workspace_row_bytes=completion_workspace,
-        learner_sigma_workspace_row_bytes=learner_workspace,
-        learner_action_workspace_row_bytes=learner_workspace,
-        topology_packet_row_bytes=_align(95, 8),
         reference_cache_bytes=workload.reference_cache_bytes,
         field_alignment=FIELD_ALIGNMENT,
         model_dtype=dtype,

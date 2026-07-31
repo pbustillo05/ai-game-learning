@@ -57,7 +57,7 @@ class PartitionRows:
     def __post_init__(self) -> None:
         if not self.name or not self.name.isidentifier():
             raise CapacityError(f"invalid capacity partition {self.name!r}")
-        _positive_int(self.rows, f"{self.name} rows")
+        _nonnegative_int(self.rows, f"{self.name} rows")
 
 
 @dataclass(frozen=True, order=True)
@@ -102,37 +102,15 @@ class HardwareLimits:
     """Immutable accelerator identity and hard admission limits."""
 
     total_memory_bytes: int
-    memory_budget_bytes: int
-    training_max_tokens: int
-    training_max_token_pairs: int
-    query_chunk_size: int
+    usable_memory_bytes: int
+    reserve_bytes: int = 0
 
     def __post_init__(self) -> None:
         total = _positive_int(self.total_memory_bytes, "total_memory_bytes")
-        budget = _positive_int(self.memory_budget_bytes, "memory_budget_bytes")
-        if budget > total:
-            raise CapacityError("memory budget exceeds declared device memory")
-        _positive_int(self.training_max_tokens, "training_max_tokens")
-        _positive_int(self.training_max_token_pairs, "training_max_token_pairs")
-        _positive_int(self.query_chunk_size, "query_chunk_size")
-        if self.training_max_token_pairs < self.training_max_tokens:
-            raise CapacityError(
-                "training token-pair limit is smaller than the token limit"
-            )
-        if self.query_chunk_size > self.training_max_tokens:
-            raise CapacityError("query chunk exceeds the training token limit")
-
-
-@dataclass(frozen=True)
-class ExternalWorkspaceBounds:
-    """Versioned lower bounds reported by external CUDA operations."""
-
-    library_bytes: int
-    evaluator_bytes: int
-
-    def __post_init__(self) -> None:
-        _nonnegative_int(self.library_bytes, "required library workspace")
-        _nonnegative_int(self.evaluator_bytes, "required evaluator workspace")
+        budget = _positive_int(self.usable_memory_bytes, "usable_memory_bytes")
+        reserve = _nonnegative_int(self.reserve_bytes, "reserve_bytes")
+        if budget + reserve > total:
+            raise CapacityError("usable memory plus reserve exceeds observed device memory")
 
 
 @dataclass(frozen=True)
@@ -143,12 +121,6 @@ class PhysicalLayout:
     player_count: int
     stratum_count: int
     evaluator_private_width: int
-    family_workspace_row_bytes: int
-    chance_frontier_row_bytes: int
-    completion_workspace_row_bytes: int
-    learner_sigma_workspace_row_bytes: int
-    learner_action_workspace_row_bytes: int
-    topology_packet_row_bytes: int
     reference_cache_bytes: int = 0
     field_alignment: int = 64
     model_dtype: torch.dtype = torch.float32
@@ -162,21 +134,6 @@ class PhysicalLayout:
         _positive_int(self.player_count, "layout player_count")
         _positive_int(self.stratum_count, "stratum_count")
         _positive_int(self.evaluator_private_width, "evaluator_private_width")
-        for label, value in (
-            ("family_workspace_row_bytes", self.family_workspace_row_bytes),
-            ("chance_frontier_row_bytes", self.chance_frontier_row_bytes),
-            ("completion_workspace_row_bytes", self.completion_workspace_row_bytes),
-            (
-                "learner_sigma_workspace_row_bytes",
-                self.learner_sigma_workspace_row_bytes,
-            ),
-            (
-                "learner_action_workspace_row_bytes",
-                self.learner_action_workspace_row_bytes,
-            ),
-            ("topology_packet_row_bytes", self.topology_packet_row_bytes),
-        ):
-            _positive_int(value, label)
         _nonnegative_int(self.reference_cache_bytes, "reference_cache_bytes")
         if (
             isinstance(self.field_alignment, bool)
@@ -224,12 +181,13 @@ class CapacityManifest:
     learner_action_pack_cap: int
     topology_packet_cap: int
     target_arena_cap: int
-    movement_scratch_bytes: int
-    library_workspace_bytes: int
-    evaluator_workspace_bytes: int
-    memory_guard_bytes: int
+    rollout_workspace_bytes: int
+    queue_drain_workspace_bytes: int
+    completion_workspace_bytes: int
+    align_workspace_bytes: int
+    target_workspace_bytes: int
+    learner_workspace_bytes: int
     hardware: HardwareLimits
-    required_external: ExternalWorkspaceBounds
 
     def __post_init__(self) -> None:
         _positive_int(self.root_count, "root_count")
@@ -243,20 +201,10 @@ class CapacityManifest:
         for name in (
             *CAPACITY_VOCABULARY.scalar_rows,
             *CAPACITY_VOCABULARY.pack_limits,
-            "target_arena_cap",
         ):
             _positive_int(getattr(self, name), name)
-        for name in (
-            "movement_scratch_bytes",
-            "library_workspace_bytes",
-            "evaluator_workspace_bytes",
-        ):
+        for name in CAPACITY_VOCABULARY.workspaces:
             _nonnegative_int(getattr(self, name), name)
-        _nonnegative_int(self.memory_guard_bytes, "memory_guard_bytes")
-        if self.library_workspace_bytes < self.required_external.library_bytes:
-            raise CapacityError("library workspace does not cover its versioned bound")
-        if self.evaluator_workspace_bytes < self.required_external.evaluator_bytes:
-            raise CapacityError("evaluator workspace does not cover its versioned bound")
 
     def partition_rows(self, name: str) -> Mapping[str, int]:
         if name not in CAPACITY_VOCABULARY.partitioned_rows:
@@ -632,7 +580,9 @@ def _validate_manifest(
         1, manifest.topology_cap - manifest.root_count
     ):
         raise CapacityError("topology edge capacity cannot connect its node bound")
-    if folded_rows < len(partitions.folded):
+    if geometry.actor_count == 2 and folded_rows != 0:
+        raise CapacityError("heads-up folded-range capacity must be zero")
+    if geometry.actor_count > 2 and folded_rows < len(partitions.folded):
         raise CapacityError("folded-range capacity does not cover its partitions")
     if manifest.topology_edge_cap < manifest.beta_max:
         raise CapacityError("topology edge capacity does not cover beta_max")
@@ -652,90 +602,26 @@ def _validate_manifest(
         if getattr(manifest, name) > upper:
             raise CapacityError(f"{name} exceeds its covered row capacity")
 
-    if geometry.model_token_bound > manifest.hardware.training_max_tokens:
-        raise CapacityError("game geometry exceeds the hardware token limit")
-    if geometry.model_token_pair_bound > manifest.hardware.training_max_token_pairs:
-        raise CapacityError("game geometry exceeds the hardware token-pair limit")
     properties = torch.cuda.get_device_properties(device)
     actual_total = int(properties.total_memory)
     if manifest.hardware.total_memory_bytes != actual_total:
         raise CapacityError("resolved manifest device memory is stale")
-    if manifest.hardware.memory_budget_bytes > actual_total:
-        raise CapacityError("memory budget exceeds selected CUDA device memory")
+    if manifest.hardware.usable_memory_bytes > actual_total:
+        raise CapacityError("usable memory exceeds selected CUDA device memory")
 
 
 def _bounded_workspace(
     phase: ExecutionPhase,
-    mode: ModeSchema,
     manifest: CapacityManifest,
-    layout: PhysicalLayout,
 ) -> int:
-    if phase is ExecutionPhase.ROLLOUT:
-        family_multiplier = (
-            2
-            if (
-                mode.rollout_mode.is_branched
-                and mode.training_regime is TrainingRegime.BEST_RESPONSE
-            )
-            else 1
-        )
-        topology_rows = manifest.topology_packet_cap + int(
-            mode.rollout_mode.is_branched
-        )
-        return (
-            manifest.n_replica
-            * family_multiplier
-            * manifest.family_pack_cap
-            * layout.family_workspace_row_bytes
-            + manifest.n_replica
-            * manifest.chance_frontier_cap
-            * layout.chance_frontier_row_bytes
-            + manifest.n_replica
-            * topology_rows
-            * layout.topology_packet_row_bytes
-            + manifest.library_workspace_bytes
-        )
-    if phase is ExecutionPhase.QUEUE_DRAIN:
-        return manifest.library_workspace_bytes
-    if phase is ExecutionPhase.COMPLETION:
-        return (
-            manifest.n_replica
-            * manifest.completion_pack_cap
-            * layout.completion_workspace_row_bytes
-            + manifest.evaluator_workspace_bytes
-            + manifest.library_workspace_bytes
-        )
-    if phase in (ExecutionPhase.ALIGN_AND_SEAL, ExecutionPhase.TARGETS):
-        log_mass_bytes = (
-            manifest.topology_cap * BRANCHED_LOG_MASS_ROW_BYTES
-            if (
-                phase is ExecutionPhase.ALIGN_AND_SEAL
-                and mode.rollout_mode.is_branched
-            )
-            else 0
-        )
-        return (
-            manifest.movement_scratch_bytes
-            + manifest.library_workspace_bytes
-            + log_mass_bytes
-        )
-    if phase is ExecutionPhase.LEARNER:
-        alias_bytes = (
-            sum(manifest.partition_rows("trained_player_cap").values())
-            * BRANCHED_ALIAS_PEAK_ROW_BYTES
-            if mode.rollout_mode.is_branched
-            else 0
-        )
-        return (
-            manifest.learner_sigma_pack_cap
-            * layout.learner_sigma_workspace_row_bytes
-            + manifest.learner_action_pack_cap
-            * layout.learner_action_workspace_row_bytes
-            + manifest.library_workspace_bytes
-            + alias_bytes
-            + layout.reference_cache_bytes
-        )
-    return 0
+    return {
+        ExecutionPhase.ROLLOUT: manifest.rollout_workspace_bytes,
+        ExecutionPhase.QUEUE_DRAIN: manifest.queue_drain_workspace_bytes,
+        ExecutionPhase.COMPLETION: manifest.completion_workspace_bytes,
+        ExecutionPhase.ALIGN_AND_SEAL: manifest.align_workspace_bytes,
+        ExecutionPhase.TARGETS: manifest.target_workspace_bytes,
+        ExecutionPhase.LEARNER: manifest.learner_workspace_bytes,
+    }.get(phase, 0)
 
 
 def build_storage_plan(
@@ -811,15 +697,15 @@ def build_storage_plan(
             for allocation in allocations
             if allocation.start_phase <= phase <= allocation.last_consumer
         )
-        bounded = _bounded_workspace(phase, mode, manifest, layout)
-        required = owner_bytes + bounded + manifest.memory_guard_bytes
+        bounded = _bounded_workspace(phase, manifest)
+        required = owner_bytes + bounded
         admission = PhaseAdmission(
             phase=phase,
             owner_bytes=owner_bytes,
             bounded_workspace_bytes=bounded,
-            guard_bytes=manifest.memory_guard_bytes,
+            guard_bytes=manifest.hardware.reserve_bytes,
             required_bytes=required,
-            configured_budget_bytes=manifest.hardware.memory_budget_bytes,
+            configured_budget_bytes=manifest.hardware.usable_memory_bytes,
         )
         deferred_layer_work = (
             ExecutionPhase.COMPLETION
@@ -838,12 +724,12 @@ def build_storage_plan(
         )
         if (
             required - deferred_bytes
-            > manifest.hardware.memory_budget_bytes
+            > manifest.hardware.usable_memory_bytes
         ):
             raise AdmissionError(
                 f"{phase.name} non-deferred owners require "
                 f"{required - deferred_bytes} bytes but immutable budget is "
-                f"{manifest.hardware.memory_budget_bytes}"
+                f"{manifest.hardware.usable_memory_bytes}"
             )
         admissions.append(admission)
 
@@ -857,9 +743,10 @@ def build_storage_plan(
             <= ExecutionPhase.TARGETS
         )
     )
-    if peak_required > int(free_bytes):
+    reserve = manifest.hardware.reserve_bytes
+    if peak_required + reserve > int(free_bytes):
         raise AdmissionError(
-            f"validated plan requires {peak_required} free bytes, selected device "
+            f"validated plan plus reserve requires {peak_required + reserve} free bytes, selected device "
             f"currently has {int(free_bytes)}"
         )
     return StoragePlan(
@@ -1012,11 +899,7 @@ class GeneratedOwners:
                 if allocation.start_phase <= phase <= allocation.last_consumer
             )
             planned = self.plan.admission(phase)
-            required = (
-                owner_bytes
-                + planned.bounded_workspace_bytes
-                + planned.guard_bytes
-            )
+            required = owner_bytes + planned.bounded_workspace_bytes
             if required > planned.configured_budget_bytes:
                 raise AdmissionError(
                     f"{phase.name} exact LayerWork plan requires {required} bytes "
@@ -1109,7 +992,9 @@ class GeneratedOwners:
                     self.plan.device,
                     failure_state=self.failure_state,
                     label=allocation.key.label,
-                    allow_empty=allocation.key.owner == "LayerWork",
+                    allow_empty=(
+                        allocation.key.owner in {"LayerWork", "FoldedRanges"}
+                    ),
                 )
                 created.append(allocation.key)
         except BaseException:
@@ -1229,7 +1114,6 @@ __all__ = [
     "CapacityManifest",
     "ExecutionGeometry",
     "ExecutionPhase",
-    "ExternalWorkspaceBounds",
     "GeneratedOwners",
     "HardwareLimits",
     "MemoryReport",
