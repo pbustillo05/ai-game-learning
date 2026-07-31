@@ -237,6 +237,20 @@ def _scientific_mapping(
     return scientific
 
 
+def cumulative_folded_range_rows(roots: int, players: int) -> int:
+    """Return the per-partition folded-row bound for a root batch."""
+
+    if isinstance(roots, bool) or not isinstance(roots, int) or roots <= 0:
+        raise ValueError("roots must be a positive integer")
+    if (
+        isinstance(players, bool)
+        or not isinstance(players, int)
+        or not 2 <= players <= 6
+    ):
+        raise ValueError("players must be an integer in [2,6]")
+    return roots * (players - 1)
+
+
 def pilot_config_mapping(
     arm: Arm,
     *,
@@ -267,7 +281,7 @@ def pilot_config_mapping(
     leaf_cap = 2 * arm.roots
     topology_cap = 42 * arm.roots
     topology_edge_cap = topology_cap - arm.roots
-    folded_rows = max(1, min(arm.family_pack, arm.roots))
+    folded_rows = cumulative_folded_range_rows(arm.roots, geometry.players)
     learner_pack = min(arm.family_pack, batch_size)
     completion_pack = min(256 if h100 else 8, leaf_cap)
     chance_pack = min(max(2 * arm.family_pack, 8), pre_rows + post_rows + leaf_cap)
@@ -600,6 +614,7 @@ __all__ = [
     "PilotError",
     "base_plan",
     "benchmark_summary",
+    "cumulative_folded_range_rows",
     "export_model_initializer",
     "geometry_roots",
     "h100_preflight",

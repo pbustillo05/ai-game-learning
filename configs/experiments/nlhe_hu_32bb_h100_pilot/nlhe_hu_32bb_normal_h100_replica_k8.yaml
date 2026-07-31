@@ -82,8 +82,8 @@ execution:
       pre: 4096
       post_2: 16384
     folded_range_cap:
-      pre: 84
-      post: 84
+      pre: 512
+      post: 512
     leaf_cap: 1024
     topology_cap: 21504
     topology_edge_cap: 20992
