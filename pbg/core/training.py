@@ -170,7 +170,10 @@ class LearnerIteration:
                         }
                     ),
                 )
-                yield physical, physical.rows / batch.objective_rows
+                yield (
+                    physical,
+                    batch.objective_weight * physical.rows / batch.rows,
+                )
             return
         if self.sigma_pack_cap is None or self.action_pack_cap is None:
             raise TrainingError("ragged batch reached an aligned-only learner")

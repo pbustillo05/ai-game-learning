@@ -97,7 +97,7 @@ def test_512_root_configs_compile_all_capacity_from_workload(mode: str) -> None:
 
     assert "manifest" not in mapping["run"]
     config = load_config_mapping(mapping)
-    assert config.execution.manifest.family_pack_cap == 84
+    assert config.execution.manifest.family_pack_cap == 256
     assert config.execution.manifest.partition_rows("folded_range_cap") == {}
 
 
@@ -115,5 +115,11 @@ def test_checked_in_512_root_k1_config_has_no_authored_capacity(
 
     assert "manifest" not in mapping["run"]
     assert "layout" not in mapping["run"]
+    assert mapping["run"]["execution"]["reference_cache"] == "auto"
+    assert mapping["run"]["execution"]["microbatch"] == {
+        "rollout_rows": 256,
+        "completion_rows": 512,
+        "learner_rows": 256,
+    }
     assert config.scientific.common.root_count == 512
     assert config.execution.manifest.partition_rows("folded_range_cap") == {}

@@ -30,7 +30,7 @@ if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   printf 'CUDA_VISIBLE_DEVICES is empty; launch inside a GPU allocation\n' >&2
   exit 2
 fi
-if [[ ! "$replicas" =~ ^[2-9][0-9]*$ ]] || [[ ! -x "$python" ]] || [[ ! -d "$evaluator" ]]; then
+if [[ ! "$replicas" =~ ^[1-9][0-9]*$ ]] || [[ ! -x "$python" ]] || [[ ! -d "$evaluator" ]]; then
   printf 'replicas, Python, or evaluator path is invalid\n' >&2
   exit 2
 fi
@@ -39,6 +39,9 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 export PYTHONPATH="$repo_root:$(cd "$evaluator" && pwd)${PYTHONPATH:+:$PYTHONPATH}"
 export PBG_EVALUATOR_ROOT="$(cd "$evaluator" && pwd)"
 export PYTHONUNBUFFERED=1
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${SLURM_TMPDIR:-/tmp}/pbg-torch-extensions-sm90}"
+mkdir -p "$TORCH_EXTENSIONS_DIR"
 IFS=',' read -r -a assigned_gpus <<< "$CUDA_VISIBLE_DEVICES"
 nproc=${#assigned_gpus[@]}
 

@@ -14,8 +14,7 @@ def test_runpod_selection_uses_the_public_session() -> None:
     }
     assert "pbg.runtime" in imports
     assert not any(
-        value == "pbg.queued" or value.startswith("pbg.queued.")
-        for value in imports
+        value == "pbg.queued" or value.startswith("pbg.queued.") for value in imports
     )
 
 
@@ -24,3 +23,5 @@ def test_runpod_selection_has_strict_deadline_and_replica_arguments() -> None:
     assert "--deadline-minutes" in source
     assert "--replicas" in source
     assert "manifest.n_replica" in source
+    assert "args.replicas <= 0" in source
+    assert "args.replicas <= 1" not in source

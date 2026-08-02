@@ -1323,15 +1323,57 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
     assert cost_sampler.optimizer_steps == len(cost_batches)
     assert sum(batch.rows for batch in cost_batches) == 7
     assert all(0 < batch.rows <= 3 for batch in cost_batches)
-    mixed_sampler = SequentialBatchSampler.from_costs(
+
+    def cost_stratified_sampler() -> SequentialBatchSampler:
+        return SequentialBatchSampler.from_costs(
+            stores,
+            LearnerSchedule(batch_size=4, epochs=None, gradient_steps=2),
+            generator=torch.Generator(device=device).manual_seed(885),
+            mass=torch.tensor([3.0, 1.0]),
+            variance=torch.ones(2),
+            seconds_per_draw=torch.ones(2),
+            total_count=4,
+        )
+
+    weighted_batches = tuple(cost_stratified_sampler().batches())
+    for step in range(2):
+        step_batches = [
+            batch for batch in weighted_batches if batch.logical_step == step
+        ]
+        assert [batch.input_type for batch in step_batches] == ["pre", "post_2"]
+        assert [batch.objective_weight for batch in step_batches] == [0.75, 0.25]
+        assert sum(float(batch.objective_weight) for batch in step_batches) == 1.0
+
+    pooled_generator = torch.Generator(device=device).manual_seed(886)
+    pooled_sampler = SequentialBatchSampler(
         stores,
-        LearnerSchedule(batch_size=4, epochs=None, gradient_steps=2),
-        generator=torch.Generator(device=device).manual_seed(885),
-        mass=torch.tensor([3.0, 1.0]),
-        variance=torch.ones(2),
-        seconds_per_draw=torch.ones(2),
-        total_count=4,
+        LearnerSchedule(batch_size=4, epochs=None, gradient_steps=3),
+        generator=pooled_generator,
     )
+    pooled_batches = tuple(pooled_sampler.batches())
+    oracle_generator = torch.Generator(device=device).manual_seed(886)
+    for step in range(3):
+        oracle = torch.randint(
+            8,
+            (4,),
+            dtype=torch.int64,
+            device=device,
+            generator=oracle_generator,
+        )
+        step_batches = {
+            batch.input_type: batch
+            for batch in pooled_batches
+            if batch.logical_step == step
+        }
+        assert sum(batch.rows for batch in step_batches.values()) == 4
+        if bool((oracle < 5).any()):
+            torch.testing.assert_close(step_batches["pre"].indices, oracle[oracle < 5])
+        if bool((oracle >= 5).any()):
+            torch.testing.assert_close(
+                step_batches["post_2"].indices, oracle[oracle >= 5] - 5
+            )
+
+    mixed_sampler = cost_stratified_sampler()
     mixed_model = _LearnerModel(device)
     mixed_result = LearnerIteration(
         learner=LearnerOperation(

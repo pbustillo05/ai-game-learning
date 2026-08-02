@@ -77,15 +77,17 @@ def _run_arm(args: argparse.Namespace) -> None:
     else:
         hardware = {"preflight": "explicitly bypassed for local smoke"}
     arm = Arm(
-        args.name,
-        args.stage,
-        args.mode,
-        args.replicas,
-        args.roots,
-        args.completion_samples,
-        args.family_pack,
-        args.warmup,
-        args.repeats,
+        name=args.name,
+        stage=args.stage,
+        mode=args.mode,
+        replicas=args.replicas,
+        roots=args.roots,
+        completion_samples=args.completion_samples,
+        rollout_pack=args.rollout_pack,
+        completion_pack=args.completion_pack,
+        learner_pack=args.learner_pack,
+        warmup=args.warmup,
+        repeats=args.repeats,
     )
     config = load_config(args.config)
     if config.execution.manifest.n_replica != arm.replicas:
@@ -98,6 +100,7 @@ def _run_arm(args: argparse.Namespace) -> None:
         warmup=arm.warmup,
         repeats=arm.repeats,
         initial_model_state=state,
+        progress_path=Path(args.report).with_suffix(".progress.json"),
     )
     report = {
         "summary": benchmark_summary(arm, benchmark),
@@ -141,8 +144,12 @@ def _invoke_arm(
         str(arm.replicas),
         "--roots",
         str(arm.roots),
-        "--family-pack",
-        str(arm.family_pack),
+        "--rollout-pack",
+        str(arm.rollout_pack),
+        "--completion-pack",
+        str(arm.completion_pack),
+        "--learner-pack",
+        str(arm.learner_pack),
         "--warmup",
         str(arm.warmup),
         "--repeats",
@@ -315,10 +322,10 @@ def _local_smoke(args: argparse.Namespace) -> None:
     }
     reports = []
     arms = (
-        Arm("nlhe_hu_32bb_normal_local_smoke_k1", "local_smoke", "normal", 1, 1, None, 1, 0, 1),
-        Arm("nlhe_hu_32bb_normal_local_smoke_k2", "local_smoke", "normal", 2, 1, None, 1, 0, 1),
-        Arm("nlhe_hu_32bb_rb_local_smoke_k1", "local_smoke", "rb", 1, 1, 4, 1, 0, 1),
-        Arm("nlhe_hu_32bb_rb_local_smoke_k2", "local_smoke", "rb", 2, 1, 4, 1, 0, 1),
+        Arm("nlhe_hu_32bb_normal_local_smoke_k1", "local_smoke", "normal", 1, 1, None, rollout_pack=1, completion_pack=1, learner_pack=1, warmup=0, repeats=1),
+        Arm("nlhe_hu_32bb_normal_local_smoke_k2", "local_smoke", "normal", 2, 1, None, rollout_pack=1, completion_pack=1, learner_pack=1, warmup=0, repeats=1),
+        Arm("nlhe_hu_32bb_rb_local_smoke_k1", "local_smoke", "rb", 1, 1, 4, rollout_pack=1, completion_pack=1, learner_pack=1, warmup=0, repeats=1),
+        Arm("nlhe_hu_32bb_rb_local_smoke_k2", "local_smoke", "rb", 2, 1, 4, rollout_pack=1, completion_pack=1, learner_pack=1, warmup=0, repeats=1),
     )
     for arm in arms:
         try:
@@ -374,9 +381,11 @@ def _parser() -> argparse.ArgumentParser:
     arm.add_argument("--replicas", type=int, required=True)
     arm.add_argument("--roots", type=int, required=True)
     arm.add_argument("--completion-samples", type=int)
-    arm.add_argument("--family-pack", type=int, default=84)
+    arm.add_argument("--rollout-pack", type=int, default=256)
+    arm.add_argument("--completion-pack", type=int, default=512)
+    arm.add_argument("--learner-pack", type=int, default=256)
     arm.add_argument("--warmup", type=int, default=1)
-    arm.add_argument("--repeats", type=int, default=2)
+    arm.add_argument("--repeats", type=int, default=3)
     arm.add_argument("--config", required=True)
     arm.add_argument("--initializer", required=True)
     arm.add_argument("--report", required=True)

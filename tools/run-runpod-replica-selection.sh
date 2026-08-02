@@ -40,6 +40,9 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 export PYTHONPATH="$repo_root:$(cd "$evaluator" && pwd)${PYTHONPATH:+:$PYTHONPATH}"
 export PBG_EVALUATOR_ROOT="$(cd "$evaluator" && pwd)"
 export PYTHONUNBUFFERED=1
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/tmp/pbg-torch-extensions-sm90}"
+mkdir -p "$TORCH_EXTENSIONS_DIR"
 cmd=("$python" -m pbg.cli.runpod_replica_selection
   --config "$config" --report "$report" --replicas "$replicas"
   --deadline-minutes "$deadline_minutes")

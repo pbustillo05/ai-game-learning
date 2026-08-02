@@ -39,17 +39,22 @@ class Arm:
     replicas: int
     roots: int
     completion_samples: int | None
-    family_pack: int = 84
+    rollout_pack: int = 256
+    completion_pack: int = 512
+    learner_pack: int = 256
     warmup: int = 1
-    repeats: int = 2
+    repeats: int = 3
 
     def __post_init__(self) -> None:
         if self.mode not in ("normal", "rb"):
             raise ValueError("pilot mode must be normal or rb")
         if self.replicas not in REPLICA_COUNTS:
             raise ValueError("pilot replicas must be one of 1, 2, 4, 8")
-        if self.roots <= 0 or self.family_pack <= 0:
-            raise ValueError("pilot roots and family pack must be positive")
+        if (
+            self.roots <= 0
+            or min(self.rollout_pack, self.completion_pack, self.learner_pack) <= 0
+        ):
+            raise ValueError("pilot roots and execution packs must be positive")
         if self.mode == "rb" and (
             self.completion_samples is None or self.completion_samples <= 0
         ):
@@ -217,7 +222,11 @@ def pilot_config_mapping(
     precision = "bf16" if h100 else "fp32"
     batch_size = 256 if h100 else 8
     gradient_steps = 116 if h100 else 1
-    learner_pack = min(arm.family_pack, batch_size)
+    rollout_pack = min(arm.rollout_pack, batch_size) if not h100 else arm.rollout_pack
+    completion_pack = (
+        min(arm.completion_pack, batch_size) if not h100 else arm.completion_pack
+    )
+    learner_pack = min(arm.learner_pack, batch_size)
     result: dict[str, object] = {
         "kind": "nlhe_run_v1",
         "scientific": _scientific_mapping(
@@ -238,12 +247,13 @@ def pilot_config_mapping(
                 "device": device,
                 "precision": precision,
                 "attention": "sdpa",
+                "reference_cache": "auto" if arm.replicas == 1 else "off",
                 "memory": {
                     "reserve_bytes": (H100_MEMORY_GUARD_BYTES if h100 else 256 << 20)
                 },
                 "microbatch": {
-                    "rollout_rows": arm.family_pack,
-                    "completion_rows": 256 if h100 else 8,
+                    "rollout_rows": rollout_pack,
+                    "completion_rows": completion_pack,
                     "learner_rows": learner_pack,
                 },
             },
@@ -295,6 +305,8 @@ def base_plan() -> dict[str, object]:
             1,
             4,
             None,
+            rollout_pack=4,
+            completion_pack=16,
             warmup=0,
             repeats=1,
         ),
@@ -305,6 +317,8 @@ def base_plan() -> dict[str, object]:
             1,
             4,
             16,
+            rollout_pack=4,
+            completion_pack=16,
             warmup=0,
             repeats=1,
         ),
@@ -319,7 +333,7 @@ def base_plan() -> dict[str, object]:
             1024 if mode == "rb" else None,
         )
         for mode in ("normal", "rb")
-        for replicas in REPLICA_COUNTS
+        for replicas in (1,)
     )
     return {
         "schema": PLAN_SCHEMA,
@@ -330,7 +344,12 @@ def base_plan() -> dict[str, object]:
         "fixed_batch_size": 256,
         "fixed_gradient_steps": 116,
         "production_precision": "bf16",
-        "replica_counts": list(REPLICA_COUNTS),
+        "replica_counts": [1],
+        "execution_packs": {
+            "rollout_rows": 256,
+            "completion_rows": 512,
+            "learner_rows": 256,
+        },
         "rb_sample_counts": list(RB_SAMPLE_COUNTS),
         "arms": [asdict(arm) for arm in arms],
     }
@@ -448,6 +467,9 @@ def benchmark_summary(
         "replicas": arm.replicas,
         "roots_per_replica": arm.roots,
         "completion_samples": arm.completion_samples,
+        "rollout_pack": arm.rollout_pack,
+        "completion_pack": arm.completion_pack,
+        "learner_pack": arm.learner_pack,
         "player_nodes_per_second": float(median["player_nodes_per_second"]),
         "seconds": float(median["seconds"]),
         "peak_allocated_bytes": int(median["peak_allocated_bytes"]),

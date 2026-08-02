@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import statistics
 import time
@@ -34,6 +35,18 @@ _REQUIRED_SAMPLE_METRICS = (
 )
 
 
+def _write_json_atomic(value: object, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.tmp"
+    )
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, destination)
+
+
 def benchmark_training(
     cfg: RootConfig,
     *,
@@ -41,6 +54,7 @@ def benchmark_training(
     repeats: int = 5,
     checkpoint: str | Path | None = None,
     initial_model_state: Mapping[str, torch.Tensor] | None = None,
+    progress_path: str | Path | None = None,
 ) -> dict[str, Any]:
     if warmup < 0 or repeats <= 0:
         raise ValueError("warmup must be nonnegative and repeats positive")
@@ -55,28 +69,73 @@ def benchmark_training(
     )
     samples = []
     benchmark_device: torch.device | None = None
+    progress = None if progress_path is None else Path(progress_path)
+    if progress is not None:
+        _write_json_atomic(
+            {
+                "schema": "pbg-queued-benchmark-progress-v1",
+                "status": "starting",
+                "warmup": warmup,
+                "repeats": repeats,
+                "completed_warmups": 0,
+                "completed_repeats": 0,
+                "samples": [],
+            },
+            progress,
+        )
     for index in range(warmup + repeats):
         # Every repeat starts from the identical model/optimizer/RNG/run state.
         # Warmup compiles the same production path but is never a measured row.
+        if progress is not None:
+            _write_json_atomic(
+                {
+                    "schema": "pbg-queued-benchmark-progress-v1",
+                    "status": "running",
+                    "active_kind": "warmup" if index < warmup else "repeat",
+                    "active_index": index if index < warmup else index - warmup,
+                    "warmup": warmup,
+                    "repeats": repeats,
+                    "completed_warmups": min(index, warmup),
+                    "completed_repeats": max(0, index - warmup),
+                    "samples": samples,
+                },
+                progress,
+            )
         session = TrainingSession(
             cfg,
             resume_from=checkpoint,
             benchmark_telemetry=True,
             initial_model_state=initial_model_state,
         )
-        benchmark_device = session.device
-        iteration = session.run_states[0].iteration
-        logical_before = tuple(
-            dict(state.logical_work) for state in session.run_states
-        )
-        torch.cuda.synchronize(session.device)
-        torch.cuda.reset_peak_memory_stats(session.device)
-        before_allocated = torch.cuda.memory_allocated(session.device)
-        started = time.perf_counter()
-        result = session.step()
-        torch.cuda.synchronize(session.device)
-        elapsed = time.perf_counter() - started
-        if index >= warmup:
+        try:
+            benchmark_device = session.device
+            iteration = session.run_states[0].iteration
+            logical_before = tuple(
+                dict(state.logical_work) for state in session.run_states
+            )
+            torch.cuda.synchronize(session.device)
+            torch.cuda.reset_peak_memory_stats(session.device)
+            before_allocated = torch.cuda.memory_allocated(session.device)
+            started = time.perf_counter()
+            result = session.step()
+            torch.cuda.synchronize(session.device)
+            elapsed = time.perf_counter() - started
+            if index < warmup:
+                del result
+                if progress is not None:
+                    _write_json_atomic(
+                        {
+                            "schema": "pbg-queued-benchmark-progress-v1",
+                            "status": "running",
+                            "warmup": warmup,
+                            "repeats": repeats,
+                            "completed_warmups": index + 1,
+                            "completed_repeats": 0,
+                            "samples": samples,
+                        },
+                        progress,
+                    )
+                continue
             nodes = sum(
                 int(getattr(value, "player_nodes", getattr(value, "nodes", 0)))
                 for value in (
@@ -126,9 +185,39 @@ def benchmark_training(
                     "telemetry": telemetry,
                 }
             )
-        del result
-        session.close()
-        del session
+            del result
+        except BaseException as error:
+            if progress is not None:
+                _write_json_atomic(
+                    {
+                        "schema": "pbg-queued-benchmark-progress-v1",
+                        "status": "failed",
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "warmup": warmup,
+                        "repeats": repeats,
+                        "completed_repeats": len(samples),
+                        "samples": samples,
+                    },
+                    progress,
+                )
+            raise
+        finally:
+            session.close()
+            del session
+        if progress is not None:
+            _write_json_atomic(
+                {
+                    "schema": "pbg-queued-benchmark-progress-v1",
+                    "status": "running",
+                    "warmup": warmup,
+                    "repeats": repeats,
+                    "completed_warmups": warmup,
+                    "completed_repeats": len(samples),
+                    "samples": samples,
+                },
+                progress,
+            )
     numeric = {
         key
         for key in set.intersection(*(set(sample) for sample in samples))
@@ -144,7 +233,7 @@ def benchmark_training(
     }
     assert benchmark_device is not None
     properties = torch.cuda.get_device_properties(benchmark_device)
-    return {
+    report = {
         "schema": "pbg-queued-benchmark-v1",
         "mode": dict(cfg.mode),
         "scientific_config": cfg.scientific_mapping(),
@@ -174,6 +263,21 @@ def benchmark_training(
         "median": median,
         "samples": samples,
     }
+    if progress is not None:
+        _write_json_atomic(
+            {
+                "schema": "pbg-queued-benchmark-progress-v1",
+                "status": "complete",
+                "warmup": warmup,
+                "repeats": repeats,
+                "completed_warmups": warmup,
+                "completed_repeats": len(samples),
+                "samples": samples,
+                "median": median,
+            },
+            progress,
+        )
+    return report
 
 
 def compare_benchmark(

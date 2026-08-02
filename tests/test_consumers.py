@@ -484,8 +484,19 @@ def test_benchmark_reuses_process_workspaces_across_repeats(
     raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
     raw["run"]["output_dir"] = str(tmp_path / "benchmark")
     cfg = load_config_mapping(raw)
-    report = benchmark_training(cfg, warmup=1, repeats=3)
+    progress_path = tmp_path / "benchmark.progress.json"
+    report = benchmark_training(
+        cfg,
+        warmup=1,
+        repeats=3,
+        progress_path=progress_path,
+    )
     peaks = [sample["peak_allocated_bytes"] for sample in report["samples"]]
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert progress["status"] == "complete"
+    assert progress["completed_warmups"] == 1
+    assert progress["completed_repeats"] == 3
+    assert len(progress["samples"]) == 3
     del report
     gc.collect()
     torch.cuda.synchronize()

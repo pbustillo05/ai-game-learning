@@ -22,8 +22,8 @@ def main() -> None:
     if args.deadline_minutes <= 0:
         parser.error("--deadline-minutes must be positive")
     cfg = load_config(args.config)
-    if cfg.execution.manifest.n_replica != args.replicas or args.replicas <= 1:
-        parser.error("replica count must match the strict manifest and exceed one")
+    if cfg.execution.manifest.n_replica != args.replicas or args.replicas <= 0:
+        parser.error("replica count must be positive and match the strict manifest")
     started = time.monotonic()
     session = TrainingSession(cfg, resume_from=args.resume)
     try:
@@ -41,9 +41,7 @@ def main() -> None:
             ),
             "checkpoint": str(checkpoint),
             "checkpoint_sha256": digest,
-            "lane_iterations": [
-                state.iteration for state in session.run_states
-            ],
+            "lane_iterations": [state.iteration for state in session.run_states],
         }
     finally:
         session.close()

@@ -1456,25 +1456,6 @@ class IterationEngine:
                 if state.sealed[(lane, name)].rows
             }
             allocation = context.allocation_inputs
-            if allocation is None and self.config.schedule.gradient_steps is not None:
-                costs = self.operations.model_costs(lane)
-                if costs is not None:
-                    names = tuple(stores)
-                    allocation = (
-                        torch.tensor(
-                            [float(stores[name].rows) for name in names],
-                            dtype=torch.float64,
-                        ),
-                        torch.ones(len(names), dtype=torch.float64),
-                        torch.tensor(
-                            [
-                                float(costs[name] * costs[name])
-                                for name in names
-                            ],
-                            dtype=torch.float64,
-                        ),
-                        self.config.schedule.batch_size,
-                    )
             sampler = (
                 SequentialBatchSampler(
                     stores,

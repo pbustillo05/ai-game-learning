@@ -59,12 +59,13 @@ run:
     device: cuda:0
     precision: bf16
     attention: sdpa
+    reference_cache: auto
     memory:
       reserve_bytes: 10737418240
     microbatch:
-      rollout_rows: 84
-      completion_rows: 256
-      learner_rows: 84
+      rollout_rows: 256
+      completion_rows: 512
+      learner_rows: 256
   iterations: 1
   checkpoint_every: 1
   output_dir: runs/experiments/nlhe_hu_32bb_h100_pilot/runtime/nlhe_hu_32bb_rb_h100_replica_k1

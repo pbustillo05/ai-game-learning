@@ -539,6 +539,7 @@ class SequentialLearnerBatch:
     fields: Mapping[str, Tensor]
     logical_step: int = 0
     logical_rows: int | None = None
+    statistical_weight: float | Tensor | None = None
 
     @property
     def rows(self) -> int:
@@ -547,6 +548,14 @@ class SequentialLearnerBatch:
     @property
     def objective_rows(self) -> int:
         return self.rows if self.logical_rows is None else self.logical_rows
+
+    @property
+    def objective_weight(self) -> float | Tensor:
+        return (
+            self.rows / self.objective_rows
+            if self.statistical_weight is None
+            else self.statistical_weight
+        )
 
     @property
     def sigma_index(self) -> Tensor:
@@ -785,7 +794,7 @@ class AlignedSequentialStore:
 
 
 class SequentialBatchSampler:
-    """One lane-local ``randperm`` per partition and epoch with exact tails."""
+    """Pooled fixed-step sampling or exact per-partition epoch traversal."""
 
     def __init__(
         self,
@@ -794,6 +803,7 @@ class SequentialBatchSampler:
         *,
         generator: torch.Generator,
         statistical_counts: Mapping[str, int] | None = None,
+        statistical_weights: Mapping[str, float] | None = None,
         reproducibility: str = "strict",
     ) -> None:
         if not stores:
@@ -821,10 +831,29 @@ class SequentialBatchSampler:
                 )
             if not any(statistical_counts.values()):
                 raise LearnerError("statistical allocation cannot be empty")
+        if statistical_weights is not None:
+            if statistical_counts is None or set(statistical_weights) != set(stores):
+                raise LearnerError(
+                    "statistical weights require the same complete partition set"
+                )
+            if any(
+                not math.isfinite(value) or value < 0
+                for value in statistical_weights.values()
+            ) or not math.isclose(
+                sum(statistical_weights.values()), 1.0, rel_tol=1.0e-6, abs_tol=1.0e-8
+            ):
+                raise LearnerError(
+                    "statistical weights must be nonnegative and sum to one"
+                )
         self.statistical_counts = (
             None
             if statistical_counts is None
             else MappingProxyType(dict(statistical_counts))
+        )
+        self.statistical_weights = (
+            None
+            if statistical_weights is None
+            else MappingProxyType(dict(statistical_weights))
         )
         if reproducibility not in ("strict", "seeded", "throughput"):
             raise LearnerError("unknown learner reproducibility profile")
@@ -849,12 +878,19 @@ class SequentialBatchSampler:
         counts = allocate_statistical_counts(
             mass, variance, seconds_per_draw, total_count
         )
+        total_mass = float(mass.sum())
+        if not math.isfinite(total_mass) or total_mass <= 0:
+            raise LearnerError("cost-aware allocation requires positive total mass")
         return cls(
             stores,
             schedule,
             generator=generator,
             statistical_counts={
                 name: int(counts[index]) for index, name in enumerate(names)
+            },
+            statistical_weights={
+                name: float(mass[index]) / total_mass
+                for index, name in enumerate(names)
             },
             reproducibility=reproducibility,
         )
@@ -913,6 +949,8 @@ class SequentialBatchSampler:
             standalone_step = 0
             for logical_step in range(logical_steps):
                 for name, requested in self.statistical_counts.items():
+                    if requested == 0:
+                        continue
                     store = self.stores[name]
                     if self.schedule.gradient_steps is not None:
                         pieces: list[Tensor] = []
@@ -934,6 +972,11 @@ class SequentialBatchSampler:
                             gathered.fields,
                             logical_step=logical_step,
                             logical_rows=logical_rows,
+                            statistical_weight=(
+                                None
+                                if self.statistical_weights is None
+                                else self.statistical_weights[name]
+                            ),
                         )
                         continue
                     emitted = 0
@@ -980,28 +1023,34 @@ class SequentialBatchSampler:
             else tuple(self.stores)
         )
         if self.schedule.gradient_steps is not None:
+            offsets: list[tuple[str, int, int]] = []
+            begin = 0
+            for name in names:
+                end = begin + self.stores[name].rows
+                offsets.append((name, begin, end))
+                begin = end
+            if begin <= 0:
+                raise LearnerError("fixed-step sampling requires retained rows")
             for step in range(self.schedule.gradient_steps):
-                store = self.stores[names[step % len(names)]]
-                pieces: list[Tensor] = []
-                remaining = self.schedule.batch_size
-                while remaining:
-                    permutation = torch.randperm(
-                        store.rows,
-                        dtype=torch.int64,
-                        device=store.device,
-                        generator=self.generator,
-                    )
-                    take = min(store.rows, remaining)
-                    pieces.append(permutation[:take])
-                    remaining -= take
-                gathered = store.gather(torch.cat(pieces))
-                yield SequentialLearnerBatch(
-                    gathered.input_type,
-                    gathered.indices,
-                    gathered.fields,
-                    logical_step=step,
-                    logical_rows=gathered.rows,
+                pooled = torch.randint(
+                    begin,
+                    (self.schedule.batch_size,),
+                    dtype=torch.int64,
+                    device=next(iter(self.stores.values())).device,
+                    generator=self.generator,
                 )
+                for name, offset, end in offsets:
+                    selected = pooled[(pooled >= offset) & (pooled < end)] - offset
+                    if selected.numel() == 0:
+                        continue
+                    gathered = self.stores[name].gather(selected)
+                    yield SequentialLearnerBatch(
+                        gathered.input_type,
+                        gathered.indices,
+                        gathered.fields,
+                        logical_step=step,
+                        logical_rows=self.schedule.batch_size,
+                    )
             return
         epoch = 0
         assert self.schedule.epochs is not None

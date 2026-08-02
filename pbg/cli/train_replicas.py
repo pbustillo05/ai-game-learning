@@ -17,8 +17,8 @@ def main() -> None:
     cfg = load_config(args.config)
     if args.replicas != cfg.execution.manifest.n_replica:
         parser.error("--replicas must equal run.workload.replicas")
-    if args.replicas <= 1:
-        parser.error("replica training requires at least two lanes")
+    if args.replicas <= 0:
+        parser.error("replica count must be positive")
     train(cfg, resume_from=args.resume)
 
 

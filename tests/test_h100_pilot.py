@@ -9,7 +9,6 @@ from pbg.config import load_config_mapping
 from pbg.core.persistence import model_state_sha256
 from pbg.h100_pilot import (
     H100_MEMORY_BUDGET_BYTES,
-    REPLICA_COUNTS,
     Arm,
     PilotError,
     base_plan,
@@ -22,7 +21,7 @@ from pbg.h100_pilot import (
 from pbg.runtime import TrainingSession
 
 
-def test_h100_plan_keeps_batch_fixed_and_sweeps_replicas() -> None:
+def test_h100_plan_keeps_science_fixed_and_uses_k1_execution_packs() -> None:
     plan = base_plan()
     arms = [Arm(**value) for value in plan["arms"]]
     assert plan["fixed_batch_size"] == 256
@@ -32,13 +31,19 @@ def test_h100_plan_keeps_batch_fixed_and_sweeps_replicas() -> None:
         scaling = [
             arm for arm in arms if arm.mode == mode and arm.stage == "replica_scaling"
         ]
-        assert tuple(arm.replicas for arm in scaling) == REPLICA_COUNTS
+        assert tuple(arm.replicas for arm in scaling) == (1,)
         for arm in scaling:
             mapping = pilot_config_mapping(arm, output_dir="/tmp/pilot")
             scientific = mapping["scientific"]
             execution = mapping["run"]["execution"]
             assert scientific["schedule"] == {"batch_size": 256, "steps": 116}
             assert execution["precision"] == "bf16"
+            assert execution["reference_cache"] == "auto"
+            assert execution["microbatch"] == {
+                "rollout_rows": 256,
+                "completion_rows": 512,
+                "learner_rows": 256,
+            }
             assert "manifest" not in mapping["run"]
             resolved = load_config_mapping(mapping)
             assert resolved.execution.layout.model_dtype == torch.bfloat16
@@ -53,7 +58,9 @@ def test_local_smoke_changes_only_execution_scale_and_precision() -> None:
         2,
         1,
         4,
-        family_pack=1,
+        rollout_pack=1,
+        completion_pack=1,
+        learner_pack=1,
         warmup=0,
         repeats=1,
     )
@@ -139,7 +146,9 @@ def test_model_only_initializer_reaches_every_replica_and_reference() -> None:
         1,
         1,
         None,
-        family_pack=1,
+        rollout_pack=1,
+        completion_pack=1,
+        learner_pack=1,
         warmup=0,
         repeats=1,
     )
@@ -164,7 +173,9 @@ def test_model_only_initializer_reaches_every_replica_and_reference() -> None:
         2,
         1,
         None,
-        family_pack=1,
+        rollout_pack=1,
+        completion_pack=1,
+        learner_pack=1,
         warmup=0,
         repeats=1,
     )
@@ -201,7 +212,9 @@ def test_runtime_separates_rb_rollout_and_natural_learner_domains(
         replicas,
         1,
         4,
-        family_pack=1,
+        rollout_pack=1,
+        completion_pack=1,
+        learner_pack=1,
         warmup=0,
         repeats=1,
     )
