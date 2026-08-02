@@ -38,11 +38,11 @@ from pbg.games.poker.queued.branching import (
 )
 from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
 from pbg.games.poker.queued.hooks import NLHEGeometry, poker_partitions
+from pbg.games.poker.queued.rb_sampling import POSTERIOR_MAX_ATTEMPTS
 
 CAPACITY_DERIVATION_VERSION = "nlhe_capacity_v1"
 FIELD_ALIGNMENT = 64
 _CUBLAS_WORKSPACE_BYTES = 8 << 20
-_POSTERIOR_MAX_ATTEMPTS = 256
 
 
 @dataclass(frozen=True)
@@ -128,9 +128,9 @@ def _chance_frontier_row_bytes(
     if rao_blackwell:
         # Posterior collision attempts plus accepted profile and legality masks.
         return _align(
-            4 * (players * hands + _POSTERIOR_MAX_ATTEMPTS * players)
-            + _POSTERIOR_MAX_ATTEMPTS * players
-            + 8 * _POSTERIOR_MAX_ATTEMPTS
+            4 * (players * hands + POSTERIOR_MAX_ATTEMPTS * players)
+            + POSTERIOR_MAX_ATTEMPTS * players
+            + 8 * POSTERIOR_MAX_ATTEMPTS
         )
     return _align(4 * players * hands + 16 * players + 64)
 
@@ -171,11 +171,7 @@ def _evaluator_workspace_bytes(
     weights_and_payoffs = worlds * (8 + 4 * geometry.players)
     results = batch * geometry.private_hands * geometry.players * 2 * 4
     return _align(
-        sampled_profiles
-        + completed_boards
-        + hand_ranks
-        + weights_and_payoffs
-        + results
+        sampled_profiles + completed_boards + hand_ranks + weights_and_payoffs + results
     )
 
 
@@ -254,7 +250,7 @@ def compile_capacity(
             PartitionRows(item.name, item.rows) for item in trained_rows
         )
 
-    folded_cap = 0 if geometry.players == 2 else topology_cap
+    folded_cap = topology_cap
     folded_rows = tuple(
         PartitionRows(item.name, folded_cap) for item in partitions.folded
     )
@@ -300,7 +296,7 @@ def compile_capacity(
     chance_workspace = (
         (
             branched_rb_chance_frontier_row_bytes(
-                geometry, max_attempts=_POSTERIOR_MAX_ATTEMPTS
+                geometry, max_attempts=POSTERIOR_MAX_ATTEMPTS
             )
             if rao_blackwell
             else sampled_branched_chance_frontier_row_bytes(geometry)
@@ -341,15 +337,16 @@ def compile_capacity(
     )
     completion_destinations = len(partitions.outputs)
     completion_commit_workspace = _align(
-        workload.replicas
-        * completion_pack
-        * (25 + 8 + 16 * completion_destinations)
+        workload.replicas * completion_pack * (25 + 8 + 16 * completion_destinations)
         + workload.replicas * completion_destinations * 8
     )
-    family_multiplier = int(
-        mode.rollout_mode.is_branched
-        and mode.training_regime is TrainingRegime.BEST_RESPONSE
-    ) + 1
+    family_multiplier = (
+        int(
+            mode.rollout_mode.is_branched
+            and mode.training_regime is TrainingRegime.BEST_RESPONSE
+        )
+        + 1
+    )
     topology_rows = topology_packet + int(mode.rollout_mode.is_branched)
     rollout_workspace = (
         workload.replicas * family_multiplier * family_pack * family_workspace
@@ -440,7 +437,6 @@ def compile_capacity(
         ),
         player_count=geometry.players,
         stratum_count=geometry.players,
-        evaluator_private_width=(geometry.private_hands if rao_blackwell else 1),
         reference_cache_bytes=workload.reference_cache_bytes,
         field_alignment=FIELD_ALIGNMENT,
         model_dtype=dtype,

@@ -90,7 +90,6 @@ def _layout() -> PhysicalLayout:
         ),
         player_count=2,
         stratum_count=3,
-        evaluator_private_width=28,
         opaque_fields=(
             SoAField("leaf_public_state", torch.uint8, (5,), fill=255),
             SoAField("leaf_private_profile", torch.int32, (2,), fill=-1),
@@ -129,9 +128,7 @@ def _manifest(
             PartitionRows("pre", 20),
             PartitionRows("post2", 20),
         ),
-        action_cap=tuple(
-            PartitionRows(name, action_rows) for name in action_names
-        ),
+        action_cap=tuple(PartitionRows(name, action_rows) for name in action_names),
         folded_range_cap=(
             PartitionRows("pre", 0),
             PartitionRows("post", 0),
@@ -268,7 +265,9 @@ def test_all_twelve_modes_allocate_only_their_generated_cuda_owners() -> None:
         assert len({item.key for item in plan.allocations}) == len(plan.allocations)
         for allocation in plan.allocations:
             owner = mode.owner(allocation.key.owner)
-            assert tuple(field.name for field in allocation.schema.fields) == owner.fields
+            assert (
+                tuple(field.name for field in allocation.schema.fields) == owner.fields
+            )
             assert allocation.schema.lifetime == owner.lifetime
             assert allocation.analytical_bytes > 0
 
@@ -291,14 +290,10 @@ def test_all_twelve_modes_allocate_only_their_generated_cuda_owners() -> None:
 def test_monotone_slab_uses_one_aligned_arena_and_never_repeats_addresses() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     failures = DeviceFailureState(2, device)
-    slab = MonotoneSlab(
-        _small_schema("monotone"), 5, 2, device, failure_state=failures
-    )
+    slab = MonotoneSlab(_small_schema("monotone"), 5, 2, device, failure_state=failures)
     with pytest.raises(AttributeError, match="immutable"):
         slab.capacity = 6  # type: ignore[misc]
-    assert slab.allocated_bytes == MonotoneSlab.analytical_bytes(
-        slab.schema, 5, 2
-    )
+    assert slab.allocated_bytes == MonotoneSlab.analytical_bytes(slab.schema, 5, 2)
     backing_pointers = {
         value.untyped_storage().data_ptr() for value in slab.columns.values()
     }
@@ -347,12 +342,8 @@ def test_monotone_slab_uses_one_aligned_arena_and_never_repeats_addresses() -> N
 def test_transaction_failure_injection_publishes_every_destination_or_none() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     failures = DeviceFailureState(1, device)
-    left = MonotoneSlab(
-        _small_schema("left"), 4, 1, device, failure_state=failures
-    )
-    right = MonotoneSlab(
-        _small_schema("right"), 4, 1, device, failure_state=failures
-    )
+    left = MonotoneSlab(_small_schema("left"), 4, 1, device, failure_state=failures)
+    right = MonotoneSlab(_small_schema("right"), 4, 1, device, failure_state=failures)
     transaction = PublicationTransaction.begin(
         (
             DestinationRequest(left, 0, 2, "pre", 20),
@@ -440,9 +431,7 @@ def test_concurrent_failure_batch_keeps_each_lanes_minimum_address() -> None:
     )
     assert failures.snapshot(0).logical_address == 7  # type: ignore[union-attr]
     assert failures.snapshot(1).logical_address == 22  # type: ignore[union-attr]
-    failures.record(
-        DeviceFailure(0, 1, "later", "overflow", "pre", 99, 1, 0)
-    )
+    failures.record(DeviceFailure(0, 1, "later", "overflow", "pre", 99, 1, 0))
     assert failures.snapshot(0).logical_address == 7  # type: ignore[union-attr]
     failures.release()
 
@@ -451,9 +440,7 @@ def test_concurrent_failure_batch_keeps_each_lanes_minimum_address() -> None:
 def test_failed_lane_retry_does_not_corrupt_completed_lane() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     failures = DeviceFailureState(2, device)
-    slab = MonotoneSlab(
-        _small_schema("lanes"), 2, 2, device, failure_state=failures
-    )
+    slab = MonotoneSlab(_small_schema("lanes"), 2, 2, device, failure_state=failures)
     completed = slab.reserve(
         1,
         2,
@@ -525,9 +512,7 @@ def test_generated_owner_retry_discards_whole_lane_attempt_only() -> None:
     )
     completed_hot.fill(_values(family, 1, 3))
     completed_retained.fill(_values(retained, 1, 3))
-    PublicationTransaction(
-        (completed_hot, completed_retained)
-    ).publish()
+    PublicationTransaction((completed_hot, completed_retained)).publish()
     lane_one_before = published_rows(retained, 1, "model_input").clone()
 
     leaf = owners.slab("Leaf")
@@ -547,9 +532,7 @@ def test_generated_owner_retry_discards_whole_lane_attempt_only() -> None:
         assert slab.tail(0) == 0
     assert family.epoch(1) == 0
     assert family.tail(1) == 1
-    assert torch.equal(
-        published_rows(retained, 1, "model_input"), lane_one_before
-    )
+    assert torch.equal(published_rows(retained, 1, "model_input"), lane_one_before)
 
     owners.bind_empty_layer_work_for_abort()
     owners.release_after(ExecutionPhase.ROLLOUT)
@@ -567,9 +550,10 @@ def test_exact_block_has_immutable_extent_exact_bytes_and_explicit_release() -> 
         block.rows = 4  # type: ignore[misc]
     assert block.rows == 3
     assert block.allocated_bytes == block.schema.allocation_bytes(3)
-    assert len(
-        {value.untyped_storage().data_ptr() for value in block.columns.values()}
-    ) == 1
+    assert (
+        len({value.untyped_storage().data_ptr() for value in block.columns.values()})
+        == 1
+    )
     with pytest.raises(TypeError):
         block.columns["extra"] = torch.empty(0, device=device)  # type: ignore[index]
     block.release()
@@ -694,9 +678,7 @@ def test_manifest_vocabulary_and_firewall_remain_closed() -> None:
     )
     assert len(names) == 20
     assert core_firewall_violations(REPOSITORY / "pbg" / "core") == ()
-    source = (REPOSITORY / "pbg" / "core" / "storage.py").read_text(
-        encoding="utf-8"
-    )
+    source = (REPOSITORY / "pbg" / "core" / "storage.py").read_text(encoding="utf-8")
     assert "class Paged" not in source
     assert "class Recyclable" not in source
     assert "def grow" not in source

@@ -4,6 +4,15 @@ Date: 2026-07-29
 
 Audited revision: `a5d5fb1dda4d8065c6c3fb49b13676b26974c131`
 
+Post-audit update (2026-07-30): F1 and F2 were resolved by commits
+`4616ddb`, `f37bc2f`, and `13f3609`. F3 was completed by commit `9229734`
+after the preceding refactor had already unified the objective equation. F4
+was completed by commits `35a5a33`, `b3ad5ba`, and `1c8ae2a`. F8 was closed
+as an intentional design decision: the explicit
+`torch.cuda.empty_cache()` call at the rollout-owner release boundary is
+desired. The findings below retain the original audit evidence for historical
+context.
+
 Scope: all production Python and CUDA sources under `pbg/`, with particular
 attention to `pbg/core/`, `pbg/games/poker/queued/`, and the public composition
 in `pbg/runtime.py`. The comparison authority is
@@ -314,7 +323,7 @@ and optimizer are common. That is not the requested lifecycle architecture.
 
 ## 3. Major findings
 
-### F1 — High: there are multiple production iteration engines
+### F1 — Resolved (was High): there are multiple production iteration engines
 
 `SequentialPokerIteration.run()` starts at
 `pbg/games/poker/queued/training.py:768`. It is a complete 430-line lifecycle
@@ -348,7 +357,7 @@ draining, sealing, targets, learner invocation, release, and recovery
 boundaries. Mode and game behavior should enter through immutable schema data
 and a small hook bundle.
 
-### F2 — High: sequential is not implemented as the degree-one specialization
+### F2 — Resolved (was High): sequential is not implemented as the degree-one specialization
 
 At the storage and target-kernel layers, sequential is close to the
 degree-one specialization. At the pipeline level it is not.
@@ -388,8 +397,21 @@ A clean degree-one representation is possible:
 - the same optimization loop handles either batch layout through a small
   gather strategy.
 
-### F3 — High: “one authoritative learner operation” is a façade over three
-objective implementations
+### F3 — Resolved (was High): “one authoritative learner operation” is a
+façade over three objective implementations
+
+Resolution: the production learner now has one
+`LearnerOperation.forward_loss_backward()` over the common sigma/action-span
+schema, with sequential represented by unit spans, and one `LearnerIteration`
+optimizer state machine for aligned and ragged presentations. Commit
+`9229734` removed the remaining replica/distributed validate-only replay and
+routed sequential and branched preparation through one `LearnerTransaction`.
+The retired learner objective methods, sampled iteration classes, preflight
+optimizer, and `validate_only` path are absent from production. Focused CUDA
+tests cover the common objective, one-pass replica execution, and local
+transaction rollback.
+
+The text below records the original audited implementation.
 
 `LearnerOperation.forward_loss_backward()` dispatches on rollout mode at
 `pbg/core/learner.py:1593-1615`.
@@ -427,7 +449,24 @@ steps, and run-state publication.
 The class names are also misleading: both “Sampled” classes support RB. This
 is migration-era naming debt and makes the architecture harder to understand.
 
-### F4 — High: the core/poker responsibility boundary is misplaced
+### F4 — Resolved (was High): the core/poker responsibility boundary is misplaced
+
+Resolution: production now constructs one generic `IterationEngine` and one
+semantic `PokerOperations` bundle for every sequential, branched, sampled,
+RB, replica, and distributed mode. Core exclusively owns phase orchestration,
+queue scheduling, topology acceptance and sealing, completion draining,
+target-arena padding, align-and-seal, learner stores and samplers, reference
+caches, target execution, the learner transaction, recovery, telemetry, and
+storage release. Poker supplies only the game operations exposed through the
+small `GameOperations` protocol.
+
+The phase-sized `PokerSequentialProgram`, `PokerBranchedProgram`,
+`PokerIterationHooks`, and their compatibility surfaces were deleted rather
+than wrapped. The former poker `training.py` and `iteration.py` modules are
+also absent. Static ownership gates, the full CUDA suite, and the two-GPU NCCL
+test passed after comparison with the pre-F4 baseline at `9229734`.
+
+The text below records the original audited implementation.
 
 The import firewall is sound. The current static gate confirms that no module
 under `pbg/core` imports `pbg.games.poker`.
@@ -475,7 +514,7 @@ iteration advances and releases storage.
 The current boundary therefore passes a dependency-direction test while
 failing a responsibility test.
 
-### F5 — High: `LearnerIndex` is a second retained-payload owner
+### F5 — Resolved (was High): `LearnerIndex` is a second retained-payload owner
 
 The design declares:
 
@@ -543,7 +582,7 @@ branched ragged presentation. Sequential mode needs no substantive
 compact trained retained rows when genuinely required; self-play should not
 pay that copy.
 
-### F6 — High: exact `LayerWork` sizing is known and ignored
+### F6 — Resolved (was High): exact `LayerWork` sizing is known and ignored
 
 The repository's own capacity audit identifies this as a required fix.
 
@@ -616,7 +655,12 @@ per-call role classification, gather, or merge. Queue identity also makes the
 player remains root metadata where leaf completion or topology semantics
 require it; it is not carried in every hot family row.
 
-### F8 — Conforming clarification: completion is serialized after rollout
+### F8 — Resolved: serialized completion and `empty_cache()` are intentional
+
+Resolution: there is no implementation defect and no code change is required.
+The explicit `torch.cuda.empty_cache()` call was intentionally added at this
+owner-lifecycle boundary so inactive PyTorch cache blocks are returned before
+the native evaluator requests its workspace.
 
 All three current lifecycle implementations instead finish rollout and
 topology planning, release rollout owners, enter queue drain, synchronize the

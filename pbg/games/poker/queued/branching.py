@@ -39,6 +39,7 @@ from pbg.core.rollout import (
 from pbg.core.storage import (
     DeviceDestinationRequest,
     DeviceFailure,
+    MonotoneSlab,
 )
 from pbg.core.topology import (
     TopologyExpansionRecord,
@@ -87,10 +88,7 @@ def sampled_branched_chance_frontier_row_bytes(
     players = geometry.players
     hands = geometry.private_hands
     history = (
-        geometry.postflop_base_model_input_width
-        - 8
-        - 10 * players
-        - players * hands
+        geometry.postflop_base_model_input_width - 8 - 10 * players - players * hands
     ) // 10
     return (
         512
@@ -137,34 +135,25 @@ def action_conditioned_log_reach(
 
     if (
         log_reach.ndim != 3
-        or selected_log_policy.shape
-        != (log_reach.shape[0], log_reach.shape[2])
+        or selected_log_policy.shape != (log_reach.shape[0], log_reach.shape[2])
         or actor.shape != log_reach.shape[:1]
         or actor.dtype not in (torch.int32, torch.int64)
         or selected_log_policy.device != log_reach.device
         or actor.device != log_reach.device
     ):
-        raise BranchedPokerError(
-            "action conditioning requires [B,P,H], [B,H], and [B]"
-        )
+        raise BranchedPokerError("action conditioning requires [B,P,H], [B,H], and [B]")
     actor64 = actor.to(torch.int64)
     torch._assert_async(
-        actor64.ge(0).logical_and(
-            actor64.lt(log_reach.shape[1])
-        ).all(),
+        actor64.ge(0).logical_and(actor64.lt(log_reach.shape[1])).all(),
         "action-conditioning actor is outside the seat axis",
     )
     selected = log_reach.gather(
         1,
-        actor64[:, None, None].expand(
-            -1, 1, log_reach.shape[2]
-        ),
+        actor64[:, None, None].expand(-1, 1, log_reach.shape[2]),
     ).squeeze(1)
     return log_reach.scatter(
         1,
-        actor64[:, None, None].expand(
-            -1, 1, log_reach.shape[2]
-        ),
+        actor64[:, None, None].expand(-1, 1, log_reach.shape[2]),
         (selected + selected_log_policy.float())[:, None],
     )
 
@@ -221,9 +210,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             )
             > owners.chance_frontier_cap
         ):
-            raise ValueError(
-                "chance frontier does not cover one maximal player pack"
-            )
+            raise ValueError("chance frontier does not cover one maximal player pack")
         self.cost_safeguard = cost_safeguard
         self.child_model = child_model
         self.topology_stager = topology_stager
@@ -272,9 +259,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         self._posterior_attempts.copy_(
             torch.maximum(
                 self._posterior_attempts,
-                observation.attempt_count.masked_fill(
-                    ~observation.exhausted, 0
-                ).amax(),
+                observation.attempt_count.masked_fill(~observation.exhausted, 0).amax(),
             )
         )
 
@@ -296,9 +281,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         self._posterior_address.fill_(torch.iinfo(torch.int64).max)
         self._posterior_attempts.zero_()
         if batch.lane_count != 1:
-            raise BranchedPokerError(
-                "branched sampling requires one active lane"
-            )
+            raise BranchedPokerError("branched sampling requires one active lane")
         lane = int(batch.lanes[0])
         rows = batch.rows
         root = batch.fields["logical_rng_key"][0, :, 0]
@@ -306,23 +289,21 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         values = request.model.values
         if "trace" not in values or "cost" not in values:
             raise BranchedPokerError("branched rollout omitted T/C heads")
-        missing_frontier_cost = values["cost"].detach().float().masked_fill(
-            batch.fields["frontier_cost_contribution"][0].gt(0), 0
-        ).sum()
+        missing_frontier_cost = (
+            values["cost"]
+            .detach()
+            .float()
+            .masked_fill(batch.fields["frontier_cost_contribution"][0].gt(0), 0)
+            .sum()
+        )
         frontier_cost = (
-            self.realized_tree_size.to(values["cost"].dtype).expand_as(
-                values["cost"]
-            )
+            self.realized_tree_size.to(values["cost"].dtype).expand_as(values["cost"])
             + (
                 torch.stack(
-                    tuple(
-                        queue.frontier_cost[lane]
-                        for queue in self.queues.values()
-                    )
+                    tuple(queue.frontier_cost[lane] for queue in self.queues.values())
                 ).sum()
                 + missing_frontier_cost
-                if self.cost_safeguard is not None
-                and self.cost_safeguard.active
+                if self.cost_safeguard is not None and self.cost_safeguard.active
                 else 0
             )
             if self.cost_safeguard is not None
@@ -332,9 +313,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         self._safe_tree_triggered = (
             frontier_cost is not None
             and self.controller.safe_tree_size is not None
-            and bool(
-                frontier_cost.gt(self.controller.safe_tree_size).all()
-            )
+            and bool(frontier_cost.gt(self.controller.safe_tree_size).all())
         )
         decision = self.controller.decide(
             schema=self.mode,
@@ -349,9 +328,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             log_player_ancestor_sum=batch.fields["log_player_ancestor_sum"][0],
             log_ancestor_product=batch.fields["log_ancestor_product"][0],
             frontier_cost=frontier_cost,
-            player_family=(
-                "pre" if batch.input_type == "pre" else "post"
-            ),
+            player_family=("pre" if batch.input_type == "pre" else "post"),
         )
         if self._refill:
             if rows != 1:
@@ -374,9 +351,9 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         source = torch.arange(
             rows, dtype=torch.int64, device=root.device
         ).repeat_interleave(beta_max)
-        ordinal = torch.arange(
-            beta_max, dtype=torch.int64, device=root.device
-        ).repeat(rows)
+        ordinal = torch.arange(beta_max, dtype=torch.int64, device=root.device).repeat(
+            rows
+        )
         active = ordinal < degree.index_select(0, source)
         torch._assert_async(
             active.sum(dtype=torch.int64).eq(total_tensor),
@@ -391,18 +368,14 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         expanded_input = self._forward_model_input(batch).index_select(0, source)
         parent_profile = batch.fields["true_profile"][0]
         private = parent_profile.index_select(0, source)
-        if (
-            self.mode.private_estimator is PrivateEstimator.RAO_BLACKWELL
-            and not (self._safe_tree_triggered and not self._refill)
+        if self.mode.private_estimator is PrivateEstimator.RAO_BLACKWELL and not (
+            self._safe_tree_triggered and not self._refill
         ):
             log_reach, _history = self._resolved_model_context(batch)
             finite = torch.isfinite(log_reach)
-            gauge = log_reach.masked_fill(~finite, -torch.inf).amax(
-                -1, keepdim=True
-            )
+            gauge = log_reach.masked_fill(~finite, -torch.inf).amax(-1, keepdim=True)
             range_weights = torch.exp(
-                log_reach
-                - gauge.masked_fill(~torch.isfinite(gauge), 0.0)
+                log_reach - gauge.masked_fill(~torch.isfinite(gauge), 0.0)
             ).masked_fill(~finite, 0.0)
             parent_state = self.machine.state_from_model_input(
                 batch.input_type,
@@ -556,9 +529,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             raise BranchedPokerError(
                 "player expansion exceeds the admitted chance frontier"
             )
-        action_row = torch.arange(
-            action_total, dtype=torch.int64, device=device
-        )
+        action_row = torch.arange(action_total, dtype=torch.int64, device=device)
         current_active = action_active
         current_key = first_child_key
         current_state = replace(
@@ -572,10 +543,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         current_private = private
         current_history = replace(
             history,
-            **{
-                name: value
-                for name, value in history.__dict__.items()
-            },
+            **{name: value for name, value in history.__dict__.items()},
         )
         current_log_reach = log_reach
         current_frontier_cost = (
@@ -589,17 +557,11 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         endpoint_log_sum = initial_log_sum
         endpoint_log_product = initial_log_product
         chance_records: list[TopologyExpansionRecord] = []
-        current_beta = torch.ones(
-            action_total, dtype=torch.float32, device=device
-        )
+        current_beta = torch.ones(action_total, dtype=torch.float32, device=device)
         sampled_nodes = action_active.sum(dtype=torch.int64)
         frontier_demand = sampled_nodes.clone()
-        frontier_overflow = torch.zeros(
-            (), dtype=torch.bool, device=device
-        )
-        endpoint_record = torch.zeros(
-            action_total, dtype=torch.int64, device=device
-        )
+        frontier_overflow = torch.zeros((), dtype=torch.bool, device=device)
+        endpoint_record = torch.zeros(action_total, dtype=torch.int64, device=device)
         endpoint_record_edge = action_row
         for generation in BoundedChanceClosure(
             max_generations=3,
@@ -608,8 +570,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             current_rows = current_active.numel()
             generation_capacity = min(
                 chance_capacity,
-                current_rows
-                * self.controller.max_degree(owner_is_player=False),
+                current_rows * self.controller.max_degree(owner_is_player=False),
             )
             frontier_row = torch.arange(
                 generation_capacity,
@@ -710,12 +671,11 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 and not self._safe_tree_triggered
             ):
                 finite = torch.isfinite(current_log_reach)
-                gauge = current_log_reach.masked_fill(
-                    ~finite, -torch.inf
-                ).amax(-1, keepdim=True)
+                gauge = current_log_reach.masked_fill(~finite, -torch.inf).amax(
+                    -1, keepdim=True
+                )
                 range_weights = torch.exp(
-                    current_log_reach
-                    - gauge.masked_fill(~torch.isfinite(gauge), 0.0)
+                    current_log_reach - gauge.masked_fill(~torch.isfinite(gauge), 0.0)
                 ).masked_fill(~finite, 0.0)
                 assert self.posterior_sampler is not None
                 expanded_private = self.posterior_sampler.sample_children(
@@ -765,22 +725,20 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 + dealt_state.board_cards[:, 1].to(torch.int32) * 52
                 + dealt_state.board_cards[:, 2].to(torch.int32)
             )
-            turn_or_river = dealt_state.board_cards.gather(
-                1,
-                dealt_street.clamp(1, 2).to(torch.int64)[:, None] + 2,
-            ).squeeze(1).to(torch.int32)
-            chance_label = torch.where(
-                dealt_street.eq(0), flop_label, turn_or_river
+            turn_or_river = (
+                dealt_state.board_cards.gather(
+                    1,
+                    dealt_street.clamp(1, 2).to(torch.int64)[:, None] + 2,
+                )
+                .squeeze(1)
+                .to(torch.int32)
             )
-            next_endpoint_record = endpoint_record.index_select(
-                0, chance_source
-            )
+            chance_label = torch.where(dealt_street.eq(0), flop_label, turn_or_river)
+            next_endpoint_record = endpoint_record.index_select(0, chance_source)
             next_endpoint_record_edge = endpoint_record_edge.index_select(
                 0, chance_source
             )
-            chance_edge_active = (
-                next_active & chance.index_select(0, chance_source)
-            )
+            chance_edge_active = next_active & chance.index_select(0, chance_source)
             record_identifier = 1 + len(chance_records)
             next_endpoint_record = torch.where(
                 chance_edge_active,
@@ -988,16 +946,12 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 ),
                 selected_player=(
                     selected_player.index_select(0, endpoint_source)
-                    if self.mode.training_regime
-                    is TrainingRegime.BEST_RESPONSE
+                    if self.mode.training_regime is TrainingRegime.BEST_RESPONSE
                     else None
                 ),
             )
         )
-        if (
-            sampled_mode
-            and self.mode.training_regime is TrainingRegime.BEST_RESPONSE
-        ):
+        if sampled_mode and self.mode.training_regime is TrainingRegime.BEST_RESPONSE:
             leaf_source = MappingProxyType(
                 {
                     **dict(leaf_source),
@@ -1005,7 +959,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                         0, endpoint_source
                     ).to(torch.int32),
                 }
-        )
+            )
         terminal_rows = route.source_row[0, 0]
         for name, value in leaf_source.items():
             leaf_values[name][lane].copy_(value.index_select(0, terminal_rows))
@@ -1062,9 +1016,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         )
 
         output_type = (
-            "all"
-            if sampled_mode
-            else ("pre" if batch.input_type == "pre" else "post")
+            "all" if sampled_mode else ("pre" if batch.input_type == "pre" else "post")
         )
         action_head = next(
             slab
@@ -1074,16 +1026,10 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         action_old_tail = action_head.reserved_tails_device()[lane]
         trained_child = trained.index_select(0, action_source) & action_active
         trained_action_row = torch.argsort(~trained_child, stable=True)
-        trained_action_valid = trained_child.index_select(
-            0, trained_action_row
-        )
-        trained_action_count = lane_count(
-            trained_child.sum(dtype=torch.int64)
-        )
+        trained_action_valid = trained_child.index_select(0, trained_action_row)
+        trained_action_count = lane_count(trained_child.sum(dtype=torch.int64))
         action_values = self._defaults(action_head, action_total)
-        action_values["action"][lane].copy_(
-            action.index_select(0, trained_action_row)
-        )
+        action_values["action"][lane].copy_(action.index_select(0, trained_action_row))
         retained_log = (
             sample["selected_log_policy"].reshape(action_total, -1)[:, :1]
             if sampled_mode
@@ -1104,9 +1050,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
 
         fold = action.eq(FOLD) & action_active
         endpoint_nonterminal = current_active & ~terminal
-        fold_consumed = torch.zeros(
-            action_total, dtype=torch.int32, device=device
-        )
+        fold_consumed = torch.zeros(action_total, dtype=torch.int32, device=device)
         fold_consumed.scatter_reduce_(
             0,
             endpoint_action,
@@ -1118,85 +1062,76 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         if self.geometry.players == 2:
             stored_fold.zero_()
         finite_fold = torch.isfinite(fold_log_reach)
-        fold_gauge = fold_log_reach.masked_fill(
-            ~finite_fold, -torch.inf
-        ).amax(-1, keepdim=True)
+        fold_gauge = fold_log_reach.masked_fill(~finite_fold, -torch.inf).amax(
+            -1, keepdim=True
+        )
         fold_weight = torch.exp(
-            fold_log_reach
-            - fold_gauge.masked_fill(~torch.isfinite(fold_gauge), 0.0)
+            fold_log_reach - fold_gauge.masked_fill(~torch.isfinite(fold_gauge), 0.0)
         ).masked_fill(~finite_fold, 0.0)
         actor_weight = fold_weight.gather(
             1,
-            actor[:, None, None].expand(
-                -1, 1, self.geometry.private_hands
-            ),
+            actor[:, None, None].expand(-1, 1, self.geometry.private_hands),
         ).squeeze(1)
         actor_weight /= actor_weight.sum(-1, keepdim=True).clamp_min(
             torch.finfo(torch.float32).tiny
         )
         folded_partition = "pre" if batch.input_type == "pre" else "post"
-        folded_slab = self._owner_slab("FoldedRanges", folded_partition)
-        folded_rows = actor_weight
-        if folded_partition == "pre":
-            classes = self._combo_class()
-            folded_rows = torch.zeros(
-                (action_total, self.geometry.private_classes),
-                dtype=torch.float32,
-                device=device,
-            )
-            folded_rows.scatter_add_(
-                1,
-                classes[None].expand_as(actor_weight),
-                actor_weight,
-            )
-        if folded_slab.columns["range"].shape[-1] == 1:
-            folded_rows = folded_rows.sum(-1, keepdim=True)
+        action_folded_reference = (
+            batch.fields["folded_range_row"][0]
+            .index_select(0, action_source)
+            .to(torch.int64)
+        )
+        folded_slab: MonotoneSlab | None = None
+        folded_values: Mapping[str, Tensor] = {}
+        fold_count = lane_count(torch.zeros((), dtype=torch.int64, device=device))
         fold_order = torch.argsort(~stored_fold, stable=True)
-        folded_values = self._defaults(folded_slab, action_total)
-        folded_values["range"][lane].copy_(
-            folded_rows.index_select(0, fold_order)
-        )
-        actor_log_mass = torch.logsumexp(
-            fold_log_reach.gather(
+        if self.geometry.players > 2:
+            folded_slab = self._owner_slab("FoldedRanges", folded_partition)
+            folded_rows = actor_weight
+            if folded_partition == "pre":
+                classes = self._combo_class()
+                folded_rows = torch.zeros(
+                    (action_total, self.geometry.private_classes),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                folded_rows.scatter_add_(
+                    1, classes[None].expand_as(actor_weight), actor_weight
+                )
+            if folded_slab.columns["range"].shape[-1] == 1:
+                folded_rows = folded_rows.sum(-1, keepdim=True)
+            folded_values = self._defaults(folded_slab, action_total)
+            folded_values["range"][lane].copy_(folded_rows.index_select(0, fold_order))
+            actor_log_mass = torch.logsumexp(
+                fold_log_reach.gather(
+                    1,
+                    actor[:, None, None].expand(-1, 1, self.geometry.private_hands),
+                ).squeeze(1),
+                -1,
+            )
+            folded_values["log_mass"][lane].copy_(
+                actor_log_mass.index_select(0, fold_order)
+            )
+            fold_count = lane_count(stored_fold.sum(dtype=torch.int64))
+            fold_base = folded_slab.reserved_tails_device()[lane]
+            fold_ordinal = stored_fold.cumsum(0, dtype=torch.int64) - 1
+            encoded_reference = (
+                fold_base + fold_ordinal
+                if folded_partition == "pre"
+                else -(fold_base + fold_ordinal + 2)
+            )
+            prior_actor_reference = action_folded_reference.gather(
+                1, actor[:, None]
+            ).squeeze(1)
+            action_folded_reference = action_folded_reference.scatter(
                 1,
-                actor[:, None, None].expand(
-                    -1, 1, self.geometry.private_hands
-                ),
-            ).squeeze(1),
-            -1,
-        )
-        folded_values["log_mass"][lane].copy_(
-            actor_log_mass.index_select(0, fold_order)
-        )
-        fold_count = lane_count(stored_fold.sum(dtype=torch.int64))
-        fold_base = folded_slab.reserved_tails_device()[lane]
-        fold_ordinal = stored_fold.cumsum(0, dtype=torch.int64) - 1
-        encoded_reference = (
-            fold_base + fold_ordinal
-            if folded_partition == "pre"
-            else -(fold_base + fold_ordinal + 2)
-        )
-        action_folded_reference = batch.fields["folded_range_row"][
-            0
-        ].index_select(0, action_source).to(torch.int64)
-        prior_actor_reference = action_folded_reference.gather(
-            1, actor[:, None]
-        ).squeeze(1)
-        action_folded_reference = action_folded_reference.scatter(
-            1,
-            actor[:, None],
-            torch.where(
-                stored_fold,
-                encoded_reference,
-                prior_actor_reference,
-            )[:, None],
-        )
-        folded_reference = action_folded_reference.index_select(
-            0, endpoint_action
-        )
-        post_summary = log_reach.new_zeros(
-            (total, self.geometry.folded_summary_width)
-        )
+                actor[:, None],
+                torch.where(stored_fold, encoded_reference, prior_actor_reference)[
+                    :, None
+                ],
+            )
+        folded_reference = action_folded_reference.index_select(0, endpoint_action)
+        post_summary = log_reach.new_zeros((total, self.geometry.folded_summary_width))
         if self.geometry.folded_summary_width:
             if batch.input_type != "pre":
                 post_summary.copy_(
@@ -1206,14 +1141,16 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 )
             endpoint_fold = stored_fold.index_select(0, endpoint_action)
             refresh = (
-                endpoint_fold
-                | next_state.street.ne(
-                    fold_parent_street.index_select(0, endpoint_action)
+                (
+                    endpoint_fold
+                    | next_state.street.ne(
+                        fold_parent_street.index_select(0, endpoint_action)
+                    )
                 )
-            ) & endpoint_nonterminal & next_state.street.ne(0)
-            refresh_rows = torch.nonzero(
-                refresh, as_tuple=False
-            ).flatten()
+                & endpoint_nonterminal
+                & next_state.street.ne(0)
+            )
+            refresh_rows = torch.nonzero(refresh, as_tuple=False).flatten()
             from pbg.games.poker.queued.folded import (
                 folded_statistics,
                 pack_folded_statistics,
@@ -1221,15 +1158,11 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
 
             refreshed_summary = folded_statistics(
                 self.geometry,
-                board_cards=next_state.board_cards.index_select(
-                    0, refresh_rows
-                ),
+                board_cards=next_state.board_cards.index_select(0, refresh_rows),
                 range_weights=torch.exp(
                     log_reach.index_select(0, refresh_rows).float()
                 ).masked_fill(
-                    ~torch.isfinite(
-                        log_reach.index_select(0, refresh_rows)
-                    ),
+                    ~torch.isfinite(log_reach.index_select(0, refresh_rows)),
                     0.0,
                 ),
                 status=next_state.status.index_select(0, refresh_rows),
@@ -1243,9 +1176,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
             post_summary.index_copy_(
                 0,
                 refresh_rows,
-                pack_folded_statistics(
-                    self.geometry, refreshed_summary
-                ),
+                pack_folded_statistics(self.geometry, refreshed_summary),
             )
         next_logical = torch.stack((root, child_path), -1)
         family_source: dict[str, Tensor] = {
@@ -1277,36 +1208,27 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 name, next_state, log_reach, history
             )
             if name != "pre" and self.geometry.folded_summary_width:
-                next_input[
-                    :, self.geometry.postflop_base_model_input_width :
-                ].copy_(post_summary.to(next_input.dtype))
+                next_input[:, self.geometry.postflop_base_model_input_width :].copy_(
+                    post_summary.to(next_input.dtype)
+                )
             queue_source = {**family_source, "model_input": next_input}
             for field_name, value in queue_source.items():
                 if field_name in values:
-                    values[field_name][lane].copy_(
-                        value.index_select(0, selected_rows)
-                    )
+                    values[field_name][lane].copy_(value.index_select(0, selected_rows))
             cost_addition = torch.zeros(
                 self.owners.n_replica,
                 dtype=torch.float32,
                 device=device,
             )
-            if (
-                self.cost_safeguard is not None
-                and self.cost_safeguard.active
-            ):
+            if self.cost_safeguard is not None and self.cost_safeguard.active:
                 active_position = torch.nonzero(
                     selected_valid, as_tuple=False
                 ).flatten()
-                active_rows = selected_rows.index_select(
-                    0, active_position
-                )
+                active_rows = selected_rows.index_select(0, active_position)
                 selected_role = (
                     None
                     if "role_selector" not in family_source
-                    else family_source["role_selector"].index_select(
-                        0, active_rows
-                    )
+                    else family_source["role_selector"].index_select(0, active_rows)
                 )
                 child_cost = torch.zeros(
                     selected_valid.shape,
@@ -1320,9 +1242,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                                 name,
                                 next_input.index_select(0, active_rows),
                                 private.index_select(0, active_rows),
-                                next_state.to_act.index_select(
-                                    0, active_rows
-                                ),
+                                next_state.to_act.index_select(0, active_rows),
                                 selected_role,
                             ),
                             torch.tensor(
@@ -1347,6 +1267,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
 
         folded_destination = 0
         if self.geometry.players > 2:
+            assert folded_slab is not None
             folded_destination = len(destinations)
             destinations.append(
                 DeviceDestinationRequest(
@@ -1366,28 +1287,18 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
         descriptor_destination.append(torch.full_like(compact, 1))
         descriptor_ordinal.append(compact)
         descriptor_valid.append(trained_valid)
-        action_compact = torch.arange(
-            action_total, dtype=torch.int64, device=device
-        )
-        descriptor_source.append(
-            action_source.index_select(0, trained_action_row)
-        )
+        action_compact = torch.arange(action_total, dtype=torch.int64, device=device)
+        descriptor_source.append(action_source.index_select(0, trained_action_row))
         descriptor_destination.append(torch.full_like(action_compact, 2))
         descriptor_ordinal.append(action_compact)
         descriptor_valid.append(trained_action_valid)
-        descriptor_source.append(
-            action_source.index_select(0, fold_order)
-        )
+        descriptor_source.append(action_source.index_select(0, fold_order))
         descriptor_destination.append(
             torch.full_like(action_compact, folded_destination)
         )
         descriptor_ordinal.append(action_compact)
-        descriptor_valid.append(
-            stored_fold.index_select(0, fold_order)
-        )
-        endpoint_destination = torch.zeros(
-            total, dtype=torch.int64, device=device
-        )
+        descriptor_valid.append(stored_fold.index_select(0, fold_order))
+        endpoint_destination = torch.zeros(total, dtype=torch.int64, device=device)
         endpoint_ordinal = torch.zeros_like(endpoint_destination)
         for family_value in self._route_family_values:
             selected = route_family[0].eq(family_value)
@@ -1517,9 +1428,7 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 torch.full_like(frontier_row, total),
             )
             edge = endpoint_record_edge.clamp(0, edge_count - 1)
-            inverse = torch.full(
-                (edge_count,), total, dtype=torch.int64, device=device
-            )
+            inverse = torch.full((edge_count,), total, dtype=torch.int64, device=device)
             inverse.scatter_reduce_(
                 0, edge, candidate, reduce="amin", include_self=True
             )
@@ -1554,18 +1463,12 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                 )
             )
         correction = (
-            (
-                sample["nominal_degree"].float()
-                - sample["executed_degree"].float()
-            )
+            (sample["nominal_degree"].float() - sample["executed_degree"].float())
             * request.model.values["cost"].detach().float()
         ).sum()
         staged_payload = self.topology_stager.stage(
             device_records,
-            slot=(
-                self._topology_sequence
-                % self.topology_stager.inflight_cap
-            ),
+            slot=(self._topology_sequence % self.topology_stager.inflight_cap),
             produced=route.counts[0, 1:],
             sampled_nodes=sampled_nodes,
             counterfactual_correction=correction,
@@ -1597,17 +1500,13 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                         self.owners.n_replica,
                         dtype=torch.bool,
                         device=device,
-                    ).index_copy(
-                        0, batch.lanes, self._posterior_failed.reshape(1)
-                    ),
+                    ).index_copy(0, batch.lanes, self._posterior_failed.reshape(1)),
                     logical_address=torch.full(
                         (self.owners.n_replica,),
                         torch.iinfo(torch.int64).max,
                         dtype=torch.int64,
                         device=device,
-                    ).index_copy(
-                        0, batch.lanes, self._posterior_address.reshape(1)
-                    ),
+                    ).index_copy(0, batch.lanes, self._posterior_address.reshape(1)),
                     requested_extent=torch.zeros(
                         self.owners.n_replica,
                         dtype=torch.int64,
@@ -1621,16 +1520,12 @@ class BranchedSampledPokerHooks(SequentialPokerHooks):
                         self.owners.n_replica,
                         dtype=torch.int64,
                         device=device,
-                    ).index_fill_(
-                        0, batch.lanes, self.posterior_sampler.max_attempts
-                    ),
+                    ).index_fill_(0, batch.lanes, self.posterior_sampler.max_attempts),
                     sampler_attempt_count=torch.zeros(
                         self.owners.n_replica,
                         dtype=torch.int64,
                         device=device,
-                    ).index_copy(
-                        0, batch.lanes, self._posterior_attempts.reshape(1)
-                    ),
+                    ).index_copy(0, batch.lanes, self._posterior_attempts.reshape(1)),
                     phase="posterior_sample",
                     failure_code="rejection_exhausted",
                     input_type=batch.input_type,

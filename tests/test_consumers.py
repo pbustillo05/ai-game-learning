@@ -320,7 +320,14 @@ def test_end_to_end_br_and_variance_consumers(tmp_path: Path) -> None:
     target_config = load_config_mapping(raw)
     target_checkpoint = tmp_path / "target.pt"
     target_session = TrainingSession(target_config)
+    assert target_session.reference_modules is None
+    assert target_session.reference_states is None
     target_session.checkpoint(target_checkpoint)
+    target_payload = torch.load(
+        target_checkpoint, map_location="cpu", weights_only=False
+    )
+    assert "reference_model" not in target_payload
+    assert "reference_state" not in target_payload
     target_artifact = tmp_path / "target_inference.pt"
     export_inference_artifact(target_checkpoint, target_artifact)
 

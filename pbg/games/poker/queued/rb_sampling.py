@@ -10,6 +10,8 @@ from torch import Tensor
 from pbg.core.rollout import DrawPurpose, logical_rng_keys, logical_uniform
 from pbg.games.poker.queued.hooks import PAD_CARD, NLHEGeometry
 
+POSTERIOR_MAX_ATTEMPTS = 256
+
 
 class PosteriorSamplingError(RuntimeError):
     """A posterior-profile request violated the bounded CUDA contract."""
@@ -33,9 +35,7 @@ def _fixed_upper_bound(
     """First CDF entry strictly above target using a fixed search schedule."""
 
     if cdf.ndim != 3 or target.ndim != 3:
-        raise PosteriorSamplingError(
-            "CDF search requires [G,P,H] and [G,A,P]"
-        )
+        raise PosteriorSamplingError("CDF search requires [G,P,H] and [G,A,P]")
     _parents, players, width = cdf.shape
     rows = target.shape[0]
     if target.shape[2] != players or source.shape != (rows,):
@@ -43,9 +43,7 @@ def _fixed_upper_bound(
     lo = torch.zeros_like(target, dtype=torch.int64)
     hi = torch.full_like(lo, width)
     parent = source[:, None, None]
-    seat = torch.arange(
-        players, dtype=torch.int64, device=cdf.device
-    )[None, None, :]
+    seat = torch.arange(players, dtype=torch.int64, device=cdf.device)[None, None, :]
     for _ in range(steps):
         mid = (lo + hi) >> 1
         safe = mid.clamp_max(width - 1)
@@ -117,8 +115,7 @@ class CollisionConditionedProfileSampler:
             or inherited_profile.dtype != torch.int32
         ):
             raise PosteriorSamplingError(
-                "posterior parents require FP32 [B,P,H], uint8 [B,5], "
-                "and int32 [B,P]"
+                "posterior parents require FP32 [B,P,H], uint8 [B,5], and int32 [B,P]"
             )
         edges = source.numel()
         if any(
@@ -131,11 +128,7 @@ class CollisionConditionedProfileSampler:
         if active.dtype != torch.bool:
             raise PosteriorSamplingError("posterior active mask must be bool")
         torch._assert_async(
-            (
-                source.ge(0)
-                & source.lt(range_weights.shape[0])
-                & ordinal.ge(0)
-            ).all(),
+            (source.ge(0) & source.lt(range_weights.shape[0]) & ordinal.ge(0)).all(),
             "posterior source or child ordinal is invalid",
         )
         source64 = source.to(torch.int64)
@@ -144,9 +137,7 @@ class CollisionConditionedProfileSampler:
 
         weights = range_weights.float()
         board = board_cards
-        combo_ids = torch.arange(
-            hands, dtype=torch.int32, device=device
-        )
+        combo_ids = torch.arange(hands, dtype=torch.int32, device=device)
         combo_cards = self._combo_cards(combo_ids)
         board_conflict = (
             (
@@ -159,17 +150,12 @@ class CollisionConditionedProfileSampler:
         weights = weights.masked_fill(board_conflict[:, None], 0.0)
         mass = weights.sum(-1)
         torch._assert_async(
-            (
-                ~fresh[:, None]
-                | mass.index_select(0, source64).gt(0)
-            ).all(),
+            (~fresh[:, None] | mass.index_select(0, source64).gt(0)).all(),
             "posterior seat has no board-legal mass",
         )
         cdf = weights.cumsum(-1)
 
-        attempts = torch.arange(
-            self.max_attempts, dtype=torch.int64, device=device
-        )
+        attempts = torch.arange(self.max_attempts, dtype=torch.int64, device=device)
         seats = torch.arange(players, dtype=torch.int64, device=device)
         edge_grid, attempt_grid, seat_grid = torch.meshgrid(
             torch.arange(edges, dtype=torch.int64, device=device),
@@ -189,9 +175,8 @@ class CollisionConditionedProfileSampler:
             retry_epoch=retry_epoch,
             active=proposal_active,
         )
-        totals = (
-            mass.index_select(0, source64)[:, None]
-            .expand(edges, self.max_attempts, players)
+        totals = mass.index_select(0, source64)[:, None].expand(
+            edges, self.max_attempts, players
         )
         target = torch.minimum(
             logical_uniform(keys) * totals,
@@ -219,12 +204,8 @@ class CollisionConditionedProfileSampler:
             for second_seat in range(first_seat + 1, players):
                 second_cards = cards[:, :, second_seat]
                 collision_free &= ~(
-                    first_cards[:, :, 0, None]
-                    .eq(second_cards)
-                    .any(-1)
-                    | first_cards[:, :, 1, None]
-                    .eq(second_cards)
-                    .any(-1)
+                    first_cards[:, :, 0, None].eq(second_cards).any(-1)
+                    | first_cards[:, :, 1, None].eq(second_cards).any(-1)
                 )
         accepted = collision_free & fresh[:, None]
         has_success = accepted.any(1)
@@ -241,14 +222,10 @@ class CollisionConditionedProfileSampler:
         exhausted = fresh & ~has_success
         attempt_count = torch.where(
             exhausted,
-            torch.full_like(
-                attempt_count, self.max_attempts
-            ),
+            torch.full_like(attempt_count, self.max_attempts),
             attempt_count,
         )
-        result = torch.where(
-            exhausted[:, None], inherited, result
-        )
+        result = torch.where(exhausted[:, None], inherited, result)
         max_address = torch.full_like(root, torch.iinfo(torch.int64).max)
         minimum_failing = torch.where(exhausted, path, max_address).amin()
         self.last_observation = RejectionObservation(
@@ -268,17 +245,18 @@ class CollisionConditionedProfileSampler:
             count = deck - card - 1
             advance = unresolved & remaining.ge(count)
             first = torch.where(advance, first + 1, first)
-            remaining = torch.where(
-                advance, remaining - count, remaining
-            )
+            remaining = torch.where(advance, remaining - count, remaining)
             unresolved &= advance
         second = first + remaining + 1
-        return torch.stack((first, second), -1).add(
-            self.geometry.first_card
-        ).to(torch.int64)
+        return (
+            torch.stack((first, second), -1)
+            .add(self.geometry.first_card)
+            .to(torch.int64)
+        )
 
 
 __all__ = [
+    "POSTERIOR_MAX_ATTEMPTS",
     "CollisionConditionedProfileSampler",
     "PosteriorSamplingError",
     "RejectionObservation",

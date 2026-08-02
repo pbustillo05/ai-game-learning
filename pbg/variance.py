@@ -30,10 +30,7 @@ def _device_state(value: object) -> object:
 
 def _parameters(module: nn.Module) -> Tensor:
     return torch.cat(
-        tuple(
-            parameter.detach().float().flatten()
-            for parameter in module.parameters()
-        )
+        tuple(parameter.detach().float().flatten() for parameter in module.parameters())
     )
 
 
@@ -62,7 +59,11 @@ def estimate_update_variance(
         raise ValueError("seed_stride must be positive")
     base = TrainingSession(cfg, resume_from=checkpoint)
     model_state = _device_state(base.modules.state_dict())
-    reference_model_state = _device_state(base.reference_modules.state_dict())
+    reference_model_state = (
+        None
+        if base.reference_modules is None
+        else _device_state(base.reference_modules.state_dict())
+    )
     optimizer_state = _device_state(base.optimizers.state_dict())
     run_states = copy.deepcopy(base.run_states)
     reference_states = copy.deepcopy(base.reference_states)
@@ -75,9 +76,7 @@ def estimate_update_variance(
     means = tuple(torch.zeros_like(value) for value in initial)
     m2 = tuple(torch.zeros_like(value) for value in initial)
     budget = base.plan.manifest.hardware.usable_memory_bytes
-    admitted_peak = max(
-        admission.required_bytes for admission in base.plan.admissions
-    )
+    admitted_peak = max(admission.required_bytes for admission in base.plan.admissions)
     variance_bytes = sum(
         value.numel() * value.element_size()
         for values in (initial, means, m2)
@@ -101,13 +100,14 @@ def estimate_update_variance(
     base_source = cfg.source_mapping()
     for repeat in range(repeats):
         source = copy.deepcopy(base_source)
-        source["run"]["seed"] = (
-            int(base_source["run"]["seed"]) + repeat * seed_stride
-        )
+        source["run"]["seed"] = int(base_source["run"]["seed"]) + repeat * seed_stride
         local = load_config_mapping(source)
         session = TrainingSession(local)
         session.modules.load_state_dict(model_state)
-        session.reference_modules.load_state_dict(reference_model_state)
+        if reference_model_state is not None:
+            if session.reference_modules is None:
+                raise RuntimeError("variance reference ownership differs")
+            session.reference_modules.load_state_dict(reference_model_state)
         session.optimizers.load_state_dict(optimizer_state)
         session.run_states = copy.deepcopy(run_states)
         session.reference_states = copy.deepcopy(reference_states)
@@ -125,15 +125,11 @@ def estimate_update_variance(
             delta = update - means[lane]
             means[lane].add_(delta / (repeat + 1))
             m2[lane].add_(delta * (update - means[lane]))
-            lane_result = (
-                lane_results[lane] if lane < len(lane_results) else None
-            )
+            lane_result = lane_results[lane] if lane < len(lane_results) else None
             lane_rows.append(
                 {
                     "lane": lane,
-                    "player_nodes": int(
-                        getattr(lane_result, "player_nodes", 0)
-                    ),
+                    "player_nodes": int(getattr(lane_result, "player_nodes", 0)),
                     "update_l2": float(torch.linalg.vector_norm(update)),
                 }
             )
@@ -146,9 +142,7 @@ def estimate_update_variance(
                     dict(state.logical_work) for state in session.run_states
                 ),
                 "allocated_bytes": torch.cuda.memory_allocated(session.device),
-                "peak_allocated_bytes": torch.cuda.max_memory_allocated(
-                    session.device
-                ),
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(session.device),
             }
         )
         del result
@@ -174,9 +168,7 @@ def estimate_update_variance(
         "execution": cfg.execution.mapping(),
         "identity": {
             "code": code_identity(),
-            "accelerator": accelerator_identity(
-                cfg.scientific.common.game.rank_count
-            ),
+            "accelerator": accelerator_identity(cfg.scientific.common.game.rank_count),
             "checkpoint_sha256": (
                 None if checkpoint is None else sha256_file(checkpoint)
             ),
@@ -190,12 +182,8 @@ def estimate_update_variance(
             "admitted_peak_bytes": admitted_peak,
             "variance_statistics_bytes": variance_bytes,
             "start_allocated_bytes": memory_start,
-            "peak_allocated_bytes": torch.cuda.max_memory_allocated(
-                variance_device
-            ),
-            "end_allocated_bytes": torch.cuda.memory_allocated(
-                variance_device
-            ),
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(variance_device),
+            "end_allocated_bytes": torch.cuda.memory_allocated(variance_device),
         },
     }
 

@@ -97,7 +97,7 @@ profile:
         player: 2.4
         chance: 2.4
       minimum_tree_size: 1000
-      safe_tree_size: 25000.0
+      safe_tree_size: 25000
       cost_safeguard:
         gamma_deviance_max: 1.0
         p95_underprediction_max: 2.0
@@ -106,7 +106,6 @@ profile:
         active: false
         observations: 0
       completion_samples: 1024
-      posterior_max_attempts: 256
       seed: 104830
       iteration: 1110
       warmup: 0
@@ -118,7 +117,7 @@ profile:
         player: 2.4
         chance: 2.4
       minimum_tree_size: 1000
-      safe_tree_size: 25000.0
+      safe_tree_size: 25000
       cost_safeguard:
         gamma_deviance_max: 1.0
         p95_underprediction_max: 2.0
@@ -127,7 +126,6 @@ profile:
         active: false
         observations: 0
       completion_samples: 1024
-      posterior_max_attempts: 256
       seed: 209559
       iteration: 1110
       warmup: 0
@@ -139,9 +137,8 @@ profile:
         player: 3.0
         chance: 3.0
       minimum_tree_size: 1000
-      safe_tree_size: 10000.0
+      safe_tree_size: 10000
       completion_samples: 1024
-      posterior_max_attempts: 256
       seed: 104830
       iteration: 1110
       warmup: 1
@@ -153,7 +150,7 @@ profile:
         player: 3.0
         chance: 3.0
       minimum_tree_size: 1000
-      safe_tree_size: 10000.0
+      safe_tree_size: 10000
       cost_safeguard:
         gamma_deviance_max: 1.0
         p95_underprediction_max: 2.0
@@ -162,7 +159,6 @@ profile:
         active: true
         observations: 0
       completion_samples: 1024
-      posterior_max_attempts: 256
       seed: 104830
       iteration: 1110
       warmup: 0

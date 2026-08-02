@@ -84,11 +84,13 @@ class PartitionContract:
     def __post_init__(self) -> None:
         self._require_unique("input", self.inputs)
         self._require_unique("output", self.outputs)
-        self._require_unique("folded", self.folded)
+        self._require_unique("folded", self.folded, allow_empty=True)
         input_names = {item.name for item in self.inputs}
         output_names = {item.name for item in self.outputs}
         mapped_inputs = {item.input_name for item in self.input_to_output}
-        if mapped_inputs != input_names or len(mapped_inputs) != len(self.input_to_output):
+        if mapped_inputs != input_names or len(mapped_inputs) != len(
+            self.input_to_output
+        ):
             raise ContractError("every input partition must have exactly one output")
         for item in self.input_to_output:
             if item.output_name not in output_names:
@@ -105,8 +107,13 @@ class PartitionContract:
             conversion_pairs.add(pair)
 
     @staticmethod
-    def _require_unique(label: str, values: tuple[Partition, ...]) -> None:
-        if not values:
+    def _require_unique(
+        label: str,
+        values: tuple[Partition, ...],
+        *,
+        allow_empty: bool = False,
+    ) -> None:
+        if not values and not allow_empty:
             raise ContractError(f"{label} partition is empty")
         names = tuple(item.name for item in values)
         if len(set(names)) != len(names):

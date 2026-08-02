@@ -40,6 +40,9 @@ def test_public_config_compiles_one_resolved_runtime_contract() -> None:
         "pre": (240,),
         "post_2": (448,),
     }
+    assert cfg.scientific.common.reference is None
+    assert cfg.scientific.common.loss.reference_kl_coefficient is None
+    assert cfg.scientific.common.loss.branching is None
     manifest = cfg.execution.manifest
     assert manifest.topology_edge_cap == (
         manifest.topology_cap - manifest.root_count + manifest.leaf_cap
@@ -87,7 +90,9 @@ def _mutated_leaf(value: object, path: tuple[object, ...]) -> object:
     raise AssertionError("resolved path did not reach a container")
 
 
-def _leaf_paths(value: object, prefix: tuple[object, ...] = ()) -> list[tuple[object, ...]]:
+def _leaf_paths(
+    value: object, prefix: tuple[object, ...] = ()
+) -> list[tuple[object, ...]]:
     if isinstance(value, dict):
         return [
             path
@@ -105,7 +110,9 @@ def _leaf_paths(value: object, prefix: tuple[object, ...] = ()) -> list[tuple[ob
 
 def test_every_resolved_leaf_is_hash_bound_and_resume_identity_bound() -> None:
     resolved = load_config(CONFIG).execution.mapping()
-    payload = {name: value for name, value in resolved.items() if name != "resolved_sha256"}
+    payload = {
+        name: value for name, value in resolved.items() if name != "resolved_sha256"
+    }
     for path in _leaf_paths(payload):
         mutated_payload = _mutated_leaf(payload, path)
         tampered = {**mutated_payload, "resolved_sha256": resolved["resolved_sha256"]}
@@ -258,5 +265,8 @@ def test_profiler_scenarios_compile_without_mutation_or_null_placeholders() -> N
     failed = loader(PROFILE, "failed_beta3_capacity")
     assert successful.root.source_mapping()["kind"] == "nlhe_run_v1"
     assert failed.scenario.cost_safeguard is None
+    assert successful.root.execution.manifest.topology_cap == 25_000
+    assert failed.root.execution.manifest.topology_cap == 10_000
     assert PROFILE.read_text(encoding="utf-8") == before
     assert ": null" not in before
+    assert "posterior_max_attempts" not in before

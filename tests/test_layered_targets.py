@@ -63,9 +63,7 @@ CUDA = pytest.mark.skipif(
 REPOSITORY = Path(__file__).resolve().parents[1]
 
 
-def sampled_completion(
-    payoff: torch.Tensor, *, branched: bool
-) -> SampledLeafWork:
+def sampled_completion(payoff: torch.Tensor, *, branched: bool) -> SampledLeafWork:
     if (
         payoff.device.type != "cuda"
         or payoff.dtype != torch.float32
@@ -82,17 +80,11 @@ def sampled_completion(
 def initialize_work_arenas(
     owners: GeneratedOwners,
     plan: LayerPlan,
-    completion: Mapping[
-        tuple[int, str], SampledLeafWork | RBLeafWork
-    ],
+    completion: Mapping[tuple[int, str], SampledLeafWork | RBLeafWork],
 ) -> None:
     n_replica = owners.plan.manifest.n_replica
-    expected_inputs = tuple(
-        item.name for item in owners.plan.partitions.inputs
-    )
-    expected_outputs = tuple(
-        item.name for item in owners.plan.partitions.outputs
-    )
+    expected_inputs = tuple(item.name for item in owners.plan.partitions.inputs)
+    expected_outputs = tuple(item.name for item in owners.plan.partitions.outputs)
     if plan.input_names != expected_inputs or plan.output_names != expected_outputs:
         raise TargetError("LayerPlan partitions differ from generated owners")
     if plan.branched != owners.plan.mode.rollout_mode.is_branched:
@@ -137,9 +129,8 @@ def initialize_work_arenas(
                     logical_address=output,
                 )
             )
-            selected = (
-                (plan.movement_replica == lane)
-                & (plan.movement_output_type == output)
+            selected = (plan.movement_replica == lane) & (
+                plan.movement_output_type == output
             )
             destinations = plan.movement_destination_work_row[selected].long()
             sources = plan.movement_source_leaf_row[selected].long()
@@ -148,8 +139,7 @@ def initialize_work_arenas(
                 if not isinstance(payload, (SampledLeafWork, RBLeafWork)):
                     raise TargetError("completion payload type is not supported")
                 expects_sampled = (
-                    owners.plan.mode.private_estimator
-                    is PrivateEstimator.SAMPLED
+                    owners.plan.mode.private_estimator is PrivateEstimator.SAMPLED
                 )
                 if expects_sampled != isinstance(payload, SampledLeafWork):
                     raise TargetError(
@@ -191,8 +181,7 @@ def initialize_work_arenas(
                 elif trace is not None:
                     raise TargetError("sequential completion must omit trace_vector")
                 finite = all(
-                    bool(torch.isfinite(tensor).all())
-                    for _, tensor in tensors
+                    bool(torch.isfinite(tensor).all()) for _, tensor in tensors
                 )
                 if trace is not None:
                     finite = finite and bool(torch.isfinite(trace).all())
@@ -201,10 +190,7 @@ def initialize_work_arenas(
                 if isinstance(payload, RBLeafWork):
                     invalid_mass = bool((payload.mass < 0).any())
                     invalid_zero = bool(
-                        (
-                            (payload.mass == 0)
-                            & (payload.moment.abs() > 1.0e-7)
-                        ).any()
+                        ((payload.mass == 0) & (payload.moment.abs() > 1.0e-7)).any()
                     )
                     if invalid_mass or invalid_zero:
                         raise TargetError("RB completion violates mass/moment laws")
@@ -215,37 +201,27 @@ def initialize_work_arenas(
             requests, phase="completion_movement"
         )
         try:
-            for index, (_, _, destinations, sources, payload) in enumerate(
-                operations
-            ):
+            for index, (_, _, destinations, sources, payload) in enumerate(operations):
                 transaction.fill_defaults(index)
                 if payload is None:
                     continue
                 reservation = transaction.reservations[index]
-                fields = tuple(
-                    field.name for field in reservation._slab.schema.fields
-                )
+                fields = tuple(field.name for field in reservation._slab.schema.fields)
                 sources_device = sources.to(
                     device=owners.plan.device, dtype=torch.int64
                 )
                 if isinstance(payload, SampledLeafWork):
                     if "return_value" not in fields:
-                        raise TargetError(
-                            "sampled completion used with RB work schema"
-                        )
+                        raise TargetError("sampled completion used with RB work schema")
                     torch.index_select(
                         payload.return_value,
                         0,
                         sources_device,
-                        out=reservation.view("return_value")[
-                            : destinations.numel(), 0
-                        ],
+                        out=reservation.view("return_value")[: destinations.numel(), 0],
                     )
                     if "trace_vector" in fields:
                         if payload.trace_vector is None:
-                            raise TargetError(
-                                "branched completion lacks trace vector"
-                            )
+                            raise TargetError("branched completion lacks trace vector")
                         torch.index_select(
                             payload.trace_vector,
                             0,
@@ -256,30 +232,22 @@ def initialize_work_arenas(
                         )
                 else:
                     if "mass" not in fields:
-                        raise TargetError(
-                            "RB completion used with sampled work schema"
-                        )
+                        raise TargetError("RB completion used with sampled work schema")
                     torch.index_select(
                         payload.mass,
                         0,
                         sources_device,
-                        out=reservation.view("mass")[
-                            : destinations.numel(), 0
-                        ],
+                        out=reservation.view("mass")[: destinations.numel(), 0],
                     )
                     torch.index_select(
                         payload.moment,
                         0,
                         sources_device,
-                        out=reservation.view("moment")[
-                            : destinations.numel(), 0
-                        ],
+                        out=reservation.view("moment")[: destinations.numel(), 0],
                     )
                     if "trace_vector" in fields:
                         if payload.trace_vector is None:
-                            raise TargetError(
-                                "branched completion lacks trace vector"
-                            )
+                            raise TargetError("branched completion lacks trace vector")
                         torch.index_select(
                             payload.trace_vector,
                             0,
@@ -340,7 +308,6 @@ def _layout() -> PhysicalLayout:
         ),
         player_count=2,
         stratum_count=2,
-        evaluator_private_width=4,
         opaque_fields=(
             SoAField("leaf_public_state", torch.uint8, (5,), fill=255),
             SoAField("leaf_private_profile", torch.int32, (2,), fill=-1),
@@ -368,8 +335,7 @@ def _manifest(mode, device: torch.device) -> CapacityManifest:
             PartitionRows("post2", 8),
         ),
         action_cap=tuple(
-            PartitionRows(partition.name, 16)
-            for partition in action_partitions
+            PartitionRows(partition.name, 16) for partition in action_partitions
         ),
         folded_range_cap=(
             PartitionRows("pre", 0),
@@ -441,9 +407,7 @@ def _topology(
             action_begin=_i32([0, -1]),
             label=_i32([4, 9]),
             path_length=_i32([1, 2]),
-            target_kind=_i32(
-                [int(TargetKind.TOPOLOGY), int(TargetKind.LEAF)]
-            ),
+            target_kind=_i32([int(TargetKind.TOPOLOGY), int(TargetKind.LEAF)]),
             target_row=_i32([1, 0]),
         )
         bindings = TopologyBindings(
@@ -507,9 +471,7 @@ def _topology(
     return topology, bindings
 
 
-def _fill_heads(
-    owners: GeneratedOwners, mode, rows: int, *, lane: int = 0
-) -> None:
+def _fill_heads(owners: GeneratedOwners, mode, rows: int, *, lane: int = 0) -> None:
     slab = owners.slab("SigmaHead", "pre")
     reservation = slab.reserve(
         lane, rows, phase="model_commit", input_type="pre", logical_address=0
@@ -550,9 +512,7 @@ def _enter_through_targets(
     owners.enter_phase(ExecutionPhase.COMPLETION)
     for output, name in enumerate(plan.output_names):
         work = owners.slab("LayerWork", name)
-        exact_rows = max(
-            rows[output] for rows in plan.arena_rows
-        )
+        exact_rows = max(rows[output] for rows in plan.arena_rows)
         assert work.capacity == exact_rows
         assert work.allocated_bytes == MonotoneSlab.analytical_bytes(
             work.schema,
@@ -586,7 +546,11 @@ def test_topology_compaction_preserves_unary_path_cost() -> None:
     assert compact.label.tolist() == [4]
     assert compact.target_kind.tolist() == [int(TargetKind.LEAF)]
     compact.validate(compact_bindings, p_train=2, compact=True)
-def test_layer_plan_handles_duplicates_unbalanced_last_consumers_and_dense_rows() -> None:
+
+
+def test_layer_plan_handles_duplicates_unbalanced_last_consumers_and_dense_rows() -> (
+    None
+):
     mode = mode_schema("self_play", "branched.fixed", "sampled")
     topology, bindings = _topology(mode, unbalanced=True)
     plan = build_layer_plan(
@@ -687,12 +651,8 @@ def test_protected_root_prefix_is_numerical_and_ignores_refill_child() -> None:
     result = LayeredTargetExecutor(
         mode, _algebra(mode.private_estimator), lambda_=1.0
     ).execute(owners, plan)
-    sigma = published_rows(
-        owners.slab("SigmaTarget", "pre"), 0, "value_target"
-    )
-    action = published_rows(
-        owners.slab("ActionTarget", "all"), 0, "advantage_target"
-    )
+    sigma = published_rows(owners.slab("SigmaTarget", "pre"), 0, "value_target")
+    action = published_rows(owners.slab("ActionTarget", "all"), 0, "advantage_target")
     assert torch.equal(sigma[0], torch.tensor([3.0], device=device))
     assert action.shape[0] == 2
     assert result.counters.child_edges_read == 2
@@ -757,9 +717,7 @@ def test_topology_rejects_overlapping_or_orphan_child_spans() -> None:
         target_kind=_i32([int(TargetKind.LEAF)] * 3),
         target_row=_i32([0, 1, 2]),
     )
-    orphan_bindings = replace(
-        bindings, child_output_type=_i32([0, 0, 0])
-    )
+    orphan_bindings = replace(bindings, child_output_type=_i32([0, 0, 0]))
     with pytest.raises(TopologyError, match="orphan"):
         orphaned.validate(orphan_bindings, p_train=2)
 
@@ -795,9 +753,7 @@ def test_layer_plan_rejects_duplicate_sigma_and_action_destinations() -> None:
             (duplicate_sigma,),
             p_train=2,
         )
-    unique_sigma = replace(
-        duplicate_sigma, sigma_target_row=_i32([0, 1])
-    )
+    unique_sigma = replace(duplicate_sigma, sigma_target_row=_i32([0, 1]))
     with pytest.raises(TopologyError, match="action target spans"):
         build_layer_plan(
             mode,
@@ -947,18 +903,14 @@ def test_completion_payload_contract_rejects_broadcast_before_reservation() -> N
     )
     invalid = SampledLeafWork(torch.ones((1, 1, 1), device=device))
     with pytest.raises(TargetError, match="closed|must be contiguous"):
-        _enter_through_targets(
-            owners, mode, plan, {(0, "all"): invalid}, 1
-        )
+        _enter_through_targets(owners, mode, plan, {(0, "all"): invalid}, 1)
     assert owners.slab("LayerWork", "all").tail(0) == 0
     crossed = RBLeafWork(
         torch.ones((1, 2, 1), device=device),
         torch.ones((1, 2, 1), device=device),
     )
     with pytest.raises(TargetError, match="estimator differs"):
-        initialize_work_arenas(
-            owners, plan, {(0, "all"): crossed}
-        )
+        initialize_work_arenas(owners, plan, {(0, "all"): crossed})
     work = owners.slab("LayerWork", "all")
     assert work.tail(0) == 0
     assert work.reserved_tail(0) == 0
@@ -998,9 +950,7 @@ def test_negative_post_mass_cannot_cancel_before_h_to_k_validation() -> None:
     )
     invalid = RBLeafWork(mass, torch.zeros_like(mass))
     with pytest.raises(TargetError, match="mass/moment"):
-        _enter_through_targets(
-            owners, mode, plan, {(0, "post"): invalid}, 1
-        )
+        _enter_through_targets(owners, mode, plan, {(0, "post"): invalid}, 1)
     assert owners.slab("LayerWork", "post").tail(0) == 0
     valid_mass = mass.abs()
     initialize_work_arenas(
@@ -1033,8 +983,7 @@ def test_configured_maximum_sequential_depth_is_admitted() -> None:
         label=_i32(range(nodes)),
         path_length=_i32([1] * nodes),
         target_kind=_i32(
-            [int(TargetKind.TOPOLOGY)] * (nodes - 1)
-            + [int(TargetKind.LEAF)]
+            [int(TargetKind.TOPOLOGY)] * (nodes - 1) + [int(TargetKind.LEAF)]
         ),
         target_row=_i32([*range(1, nodes), 0]),
     )
@@ -1103,9 +1052,7 @@ def test_signed_sampled_return_is_valid() -> None:
     ).execute(owners, plan)
     assert result.published_lanes == (0,)
     assert torch.equal(
-        published_rows(
-            owners.slab("SigmaTarget", "pre"), 0, "value_target"
-        )[0],
+        published_rows(owners.slab("SigmaTarget", "pre"), 0, "value_target")[0],
         torch.tensor([-3.0], device=device),
     )
     _close(owners)
@@ -1116,9 +1063,7 @@ def test_signed_sampled_return_is_valid() -> None:
     ("bad_mass", "bad_moment"),
     ((-1.0, -2.0), (0.0, 1.0)),
 )
-def test_rb_validates_every_work_channel(
-    bad_mass: float, bad_moment: float
-) -> None:
+def test_rb_validates_every_work_channel(bad_mass: float, bad_moment: float) -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     mode = mode_schema("self_play", "sequential", "rao_blackwell")
     topology, bindings = _topology(mode)
@@ -1183,9 +1128,7 @@ def test_all_twelve_modes_match_direct_one_node_reference(
         p_train=2 if regime is TrainingRegime.SELF_PLAY else 1,
         manifest=manifest,
     )
-    storage_plan = build_storage_plan(
-        mode, partitions, manifest, _layout(), device
-    )
+    storage_plan = build_storage_plan(mode, partitions, manifest, _layout(), device)
     owners = GeneratedOwners(storage_plan)
     p_train = 2 if regime is TrainingRegime.SELF_PLAY else 1
     leaves = 1 if rollout is RolloutMode.SEQUENTIAL else 2
@@ -1197,9 +1140,7 @@ def test_all_twelve_modes_match_direct_one_node_reference(
             payoff, branched=rollout.is_branched
         )
     else:
-        mass = torch.ones(
-            (leaves, p_train, 2), dtype=torch.float32, device=device
-        )
+        mass = torch.ones((leaves, p_train, 2), dtype=torch.float32, device=device)
         value = torch.arange(
             1,
             leaves * p_train * 2 + 1,
@@ -1213,12 +1154,10 @@ def test_all_twelve_modes_match_direct_one_node_reference(
             algebra=_algebra(estimator),
             source_output="pre",
         )
-    _enter_through_targets(
-        owners, mode, plan, {(0, plan.output_names[0]): payload}, 1
+    _enter_through_targets(owners, mode, plan, {(0, plan.output_names[0]): payload}, 1)
+    result = LayeredTargetExecutor(mode, _algebra(estimator), lambda_=0.5).execute(
+        owners, plan
     )
-    result = LayeredTargetExecutor(
-        mode, _algebra(estimator), lambda_=0.5
-    ).execute(owners, plan)
     assert result.published_lanes == (0,)
     assert result.failed_lanes == ()
     assert result.counters.layer_count == 1
@@ -1226,9 +1165,7 @@ def test_all_twelve_modes_match_direct_one_node_reference(
         mode, _algebra(estimator), lambda_=0.5
     ).required_scratch_bytes(plan, manifest.n_replica)
     assert result.counters.scratch_bytes <= manifest.target_workspace_bytes
-    sigma = published_rows(
-        owners.slab("SigmaTarget", "pre"), 0, "value_target"
-    )
+    sigma = published_rows(owners.slab("SigmaTarget", "pre"), 0, "value_target")
     action_name = "pre" if not rollout.is_branched else plan.output_names[0]
     advantage = published_rows(
         owners.slab("ActionTarget", action_name), 0, "advantage_target"
@@ -1244,9 +1181,7 @@ def test_all_twelve_modes_match_direct_one_node_reference(
                 else 0.5 * owner_payoff[1 - child] + 1.0
             )
             expected.append(owner_payoff[child] - baseline)
-        assert torch.allclose(
-            advantage[:, 0], torch.stack(expected)
-        )
+        assert torch.allclose(advantage[:, 0], torch.stack(expected))
     else:
         owner_value = value[:, 0]
         assert torch.allclose(sigma[0], owner_value.mean(0))
@@ -1259,24 +1194,18 @@ def test_all_twelve_modes_match_direct_one_node_reference(
             baseline = (
                 torch.full((2,), 2.0, device=device)
                 if leaves == 1
-                else 0.5 * owner_value[1 - child]
-                + torch.ones(2, device=device)
+                else 0.5 * owner_value[1 - child] + torch.ones(2, device=device)
             )
             expected.append(owner_value[child] - baseline)
         assert torch.allclose(advantage, torch.stack(expected))
     if rollout.is_branched:
-        trace = published_rows(
-            owners.slab("SigmaTarget", "pre"), 0, "trace_target"
-        )
-        cost = published_rows(
-            owners.slab("SigmaTarget", "pre"), 0, "cost_target"
-        )
+        trace = published_rows(owners.slab("SigmaTarget", "pre"), 0, "trace_target")
+        cost = published_rows(owners.slab("SigmaTarget", "pre"), 0, "cost_target")
         trace_vector = payload.trace_vector
         assert trace_vector is not None
         expected_trace = (
-            (trace_vector - trace_vector.mean(0, keepdim=True)).square().sum()
-            / (leaves - 1)
-        )
+            trace_vector - trace_vector.mean(0, keepdim=True)
+        ).square().sum() / (leaves - 1)
         assert torch.allclose(trace, expected_trace.reshape(1))
         assert torch.equal(cost, torch.ones_like(cost))
         work = owners.slab("LayerWork", plan.output_names[0])
@@ -1300,9 +1229,7 @@ def test_unbalanced_last_consumer_slots_match_reference_without_copy_traffic() -
     owners = GeneratedOwners(
         build_storage_plan(mode, partitions, manifest, _layout(), device)
     )
-    payoff = torch.tensor(
-        [[2.0, -2.0], [4.0, -4.0], [8.0, -8.0]], device=device
-    )
+    payoff = torch.tensor([[2.0, -2.0], [4.0, -4.0], [8.0, -8.0]], device=device)
     _enter_through_targets(
         owners,
         mode,
@@ -1321,16 +1248,12 @@ def test_unbalanced_last_consumer_slots_match_reference_without_copy_traffic() -
             mode, _algebra(mode.private_estimator), lambda_=1.0
         ).execute(owners, plan)
     layer_kernels = [
-        event
-        for event in profile.events()
-        if "layered_target_kernel" in event.name
+        event for event in profile.events() if "layered_target_kernel" in event.name
     ]
     assert len(layer_kernels) == plan.layer_count
     assert not hasattr(result.counters, "carry_count")
     assert not hasattr(result.counters, "carry_payload_bytes")
-    sigma = published_rows(
-        owners.slab("SigmaTarget", "pre"), 0, "value_target"
-    )
+    sigma = published_rows(owners.slab("SigmaTarget", "pre"), 0, "value_target")
     # Node 1 is mean(4,8)=6, root is mean(2,6)=4.
     assert torch.equal(sigma[:, 0], torch.tensor([4.0, 6.0], device=device))
     _close(owners)
@@ -1377,9 +1300,7 @@ def test_unbalanced_rb_two_layer_recurrence_matches_direct_reference() -> None:
         mode, _algebra(mode.private_estimator), lambda_=1.0
     ).execute(owners, plan)
     assert result.published_lanes == (0,)
-    sigma = published_rows(
-        owners.slab("SigmaTarget", "pre"), 0, "value_target"
-    )
+    sigma = published_rows(owners.slab("SigmaTarget", "pre"), 0, "value_target")
     assert torch.equal(
         sigma,
         torch.tensor([[4.0, 4.0], [6.0, 6.0]], device=device),
@@ -1405,9 +1326,7 @@ def test_sequential_two_level_player_clock_specialization() -> None:
         action_begin=_i32([0, 1]),
         label=_i32([1, 2]),
         path_length=_i32([1, 1]),
-        target_kind=_i32(
-            [int(TargetKind.TOPOLOGY), int(TargetKind.LEAF)]
-        ),
+        target_kind=_i32([int(TargetKind.TOPOLOGY), int(TargetKind.LEAF)]),
         target_row=_i32([1, 0]),
     )
     bindings = TopologyBindings(
@@ -1439,17 +1358,13 @@ def test_sequential_two_level_player_clock_specialization() -> None:
         mode, _algebra(mode.private_estimator), lambda_=0.5
     ).execute(owners, plan)
     assert result.counters.layer_count == 2
-    sigma = published_rows(
-        owners.slab("SigmaTarget", "pre"), 0, "value_target"
-    )
+    sigma = published_rows(owners.slab("SigmaTarget", "pre"), 0, "value_target")
     advantage = published_rows(
         owners.slab("ActionTarget", "pre"), 0, "advantage_target"
     )
     # Descendant target is 10, then propagation bootstraps to 6 for its parent.
     assert torch.equal(sigma[:, 0], torch.tensor([6.0, 10.0], device=device))
-    assert torch.equal(
-        advantage[:, 0], torch.tensor([4.0, 8.0], device=device)
-    )
+    assert torch.equal(advantage[:, 0], torch.tensor([4.0, 8.0], device=device))
     _close(owners)
 
 
@@ -1512,9 +1427,7 @@ def test_headless_frozen_structural_row_never_accesses_heads_or_targets() -> Non
 def test_post_to_pre_reduces_mass_and_moment_before_conditionalization() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     algebra = _algebra(PrivateEstimator.RAO_BLACKWELL)
-    mass = torch.tensor(
-        [[[1.0, 3.0, 0.0, 0.0]]], dtype=torch.float32, device=device
-    )
+    mass = torch.tensor([[[1.0, 3.0, 0.0, 0.0]]], dtype=torch.float32, device=device)
     value = torch.tensor(
         [[[10.0, 2.0, 100.0, 200.0]]],
         dtype=torch.float32,
@@ -1529,9 +1442,7 @@ def test_post_to_pre_reduces_mass_and_moment_before_conditionalization() -> None
         destination_output="pre",
     )
     assert torch.equal(payload.mass, torch.tensor([[[4.0, 0.0]]], device=device))
-    assert torch.equal(
-        payload.moment, torch.tensor([[[16.0, 0.0]]], device=device)
-    )
+    assert torch.equal(payload.moment, torch.tensor([[[16.0, 0.0]]], device=device))
 
 
 @CUDA
@@ -1575,12 +1486,8 @@ def test_internal_layer_post_to_pre_conversion_is_deterministic() -> None:
         mode, _algebra(mode.private_estimator), lambda_=1.0
     ).execute(owners, plan)
     assert result.published_lanes == (0,)
-    sigma = published_rows(
-        owners.slab("SigmaTarget", "pre"), 0, "value_target"
-    )
-    posterior = published_rows(
-        owners.slab("ActionTarget", "pre"), 0, "posterior"
-    )
+    sigma = published_rows(owners.slab("SigmaTarget", "pre"), 0, "value_target")
+    posterior = published_rows(owners.slab("ActionTarget", "pre"), 0, "posterior")
     assert torch.equal(sigma[0], torch.tensor([4.0, 0.0], device=device))
     assert torch.equal(posterior[0], torch.tensor([4.0, 0.0], device=device))
     _close(owners)
@@ -1656,9 +1563,9 @@ def test_failure_is_isolated_across_replica_axis() -> None:
         },
         1,
     )
-    owners.slab("LayerWork", "all").columns["return_value"][
-        1, 0, 0, 0, 0
-    ] = float("nan")
+    owners.slab("LayerWork", "all").columns["return_value"][1, 0, 0, 0, 0] = float(
+        "nan"
+    )
     result = LayeredTargetExecutor(
         mode, _algebra(mode.private_estimator), lambda_=0.5
     ).execute(owners, plan)
@@ -1681,12 +1588,8 @@ def test_direct_sibling_sum_avoids_total_minus_child_cancellation() -> None:
     )
     mask = torch.ones((1, 4), dtype=torch.bool, device=device)
     ordinal = torch.arange(4, device=device)
-    sibling = mask[:, None, :] & (
-        ordinal[None, :, None] != ordinal[None, None, :]
-    )
-    direct = (
-        values[:, None] * sibling[..., None]
-    ).sum(dim=2)
+    sibling = mask[:, None, :] & (ordinal[None, :, None] != ordinal[None, None, :])
+    direct = (values[:, None] * sibling[..., None]).sum(dim=2)
     total_minus = values.sum(1, keepdim=True) - values
     # For the middle child the direct logical-order sum is exactly zero, while
     # total-minus-child loses the unit term in the total and returns -1.
@@ -1748,9 +1651,9 @@ def test_cuda_executor_uses_direct_sibling_sum_for_concentrated_rows() -> None:
         {(0, "all"): sampled_completion(payoff, branched=True)},
         1,
     )
-    LayeredTargetExecutor(
-        mode, _algebra(mode.private_estimator), lambda_=1.0
-    ).execute(owners, plan)
+    LayeredTargetExecutor(mode, _algebra(mode.private_estimator), lambda_=1.0).execute(
+        owners, plan
+    )
     advantage = published_rows(
         owners.slab("ActionTarget", "all"), 0, "advantage_target"
     )
@@ -1779,9 +1682,9 @@ def test_failure_keeps_targets_unpublished_and_records_lane() -> None:
         {(0, "all"): sampled_completion(payoff, branched=False)},
         1,
     )
-    owners.slab("LayerWork", "all").columns["return_value"][
-        0, 0, 0, 0, 0
-    ] = float("nan")
+    owners.slab("LayerWork", "all").columns["return_value"][0, 0, 0, 0, 0] = float(
+        "nan"
+    )
     result = LayeredTargetExecutor(
         mode, _algebra(mode.private_estimator), lambda_=0.5
     ).execute(owners, plan)

@@ -114,9 +114,9 @@ transition before adding across lanes.
 
 Runtime loading accepts only the strict queued schemas:
 
-- ordinary checkpoint `pbg-queued-checkpoint-v2`;
-- replica checkpoint `pbg-queued-replica-checkpoint-v2`;
-- distributed manifest `pbg-queued-distributed-checkpoint-v1`; and
+- ordinary checkpoint `pbg-queued-checkpoint-v3`;
+- replica checkpoint `pbg-queued-replica-checkpoint-v3`;
+- distributed manifest `pbg-queued-distributed-checkpoint-v2`; and
 - model-only inference artifact `pbg-queued-inference-v1`.
 
 Ordinary and replica checkpoints preserve model/reference weights, optimizer,

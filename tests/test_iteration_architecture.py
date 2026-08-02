@@ -237,9 +237,7 @@ def _neutral_plan(device: torch.device):
         target_workspace_bytes=8192,
         learner_workspace_bytes=8192,
         hardware=HardwareLimits(
-            total_memory_bytes=torch.cuda.get_device_properties(
-                device
-            ).total_memory,
+            total_memory_bytes=torch.cuda.get_device_properties(device).total_memory,
             usable_memory_bytes=64 * 1024 * 1024,
         ),
     )
@@ -247,7 +245,6 @@ def _neutral_plan(device: torch.device):
         model_input_shapes=(NamedShape("origin", (2,)),),
         player_count=1,
         stratum_count=1,
-        evaluator_private_width=1,
         opaque_fields=(
             SoAField("leaf_public_state", torch.float32, (1,)),
             SoAField("leaf_private_profile", torch.int32, (1,), fill=-1),
@@ -318,19 +315,17 @@ class _NeutralRolloutHooks:
             source_ordinal=ordinal,
             terminal=torch.ones(rows, dtype=torch.bool, device=device),
             child_input=torch.zeros(rows, dtype=torch.int32, device=device),
-            child_leaf_row=(
-                self.leaf.reserved_tails_device()[0] + ordinal
-            ),
+            child_leaf_row=(self.leaf.reserved_tails_device()[0] + ordinal),
             label=torch.zeros(rows, dtype=torch.int32, device=device),
             owner=torch.zeros(rows, dtype=torch.int32, device=device),
             input_type=torch.zeros(rows, dtype=torch.int32, device=device),
             familywork_row=batch.row[0].to(torch.int32),
-            sigma_head_row=(
-                self.sigma.reserved_tails_device()[0] + ordinal
-            ).to(torch.int32),
-            action_begin=(
-                self.action.reserved_tails_device()[0] + ordinal
-            ).to(torch.int32),
+            sigma_head_row=(self.sigma.reserved_tails_device()[0] + ordinal).to(
+                torch.int32
+            ),
+            action_begin=(self.action.reserved_tails_device()[0] + ordinal).to(
+                torch.int32
+            ),
             executed_degree=one,
             nominal_degree=one,
             target_degree=one,
@@ -346,12 +341,8 @@ class _NeutralRolloutHooks:
             counterfactual_correction=torch.zeros(
                 (), dtype=torch.float32, device=device
             ),
-            frontier_overflow=torch.zeros(
-                (), dtype=torch.bool, device=device
-            ),
-            frontier_demand=torch.tensor(
-                rows, dtype=torch.int64, device=device
-            ),
+            frontier_overflow=torch.zeros((), dtype=torch.bool, device=device),
+            frontier_demand=torch.tensor(rows, dtype=torch.int64, device=device),
         )
         topology = TopologyPublication(
             lane=0,
@@ -361,9 +352,7 @@ class _NeutralRolloutHooks:
             payload=payload,
         )
         self.sequence += 1
-        logical_address = torch.zeros(
-            1, dtype=torch.int64, device=device
-        )
+        logical_address = torch.zeros(1, dtype=torch.int64, device=device)
         return CommitPlan(
             tuple(
                 DeviceDestinationRequest(
@@ -373,18 +362,14 @@ class _NeutralRolloutHooks:
                     "score" if slab is self.leaf else "origin",
                     logical_address,
                 )
-                for slab, values in zip(
-                    destinations, destination_values, strict=True
-                )
+                for slab, values in zip(destinations, destination_values, strict=True)
             ),
             CommitCoverage(
-                torch.ones(
-                    (1, 3 * rows), dtype=torch.bool, device=device
-                ),
+                torch.ones((1, 3 * rows), dtype=torch.bool, device=device),
                 ordinal.repeat(3)[None],
-                torch.arange(
-                    3, dtype=torch.int64, device=device
-                ).repeat_interleave(rows)[None],
+                torch.arange(3, dtype=torch.int64, device=device).repeat_interleave(
+                    rows
+                )[None],
                 ordinal.repeat(3)[None],
             ),
             topology=(topology,),
@@ -478,9 +463,7 @@ class _NeutralOperations:
                 )
                 for field in work.schema.fields
             }
-            counts = torch.tensor(
-                [rows], dtype=torch.int64, device=work.device
-            )
+            counts = torch.tensor([rows], dtype=torch.int64, device=work.device)
             return CompletionPlan(
                 (
                     DeviceDestinationRequest(
@@ -488,9 +471,7 @@ class _NeutralOperations:
                         counts,
                         values,
                         "score",
-                        torch.zeros(
-                            1, dtype=torch.int64, device=work.device
-                        ),
+                        torch.zeros(1, dtype=torch.int64, device=work.device),
                     ),
                 ),
                 _unit_coverage(work.device, rows),
@@ -584,14 +565,11 @@ def test_core_has_no_poker_dependency_or_semantic_inspection() -> None:
             for alias in node.names
         )
         assert not any(
-            name == "pbg.games.poker"
-            or name.startswith("pbg.games.poker.")
+            name == "pbg.games.poker" or name.startswith("pbg.games.poker.")
             for name in imports
         ), path
         names = {
-            node.id.lower()
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Name)
+            node.id.lower() for node in ast.walk(tree) if isinstance(node, ast.Name)
         }
         assert not forbidden_terms.intersection(names), path
 
@@ -626,14 +604,10 @@ def test_poker_does_not_own_generic_lifecycle_or_execution() -> None:
     for path in POKER.glob("*.py"):
         calls = _calls(path)
         attributes = {
-            node.func.attr
-            for node in calls
-            if isinstance(node.func, ast.Attribute)
+            node.func.attr for node in calls if isinstance(node.func, ast.Attribute)
         }
         constructors = {
-            node.func.id
-            for node in calls
-            if isinstance(node.func, ast.Name)
+            node.func.id for node in calls if isinstance(node.func, ast.Name)
         }
         assert not forbidden_calls.intersection(attributes), path
         assert not forbidden_constructors.intersection(constructors), path
@@ -737,7 +711,5 @@ def test_no_retired_or_compatibility_objects_remain() -> None:
             if isinstance(node, (ast.ClassDef, ast.FunctionDef))
         )
         assert not any(
-            fragment in name
-            for name in names
-            for fragment in forbidden_fragments
+            fragment in name for name in names for fragment in forbidden_fragments
         ), path

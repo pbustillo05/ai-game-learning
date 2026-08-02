@@ -98,9 +98,7 @@ def _reference_policy(
     standardized = (edges - location) / scale
     lower, upper = standardized[..., :-1], standardized[..., 1:]
     tick_probability = (
-        torch.sigmoid(upper)
-        * torch.sigmoid(-lower)
-        * (-torch.expm1(lower - upper))
+        torch.sigmoid(upper) * torch.sigmoid(-lower) * (-torch.expm1(lower - upper))
     ).clamp_min(0.0)
     normalizer = (
         torch.sigmoid(standardized[..., -1:])
@@ -114,9 +112,7 @@ def _reference_policy(
     ).clamp_min(tiny)
     mixture = (raw["omega"].float()[..., None] * tick_probability).sum(-2)
     prefix = logits.shape[:-1]
-    event_shape = (prefix[0],) + (1,) * (len(prefix) - 1) + (
-        event_ids.shape[1],
-    )
+    event_shape = (prefix[0],) + (1,) * (len(prefix) - 1) + (event_ids.shape[1],)
     mask = legal.reshape(event_shape).expand(prefix + (event_ids.shape[1],))
     raise_mask = mask[..., 2:]
     mixture = mixture.masked_fill(~raise_mask, 0.0)
@@ -131,9 +127,9 @@ def _reference_policy(
     all_in_index = torch.where(
         raise_mask, tick_index, torch.full_like(tick_index, -1)
     ).amax(-1)
-    all_in = (
-        tick_index == all_in_index[..., None]
-    ).float() * (all_in_index >= 0)[..., None]
+    all_in = (tick_index == all_in_index[..., None]).float() * (all_in_index >= 0)[
+        ..., None
+    ]
     raise_probability = (
         (1.0 - raw["iota"].float()[..., None]) * conditional
         + raw["iota"].float()[..., None] * all_in
@@ -194,10 +190,7 @@ def test_full_deck_partition_widths_match_the_storage_contract() -> None:
         "post_2": 1,
     }
     assert {item.name: item.width for item in sampled.outputs} == {"all": 1}
-    assert {item.name: item.width for item in sampled.folded} == {
-        "pre": 169,
-        "post": 1326,
-    }
+    assert sampled.folded == ()
 
     rb = rb_partitions(geometry)
     assert {item.name: item.width for item in rb.inputs} == {
@@ -208,7 +201,14 @@ def test_full_deck_partition_widths_match_the_storage_contract() -> None:
         "pre": 169,
         "post": 1326,
     }
-    assert {item.name: item.width for item in rb.folded} == {
+    assert rb.folded == ()
+
+    multiway = NLHEGeometry(3, 8.0, 13)
+    assert {item.name: item.width for item in sampled_partitions(multiway).folded} == {
+        "pre": 169,
+        "post": 1326,
+    }
+    assert {item.name: item.width for item in rb_partitions(multiway).folded} == {
         "pre": 169,
         "post": 1326,
     }
@@ -303,9 +303,7 @@ def _raw(
 ) -> dict[str, torch.Tensor]:
     generator = torch.Generator(device=device).manual_seed(9182)
     result = {
-        "type_logits": torch.randn(
-            batch, hands, 3, generator=generator, device=device
-        ),
+        "type_logits": torch.randn(batch, hands, 3, generator=generator, device=device),
         "omega": torch.softmax(
             torch.randn(batch, hands, mixture, generator=generator, device=device),
             -1,
@@ -350,9 +348,7 @@ def test_canonical_policy_matches_independent_materialization_and_gradients() ->
     queued = PokerPolicyOperator().probabilities(queued_raw, legality)
     reference = _reference_policy(reference_raw, ids, legal)
     torch.testing.assert_close(queued, reference, atol=1.0e-6, rtol=1.0e-5)
-    weight = torch.linspace(
-        -0.7, 1.1, queued.numel(), device=device
-    ).reshape_as(queued)
+    weight = torch.linspace(-0.7, 1.1, queued.numel(), device=device).reshape_as(queued)
     (queued * weight).sum().backward()
     (reference * weight).sum().backward()
     for name in queued_raw:
@@ -381,6 +377,7 @@ def test_policy_sampling_selected_head_and_learner_share_one_operation() -> None
     raw = _raw(device, batch=3, hands=7)
     hand = torch.tensor([2, 5, 1], dtype=torch.int32, device=device)
     keys = torch.tensor([71, 81, 91], dtype=torch.int64, device=device)
+
     class RecordingOperator(PokerPolicyOperator):
         def probabilities(self, selected_raw, selected_legality):
             self.rollout_shape = selected_raw["type_logits"].shape
@@ -392,9 +389,7 @@ def test_policy_sampling_selected_head_and_learner_share_one_operation() -> None
     selected_all = operator.selected_log_pi(raw, legality, sampled.action)
     torch.testing.assert_close(
         sampled.selected_log_policy,
-        selected_all[
-            torch.arange(3, device=device), hand.to(torch.int64)
-        ],
+        selected_all[torch.arange(3, device=device), hand.to(torch.int64)],
     )
     assert sampled.action[1] == CHECK_CALL
     entropy, kl = operator.policy_reductions(raw, legality, raw)
@@ -403,7 +398,9 @@ def test_policy_sampling_selected_head_and_learner_share_one_operation() -> None
 
 
 @CUDA
-def test_root_profiles_are_collision_free_and_public_transition_is_conservative() -> None:
+def test_root_profiles_are_collision_free_and_public_transition_is_conservative() -> (
+    None
+):
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(6, 8.0, 13)
     machine = PokerStateMachine(geometry)
@@ -426,9 +423,7 @@ def test_root_profiles_are_collision_free_and_public_transition_is_conservative(
     initial_total = state.stacks + state.committed
     action = torch.full((8,), FOLD, dtype=torch.int32, device=device)
     next_state = machine.step_player(state, action)
-    torch.testing.assert_close(
-        next_state.stacks + next_state.committed, initial_total
-    )
+    torch.testing.assert_close(next_state.stacks + next_state.committed, initial_total)
     assert next_state.terminal.logical_not().any()
     leaf_state = state
     # Folding in table order terminates every hand without requiring a board.
@@ -452,8 +447,7 @@ def test_root_profiles_are_collision_free_and_public_transition_is_conservative(
     if bool(leaf_state.terminal.all()):
         leaf = machine.sampled_leaf(leaf_state)
         torch.testing.assert_close(
-            leaf["payoff_baseline"].sum(-1)
-            + leaf["stratum_amount"].sum(-1),
+            leaf["payoff_baseline"].sum(-1) + leaf["stratum_amount"].sum(-1),
             torch.zeros(8, device=device),
             atol=1.0e-5,
             rtol=0,
@@ -513,15 +507,11 @@ def test_sampled_leaf_matches_exact_evaluator_rows_and_binding() -> None:
         device,
         failure_state=failures,
     )
-    binding = SampledShowdownBinding(
-        geometry, work, n_replica=1, pack_cap=2
-    )
+    binding = SampledShowdownBinding(geometry, work, n_replica=1, pack_cap=2)
     batch = CompletionBatch(
         lanes=torch.tensor([0], dtype=torch.int64, device=device),
         row=torch.tensor([[0, 1]], dtype=torch.int64, device=device),
-        fields=MappingProxyType(
-            {name: value[None] for name, value in leaf.items()}
-        ),
+        fields=MappingProxyType({name: value[None] for name, value in leaf.items()}),
     )
     plan = binding.leaf_to_layer_work(batch)
     expected = binding.evaluator.evaluate_showdowns(
@@ -540,9 +530,7 @@ def test_sampled_leaf_matches_exact_evaluator_rows_and_binding() -> None:
         pack_cap=2,
         utility="stack_normalized",
     ).leaf_to_layer_work(batch)
-    normalized_value = normalized.destinations[0].values["return_value"][
-        0, :2, 0, :, 0
-    ]
+    normalized_value = normalized.destinations[0].values["return_value"][0, :2, 0, :, 0]
     torch.testing.assert_close(normalized_value, expected / geometry.stack_bb)
     realized = plan.coverage.validate(
         batch,
@@ -566,7 +554,9 @@ class _TinyModel(nn.Module):
 
 
 class _PartitionNetwork(nn.Module):
-    def __init__(self, input_width: int, output_width: int, device: torch.device) -> None:
+    def __init__(
+        self, input_width: int, output_width: int, device: torch.device
+    ) -> None:
         super().__init__()
         self.output_width = output_width
         self.affine = nn.Linear(input_width, output_width * 9, device=device)
@@ -604,9 +594,7 @@ def test_two_partition_model_routes_natural_domains_and_preserves_class_order() 
         DeckGeometry(geometry.rank_count).class_of_combo
     )
     machine = PokerStateMachine(geometry)
-    state = machine.initial_roots(
-        3, seed=17, iteration=0, retry_epoch=0, device=device
-    )
+    state = machine.initial_roots(3, seed=17, iteration=0, retry_epoch=0, device=device)
     model_input = machine.direct_model_input("pre", state)
     pre_reach, _ = machine.model_context("pre", model_input)
     assert pre_reach.shape == (
@@ -627,9 +615,7 @@ def test_two_partition_model_routes_natural_domains_and_preserves_class_order() 
         value.shape[1] == geometry.private_classes
         for value in pre_rollout.policy_raw.values()
     )
-    assert all(
-        value.shape[1] == 1 for value in pre_learner.policy_raw.values()
-    )
+    assert all(value.shape[1] == 1 for value in pre_learner.policy_raw.values())
     state = machine.step_player(
         state,
         torch.full((3,), CHECK_CALL, dtype=torch.int32, device=device),
@@ -640,9 +626,9 @@ def test_two_partition_model_routes_natural_domains_and_preserves_class_order() 
     )
     state = machine.deal_next_street(
         state,
-        torch.arange(
-            geometry.deck_cards, dtype=torch.int64, device=device
-        )[None].expand(3, -1),
+        torch.arange(geometry.deck_cards, dtype=torch.int64, device=device)[
+            None
+        ].expand(3, -1),
     )
     post_input = machine.direct_model_input("post_2", state)
     post_reach, _ = machine.model_context("post_2", post_input)
@@ -675,9 +661,7 @@ def test_phase5_postflop_fails_before_silent_folded_summary_omission() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(3, 8.0, 4)
     machine = PokerStateMachine(geometry)
-    state = machine.initial_roots(
-        1, seed=29, iteration=0, retry_epoch=0, device=device
-    )
+    state = machine.initial_roots(1, seed=29, iteration=0, retry_epoch=0, device=device)
     status = state.status.clone()
     status[:, 2] = 1
     state = replace(
@@ -699,9 +683,7 @@ def test_phase5_postflop_fails_before_silent_folded_summary_omission() -> None:
         ),
     )
     with pytest.raises(RuntimeError, match="folded summaries"):
-        model.forward_partition(
-            "post_2", machine.direct_model_input("post_2", state)
-        )
+        model.forward_partition("post_2", machine.direct_model_input("post_2", state))
 
 
 def _phase5_manifest(device: torch.device) -> CapacityManifest:
@@ -722,10 +704,7 @@ def _phase5_manifest(device: torch.device) -> CapacityManifest:
             PartitionRows("pre", 20),
             PartitionRows("post_2", 20),
         ),
-        folded_range_cap=(
-            PartitionRows("pre", 0),
-            PartitionRows("post", 0),
-        ),
+        folded_range_cap=(),
         leaf_cap=8,
         topology_cap=8,
         topology_edge_cap=8,
@@ -752,9 +731,7 @@ def _phase5_manifest(device: torch.device) -> CapacityManifest:
 def _phase5_layout(
     geometry: NLHEGeometry | None = None,
 ) -> PhysicalLayout:
-    geometry = (
-        NLHEGeometry(2, 8.0, 4) if geometry is None else geometry
-    )
+    geometry = NLHEGeometry(2, 8.0, 4) if geometry is None else geometry
     return PhysicalLayout(
         model_input_shapes=(
             NamedShape("pre", (geometry.preflop_model_input_width,)),
@@ -762,7 +739,6 @@ def _phase5_layout(
         ),
         player_count=2,
         stratum_count=2,
-        evaluator_private_width=4,
         opaque_fields=(
             SoAField("leaf_public_state", torch.uint8, (5,), fill=255),
             SoAField(
@@ -801,9 +777,7 @@ class _LearnerModel(nn.Module):
         _owner: torch.Tensor,
     ) -> ModelEvaluation:
         batch = model_input.shape[0]
-        fields = self.affine(
-            model_input[:, :26].float()
-        ).reshape(batch, self.hands, 11)
+        fields = self.affine(model_input[:, :26].float()).reshape(batch, self.hands, 11)
         return ModelEvaluation(
             MappingProxyType(
                 {
@@ -834,9 +808,7 @@ class _LearnerPolicy:
     ):
         batch = action.shape[0]
         device = action.device
-        ids = torch.arange(4, dtype=torch.int32, device=device)[None].expand(
-            batch, -1
-        )
+        ids = torch.arange(4, dtype=torch.int32, device=device)[None].expand(batch, -1)
         legality = PokerLegality(
             ids.contiguous(), torch.ones_like(ids, dtype=torch.bool)
         )
@@ -846,25 +818,19 @@ class _LearnerPolicy:
 
 
 class _EndToEndPokerModel(nn.Module):
-    def __init__(
-        self, device: torch.device, hands: int, *, check_down: bool
-    ) -> None:
+    def __init__(self, device: torch.device, hands: int, *, check_down: bool) -> None:
         super().__init__()
         self.hands = hands
         self.check_down = check_down
         self.seen_input_types: list[str] = []
         self.public = nn.Linear(26, 1, device=device)
         self.type_logits = nn.Parameter(
-            torch.tensor([24.0, -24.0, -24.0], device=device).expand(
-                hands, -1
-            ).clone()
+            torch.tensor([24.0, -24.0, -24.0], device=device).expand(hands, -1).clone()
         )
         self.omega = nn.Parameter(torch.zeros(hands, 2, device=device))
         self.mu = nn.Parameter(torch.zeros(hands, 2, device=device))
         self.scale = nn.Parameter(torch.zeros(hands, 2, device=device))
-        self.iota = nn.Parameter(
-            torch.full((hands,), -4.0, device=device)
-        )
+        self.iota = nn.Parameter(torch.full((hands,), -4.0, device=device))
         self.value = nn.Parameter(torch.zeros(hands, device=device))
 
     def evaluate(
@@ -880,9 +846,9 @@ class _EndToEndPokerModel(nn.Module):
         type_logits = self.type_logits[None].expand(batch, -1, -1)
         if self.check_down:
             actor = model_input[:, 6:8].argmax(-1)
-            committed_street = model_input[:, 14:16].gather(
-                1, actor[:, None]
-            ).squeeze(1)
+            committed_street = (
+                model_input[:, 14:16].gather(1, actor[:, None]).squeeze(1)
+            )
             facing = model_input[:, 24].float() > committed_street + 1.0e-6
             forced = torch.stack(
                 (
@@ -901,20 +867,17 @@ class _EndToEndPokerModel(nn.Module):
                 -1,
             )
             type_logits = (
-                forced[:, None].expand(-1, self.hands, -1)
-                + 0.001 * type_logits
+                forced[:, None].expand(-1, self.hands, -1) + 0.001 * type_logits
             )
         return ModelEvaluation(
             MappingProxyType(
                 {
                     "type_logits": type_logits + public[:, None] * 0.01,
-                    "omega": torch.softmax(self.omega, -1)[None].expand(
+                    "omega": torch.softmax(self.omega, -1)[None].expand(batch, -1, -1),
+                    "mu": torch.sigmoid(self.mu)[None].expand(batch, -1, -1),
+                    "s": (torch.nn.functional.softplus(self.scale) + 0.02)[None].expand(
                         batch, -1, -1
                     ),
-                    "mu": torch.sigmoid(self.mu)[None].expand(batch, -1, -1),
-                    "s": (
-                        torch.nn.functional.softplus(self.scale) + 0.02
-                    )[None].expand(batch, -1, -1),
                     "iota": torch.sigmoid(self.iota)[None].expand(batch, -1),
                 }
             ),
@@ -940,12 +903,8 @@ def test_complete_poker_iteration_runs_roots_to_optimizer() -> None:
             device,
         )
     )
-    model = _EndToEndPokerModel(
-        device, geometry.private_hands, check_down=True
-    )
-    optimizer = DenseAdam(
-        model, OptimizerConfig(name="adamw", grad_clip=5.0)
-    )
+    model = _EndToEndPokerModel(device, geometry.private_hands, check_down=True)
+    optimizer = DenseAdam(model, OptimizerConfig(name="adamw", grad_clip=5.0))
     run_state = RunState("phase5-e2e", root_count=1)
     result = EngineDrivenSequentialAttempt(
         geometry=geometry,
@@ -954,7 +913,7 @@ def test_complete_poker_iteration_runs_roots_to_optimizer() -> None:
         model=model,
         model_operation=model.evaluate,
         optimizer=optimizer,
-        loss=LossConfig(reference_kl_coefficient=0.0),
+        loss=LossConfig(),
         schedule=LearnerSchedule(batch_size=1),
         generator=torch.Generator(device=device).manual_seed(991),
         seed=991,
@@ -1011,8 +970,7 @@ def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
     )
     model.configure_execution("sdpa")
     assert all(
-        attention.attention_backend == "sdpa"
-        and attention.query_chunk_size is None
+        attention.attention_backend == "sdpa" and attention.query_chunk_size is None
         for attention in (
             *model.preflop.attentions,
             *model.postflop.attentions,
@@ -1034,9 +992,7 @@ def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
     )
     manifest = replace(
         _phase5_manifest(device),
-        geometry=ExecutionGeometry(
-            2, 15, token_bound, token_bound * token_bound
-        ),
+        geometry=ExecutionGeometry(2, 15, token_bound, token_bound * token_bound),
         topology_cap=16,
         topology_edge_cap=16,
         topology_packet_cap=16,
@@ -1096,9 +1052,7 @@ def test_end_to_end_overflow_exposes_no_failed_attempt_rows() -> None:
             device,
         )
     )
-    model = _EndToEndPokerModel(
-        device, geometry.private_hands, check_down=True
-    )
+    model = _EndToEndPokerModel(device, geometry.private_hands, check_down=True)
     run_state = RunState("phase5-overflow", root_count=1)
     with pytest.raises(RecoverableOverflow) as raised:
         EngineDrivenSequentialAttempt(
@@ -1144,9 +1098,7 @@ def test_end_to_end_overflow_rebuilds_and_retries_at_lower_roots() -> None:
         _phase5_layout(),
         device,
     )
-    model = _EndToEndPokerModel(
-        device, geometry.private_hands, check_down=True
-    )
+    model = _EndToEndPokerModel(device, geometry.private_hands, check_down=True)
     run_state = RunState("phase5-retry", root_count=2)
     with pytest.warns(RuntimeWarning, match="RECOVERED_SEQUENTIAL_OVERFLOW"):
         result = SequentialRecoveryHarness(
@@ -1218,9 +1170,7 @@ def test_end_to_end_overflow_rejects_retry_capacity_drift() -> None:
         device,
     )
     attempts = iter((plan, drifted))
-    model = _EndToEndPokerModel(
-        device, geometry.private_hands, check_down=True
-    )
+    model = _EndToEndPokerModel(device, geometry.private_hands, check_down=True)
     run_state = RunState("phase5-cap-drift", root_count=2)
     with (
         pytest.warns(RuntimeWarning, match="RECOVERED_SEQUENTIAL_OVERFLOW"),
@@ -1307,9 +1257,7 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
                 "action": torch.full(
                     (rows,), CHECK_CALL, dtype=torch.int32, device=device
                 ),
-                "old_log_policy": torch.full(
-                    (rows, 1), -math.log(4), device=device
-                ),
+                "old_log_policy": torch.full((rows, 1), -math.log(4), device=device),
             },
         )
     owners.bind_empty_layer_work_for_abort()
@@ -1348,9 +1296,9 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
             owners.slab("ActionTarget", partition),
             rows,
             {
-                "advantage_target": torch.linspace(
-                    0.3, 1.1, rows, device=device
-                )[:, None]
+                "advantage_target": torch.linspace(0.3, 1.1, rows, device=device)[
+                    :, None
+                ]
             },
         )
     owners.release_after(ExecutionPhase.TARGETS)
@@ -1377,7 +1325,7 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
     assert all(0 < batch.rows <= 3 for batch in cost_batches)
     mixed_sampler = SequentialBatchSampler.from_costs(
         stores,
-        LearnerSchedule(batch_size=4, gradient_steps=2),
+        LearnerSchedule(batch_size=4, epochs=None, gradient_steps=2),
         generator=torch.Generator(device=device).manual_seed(885),
         mass=torch.tensor([3.0, 1.0]),
         variance=torch.ones(2),
@@ -1388,13 +1336,11 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
     mixed_result = LearnerIteration(
         learner=LearnerOperation(
             mode,
-            LossConfig(reference_kl_coefficient=0.0),
+            LossConfig(),
             mixed_model.evaluate,
             _LearnerPolicy(),
         ),
-        optimizer=DenseAdam(
-            mixed_model, OptimizerConfig(grad_clip=5.0)
-        ),
+        optimizer=DenseAdam(mixed_model, OptimizerConfig(grad_clip=5.0)),
         physical_batch_cap={"pre": 2, "post_2": 1},
     ).optimize(mixed_sampler, iteration=0)
     assert mixed_result.statistical_presentations == 8
@@ -1410,7 +1356,7 @@ def test_aligned_five_array_batches_and_complete_optimizer_iteration() -> None:
     optimizer = DenseAdam(model, OptimizerConfig(grad_clip=5.0))
     learner = LearnerOperation(
         mode,
-        LossConfig(reference_kl_coefficient=0.0),
+        LossConfig(),
         model.evaluate,
         _LearnerPolicy(),
     )
@@ -1551,17 +1497,11 @@ def test_admitted_and_uncached_reference_paths_have_identical_updates() -> None:
                 device=device,
             ),
             "owner": torch.tensor([0, 1, 0], dtype=torch.int32, device=device),
-            "action": torch.full(
-                (rows,), CHECK_CALL, dtype=torch.int32, device=device
-            ),
-            "old_log_policy": torch.full(
-                (rows, 1), -math.log(4), device=device
-            ),
+            "action": torch.full((rows,), CHECK_CALL, dtype=torch.int32, device=device),
+            "old_log_policy": torch.full((rows, 1), -math.log(4), device=device),
             "old_value": torch.zeros(rows, 1, device=device),
             "value_target": torch.linspace(-0.5, 0.5, rows, device=device)[:, None],
-            "advantage_target": torch.linspace(
-                0.2, 0.8, rows, device=device
-            )[:, None],
+            "advantage_target": torch.linspace(0.2, 0.8, rows, device=device)[:, None],
         }
     )
     batch = SequentialLearnerBatch(
@@ -1665,7 +1605,9 @@ def test_checkpoint_resume_is_strict_and_execution_drift_is_allowed(
         expected_execution_config=execution_manifest,
         generator=generator,
     )
-    torch.testing.assert_close(model.weight, torch.tensor([0.4, -0.8, 1.2], device=device))
+    torch.testing.assert_close(
+        model.weight, torch.tensor([0.4, -0.8, 1.2], device=device)
+    )
     torch.testing.assert_close(optimizer.exp_avg, torch.full((3,), 0.3, device=device))
     assert resumed.recovered_overflow and resumed.iteration == 6
     assert reference_state.interval_iterations == 3
@@ -1681,7 +1623,6 @@ def test_checkpoint_resume_is_strict_and_execution_drift_is_allowed(
             expected_execution_config=execution_manifest,
             generator=generator,
         )
-
 
 
 def test_runtime_scientific_product_has_no_legacy_mapping_parser() -> None:

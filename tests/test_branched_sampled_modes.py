@@ -37,6 +37,7 @@ from pbg.core.contracts import mode_schema
 from pbg.core.execution_manifest import seal_execution_manifest
 from pbg.core.iteration import IterationEngine, LaneContext
 from pbg.core.learner import (
+    BranchingLossConfig,
     LearnerSchedule,
     LossConfig,
     ModelEvaluation,
@@ -108,14 +109,13 @@ class _BranchedModel(_EndToEndPokerModel):
             ),
         )
 
+
 def _manifest(
     device: torch.device,
     geometry: NLHEGeometry | None = None,
 ) -> CapacityManifest:
     geometry = NLHEGeometry(2, 8.0, 4) if geometry is None else geometry
-    inputs = tuple(
-        item.name for item in sampled_partitions(geometry).inputs
-    )
+    inputs = tuple(item.name for item in sampled_partitions(geometry).inputs)
     return CapacityManifest(
         geometry=ExecutionGeometry(
             geometry.players,
@@ -126,18 +126,16 @@ def _manifest(
         root_count=1,
         n_replica=1,
         beta_max=2,
-        player_node_cap=tuple(
-            PartitionRows(name, 1024) for name in inputs
-        ),
-        trained_player_cap=tuple(
-            PartitionRows(name, 1024) for name in inputs
-        ),
-        action_cap=(
-            PartitionRows("all", 2048 * max(1, geometry.players - 1)),
-        ),
+        player_node_cap=tuple(PartitionRows(name, 1024) for name in inputs),
+        trained_player_cap=tuple(PartitionRows(name, 1024) for name in inputs),
+        action_cap=(PartitionRows("all", 2048 * max(1, geometry.players - 1)),),
         folded_range_cap=(
-            PartitionRows("pre", 0 if geometry.players == 2 else 1024),
-            PartitionRows("post", 0 if geometry.players == 2 else 1024),
+            ()
+            if geometry.players == 2
+            else (
+                PartitionRows("pre", 1024),
+                PartitionRows("post", 1024),
+            )
         ),
         leaf_cap=1024,
         topology_cap=1024,
@@ -168,14 +166,15 @@ def _phase7_layout(geometry: NLHEGeometry):
 
 def _scientific_config(regime: str, rollout: str) -> dict[str, object]:
     value = yaml.safe_load(
-        (Path(__file__).parents[1] / "configs/train/nlhe_hu_8bb_normal_smoke.yaml")
-        .read_text(encoding="utf-8")
+        (
+            Path(__file__).parents[1] / "configs/train/nlhe_hu_8bb_normal_smoke.yaml"
+        ).read_text(encoding="utf-8")
     )
     scientific = value["scientific"]
     scientific["mode"] = {
-            "training_regime": regime,
-            "rollout_mode": rollout,
-            "private_estimator": "sampled",
+        "training_regime": regime,
+        "rollout_mode": rollout,
+        "private_estimator": "sampled",
     }
     scientific["objective"]["branching"] = {
         "trace_coefficient": 0.1,
@@ -183,14 +182,14 @@ def _scientific_config(regime: str, rollout: str) -> dict[str, object]:
         "trace_epsilon": 1.0e-6,
     }
     scientific["branching"] = {
-            "fixed_beta": {"player": 1.5, "chance": 1.25},
-            "beta_max": 3,
-            "minimum_tree_size": 16,
-            "cost_safeguard": {
-                "gamma_deviance_max": 0.2,
-                "p95_underprediction_max": 1.5,
-                "consecutive_iterations": 4,
-            },
+        "fixed_beta": {"player": 1.5, "chance": 1.25},
+        "beta_max": 3,
+        "minimum_tree_size": 16,
+        "cost_safeguard": {
+            "gamma_deviance_max": 0.2,
+            "p95_underprediction_max": 1.5,
+            "consecutive_iterations": 4,
+        },
     }
     value["run"]["workload"]["tree_nodes"] = 512
     value["run"]["recovery"] = {
@@ -199,13 +198,13 @@ def _scientific_config(regime: str, rollout: str) -> dict[str, object]:
     }
     if rollout == "branched.KKT":
         scientific["branching"]["kkt"] = {
-                "warmup_iterations": 5,
-                "target_tree_size": 256.0,
-                "gamma_kappa": 0.2,
-                "eta_kappa": 0.2,
-                "kappa_min": 0.25,
-                "kappa_max": 4.0,
-                "log_kappa": 0.0,
+            "warmup_iterations": 5,
+            "target_tree_size": 256.0,
+            "gamma_kappa": 0.2,
+            "eta_kappa": 0.2,
+            "kappa_min": 0.25,
+            "kappa_max": 4.0,
+            "log_kappa": 0.0,
         }
     if regime == "best_response":
         scientific["response_initialization"] = "target"
@@ -332,14 +331,10 @@ def test_phase7_admission_covers_fixed_and_full_decision_workspaces() -> None:
         device,
     )
     assert (
-        self_plan.admission(
-            ExecutionPhase.LEARNER
-        ).bounded_workspace_bytes
+        self_plan.admission(ExecutionPhase.LEARNER).bounded_workspace_bytes
         == manifest.learner_workspace_bytes
     )
-    self_rollout = self_plan.admission(
-        ExecutionPhase.ROLLOUT
-    ).bounded_workspace_bytes
+    self_rollout = self_plan.admission(ExecutionPhase.ROLLOUT).bounded_workspace_bytes
     response_rollout = response_plan.admission(
         ExecutionPhase.ROLLOUT
     ).bounded_workspace_bytes
@@ -352,9 +347,7 @@ def test_phase7_admission_covers_fixed_and_full_decision_workspaces() -> None:
         BranchedRecoveryHarness(
             owner_factory=lambda: GeneratedOwners(self_plan),
             plan=self_plan,
-            controller=FixedBranchController(
-                {"player": 1.0, "chance": 1.0}, 2
-            ),
+            controller=FixedBranchController({"player": 1.0, "chance": 1.0}, 2),
             run_state=RunState("phase7-root-bound", root_count=2),
             arguments={},
         )
@@ -369,9 +362,7 @@ def test_phase7_admission_covers_fixed_and_full_decision_workspaces() -> None:
         BranchedRecoveryHarness(
             owner_factory=lambda: GeneratedOwners(two_root_plan),
             plan=two_root_plan,
-            controller=FixedBranchController(
-                {"player": 1.0, "chance": 1.0}, 2
-            ),
+            controller=FixedBranchController({"player": 1.0, "chance": 1.0}, 2),
             run_state=RunState("phase7-root-exact", root_count=1),
             arguments={},
         )
@@ -545,9 +536,7 @@ def test_fixed_and_kkt_share_decision_contract_and_round_the_root() -> None:
         schema=mode_schema("self_play", "branched.fixed", "sampled"),
         **{
             **common,
-            "owner_is_player": torch.zeros_like(
-                common["owner_is_player"]
-            ),
+            "owner_is_player": torch.zeros_like(common["owner_is_player"]),
             "trace": None,
             "cost": None,
         },
@@ -589,9 +578,7 @@ def test_fixed_and_kkt_share_decision_contract_and_round_the_root() -> None:
         schema=mode_schema("self_play", "branched.KKT", "sampled"),
         **{
             **common,
-            "owner_is_player": torch.zeros_like(
-                common["owner_is_player"]
-            ),
+            "owner_is_player": torch.zeros_like(common["owner_is_player"]),
             "trace": None,
             "cost": None,
         },
@@ -984,18 +971,15 @@ def test_full_branched_iteration_is_family_pack_invariant() -> None:
                 OptimizerConfig(name="adamw", grad_clip=5),
             ),
             loss=LossConfig(
-                reference_kl_coefficient=0,
-                trace_coefficient=0.1,
-                cost_coefficient=0.1,
+                branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
             ),
-            schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+            schedule=LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
             generator=torch.Generator(device=device).manual_seed(991),
             seed=991,
             lambda_=0.95,
         ).run(iteration=0)
         return result, {
-            name: value.detach().clone()
-            for name, value in model.state_dict().items()
+            name: value.detach().clone() for name, value in model.state_dict().items()
         }
 
     narrow, narrow_state = execute(1)
@@ -1056,11 +1040,9 @@ def test_multi_pack_roots_use_complete_frontier_cost_forecast() -> None:
             OptimizerConfig(name="adamw", grad_clip=5),
         ),
         loss=LossConfig(
-            reference_kl_coefficient=0,
-            trace_coefficient=0.1,
-            cost_coefficient=0.1,
+            branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
         ),
-        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        schedule=LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
         generator=torch.Generator(device=device).manual_seed(991),
         seed=991,
         lambda_=0.95,
@@ -1082,12 +1064,12 @@ def test_kkt_feedback_is_invariant_to_root_batching() -> None:
         plan = build_storage_plan(
             mode,
             sampled_partitions(geometry),
-                replace(
-                    _manifest(device),
-                    root_count=root_count,
-                    beta_max=1,
-                    family_pack_cap=1,
-                ),
+            replace(
+                _manifest(device),
+                root_count=root_count,
+                beta_max=1,
+                family_pack_cap=1,
+            ),
             replace(_phase7_layout(geometry), player_count=2),
             device,
         )
@@ -1115,11 +1097,9 @@ def test_kkt_feedback_is_invariant_to_root_batching() -> None:
                 OptimizerConfig(name="adamw", grad_clip=5),
             ),
             loss=LossConfig(
-                reference_kl_coefficient=0,
-                trace_coefficient=0.1,
-                cost_coefficient=0.1,
+                branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
             ),
-            schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+            schedule=LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
             generator=torch.Generator(device=device).manual_seed(991),
             seed=991,
             lambda_=0.95,
@@ -1168,18 +1148,15 @@ def test_ragged_statistical_work_subdivides_by_action_cap() -> None:
                 OptimizerConfig(name="adamw", grad_clip=5),
             ),
             loss=LossConfig(
-                reference_kl_coefficient=0,
-                trace_coefficient=0.1,
-                cost_coefficient=0.1,
+                branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
             ),
-            schedule=LearnerSchedule(batch_size=8, gradient_steps=1),
+            schedule=LearnerSchedule(batch_size=8, epochs=None, gradient_steps=1),
             generator=torch.Generator(device=device).manual_seed(991),
             seed=991,
             lambda_=0.95,
         ).run(iteration=0)
         return result, {
-            name: value.detach().clone()
-            for name, value in model.state_dict().items()
+            name: value.detach().clone() for name, value in model.state_dict().items()
         }
 
     narrow, narrow_state = execute(2)
@@ -1252,11 +1229,9 @@ def test_four_sampled_branched_modes_complete_optimizer_step(
             "frozen_operation": None if frozen is None else frozen.evaluate,
             "optimizer": optimizer,
             "loss": LossConfig(
-                reference_kl_coefficient=0,
-                trace_coefficient=0.1,
-                cost_coefficient=0.1,
+                branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
             ),
-            "schedule": LearnerSchedule(batch_size=2, gradient_steps=1),
+            "schedule": LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
             "generator": torch.Generator(device=device).manual_seed(991),
             "seed": 991,
             "lambda_": 0.95,
@@ -1297,9 +1272,7 @@ def test_best_response_rollout_selects_one_model_per_role_subspan() -> None:
         def evaluate(self, input_type, model_input, private, owner):
             if not torch.is_grad_enabled():
                 self.rollout_owners.append(owner.detach().clone())
-            return super().evaluate(
-                input_type, model_input, private, owner
-            )
+            return super().evaluate(input_type, model_input, private, owner)
 
     learned = RoleRecordingModel()
     frozen = RoleRecordingModel()
@@ -1307,9 +1280,7 @@ def test_best_response_rollout_selects_one_model_per_role_subspan() -> None:
         geometry=geometry,
         owners=GeneratedOwners(plan),
         mode=mode,
-        controller=FixedBranchController(
-            {"player": 1.0, "chance": 1.0}, 2
-        ),
+        controller=FixedBranchController({"player": 1.0, "chance": 1.0}, 2),
         model=learned,
         model_operation=learned.evaluate,
         frozen_operation=frozen.evaluate,
@@ -1318,23 +1289,17 @@ def test_best_response_rollout_selects_one_model_per_role_subspan() -> None:
             OptimizerConfig(name="adamw", grad_clip=5),
         ),
         loss=LossConfig(
-            reference_kl_coefficient=0,
-            trace_coefficient=0.1,
-            cost_coefficient=0.1,
+            branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
         ),
-        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        schedule=LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
         generator=torch.Generator(device=device).manual_seed(701),
         seed=701,
         lambda_=0.95,
     ).run(iteration=0)
     assert learned.rollout_owners
     assert frozen.rollout_owners
-    assert all(
-        bool(owner.eq(0).all()) for owner in learned.rollout_owners
-    )
-    assert all(
-        bool(owner.eq(1).all()) for owner in frozen.rollout_owners
-    )
+    assert all(bool(owner.eq(0).all()) for owner in learned.rollout_owners)
+    assert all(bool(owner.eq(1).all()) for owner in frozen.rollout_owners)
 
 
 @CUDA
@@ -1378,9 +1343,7 @@ def test_multiplayer_best_response_root_uses_frozen_opponent_model() -> None:
         geometry=geometry,
         owners=GeneratedOwners(plan),
         mode=mode,
-        controller=FixedBranchController(
-            {"player": 1.0, "chance": 1.0}, 2
-        ),
+        controller=FixedBranchController({"player": 1.0, "chance": 1.0}, 2),
         model=learned,
         model_operation=learned.evaluate,
         frozen_operation=frozen.evaluate,
@@ -1389,11 +1352,9 @@ def test_multiplayer_best_response_root_uses_frozen_opponent_model() -> None:
             OptimizerConfig(name="adamw", grad_clip=5),
         ),
         loss=LossConfig(
-            reference_kl_coefficient=0,
-            trace_coefficient=0.1,
-            cost_coefficient=0.1,
+            branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
         ),
-        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        schedule=LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
         generator=torch.Generator(device=device).manual_seed(703),
         seed=703,
         lambda_=0.95,
@@ -1468,9 +1429,7 @@ def test_branched_allocator_and_reference_cache_controls_are_wired() -> None:
         geometry=geometry,
         owners=GeneratedOwners(plan),
         mode=mode,
-        controller=FixedBranchController(
-            {"player": 2.0, "chance": 1.0}, 2
-        ),
+        controller=FixedBranchController({"player": 2.0, "chance": 1.0}, 2),
         model=model,
         model_operation=model.evaluate,
         reference_operation=reference.evaluate,
@@ -1487,10 +1446,9 @@ def test_branched_allocator_and_reference_cache_controls_are_wired() -> None:
         ),
         loss=LossConfig(
             reference_kl_coefficient=0.1,
-            trace_coefficient=0.1,
-            cost_coefficient=0.1,
+            branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
         ),
-        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        schedule=LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
         generator=torch.Generator(device=device).manual_seed(709),
         seed=709,
         lambda_=0.95,
@@ -1544,9 +1502,7 @@ def test_three_player_nonterminal_fold_seals_branched_summary() -> None:
                         .shape[-1]
                         == geometry.private_classes
                     )
-                    state = PokerStateMachine(
-                        geometry
-                    ).state_from_model_input(
+                    state = PokerStateMachine(geometry).state_from_model_input(
                         "pre", model_input, private
                     )
                     torch._assert_async(
@@ -1559,18 +1515,14 @@ def test_three_player_nonterminal_fold_seals_branched_summary() -> None:
                         "nonterminal postflop fold omitted its sealed summary",
                     )
                 self.sealed_fold_seen = True
-            return super().evaluate(
-                input_type, model_input, private, owner
-            )
+            return super().evaluate(input_type, model_input, private, owner)
 
     model = FoldCheckingModel()
     result = EngineDrivenBranchedAttempt(
         geometry=geometry,
         owners=GeneratedOwners(plan),
         mode=mode,
-        controller=FixedBranchController(
-            {"player": 1.0, "chance": 1.0}, 2
-        ),
+        controller=FixedBranchController({"player": 1.0, "chance": 1.0}, 2),
         model=model,
         model_operation=model.evaluate,
         optimizer=DenseAdam(
@@ -1578,11 +1530,9 @@ def test_three_player_nonterminal_fold_seals_branched_summary() -> None:
             OptimizerConfig(name="adamw", grad_clip=5),
         ),
         loss=LossConfig(
-            reference_kl_coefficient=0,
-            trace_coefficient=0.1,
-            cost_coefficient=0.1,
+            branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
         ),
-        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        schedule=LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
         generator=torch.Generator(device=device).manual_seed(607),
         seed=607,
         lambda_=0.95,
@@ -1624,11 +1574,9 @@ def test_chance_branching_and_protected_root_refill_complete_targets(
         model_operation=model.evaluate,
         optimizer=optimizer,
         loss=LossConfig(
-            reference_kl_coefficient=0,
-            trace_coefficient=0.1,
-            cost_coefficient=0.1,
+            branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
         ),
-        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        schedule=LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
         generator=torch.Generator(device=device).manual_seed(123),
         seed=123,
         lambda_=0.95,

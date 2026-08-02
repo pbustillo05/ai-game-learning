@@ -30,6 +30,8 @@ from pbg.core.contracts import mode_schema
 from pbg.core.execution_manifest import seal_execution_manifest
 from pbg.core.iteration import IterationBatchResult
 from pbg.core.learner import (
+    BranchingLossConfig,
+    EntropyLossConfig,
     LearnerDTypes,
     LearnerOperation,
     LearnerSchedule,
@@ -38,6 +40,7 @@ from pbg.core.learner import (
     ModelEvaluation,
     PolicyEvaluation,
     SequentialLearnerBatch,
+    ValueLossConfig,
 )
 from pbg.core.optimization import DenseAdam, LossScaler, OptimizerConfig
 from pbg.core.persistence import (
@@ -134,9 +137,7 @@ class ReplicaLearnerScheduler:
             active_lanes=lanes,
             optimizer_steps=steps,
             failures=MappingProxyType(failures),
-            versions=tuple(
-                int(value) for value in self.optimizers.versions.tolist()
-            ),
+            versions=tuple(int(value) for value in self.optimizers.versions.tolist()),
         )
 
 
@@ -323,9 +324,7 @@ def _modules(count: int) -> list[_Toy]:
     return [_Toy(100 + lane).cuda() for lane in range(count)]
 
 
-def _poker_manifest(
-    device: torch.device, *, n_replica: int
-) -> CapacityManifest:
+def _poker_manifest(device: torch.device, *, n_replica: int) -> CapacityManifest:
     return CapacityManifest(
         geometry=ExecutionGeometry(2, 15, 64, 4096),
         root_count=1,
@@ -343,10 +342,7 @@ def _poker_manifest(
             PartitionRows("pre", 20),
             PartitionRows("post_2", 20),
         ),
-        folded_range_cap=(
-            PartitionRows("pre", 0),
-            PartitionRows("post", 0),
-        ),
+        folded_range_cap=(),
         leaf_cap=8,
         topology_cap=8 * n_replica,
         topology_edge_cap=8 * n_replica,
@@ -378,7 +374,6 @@ def _poker_layout(geometry: NLHEGeometry) -> PhysicalLayout:
         ),
         player_count=2,
         stratum_count=2,
-        evaluator_private_width=4,
         opaque_fields=(
             SoAField("leaf_public_state", torch.uint8, (5,), fill=255),
             SoAField("leaf_private_profile", torch.int32, (2,), fill=-1),
@@ -445,11 +440,7 @@ def _distributed_sum_worker(
                 yield SequentialLearnerBatch(
                     "pre",
                     torch.tensor([0], dtype=torch.int64, device=gradients.device),
-                    {
-                        "model_input": torch.ones(
-                            (1, 1), device=gradients.device
-                        )
-                    },
+                    {"model_input": torch.ones((1, 1), device=gradients.device)},
                 )
 
         class _AsymmetricLearner:
@@ -467,9 +458,7 @@ def _distributed_sum_worker(
         ):
             LearnerIteration(
                 learner=_AsymmetricLearner(),  # type: ignore[arg-type]
-                optimizer=optimizer_group.lane_stepper(
-                    0, distributed=synchronizer
-                ),  # type: ignore[arg-type]
+                optimizer=optimizer_group.lane_stepper(0, distributed=synchronizer),  # type: ignore[arg-type]
             ).optimize(_OneBatch(), iteration=0)  # type: ignore[arg-type]
         assert optimizer_group.versions.tolist() == [0]
     finally:
@@ -556,6 +545,8 @@ def test_poker_rollout_vmap_preserves_lane_weights_and_natural_labels() -> None:
     torch.testing.assert_close(actual.value, expected)
     assert actual.value.shape == (2, rows, geometry.private_classes)
     assert float(actual.value[0, 0, 0]) != float(actual.value[1, 0, 0])
+
+
 @CUDA
 def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
@@ -582,7 +573,7 @@ def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
         model=ordinary_model,
         model_operation=ordinary_model.learner_operation,
         optimizer=ordinary_optimizer,
-        loss=LossConfig(reference_kl_coefficient=0),
+        loss=LossConfig(),
         schedule=LearnerSchedule(batch_size=1),
         generator=torch.Generator(device=device).manual_seed(710),
         seed=710,
@@ -603,16 +594,12 @@ def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
             device,
         )
     )
-    modules = tuple(
-        inference.modules.lane_module(lane) for lane in range(2)
-    )
+    modules = tuple(inference.modules.lane_module(lane) for lane in range(2))
     generators = tuple(
-        torch.Generator(device=device).manual_seed(710 + lane)
-        for lane in range(2)
+        torch.Generator(device=device).manual_seed(710 + lane) for lane in range(2)
     )
     run_states = tuple(
-        RunState(f"real-replica-{lane}", root_count=1)
-        for lane in range(2)
+        RunState(f"real-replica-{lane}", root_count=1) for lane in range(2)
     )
     result = EngineDrivenSequentialAttempt(
         geometry=geometry,
@@ -621,7 +608,7 @@ def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
         model=modules[0],
         model_operation=modules[0].learner_operation,
         optimizer=optimizers.optimizers[0],
-        loss=LossConfig(reference_kl_coefficient=0),
+        loss=LossConfig(),
         schedule=LearnerSchedule(batch_size=1),
         generator=generators[0],
         seed=710,
@@ -630,9 +617,7 @@ def test_shared_owner_sequential_poker_runs_real_two_lane_transaction() -> None:
         replica_optimizers=optimizers,
         replica_generators=generators,
         replica_run_states=run_states,
-        replica_model_operations=tuple(
-            module.learner_operation for module in modules
-        ),
+        replica_model_operations=tuple(module.learner_operation for module in modules),
     ).run(iteration=0)
     assert isinstance(result, IterationBatchResult)
     assert result.failures == {}
@@ -682,9 +667,7 @@ def test_complete_sequential_transactions_isolate_every_replica_lane(
         inference.modules,
         OptimizerConfig(name="adamw", grad_clip=5.0),
     )
-    modules = tuple(
-        inference.modules.lane_module(lane) for lane in range(count)
-    )
+    modules = tuple(inference.modules.lane_module(lane) for lane in range(count))
     learner_calls = [0 for _ in range(count)]
 
     class _CountedLearner:
@@ -701,8 +684,7 @@ def test_complete_sequential_transactions_isolate_every_replica_lane(
         for lane, module in enumerate(modules)
     )
     generators = tuple(
-        torch.Generator(device=device).manual_seed(730 + lane)
-        for lane in range(count)
+        torch.Generator(device=device).manual_seed(730 + lane) for lane in range(count)
     )
     initial_rng = tuple(generator.get_state() for generator in generators)
     run_states = tuple(
@@ -724,7 +706,7 @@ def test_complete_sequential_transactions_isolate_every_replica_lane(
         model=modules[0],
         model_operation=learner_operations[0],
         optimizer=optimizers.optimizers[0],
-        loss=LossConfig(reference_kl_coefficient=0),
+        loss=LossConfig(),
         schedule=LearnerSchedule(batch_size=1),
         generator=generators[0],
         seed=730,
@@ -748,8 +730,7 @@ def test_complete_sequential_transactions_isolate_every_replica_lane(
     )
     assert len({bytes(value.cpu().tolist()) for value in final_rng}) == count
     assert all(
-        optimizers.gradients[lane].data_ptr()
-        != optimizers.gradients[other].data_ptr()
+        optimizers.gradients[lane].data_ptr() != optimizers.gradients[other].data_ptr()
         for lane in range(count)
         for other in range(lane)
     )
@@ -772,7 +753,9 @@ def test_shared_owner_branched_poker_preserves_fixed_kkt_lane_identity(
         if estimator == "rao_blackwell":
             return (
                 build_model_from_config(
-                    _branched_rb_config(selected_regime, "branched.fixed")["scientific"],
+                    _branched_rb_config(selected_regime, "branched.fixed")[
+                        "scientific"
+                    ],
                     device,
                 ),
                 build_model_from_config(
@@ -847,22 +830,18 @@ def test_shared_owner_branched_poker_preserves_fixed_kkt_lane_identity(
         optimizers=optimizers,
         losses=(
             LossConfig(
-                reference_kl_coefficient=0,
-                trace_coefficient=0.1,
-                cost_coefficient=0.1,
+                branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
             ),
         )
         * 2,
-        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
+        schedule=LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
         generators=tuple(
-            torch.Generator(device=device).manual_seed(900 + lane)
-            for lane in range(2)
+            torch.Generator(device=device).manual_seed(900 + lane) for lane in range(2)
         ),
         run_states=run_states,
         seed=900,
         lambda_=0.95,
         completion_samples=4 if estimator == "rao_blackwell" else 0,
-        posterior_max_attempts=16,
     ).run(iteration=0)
     assert result.failures == {}
     assert result.versions == (1, 1)
@@ -913,62 +892,57 @@ def test_branched_replica_learner_failure_aborts_before_any_lane_commit() -> Non
         RunState("branched-failed-lane", root_count=1),
     )
     generators = tuple(
-        torch.Generator(device=device).manual_seed(950 + lane)
-        for lane in range(2)
+        torch.Generator(device=device).manual_seed(950 + lane) for lane in range(2)
     )
     parameters_before = {
-        name: value.clone()
-        for name, value in inference.modules.parameters.items()
+        name: value.clone() for name, value in inference.modules.parameters.items()
     }
     buffers_before = {
-        name: value.clone()
-        for name, value in inference.modules.buffers.items()
+        name: value.clone() for name, value in inference.modules.buffers.items()
     }
     exp_avg_before = optimizers.exp_avg.clone()
     exp_avg_sq_before = optimizers.exp_avg_sq.clone()
-    steps_before = tuple(
-        optimizer.step_count for optimizer in optimizers.optimizers
-    )
+    steps_before = tuple(optimizer.step_count for optimizer in optimizers.optimizers)
     scalers_before = tuple(
         optimizer.scaler.state_dict() for optimizer in optimizers.optimizers
     )
     rng_before = tuple(generator.get_state() for generator in generators)
     with pytest.raises(RuntimeError, match="every transition was rolled back"):
         EngineDrivenReplicaBranchedAttempt(
-        geometry=geometry,
-        owners=GeneratedOwners(
-            build_storage_plan(
-                mode,
-                sampled_partitions(geometry),
-                replace(_branched_manifest(device), n_replica=2),
-                replace(_phase7_layout(geometry), player_count=2),
-                device,
-            )
-        ),
-        modes=(mode, mode),
-        controllers=(
-            FixedBranchController(
-                {"player": 1.0, "chance": 1.0},
-                2,
+            geometry=geometry,
+            owners=GeneratedOwners(
+                build_storage_plan(
+                    mode,
+                    sampled_partitions(geometry),
+                    replace(_branched_manifest(device), n_replica=2),
+                    replace(_phase7_layout(geometry), player_count=2),
+                    device,
+                )
             ),
-            FixedBranchController(
-                {"player": 1.0, "chance": 1.0},
-                2,
+            modes=(mode, mode),
+            controllers=(
+                FixedBranchController(
+                    {"player": 1.0, "chance": 1.0},
+                    2,
+                ),
+                FixedBranchController(
+                    {"player": 1.0, "chance": 1.0},
+                    2,
+                ),
             ),
-        ),
-        safeguards=(
-            CostSafeguardController(1.0, 10.0, 1),
-            CostSafeguardController(1.0, 10.0, 1),
-        ),
-        reference_operations=(None, None),
-        inference=inference,
-        optimizers=optimizers,
-        losses=(LossConfig(reference_kl_coefficient=0),) * 2,
-        schedule=LearnerSchedule(batch_size=2, gradient_steps=1),
-        generators=generators,
-        run_states=run_states,
-        seed=950,
-        lambda_=0.95,
+            safeguards=(
+                CostSafeguardController(1.0, 10.0, 1),
+                CostSafeguardController(1.0, 10.0, 1),
+            ),
+            reference_operations=(None, None),
+            inference=inference,
+            optimizers=optimizers,
+            losses=(LossConfig(branching=BranchingLossConfig(0.0, 0.0, 1.0e-6)),) * 2,
+            schedule=LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
+            generators=generators,
+            run_states=run_states,
+            seed=950,
+            lambda_=0.95,
         ).run(iteration=0)
     assert tuple(int(value) for value in optimizers.versions.tolist()) == (0, 0)
     assert tuple(state.iteration for state in run_states) == (0, 0)
@@ -980,12 +954,14 @@ def test_branched_replica_learner_failure_aborts_before_any_lane_commit() -> Non
         torch.testing.assert_close(inference.modules.buffers[name], expected)
     torch.testing.assert_close(optimizers.exp_avg, exp_avg_before)
     torch.testing.assert_close(optimizers.exp_avg_sq, exp_avg_sq_before)
-    assert tuple(
-        optimizer.step_count for optimizer in optimizers.optimizers
-    ) == steps_before
-    assert tuple(
-        optimizer.scaler.state_dict() for optimizer in optimizers.optimizers
-    ) == scalers_before
+    assert (
+        tuple(optimizer.step_count for optimizer in optimizers.optimizers)
+        == steps_before
+    )
+    assert (
+        tuple(optimizer.scaler.state_dict() for optimizer in optimizers.optimizers)
+        == scalers_before
+    )
     assert all(
         torch.equal(generator.get_state(), expected)
         for generator, expected in zip(generators, rng_before, strict=True)
@@ -1021,7 +997,7 @@ def test_replica_best_response_groups_compact_learned_and_frozen_rows() -> None:
         model=modules[0],
         model_operation=modules[0].learner_operation,
         optimizer=optimizers.optimizers[0],
-        loss=LossConfig(reference_kl_coefficient=0),
+        loss=LossConfig(),
         schedule=LearnerSchedule(batch_size=1),
         generator=torch.Generator(device=device).manual_seed(812),
         seed=812,
@@ -1031,16 +1007,12 @@ def test_replica_best_response_groups_compact_learned_and_frozen_rows() -> None:
         replica_frozen_inference=frozen,
         replica_optimizers=optimizers,
         replica_generators=tuple(
-            torch.Generator(device=device).manual_seed(812 + lane)
-            for lane in range(2)
+            torch.Generator(device=device).manual_seed(812 + lane) for lane in range(2)
         ),
         replica_run_states=tuple(
-            RunState(f"br-lane-{lane}", root_count=1)
-            for lane in range(2)
+            RunState(f"br-lane-{lane}", root_count=1) for lane in range(2)
         ),
-        replica_model_operations=tuple(
-            module.learner_operation for module in modules
-        ),
+        replica_model_operations=tuple(module.learner_operation for module in modules),
     )
 
     class _Observed:
@@ -1062,15 +1034,9 @@ def test_replica_best_response_groups_compact_learned_and_frozen_rows() -> None:
     model_input = torch.zeros(
         (2, rows, geometry.preflop_model_input_width), device=device
     )
-    private = torch.zeros(
-        (2, rows, geometry.players), dtype=torch.int32, device=device
-    )
-    owner = torch.tensor(
-        [[0, 1, 0], [1, 0, 1]], dtype=torch.uint8, device=device
-    )
-    role = torch.tensor(
-        [[0, 1, 1], [1, 1, 1]], dtype=torch.uint8, device=device
-    )
+    private = torch.zeros((2, rows, geometry.players), dtype=torch.int32, device=device)
+    owner = torch.tensor([[0, 1, 0], [1, 0, 1]], dtype=torch.uint8, device=device)
+    role = torch.tensor([[0, 1, 1], [1, 1, 1]], dtype=torch.uint8, device=device)
     observed = iteration.operations._model(
         0,
         PokerForwardInput(
@@ -1086,12 +1052,16 @@ def test_replica_best_response_groups_compact_learned_and_frozen_rows() -> None:
     assert frozen_calls.calls == [(2, 1)]
     expected = []
     for lane in range(2):
-        learned_value = learned_source[lane].rollout_operation(
-            "pre", model_input[lane], private[lane], owner[lane]
-        ).value
-        frozen_value = frozen_source[lane].rollout_operation(
-            "pre", model_input[lane], private[lane], owner[lane]
-        ).value
+        learned_value = (
+            learned_source[lane]
+            .rollout_operation("pre", model_input[lane], private[lane], owner[lane])
+            .value
+        )
+        frozen_value = (
+            frozen_source[lane]
+            .rollout_operation("pre", model_input[lane], private[lane], owner[lane])
+            .value
+        )
         expected.append(
             torch.where(
                 owner[lane].eq(role[lane])[:, None],
@@ -1099,9 +1069,7 @@ def test_replica_best_response_groups_compact_learned_and_frozen_rows() -> None:
                 frozen_value,
             )
         )
-    torch.testing.assert_close(
-        observed["value"], torch.stack(expected).flatten(0, 1)
-    )
+    torch.testing.assert_close(observed["value"], torch.stack(expected).flatten(0, 1))
 
 
 @CUDA
@@ -1118,10 +1086,7 @@ def test_one_lane_uses_the_ordinary_learner_graph_for_complete_run_parity() -> N
     scheduler = ReplicaLearnerScheduler(group)
     oracle_optimizer = DenseAdam(oracle, config)
     mode = mode_schema("self_play", "sequential", "sampled")
-    loss = LossConfig(
-        entropy_coefficient=0,
-        reference_kl_coefficient=0,
-    )
+    loss = LossConfig(entropy=EntropyLossConfig(coefficient=0))
     batch = _learner_batch()
     for iteration in range(3):
         result = scheduler.run_step(
@@ -1170,8 +1135,14 @@ def test_lane_local_loss_controls_preserve_independent_updates() -> None:
     mode = mode_schema("self_play", "sequential", "sampled")
     batch = _learner_batch()
     controls = (
-        LossConfig(value_coefficient=0, entropy_coefficient=0),
-        LossConfig(value_coefficient=2.0, entropy_coefficient=0),
+        LossConfig(
+            value=ValueLossConfig(coefficient=0),
+            entropy=EntropyLossConfig(coefficient=0),
+        ),
+        LossConfig(
+            value=ValueLossConfig(coefficient=2.0),
+            entropy=EntropyLossConfig(coefficient=0),
+        ),
     )
 
     def backward(lane: int, module: torch.nn.Module, optimizer: DenseAdam) -> None:
@@ -1231,9 +1202,7 @@ def test_zero_copy_lanes_use_one_dense_gradient_axis_and_dense_oracle(
     memory.assert_reconciled(owner, group)
     assert memory.gradient_bytes == 4 * owner.parameter_count * 4
     assert memory.optimizer_bytes == 2 * memory.gradient_bytes
-    assert memory.transaction_bytes == (
-        3 * memory.gradient_bytes + memory.buffer_bytes
-    )
+    assert memory.transaction_bytes == (3 * memory.gradient_bytes + memory.buffer_bytes)
     assert bool(group.gradients[1].eq(0).all())
     assert group.versions.tolist() == [1, 0, 1, 1]
     owner.assert_zero_copy()

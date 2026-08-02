@@ -110,7 +110,9 @@ class HardwareLimits:
         budget = _positive_int(self.usable_memory_bytes, "usable_memory_bytes")
         reserve = _nonnegative_int(self.reserve_bytes, "reserve_bytes")
         if budget + reserve > total:
-            raise CapacityError("usable memory plus reserve exceeds observed device memory")
+            raise CapacityError(
+                "usable memory plus reserve exceeds observed device memory"
+            )
 
 
 @dataclass(frozen=True)
@@ -120,7 +122,6 @@ class PhysicalLayout:
     model_input_shapes: tuple[NamedShape, ...]
     player_count: int
     stratum_count: int
-    evaluator_private_width: int
     reference_cache_bytes: int = 0
     field_alignment: int = 64
     model_dtype: torch.dtype = torch.float32
@@ -133,7 +134,6 @@ class PhysicalLayout:
         object.__setattr__(self, "model_input_shapes", shapes)
         _positive_int(self.player_count, "layout player_count")
         _positive_int(self.stratum_count, "stratum_count")
-        _positive_int(self.evaluator_private_width, "evaluator_private_width")
         _nonnegative_int(self.reference_cache_bytes, "reference_cache_bytes")
         if (
             isinstance(self.field_alignment, bool)
@@ -195,8 +195,10 @@ class CapacityManifest:
         _positive_int(self.beta_max, "beta_max")
         for name in CAPACITY_VOCABULARY.partitioned_rows:
             values = tuple(getattr(self, name))
-            if not values or len({item.name for item in values}) != len(values):
-                raise CapacityError(f"{name} must have unique nonempty partitions")
+            if (not values and name != "folded_range_cap") or len(
+                {item.name for item in values}
+            ) != len(values):
+                raise CapacityError(f"{name} must have unique applicable partitions")
             object.__setattr__(self, name, values)
         for name in (
             *CAPACITY_VOCABULARY.scalar_rows,
@@ -209,9 +211,8 @@ class CapacityManifest:
     def partition_rows(self, name: str) -> Mapping[str, int]:
         if name not in CAPACITY_VOCABULARY.partitioned_rows:
             raise KeyError(f"unknown partitioned capacity {name!r}")
-        return MappingProxyType(
-            {item.name: item.rows for item in getattr(self, name)}
-        )
+        return MappingProxyType({item.name: item.rows for item in getattr(self, name)})
+
 
 class ExecutionPhase(IntEnum):
     """Ordered allocation and last-consumer boundaries."""
@@ -393,14 +394,12 @@ def _field(
     if field_name == "payoff_baseline":
         return SoAField(field_name, torch.float32, (players,), alignment)
     if field_name == "stratum_amount":
-        return SoAField(
-            field_name, torch.float32, (layout.stratum_count,), alignment
-        )
+        return SoAField(field_name, torch.float32, (layout.stratum_count,), alignment)
     if field_name == "range_weights":
         return SoAField(
             field_name,
             torch.float32,
-            (players, layout.evaluator_private_width),
+            (players, max(item.width for item in partitions.outputs)),
             alignment,
         )
     if field_name == "seed":
@@ -420,17 +419,11 @@ def _field(
     ):
         return SoAField(field_name, torch.float32, (width,), alignment)
     if field_name in ("return_value", "mass", "moment"):
-        p_train = (
-            players if mode.training_regime is TrainingRegime.SELF_PLAY else 1
-        )
+        p_train = players if mode.training_regime is TrainingRegime.SELF_PLAY else 1
         # One row owns both fixed ping-pong arenas and every trained channel.
-        return SoAField(
-            field_name, torch.float32, (2, p_train, width), alignment
-        )
+        return SoAField(field_name, torch.float32, (2, p_train, width), alignment)
     if field_name == "trace_vector":
-        p_train = (
-            players if mode.training_regime is TrainingRegime.SELF_PLAY else 1
-        )
+        p_train = players if mode.training_regime is TrainingRegime.SELF_PLAY else 1
         return SoAField(field_name, torch.float32, (2, p_train), alignment)
     if field_name in (
         "path_mass",
@@ -518,11 +511,7 @@ def _validate_manifest(
     if layout.player_count != manifest.geometry.actor_count:
         raise CapacityError("physical layout and game geometry player counts differ")
     if set(layout.input_shapes) != {item.name for item in partitions.inputs}:
-        raise CapacityError(
-            "physical layout must cover every input partition exactly"
-        )
-    if layout.evaluator_private_width < max(item.width for item in partitions.outputs):
-        raise CapacityError("evaluator private width does not cover output domains")
+        raise CapacityError("physical layout must cover every input partition exactly")
     if mode.output_domain == "scalar" and (
         len(partitions.outputs) != 1 or partitions.outputs[0].width != 1
     ):
@@ -576,9 +565,7 @@ def _validate_manifest(
         raise CapacityError("leaf capacity does not cover root/branch geometry")
     if manifest.topology_cap < manifest.root_count:
         raise CapacityError("topology capacity does not cover distinguished roots")
-    if manifest.topology_edge_cap < max(
-        1, manifest.topology_cap - manifest.root_count
-    ):
+    if manifest.topology_edge_cap < max(1, manifest.topology_cap - manifest.root_count):
         raise CapacityError("topology edge capacity cannot connect its node bound")
     if geometry.actor_count == 2 and folded_rows != 0:
         raise CapacityError("heads-up folded-range capacity must be zero")
@@ -595,8 +582,7 @@ def _validate_manifest(
         "completion_pack_cap": manifest.leaf_cap,
         "learner_sigma_pack_cap": trained_rows,
         "learner_action_pack_cap": action_rows,
-        "topology_packet_cap": manifest.topology_cap
-        + manifest.topology_edge_cap,
+        "topology_packet_cap": manifest.topology_cap + manifest.topology_edge_cap,
     }
     for name, upper in pack_bounds.items():
         if getattr(manifest, name) > upper:
@@ -708,9 +694,7 @@ def build_storage_plan(
             configured_budget_bytes=manifest.hardware.usable_memory_bytes,
         )
         deferred_layer_work = (
-            ExecutionPhase.COMPLETION
-            <= phase
-            <= ExecutionPhase.TARGETS
+            ExecutionPhase.COMPLETION <= phase <= ExecutionPhase.TARGETS
         )
         deferred_bytes = (
             sum(
@@ -722,10 +706,7 @@ def build_storage_plan(
             if deferred_layer_work
             else 0
         )
-        if (
-            required - deferred_bytes
-            > manifest.hardware.usable_memory_bytes
-        ):
+        if required - deferred_bytes > manifest.hardware.usable_memory_bytes:
             raise AdmissionError(
                 f"{phase.name} non-deferred owners require "
                 f"{required - deferred_bytes} bytes but immutable budget is "
@@ -737,11 +718,7 @@ def build_storage_plan(
     peak_required = max(
         item.required_bytes
         for item in admissions
-        if not (
-            ExecutionPhase.COMPLETION
-            <= item.phase
-            <= ExecutionPhase.TARGETS
-        )
+        if not (ExecutionPhase.COMPLETION <= item.phase <= ExecutionPhase.TARGETS)
     )
     reserve = manifest.hardware.reserve_bytes
     if peak_required + reserve > int(free_bytes):
@@ -802,9 +779,7 @@ class GeneratedOwners:
 
     def __init__(self, plan: StoragePlan) -> None:
         self.plan = plan
-        self.failure_state = DeviceFailureState(
-            plan.manifest.n_replica, plan.device
-        )
+        self.failure_state = DeviceFailureState(plan.manifest.n_replica, plan.device)
         self._live: dict[OwnerKey, MonotoneSlab] = {}
         self._released: set[OwnerKey] = set()
         self._release_counts: dict[OwnerKey, int] = {}
@@ -816,9 +791,7 @@ class GeneratedOwners:
     @property
     def layer_work_is_bound(self) -> bool:
         expected = {
-            item.key
-            for item in self.plan.allocations
-            if item.key.owner == "LayerWork"
+            item.key for item in self.plan.allocations if item.key.owner == "LayerWork"
         }
         return expected == set(self._realized_capacities)
 
@@ -833,9 +806,8 @@ class GeneratedOwners:
             raise StorageError("LayerWork extents must bind during rollout sealing")
         if self.layer_work_is_bound:
             raise StorageError("LayerWork extents were already bound")
-        if (
-            len(arena_rows) != self.plan.manifest.n_replica
-            or any(len(rows) != len(output_names) for rows in arena_rows)
+        if len(arena_rows) != self.plan.manifest.n_replica or any(
+            len(rows) != len(output_names) for rows in arena_rows
         ):
             raise StorageError("LayerWork extents have invalid replica partitions")
         expected_names = tuple(item.name for item in self.plan.partitions.outputs)
@@ -871,9 +843,7 @@ class GeneratedOwners:
         self.bind_layer_work(output_names, arena_rows)
 
     def _allocation_capacity(self, allocation: OwnerAllocation) -> int:
-        return self._realized_capacities.get(
-            allocation.key, allocation.capacity
-        )
+        return self._realized_capacities.get(allocation.key, allocation.capacity)
 
     def _allocation_bytes(self, allocation: OwnerAllocation) -> int:
         capacity = self._allocation_capacity(allocation)
@@ -922,8 +892,7 @@ class GeneratedOwners:
         """All sanctioned live retained owners in stable allocation order."""
 
         return tuple(
-            self._live[key]
-            for key in sorted(self._live, key=lambda item: item.label)
+            self._live[key] for key in sorted(self._live, key=lambda item: item.label)
         )
 
     def enter_phase(
@@ -951,10 +920,7 @@ class GeneratedOwners:
                     "have not been explicitly released"
                 )
 
-        if (
-            phase is ExecutionPhase.COMPLETION
-            and not self.layer_work_is_bound
-        ):
+        if phase is ExecutionPhase.COMPLETION and not self.layer_work_is_bound:
             raise StorageError(
                 "LayerWork exact extents must be bound before completion"
             )
@@ -992,9 +958,7 @@ class GeneratedOwners:
                     self.plan.device,
                     failure_state=self.failure_state,
                     label=allocation.key.label,
-                    allow_empty=(
-                        allocation.key.owner in {"LayerWork", "FoldedRanges"}
-                    ),
+                    allow_empty=(allocation.key.owner in {"LayerWork", "FoldedRanges"}),
                 )
                 created.append(allocation.key)
         except BaseException:
@@ -1016,15 +980,15 @@ class GeneratedOwners:
         if phase is not self._entered_phase:
             raise StorageError("release boundary must match the entered phase")
         due = tuple(
-            item.key
-            for item in self.plan.allocations
-            if item.last_consumer is phase
+            item.key for item in self.plan.allocations if item.last_consumer is phase
         )
         for key in due:
             try:
                 slab = self._live.pop(key)
             except KeyError as exc:
-                raise StorageError(f"{key.label} was not live at last consumer") from exc
+                raise StorageError(
+                    f"{key.label} was not live at last consumer"
+                ) from exc
             slab.release()
             self._released.add(key)
             self._release_counts[key] = self._release_counts.get(key, 0) + 1

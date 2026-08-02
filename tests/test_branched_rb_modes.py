@@ -16,6 +16,7 @@ from pbg.core.capacity import GeneratedOwners, PartitionRows, build_storage_plan
 from pbg.core.contracts import mode_schema
 from pbg.core.iteration import IterationTelemetry
 from pbg.core.learner import (
+    BranchingLossConfig,
     LearnerSchedule,
     LossConfig,
 )
@@ -32,6 +33,7 @@ from pbg.games.poker.queued.hooks import (
 )
 from pbg.games.poker.queued.model import build_model_from_config
 from pbg.games.poker.queued.rb_sampling import (
+    POSTERIOR_MAX_ATTEMPTS,
     CollisionConditionedProfileSampler,
     RejectionObservation,
 )
@@ -42,9 +44,7 @@ from tests.test_branched_sampled_modes import (
     _scientific_config,
 )
 
-CUDA = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Phase 8 requires CUDA"
-)
+CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase 8 requires CUDA")
 
 
 def _config(regime: str, rollout: str) -> dict[str, object]:
@@ -74,18 +74,13 @@ def _plan(
     )
     layout = replace(
         _phase7_layout(geometry),
-        evaluator_private_width=geometry.private_hands,
     )
-    return build_storage_plan(
-        mode, partitions, manifest, layout, device
-    )
+    return build_storage_plan(mode, partitions, manifest, layout, device)
 
 
 @pytest.mark.parametrize("regime", ("self_play", "best_response"))
 @pytest.mark.parametrize("rollout", ("branched.fixed", "branched.KKT"))
-def test_phase8_config_closes_all_four_rb_modes(
-    regime: str, rollout: str
-) -> None:
+def test_phase8_config_closes_all_four_rb_modes(regime: str, rollout: str) -> None:
     value = _config(regime, rollout)
     configured = load_config_mapping(value).scientific
     assert isinstance(configured, BranchedModeConfig)
@@ -97,22 +92,17 @@ def test_phase8_config_closes_all_four_rb_modes(
         load_config_mapping(missing)
 
 
-
 @CUDA
 def test_collision_sampler_reuses_child_zero_and_is_subdivision_invariant() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 4)
-    sampler = CollisionConditionedProfileSampler(
-        geometry, max_attempts=16
-    )
+    sampler = CollisionConditionedProfileSampler(geometry, max_attempts=16)
     weights = torch.ones(
         (2, 2, geometry.private_hands),
         dtype=torch.float32,
         device=device,
     )
-    board = torch.full(
-        (2, 5), 255, dtype=torch.uint8, device=device
-    )
+    board = torch.full((2, 5), 255, dtype=torch.uint8, device=device)
     first = geometry.first_card
     inherited_cards = torch.tensor(
         (
@@ -122,22 +112,12 @@ def test_collision_sampler_reuses_child_zero_and_is_subdivision_invariant() -> N
         dtype=torch.int64,
         device=device,
     )
-    inherited = geometry.combo_id(
-        inherited_cards[..., 0], inherited_cards[..., 1]
-    )
-    source = torch.tensor(
-        (0, 0, 1, 1), dtype=torch.int64, device=device
-    )
-    ordinal = torch.tensor(
-        (0, 1, 0, 1), dtype=torch.int64, device=device
-    )
+    inherited = geometry.combo_id(inherited_cards[..., 0], inherited_cards[..., 1])
+    source = torch.tensor((0, 0, 1, 1), dtype=torch.int64, device=device)
+    ordinal = torch.tensor((0, 1, 0, 1), dtype=torch.int64, device=device)
     active = torch.ones(4, dtype=torch.bool, device=device)
-    root = torch.tensor(
-        (5, 5, 6, 6), dtype=torch.int64, device=device
-    )
-    path = torch.tensor(
-        (11, 12, 21, 22), dtype=torch.int64, device=device
-    )
+    root = torch.tensor((5, 5, 6, 6), dtype=torch.int64, device=device)
+    path = torch.tensor((11, 12, 21, 22), dtype=torch.int64, device=device)
 
     def sample(selected: torch.Tensor) -> torch.Tensor:
         return sampler.sample_children(
@@ -167,9 +147,7 @@ def test_collision_sampler_reuses_child_zero_and_is_subdivision_invariant() -> N
     torch.testing.assert_close(whole, split)
     torch.testing.assert_close(whole[::2], inherited)
     cards = sampler._combo_cards(whole.flatten()).reshape(4, 2, 2)
-    assert bool(
-        cards[:, 0, :, None].ne(cards[:, 1, None, :]).all()
-    )
+    assert bool(cards[:, 0, :, None].ne(cards[:, 1, None, :]).all())
 
 
 @CUDA
@@ -178,9 +156,7 @@ def test_collision_sampler_clamps_rounded_total_before_fixed_search(
 ) -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 4)
-    sampler = CollisionConditionedProfileSampler(
-        geometry, max_attempts=1
-    )
+    sampler = CollisionConditionedProfileSampler(geometry, max_attempts=1)
     first = geometry.first_card
     selected = geometry.combo_id(
         torch.tensor(
@@ -207,9 +183,7 @@ def test_collision_sampler_clamps_rounded_total_before_fixed_search(
     )
     sampled = sampler.sample_children(
         range_weights=weights,
-        board_cards=torch.full(
-            (1, 5), 255, dtype=torch.uint8, device=device
-        ),
+        board_cards=torch.full((1, 5), 255, dtype=torch.uint8, device=device),
         inherited_profile=selected[None].to(torch.int32),
         source=torch.zeros(1, dtype=torch.int64, device=device),
         ordinal=torch.ones(1, dtype=torch.int64, device=device),
@@ -230,9 +204,7 @@ def test_root_refill_uses_fresh_posterior_ordinals(
 ) -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 4)
-    mode = mode_schema(
-        "self_play", "branched.fixed", "rao_blackwell"
-    )
+    mode = mode_schema("self_play", "branched.fixed", "rao_blackwell")
     plan = _plan(device, mode, geometry)
     observed_ordinals: list[int] = []
 
@@ -241,9 +213,7 @@ def test_root_refill_uses_fresh_posterior_ordinals(
         **request,
     ) -> torch.Tensor:
         active = request["active"]
-        observed_ordinals.extend(
-            request["ordinal"][active].detach().cpu().tolist()
-        )
+        observed_ordinals.extend(request["ordinal"][active].detach().cpu().tolist())
         source = request["source"].to(torch.int64)
         sampler.last_observation = RejectionObservation(
             torch.zeros_like(source, dtype=torch.int32),
@@ -268,9 +238,7 @@ def test_root_refill_uses_fresh_posterior_ordinals(
     result = BranchedRecoveryHarness(
         owner_factory=lambda: GeneratedOwners(plan),
         plan=plan,
-        controller=FixedBranchController(
-            {"player": 1.0, "chance": 1.0}, 2
-        ),
+        controller=FixedBranchController({"player": 1.0, "chance": 1.0}, 2),
         run_state=RunState("phase8-refill-profile", root_count=1),
         arguments={
             "geometry": geometry,
@@ -278,25 +246,16 @@ def test_root_refill_uses_fresh_posterior_ordinals(
             "model": model,
             "model_operation": model.rb_learner_operation,
             "rollout_operation": model.rollout_operation,
-            "optimizer": DenseAdam(
-                model, OptimizerConfig(name="adamw", grad_clip=5)
-            ),
+            "optimizer": DenseAdam(model, OptimizerConfig(name="adamw", grad_clip=5)),
             "loss": LossConfig(
-                reference_kl_coefficient=0,
-                trace_coefficient=0.1,
-                cost_coefficient=0.1,
+                branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
             ),
-            "schedule": LearnerSchedule(
-                batch_size=2, gradient_steps=1
-            ),
-            "generator": torch.Generator(
-                device=device
-            ).manual_seed(127),
+            "schedule": LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
+            "generator": torch.Generator(device=device).manual_seed(127),
             "seed": 127,
             "lambda_": 0.95,
             "minimum_tree_size": 100,
             "completion_samples": 4,
-            "posterior_max_attempts": 16,
         },
     ).run(iteration=0)
     degree = result.root_executed_degree[0]
@@ -310,9 +269,7 @@ def test_root_refill_uses_fresh_posterior_ordinals(
 def test_collision_sampler_matches_the_exact_conditioned_sparse_law() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 4)
-    sampler = CollisionConditionedProfileSampler(
-        geometry, max_attempts=16
-    )
+    sampler = CollisionConditionedProfileSampler(geometry, max_attempts=16)
     first = geometry.first_card
 
     def combo(a: int, b: int) -> int:
@@ -342,9 +299,7 @@ def test_collision_sampler_matches_the_exact_conditioned_sparse_law() -> None:
     samples = 4096
     sampled = sampler.sample_children(
         range_weights=weights,
-        board_cards=torch.full(
-            (1, 5), 255, dtype=torch.uint8, device=device
-        ),
+        board_cards=torch.full((1, 5), 255, dtype=torch.uint8, device=device),
         inherited_profile=torch.tensor(
             ((seat_zero[0], seat_one[1]),),
             dtype=torch.int32,
@@ -354,9 +309,7 @@ def test_collision_sampler_matches_the_exact_conditioned_sparse_law() -> None:
         ordinal=torch.ones(samples, dtype=torch.int64, device=device),
         active=torch.ones(samples, dtype=torch.bool, device=device),
         root=torch.zeros(samples, dtype=torch.int64, device=device),
-        path=torch.arange(
-            1, samples + 1, dtype=torch.int64, device=device
-        ),
+        path=torch.arange(1, samples + 1, dtype=torch.int64, device=device),
         seed=719,
         iteration=3,
         retry_epoch=0,
@@ -394,9 +347,7 @@ def test_action_conditioned_folded_range_drives_chance_profiles() -> None:
         dtype=torch.float32,
         device=device,
     )
-    log_reach[0, 0, hands[:2]] = torch.log(
-        torch.tensor((0.25, 0.75), device=device)
-    )
+    log_reach[0, 0, hands[:2]] = torch.log(torch.tensor((0.25, 0.75), device=device))
     log_reach[0, 1, hands[2]] = 0
     selected_log = torch.full(
         (1, geometry.private_hands),
@@ -404,9 +355,7 @@ def test_action_conditioned_folded_range_drives_chance_profiles() -> None:
         dtype=torch.float32,
         device=device,
     )
-    selected_log[0, hands[:2]] = torch.log(
-        torch.tensor((0.9, 0.1), device=device)
-    )
+    selected_log[0, hands[:2]] = torch.log(torch.tensor((0.9, 0.1), device=device))
     conditioned = action_conditioned_log_reach(
         log_reach,
         selected_log,
@@ -421,9 +370,7 @@ def test_action_conditioned_folded_range_drives_chance_profiles() -> None:
     )
 
     samples = 2048
-    sampler = CollisionConditionedProfileSampler(
-        geometry, max_attempts=8
-    )
+    sampler = CollisionConditionedProfileSampler(geometry, max_attempts=8)
     inherited = torch.tensor(
         ((int(hands[0]), int(hands[2])),),
         dtype=torch.int32,
@@ -431,17 +378,13 @@ def test_action_conditioned_folded_range_drives_chance_profiles() -> None:
     )
     profile = sampler.sample_children(
         range_weights=weights,
-        board_cards=torch.full(
-            (1, 5), 255, dtype=torch.uint8, device=device
-        ),
+        board_cards=torch.full((1, 5), 255, dtype=torch.uint8, device=device),
         inherited_profile=inherited,
         source=torch.zeros(samples, dtype=torch.int64, device=device),
         ordinal=torch.ones(samples, dtype=torch.int64, device=device),
         active=torch.ones(samples, dtype=torch.bool, device=device),
         root=torch.zeros(samples, dtype=torch.int64, device=device),
-        path=torch.arange(
-            1, samples + 1, dtype=torch.int64, device=device
-        ),
+        path=torch.arange(1, samples + 1, dtype=torch.int64, device=device),
         seed=811,
         iteration=2,
         retry_epoch=0,
@@ -462,25 +405,16 @@ def test_conditioned_sampler_covers_player_rank_boundaries_and_zero_plateaus(
 ) -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(players, 8.0, ranks)
-    sampler = CollisionConditionedProfileSampler(
-        geometry, max_attempts=8
-    )
+    sampler = CollisionConditionedProfileSampler(geometry, max_attempts=8)
     first = geometry.first_card
     desired_cards = torch.tensor(
-        [
-            (first + 1 + 2 * seat, first + 2 + 2 * seat)
-            for seat in range(players)
-        ],
+        [(first + 1 + 2 * seat, first + 2 + 2 * seat) for seat in range(players)],
         dtype=torch.int64,
         device=device,
     )
-    desired = geometry.combo_id(
-        desired_cards[:, 0], desired_cards[:, 1]
-    )
+    desired = geometry.combo_id(desired_cards[:, 0], desired_cards[:, 1])
     conflicting = geometry.combo_id(
-        torch.full(
-            (players,), first, dtype=torch.int64, device=device
-        ),
+        torch.full((players,), first, dtype=torch.int64, device=device),
         desired_cards[:, 0],
     )
     weights = torch.zeros(
@@ -491,9 +425,7 @@ def test_conditioned_sampler_covers_player_rank_boundaries_and_zero_plateaus(
     seat = torch.arange(players, device=device)
     weights[0, seat, desired.to(torch.int64)] = 1
     weights[0, seat, conflicting.to(torch.int64)] = 1_000
-    board = torch.full(
-        (1, 5), 255, dtype=torch.uint8, device=device
-    )
+    board = torch.full((1, 5), 255, dtype=torch.uint8, device=device)
     board[0, 0] = first
     sampled = sampler.sample_children(
         range_weights=weights,
@@ -515,23 +447,17 @@ def test_conditioned_sampler_covers_player_rank_boundaries_and_zero_plateaus(
 def test_rejection_tail_reports_minimum_address_and_full_attempt_count() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 4)
-    sampler = CollisionConditionedProfileSampler(
-        geometry, max_attempts=3
-    )
+    sampler = CollisionConditionedProfileSampler(geometry, max_attempts=3)
     weights = torch.zeros(
         (1, 2, geometry.private_hands),
         dtype=torch.float32,
         device=device,
     )
     weights[:, :, 0] = 1
-    inherited = torch.zeros(
-        (1, 2), dtype=torch.int32, device=device
-    )
+    inherited = torch.zeros((1, 2), dtype=torch.int32, device=device)
     sampler.sample_children(
         range_weights=weights,
-        board_cards=torch.full(
-            (1, 5), 255, dtype=torch.uint8, device=device
-        ),
+        board_cards=torch.full((1, 5), 255, dtype=torch.uint8, device=device),
         inherited_profile=inherited,
         source=torch.zeros(1, dtype=torch.int64, device=device),
         ordinal=torch.ones(1, dtype=torch.int64, device=device),
@@ -555,9 +481,7 @@ def test_rejection_exhaustion_blocks_commit_and_publishes_device_failure(
 ) -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 4)
-    mode = mode_schema(
-        "self_play", "branched.fixed", "rao_blackwell"
-    )
+    mode = mode_schema("self_play", "branched.fixed", "rao_blackwell")
     plan = _plan(device, mode, geometry)
 
     def exhaust(
@@ -569,20 +493,14 @@ def test_rejection_exhaustion_blocks_commit_and_publishes_device_failure(
         fresh = request["active"] & request["ordinal"].gt(0)
         attempts = torch.where(
             fresh,
-            torch.full_like(
-                source, sampler.max_attempts, dtype=torch.int32
-            ),
+            torch.full_like(source, sampler.max_attempts, dtype=torch.int32),
             torch.zeros_like(source, dtype=torch.int32),
         )
-        maximum = torch.full_like(
-            request["path"], torch.iinfo(torch.int64).max
-        )
+        maximum = torch.full_like(request["path"], torch.iinfo(torch.int64).max)
         sampler.last_observation = RejectionObservation(
             attempts,
             fresh,
-            torch.where(
-                fresh, request["path"], maximum
-            ).amin(),
+            torch.where(fresh, request["path"], maximum).amin(),
         )
         return inherited
 
@@ -598,9 +516,7 @@ def test_rejection_exhaustion_blocks_commit_and_publishes_device_failure(
         BranchedRecoveryHarness(
             owner_factory=lambda: GeneratedOwners(plan),
             plan=plan,
-            controller=FixedBranchController(
-                {"player": 2.0, "chance": 1.0}, 2
-            ),
+            controller=FixedBranchController({"player": 2.0, "chance": 1.0}, 2),
             run_state=RunState("phase8-exhaustion", root_count=1),
             arguments={
                 "geometry": geometry,
@@ -613,26 +529,21 @@ def test_rejection_exhaustion_blocks_commit_and_publishes_device_failure(
                     OptimizerConfig(name="adamw", grad_clip=5),
                 ),
                 "loss": LossConfig(
-                    reference_kl_coefficient=0,
-                    trace_coefficient=0.1,
-                    cost_coefficient=0.1,
+                    branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
                 ),
                 "schedule": LearnerSchedule(
-                    batch_size=2, gradient_steps=1
+                    batch_size=2, epochs=None, gradient_steps=1
                 ),
-                "generator": torch.Generator(
-                    device=device
-                ).manual_seed(31),
+                "generator": torch.Generator(device=device).manual_seed(31),
                 "seed": 31,
                 "lambda_": 0.95,
                 "completion_samples": 4,
-                "posterior_max_attempts": 7,
             },
         ).run(iteration=0)
     failure = raised.value.failure
     assert failure.failure_code == "rejection_exhausted"
     assert failure.phase == "posterior_sample"
-    assert failure.sampler_attempt_count == 7
+    assert failure.sampler_attempt_count == POSTERIOR_MAX_ATTEMPTS
     assert failure.logical_address >= 0
 
 
@@ -642,18 +553,14 @@ def test_safe_tree_uses_only_inherited_profiles_for_rb_player_and_chance(
 ) -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 4)
-    mode = mode_schema(
-        "self_play", "branched.fixed", "rao_blackwell"
-    )
+    mode = mode_schema("self_play", "branched.fixed", "rao_blackwell")
     plan = _plan(device, mode, geometry)
 
     def unexpected_posterior(
         _sampler: CollisionConditionedProfileSampler,
         **_request,
     ) -> torch.Tensor:
-        raise AssertionError(
-            "safe-tree N=1 work entered posterior profile sampling"
-        )
+        raise AssertionError("safe-tree N=1 work entered posterior profile sampling")
 
     monkeypatch.setattr(
         CollisionConditionedProfileSampler,
@@ -673,9 +580,7 @@ def test_safe_tree_uses_only_inherited_profiles_for_rb_player_and_chance(
         def decide(self, **request):
             decision = super().decide(**request)
             if not bool(request["owner_is_player"].any()):
-                self.chance_degrees.append(
-                    decision.executed_degree.detach().cpu()
-                )
+                self.chance_degrees.append(decision.executed_degree.detach().cpu())
             return decision
 
     controller = RecordingController()
@@ -695,32 +600,21 @@ def test_safe_tree_uses_only_inherited_profiles_for_rb_player_and_chance(
             "model": model,
             "model_operation": model.rb_learner_operation,
             "rollout_operation": model.rollout_operation,
-            "optimizer": DenseAdam(
-                model, OptimizerConfig(name="adamw", grad_clip=5)
-            ),
+            "optimizer": DenseAdam(model, OptimizerConfig(name="adamw", grad_clip=5)),
             "loss": LossConfig(
-                reference_kl_coefficient=0,
-                trace_coefficient=0.1,
-                cost_coefficient=0.1,
+                branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
             ),
-            "schedule": LearnerSchedule(
-                batch_size=2, gradient_steps=1
-            ),
-            "generator": torch.Generator(
-                device=device
-            ).manual_seed(613),
+            "schedule": LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
+            "generator": torch.Generator(device=device).manual_seed(613),
             "seed": 613,
             "lambda_": 0.95,
             "completion_samples": 4,
-            "posterior_max_attempts": 16,
             "cost_safeguard": safeguard,
         },
     ).run(iteration=0)
     assert result.root_executed_degree == (1,)
     assert controller.chance_degrees
-    assert all(
-        degree.eq(1).all() for degree in controller.chance_degrees
-    )
+    assert all(degree.eq(1).all() for degree in controller.chance_degrees)
 
 
 @CUDA
@@ -742,9 +636,7 @@ def test_four_branched_rb_modes_complete_optimizer_step(
     controller = (
         FixedBranchController(
             {
-                "player": (
-                    2.0 if regime == "self_play" else 1.0
-                ),
+                "player": (2.0 if regime == "self_play" else 1.0),
                 "chance": 1.0,
             },
             2,
@@ -766,37 +658,25 @@ def test_four_branched_rb_modes_complete_optimizer_step(
         owner_factory=lambda: GeneratedOwners(plan),
         plan=plan,
         controller=controller,
-        run_state=RunState(
-            f"phase8-{regime}-{rollout}", root_count=1
-        ),
+        run_state=RunState(f"phase8-{regime}-{rollout}", root_count=1),
         arguments={
             "geometry": geometry,
             "mode": mode,
             "model": model,
             "model_operation": model.rb_learner_operation,
             "rollout_operation": model.rollout_operation,
-            "frozen_operation": (
-                None if frozen is None else frozen.rollout_operation
-            ),
-            "optimizer": DenseAdam(
-                model, OptimizerConfig(name="adamw", grad_clip=5)
-            ),
+            "frozen_operation": (None if frozen is None else frozen.rollout_operation),
+            "optimizer": DenseAdam(model, OptimizerConfig(name="adamw", grad_clip=5)),
             "loss": LossConfig(
-                reference_kl_coefficient=0,
-                trace_coefficient=0.1,
-                cost_coefficient=0.1,
+                branching=BranchingLossConfig(0.1, 0.1, 1.0e-6),
             ),
-            "schedule": LearnerSchedule(
-                batch_size=2, gradient_steps=1
-            ),
+            "schedule": LearnerSchedule(batch_size=2, epochs=None, gradient_steps=1),
             "generator": torch.Generator(device=device).manual_seed(991),
             "seed": 991,
             "lambda_": 0.95,
             "completion_samples": 4,
-            "posterior_max_attempts": 16,
             "benchmark_telemetry": (
-                regime == "self_play"
-                and rollout == "branched.fixed"
+                regime == "self_play" and rollout == "branched.fixed"
             ),
         },
     ).run(iteration=0)

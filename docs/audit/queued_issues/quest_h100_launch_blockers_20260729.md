@@ -23,9 +23,11 @@ reached 41.12 player nodes/s. Peak reserved memory was at most 16.38 GiB.
 A single-GPU, single-replica Quest run is a **no-go until QH100-1 and QH100-2
 are ported to the current branch and retested**.
 
-Same-GPU multi-replica and distributed Quest runs are a **performance no-go
-until QH100-3 is fixed or its approximately twofold learner tax is explicitly
-accepted**. Distributed K=1 also enters the affected preflight path.
+Post-audit update (2026-07-30): commit `9229734` resolved the QH100-3
+implementation defect by removing the validate-only replay and introducing one
+transactional learner pass per lane. Same-GPU multi-replica and distributed
+Quest runs remain a **performance no-go pending the deferred H100 K1/K2 and
+distributed K1 validation gates**.
 
 ## Required fixes
 
@@ -33,7 +35,7 @@ accepted**. Distributed K=1 also enters the affected preflight path.
 |---|---|---|---|---|
 | QH100-1 | P0 correctness | BF16 transition routing writes FP32 `model_input` into BF16 family storage with strict `index_copy_` | Immediate Normal smoke failure | Every H100 run |
 | QH100-2 | P0 capacity | H100 pilot sizes cumulative folded-range storage to one 84-row scheduler pack | Deterministic overflow at logical root 336 for 512-root arms | Every H100 run above one pack |
-| QH100-3 | P1 performance | Replica/distributed learner performs a complete validate-only forward/backward pass for every lane, clears it, then repeats every lane for committed updates | K=2 takes about 4x K=1 while producing only 2x logical work; K4 times out | Multi-replica or distributed production |
+| QH100-3 | P1 performance — implementation resolved, H100 validation pending | Replica/distributed learner performed a complete validate-only forward/backward pass for every lane, cleared it, then repeated every lane for committed updates | Commit `9229734` removed the duplicate pass; H100 K2 timing and distributed K1 validation remain pending | H100 validation before multi-replica or distributed production |
 | QH100-4 | P1 operations | Benchmark reports are emitted only after an arm finishes and omit learner/completion phase timings and progress heartbeats | Timeouts produce empty logs and no partial report; Slurm allocation time cannot be diagnosed safely | Long Quest jobs |
 
 ### QH100-1: BF16 route boundary
@@ -83,9 +85,39 @@ Acceptance gates:
 - A multiplayer capacity review confirms whether the general bound must be
   larger than one folded row per root outside heads-up poker.
 
-### QH100-3: duplicated replica/distributed learner work
+### QH100-3: implementation resolved; H100 validation pending
 
-For K>1 or any distributed session, sequential training currently executes:
+Status update (2026-07-30): commit `9229734` deleted
+`LearnerPreflightOptimizer`, `IterationEngine.preflight_learners()`, and the
+`validate_only` path. Sequential and branched modes now prepare their
+presentation-specific sampler and enter the same `LearnerTransaction`, which
+executes one real `LearnerIteration` per lane. Accelerator-resident rollback
+snapshots cover model parameters and buffers, optimizer moments and step
+count, scaler state, replica versions, explicit learner RNG state, and run
+state.
+
+Focused CUDA validation passed for K=2, K=4, and K=8 one-pass learner call
+counts, local late-lane rollback, and transaction-memory reconciliation. The
+broader relevant CUDA/two-GPU NCCL suite also passed. QH100-3 is therefore
+**resolved at the implementation level**, with these closure gates still
+pending:
+
+- run the production K2 arm on H100 and verify exactly 232 committed optimizer
+  steps with no hidden dry pass;
+- demonstrate H100 K2 wall time no worse than approximately 2x K1;
+- benchmark distributed K=1; and
+- add a distributed late-failure regression through the production
+  `LearnerTransaction`.
+
+The checked-in pilot YAMLs and the generated Normal local-smoke capacity also
+need separate repair before they can serve as the deferred H100 validation
+path. These launch-path defects do not reinstate the duplicated learner pass,
+but they currently prevent end-to-end closure of the H100 gate.
+
+The evidence below describes the original audited implementation.
+
+For K>1 or any distributed session, sequential training at the audited
+revision executed:
 
 ```text
 every lane: validate-only forward/loss/backward, no parameter update
@@ -170,8 +202,27 @@ Before submitting the long job:
 3. Run one Normal and one RB BF16 K=1, 512-root iteration.
 4. Verify finite losses, 116 applied optimizer steps, checkpoint creation,
    checkpoint reload, and one resumed iteration.
-5. If using multiple GPUs, resolve or explicitly accept QH100-3 and benchmark
-   distributed K=1 before requesting the full allocation.
+5. If using multiple GPUs, complete the deferred QH100-3 H100 K1/K2 and
+   distributed K1 validation before requesting the full allocation.
 6. Start the Quest job with K=1 unless a later replica benchmark demonstrates
    a real aggregate throughput gain.
 
+## Ideal replica learner parallelism
+
+After removing the duplicated dry pass, the ideal single-GPU design is
+memory-admitted lane-wave concurrency. Each replica keeps its independent
+weights, autograd graph, dense FP32 gradients, optimizer state, RNG, and CUDA
+stream; the common learner launches as many lanes concurrently as the H100
+activation/workspace budget safely admits. This must remain the same
+per-lane learner operation rather than a functional or vmapped backward, and
+must never combine gradients between replica lanes.
+
+Within a lane, optimizer step $s$ must still precede forward step $s+1$.
+Across lanes, forward/loss/backward work may overlap freely. Each admitted
+wave joins at one failure-agreement boundary before its independent optimizer
+transitions, while the iteration-wide transaction publishes all lane
+versions and run state only after every wave/rank succeeds. Distributed ranks
+must launch lane collectives in the same fixed order. H100 experiments should
+sweep concurrent lane-wave width, record activation and synchronization
+memory, and accept the change only when aggregate learner throughput improves
+without numerical, RNG, rollback, or peak-memory regression.

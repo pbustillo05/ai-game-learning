@@ -189,59 +189,96 @@ class ReferenceOutputCache:
         self.released = True
 
 
-@dataclass(frozen=True)
-class LossConfig:
-    """Closed loss surface shared by every queued mode."""
+def _nonnegative_finite(value: float, name: str) -> None:
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be finite and nonnegative")
 
-    clip_epsilon: float = 0.2
-    value_clip_epsilon: float = 0.2
-    value_coefficient: float = 0.5
-    entropy_coefficient: float = 0.01
-    reference_kl_coefficient: float = 0.0
-    value_loss: str = "mse"
-    entropy_schedule: str = "constant"
-    entropy_decay_iterations: int | None = None
-    trace_coefficient: float = 0.0
-    cost_coefficient: float = 0.0
-    trace_epsilon: float = 1.0e-6
+
+@dataclass(frozen=True)
+class ValueLossConfig:
+    """Value objective with only fields applicable to its selected kind."""
+
+    kind: str = "mse"
+    coefficient: float = 0.5
+    epsilon: float | None = None
 
     def __post_init__(self) -> None:
-        for name in (
-            "clip_epsilon",
-            "value_clip_epsilon",
-            "value_coefficient",
-            "entropy_coefficient",
-            "reference_kl_coefficient",
-            "trace_coefficient",
-            "cost_coefficient",
-            "trace_epsilon",
-        ):
-            value = getattr(self, name)
-            if not math.isfinite(value) or value < 0:
-                raise ValueError(f"{name} must be finite and nonnegative")
-        if self.value_loss not in ("mse", "clipped"):
-            raise ValueError("value_loss must be 'mse' or 'clipped'")
-        if self.trace_epsilon <= 0:
-            raise ValueError("trace_epsilon must be positive")
-        if self.entropy_schedule not in ("constant", "linear_decay"):
-            raise ValueError("entropy_schedule must be 'constant' or 'linear_decay'")
-        if self.entropy_schedule == "linear_decay" and (
-            isinstance(self.entropy_decay_iterations, bool)
-            or not isinstance(self.entropy_decay_iterations, int)
-            or self.entropy_decay_iterations <= 0
-        ):
-            raise ValueError(
-                "linear entropy decay requires a positive independent horizon"
-            )
+        if self.kind not in ("mse", "clipped"):
+            raise ValueError("value loss kind must be 'mse' or 'clipped'")
+        _nonnegative_finite(self.coefficient, "value coefficient")
+        if self.kind == "mse" and self.epsilon is not None:
+            raise ValueError("MSE value loss cannot carry a clip epsilon")
+        if self.kind == "clipped":
+            if self.epsilon is None:
+                raise ValueError("clipped value loss requires epsilon")
+            _nonnegative_finite(self.epsilon, "value clip epsilon")
 
-    def entropy_at(self, iteration: int) -> float:
+
+@dataclass(frozen=True)
+class EntropyLossConfig:
+    """Entropy objective with an optional independent linear horizon."""
+
+    kind: str = "constant"
+    coefficient: float = 0.01
+    iterations: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("constant", "linear_decay"):
+            raise ValueError("entropy kind must be 'constant' or 'linear_decay'")
+        _nonnegative_finite(self.coefficient, "entropy coefficient")
+        if self.kind == "constant" and self.iterations is not None:
+            raise ValueError("constant entropy cannot carry an iteration horizon")
+        if self.kind == "linear_decay" and (
+            isinstance(self.iterations, bool)
+            or not isinstance(self.iterations, int)
+            or self.iterations <= 0
+        ):
+            raise ValueError("linear entropy decay requires a positive horizon")
+
+    def at(self, iteration: int) -> float:
         if iteration < 0:
             raise ValueError("iteration must be nonnegative")
-        if self.entropy_schedule == "constant":
-            return self.entropy_coefficient
-        assert self.entropy_decay_iterations is not None
-        fraction = max(0.0, 1.0 - float(iteration) / self.entropy_decay_iterations)
-        return self.entropy_coefficient * fraction
+        if self.kind == "constant":
+            return self.coefficient
+        assert self.iterations is not None
+        return self.coefficient * max(0.0, 1.0 - float(iteration) / self.iterations)
+
+
+@dataclass(frozen=True)
+class BranchingLossConfig:
+    """Public-head objective, present only for branched rollout."""
+
+    trace_coefficient: float
+    cost_coefficient: float
+    trace_epsilon: float
+
+    def __post_init__(self) -> None:
+        _nonnegative_finite(self.trace_coefficient, "trace coefficient")
+        _nonnegative_finite(self.cost_coefficient, "cost coefficient")
+        if not math.isfinite(self.trace_epsilon) or self.trace_epsilon <= 0:
+            raise ValueError("trace epsilon must be finite and positive")
+
+
+@dataclass(frozen=True)
+class LossConfig:
+    """Closed, structured loss surface shared by every queued mode."""
+
+    policy_clip: float = 0.2
+    value: ValueLossConfig = field(default_factory=ValueLossConfig)
+    entropy: EntropyLossConfig = field(default_factory=EntropyLossConfig)
+    reference_kl_coefficient: float | None = None
+    branching: BranchingLossConfig | None = None
+
+    def __post_init__(self) -> None:
+        _nonnegative_finite(self.policy_clip, "policy clip")
+        if self.reference_kl_coefficient is not None and (
+            not math.isfinite(self.reference_kl_coefficient)
+            or self.reference_kl_coefficient <= 0
+        ):
+            raise ValueError("reference KL coefficient must be finite and positive")
+
+    def entropy_at(self, iteration: int) -> float:
+        return self.entropy.at(iteration)
 
 
 @dataclass(frozen=True)
@@ -249,7 +286,7 @@ class LearnerSchedule:
     """Exact statistical presentation schedule for sequential modes."""
 
     batch_size: int
-    epochs: int = 1
+    epochs: int | None = 1
     gradient_steps: int | None = None
 
     def __post_init__(self) -> None:
@@ -259,12 +296,14 @@ class LearnerSchedule:
             or self.batch_size <= 0
         ):
             raise ValueError("batch_size must be a positive integer")
-        if (
+        if (self.epochs is None) == (self.gradient_steps is None):
+            raise ValueError("select exactly one of epochs or gradient_steps")
+        if self.epochs is not None and (
             isinstance(self.epochs, bool)
             or not isinstance(self.epochs, int)
             or self.epochs <= 0
         ):
-            raise ValueError("epochs must be a positive integer")
+            raise ValueError("epochs must be positive when supplied")
         if self.gradient_steps is not None and (
             isinstance(self.gradient_steps, bool)
             or not isinstance(self.gradient_steps, int)
@@ -620,10 +659,7 @@ class SealedSequentialInputs:
         rows = int(selected.numel())
         if rows <= 0:
             return cls(destination, input_type=input_type, lane=lane)
-        values = {
-            name: retained.columns[name][lane, selected][None]
-            for name in fields
-        }
+        values = {name: retained.columns[name][lane, selected][None] for name in fields}
         counts = torch.zeros(
             retained.n_replica, dtype=torch.int64, device=retained.device
         )
@@ -641,9 +677,7 @@ class SealedSequentialInputs:
                 ),
             ),
             phase="sequential_retained_compaction",
-            active=torch.arange(
-                retained.n_replica, device=retained.device
-            ).eq(lane),
+            active=torch.arange(retained.n_replica, device=retained.device).eq(lane),
         )
         transaction.fill_all()
         success = transaction.publish()
@@ -836,6 +870,7 @@ class SequentialBatchSampler:
             )
         rows = sum(store.rows for store in self.stores.values())
         if self.schedule.gradient_steps is None:
+            assert self.schedule.epochs is not None
             return rows * self.schedule.epochs
         return self.schedule.gradient_steps * self.schedule.batch_size
 
@@ -845,10 +880,10 @@ class SequentialBatchSampler:
 
         if self.schedule.gradient_steps is not None:
             return self.schedule.gradient_steps
+        assert self.schedule.epochs is not None
         if self.statistical_counts is None:
             return self.schedule.epochs * sum(
-                (store.rows + self.schedule.batch_size - 1)
-                // self.schedule.batch_size
+                (store.rows + self.schedule.batch_size - 1) // self.schedule.batch_size
                 for store in self.stores.values()
             )
         total = 0
@@ -856,8 +891,7 @@ class SequentialBatchSampler:
             rows = self.stores[name].rows
             full, remainder = divmod(requested, rows)
             total += full * (
-                (rows + self.schedule.batch_size - 1)
-                // self.schedule.batch_size
+                (rows + self.schedule.batch_size - 1) // self.schedule.batch_size
             )
             if remainder:
                 total += (
@@ -970,6 +1004,7 @@ class SequentialBatchSampler:
                 )
             return
         epoch = 0
+        assert self.schedule.epochs is not None
         while maximum is None or emitted < maximum:
             epoch += 1
             if epoch > self.schedule.epochs and maximum is None:
@@ -1168,22 +1203,16 @@ class SealedBranchedInputs:
             retained_row = family_row.to(torch.int32)
         else:
             if (
-                payload_destination.schema.name
-                != f"LearnerRetained.{input_type}"
+                payload_destination.schema.name != f"LearnerRetained.{input_type}"
                 or tuple(payload_destination.columns) != retained_fields
-                or payload_destination.n_replica
-                != family_retained.n_replica
+                or payload_destination.n_replica != family_retained.n_replica
                 or payload_destination.device != device
                 or payload_destination.failure_state
                 is not family_retained.failure_state
             ):
-                raise LearnerError(
-                    "best-response retained destination is incompatible"
-                )
+                raise LearnerError("best-response retained destination is incompatible")
             retained = payload_destination
-            retained_row = torch.arange(
-                rows, dtype=torch.int32, device=device
-            )
+            retained_row = torch.arange(rows, dtype=torch.int32, device=device)
         lane_values = {
             "family_row": retained_row,
             "target_degree": target_degree.to(torch.int32),
@@ -1248,9 +1277,7 @@ class SealedBranchedInputs:
         transaction = PublicationTransaction.begin_device(
             tuple(requests),
             phase="branched_retained_seal",
-            active=torch.arange(
-                family_retained.n_replica, device=device
-            ).eq(lane),
+            active=torch.arange(family_retained.n_replica, device=device).eq(lane),
         )
         transaction.fill_all()
         success = transaction.publish()
@@ -1397,8 +1424,7 @@ class RaggedBranchedStore:
             {
                 name: value[selected]
                 for name, value in index.items()
-                if name
-                not in ("family_row", "action_begin", "action_count")
+                if name not in ("family_row", "action_begin", "action_count")
             }
         )
         for slab in self.sigma_slabs.values():
@@ -1645,6 +1671,7 @@ class LossResult:
     approximate_kl: Tensor
     clip_fraction: Tensor
 
+
 def _scalar_private_row(value: Tensor, private: Tensor, owner: Tensor) -> Tensor:
     """Select owner-combo values when a model exposes ``[B,H]`` rows."""
 
@@ -1725,9 +1752,7 @@ class LearnerOperation:
         loss_scale: float = 1.0,
         objective_weight: float | Tensor = 1.0,
     ) -> LossResult:
-        if not isinstance(
-            batch, (SequentialLearnerBatch, BranchedLearnerBatch)
-        ):
+        if not isinstance(batch, (SequentialLearnerBatch, BranchedLearnerBatch)):
             raise LearnerError("learner batch has no supported presentation")
         rows = batch.rows
         sigma_index = batch.sigma_index
@@ -1753,9 +1778,7 @@ class LearnerOperation:
         )
         sampled = self.mode.private_estimator is PrivateEstimator.SAMPLED
         sigma_private = (
-            sigma["sampled_private_state"]
-            if sampled
-            else sigma["owner"][:, None]
+            sigma["sampled_private_state"] if sampled else sigma["owner"][:, None]
         )
         autocast_dtype = {
             "fp32": torch.float32,
@@ -1848,9 +1871,7 @@ class LearnerOperation:
         repeated_owner = sigma["owner"].index_select(0, action_to_sigma)
         repeated_private = sigma_private.index_select(0, action_to_sigma)
         policy_private = (
-            torch.zeros_like(repeated_private)
-            if sampled
-            else repeated_owner[:, None]
+            torch.zeros_like(repeated_private) if sampled else repeated_owner[:, None]
         )
         policy = self.policy_operation(
             batch.input_type,
@@ -1878,16 +1899,12 @@ class LearnerOperation:
                 torch.zeros_like(sigma_private),
                 sigma["owner"],
             ).reshape(rows, 1)
-            old_log = action["old_log_policy"].float().reshape(
-                action_rows, -1
-            )[:, :1]
-            advantage = action["advantage_target"].float().reshape(
-                action_rows, -1
-            )[:, :1]
+            old_log = action["old_log_policy"].float().reshape(action_rows, -1)[:, :1]
+            advantage = (
+                action["advantage_target"].float().reshape(action_rows, -1)[:, :1]
+            )
             old_value = sigma["old_value"].float().reshape(rows, -1)[:, :1]
-            target_value = sigma["value_target"].float().reshape(
-                rows, -1
-            )[:, :1]
+            target_value = sigma["value_target"].float().reshape(rows, -1)[:, :1]
             posterior = torch.ones_like(current_log)
         else:
             current_log = policy.selected_log_policy.float()
@@ -1918,8 +1935,8 @@ class LearnerOperation:
         log_ratio = current_log - old_log
         ratio = log_ratio.exp()
         clipped = ratio.clamp(
-            1 - self.loss.clip_epsilon,
-            1 + self.loss.clip_epsilon,
+            1 - self.loss.policy_clip,
+            1 + self.loss.policy_clip,
         )
         policy_row = (
             posterior
@@ -1932,7 +1949,7 @@ class LearnerOperation:
         reference_row = (posterior * reference_kl).sum(-1)
         approximate_row = (posterior * ((ratio - 1) - log_ratio)).sum(-1)
         clipped_row = (
-            posterior * ratio.sub(1).abs().gt(self.loss.clip_epsilon).float()
+            posterior * ratio.sub(1).abs().gt(self.loss.policy_clip).float()
         ).sum(-1)
         sigma_posterior = torch.zeros_like(current_value, dtype=torch.float32)
         sigma_posterior.scatter_add_(
@@ -1945,10 +1962,11 @@ class LearnerOperation:
             torch.finfo(torch.float32).tiny
         )
         value_error = (current_value - target_value).square()
-        if self.loss.value_loss == "clipped":
+        if self.loss.value.kind == "clipped":
+            assert self.loss.value.epsilon is not None
             clipped_value = old_value + (current_value - old_value).clamp(
-                -self.loss.value_clip_epsilon,
-                self.loss.value_clip_epsilon,
+                -self.loss.value.epsilon,
+                self.loss.value.epsilon,
             )
             value_error = torch.maximum(
                 value_error,
@@ -1971,15 +1989,15 @@ class LearnerOperation:
         sigma_approximate = mean_by_sigma(approximate_row)
         sigma_clipped = mean_by_sigma(clipped_row)
         if "trace_target" in sigma or "cost_target" in sigma:
+            if self.loss.branching is None:
+                raise LearnerError("branched public targets require a branching loss")
             if (
                 set(evaluation.public_heads) != {"trace", "cost"}
                 or "trace_target" not in sigma
                 or "cost_target" not in sigma
                 or "target_degree" not in sigma
             ):
-                raise LearnerError(
-                    "public heads and targets must share one schema"
-                )
+                raise LearnerError("public heads and targets must share one schema")
             trace_prediction = evaluation.public_heads["trace"].float()
             cost_prediction = evaluation.public_heads["cost"].float()
             trace_target = sigma["trace_target"].float()
@@ -1993,15 +2011,10 @@ class LearnerOperation:
                     cost_target,
                 )
             ):
-                raise LearnerError(
-                    "public heads and targets are not sigma aligned"
-                )
-            eps = self.loss.trace_epsilon
+                raise LearnerError("public heads and targets are not sigma aligned")
+            eps = self.loss.branching.trace_epsilon
             trace_ratio = (trace_target + eps) / (
-                trace_prediction.clamp_min(
-                    torch.finfo(torch.float32).tiny
-                )
-                + eps
+                trace_prediction.clamp_min(torch.finfo(torch.float32).tiny) + eps
             )
             trace_loss = torch.where(
                 sigma["target_degree"].ge(2),
@@ -2015,9 +2028,7 @@ class LearnerOperation:
             cost_ratio = cost_target / cost_prediction.clamp_min(
                 torch.finfo(torch.float32).tiny
             )
-            cost_loss = (
-                cost_ratio - cost_ratio.log() - 1
-            ).mean()
+            cost_loss = (cost_ratio - cost_ratio.log() - 1).mean()
         else:
             trace_loss = current_value.new_zeros(())
             cost_loss = current_value.new_zeros(())
@@ -2025,13 +2036,22 @@ class LearnerOperation:
         value_loss = value_row.mean()
         entropy_mean = sigma_entropy.mean()
         reference_kl_mean = sigma_reference.mean()
+        reference_coefficient = self.loss.reference_kl_coefficient or 0.0
+        trace_coefficient = (
+            0.0
+            if self.loss.branching is None
+            else self.loss.branching.trace_coefficient
+        )
+        cost_coefficient = (
+            0.0 if self.loss.branching is None else self.loss.branching.cost_coefficient
+        )
         total = (
             policy_loss
-            + self.loss.value_coefficient * value_loss
+            + self.loss.value.coefficient * value_loss
             - self.loss.entropy_at(iteration) * entropy_mean
-            + self.loss.reference_kl_coefficient * reference_kl_mean
-            + self.loss.trace_coefficient * trace_loss
-            + self.loss.cost_coefficient * cost_loss
+            + reference_coefficient * reference_kl_mean
+            + trace_coefficient * trace_loss
+            + cost_coefficient * cost_loss
         )
         if self.precision != "fp16" and not torch.isfinite(total):
             raise LearnerError("learner loss is nonfinite")
@@ -2049,10 +2069,7 @@ class LearnerOperation:
                 & objective_weight.le(1),
                 "physical objective weight must lie in (0,1]",
             )
-        elif (
-            not math.isfinite(objective_weight)
-            or not 0 < objective_weight <= 1
-        ):
+        elif not math.isfinite(objective_weight) or not 0 < objective_weight <= 1:
             raise LearnerError("physical objective weight must lie in (0,1]")
         (total * float(loss_scale) * objective_weight).backward()
         return LossResult(
@@ -2144,6 +2161,8 @@ __all__ = [
     "AlignedSequentialStore",
     "BranchedBatchSampler",
     "BranchedLearnerBatch",
+    "BranchingLossConfig",
+    "EntropyLossConfig",
     "LearnerDTypes",
     "LearnerError",
     "LearnerOperation",
@@ -2159,6 +2178,7 @@ __all__ = [
     "SealedSequentialInputs",
     "SequentialBatchSampler",
     "SequentialLearnerBatch",
+    "ValueLossConfig",
     "allocate_statistical_counts",
     "build_reference_output_cache",
     "compact_best_response_evaluation",

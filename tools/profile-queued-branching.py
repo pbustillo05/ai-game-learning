@@ -10,6 +10,7 @@ conservative capacities.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -291,10 +292,9 @@ class ProfileScenario:
     output: Path
     fixed_beta: Mapping[str, float]
     minimum_tree_size: int
-    safe_tree_size: float
+    safe_tree_size: int
     cost_safeguard: Mapping[str, object] | None
     completion_samples: int
-    posterior_max_attempts: int
     seed: int
     iteration: int
     warmup: int
@@ -307,6 +307,7 @@ class ProfileConfig:
     """Strict diagnostic fields layered over one public runtime config."""
 
     source: Path
+    run_source: Mapping[str, object]
     root: RootConfig
     checkpoint: Path
     checkpoint_sha256: str
@@ -365,7 +366,6 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
         "minimum_tree_size",
         "safe_tree_size",
         "completion_samples",
-        "posterior_max_attempts",
         "seed",
         "iteration",
         "warmup",
@@ -373,7 +373,9 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
         "expected_outcome",
     }
     allowed_scenario = required_scenario | {"cost_safeguard"}
-    if not required_scenario.issubset(scenario) or not set(scenario).issubset(allowed_scenario):
+    if not required_scenario.issubset(scenario) or not set(scenario).issubset(
+        allowed_scenario
+    ):
         unknown = sorted(set(scenario).difference(allowed_scenario))
         missing = sorted(required_scenario.difference(scenario))
         name = unknown[0] if unknown else missing[0]
@@ -394,7 +396,6 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
     for name in (
         "minimum_tree_size",
         "completion_samples",
-        "posterior_max_attempts",
         "seed",
         "iteration",
         "warmup",
@@ -408,7 +409,6 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
     for name in (
         "minimum_tree_size",
         "completion_samples",
-        "posterior_max_attempts",
     ):
         if scenario[name] <= 0:
             raise ValueError(
@@ -440,8 +440,8 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
     safe_tree_size = scenario["safe_tree_size"]
     if (
         isinstance(safe_tree_size, bool)
-        or not isinstance(safe_tree_size, (int, float))
-        or float(safe_tree_size) < 1
+        or not isinstance(safe_tree_size, int)
+        or safe_tree_size < 1
     ):
         raise ValueError(
             f"profile.scenarios.{scenario_name}.safe_tree_size: invalid bound"
@@ -471,44 +471,81 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
         raise ValueError(
             f"profile.scenarios.{scenario_name}.cost_safeguard: expected object"
         )
-    scientific = dict(base_source["scientific"])
-    base_branching = dict(scientific["branching"])
-    scenario_safeguard = (
+    parsed_scenario = ProfileScenario(
+        name=scenario_name,
+        output=Path(str(scenario["output"])).resolve(),
+        fixed_beta={name: float(value) for name, value in fixed_beta_raw.items()},
+        minimum_tree_size=int(scenario["minimum_tree_size"]),
+        safe_tree_size=safe_tree_size,
+        cost_safeguard=safeguard,
+        completion_samples=int(scenario["completion_samples"]),
+        seed=int(scenario["seed"]),
+        iteration=int(scenario["iteration"]),
+        warmup=int(scenario["warmup"]),
+        historical_physical_gpu=int(scenario["historical_physical_gpu"]),
+        expected_outcome=str(scenario["expected_outcome"]),
+    )
+    root = _compile_profile_run(base_source, parsed_scenario)
+    return ProfileConfig(
+        source=path.resolve(),
+        run_source=copy.deepcopy(dict(base_source)),
+        root=root,
+        checkpoint=Path(str(profile["checkpoint"])).resolve(),
+        checkpoint_sha256=digest,
+        scenario=parsed_scenario,
+    )
+
+
+def _compile_profile_run(
+    base_source: Mapping[str, object],
+    scenario: ProfileScenario,
+    *,
+    beta_max: Mapping[str, int] | None = None,
+) -> RootConfig:
+    """Compile every diagnostic override through the public run schema."""
+
+    source = copy.deepcopy(dict(base_source))
+    scientific = dict(source["scientific"])
+    branching = dict(scientific["branching"])
+    safeguard = (
         {
-            name: safeguard[name]
+            name: scenario.cost_safeguard[name]
             for name in (
                 "gamma_deviance_max",
                 "p95_underprediction_max",
                 "consecutive_iterations",
             )
         }
-        if isinstance(safeguard, Mapping)
-        else base_branching["cost_safeguard"]
+        if scenario.cost_safeguard is not None
+        else branching["cost_safeguard"]
     )
-    source = {
-        **dict(base_source),
-        "scientific": {
-            **scientific,
-            "branching": {
-                **base_branching,
-                "fixed_beta": dict(fixed_beta_raw),
-                "minimum_tree_size": int(scenario["minimum_tree_size"]),
-                "cost_safeguard": scenario_safeguard,
-            },
-            "completion": {
-                "samples": int(scenario["completion_samples"]),
-            },
-        },
-        "run": {
-            **dict(base_source["run"]),
-            "seed": int(scenario["seed"]),
-            "output_dir": str(Path(str(scenario["output"])).parent),
+    branching.update(
+        {
+            "fixed_beta": dict(scenario.fixed_beta),
+            "minimum_tree_size": scenario.minimum_tree_size,
+            "cost_safeguard": safeguard,
+        }
+    )
+    if beta_max is not None:
+        branching["beta_max"] = dict(beta_max)
+    scientific.update(
+        {
+            "branching": branching,
+            "completion": {"samples": scenario.completion_samples},
+        }
+    )
+    run = dict(source["run"])
+    run.update(
+        {
+            "seed": scenario.seed,
+            "output_dir": str(scenario.output.parent),
             "workload": {
-                **dict(base_source["run"]["workload"]),
-                "tree_nodes": int(safe_tree_size),
+                **dict(run["workload"]),
+                "tree_nodes": scenario.safe_tree_size,
             },
-        },
-    }
+        }
+    )
+    source.update({"scientific": scientific, "run": run})
     root = load_config_mapping(source)
     if (
         not isinstance(root.scientific, BranchedModeConfig)
@@ -524,27 +561,7 @@ def _load_profile_config(path: Path, requested_scenario: str | None) -> ProfileC
         raise ValueError(
             "profiler requires one-lane, one-root, self-play fixed branched RB"
         )
-    return ProfileConfig(
-        source=path.resolve(),
-        root=root,
-        checkpoint=Path(str(profile["checkpoint"])).resolve(),
-        checkpoint_sha256=digest,
-        scenario=ProfileScenario(
-            name=scenario_name,
-            output=Path(str(scenario["output"])).resolve(),
-            fixed_beta={name: float(value) for name, value in fixed_beta_raw.items()},
-            minimum_tree_size=int(scenario["minimum_tree_size"]),
-            safe_tree_size=float(safe_tree_size),
-            cost_safeguard=safeguard,
-            completion_samples=int(scenario["completion_samples"]),
-            posterior_max_attempts=int(scenario["posterior_max_attempts"]),
-            seed=int(scenario["seed"]),
-            iteration=int(scenario["iteration"]),
-            warmup=int(scenario["warmup"]),
-            historical_physical_gpu=int(scenario["historical_physical_gpu"]),
-            expected_outcome=str(scenario["expected_outcome"]),
-        ),
-    )
+    return root
 
 
 def _run_once(
@@ -557,19 +574,18 @@ def _run_once(
     device: torch.device,
     scenario: ProfileScenario,
     timing: CudaOperationTimes | None,
-    beta_max: int | Mapping[str, int] | None = None,
 ) -> object:
     scientific = config.scientific
     assert isinstance(scientific, BranchedModeConfig)
     common = scientific.common
     controller = FixedBranchController(
-        scenario.fixed_beta,
-        (int(scientific.branching["beta_max"]) if beta_max is None else beta_max),
+        scientific.branching["fixed_beta"],
+        scientific.branching["beta_max"],
         minimum_scale=float(scientific.branching["minimum_scale"]),
         backoff_factor=float(scientific.branching["backoff_factor"]),
-        safe_tree_size=scenario.safe_tree_size,
+        safe_tree_size=int(scientific.branching["safe_tree_size"]),
     )
-    generator = torch.Generator(device=device).manual_seed(scenario.seed)
+    generator = torch.Generator(device=device).manual_seed(common.seed)
     run_state = RunState(
         config.execution.run_id,
         root_count=common.root_count,
@@ -595,11 +611,10 @@ def _run_once(
             models=(lane_model,),
             rollout_operations=(lane_model.rollout_operation,),
             frozen_operations=(None,),
-            seed=scenario.seed,
+            seed=common.seed,
             precision=common.precision.name,
             utility=common.utility,
-            completion_samples=scenario.completion_samples,
-            posterior_max_attempts=scenario.posterior_max_attempts,
+            completion_samples=int(scientific.applicable["completion_samples"]),
         )
         result = IterationEngine(
             config=IterationConfig(
@@ -615,14 +630,18 @@ def _run_once(
                         model=lane_model,
                         branch_controller=controller,
                         cost_safeguard=safeguard,
-                        minimum_tree_size=scenario.minimum_tree_size,
+                        minimum_tree_size=int(
+                            scientific.branching["minimum_tree_size"]
+                        ),
                     ),
                 ),
                 common.schedule,
                 optimizers,
                 common.lambda_,
                 precision=common.precision.name,
-                cache_reference_outputs=common.reference.cache_outputs,
+                cache_reference_outputs=(
+                    common.reference is not None and common.reference.cache_outputs
+                ),
                 benchmark_telemetry=True,
             ),
             owner_factory=lambda: GeneratedOwners(plan),
@@ -645,7 +664,7 @@ def main() -> None:
     parser.add_argument("--player-pre-beta", type=float)
     parser.add_argument("--player-post-beta", type=float)
     parser.add_argument("--chance-beta", type=float)
-    parser.add_argument("--safe-tree-size", type=float)
+    parser.add_argument("--safe-tree-size", type=int)
     parser.add_argument("--player-pre-beta-max", type=int)
     parser.add_argument("--player-post-beta-max", type=int, default=3)
     parser.add_argument("--chance-beta-max", type=int, default=3)
@@ -704,10 +723,14 @@ def main() -> None:
         scenario = ProfileScenario(
             **{
                 **asdict(scenario),
-                "safe_tree_size": float(args.safe_tree_size),
+                "safe_tree_size": int(args.safe_tree_size),
             }
         )
-    config = profile.root
+    config = _compile_profile_run(
+        profile.run_source,
+        scenario,
+        beta_max=stage_beta_max,
+    )
     common = config.scientific.common
     device = torch.device(config.execution.device)
     torch.cuda.set_device(device)
@@ -752,7 +775,6 @@ def main() -> None:
             device=device,
             scenario=scenario,
             timing=None,
-            beta_max=stage_beta_max,
         )
         torch.cuda.synchronize(device)
 
@@ -767,7 +789,6 @@ def main() -> None:
         device=device,
         scenario=scenario,
         timing=timing,
-        beta_max=stage_beta_max,
     )
     torch.cuda.synchronize(device)
     wall_seconds = time.perf_counter() - started
@@ -809,22 +830,17 @@ def main() -> None:
                 "stack_bb": common.game.stack_bb,
                 "rank_count": common.game.rank_count,
             },
-            "fixed_beta": dict(scenario.fixed_beta),
-            "beta_max": (
-                config.scientific.branching["beta_max"]
-                if stage_beta_max is None
-                else dict(stage_beta_max)
-            ),
-            "minimum_tree_size": scenario.minimum_tree_size,
-            "safe_tree_size": scenario.safe_tree_size,
+            "fixed_beta": dict(config.scientific.branching["fixed_beta"]),
+            "beta_max": config.scientific.branching["beta_max"],
+            "minimum_tree_size": config.scientific.branching["minimum_tree_size"],
+            "safe_tree_size": config.scientific.branching["safe_tree_size"],
             "cost_safeguard": (
                 None
                 if scenario.cost_safeguard is None
                 else dict(scenario.cost_safeguard)
             ),
-            "completion_samples": scenario.completion_samples,
-            "posterior_max_attempts": scenario.posterior_max_attempts,
-            "seed": scenario.seed,
+            "completion_samples": config.scientific.applicable["completion_samples"],
+            "seed": common.seed,
             "iteration": scenario.iteration,
             "warmup": scenario.warmup,
             "historical_physical_gpu": scenario.historical_physical_gpu,

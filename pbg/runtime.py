@@ -70,9 +70,7 @@ def _checkpoint_payload(path: Path) -> dict[str, object]:
         CHECKPOINT_SCHEMA,
         REPLICA_CHECKPOINT_SCHEMA,
     }:
-        raise RuntimeError(
-            "unsupported checkpoint schema"
-        )
+        raise RuntimeError("unsupported checkpoint schema")
     return value
 
 
@@ -227,17 +225,13 @@ class TrainingSession:
             self.modules,
             config.scientific.common.optimizer,
             scalers=tuple(
-                LossScaler(
-                    enabled=config.scientific.common.precision.name == "fp16"
-                )
+                LossScaler(enabled=config.scientific.common.precision.name == "fp16")
                 for _ in range(count)
             ),
         )
         self.generators = tuple(
             torch.Generator(device=self.device).manual_seed(
-                config.scientific.common.seed
-                + lane
-                + self.rank * 1_000_003
+                config.scientific.common.seed + lane + self.rank * 1_000_003
             )
             for lane in range(count)
         )
@@ -249,31 +243,35 @@ class TrainingSession:
             )
             for lane in range(count)
         )
-        self.reference_modules = ReplicaModuleOwner(
-            tuple(
-                copy.deepcopy(self.modules.lane_module(lane))
-                .eval()
-                .requires_grad_(False)
+        reference_config = config.scientific.common.reference
+        if reference_config is None:
+            self.reference_modules: ReplicaModuleOwner | None = None
+            self.reference_operations = (None,) * count
+            self.reference_states: tuple[ReferenceState, ...] | None = None
+        else:
+            self.reference_modules = ReplicaModuleOwner(
+                tuple(
+                    copy.deepcopy(self.modules.lane_module(lane))
+                    .eval()
+                    .requires_grad_(False)
+                    for lane in range(count)
+                )
+            )
+            self.reference_operations = tuple(
+                (
+                    self.reference_modules.lane_module(lane).rb_learner_operation
+                    if rb
+                    else self.reference_modules.lane_module(lane).learner_operation
+                )
                 for lane in range(count)
             )
-        )
-        self.reference_operations = tuple(
-            (
-                self.reference_modules.lane_module(lane).rb_learner_operation
-                if rb
-                else self.reference_modules.lane_module(lane).learner_operation
+            self.reference_states = tuple(
+                ReferenceState(
+                    interval_iterations=reference_config.interval_iterations,
+                    interval_effective_hands=reference_config.interval_effective_hands,
+                )
+                for _ in range(count)
             )
-            for lane in range(count)
-        )
-        self.reference_states = tuple(
-            ReferenceState(
-                interval_iterations=config.scientific.common.reference.interval_iterations,
-                interval_effective_hands=(
-                    config.scientific.common.reference.interval_effective_hands
-                ),
-            )
-            for _ in range(count)
-        )
         frozen = _frozen_state(config)
         self.frozen_inference: PokerReplicaInference | None = None
         if frozen is not None:
@@ -288,31 +286,28 @@ class TrainingSession:
                 module.eval().requires_grad_(False)
                 frozen_modules.append(module)
             self.frozen_inference = PokerReplicaInference(frozen_modules)
-            if (
-                config.scientific.applicable.get("response_initialization")
-                == "target"
-            ):
+            if config.scientific.applicable.get("response_initialization") == "target":
                 for lane in range(count):
-                    self.modules.lane_module(lane).load_state_dict(
-                        frozen, strict=True
-                    )
-                    self.reference_modules.lane_module(lane).load_state_dict(
-                        frozen, strict=True
-                    )
+                    self.modules.lane_module(lane).load_state_dict(frozen, strict=True)
+                    if self.reference_modules is not None:
+                        self.reference_modules.lane_module(lane).load_state_dict(
+                            frozen, strict=True
+                        )
         if self.distributed is not None:
-            for owner in (self.modules, self.reference_modules):
+            owners = (self.modules,) + (
+                (self.reference_modules,) if self.reference_modules is not None else ()
+            )
+            for owner in owners:
                 for lane in range(count):
                     for value in owner.lane_module(lane).state_dict().values():
                         dist.broadcast(value, src=0)
         self.initial_model_sha256 = tuple(
-            model_state_sha256(self.modules.lane_module(lane))
-            for lane in range(count)
+            model_state_sha256(self.modules.lane_module(lane)) for lane in range(count)
         )
         probe = config.scientific.applicable.get("probe")
         if (
             isinstance(probe, dict)
-            and self.initial_model_sha256[0]
-            != probe["initial_model_sha256"]
+            and self.initial_model_sha256[0] != probe["initial_model_sha256"]
         ):
             raise RuntimeError(
                 "probe initial model content hash differs from configuration"
@@ -352,17 +347,13 @@ class TrainingSession:
         expected = [
             {
                 "iteration": iteration,
-                "lanes": [
-                    state.metrics_prefix[iteration] for state in self.run_states
-                ],
+                "lanes": [state.metrics_prefix[iteration] for state in self.run_states],
             }
             for iteration in range(completed)
         ]
         if not path.exists():
             path.write_text(
-                "".join(
-                    json.dumps(row, sort_keys=True) + "\n" for row in expected
-                ),
+                "".join(json.dumps(row, sort_keys=True) + "\n" for row in expected),
                 encoding="utf-8",
             )
             return
@@ -380,14 +371,11 @@ class TrainingSession:
                 "metrics.jsonl is not the checkpoint's exact gap-free prefix"
             )
         if len(records) > completed:
-            backup = path.with_name(
-                f"{path.name}.before_resume_{completed:07d}.bak"
-            )
+            backup = path.with_name(f"{path.name}.before_resume_{completed:07d}.bak")
             if not backup.exists():
                 shutil.copy2(path, backup)
             path.write_text(
-                "\n".join(raw_lines[:completed])
-                + ("\n" if completed else ""),
+                "\n".join(raw_lines[:completed]) + ("\n" if completed else ""),
                 encoding="utf-8",
             )
 
@@ -408,28 +396,28 @@ class TrainingSession:
                 path,
                 model=self.modules.lane_module(0),
                 optimizer=optimizer,
-                reference_model=self.reference_modules.lane_module(0),
+                reference_model=(
+                    None
+                    if self.reference_modules is None
+                    else self.reference_modules.lane_module(0)
+                ),
                 expected_scientific_config=scientific,
                 expected_execution_config=execution,
                 generator=self.generators[0],
             )
             optimizer.scaler = scaler
-            self.reference_states = (reference,)
+            self.reference_states = None if reference is None else (reference,)
             self.run_states = (state,)
         else:
             references, states, _ = load_replica_checkpoint(
                 path,
                 modules=self.modules,
                 optimizers=self.optimizers,
-                expected_scientific_configs=tuple(
-                    scientific for _ in self.run_states
-                ),
+                expected_scientific_configs=tuple(scientific for _ in self.run_states),
                 expected_execution_config=execution,
                 generators=self.generators,
                 reference_modules=self.reference_modules,
             )
-            if references is None:
-                raise RuntimeError("replica resume omitted reference cadence state")
             self.reference_states = references
             self.run_states = states
         if self.controllers:
@@ -442,13 +430,9 @@ class TrainingSession:
                     controller_from_state_dict(state.branch_controller_state)
                 )
                 if state.cost_safeguard_state is None:
-                    raise RuntimeError(
-                        "branched resume omitted cost-safeguard state"
-                    )
+                    raise RuntimeError("branched resume omitted cost-safeguard state")
                 restored_safeguards.append(
-                    CostSafeguardController.from_state_dict(
-                        state.cost_safeguard_state
-                    )
+                    CostSafeguardController.from_state_dict(state.cost_safeguard_state)
                 )
             self.controllers = tuple(restored)
             self.safeguards = tuple(restored_safeguards)
@@ -459,8 +443,7 @@ class TrainingSession:
         distributed = self.distributed is not None and dist.get_world_size() > 1
         local_destination = (
             destination.with_name(
-                f"{destination.stem}.rank_{dist.get_rank():04d}"
-                f"{destination.suffix}"
+                f"{destination.stem}.rank_{dist.get_rank():04d}{destination.suffix}"
             )
             if distributed
             else destination
@@ -471,8 +454,14 @@ class TrainingSession:
                 model=self.modules.lane_module(0),
                 optimizer=self.optimizers.optimizers[0],
                 scaler=self.optimizers.optimizers[0].scaler,
-                reference_model=self.reference_modules.lane_module(0),
-                reference_state=self.reference_states[0],
+                reference_model=(
+                    None
+                    if self.reference_modules is None
+                    else self.reference_modules.lane_module(0)
+                ),
+                reference_state=(
+                    None if self.reference_states is None else self.reference_states[0]
+                ),
                 run_state=self.run_states[0],
                 scientific_config=scientific,
                 execution_config=self.config.execution.mapping(),
@@ -516,9 +505,7 @@ class TrainingSession:
         """Assemble one semantic NLHE bundle without selecting an engine."""
 
         count = self.plan.manifest.n_replica
-        models = tuple(
-            self.modules.lane_module(lane) for lane in range(count)
-        )
+        models = tuple(self.modules.lane_module(lane) for lane in range(count))
         completion_samples = int(
             self.config.scientific.applicable.get("completion_samples", 0)
         )
@@ -528,15 +515,11 @@ class TrainingSession:
             plan=self.plan,
             modes=tuple(self.mode for _ in range(count)),
             models=models,
-            rollout_operations=tuple(
-                model.rollout_operation for model in models
-            ),
+            rollout_operations=tuple(model.rollout_operation for model in models),
             frozen_operations=tuple(
                 None
                 if self.frozen_inference is None
-                else self.frozen_inference.modules.lane_module(
-                    lane
-                ).rollout_operation
+                else self.frozen_inference.modules.lane_module(lane).rollout_operation
                 for lane in range(count)
             ),
             seed=self.config.scientific.common.seed,
@@ -545,9 +528,7 @@ class TrainingSession:
             completion_samples=completion_samples,
             response_cutoff="probe" in self.config.scientific.applicable,
             inference=self.inference if shared_inference else None,
-            frozen_inference=(
-                self.frozen_inference if shared_inference else None
-            ),
+            frozen_inference=(self.frozen_inference if shared_inference else None),
         )
 
     def _iteration_engine(self) -> IterationEngine:
@@ -567,15 +548,9 @@ class TrainingSession:
                 loss=self.config.scientific.common.loss,
                 model=self.modules.lane_module(lane),
                 reference_operation=self.reference_operations[lane],
-                branch_controller=(
-                    self.controllers[lane] if branched else None
-                ),
-                cost_safeguard=(
-                    self.safeguards[lane] if branched else None
-                ),
-                minimum_root_count=(
-                    self.config.scientific.common.root_count_minimum
-                ),
+                branch_controller=(self.controllers[lane] if branched else None),
+                cost_safeguard=(self.safeguards[lane] if branched else None),
+                minimum_root_count=(self.config.scientific.common.root_count_minimum),
                 minimum_tree_size=minimum_tree_size,
             )
             for lane in range(self.plan.manifest.n_replica)
@@ -589,11 +564,10 @@ class TrainingSession:
                 self.config.scientific.common.lambda_,
                 precision=self.config.scientific.common.precision.name,
                 cache_reference_outputs=(
-                    self.config.scientific.common.reference.cache_outputs
+                    self.config.scientific.common.reference is not None
+                    and self.config.scientific.common.reference.cache_outputs
                 ),
-                reproducibility=(
-                    self.config.scientific.common.reproducibility
-                ),
+                reproducibility=(self.config.scientific.common.reproducibility),
                 distributed=self.distributed,
                 benchmark_telemetry=self.benchmark_telemetry,
             ),
@@ -618,15 +592,17 @@ class TrainingSession:
         if len(iterations) != 1:
             raise RuntimeError("all active lanes must enter an iteration together")
         iteration = iterations.pop()
-        reference_refresh_before = []
-        for lane, reference in enumerate(self.reference_states):
-            refresh = reference.refresh_before_iteration(iteration)
-            reference_refresh_before.append(refresh)
-            if refresh:
-                self.reference_modules.lane_module(lane).load_state_dict(
-                    self.modules.lane_module(lane).state_dict(),
-                    strict=True,
-                )
+        reference_refresh_before: list[bool] = []
+        if self.reference_states is not None:
+            assert self.reference_modules is not None
+            for lane, reference in enumerate(self.reference_states):
+                refresh = reference.refresh_before_iteration(iteration)
+                reference_refresh_before.append(refresh)
+                if refresh:
+                    self.reference_modules.lane_module(lane).load_state_dict(
+                        self.modules.lane_module(lane).state_dict(),
+                        strict=True,
+                    )
         result = self._iteration_engine().run(iteration=iteration)
         lane_results = self._lane_results(result)
         local_nodes = [
@@ -660,13 +636,9 @@ class TrainingSession:
             )
         if self.mode.private_estimator.value == "rao_blackwell":
             for lane, state in enumerate(self.run_states):
-                lane_result = (
-                    lane_results[lane] if lane < len(lane_results) else None
-                )
+                lane_result = lane_results[lane] if lane < len(lane_results) else None
                 leaves = int(getattr(lane_result, "leaves", 0))
-                state.logical_work["completion_samples"] += (
-                    leaves * samples_per_leaf
-                )
+                state.logical_work["completion_samples"] += leaves * samples_per_leaf
         if self.distributed is not None:
             lane_totals = torch.tensor(
                 [*local_nodes, *local_effective],
@@ -674,18 +646,15 @@ class TrainingSession:
                 device=self.device,
             )
             gathered = [
-                torch.empty_like(lane_totals)
-                for _ in range(dist.get_world_size())
+                torch.empty_like(lane_totals) for _ in range(dist.get_world_size())
             ]
             dist.all_gather(gathered, lane_totals)
             split = len(self.run_states)
             per_rank_lane_nodes = [
-                [int(item) for item in value[:split].tolist()]
-                for value in gathered
+                [int(item) for item in value[:split].tolist()] for value in gathered
             ]
             per_rank_lane_effective = [
-                [float(item) for item in value[split:].tolist()]
-                for value in gathered
+                [float(item) for item in value[split:].tolist()] for value in gathered
             ]
             per_rank_nodes = [sum(value) for value in per_rank_lane_nodes]
             logical_values = torch.tensor(
@@ -698,8 +667,7 @@ class TrainingSession:
                 device=self.device,
             )
             gathered_logical = [
-                torch.empty_like(logical_values)
-                for _ in range(dist.get_world_size())
+                torch.empty_like(logical_values) for _ in range(dist.get_world_size())
             ]
             dist.all_gather(gathered_logical, logical_values)
         else:
@@ -722,19 +690,14 @@ class TrainingSession:
             per_rank_lane_logical_work.append(
                 [
                     {
-                        name: flat[
-                            lane * len(LOGICAL_WORK_KEYS) + index
-                        ]
+                        name: flat[lane * len(LOGICAL_WORK_KEYS) + index]
                         for index, name in enumerate(LOGICAL_WORK_KEYS)
                     }
                     for lane in range(len(self.run_states))
                 ]
             )
         per_rank_logical_work = [
-            {
-                name: sum(lane[name] for lane in rank_lanes)
-                for name in LOGICAL_WORK_KEYS
-            }
+            {name: sum(lane[name] for lane in rank_lanes) for name in LOGICAL_WORK_KEYS}
             for rank_lanes in per_rank_lane_logical_work
         ]
         global_lane_logical_work = [
@@ -767,9 +730,7 @@ class TrainingSession:
             sum(rank_values[lane] for rank_values in per_rank_lane_effective)
             for lane in range(len(self.run_states))
         ]
-        for lane, (state, reference) in enumerate(
-            zip(self.run_states, self.reference_states, strict=True)
-        ):
+        for lane, state in enumerate(self.run_states):
             lane_result = lane_results[lane] if lane < len(lane_results) else None
             player_nodes = int(
                 getattr(
@@ -778,30 +739,6 @@ class TrainingSession:
                     getattr(lane_result, "nodes", 0),
                 )
             )
-            exposure = float(
-                global_lane_effective[lane]
-                if samples_per_leaf
-                else global_lane_nodes[lane]
-            )
-            reference_before = reference.effective_hands_rollout
-            reference_threshold = reference.interval_effective_hands
-            reference_overshoot = (
-                max(
-                    reference_before + exposure - reference_threshold,
-                    0.0,
-                )
-                if reference_threshold is not None
-                else 0.0
-            )
-            reference_refresh_after = reference.observe(
-                iteration=iteration + 1,
-                effective_hands=exposure,
-            )
-            if reference_refresh_after:
-                self.reference_modules.lane_module(lane).load_state_dict(
-                    self.modules.lane_module(lane).state_dict(),
-                    strict=True,
-                )
             state.iteration = iteration + 1
             if not state.metrics_prefix:
                 raise RuntimeError("learner omitted the iteration metrics row")
@@ -809,16 +746,12 @@ class TrainingSession:
                 {
                     "player_nodes": player_nodes,
                     "leaves": int(getattr(lane_result, "leaves", 0)),
-                    "target_layers": int(
-                        getattr(lane_result, "target_layers", 0)
-                    ),
+                    "target_layers": int(getattr(lane_result, "target_layers", 0)),
                     "mode": self.mode.key,
                     "lane": lane,
                     "rank": dist.get_rank() if self.distributed is not None else 0,
                     "world_size": (
-                        dist.get_world_size()
-                        if self.distributed is not None
-                        else 1
+                        dist.get_world_size() if self.distributed is not None else 1
                     ),
                     "per_rank_player_nodes": per_rank_nodes,
                     "per_rank_lane_player_nodes": per_rank_lane_nodes,
@@ -827,39 +760,11 @@ class TrainingSession:
                     "per_rank_lane_effective_hands": per_rank_lane_effective,
                     "global_lane_effective_hands": global_lane_effective,
                     "logical_work": dict(state.logical_work),
-                    "per_rank_lane_logical_work": (
-                        per_rank_lane_logical_work
-                    ),
+                    "per_rank_lane_logical_work": (per_rank_lane_logical_work),
                     "per_rank_logical_work": per_rank_logical_work,
                     "global_lane_logical_work": global_lane_logical_work,
                     "global_logical_work": global_logical_work,
-                    "reference": reference.state_dict(),
-                    "kl_ref_refresh_before_iteration": (
-                        reference_refresh_before[lane]
-                    ),
-                    "kl_ref_effective_hands_rollout_before": (
-                        reference_before
-                    ),
-                    "kl_ref_effective_hands_rollout_threshold": (
-                        reference_threshold
-                    ),
-                    "kl_ref_refresh_after_iteration": (
-                        reference_refresh_after
-                    ),
-                    "kl_ref_effective_hands_rollout_overshoot": (
-                        reference_overshoot
-                        if reference_refresh_after
-                        else 0.0
-                    ),
-                    "kl_ref_effective_hands_rollout_after": (
-                        reference.effective_hands_rollout
-                    ),
-                    "reference_iteration_next": (
-                        reference.reference_iteration
-                    ),
-                    "structure": dict(
-                        getattr(lane_result, "observability", {})
-                    ),
+                    "structure": dict(getattr(lane_result, "observability", {})),
                     "completion_health": {
                         "leaf_rows": int(getattr(lane_result, "leaves", 0)),
                         "samples_per_leaf": int(
@@ -871,9 +776,7 @@ class TrainingSession:
                             state.logical_work["completion_samples"]
                         ),
                         "posterior_effective_hands": (
-                            global_lane_effective[lane]
-                            if samples_per_leaf
-                            else None
+                            global_lane_effective[lane] if samples_per_leaf else None
                         ),
                     },
                     "memory": {
@@ -884,12 +787,8 @@ class TrainingSession:
                             admission.phase.name: admission.required_bytes
                             for admission in self.plan.admissions
                         },
-                        "allocated_bytes": torch.cuda.memory_allocated(
-                            self.device
-                        ),
-                        "reserved_bytes": torch.cuda.memory_reserved(
-                            self.device
-                        ),
+                        "allocated_bytes": torch.cuda.memory_allocated(self.device),
+                        "reserved_bytes": torch.cuda.memory_reserved(self.device),
                         "peak_allocated_bytes": (
                             torch.cuda.max_memory_allocated(self.device)
                         ),
@@ -909,6 +808,45 @@ class TrainingSession:
                     },
                 }
             )
+            if self.reference_states is not None:
+                assert self.reference_modules is not None
+                reference = self.reference_states[lane]
+                exposure = float(
+                    global_lane_effective[lane]
+                    if samples_per_leaf
+                    else global_lane_nodes[lane]
+                )
+                reference_before = reference.effective_hands_rollout
+                reference_threshold = reference.interval_effective_hands
+                reference_overshoot = (
+                    max(reference_before + exposure - reference_threshold, 0.0)
+                    if reference_threshold is not None
+                    else 0.0
+                )
+                reference_refresh_after = reference.observe(
+                    iteration=iteration + 1,
+                    effective_hands=exposure,
+                )
+                if reference_refresh_after:
+                    self.reference_modules.lane_module(lane).load_state_dict(
+                        self.modules.lane_module(lane).state_dict(), strict=True
+                    )
+                state.metrics_prefix[-1].update(
+                    {
+                        "reference": reference.state_dict(),
+                        "kl_ref_refresh_before_iteration": reference_refresh_before[
+                            lane
+                        ],
+                        "kl_ref_effective_hands_rollout_before": reference_before,
+                        "kl_ref_effective_hands_rollout_threshold": reference_threshold,
+                        "kl_ref_refresh_after_iteration": reference_refresh_after,
+                        "kl_ref_effective_hands_rollout_overshoot": (
+                            reference_overshoot if reference_refresh_after else 0.0
+                        ),
+                        "kl_ref_effective_hands_rollout_after": reference.effective_hands_rollout,
+                        "reference_iteration_next": reference.reference_iteration,
+                    }
+                )
             learner = getattr(lane_result, "learner", None)
             losses = tuple(getattr(learner, "losses", ()))
             if losses:
@@ -920,8 +858,7 @@ class TrainingSession:
             if steps:
                 state.metrics_prefix[-1]["gradient"] = {
                     "finite": all(step.gradients_finite for step in steps),
-                    "norm_mean": sum(step.grad_norm for step in steps)
-                    / len(steps),
+                    "norm_mean": sum(step.grad_norm for step in steps) / len(steps),
                     "norm_max": max(step.grad_norm for step in steps),
                     "clip_scale_min": min(step.clip_scale for step in steps),
                     "applied_steps": sum(int(step.applied) for step in steps),
@@ -982,8 +919,7 @@ class TrainingSession:
                         )
                     if checkpointable:
                         self.checkpoint(
-                            output
-                            / f"failure_checkpoint_{iteration:08d}.pt"
+                            output / f"failure_checkpoint_{iteration:08d}.pt"
                         )
                     if local_error is not None:
                         raise local_error
@@ -1010,13 +946,10 @@ class TrainingSession:
                         )
                 stop_requested = self._agree_flag(notice.requested)
                 checkpoint_due = (
-                    (iteration + 1) % self.config.execution.checkpoint_every == 0
-                    or stop_requested
-                )
+                    iteration + 1
+                ) % self.config.execution.checkpoint_every == 0 or stop_requested
                 if checkpoint_due:
-                    self.checkpoint(
-                        output / f"checkpoint_{iteration + 1:08d}.pt"
-                    )
+                    self.checkpoint(output / f"checkpoint_{iteration + 1:08d}.pt")
                 del result
                 if stop_requested:
                     break
@@ -1027,9 +960,7 @@ class TrainingSession:
     def _agree_flag(self, value: bool) -> bool:
         if self.distributed is None:
             return bool(value)
-        flag = torch.tensor(
-            [int(value)], dtype=torch.int32, device=self.device
-        )
+        flag = torch.tensor([int(value)], dtype=torch.int32, device=self.device)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
         return bool(flag.item())
 

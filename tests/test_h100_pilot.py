@@ -180,6 +180,7 @@ def test_model_only_initializer_reaches_every_replica_and_reference() -> None:
     try:
         expected = model_state_sha256(state)
         assert target.initial_model_sha256 == (expected, expected)
+        assert target.reference_modules is not None
         assert tuple(
             model_state_sha256(target.reference_modules.lane_module(lane))
             for lane in range(2)

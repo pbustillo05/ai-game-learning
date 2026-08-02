@@ -53,6 +53,7 @@ from pbg.games.poker.queued.hooks import (
 from pbg.games.poker.queued.observability import topology_diagnostics
 from pbg.games.poker.queued.policy import PokerPolicyOperator
 from pbg.games.poker.queued.rb_sampling import (
+    POSTERIOR_MAX_ATTEMPTS,
     CollisionConditionedProfileSampler,
 )
 from pbg.games.poker.queued.replica import PokerReplicaInference
@@ -87,9 +88,10 @@ def balanced_response_roles(
         raise ValueError("players must be an integer of at least two")
     base = logical_roots.amin()
     ordinal = logical_roots - base
-    if int(ordinal.amax()) + 1 != logical_roots.numel() or int(
-        torch.unique(logical_roots).numel()
-    ) != logical_roots.numel():
+    if (
+        int(ordinal.amax()) + 1 != logical_roots.numel()
+        or int(torch.unique(logical_roots).numel()) != logical_roots.numel()
+    ):
         raise ValueError("logical roots must form one contiguous interval")
     seats = torch.arange(players, dtype=torch.int64, device=logical_roots.device)
     keys = logical_rng_keys(
@@ -125,7 +127,6 @@ class PokerOperations:
         utility: str,
         completion_samples: int,
         response_cutoff: bool = False,
-        posterior_max_attempts: int = 256,
         inference: PokerReplicaInference | None = None,
         frozen_inference: PokerReplicaInference | None = None,
     ) -> None:
@@ -141,7 +142,6 @@ class PokerOperations:
         self.utility = utility
         self.completion_samples = int(completion_samples)
         self.response_cutoff = response_cutoff
-        self.posterior_max_attempts = int(posterior_max_attempts)
         self.inference = inference
         self.frozen_inference = frozen_inference
         self.policy = PokerPolicyOperator()
@@ -157,8 +157,7 @@ class PokerOperations:
             raise ValueError("poker operation lanes are not aligned")
         validate_replica_group(self.modes)
         if plan.mode != self.modes[0] or any(
-            not mode.physically_compatible_with(plan.mode)
-            for mode in self.modes
+            not mode.physically_compatible_with(plan.mode) for mode in self.modes
         ):
             raise ValueError("poker operation modes differ from storage")
         if plan.manifest.geometry.actor_count != geometry.players:
@@ -168,9 +167,7 @@ class PokerOperations:
             != (geometry.model_input_width(partition.name),)
             for partition in plan.partitions.inputs
         ):
-            raise ValueError(
-                "family model-input layout differs from poker geometry"
-            )
+            raise ValueError("family model-input layout differs from poker geometry")
         if precision not in ("fp32", "fp16", "bf16"):
             raise ValueError("poker precision is invalid")
         if utility not in ("raw_bb", "stack_normalized"):
@@ -179,8 +176,7 @@ class PokerOperations:
             raise TypeError("response_cutoff must be bool")
         if response_cutoff and (
             plan.mode.training_regime is not TrainingRegime.BEST_RESPONSE
-            or plan.mode.private_estimator
-            is not PrivateEstimator.RAO_BLACKWELL
+            or plan.mode.private_estimator is not PrivateEstimator.RAO_BLACKWELL
             or plan.mode.rollout_mode.is_branched
         ):
             raise ValueError("response cutoff requires sequential BR/RB")
@@ -189,8 +185,6 @@ class PokerOperations:
             and completion_samples <= 0
         ):
             raise ValueError("RB poker requires positive completion samples")
-        if posterior_max_attempts <= 0:
-            raise ValueError("posterior_max_attempts must be positive")
         if (
             any(
                 mode.training_regime is TrainingRegime.BEST_RESPONSE
@@ -209,9 +203,7 @@ class PokerOperations:
             frozen_inference.modules.n_replica != count
             or frozen_inference.modules.device != plan.device
         ):
-            raise ValueError(
-                "frozen replica inference differs from the storage plan"
-            )
+            raise ValueError("frozen replica inference differs from the storage plan")
 
     def _direct_evaluation(
         self,
@@ -243,9 +235,7 @@ class PokerOperations:
                 role_selector=forward.role_selector,
             )
         if not isinstance(result, ModelEvaluation):
-            raise PokerOperationsError(
-                "rollout model returned the wrong contract"
-            )
+            raise PokerOperationsError("rollout model returned the wrong contract")
         return result
 
     def _replica_evaluation(
@@ -289,23 +279,19 @@ class PokerOperations:
             width = int(count.max().item())
             if width == 0:
                 return None
-            ordinal = torch.arange(
-                rows, dtype=torch.int64, device=self.plan.device
-            )[None].expand(lane_count, -1)
+            ordinal = torch.arange(rows, dtype=torch.int64, device=self.plan.device)[
+                None
+            ].expand(lane_count, -1)
             packed_row = torch.argsort(
                 torch.where(selected, ordinal, rows + ordinal),
                 dim=1,
                 stable=True,
             )[:, :width]
             valid = (
-                torch.arange(
-                    width, dtype=torch.int64, device=self.plan.device
-                )[None]
+                torch.arange(width, dtype=torch.int64, device=self.plan.device)[None]
                 < count[:, None]
             )
-            packed_row = torch.where(
-                valid, packed_row, torch.zeros_like(packed_row)
-            )
+            packed_row = torch.where(valid, packed_row, torch.zeros_like(packed_row))
             lane_row = torch.arange(
                 lane_count, dtype=torch.int64, device=self.plan.device
             )[:, None]
@@ -329,10 +315,7 @@ class PokerOperations:
             )
             return ModelEvaluation(
                 MappingProxyType(
-                    {
-                        name: flatten(value)
-                        for name, value in result.policy_raw.items()
-                    }
+                    {name: flatten(value) for name, value in result.policy_raw.items()}
                 ),
                 flatten(result.value),
                 MappingProxyType(
@@ -343,9 +326,7 @@ class PokerOperations:
                 ),
             )
         if self.frozen_inference is None or role is None:
-            raise PokerOperationsError(
-                "replica best response omitted its frozen role"
-            )
+            raise PokerOperationsError("replica best response omitted its frozen role")
         trained = owner.eq(role)
         learned = evaluate(self.inference, trained)
         frozen = evaluate(self.frozen_inference, ~trained)
@@ -359,9 +340,7 @@ class PokerOperations:
         ) -> Tensor:
             source = learned_value if learned_value is not None else frozen_value
             assert source is not None
-            output = source.new_empty(
-                (lane_count, rows, *source.shape[2:])
-            )
+            output = source.new_empty((lane_count, rows, *source.shape[2:]))
             for value, packed in (
                 (learned_value, learned),
                 (frozen_value, frozen),
@@ -381,12 +360,8 @@ class PokerOperations:
             MappingProxyType(
                 {
                     name: restore(
-                        None
-                        if learned is None
-                        else learned[0].policy_raw[name],
-                        None
-                        if frozen is None
-                        else frozen[0].policy_raw[name],
+                        None if learned is None else learned[0].policy_raw[name],
+                        None if frozen is None else frozen[0].policy_raw[name],
                     )
                     for name in prototype.policy_raw
                 }
@@ -398,12 +373,8 @@ class PokerOperations:
             MappingProxyType(
                 {
                     name: restore(
-                        None
-                        if learned is None
-                        else learned[0].public_heads[name],
-                        None
-                        if frozen is None
-                        else frozen[0].public_heads[name],
+                        None if learned is None else learned[0].public_heads[name],
+                        None if frozen is None else frozen[0].public_heads[name],
                     )
                     for name in prototype.public_heads
                 }
@@ -423,9 +394,7 @@ class PokerOperations:
             "bf16": torch.bfloat16,
         }[self.precision]
         if self.precision == "bf16" and not torch.cuda.is_bf16_supported():
-            raise PokerOperationsError(
-                "selected CUDA device does not support BF16"
-            )
+            raise PokerOperationsError("selected CUDA device does not support BF16")
         with torch.autocast(
             device_type="cuda",
             dtype=autocast_dtype,
@@ -439,8 +408,7 @@ class PokerOperations:
         return MappingProxyType(
             {
                 **{
-                    name: value.float()
-                    for name, value in evaluation.policy_raw.items()
+                    name: value.float() for name, value in evaluation.policy_raw.items()
                 },
                 "value": evaluation.value.float(),
                 **{
@@ -475,24 +443,16 @@ class PokerOperations:
             device=request.plan.device,
         )
         values: dict[str, Tensor] = {
-            "logical_rng_key": torch.stack(
-                (logical, torch.zeros_like(logical)), dim=1
-            ),
+            "logical_rng_key": torch.stack((logical, torch.zeros_like(logical)), dim=1),
             "true_profile": state.combo_ids,
             "model_input": machine.direct_model_input(
                 request.destination.input_type, state
             ),
             "owner": state.to_act,
         }
-        if (
-            request.plan.mode.private_estimator
-            is PrivateEstimator.SAMPLED
-        ):
+        if request.plan.mode.private_estimator is PrivateEstimator.SAMPLED:
             values["sampled_private_state"] = state.combo_ids
-        if (
-            request.plan.mode.training_regime
-            is TrainingRegime.BEST_RESPONSE
-        ):
+        if request.plan.mode.training_regime is TrainingRegime.BEST_RESPONSE:
             values["role_selector"] = balanced_response_roles(
                 logical,
                 players=self.geometry.players,
@@ -578,11 +538,7 @@ class PokerOperations:
                     for lane in range(count)
                 )
             else:
-                cohort_model = (
-                    lambda forward, lanes: self._model(
-                        0, forward, lanes
-                    )
-                )
+                cohort_model = lambda forward, lanes: self._model(0, forward, lanes)
                 models = tuple(cohort_model for _lane in range(count))
             return GameRollout(
                 tuple(hooks for _lane in range(count)),
@@ -594,16 +550,14 @@ class PokerOperations:
         for lane in range(count):
             controller = request.controllers[lane]
             if controller is None:
-                raise PokerOperationsError(
-                    "branched rollout omitted its controller"
-                )
+                raise PokerOperationsError("branched rollout omitted its controller")
             mode = self.modes[lane]
             posterior = (
                 None
                 if mode.private_estimator is PrivateEstimator.SAMPLED
                 else CollisionConditionedProfileSampler(
                     self.geometry,
-                    max_attempts=self.posterior_max_attempts,
+                    max_attempts=POSTERIOR_MAX_ATTEMPTS,
                 )
             )
             hooks = BranchedSampledPokerHooks(
@@ -634,9 +588,7 @@ class PokerOperations:
                 topology_rows_per_root
                 > request.owners.plan.manifest.topology_packet_cap
             ):
-                raise ValueError(
-                    "topology packet cannot cover one maximal poker root"
-                )
+                raise ValueError("topology packet cannot cover one maximal poker root")
             hooks_by_lane.append(hooks)
             max_prefix.append(
                 min(
@@ -661,14 +613,10 @@ class PokerOperations:
             ),
             tuple(max_prefix),
             begin_refill=begin_refill,
-            routing_traffic=(
-                lambda lane: hooks_by_lane[lane].routing_traffic_bytes
-            ),
+            routing_traffic=(lambda lane: hooks_by_lane[lane].routing_traffic_bytes),
         )
 
-    def rollout_failure(
-        self, lane: int, failure: DeviceFailure | None
-    ) -> Exception:
+    def rollout_failure(self, lane: int, failure: DeviceFailure | None) -> Exception:
         del lane
         if failure is not None and failure.failure_code == "rejection_exhausted":
             return BranchedPosteriorExhaustion(failure)
@@ -684,12 +632,10 @@ class PokerOperations:
         rank = cards.long() // 4 - (13 - ranks)
         high, low = rank.max(1).values, rank.min(1).values
         hp, lp = ranks - 1 - high, ranks - 1 - low
-        suited_or_pair = rank[:, 0].eq(rank[:, 1]) | cards[
-            :, 0
-        ].remainder(4).eq(cards[:, 1].remainder(4))
-        classes = torch.where(
-            suited_or_pair, hp * ranks + lp, lp * ranks + hp
+        suited_or_pair = rank[:, 0].eq(rank[:, 1]) | cards[:, 0].remainder(4).eq(
+            cards[:, 1].remainder(4)
         )
+        classes = torch.where(suited_or_pair, hp * ranks + lp, lp * ranks + hp)
         return TargetAlgebra(
             plan.partitions,
             (
@@ -715,10 +661,7 @@ class PokerOperations:
             return GameCompletion(binding.leaf_to_layer_work)
         binding = RBCompletionBinding(
             self.geometry,
-            {
-                name: owners.slab("LayerWork", name)
-                for name in ("pre", "post")
-            },
+            {name: owners.slab("LayerWork", name) for name in ("pre", "post")},
             context.algebra,
             mode=owners.plan.mode,
             n_replica=count,
@@ -732,9 +675,7 @@ class PokerOperations:
                 {
                     "posterior_effective_hands": tuple(
                         float(value)
-                        for value in binding.effective_hands.detach()
-                        .cpu()
-                        .tolist()
+                        for value in binding.effective_hands.detach().cpu().tolist()
                     )
                 }
             )

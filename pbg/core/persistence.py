@@ -20,9 +20,9 @@ from pbg.core.execution_manifest import (
 from pbg.core.learner import ReferenceState
 from pbg.core.optimization import DenseAdam, LossScaler
 
-CHECKPOINT_SCHEMA = "pbg-queued-checkpoint-v2"
-REPLICA_CHECKPOINT_SCHEMA = "pbg-queued-replica-checkpoint-v2"
-DISTRIBUTED_CHECKPOINT_SCHEMA = "pbg-queued-distributed-checkpoint-v1"
+CHECKPOINT_SCHEMA = "pbg-queued-checkpoint-v3"
+REPLICA_CHECKPOINT_SCHEMA = "pbg-queued-replica-checkpoint-v3"
+DISTRIBUTED_CHECKPOINT_SCHEMA = "pbg-queued-distributed-checkpoint-v2"
 
 
 class PersistenceError(RuntimeError):
@@ -179,8 +179,8 @@ def save_checkpoint(
     model: nn.Module,
     optimizer: DenseAdam,
     scaler: LossScaler,
-    reference_model: nn.Module,
-    reference_state: ReferenceState,
+    reference_model: nn.Module | None,
+    reference_state: ReferenceState | None,
     run_state: RunState,
     scientific_config: Mapping[str, object],
     execution_config: Mapping[str, object],
@@ -192,6 +192,8 @@ def save_checkpoint(
         resolved_execution = validate_execution_manifest(execution_config)
     except ExecutionManifestError as exc:
         raise PersistenceError(str(exc)) from exc
+    if (reference_model is None) != (reference_state is None):
+        raise ValueError("reference model and cadence state must be owned together")
     state = {
         "checkpoint_schema": CHECKPOINT_SCHEMA,
         "scientific_config": dict(scientific_config),
@@ -200,8 +202,6 @@ def save_checkpoint(
         "model": _clone_cpu(model.state_dict()),
         "optimizer": _clone_cpu(optimizer.state_dict()),
         "scaler": scaler.state_dict(),
-        "reference_model": _clone_cpu(reference_model.state_dict()),
-        "reference_state": reference_state.state_dict(),
         "run_state": run_state.state_dict(),
         "explicit_rng": generator.get_state().cpu(),
         "ambient_cpu_rng": torch.get_rng_state(),
@@ -209,6 +209,9 @@ def save_checkpoint(
             value.cpu() for value in torch.cuda.get_rng_state_all()
         ),
     }
+    if reference_model is not None and reference_state is not None:
+        state["reference_model"] = _clone_cpu(reference_model.state_dict())
+        state["reference_state"] = reference_state.state_dict()
     destination = Path(path)
     _atomic_torch_save(state, destination)
     return sha256_file(destination)
@@ -222,13 +225,12 @@ _CHECKPOINT_FIELDS = {
     "model",
     "optimizer",
     "scaler",
-    "reference_model",
-    "reference_state",
     "run_state",
     "explicit_rng",
     "ambient_cpu_rng",
     "ambient_cuda_rng",
 }
+_REFERENCE_FIELDS = {"reference_model", "reference_state"}
 
 _RUN_STATE_FIELDS = {
     "run_id",
@@ -261,13 +263,19 @@ def validate_checkpoint_payload(state: object) -> dict[str, object]:
         raise PersistenceError("checkpoint payload must be a mapping")
     schema = state.get("checkpoint_schema")
     if schema == CHECKPOINT_SCHEMA:
-        if set(state) != _CHECKPOINT_FIELDS:
+        if set(state) not in (
+            _CHECKPOINT_FIELDS,
+            _CHECKPOINT_FIELDS | _REFERENCE_FIELDS,
+        ):
             raise PersistenceError("checkpoint has unknown or missing top-level fields")
         configs = (state["scientific_config"],)
         hashes = (state["scientific_sha256"],)
         runs = (state["run_state"],)
     elif schema == REPLICA_CHECKPOINT_SCHEMA:
-        if set(state) != _REPLICA_CHECKPOINT_FIELDS:
+        if set(state) not in (
+            _REPLICA_CHECKPOINT_FIELDS,
+            _REPLICA_CHECKPOINT_FIELDS | _REFERENCE_FIELDS,
+        ):
             raise PersistenceError(
                 "replica checkpoint has unknown or missing top-level fields"
             )
@@ -283,12 +291,9 @@ def validate_checkpoint_payload(state: object) -> dict[str, object]:
         ):
             raise PersistenceError("replica checkpoint lanes are not aligned")
     else:
-        raise PersistenceError(
-            "unsupported checkpoint schema"
-        )
+        raise PersistenceError("unsupported checkpoint schema")
     if any(
-        not isinstance(config, Mapping)
-        or digest != _canonical_hash(config)
+        not isinstance(config, Mapping) or digest != _canonical_hash(config)
         for config, digest in zip(configs, hashes, strict=True)
     ):
         raise PersistenceError("checkpoint scientific configuration hash is invalid")
@@ -306,21 +311,19 @@ def load_checkpoint(
     *,
     model: nn.Module,
     optimizer: DenseAdam,
-    reference_model: nn.Module,
+    reference_model: nn.Module | None,
     expected_scientific_config: Mapping[str, object],
     expected_execution_config: Mapping[str, object],
     generator: torch.Generator,
     restore_ambient_rng: bool = True,
-) -> tuple[LossScaler, ReferenceState, RunState, Mapping[str, object]]:
+) -> tuple[LossScaler, ReferenceState | None, RunState, Mapping[str, object]]:
     """Strictly resume current state; retired schemas are never loaded here."""
 
     state = validate_checkpoint_payload(
         torch.load(path, map_location="cpu", weights_only=False)
     )
     if state["checkpoint_schema"] != CHECKPOINT_SCHEMA:
-        raise PersistenceError(
-            "unsupported checkpoint schema"
-        )
+        raise PersistenceError("unsupported checkpoint schema")
     expected_hash = _canonical_hash(expected_scientific_config)
     if state["scientific_sha256"] != expected_hash or state[
         "scientific_config"
@@ -333,11 +336,19 @@ def load_checkpoint(
     except ExecutionManifestError as exc:
         raise PersistenceError(f"resume rejected execution drift: {exc}") from exc
     model.load_state_dict(state["model"], strict=True)
-    reference_model.load_state_dict(state["reference_model"], strict=True)
+    owns_reference = "reference_model" in state
+    if owns_reference != (reference_model is not None):
+        raise PersistenceError("checkpoint reference ownership differs")
+    if reference_model is not None:
+        reference_model.load_state_dict(state["reference_model"], strict=True)
     optimizer.load_state_dict(state["optimizer"])
     scaler = LossScaler.from_state_dict(state["scaler"])
     optimizer.scaler = scaler
-    reference = ReferenceState.from_state_dict(state["reference_state"])
+    reference = (
+        ReferenceState.from_state_dict(state["reference_state"])
+        if owns_reference
+        else None
+    )
     run_data = state["run_state"]
     run = _validate_run_state_mapping(run_data)
     generator.set_state(state["explicit_rng"])
@@ -414,16 +425,6 @@ def save_replica_checkpoint(
         "execution_config": resolved_execution,
         "model": _clone_cpu(modules.state_dict()),
         "optimizer": _clone_cpu(optimizers.state_dict()),
-        "reference_model": (
-            None
-            if reference_modules is None
-            else _clone_cpu(reference_modules.state_dict())
-        ),
-        "reference_state": (
-            None
-            if reference_states is None
-            else tuple(value.state_dict() for value in reference_states)
-        ),
         "run_state": tuple(value.state_dict() for value in run_states),
         "explicit_rng": tuple(generator.get_state().cpu() for generator in generators),
         "ambient_cpu_rng": torch.get_rng_state(),
@@ -431,6 +432,11 @@ def save_replica_checkpoint(
             value.cpu() for value in torch.cuda.get_rng_state_all()
         ),
     }
+    if reference_modules is not None and reference_states is not None:
+        state["reference_model"] = _clone_cpu(reference_modules.state_dict())
+        state["reference_state"] = tuple(
+            value.state_dict() for value in reference_states
+        )
     destination = Path(path)
     _atomic_torch_save(state, destination)
     return sha256_file(destination)
@@ -444,8 +450,6 @@ _REPLICA_CHECKPOINT_FIELDS = {
     "execution_config",
     "model",
     "optimizer",
-    "reference_model",
-    "reference_state",
     "run_state",
     "explicit_rng",
     "ambient_cpu_rng",
@@ -499,18 +503,18 @@ def load_replica_checkpoint(
             state["execution_config"], expected=expected_execution_config
         )
     except ExecutionManifestError as exc:
-        raise PersistenceError(f"replica resume rejected execution drift: {exc}") from exc
+        raise PersistenceError(
+            f"replica resume rejected execution drift: {exc}"
+        ) from exc
     modules.load_state_dict(state["model"])
     optimizers.load_state_dict(state["optimizer"])
-    stored_reference = state["reference_model"]
-    stored_reference_states = state["reference_state"]
-    if (
-        (stored_reference is None) != (reference_modules is None)
-        or (stored_reference_states is None) != (reference_modules is None)
-    ):
+    owns_reference = "reference_model" in state
+    if owns_reference != (reference_modules is not None):
         raise PersistenceError("replica reference ownership differs")
     references: tuple[ReferenceState, ...] | None = None
     if reference_modules is not None:
+        stored_reference = state["reference_model"]
+        stored_reference_states = state["reference_state"]
         if (
             not isinstance(reference_modules, ReplicaModuleOwner)
             or reference_modules.n_replica != count
@@ -612,17 +616,18 @@ def load_distributed_checkpoint_manifest(
     ):
         raise PersistenceError("distributed checkpoint manifest is invalid")
     expected = dict(expected_scientific_config)
-    if (
-        state["scientific_config"] != expected
-        or state["scientific_sha256"] != _canonical_hash(expected)
-    ):
+    if state["scientific_config"] != expected or state[
+        "scientific_sha256"
+    ] != _canonical_hash(expected):
         raise PersistenceError("distributed resume rejected scientific drift")
     try:
         validate_execution_manifest(
             state["execution_config"], expected=expected_execution_config
         )
     except ExecutionManifestError as exc:
-        raise PersistenceError(f"distributed resume rejected execution drift: {exc}") from exc
+        raise PersistenceError(
+            f"distributed resume rejected execution drift: {exc}"
+        ) from exc
     files = state["rank_files"]
     hashes = state["rank_sha256"]
     if (
@@ -639,7 +644,6 @@ def load_distributed_checkpoint_manifest(
     ):
         raise PersistenceError("distributed checkpoint rank hash differs")
     return paths
-
 
 
 __all__ = [

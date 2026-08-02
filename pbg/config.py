@@ -18,7 +18,13 @@ import yaml
 from pbg.core.capacity import CapacityManifest, PhysicalLayout
 from pbg.core.contracts import mode_schema
 from pbg.core.execution_manifest import seal_execution_manifest
-from pbg.core.learner import LearnerSchedule, LossConfig
+from pbg.core.learner import (
+    BranchingLossConfig,
+    EntropyLossConfig,
+    LearnerSchedule,
+    LossConfig,
+    ValueLossConfig,
+)
 from pbg.core.optimization import OptimizerConfig
 from pbg.games.poker.queued.capacity_compiler import (
     CAPACITY_DERIVATION_VERSION,
@@ -28,7 +34,7 @@ from pbg.games.poker.queued.capacity_compiler import (
 from pbg.games.poker.queued.config import (
     BranchedModeConfig,
     PokerGameConfig,
-    PokerModelConfig,
+    PokerModelSpec,
     PokerScientificConfig,
     PrecisionConfig,
     ReferenceConfig,
@@ -231,7 +237,6 @@ class ExecutionConfig:
                     for name in (
                         "player_count",
                         "stratum_count",
-                        "evaluator_private_width",
                         "reference_cache_bytes",
                         "field_alignment",
                     )
@@ -346,7 +351,7 @@ def _parse_model(
 
 def _parse_objective(
     value: object, *, branched: bool
-) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+) -> tuple[LossConfig, dict[str, object] | None, dict[str, object]]:
     source = _object(value, "root.scientific.objective")
     allowed = {"policy_clip", "value", "entropy", "reference_kl", "branching"}
     _closed(source, allowed, "root.scientific.objective")
@@ -378,13 +383,9 @@ def _parse_objective(
     if entropy_kind not in ("constant", "linear_decay"):
         raise ConfigError("root.scientific.objective.entropy.kind: invalid schedule")
 
-    reference_internal = {
-        "interval_iterations": 1,
-        "interval_effective_hands": None,
-        "cache_outputs": False,
-    }
+    reference_internal: dict[str, object] | None = None
     reference_canonical: dict[str, object] | None = None
-    reference_coefficient = 0.0
+    reference_coefficient: float | None = None
     if "reference_kl" in source:
         reference = _object(
             source["reference_kl"], "root.scientific.objective.reference_kl"
@@ -448,23 +449,63 @@ def _parse_objective(
             "root.scientific.objective.branching: inapplicable to sequential rollout"
         )
     else:
-        values = {
-            "trace_coefficient": 0.0,
-            "cost_coefficient": 0.0,
-            "trace_epsilon": 1.0e-6,
-        }
+        values = None
 
-    loss = {
-        "clip_epsilon": source["policy_clip"],
-        "value_clip_epsilon": value_spec.get("epsilon", 0.0),
-        "value_coefficient": value_spec["coefficient"],
-        "entropy_coefficient": entropy["coefficient"],
-        "reference_kl_coefficient": reference_coefficient,
-        "value_loss": kind,
-        "entropy_schedule": entropy_kind,
-        "entropy_decay_iterations": entropy.get("iterations"),
-        **values,
-    }
+    loss = LossConfig(
+        policy_clip=_number(
+            source["policy_clip"], "root.scientific.objective.policy_clip"
+        ),
+        value=ValueLossConfig(
+            kind=str(kind),
+            coefficient=_number(
+                value_spec["coefficient"],
+                "root.scientific.objective.value.coefficient",
+            ),
+            epsilon=(
+                _number(
+                    value_spec["epsilon"],
+                    "root.scientific.objective.value.epsilon",
+                )
+                if kind == "clipped"
+                else None
+            ),
+        ),
+        entropy=EntropyLossConfig(
+            kind=str(entropy_kind),
+            coefficient=_number(
+                entropy["coefficient"],
+                "root.scientific.objective.entropy.coefficient",
+            ),
+            iterations=(
+                _positive_int(
+                    entropy["iterations"],
+                    "root.scientific.objective.entropy.iterations",
+                )
+                if entropy_kind == "linear_decay"
+                else None
+            ),
+        ),
+        reference_kl_coefficient=reference_coefficient,
+        branching=(
+            BranchingLossConfig(
+                trace_coefficient=_number(
+                    values["trace_coefficient"],
+                    "root.scientific.objective.branching.trace_coefficient",
+                ),
+                cost_coefficient=_number(
+                    values["cost_coefficient"],
+                    "root.scientific.objective.branching.cost_coefficient",
+                ),
+                trace_epsilon=_number(
+                    values["trace_epsilon"],
+                    "root.scientific.objective.branching.trace_epsilon",
+                    positive=True,
+                ),
+            )
+            if values is not None
+            else None
+        ),
+    )
     canonical: dict[str, object] = {
         "policy_clip": source["policy_clip"],
         "value": dict(value_spec),
@@ -473,6 +514,7 @@ def _parse_objective(
     if reference_canonical is not None:
         canonical["reference_kl"] = reference_canonical
     if branched:
+        assert values is not None
         canonical["branching"] = dict(values)
     return loss, reference_internal, canonical
 
@@ -513,7 +555,7 @@ def _parse_schedule(value: object) -> tuple[dict[str, object], dict[str, object]
     batch = _positive_int(source["batch_size"], "root.scientific.schedule.batch_size")
     if "steps" in source:
         count = _positive_int(source["steps"], "root.scientific.schedule.steps")
-        return {"batch_size": batch, "epochs": 1, "gradient_steps": count}, {
+        return {"batch_size": batch, "epochs": None, "gradient_steps": count}, {
             "batch_size": batch,
             "steps": count,
         }
@@ -638,7 +680,9 @@ def _parse_branching(
         positive=True,
     )
     if minimum_scale > 1 or backoff >= 1:
-        raise ConfigError("root.run.recovery: branch recovery factors must lie in (0,1]")
+        raise ConfigError(
+            "root.run.recovery: branch recovery factors must lie in (0,1]"
+        )
     internal: dict[str, object] = {
         "fixed_beta": fixed_beta,
         "beta_max": beta_values if isinstance(beta, Mapping) else beta_max,
@@ -708,7 +752,9 @@ def _parse_branching(
             or kappa_min > kappa_max
             or not math.log(kappa_min) <= log_kappa <= math.log(kappa_max)
         ):
-            raise ConfigError("root.scientific.branching.kkt: controller bounds are invalid")
+            raise ConfigError(
+                "root.scientific.branching.kkt: controller bounds are invalid"
+            )
         validated_kkt = {
             **kkt,
             "warmup_iterations": warmup,
@@ -1019,9 +1065,9 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
             "root.run.execution.distributed: differs from launcher WORLD_SIZE"
         )
 
-    reference_coefficient = float(loss["reference_kl_coefficient"])
+    reference_coefficient = loss.reference_kl_coefficient
     cache_policy = execution_source.get("reference_cache", "off")
-    if reference_coefficient == 0 and cache_policy != "off":
+    if reference_coefficient is None and cache_policy != "off":
         raise ConfigError("root.run.execution.reference_cache: requires reference_kl")
     if cache_policy == "off":
         cache_bytes = 0
@@ -1030,6 +1076,7 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
         total = int(torch.cuda.get_device_properties(device).total_memory)
         cache_bytes = max(1, (total - reserve_bytes) // 20)
         canonical_cache = "auto"
+        assert reference is not None
         reference["cache_outputs"] = True
     else:
         cache = _object(cache_policy, "root.run.execution.reference_cache")
@@ -1039,17 +1086,18 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
             cache["budget_bytes"], "root.run.execution.reference_cache.budget_bytes"
         )
         canonical_cache = {"budget_bytes": cache_bytes}
+        assert reference is not None
         reference["cache_outputs"] = True
 
     try:
         common = PokerScientificConfig(
             game=PokerGameConfig(**game),
-            model=PokerModelConfig(**model),
-            loss=LossConfig(**loss),
+            model=PokerModelSpec(**model),
+            loss=loss,
             optimizer=OptimizerConfig(**optimizer),
             schedule=LearnerSchedule(**schedule),
             precision=PrecisionConfig(name=str(precision)),
-            reference=ReferenceConfig(**reference),
+            reference=(ReferenceConfig(**reference) if reference is not None else None),
             lambda_=scientific_source["lambda"],
             root_count=roots,
             root_count_minimum=minimum_roots,
@@ -1272,7 +1320,9 @@ def validate_scientific_mapping(value: Mapping[str, object]) -> dict[str, object
     game = _object(source["game"], "scientific.game")
     try:
         geometry = NLHEGeometry(
-            game["players"], game["stack_bb"], game["rank_count"]  # type: ignore[arg-type]
+            game["players"],
+            game["stack_bb"],
+            game["rank_count"],  # type: ignore[arg-type]
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"scientific.game: {exc}") from exc
@@ -1303,7 +1353,9 @@ def validate_scientific_mapping(value: Mapping[str, object]) -> dict[str, object
         raise ConfigError("scientific.completion: inapplicable to sampled mode")
     response = schema.training_regime.value == "best_response"
     if response != ("response_initialization" in source):
-        raise ConfigError("scientific.response_initialization: mode applicability mismatch")
+        raise ConfigError(
+            "scientific.response_initialization: mode applicability mismatch"
+        )
     run = _object(source["run"], "scientific.run")
     run_allowed = {
         "seed",
@@ -1369,7 +1421,10 @@ def validate_scientific_mapping(value: Mapping[str, object]) -> dict[str, object
             probe_fields = {"target_sha256", "initial_model_sha256"}
             _closed(probe, probe_fields, "scientific.probe")
             _required(probe, probe_fields, "scientific.probe")
-            if _sha256(probe["target_sha256"], "scientific.probe.target_sha256") != frozen_sha:
+            if (
+                _sha256(probe["target_sha256"], "scientific.probe.target_sha256")
+                != frozen_sha
+            ):
                 raise ConfigError("scientific.probe.target_sha256: differs from frozen")
             _sha256(
                 probe["initial_model_sha256"],

@@ -27,9 +27,7 @@ def _lane_values(
     count: int,
 ) -> tuple[object, ...]:
     return (
-        tuple(first for _lane in range(count))
-        if explicit is None
-        else tuple(explicit)
+        tuple(first for _lane in range(count)) if explicit is None else tuple(explicit)
     )
 
 
@@ -77,23 +75,14 @@ def _sequential_engine(
     models = (
         (model,)
         if replica_inference is None
-        else tuple(
-            replica_inference.modules.lane_module(lane)
-            for lane in range(count)
-        )
+        else tuple(replica_inference.modules.lane_module(lane) for lane in range(count))
     )
-    model_operations = _lane_values(
-        replica_model_operations, model_operation, count
-    )
+    model_operations = _lane_values(replica_model_operations, model_operation, count)
     losses = _lane_values(replica_losses, loss, count)
     generators = _lane_values(replica_generators, generator, count)
     run_states = _lane_values(replica_run_states, run_state, count)
-    references = _lane_values(
-        replica_reference_operations, reference_operation, count
-    )
-    optimizer_owner = (
-        optimizer if replica_optimizers is None else replica_optimizers
-    )
+    references = _lane_values(replica_reference_operations, reference_operation, count)
+    optimizer_owner = optimizer if replica_optimizers is None else replica_optimizers
     optimizers = (
         (optimizer,)
         if replica_optimizers is None
@@ -167,9 +156,7 @@ def _sequential_engine(
             reproducibility=reproducibility,
             distributed=distributed,
         ),
-        owner_factory=(
-            (lambda: owners) if owner_factory is None else owner_factory
-        ),
+        owner_factory=((lambda: owners) if owner_factory is None else owner_factory),
         operations=operations,
         rank_agreement=_LocalAgreement(),
     )
@@ -195,7 +182,6 @@ def _branched_engine(
     precision="fp32",
     utility="raw_bb",
     completion_samples=0,
-    posterior_max_attempts=256,
     cache_reference_outputs=False,
     frozen_inference=None,
     models=None,
@@ -212,9 +198,7 @@ def _branched_engine(
     models = (
         tuple(models)
         if models is not None
-        else tuple(
-            inference.modules.lane_module(lane) for lane in range(count)
-        )
+        else tuple(inference.modules.lane_module(lane) for lane in range(count))
     )
     rollout_operations = (
         tuple(rollout_operations)
@@ -239,9 +223,7 @@ def _branched_engine(
         else tuple(
             None
             if frozen_inference is None
-            else frozen_inference.modules.lane_module(
-                lane
-            ).rollout_operation
+            else frozen_inference.modules.lane_module(lane).rollout_operation
             for lane in range(count)
         )
     )
@@ -261,7 +243,6 @@ def _branched_engine(
         precision=precision,
         utility=utility,
         completion_samples=completion_samples,
-        posterior_max_attempts=posterior_max_attempts,
         inference=inference,
         frozen_inference=frozen_inference,
     )
@@ -294,9 +275,7 @@ def _branched_engine(
             distributed=distributed,
             benchmark_telemetry=benchmark_telemetry,
         ),
-        owner_factory=(
-            (lambda: owners) if owner_factory is None else owner_factory
-        ),
+        owner_factory=((lambda: owners) if owner_factory is None else owner_factory),
         operations=operations,
         rank_agreement=_LocalAgreement(),
     )
@@ -424,9 +403,7 @@ class EngineDrivenBranchedAttempt:
             "lambda_": lambda_,
             "models": (model,),
             "rollout_operations": (
-                model_operation
-                if rollout_operation is None
-                else rollout_operation,
+                model_operation if rollout_operation is None else rollout_operation,
             ),
             "learner_operations": (model_operation,),
             "frozen_operations": (frozen_operation,),
@@ -439,9 +416,7 @@ class EngineDrivenBranchedAttempt:
 
     def run(self, *, iteration: int):
         engine = _branched_engine(**self.arguments)
-        return engine._run_once(
-            self.owners, iteration=iteration
-        ).results[0]
+        return engine._run_once(self.owners, iteration=iteration).results[0]
 
 
 class SequentialRecoveryHarness:
@@ -541,17 +516,10 @@ class BranchedRecoveryHarness:
             learner_operations=(arguments["model_operation"],),
             frozen_operations=(arguments.get("frozen_operation"),),
             completion_samples=arguments.get("completion_samples", 0),
-            posterior_max_attempts=arguments.get(
-                "posterior_max_attempts", 256
-            ),
             precision=arguments.get("precision", "fp32"),
             utility=arguments.get("utility", "raw_bb"),
-            cache_reference_outputs=arguments.get(
-                "cache_reference_outputs", False
-            ),
-            benchmark_telemetry=arguments.get(
-                "benchmark_telemetry", False
-            ),
+            cache_reference_outputs=arguments.get("cache_reference_outputs", False),
+            benchmark_telemetry=arguments.get("benchmark_telemetry", False),
             allocation_inputs=(
                 None
                 if arguments.get("allocation_inputs") is None

@@ -51,7 +51,7 @@ class PrecisionConfig:
 
 
 @dataclass(frozen=True)
-class PokerModelConfig:
+class PokerModelSpec:
     d_model: int = 256
     n_heads: int = 8
     n_layers_pre: int = 4
@@ -101,7 +101,11 @@ class PokerModelConfig:
             or not math.isfinite(self.epsilon)
             or self.epsilon <= 0
         ):
-            field = "s_min" if not math.isfinite(self.s_min) or self.s_min <= 0 else "epsilon"
+            field = (
+                "s_min"
+                if not math.isfinite(self.s_min) or self.s_min <= 0
+                else "epsilon"
+            )
             raise ValueError(f"{field} must be finite and positive")
 
 
@@ -132,12 +136,12 @@ class PokerScientificConfig:
     """Validated runtime values shared by every execution mode."""
 
     game: PokerGameConfig
-    model: PokerModelConfig
+    model: PokerModelSpec
     loss: LossConfig
     optimizer: OptimizerConfig
     schedule: LearnerSchedule
     precision: PrecisionConfig
-    reference: ReferenceConfig
+    reference: ReferenceConfig | None
     lambda_: float
     root_count: int
     root_count_minimum: int
@@ -191,7 +195,7 @@ class BranchedModeConfig:
 __all__ = [
     "BranchedModeConfig",
     "PokerGameConfig",
-    "PokerModelConfig",
+    "PokerModelSpec",
     "PokerScientificConfig",
     "PrecisionConfig",
     "ReferenceConfig",
