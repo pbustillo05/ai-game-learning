@@ -1,0 +1,82 @@
+kind: nlhe_run_v1
+scientific:
+  mode:
+    training_regime: best_response
+    rollout_mode: sequential
+    private_estimator: rao_blackwell
+  game:
+    players: 2
+    stack_bb: 32.0
+    rank_count: 13
+  model:
+    d_model: 128
+    n_heads: 4
+    layers:
+      pre: 4
+      post: 6
+    raises:
+      components: 2
+      minimum_scale: 0.02
+    class_embedding_dim: 32
+    folder_beta_rank: 0
+    folder_line_dim: 8
+    epsilon: 1.0e-08
+  objective:
+    policy_clip: 0.2
+    negative_advantage_ratio_cap: 5.0
+    value:
+      kind: clipped
+      epsilon: 0.2
+      coefficient: 0.125
+    entropy:
+      kind: linear_decay
+      coefficient: 0.025
+      iterations: 215
+    reference_kl:
+      coefficient: 0.05
+      refresh:
+        effective_hands: 172800000.0
+  optimizer:
+    kind: adamw
+    learning_rate: 5.0e-05
+    beta1: 0.9
+    beta2: 0.999
+    epsilon: 1.0e-08
+    weight_decay: 0.01
+    grad_clip: 0.5
+  schedule:
+    batch_size: 256
+    steps: 12
+  lambda: 0.95
+  completion:
+    samples: 1024
+  response_initialization: target
+  probe:
+    target_sha256: 9a9687af399f643e6bf9477afe3bda8e7b449f5b00183f3d6d3dfa8346ba58ee
+    initial_model_sha256: bb3628ad4b362075632fffb62abb97ae61bd28c00b2c33d53819a33e627cd84b
+run:
+  seed: 101
+  reproducibility: throughput
+  utility: stack_normalized
+  workload:
+    roots: 1536
+  recovery:
+    minimum_roots: 1536
+  execution:
+    device: cuda:0
+    precision: fp16
+    attention: sdpa
+    reference_cache:
+      budget_bytes: 134217728
+    memory:
+      reserve_bytes: 1350242468
+    microbatch:
+      rollout_rows: 64
+      completion_rows: 128
+      learner_rows: 12
+  iterations: 300
+  checkpoint_every: 50
+  output_dir: runs/experiments/nlhe_hu_32bb_rb_brprobe_rb_i4400_steps12_300iter_20260827
+  frozen:
+    path: /home/pablob/ai-game-learning/runs/experiments/nlhe_hu_32bb_rb_dualclip5_60h_20260814/checkpoint_00004400.pt
+    sha256: 9a9687af399f643e6bf9477afe3bda8e7b449f5b00183f3d6d3dfa8346ba58ee

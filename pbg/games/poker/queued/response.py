@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 SHARED_RESPONSE_SEMANTICS = "shared_seat_approximate_response_v1"
+FIXED_TARGET_RESPONSE_SEMANTICS = "fixed_target_paired_response_gain_v2_1"
 
 
 def balanced_evaluation_probe_seats(
@@ -70,6 +71,24 @@ class PairedProbeStatistics:
     confidence_interval: tuple[float, float]
     per_seat_gain: tuple[float, ...]
     approximate_nashconv_lower_bound: float
+
+
+@dataclass(frozen=True)
+class FixedTargetPairedStatistics:
+    """Signed paired-gain estimates over independent logical-deal clusters."""
+
+    mean_gain: float
+    standard_error: float
+    confidence_level: float
+    confidence_interval: tuple[float, float]
+    per_seat_gain: tuple[float, ...]
+    per_seat_standard_error: tuple[float, ...]
+    per_seat_confidence_interval: tuple[tuple[float, float], ...]
+    sum_achieved_response_gain: float
+    sum_achieved_response_gain_standard_error: float
+    sum_achieved_response_gain_confidence_interval: tuple[float, float]
+    independent_cluster_count: int
+    sampling_unit: str
 
 
 _T95 = (
@@ -186,6 +205,128 @@ def _student_t_critical_95(degrees: int) -> float:
         else:
             upper = middle
     return 0.5 * (lower + upper)
+
+
+def fixed_target_paired_statistics(
+    differences: Tensor,
+    seats: Tensor,
+    players: int,
+    *,
+    cluster_ids: Tensor,
+) -> FixedTargetPairedStatistics:
+    """Estimate signed gain, clustering every replay of one deal together."""
+
+    if differences.ndim != 1 or not differences.dtype.is_floating_point:
+        raise TypeError("paired differences must be a floating vector")
+    if seats.ndim != 1 or seats.dtype not in (torch.int32, torch.int64):
+        raise TypeError("paired seats must be an integer vector")
+    if cluster_ids.ndim != 1 or cluster_ids.dtype != torch.int64:
+        raise TypeError("cluster ids must be a one-dimensional int64 vector")
+    if (
+        differences.shape != seats.shape
+        or differences.shape != cluster_ids.shape
+        or differences.device != seats.device
+        or differences.device != cluster_ids.device
+    ):
+        raise ValueError("paired differences, seats, and clusters must be aligned")
+    if differences.numel() <= 1 or not bool(torch.isfinite(differences).all()):
+        raise ValueError("paired differences must contain finite replicated values")
+    if isinstance(players, bool) or not isinstance(players, int) or players < 2:
+        raise ValueError("players must be an integer of at least two")
+    seat64 = seats.to(torch.int64)
+    if bool(((seat64 < 0) | (seat64 >= players)).any()):
+        raise ValueError("paired seats are outside the table")
+
+    unique_cluster, inverse = torch.unique(
+        cluster_ids, sorted=True, return_inverse=True
+    )
+    cluster_count = unique_cluster.numel()
+    if cluster_count <= 1:
+        raise ValueError("paired evaluation needs at least two independent clusters")
+    cell = inverse * players + seat64
+    cell_count = torch.zeros(
+        cluster_count * players, dtype=torch.int64, device=differences.device
+    )
+    cell_count.scatter_add_(0, cell, torch.ones_like(cell))
+    cell_sum = torch.zeros(
+        cluster_count * players, dtype=torch.float64, device=differences.device
+    )
+    cell_sum.scatter_add_(0, cell, differences.to(torch.float64))
+    cell_count = cell_count.reshape(cluster_count, players)
+    present = cell_count.gt(0)
+    cell_value = (
+        cell_sum.reshape(cluster_count, players)
+        / cell_count.clamp_min(1).to(torch.float64)
+    )
+    single_seat = bool(present.sum(1).eq(1).all())
+    complete_seat = bool(present.all())
+    if not single_seat and not complete_seat:
+        raise ValueError(
+            "cluster design must use one seat per deal or all seats per shared deal"
+        )
+
+    per_seat_mean = []
+    per_seat_se = []
+    per_seat_interval = []
+    per_seat_count = []
+    for seat in range(players):
+        values = cell_value[present[:, seat], seat]
+        if values.numel() <= 1:
+            raise ValueError("each seat needs at least two independent deal clusters")
+        mean = values.mean()
+        se = values.std(unbiased=True) / math.sqrt(values.numel())
+        critical = _student_t_critical_95(values.numel() - 1)
+        per_seat_mean.append(mean)
+        per_seat_se.append(se)
+        per_seat_interval.append(
+            (float(mean - critical * se), float(mean + critical * se))
+        )
+        per_seat_count.append(values.numel())
+
+    mean = torch.stack(per_seat_mean).mean()
+    if complete_seat:
+        cluster_values = cell_value.mean(1)
+        standard_error = cluster_values.std(unbiased=True) / math.sqrt(cluster_count)
+        degrees = cluster_count - 1
+        sampling_unit = "logical_deal_cluster_all_seats"
+    else:
+        component_variance = torch.stack(per_seat_se).square() / (players * players)
+        variance = component_variance.sum()
+        standard_error = variance.sqrt()
+        denominator = sum(
+            float(value * value) / (count - 1)
+            for value, count in zip(
+                component_variance.tolist(), per_seat_count, strict=True
+            )
+            if value > 0
+        )
+        degrees = (
+            min(per_seat_count) - 1
+            if denominator == 0
+            else max(1, round(float(variance * variance) / denominator))
+        )
+        sampling_unit = "logical_deal_cluster_seat_stratified"
+    critical = _student_t_critical_95(degrees)
+    half_width = critical * standard_error
+    sum_gain = players * mean
+    sum_standard_error = players * standard_error
+    return FixedTargetPairedStatistics(
+        mean_gain=float(mean),
+        standard_error=float(standard_error),
+        confidence_level=0.95,
+        confidence_interval=(float(mean - half_width), float(mean + half_width)),
+        per_seat_gain=tuple(float(value) for value in per_seat_mean),
+        per_seat_standard_error=tuple(float(value) for value in per_seat_se),
+        per_seat_confidence_interval=tuple(per_seat_interval),
+        sum_achieved_response_gain=float(sum_gain),
+        sum_achieved_response_gain_standard_error=float(sum_standard_error),
+        sum_achieved_response_gain_confidence_interval=(
+            float(sum_gain - players * half_width),
+            float(sum_gain + players * half_width),
+        ),
+        independent_cluster_count=cluster_count,
+        sampling_unit=sampling_unit,
+    )
 
 
 def paired_probe_statistics(
@@ -309,11 +450,14 @@ class SequentialSharedResponseEvaluator:
 
 
 __all__ = [
+    "FIXED_TARGET_RESPONSE_SEMANTICS",
     "SHARED_RESPONSE_SEMANTICS",
+    "FixedTargetPairedStatistics",
     "PairedProbeStatistics",
     "SequentialSharedResponseEvaluator",
     "SharedResponseEvaluationReport",
     "balanced_evaluation_probe_seats",
+    "fixed_target_paired_statistics",
     "paired_probe_statistics",
     "probe_evaluation_design",
 ]

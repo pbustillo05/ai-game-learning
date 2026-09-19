@@ -57,6 +57,23 @@ def test_public_config_compiles_one_resolved_runtime_contract() -> None:
     )
 
 
+def test_negative_advantage_ratio_cap_is_hash_bound_and_validated() -> None:
+    raw = _raw()
+    raw["scientific"]["objective"]["negative_advantage_ratio_cap"] = 5.0
+    cfg = load_config_mapping(raw)
+    assert cfg.scientific.common.loss.negative_advantage_ratio_cap == 5.0
+    assert (
+        cfg.source_mapping()["scientific"]["objective"][
+            "negative_advantage_ratio_cap"
+        ]
+        == 5.0
+    )
+
+    raw["scientific"]["objective"]["negative_advantage_ratio_cap"] = 1.2
+    with pytest.raises(ConfigError, match="negative_advantage_ratio_cap"):
+        load_config_mapping(raw)
+
+
 def test_source_round_trip_and_resolved_hash_are_deterministic() -> None:
     cfg = load_config(CONFIG)
     rebuilt = load_config_mapping(cfg.source_mapping())

@@ -264,6 +264,7 @@ class LossConfig:
     """Closed, structured loss surface shared by every queued mode."""
 
     policy_clip: float = 0.2
+    negative_advantage_ratio_cap: float | None = None
     value: ValueLossConfig = field(default_factory=ValueLossConfig)
     entropy: EntropyLossConfig = field(default_factory=EntropyLossConfig)
     reference_kl_coefficient: float | None = None
@@ -271,6 +272,13 @@ class LossConfig:
 
     def __post_init__(self) -> None:
         _nonnegative_finite(self.policy_clip, "policy clip")
+        if self.negative_advantage_ratio_cap is not None and (
+            not math.isfinite(self.negative_advantage_ratio_cap)
+            or self.negative_advantage_ratio_cap <= 1 + self.policy_clip
+        ):
+            raise ValueError(
+                "negative-advantage ratio cap must exceed the PPO upper clip"
+            )
         if self.reference_kl_coefficient is not None and (
             not math.isfinite(self.reference_kl_coefficient)
             or self.reference_kl_coefficient <= 0
@@ -1719,6 +1727,9 @@ class LossResult:
     reference_kl: Tensor
     approximate_kl: Tensor
     clip_fraction: Tensor
+    negative_advantage_cap_fraction: Tensor
+    negative_advantage_log_ratio_max: Tensor
+    negative_advantage_influence_max: Tensor
 
 
 def _scalar_private_row(value: Tensor, private: Tensor, owner: Tensor) -> Tensor:
@@ -1987,10 +1998,22 @@ class LearnerOperation:
             1 - self.loss.policy_clip,
             1 + self.loss.policy_clip,
         )
+        negative = advantage.lt(0)
+        ratio_cap = self.loss.negative_advantage_ratio_cap
+        if ratio_cap is None:
+            policy_ratio = ratio
+            negative_capped = torch.zeros_like(negative)
+        else:
+            # Standard PPO leaves r*A unbounded when A < 0 and r exceeds the
+            # ordinary upper clip. Bound that branch in log space so a
+            # vanishing frozen-policy probability cannot dominate backward.
+            negative_ratio = log_ratio.clamp_max(math.log(ratio_cap)).exp()
+            policy_ratio = torch.where(negative, negative_ratio, ratio)
+            negative_capped = negative & log_ratio.gt(math.log(ratio_cap))
         policy_row = (
             posterior
             * -torch.minimum(
-                ratio * advantage,
+                policy_ratio * advantage,
                 clipped * advantage,
             )
         ).sum(-1)
@@ -2000,6 +2023,20 @@ class LearnerOperation:
         clipped_row = (
             posterior * ratio.sub(1).abs().gt(self.loss.policy_clip).float()
         ).sum(-1)
+        negative_cap_row = (
+            posterior * negative_capped.float()
+        ).sum(-1)
+        supported_negative = negative & posterior.gt(0)
+        negative_log_ratio_max = torch.where(
+            supported_negative,
+            log_ratio,
+            torch.zeros_like(log_ratio),
+        ).amax()
+        negative_influence_max = (
+            posterior
+            * advantage.neg().clamp_min(0)
+            * torch.where(negative, policy_ratio, torch.zeros_like(policy_ratio))
+        ).amax()
         sigma_posterior = torch.zeros_like(current_value, dtype=torch.float32)
         sigma_posterior.scatter_add_(
             0,
@@ -2037,6 +2074,7 @@ class LearnerOperation:
         sigma_reference = mean_by_sigma(reference_row)
         sigma_approximate = mean_by_sigma(approximate_row)
         sigma_clipped = mean_by_sigma(clipped_row)
+        sigma_negative_capped = mean_by_sigma(negative_cap_row)
         if "trace_target" in sigma or "cost_target" in sigma:
             if self.loss.branching is None:
                 raise LearnerError("branched public targets require a branching loss")
@@ -2129,6 +2167,9 @@ class LearnerOperation:
             reference_kl_mean,
             sigma_approximate.mean(),
             sigma_clipped.mean(),
+            sigma_negative_capped.mean(),
+            negative_log_ratio_max,
+            negative_influence_max,
         )
 
 

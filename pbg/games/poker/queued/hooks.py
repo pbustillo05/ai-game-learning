@@ -362,6 +362,7 @@ class PokerStateMachine:
         iteration: int,
         retry_epoch: int,
         logical_base: int = 0,
+        buttons: Tensor | None = None,
         lane: int = 0,
         device: torch.device | str,
     ) -> PokerState:
@@ -398,7 +399,21 @@ class PokerStateMachine:
             root_count, self.geometry.players, 2
         )
         combo_ids = self.geometry.combo_id(private_cards[..., 0], private_cards[..., 1])
-        button = (roots % self.geometry.players).to(torch.int32)
+        if buttons is None:
+            button = (roots % self.geometry.players).to(torch.int32)
+        else:
+            if (
+                buttons.shape != (root_count,)
+                or buttons.device != device
+                or buttons.dtype not in (torch.int32, torch.int64)
+                or bool(
+                    ((buttons < 0) | (buttons >= self.geometry.players)).any()
+                )
+            ):
+                raise ValueError(
+                    "explicit root buttons must be accelerator integers in [0,P)"
+                )
+            button = buttons.to(torch.int32)
         if self.geometry.players == 2:
             small_blind = button
             big_blind = (button + 1) % 2

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -32,6 +34,50 @@ from pbg.inference_artifact import load_inference_source
 _RANKS = "23456789TJQKA"
 _SUITS = "cdhs"
 _ActionMode = Literal["none", "argmax", "sample"]
+_ZeroProbabilityExtension = Literal["clamp", "error", "retain_prior"]
+
+
+@dataclass(frozen=True)
+class DealIdentity:
+    """Schedule-independent identity for one externally addressed poker deal."""
+
+    protocol_version: str
+    split_namespace: str
+    evaluation_seed: int
+    logical_deal_id: int
+
+    def __post_init__(self) -> None:
+        if not self.protocol_version or not self.split_namespace:
+            raise ValueError("deal protocol and split namespaces must be nonempty")
+        if isinstance(self.evaluation_seed, bool) or not isinstance(
+            self.evaluation_seed, int
+        ):
+            raise TypeError("deal evaluation seed must be an integer")
+        if (
+            isinstance(self.logical_deal_id, bool)
+            or not isinstance(self.logical_deal_id, int)
+            or self.logical_deal_id < 0
+        ):
+            raise ValueError("logical deal id must be a nonnegative integer")
+
+    def namespace_seed(self, purpose: str) -> int:
+        """Return a stable 63-bit counter namespace without Python hash."""
+
+        if not purpose:
+            raise ValueError("deal RNG purpose must be nonempty")
+        encoded = json.dumps(
+            (
+                self.protocol_version,
+                self.split_namespace,
+                self.evaluation_seed,
+                purpose,
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return int.from_bytes(hashlib.sha256(encoded).digest()[:8], "little") & (
+            (1 << 63) - 1
+        )
 
 
 @dataclass(frozen=True)
@@ -165,24 +211,31 @@ class PokerInferenceSession:
             max_batch_rows=max_batch_rows,
         )
 
-    def new_hands(self, buttons: Sequence[int]) -> list[HandHandle]:
+    def new_hands(
+        self,
+        buttons: Sequence[int],
+        *,
+        deals: Sequence[DealIdentity] | None = None,
+    ) -> list[HandHandle]:
         if any(not 0 <= int(button) < self.geometry.players for button in buttons):
             raise ValueError("button is outside the table")
+        if deals is not None and len(deals) != len(buttons):
+            raise ValueError("buttons and explicit deal identities differ in length")
         result = []
-        for button in buttons:
+        for index, button in enumerate(buttons):
+            deal = None if deals is None else deals[index]
             state = self.machine.initial_roots(
                 1,
-                seed=0,
-                iteration=self._next,
+                seed=(0 if deal is None else deal.namespace_seed("private")),
+                iteration=(self._next if deal is None else 0),
                 retry_epoch=0,
-                logical_base=int(button),
-                device=self.device,
-            )
-            state = replace(
-                state,
-                button=torch.tensor(
+                logical_base=(
+                    int(button) if deal is None else deal.logical_deal_id
+                ),
+                buttons=torch.tensor(
                     [button], dtype=torch.int32, device=self.device
                 ),
+                device=self.device,
             )
             handle = HandHandle(self._next)
             self._next += 1
@@ -198,8 +251,12 @@ class PokerInferenceSession:
             result.append(handle)
         return result
 
-    def new_hand(self, button: int = 0) -> HandHandle:
-        return self.new_hands((button,))[0]
+    def new_hand(
+        self, button: int = 0, *, deal: DealIdentity | None = None
+    ) -> HandHandle:
+        return self.new_hands(
+            (button,), deals=None if deal is None else (deal,)
+        )[0]
 
     def _hand(self, handle: HandHandle) -> _Hand:
         if not isinstance(handle, HandHandle) or handle.value not in self._hands:
@@ -216,6 +273,26 @@ class PokerInferenceSession:
             if int(state.street[0]) == 0
             else f"post_{int(state.status.ne(FOLDED).sum())}"
         )
+
+    def _condition_ranges_on_board(self, item: _Hand) -> None:
+        """Mask public-card conflicts with a deterministic zero-mass extension."""
+
+        board = item.state.board_cards[0]
+        conflict = (
+            (self._combo_cards[:, :, None] == board[None, None])
+            & board[None, None].ne(PAD_CARD)
+        ).any(2).any(1)
+        compatible = ~conflict
+        conditioned = item.log_reach.masked_fill(
+            conflict[None, None, :], -torch.inf
+        )
+        supported = torch.isfinite(conditioned).any(-1, keepdim=True)
+        fallback = torch.where(
+            compatible[None, None, :],
+            torch.zeros_like(conditioned),
+            torch.full_like(conditioned, -torch.inf),
+        )
+        item.log_reach = torch.where(supported, conditioned, fallback)
 
     def _evaluate(self, item: _Hand):
         return self._evaluate_items((item,))
@@ -493,6 +570,7 @@ class PokerInferenceSession:
         action: str | PokerAction | tuple,
         *,
         policy_probabilities: Tensor | None = None,
+        zero_probability_extension: _ZeroProbabilityExtension = "clamp",
     ) -> None:
         item = self._hand(hand)
         _evaluation, legality, probabilities = self._evaluate(item)
@@ -540,12 +618,36 @@ class PokerInferenceSession:
                 "external policy probabilities must use the finite accelerator "
                 "natural private domain"
             )
-        selected = policy[:, event].float().clamp_min(
-            torch.finfo(torch.float32).tiny
-        )
+        if zero_probability_extension not in ("clamp", "error", "retain_prior"):
+            raise ValueError(
+                "zero-probability extension must be clamp, error, or retain_prior"
+            )
+        selected = policy[:, event].float()
         if self._family(item.state) == "pre":
             selected = selected.index_select(0, self.model.combo_class)
-        item.log_reach[:, actor].add_(selected.log())
+        actor_reach = item.log_reach[0, actor]
+        finite = torch.isfinite(actor_reach)
+        gauge = actor_reach.masked_fill(~finite, -torch.inf).amax()
+        prior_weight = torch.exp(
+            actor_reach - gauge.masked_fill(~torch.isfinite(gauge), 0.0)
+        ).masked_fill(~finite, 0.0)
+        supported = bool((prior_weight * selected).sum().gt(0))
+        if zero_probability_extension == "clamp":
+            selected_log = selected.clamp_min(torch.finfo(torch.float32).tiny).log()
+        elif supported:
+            # Model policies are softmax distributions; exact FP32 zeros are
+            # numerical underflow, not structural private-hand exclusions.
+            selected_log = selected.clamp_min(
+                torch.finfo(torch.float32).tiny
+            ).log()
+        elif zero_probability_extension == "error":
+            raise RuntimeError("observed action has zero policy probability")
+        else:
+            # At a public history outside the fixed policy's support its
+            # conditional private range is undefined. Protocol-v2 extends the
+            # policy deterministically by retaining the prior reference range.
+            selected_log = torch.zeros_like(selected)
+        item.log_reach[:, actor].add_(selected_log)
         event_tensor = torch.tensor([event], dtype=torch.int32, device=self.device)
         item.history = self.machine.append_player_history(
             item.state, event_tensor, item.history
@@ -564,8 +666,9 @@ class PokerInferenceSession:
         self,
         hand: HandHandle,
         *,
-        seed: int,
-        trajectory_id: int,
+        deal: DealIdentity | None = None,
+        seed: int | None = None,
+        trajectory_id: int | None = None,
         decision_index: int,
     ) -> None:
         """Execute one schedule-independent chance transition on-device."""
@@ -582,12 +685,27 @@ class PokerInferenceSession:
             torch.ones(1, dtype=torch.bool, device=self.device),
             item.history,
         )
+        if deal is None:
+            if seed is None or trajectory_id is None:
+                raise ValueError(
+                    "keyed chance requires an explicit deal identity or legacy "
+                    "seed and trajectory id"
+                )
+            chance_seed = seed
+            logical_deal_id = trajectory_id
+        else:
+            if seed is not None or trajectory_id is not None:
+                raise ValueError(
+                    "explicit deal identity cannot be mixed with legacy chance keys"
+                )
+            chance_seed = deal.namespace_seed("public_chance")
+            logical_deal_id = deal.logical_deal_id
         item.state = self.machine.deal_next_street_keyed(
             item.state,
-            seed=seed,
+            seed=chance_seed,
             iteration=0,
             root=torch.tensor(
-                [trajectory_id], dtype=torch.int64, device=self.device
+                [logical_deal_id], dtype=torch.int64, device=self.device
             ),
             path=torch.tensor(
                 [decision_index], dtype=torch.int64, device=self.device
@@ -595,6 +713,7 @@ class PokerInferenceSession:
             draw=int(item.state.street[0]),
             retry_epoch=0,
         )
+        self._condition_ranges_on_board(item)
 
     def terminal_payoffs(self, hand: HandHandle) -> Tensor:
         """Settle one terminal equal-stack hand on the selected accelerator."""
@@ -686,6 +805,7 @@ class PokerInferenceSession:
             can_raise=active,
         )
         item.state.validate(self.geometry)
+        self._condition_ranges_on_board(item)
 
     def deal_many(
         self,

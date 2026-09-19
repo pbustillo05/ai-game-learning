@@ -192,7 +192,17 @@ class Topology:
                 raise TopologyError("structural row cannot address heads or targets")
             if output_type[node] < 0:
                 raise TopologyError("every topology row needs an output domain")
-            if compact and not trained and degree[node] == nominal[node] == 1:
+            leaf_anchor = (
+                parent[node] == -1
+                and degree[node] == nominal[node] == 1
+                and target_kind[begin[node]] == int(TargetKind.LEAF)
+            )
+            if (
+                compact
+                and not trained
+                and degree[node] == nominal[node] == 1
+                and not leaf_anchor
+            ):
                 raise TopologyError("headless ordinary unary row was not compressed")
 
             for edge in range(begin[node], begin[node] + degree[node]):
@@ -257,7 +267,7 @@ class Topology:
         p_train: int,
         _allow_zero_path: bool = False,
     ) -> tuple[Topology, TopologyBindings]:
-        """Delete headless ordinary unary rows and summarize their paths."""
+        """Compress headless unary paths while retaining empty-tree leaf anchors."""
 
         self.validate(
             bindings,
@@ -270,9 +280,25 @@ class Topology:
         degree = self.executed_degree.tolist()
         nominal = self.nominal_degree.tolist()
         owner = self.owner.tolist()
+        parent = self.parent.tolist()
         keep = [
             owner[row] >= 0 or degree[row] >= 2 or nominal[row] >= 2 for row in range(n)
         ]
+        # Best-response forests may contain roots where the frozen opponent
+        # terminates the hand before the selected response seat acts.  Such a
+        # tree has no trained row, but its already-published leaf must remain
+        # represented so leaf completion/movement retains an exact permutation.
+        # Preserve its root as one structural anchor; ordinary unary descendants
+        # are still compressed into the root-to-leaf edge below.
+        components: dict[int, list[int]] = {}
+        for node in range(n):
+            root = node
+            while parent[root] >= 0:
+                root = parent[root]
+            components.setdefault(root, []).append(node)
+        for root, nodes in components.items():
+            if not any(keep[node] for node in nodes):
+                keep[root] = True
         if all(keep):
             self.validate(bindings, p_train=p_train, compact=True)
             return self, bindings
@@ -662,10 +688,21 @@ class TopologyAssembler:
         self._record_corrections.append(float(counterfactual_correction))
 
     def seal(self) -> tuple[Topology, TopologyBindings, int]:
-        if not self._nodes:
-            raise TopologyError("topology is empty")
         if self._pending:
             raise TopologyError("topology has unresolved child endpoints")
+        # A compressed root is normally only a headless prefix and disappears
+        # when a retained descendant becomes a structural root.  If the entire
+        # logical tree is headless, however, its edge eventually terminates at
+        # an already-published leaf.  Include only those terminal roots here so
+        # compaction can preserve one leaf anchor for each empty tree.
+        for key, node in self._compressed_roots.items():
+            if all(edge.terminal for edge in node.edges):
+                if key in self._nodes:
+                    raise TopologyError("compressed topology root is duplicated")
+                self._nodes[key] = node
+        self._compressed_roots.clear()
+        if not self._nodes:
+            raise TopologyError("topology is empty")
         targeted = {
             edge.child_key
             for node in self._nodes.values()

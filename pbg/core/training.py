@@ -97,6 +97,11 @@ class LearnerIteration:
         "reference_kl",
         "approximate_kl",
         "clip_fraction",
+        "negative_advantage_cap_fraction",
+    )
+    _MAX_METRICS = (
+        "negative_advantage_log_ratio_max",
+        "negative_advantage_influence_max",
     )
 
     def __init__(
@@ -229,7 +234,12 @@ class LearnerIteration:
                 ) from error
             steps.append(self.optimizer.step())
             metric_rows.append(
-                torch.stack(tuple(weighted[name] for name in self._METRICS))
+                torch.stack(
+                    tuple(
+                        weighted[name]
+                        for name in (*self._METRICS, *self._MAX_METRICS)
+                    )
+                )
             )
             step_error = None
 
@@ -267,6 +277,13 @@ class LearnerIteration:
                                 weighted.get(name, 0.0)
                                 + weight * getattr(result, name).detach()
                             )
+                        for name in self._MAX_METRICS:
+                            value = getattr(result, name).detach()
+                            weighted[name] = (
+                                value
+                                if name not in weighted
+                                else torch.maximum(weighted[name], value)
+                            )
                 except Exception as exc:
                     if agree_failure is None:
                         raise
@@ -288,7 +305,7 @@ class LearnerIteration:
             tuple(
                 {
                     name: float(row[index])
-                    for index, name in enumerate(self._METRICS)
+                    for index, name in enumerate((*self._METRICS, *self._MAX_METRICS))
                 }
                 for row in torch.stack(metric_rows).cpu().tolist()
             )

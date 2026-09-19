@@ -50,8 +50,11 @@ from pbg.core.topology import (
     LayerPlan,
     TargetKind,
     Topology,
+    TopologyAssembler,
     TopologyBindings,
     TopologyError,
+    TopologyExpansion,
+    TopologyExpansionEdge,
     build_layer_plan,
 )
 from tests.static_gates import core_firewall_violations
@@ -546,6 +549,72 @@ def test_topology_compaction_preserves_unary_path_cost() -> None:
     assert compact.label.tolist() == [4]
     assert compact.target_kind.tolist() == [int(TargetKind.LEAF)]
     compact.validate(compact_bindings, p_train=2, compact=True)
+
+
+def test_best_response_compaction_retains_leaf_for_tree_without_trained_rows() -> None:
+    mode = mode_schema("best_response", "sequential", "rao_blackwell")
+    assembler = TopologyAssembler(
+        input_to_output=(0, 1),
+        p_train=1,
+        topology_cap=4,
+        topology_edge_cap=4,
+    )
+    assembler.accept(
+        (
+            TopologyExpansion(
+                key=(0, 0),
+                executed_degree=1,
+                nominal_degree=1,
+                target_degree=1,
+                trained=False,
+                owner=0,
+                input_type=0,
+                familywork_row=0,
+                sigma_head_row=0,
+                action_begin=0,
+                refill=False,
+                edges=(
+                    TopologyExpansionEdge(3, 1, True, (0, 1), 0, 0),
+                ),
+            ),
+            TopologyExpansion(
+                key=(1, 0),
+                executed_degree=1,
+                nominal_degree=1,
+                target_degree=1,
+                trained=True,
+                owner=0,
+                input_type=0,
+                familywork_row=0,
+                sigma_head_row=0,
+                action_begin=0,
+                refill=False,
+                edges=(
+                    TopologyExpansionEdge(7, 1, True, (1, 1), 1, 0),
+                ),
+            ),
+        ),
+        sampled_nodes=2,
+    )
+    topology, bindings, leaf_rows = assembler.seal()
+    assert leaf_rows == 2
+
+    compact, compact_bindings = topology.compact(bindings, p_train=1)
+    compact.validate(compact_bindings, p_train=1, compact=True)
+    assert compact.node_count == 2
+    assert compact.owner.tolist() == [-1, 0]
+
+    plan = build_layer_plan(
+        mode,
+        _partitions(mode.private_estimator),
+        (topology,),
+        (bindings,),
+        p_train=1,
+    )
+    assert plan.leaf_rows == (2,)
+    assert plan.movement_source_leaf_row.tolist() == [0, 1]
+    assert plan.sigma_rows == ((1, 0),)
+    assert plan.action_rows == ((1, 0),)
 
 
 def test_layer_plan_handles_duplicates_unbalanced_last_consumers_and_dense_rows() -> (

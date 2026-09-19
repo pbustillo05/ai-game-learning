@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
@@ -21,12 +22,14 @@ from pbg.core.capacity import (
 )
 from pbg.core.contracts import mode_schema
 from pbg.core.learner import (
+    EntropyLossConfig,
     LearnerOperation,
     LearnerSchedule,
     LossConfig,
     ModelEvaluation,
     PolicyEvaluation,
     SequentialLearnerBatch,
+    ValueLossConfig,
 )
 from pbg.core.optimization import DenseAdam, OptimizerConfig
 from pbg.core.rollout import (
@@ -70,6 +73,7 @@ from pbg.games.poker.queued.operations import PokerOperations
 from pbg.games.poker.queued.response import (
     SequentialSharedResponseEvaluator,
     balanced_evaluation_probe_seats,
+    fixed_target_paired_statistics,
     paired_probe_statistics,
 )
 from tests.iteration_support import EngineDrivenSequentialAttempt
@@ -318,6 +322,45 @@ def test_probe_is_the_ordinary_best_response_rb_schema() -> None:
     ) / long_summary.standard_error
     assert critical > 1.96
     assert critical == pytest.approx(2.0154, abs=1.0e-3)
+
+
+def test_fixed_target_gain_statistics_keep_sign_and_scale_clustered_sum() -> None:
+    differences = torch.tensor([1.0, 3.0, 5.0, 7.0], dtype=torch.float64)
+    seats = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
+    clusters = torch.arange(4, dtype=torch.int64)
+    summary = fixed_target_paired_statistics(
+        differences, seats, 2, cluster_ids=clusters
+    )
+    assert summary.per_seat_gain == pytest.approx((2.0, 6.0))
+    assert summary.mean_gain == pytest.approx(4.0)
+    assert summary.standard_error == pytest.approx(2**-0.5)
+    assert summary.sum_achieved_response_gain == pytest.approx(8.0)
+    assert summary.sum_achieved_response_gain_standard_error == pytest.approx(
+        2**0.5
+    )
+    assert summary.sum_achieved_response_gain_confidence_interval == pytest.approx(
+        tuple(2 * value for value in summary.confidence_interval)
+    )
+    assert summary.independent_cluster_count == 4
+    assert summary.sampling_unit == "logical_deal_cluster_seat_stratified"
+
+    negative = fixed_target_paired_statistics(
+        -differences, seats, 2, cluster_ids=clusters
+    )
+    assert negative.mean_gain == pytest.approx(-4.0)
+    assert negative.sum_achieved_response_gain == pytest.approx(-8.0)
+
+    # Two seats replay each of two shared deals: uncertainty has two, not four,
+    # independent sampling units.
+    shared = fixed_target_paired_statistics(
+        torch.tensor([1.0, 3.0, 2.0, 4.0]),
+        torch.tensor([0, 1, 0, 1]),
+        2,
+        cluster_ids=torch.tensor([10, 10, 11, 11]),
+    )
+    assert shared.independent_cluster_count == 2
+    assert shared.sampling_unit == "logical_deal_cluster_all_seats"
+    assert shared.mean_gain == pytest.approx(2.5)
 
 
 def test_sequential_config_rejects_inapplicable_mode_fields() -> None:
@@ -859,6 +902,55 @@ def test_rb_loss_stays_in_natural_domain_and_uses_fp32_posterior(
     assert torch.isfinite(result.total)
     assert model.value.grad is not None and model.value.grad.dtype == torch.float32
     assert model.logit.grad is not None and model.logit.grad.dtype == torch.float32
+
+
+@CUDA
+def test_rb_negative_advantage_ratio_cap_bounds_loss_and_gradient() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    model = _RBModel(1, device)
+    with torch.no_grad():
+        model.logit.fill_(math.log(100.0))
+        model.value.zero_()
+    fields = MappingProxyType(
+        {
+            "model_input": torch.zeros((1, 1), device=device),
+            "owner": torch.zeros(1, dtype=torch.int32, device=device),
+            "action": torch.ones(1, dtype=torch.int32, device=device),
+            "old_log_policy": torch.zeros((1, 1), device=device),
+            "old_value": torch.zeros((1, 1), device=device),
+            "value_target": torch.zeros((1, 1), device=device),
+            "posterior": torch.ones((1, 1), device=device),
+            "advantage_target": -torch.ones((1, 1), device=device),
+        }
+    )
+    result = LearnerOperation(
+        mode_schema("self_play", "sequential", "rao_blackwell"),
+        LossConfig(
+            negative_advantage_ratio_cap=5.0,
+            value=ValueLossConfig(coefficient=0.0),
+            entropy=EntropyLossConfig(coefficient=0.0),
+        ),
+        model.operation,
+        _policy,
+    ).forward_loss_backward(
+        SequentialLearnerBatch("pre", torch.zeros(1, dtype=torch.int64, device=device), fields),
+        iteration=0,
+    )
+
+    torch.testing.assert_close(result.policy, torch.tensor(5.0, device=device))
+    torch.testing.assert_close(
+        result.negative_advantage_cap_fraction,
+        torch.tensor(1.0, device=device),
+    )
+    torch.testing.assert_close(
+        result.negative_advantage_log_ratio_max,
+        torch.tensor(math.log(100.0), device=device),
+    )
+    torch.testing.assert_close(
+        result.negative_advantage_influence_max,
+        torch.tensor(5.0, device=device),
+    )
+    torch.testing.assert_close(model.logit.grad, torch.zeros_like(model.logit))
 
 
 @CUDA

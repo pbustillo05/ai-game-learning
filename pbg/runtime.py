@@ -851,10 +851,14 @@ class TrainingSession:
             losses = tuple(getattr(learner, "losses", ()))
             if losses:
                 state.metrics_prefix[-1]["objective"] = {
-                    name: sum(float(row[name]) for row in losses) / len(losses)
+                    name: (
+                        max(float(row[name]) for row in losses)
+                        if name.endswith("_max")
+                        else sum(float(row[name]) for row in losses) / len(losses)
+                    )
                     for name in losses[0]
                 }
-            steps = tuple(getattr(learner, "steps", ()))
+            steps = tuple(getattr(learner, "optimizer_steps", ()))
             if steps:
                 state.metrics_prefix[-1]["gradient"] = {
                     "finite": all(step.gradients_finite for step in steps),

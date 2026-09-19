@@ -25,6 +25,7 @@ from pbg.core.persistence import (
 from pbg.devices import resolve_execution_device, validate_workload_capabilities
 from pbg.eval.br_probe import _play_one, evaluate_br_probe
 from pbg.games.poker.queued.evaluator import bound_evaluator
+from pbg.inference import DealIdentity
 from pbg.inference_artifact import (
     INFERENCE_ARTIFACT_SCHEMA_VERSION,
     export_inference_artifact,
@@ -359,12 +360,41 @@ def test_end_to_end_br_and_variance_consumers(tmp_path: Path) -> None:
         probe_artifact,
         target_artifact=target_artifact,
         n_hands=4,
+        split_namespace="identical-policy-test",
         seed=19,
         device="cuda:0",
     )
     assert report.trajectory_count == 4
     assert report.target_sha256 == target_hash
-    assert report.approximate_nashconv_bb_per_hand == pytest.approx(0.0)
+    assert report.mean_gain_bb_per_hand == pytest.approx(0.0)
+    assert report.per_seat_gain_bb_per_hand == pytest.approx((0.0, 0.0))
+    assert report.sum_achieved_response_gain_bb_per_hand == pytest.approx(0.0)
+    assert all(row.gain_bb_per_hand == 0.0 for row in report.observations)
+
+    resumed = evaluate_br_probe(
+        probe_artifact,
+        target_artifact=target_artifact,
+        n_hands=4,
+        split_namespace="identical-policy-test",
+        seed=19,
+        device="cuda:0",
+        logical_deal_start=4,
+    )
+    whole = evaluate_br_probe(
+        probe_artifact,
+        target_artifact=target_artifact,
+        n_hands=8,
+        split_namespace="identical-policy-test",
+        seed=19,
+        device="cuda:0",
+    )
+    assert tuple(row.logical_deal_id for row in resumed.observations) == (
+        4,
+        5,
+        6,
+        7,
+    )
+    assert whole.observations == report.observations + resumed.observations
 
     variance = estimate_update_variance(target_config, repeats=2)
     assert variance["schema"] == "pbg-queued-update-variance-v1"
@@ -381,10 +411,16 @@ def test_paired_br_chance_address_is_independent_of_action_path() -> None:
     class Session:
         geometry = Geometry()
 
-        def __init__(self) -> None:
+        def __init__(self, policy_scale: float) -> None:
+            self.policy_scale = policy_scale
             self.deal_addresses: list[int] = []
+            self.extensions: list[str] = []
+            self.policy_sums: list[float] = []
 
-        def new_hand(self, _button: int) -> dict[str, int]:
+        def new_hand(
+            self, _button: int, *, deal: DealIdentity
+        ) -> dict[str, int]:
+            assert deal.logical_deal_id == 5
             return {"phase": 0}
 
         def private_cards(self, _hand: object, seat: int) -> tuple[int, int]:
@@ -400,7 +436,7 @@ def test_paired_br_chance_address_is_independent_of_action_path() -> None:
             return 0
 
         def policy_table(self, _hand: object) -> tuple[tuple[Action], torch.Tensor]:
-            return (Action(),), torch.ones((4, 1))
+            return (Action(),), torch.full((4, 1), self.policy_scale)
 
         def private_hand_id(self, _hand: object, _actor: int) -> int:
             return 0
@@ -414,41 +450,47 @@ def test_paired_br_chance_address_is_independent_of_action_path() -> None:
             _action: object,
             *,
             policy_probabilities: torch.Tensor,
+            zero_probability_extension: str,
         ) -> None:
             assert policy_probabilities.shape == (4, 1)
+            self.extensions.append(zero_probability_extension)
+            self.policy_sums.append(float(policy_probabilities.sum()))
             hand["phase"] = 1
 
         def deal_keyed(
             self,
             hand: dict[str, int],
             *,
-            seed: int,
-            trajectory_id: int,
+            deal: DealIdentity,
             decision_index: int,
         ) -> None:
-            assert seed == 17
-            assert trajectory_id == 5
+            assert deal.evaluation_seed == 17
+            assert deal.logical_deal_id == 5
             self.deal_addresses.append(decision_index)
             hand["phase"] = 2
 
         def terminal_payoffs(self, _hand: object) -> torch.Tensor:
             return torch.zeros(2)
 
-    probe = Session()
-    target = Session()
+    probe = Session(2.0)
+    target = Session(1.0)
     assert (
         _play_one(
             probe,  # type: ignore[arg-type]
             target,  # type: ignore[arg-type]
-            trajectory_id=5,
+            deal=DealIdentity("test_protocol_v2", "screening", 17, 5),
+            button=1,
             probe_seat=0,
-            seed=17,
             mixed=True,
         )
         == 0.0
     )
     assert target.deal_addresses == [0]
     assert probe.deal_addresses == [0]
+    assert target.extensions == ["retain_prior"]
+    assert probe.extensions == ["error"]
+    assert target.policy_sums == [4.0]
+    assert probe.policy_sums == [8.0]
 
 
 def test_evaluator_binding_has_one_process_owner_per_geometry(

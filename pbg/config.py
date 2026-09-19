@@ -353,7 +353,14 @@ def _parse_objective(
     value: object, *, branched: bool
 ) -> tuple[LossConfig, dict[str, object] | None, dict[str, object]]:
     source = _object(value, "root.scientific.objective")
-    allowed = {"policy_clip", "value", "entropy", "reference_kl", "branching"}
+    allowed = {
+        "policy_clip",
+        "negative_advantage_ratio_cap",
+        "value",
+        "entropy",
+        "reference_kl",
+        "branching",
+    }
     _closed(source, allowed, "root.scientific.objective")
     _required(source, {"policy_clip", "value", "entropy"}, "root.scientific.objective")
 
@@ -451,10 +458,30 @@ def _parse_objective(
     else:
         values = None
 
+    policy_clip = _number(
+        source["policy_clip"], "root.scientific.objective.policy_clip"
+    )
+    negative_advantage_ratio_cap = (
+        _number(
+            source["negative_advantage_ratio_cap"],
+            "root.scientific.objective.negative_advantage_ratio_cap",
+            positive=True,
+        )
+        if "negative_advantage_ratio_cap" in source
+        else None
+    )
+    if (
+        negative_advantage_ratio_cap is not None
+        and negative_advantage_ratio_cap <= 1 + policy_clip
+    ):
+        raise ConfigError(
+            "root.scientific.objective.negative_advantage_ratio_cap: "
+            "must exceed the PPO upper clip"
+        )
+
     loss = LossConfig(
-        policy_clip=_number(
-            source["policy_clip"], "root.scientific.objective.policy_clip"
-        ),
+        policy_clip=policy_clip,
+        negative_advantage_ratio_cap=negative_advantage_ratio_cap,
         value=ValueLossConfig(
             kind=str(kind),
             coefficient=_number(
@@ -511,6 +538,10 @@ def _parse_objective(
         "value": dict(value_spec),
         "entropy": dict(entropy),
     }
+    if "negative_advantage_ratio_cap" in source:
+        canonical["negative_advantage_ratio_cap"] = source[
+            "negative_advantage_ratio_cap"
+        ]
     if reference_canonical is not None:
         canonical["reference_kl"] = reference_canonical
     if branched:
