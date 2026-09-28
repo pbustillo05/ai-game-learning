@@ -1011,14 +1011,25 @@ def test_best_response_rollout_calls_each_model_only_for_its_role_rows() -> None
     ),
 )
 def test_all_four_sequential_modes_complete_an_optimizer_step(
-    regime: str, estimator: str
+    regime: str, estimator: str, monkeypatch
 ) -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     geometry = NLHEGeometry(2, 8.0, 4)
     mode = mode_schema(regime, "sequential", estimator)
     rb = estimator == "rao_blackwell"
     layout = _phase5_layout()
-    manifest = _phase5_manifest(device)
+    manifest = replace(
+        _phase5_manifest(device),
+        root_count=8,
+        completion_pack_cap=3,
+        player_node_cap=(PartitionRows("pre", 256), PartitionRows("post_2", 256)),
+        trained_player_cap=(PartitionRows("pre", 256), PartitionRows("post_2", 256)),
+        action_cap=(PartitionRows("pre", 256), PartitionRows("post_2", 256)),
+        topology_cap=256,
+        topology_edge_cap=256,
+        topology_packet_cap=128,
+        target_arena_cap=264,
+    )
     if rb:
         manifest = replace(
             manifest,
@@ -1055,6 +1066,85 @@ def test_all_four_sequential_modes_complete_an_optimizer_step(
                 partition.affine.bias.zero_()
         return result
 
+    # Observe real completion writes before propagation can reuse their slots,
+    # then check the actual tensors gathered by the learner against those leaves.
+    from pbg.core.iteration import IterationEngine
+    from pbg.core.topology import TargetKind
+    from pbg.games.poker.queued.hooks import RBCompletionBinding, SampledShowdownBinding
+
+    completed = {}
+    checked = []
+    binding_class = RBCompletionBinding if rb else SampledShowdownBinding
+    original_completion = binding_class.leaf_to_layer_work
+    original_prepare = IterationEngine._prepare_learner
+
+    def capture_completion(binding, batch):
+        plan = original_completion(binding, batch)
+        for lane_index, lane_tensor in enumerate(batch.lanes):
+            lane = int(lane_tensor)
+            for ordinal in range(batch.rows):
+                selected = plan.coverage.valid[lane] & plan.coverage.source_ordinal[
+                    lane
+                ].eq(ordinal)
+                (descriptor,) = selected.nonzero().flatten().tolist()
+                request = plan.destinations[
+                    int(plan.coverage.destination[lane, descriptor])
+                ]
+                row = int(plan.coverage.destination_ordinal[lane, descriptor])
+                leaf = int(batch.row[lane_index, ordinal])
+                completed[lane, leaf] = (
+                    request.input_type,
+                    {
+                        name: value[lane, row, 0].clone()
+                        for name, value in request.values.items()
+                    },
+                )
+        return plan
+
+    def verify_learner(engine, owners, state, lane):
+        prepared = original_prepare(engine, owners, state, lane)
+        topology = state.topology.topologies[lane]
+        bindings = state.topology.bindings[lane]
+        for node in range(topology.node_count):
+            edge = int(topology.child_begin[node])
+            if int(topology.target_kind[edge]) != int(TargetKind.LEAF):
+                continue
+            actor = int(topology.owner[node])
+            if actor < 0:
+                continue
+            leaf = int(topology.target_row[edge])
+            family = state.input_names[int(bindings.input_type[node])]
+            row = int(topology.sigma_head_row[node])
+            fields = (
+                prepared.sampler.stores[family]
+                .gather(torch.tensor([row], device=device))
+                .fields
+            )
+            output, payload = completed[lane, leaf]
+            if rb:
+                mass, moment = payload["mass"][actor], payload["moment"][actor]
+                if family == "pre" and output == "post":
+                    mass = torch.zeros(
+                        geometry.private_classes, device=device
+                    ).scatter_add_(0, model.combo_class, mass)
+                    moment = torch.zeros_like(mass).scatter_add_(
+                        0, model.combo_class, moment
+                    )
+                expected = torch.where(mass > 0, moment / mass, 0)
+                torch.testing.assert_close(fields["posterior"][0], mass)
+            else:
+                expected = payload["return_value"][actor]
+            torch.testing.assert_close(fields["value_target"][0], expected)
+            advantage = expected - fields["old_value"][0]
+            if rb:
+                advantage = torch.where(mass > 0, advantage, 0)
+            torch.testing.assert_close(fields["advantage_target"][0], advantage)
+            checked.append((lane, leaf))
+        return prepared
+
+    monkeypatch.setattr(binding_class, "leaf_to_layer_work", capture_completion)
+    monkeypatch.setattr(IterationEngine, "_prepare_learner", verify_learner)
+
     model = make_model()
     frozen = make_model() if regime == "best_response" else None
     generator = torch.Generator(device=device)
@@ -1077,6 +1167,8 @@ def test_all_four_sequential_modes_complete_an_optimizer_step(
         response_cutoff=regime == "best_response" and rb,
     )
     result = iteration_runner.run(iteration=0)
+    assert len(completed) == 8
+    assert checked
     assert result.learner.optimizer_steps
     assert all(step.applied for step in result.learner.optimizer_steps)
     if rb:

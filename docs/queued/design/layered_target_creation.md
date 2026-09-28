@@ -169,8 +169,13 @@ w_k=\sum_{h:c(h)=k}w_h,
 m_k=\sum_{h:c(h)=k}m_h.
 $$
 
-The initial movement plan permutes completed rows into layer-zero work addresses. Completion order is otherwise
-unchanged.
+Layer-zero addresses match completion's stable FIFO order within each replica and output partition.
+For Leaf row $i$ routed to output $o$, its arena-zero address is the number of earlier Leaf rows
+$j<i$ routed to $o$ in the same replica. Assign these addresses in increasing Leaf-row order,
+not compacted topology-edge order. Completion appends the stable partition subsequences across packs,
+so the payload already occupies its planned address. The existing movement metadata records this
+Leaf-to-partition address mapping; no additional payload permutation or CUDA launch is needed.
+Subsequent last-consumer slot reuse and per-depth propagation are unchanged.
 
 ## 6. CUDA launch
 

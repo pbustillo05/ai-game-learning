@@ -136,7 +136,10 @@ def initialize_work_arenas(
                 plan.movement_output_type == output
             )
             destinations = plan.movement_destination_work_row[selected].long()
-            sources = plan.movement_source_leaf_row[selected].long()
+            # Emulate production FIFO writes, independently of planned slot
+            # order.  Reordering payloads according to the plan hid the original
+            # completion/target identity bug.
+            sources = plan.movement_source_leaf_row[selected].long().sort().values
             payload = completion.get((lane, name)) if destinations.numel() else None
             if destinations.numel():
                 if not isinstance(payload, (SampledLeafWork, RBLeafWork)):
@@ -1790,3 +1793,147 @@ def test_executor_has_no_python_node_or_action_loop_or_interlayer_sync() -> None
 
 def test_queued_firewall_remains_closed() -> None:
     assert core_firewall_violations(REPOSITORY / "pbg" / "core") == ()
+
+
+@CUDA
+@pytest.mark.parametrize("regime", ["self_play", "best_response"])
+@pytest.mark.parametrize("rollout", ["sequential", "branched.fixed", "branched.KKT"])
+@pytest.mark.parametrize("estimator", ["sampled", "rao_blackwell"])
+def test_fifo_leaf_identity_survives_forest_reordering(regime, rollout, estimator):
+    """Changing FIFO arrival order cannot change any learner target column."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    mode = mode_schema(regime, rollout, estimator)
+    branched = mode.rollout_mode.is_branched
+    p_train = 2 if regime == "self_play" else 1
+    # An uneven tree plus independent roots exercise both retained leaf slots
+    # and reused slots across layers, rather than only terminal decisions.
+    parent = [-1, 0, -1] if branched else [-1, 0, -1, -1]
+    degree = [2, 2, 1] if branched else [1, 1, 1, 1]
+    begin = [0, 2, 4] if branched else [0, 1, 2, 3]
+    kind = [1, 0, 1, 1, 1] if branched else [0, 1, 1, 1]
+    target = [0, 1, 1, 2, 3] if branched else [1, 0, 1, 2]
+    n = len(parent)
+    leaves = sum(k == int(TargetKind.LEAF) for k in kind)
+    topology = Topology(
+        parent=_i32(parent),
+        child_begin=_i32(begin),
+        executed_degree=_i32(degree),
+        nominal_degree=_i32(degree),
+        target_degree=_i32(degree),
+        owner=_i32([i % p_train for i in range(n)]),
+        familywork_row=_i32(range(n)),
+        sigma_head_row=_i32(range(n)),
+        action_begin=_i32(begin),
+        label=_i32(range(len(kind))),
+        path_length=_i32([1] * len(kind)),
+        target_kind=_i32(kind),
+        target_row=_i32(target),
+    )
+    rb = estimator == "rao_blackwell"
+    bindings = TopologyBindings(
+        input_type=_i32([0] * n),
+        output_type=_i32([0] * n),
+        sigma_target_row=_i32(range(n)),
+        child_output_type=_i32(
+            [
+                int(rb and k == int(TargetKind.LEAF) and t != 0)
+                for k, t in zip(kind, target)
+            ]
+        ),
+    )
+    manifest = replace(_manifest(mode, device), n_replica=2)
+    partitions = _partitions(mode.private_estimator)
+    snapshots = []
+    for shuffled in (False, True):
+        # Different arrival orders and payloads per replica catch lane mixing.
+        permutations = [
+            list(reversed(range(leaves))) if shuffled else list(range(leaves)),
+            list(range(1, leaves)) + [0] if shuffled else list(range(leaves)),
+        ]
+        topologies = tuple(
+            replace(
+                topology,
+                target_row=_i32(
+                    [
+                        permutation[t] if k == int(TargetKind.LEAF) else t
+                        for k, t in zip(kind, target)
+                    ]
+                ),
+            )
+            for permutation in permutations
+        )
+        plan = build_layer_plan(
+            mode,
+            partitions,
+            topologies,
+            (bindings,) * 2,
+            p_train=p_train,
+            manifest=manifest,
+        )
+        owners = GeneratedOwners(
+            build_storage_plan(mode, partitions, manifest, _layout(), device)
+        )
+        completion = {}
+        for lane, permutation in enumerate(permutations):
+            inverse = torch.argsort(torch.tensor(permutation, device=device))
+            for output, name in enumerate(plan.output_names):
+                width = plan.output_widths[output]
+                values = torch.arange(
+                    1, leaves * p_train * width + 1, dtype=torch.float32, device=device
+                )
+                values = values.reshape(leaves, p_train, width) + lane * 100
+                values = values.index_select(0, inverse).contiguous()
+                if rb:
+                    mass = torch.arange(
+                        1,
+                        leaves * p_train * width + 1,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    mass = mass.reshape(leaves, p_train, width)
+                    mass = (mass / mass.sum(-1, keepdim=True)).index_select(0, inverse)
+                    completion[lane, name] = rb_completion(
+                        mass.contiguous(),
+                        values,
+                        branched=branched,
+                        algebra=_algebra(mode.private_estimator),
+                        source_output=name,
+                    )
+                else:
+                    completion[lane, name] = sampled_completion(
+                        values[..., 0].contiguous(),
+                        branched=branched,
+                    )
+                selected = (plan.movement_replica == lane) & (
+                    plan.movement_output_type == output
+                )
+                sources = plan.movement_source_leaf_row[selected]
+                assert sources.tolist() == sorted(sources.tolist())
+                assert plan.movement_destination_work_row[selected].tolist() == list(
+                    range(sources.numel())
+                )
+        _enter_through_targets(owners, mode, plan, completion, n)
+        result = LayeredTargetExecutor(
+            mode, _algebra(mode.private_estimator), lambda_=0.5
+        ).execute(owners, plan)
+        assert result.published_lanes == (0, 1)
+        assert result.counters.layer_count == 2
+        snapshot = {}
+        for lane in range(2):
+            for owner, names in (
+                ("SigmaTarget", plan.input_names),
+                ("ActionTarget", plan.output_names if branched else plan.input_names),
+            ):
+                for name in names:
+                    slab = owners.slab(owner, name)
+                    for field in slab.columns:
+                        snapshot[lane, owner, name, field] = published_rows(
+                            slab, lane, field
+                        ).clone()
+        snapshots.append(snapshot)
+        _close(owners)
+    assert snapshots[0].keys() == snapshots[1].keys()
+    for key in snapshots[0]:
+        torch.testing.assert_close(
+            snapshots[0][key], snapshots[1][key], rtol=0, atol=0, msg=str(key)
+        )

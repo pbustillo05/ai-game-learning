@@ -1234,7 +1234,11 @@ class TopologyPacketStager:
 
 @dataclass(frozen=True)
 class LayerPlan:
-    """Exact CPU movement and reverse-layer execution plan."""
+    """Exact CPU leaf-address and reverse-layer execution plan.
+
+    Movement metadata maps Leaf identity to its stable FIFO partition slot;
+    completion writes those arena-zero slots directly.
+    """
 
     layer_ptr: Tensor
     replica: Tensor
@@ -1780,13 +1784,21 @@ def build_layer_plan(
     ]
 
     for lane, (topology, binding) in enumerate(compacted):
-        for edge in range(topology.edge_count):
-            if int(topology.target_kind[edge]) != int(TargetKind.LEAF):
-                continue
-            output = int(binding.child_output_type[edge])
+        # CompletionFIFO drains increasing Leaf rows and appends a stable
+        # subsequence to each output partition.  Assign arena-zero addresses
+        # in that same order, independently of compacted topology traversal.
+        # This makes completion already resident at its final source address:
+        # no payload permutation, scratch copy, or extra GPU launch is needed.
+        leaf_edges = sorted(
+            (
+                (int(topology.target_row[edge]), int(binding.child_output_type[edge]))
+                for edge in range(topology.edge_count)
+                if int(topology.target_kind[edge]) == int(TargetKind.LEAF)
+            ),
+        )
+        for leaf, output in leaf_edges:
             if not 0 <= output < output_count:
                 raise TopologyError("leaf output type is outside the contract")
-            leaf = int(topology.target_row[edge])
             if leaf in leaf_source_rows[lane]:
                 raise TopologyError("a leaf row is referenced more than once")
             leaf_source_rows[lane].add(leaf)
