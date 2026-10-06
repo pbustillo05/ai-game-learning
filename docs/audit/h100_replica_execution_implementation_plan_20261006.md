@@ -40,30 +40,32 @@ contract are legitimate; duplicate whole-model or whole-learner implementations
 are not. Tests, benchmarks and historical reports remain legitimate artifacts,
 but may not shelter a retired production pipeline.
 
-### Authority and limited supersession
+### Protected design documents: stop and ask
 
-The user's decisions supersede three older prescriptions:
+**Any modification under `docs/queued/design/` or `docs/theory/` requires
+explicit user approval.** If implementation requires such a change, stop the
+affected work and ask with the exact conflict, smallest proposed diff and its
+semantic impact. Do not silently override a contract, edit first, or treat a
+goal's persistence instruction as approval. This plan grants no blanket rewrite.
 
-- `features_to_preserve.md`: replace the requirement for separated street
-  parameters; preserve its other capabilities.
-- `storage_redesign.md` §5.2: replace stream-only lane learning and the ban on
-  summed replica losses with explicit-K operations and independent gradients.
-  Preserve exact sigma/action gathers, immediate backward, FP32 ownership,
-  logical update/version boundaries and bounded workspace. No invented rows or
-  padded action evaluation.
-- [Shared-model assessment](shared_preflop_postflop_model_assessment_20260928.md):
-  implement its representation/ownership mathematics, but reject its proposed
-  retention of split architecture and old-artifact compatibility.
+The anticipated reasonable clarification is that pre/post input types may share
+parameters, instead of having disjoint weights. They remain different input
+types and queues: full-deck preflop model inputs and natural outputs remain
+169-class-wide, postflop 1,326-combo-wide. Normal's selected-row loss interface
+does not change those native domains. Parameter sharing does not redesign the
+queued abstraction. Even that wording edit must be proposed for approval.
 
-Reconcile these narrow clauses and active usage docs during implementation;
-do not rewrite the queued design around a new runtime. The design README's
-referenced `implementation_plan.md` is absent in this checkout: read it if it
-exists later, otherwise use the actual contracts and this plan.
+Check `features_to_preserve.md`'s separation requirement and `storage_redesign.md`
+§5.2's older stream-only/no-summed-loss prescription during preflight. If their
+literal requirements block the planned under-the-hood execution, surface the
+conflict and ask rather than declaring them superseded. Protected dtype/schema
+contracts and the sibling evaluator interface are not implicitly relaxed either.
 
-The shared architecture is selected. Editing `docs/theory/MHA_model.md` or
-`docs/theory/core_math.tex` still needs separate explicit approval under
-AGENTS.md; request that permission if synchronizing theory. Do not infer it
-from this document or retain the split production model on that account.
+Use the [shared-model assessment](shared_preflop_postflop_model_assessment_20260928.md)
+for model mathematics, not its rejected split-model retention proposal. Active
+unprotected usage docs may be updated normally. The design README references an
+absent `implementation_plan.md`; read it if present later, otherwise use the
+actual contracts and this plan without inventing its contents.
 
 ## 2. Where changes belong—and where they do not
 
@@ -146,7 +148,8 @@ map, not an added full FFN. Fuse accumulation/packing where possible: two small
 projections plus an addition can otherwise add launches. Derive aligned widths
 from this layout; the old 855-to-864 padding example is not a fixed interface.
 
-Use flat FP32 `[K,Nphysical]` owners for masters, gradients and moments, with
+Use the precision policy below; its starting state layout has flat FP32
+`[K,Nphysical]` owners for masters, accumulated parameter gradients and moments, with
 unique named leaf views and contiguous matrix dimensions. The flat container
 must not also be a trainable leaf. Bind leaf gradients to owner views and test
 actual backward accumulation and pointer stability. Shared family consumers
@@ -156,8 +159,8 @@ Record logical-to-physical mapping for packed QKV and zero alignment padding.
 Padding receives zero gradient and contributes nothing to clipping/updates.
 Do not repack FP32 masters per microbatch. Cohorts use views/contiguous lane runs
 or explicit lane-indexed primitives—not copies of every parameter or dummy lanes.
-Account for autocast/gradient layout temporaries and refresh any BF16 weight
-cache after an update without disconnecting gradients from FP32 masters.
+Account for autocast/gradient layout temporaries and refresh any low-precision
+compute-weight cache after an update without disconnecting gradients from masters.
 
 **Persistence:** version/hash the shared config, checkpoint and inference format.
 Start fresh; split trunks and moments cannot be merged into an exact resume.
@@ -166,6 +169,43 @@ initialize-from-target. Keep their files untouched; Git recovers their runtime.
 Compatible frozen opponents use the sole model with their own checkpoint config.
 Preserve optimizer/scaler/RNG/controller/reference/counter/metrics state on new-
 format round trips. Utility conversion visits the shared value head once.
+
+### Hardware-specific precision, one tensor program
+
+Choose precision for measured throughput and stable learning, not historical
+dtype fidelity. Resolve one hardware precision policy at startup and pass it to
+shared primitives; do not scatter device-name tests or fork trainers. Record
+compute/activation, reduction/state dtypes, scaler and attention backend in the
+run/checkpoint manifest. The execution device remains explicitly selected.
+
+| Operation/state | H100 starting policy | RTX 2080 Ti starting policy |
+| --- | --- | --- |
+| Projections, QKV/FFNs/heads, attention inputs and working activations | Native BF16 Tensor Core path | Native FP16 Tensor Core path |
+| Residual streams, embedding outputs, model feature buffers | Prefer BF16 storage; higher-precision accumulation only where justified | FP16 storage where stable; retain FP32 for sensitive paths |
+| GEMM accumulation, normalization/softmax statistics | Stable fused kernels, normally FP32 accumulation with low-precision outputs | Same principle using supported FP16 kernels |
+| Master weights, accumulated parameter gradients, Adam moments | FP32 starting choice for update accuracy | FP32 starting choice |
+| Policy probabilities/logs, losses, posterior/target reductions, clipping | FP32 stability islands; respect explicit existing contracts | Same stability requirements, not identical kernels |
+| Loss scaling | Normally unnecessary for BF16 | Dynamic FP16 scaling and overflow handling |
+
+FP32 masters do not force FP32 matrix multiplies. Backward working tensors may
+be BF16/FP16 even when parameter gradients accumulate in FP32. Avoid accidental
+promotion of whole activation/residual paths by FP32 embeddings, affine weights
+or side features; fuse casts at deliberate boundaries. Do not simply call
+`.bfloat16()` on every state or assume autocast alone chooses the best storage.
+
+These are conventional starting choices, not a demand for maximum FP32 or a
+proof of optimality. Profile casts, memory traffic and FP32 islands too; retain
+higher precision where stability warrants its cost. BF16 residuals and other
+model-internal dtype improvements are in scope, with numerical/learning tests.
+Changing a protected storage/reduction contract still requires approval above.
+Fail unsupported profiles clearly; never force BF16 on SM75 or emulate it.
+No cross-device bitwise identity, identical loss-scaler behavior or matching
+training trajectories is required. Preserve algorithms and test each hardware's
+chosen profile for numerical health and learning quality. Record any intentional
+profile change on resume; do not describe it as bit-exact continuation.
+
+References: [PyTorch AMP](https://docs.pytorch.org/docs/stable/amp.html) and
+[NVIDIA mixed precision](https://docs.nvidia.com/deeplearning/performance/mixed-precision-training/index.html).
 
 ## 4. Replica-native learning in the existing core
 
@@ -191,7 +231,7 @@ $$
 No whole-model manual backward, Jacobian, `vmap(grad)`, alternate stream trainer
 or per-lane production learner is needed. Sum independently normalized lane
 losses; never average across replicas. Keep one tensor loss implementation,
-with FP32 policy, entropy, KL, posterior, value and objective controls. Move
+with explicit stable reduction/control dtypes from the precision policy. Move
 static validation outside capture and hot finite checks into device status.
 Retain all mode-specific stratum/action normalization and loss components.
 
@@ -260,9 +300,9 @@ ordered lifetimes. No stale weight/gradient/reference cache across updates.
 
 Include these work reductions in the build:
 
-- Fuse normalization, side-feature assembly, feature alignment and BF16 casts;
-  avoid materializing large FP32 concatenations before casting. Keep FP32
-  residual semantics: changing the residual dtype is outside this decision.
+- Fuse normalization, side-feature assembly, feature alignment and casts to the
+  hardware compute dtype. Keep working activations/residuals low precision where
+  stable; avoid large FP32 concatenations and needless cast round trips.
 - Normal: select the sampled private row after trunk/pooling, before policy/value
   heads. Preserve required public heads and reference-output conventions.
 - RB readout: factor broadcast context as $W[x_h,c]=W_xx_h+W_cc$, compute its
@@ -310,8 +350,9 @@ Execute these milestones in one workstream:
 ### Goal execution and Git discipline
 
 - Before editing, record the clean starting commit and inspect current worktree
-  changes. Preserve unrelated user work. A goal running this plan should continue
-  through all milestones without asking permission after each construction step.
+  changes. Preserve unrelated user work. Continue through milestones without
+  routine phase approvals, but stop and ask for protected-document changes or
+  another genuine authority conflict; a goal does not bypass that gate.
 - Commit as work progresses: small coherent, preferably test-passing slices
   within milestones, not one enormous final commit. Do not leave days of work
   uncommitted or create empty progress commits. Include coupled caller/schema
@@ -356,11 +397,15 @@ replace CUDA tests and must not grow into a committee redesigning the scope.
 
 Use small test-local mathematical references and independent K=1 calls to the
 same production shared model. No copied legacy network/trainer. Establish
-tolerances before optimization from eager FP32 and supported precision behavior;
-do not widen them until a candidate passes.
+tolerances before optimization using stable references and each hardware profile;
+do not widen them until a candidate passes. Cross-profile floating results and
+model-dependent trajectories need not match. Separate numerical/learning-quality
+tests from exact structural and fixed-input sampling invariants.
 
 - Primitive and whole-model output/input/parameter-gradient comparisons,
-  including temperature, incidence, adapter and selected/factored readout paths.
+  including temperature, incidence, adapter and selected/factored readout paths;
+  verify actual compute/activation dtypes, finite gradients, residual stability
+  and learning behavior for H100 BF16 and SM75 FP16 separately.
 - K=1 versus K=2/4 with different parameters/data; perturb one lane and prove
   others unchanged. Shared pre/post gradients equal the weighted contribution
   sum with exactly one norm/update per logical step.
