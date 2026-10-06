@@ -1706,7 +1706,7 @@ Several specificities impact our implementation:
   \item The game of poker has a strong \textbf{preflop gauge symmetry}: any suit permutation should leave the strategy invariant.
   Instead of $\binom{4R}{2}$ possible private player states, there are $R^2$
   classes (1326 and 169 respectively for the full deck).
-  We exploit this by having a separate model for preflop and postflop, making it impossible for the model to not pick actions invariants under this transformation preflop.
+  We exploit this through a suit-invariant preflop class encoder and native $R^2$ class rows. Preflop and postflop share trunk and policy/value readout parameters, with family-specific encoders and adapters; this preserves exact preflop suit invariance without requiring disjoint learned parameters.
   Optionally, we can also exploit this symmetry in the Monte Carlo estimators (see below) by storing the $4!$ suit permutations of each sampled private state and board into the accumulated statistics (this can be considered if possible with minimal wrap divergence).
   
   \item The \textbf{postflop gauge symmetry} is harder to handle as it acts on the board which is an input.
