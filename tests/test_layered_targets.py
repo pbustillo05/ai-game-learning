@@ -637,6 +637,24 @@ def test_layer_plan_handles_duplicates_unbalanced_last_consumers_and_dense_rows(
     assert plan.arena_rows[0][0] == 3
 
 
+@CUDA
+def test_layer_plan_admission_applies_forest_limits_per_replica() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    mode = mode_schema("self_play", "branched.fixed", "sampled")
+    topology, bindings = _topology(mode, unbalanced=True)
+    manifest = replace(_manifest(mode, device), n_replica=2,
+                       topology_cap=2, topology_edge_cap=4)
+    plan = build_layer_plan(mode, _partitions(mode.private_estimator),
+                            (topology,) * 2, (bindings,) * 2,
+                            p_train=2, manifest=manifest)
+    assert plan.node_count == 4
+    assert plan.edge_count == 8
+    with pytest.raises(TopologyError, match="exceeds topology_cap"):
+        plan.assert_admitted(replace(manifest, topology_cap=1))
+    with pytest.raises(TopologyError, match="exceeds topology_edge_cap"):
+        plan.assert_admitted(replace(manifest, topology_edge_cap=3))
+
+
 def test_protected_root_prefix_excludes_refill_child_from_targets() -> None:
     mode = mode_schema("self_play", "branched.fixed", "sampled")
     topology = Topology(

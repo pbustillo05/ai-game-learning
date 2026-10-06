@@ -1370,9 +1370,19 @@ class LayerPlan:
         )
         for name in movement_fields:
             _cpu_vector(name, getattr(self, name), self.movement_count, torch.int32)
-        if self.node_count > manifest.topology_cap:
+        # The plan concatenates independent replica forests; manifest caps
+        # describe each forest, not their combined size.
+        n_replica = manifest.n_replica
+        lane_nodes = [0] * n_replica
+        lane_edges = [0] * n_replica
+        for lane, count in zip(self.replica.tolist(), self.child_count.tolist()):
+            if not 0 <= lane < n_replica:
+                raise TopologyError("LayerPlan node lane/output address is invalid")
+            lane_nodes[lane] += 1
+            lane_edges[lane] += count
+        if any(count > manifest.topology_cap for count in lane_nodes):
             raise TopologyError("realized LayerPlan exceeds topology_cap")
-        if self.edge_count > manifest.topology_edge_cap:
+        if any(count > manifest.topology_edge_cap for count in lane_edges):
             raise TopologyError("realized LayerPlan exceeds topology_edge_cap")
         if any(
             rows > manifest.target_arena_cap
@@ -1382,7 +1392,6 @@ class LayerPlan:
             raise TopologyError("realized LayerPlan exceeds target_arena_cap")
         if self.nbytes > manifest.align_workspace_bytes:
             raise TopologyError("LayerPlan upload exceeds align-phase admission")
-        n_replica = manifest.n_replica
         input_count = len(self.input_names)
         output_count = len(self.output_names)
         if len(self.output_widths) != output_count or any(

@@ -40,7 +40,7 @@ from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
 from pbg.games.poker.queued.hooks import NLHEGeometry, poker_partitions
 from pbg.games.poker.queued.rb_sampling import POSTERIOR_MAX_ATTEMPTS
 
-CAPACITY_DERIVATION_VERSION = "nlhe_capacity_v2"
+CAPACITY_DERIVATION_VERSION = "nlhe_capacity_v3"
 FIELD_ALIGNMENT = 64
 _CUBLAS_WORKSPACE_BYTES = 8 << 20
 
@@ -296,11 +296,25 @@ def compile_capacity(
         workload.learner_microbatch or batch_size,
         trained_total,
     )
-    chance_pack = min(family_pack * beta_max, family_rows + leaf_cap)
-    topology_packet = min(
-        family_pack * (beta_max + 1),
-        topology_cap + topology_edge_cap,
-    )
+    if mode.rollout_mode.is_branched:
+        # One action expansion may deal flop, turn and river without another
+        # player decision. Each of those three chance generations can branch.
+        # Even the smallest rollout pack must accommodate one complete root.
+        chance_rows_per_root = beta_max**4
+        packet_rows_per_root = beta_max * sum(
+            beta_max**generation for generation in range(4)
+        )
+        chance_pack = max(chance_rows_per_root, min(
+            family_pack * chance_rows_per_root, family_rows + leaf_cap
+        ))
+        topology_packet = max(packet_rows_per_root, min(
+            family_pack * packet_rows_per_root, topology_cap + topology_edge_cap
+        ))
+    else:
+        chance_pack = min(family_pack * beta_max, family_rows + leaf_cap)
+        topology_packet = min(
+            family_pack * (beta_max + 1), topology_cap + topology_edge_cap
+        )
 
     dtype = {
         "fp32": torch.float32,
