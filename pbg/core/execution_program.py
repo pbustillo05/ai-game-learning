@@ -20,11 +20,13 @@ class _Entry:
 
 
 class TensorProgramRunner:
-    """Exact-shape cache; rare/unadmitted shapes execute the same eager function.
+    """Bounded exact-shape compilation with optional CUDA graph ownership.
 
     The callable returns report tensors followed by a scalar objective. Backward
     runs outside its autocast context. Captures own their input/output storage;
     mutable gradients/buffers and CUDA RNG are restored after warmup/capture.
+    A warmed program remains compiled if its measured graph pool exceeds the
+    budget; other rare/unadmitted shapes execute the same eager function.
     """
 
     def __init__(self, *, mode: str = "eager", max_entries: int = 8,
@@ -136,16 +138,20 @@ class TensorProgramRunner:
                 mempool_id=graph.pool(), include_traces=False)
         )
         if entry.resident_bytes + snapshot_bytes > available:
-            # No approximation/padding or partial graph is retained on denial.
+            # Release the entire oversized graph pool, but retain the already
+            # warmed compiled program. Recurring large shapes should not lose
+            # compilation merely because capture cannot fit this cache budget.
             current.synchronize()
             entry.outputs = ()
             entry.static = ()
             entry.graph = None
             graph.reset()
-            del graph, entry, snapshots
+            del graph, snapshots
+            entry.resident_bytes = 0
+            self.entries[key] = entry
             self._deny(key)
             self.uncaptured += 1
-            return self._invoke(operation, inputs)
+            return self._invoke(entry.operation, inputs)
         del snapshots
         self.entries[key] = entry
         entry.graph.replay()
@@ -156,6 +162,7 @@ class TensorProgramRunner:
         return {"work_counts": {key: dict(value) for key, value in self.work_counts.items()},
                 "mode": self.mode, "max_entries": self.max_entries,
                 "byte_budget": self.byte_budget, "entries": len(self.entries),
+                "captured_entries": sum(entry.graph is not None for entry in self.entries.values()),
                 "resident_bytes": self.resident_bytes, "calls": self.calls,
                 "replays": self.replays, "uncaptured": self.uncaptured,
                 "denied_shapes": len(self.denied), "reserve_bytes": self.reserve_bytes,

@@ -94,6 +94,45 @@ def test_denied_shape_stays_uncaptured_and_cache_is_bounded():
     torch.testing.assert_close(parameter.grad, torch.tensor(8., device="cuda"))
 
 
+@CUDA
+def test_oversized_graph_retains_warmed_compilation_and_live_gradients():
+    parameter = torch.nn.Parameter(torch.tensor([0.2, -0.4], device="cuda"))
+    parameter.grad = torch.zeros_like(parameter)
+    pointer = parameter.grad.data_ptr()
+    # Staging and rollback fit, while the graph's allocator segment exceeds
+    # this budget. Exercise actual post-capture denial, not its staging guard.
+    runner = TensorProgramRunner(mode="captured", max_entries=1, byte_budget=64 << 10)
+
+    def program(value, control):
+        prediction = parameter * value
+        return prediction.detach(), prediction.square().sum() * control
+
+    expected = torch.zeros_like(parameter)
+    for call in range(4):
+        if call == 2:
+            with torch.no_grad():
+                parameter.add_(0.03)
+        value = torch.tensor([0.3 + call, -0.6], device="cuda")
+        control = torch.tensor(0.5 + call, device="cuda")
+        expected.add_(2 * parameter.detach() * value.square() * control)
+        output, = runner.run("oversized", program, (value, control), mutable=(parameter.grad,))
+        torch.testing.assert_close(output, parameter.detach() * value)
+        torch.testing.assert_close(parameter.grad, expected, rtol=3e-5, atol=3e-6)
+        assert parameter.grad.data_ptr() == pointer
+        if call:
+            assert len(runner.entries) == 1
+            entry = next(iter(runner.entries.values()))
+            assert entry.graph is None and entry.static == () and entry.outputs == ()
+            assert entry.resident_bytes == runner.resident_bytes == 0
+            assert len(runner.denied) == 1
+    assert runner.replays == 0
+    assert runner.manifest()["captured_entries"] == 0
+    assert runner.calls == runner.uncaptured == 4
+    parameter.grad = torch.zeros_like(parameter)
+    with pytest.raises(RuntimeError, match="lost its gradient/buffer addresses"):
+        runner.run("oversized", program, (value, control), mutable=(parameter.grad,))
+
+
 def test_config_records_exact_family_caps_graph_policy_and_h100_reserve(monkeypatch):
     from pbg.config import load_config_mapping
     from pbg.games.poker.queued import capacity_compiler
