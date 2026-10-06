@@ -546,9 +546,12 @@ action_index <E>
 Admission bounds both $B$ and $E$. Gather the aligned sigma arrays and, in branched mode, the aligned action spans.
 Run the current model once per sigma, compute the loss, and backward immediately in one bounded workspace.
 
-Each lane invokes this operation through zero-copy parameter and dense FP32-gradient views; replica learning has no
-`vmap`, padding, replay pack, summed loss, or adapter. Equal-shape lane operations may overlap on CUDA streams; dense
-clipping, AdamW, and collectives may vectorize the lane axis. Replicas advance model versions synchronously.
+Compatible exact-shape lane cohorts invoke the same tensor program through zero-copy parameter and dense
+FP32-gradient views with an explicit replica axis. Independently normalized lane losses are summed, never averaged
+across replicas; each lane accumulates all scheduled family/chunk contributions before one independent clipped
+optimizer update. No statistical row/action padding, dummy lanes, or changed sampling/RNG addresses are permitted.
+Exact tails may use singleton cohorts. Clipping, optimizer state and collectives preserve lane independence;
+distributed SUM joins matching replica IDs only. Replicas advance model versions synchronously.
 
 On BF16-capable CUDA, model compute and large model-facing floating storage use BF16 with FP32 accumulation.
 Parameter owners, policy/CDF arithmetic, posterior and target reductions, loss controls, gradients, clipping, and

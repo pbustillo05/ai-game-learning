@@ -9,14 +9,17 @@
 > `hand_rank`. The model consumes locally constructed folded features and does
 > not learn or reconstruct the underlying private combinatorics.
 
-The deployed object is one weight-only policy object with two networks:
+The deployed object is one weight-only policy object with shared parameters
+and family-specific encoders and adapters:
 
 $$
-\theta=(\theta_{\mathrm{pre}},\theta_{\mathrm{post}}).
+\theta=(\theta_{\mathrm{shared}},\phi_{\mathrm{pre}},\phi_{\mathrm{post}}),\qquad
+\theta_s=(\theta_{\mathrm{shared}},\phi_s).
 $$
 
-The preflop and postflop networks do not share weights. They share the same
-MHA-style sequence architecture. For a run with the highest $R\in\{4,\ldots,13\}$
+Preflop and postflop share the trunk and policy/value readout. The notation
+$\theta_s$ denotes each family's view of these parameters, not a disjoint owner.
+Independent replicas do not share learned parameters. For a run with the highest $R\in\{4,\ldots,13\}$
 ranks, let $D=4R$, let $\mathcal D_R=\{52-D,\ldots,51\}$ be the evaluator-facing
 suffix deck, and let $\mathcal H_R=\binom{\mathcal D_R}{2}$. The preflop model
 runs on $R^2$ canonical hand classes and the postflop model runs on the
@@ -38,8 +41,8 @@ architecture follows:
 Let $\sigma$ be the public trajectory, $p_\star=o(\sigma)$ the acting player,
 $\mathfrak r$ the Bayesian-updated ranges, and
 $\mathcal K_R=\mathcal H_R/S_4$ the $R^2$ preflop hand classes.
-The overall $F_\theta$ dispatches to the preflop or postflop network according
-to the street of $\sigma$.
+The overall $F_\theta$ selects the preflop or postflop encoder and adapters
+according to the street of $\sigma$, using the shared trunk and readout.
 
 Preflop:
 
@@ -286,7 +289,11 @@ $$
 which expose the optional third-order folded-stat products from
 `docs/theory/folder_impact.md`.
 Preflop uses analogous class-level overlap side inputs and omits folded-stat
-terms.
+terms. Factor each layer's first affine map as
+$W_2\operatorname{GELU}(W_z z+A_su_s+b)$, sharing the common/dynamic-feature
+map $W_z$, output map $W_2$ and biases while retaining family-specific static
+feature maps $A_s$. Both families use the same positive layer count. Native
+class/hand domains, geometry and incidence semantics remain unchanged.
 
 ## Incidence Residual
 

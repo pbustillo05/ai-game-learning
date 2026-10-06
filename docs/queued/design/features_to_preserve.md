@@ -45,8 +45,9 @@ user approval.
 - Configurable equal-stack NLHE retains every valid player count, half-integer
   stack depth, compact rank count, blind, deck-fit, history-capacity, and legal
   action boundary. Rake, antes, and side pots remain absent.
-- The current preflop/postflop model architecture and parameter separation
-  remain supported. Lossless history capacity is derived from the game bound,
+- The preflop/postflop families use one shared trunk and policy/value
+  readout with family-specific encoders and adapters, preserving their native
+  private domains. Independent replicas retain independent parameters. Lossless history capacity is derived from the game bound,
   and the worst legal history attention footprint is checked against the
   hardware profile before execution.
 - Preflop class-order equivariance and empty-seat masking remain exact.
@@ -62,7 +63,7 @@ user approval.
   query-chunk bounds remain equivalent to the authoritative model operation.
 - Utility units remain explicitly selectable between raw big-blind payoff and
   stack-normalized payoff. Approved checkpoint conversion changes only the
-  final preflop/postflop value-head affine weights and biases.
+  final shared value-head affine weights and biases exactly once.
 
 ## Best response and scientific controls
 
