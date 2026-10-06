@@ -30,9 +30,7 @@ is `/home/pablob/.venvs/poker`):
 
 ```bash
 source /home/pablob/.venvs/poker/bin/activate
-export CUDA_HOME="$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cu13"
-export PATH="$VIRTUAL_ENV/bin:$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
+source tools/setup-h100-toolkit.sh
 nvidia-smi
 export CUDA_VISIBLE_DEVICES=GPU-REPLACE_WITH_IDLE_GPU_UUID
 ```
@@ -42,6 +40,12 @@ reported memory, native precision policy, libraries and evaluator identity. It
 runs the production fused attention forward/backward in native BF16. Admission
 uses reported memory with at least 10 GiB reserve; it does not assume 80 GiB from
 an “80 GB” product label. No command changes clocks, power limits or driver policy.
+
+The setup script also creates the missing `libcudart.so -> libcudart.so.13`
+link in a freshly installed CUDA runtime wheel. PyTorch extension builds link
+with `-lcudart`; without this link, the clean locked environment fails to build
+the alias, branching, and layered-target operators. It leaves an existing
+linker name untouched.
 
 ## Commands
 

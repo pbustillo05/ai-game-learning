@@ -163,15 +163,25 @@ class MHA(nn.Module):
         padding = (-additive_mask.shape[-1]) % 8
         if padding:
             additive_mask = F.pad(additive_mask, (0, padding))[..., :key_bias.shape[-1]]
+        # Fused low-precision CUDA kernels require an aligned head width, even
+        # for otherwise valid small models. Zero feature padding preserves dot
+        # products; retain the original scale and remove padded output features.
+        head_padding = (-self.d_head) % 8 if q_head.device.type == "cuda" else 0
+        if head_padding:
+            q_head = F.pad(q_head, (0, head_padding))
+            k_head = F.pad(k_head, (0, head_padding))
+            v_head = F.pad(v_head, (0, head_padding))
         if q_head.device.type == "cuda":
             # Capacity admission assumes linear fused SDPA workspace. A hidden
             # quadratic math fallback would violate that contract.
             with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION,
                               SDPBackend.CUDNN_ATTENTION]):
-                return F.scaled_dot_product_attention(
+                attended = F.scaled_dot_product_attention(
                     q_head / temperature, k_head, v_head,
                     attn_mask=additive_mask, dropout_p=0.0,
+                    scale=1.0 / math.sqrt(self.d_head),
                 )
+                return attended[..., :self.d_head]
         return F.scaled_dot_product_attention(
             q_head / temperature, k_head, v_head,
             attn_mask=additive_mask, dropout_p=0.0,

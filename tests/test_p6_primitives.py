@@ -24,7 +24,7 @@ def _explicit_attention(
     logits = content + key_bias[:, None, None, :]
     logits = logits.masked_fill(~key_mask[:, None, None, :], -torch.inf)
     probability = torch.nan_to_num(torch.softmax(logits, dim=-1), nan=0.0)
-    return torch.matmul(probability.to(value.dtype), value)
+    return torch.matmul(probability, value.float()).to(value.dtype)
 
 
 @pytest.mark.parametrize("backend", ("auto", "flex"))
@@ -81,8 +81,8 @@ def test_query_chunk_attention_matches_explicit_forward_and_backward() -> None:
     wanted = _explicit_attention(explicit, q_a, k_a, v_a, bias, mask)
     actual = chunked._chunked_attention(q_b, k_b, v_b, bias, mask)
     torch.testing.assert_close(actual, wanted, atol=1e-5, rtol=1e-5)
-    wanted.square().sum().backward()
-    actual.square().sum().backward()
+    wanted.float().square().mean().backward()
+    actual.float().square().mean().backward()
     torch.testing.assert_close(query_b.grad, query_a.grad, atol=1e-5, rtol=1e-5)
     for left, right in zip(explicit.parameters(), chunked.parameters(), strict=True):
         if left.grad is not None:
@@ -90,27 +90,39 @@ def test_query_chunk_attention_matches_explicit_forward_and_backward() -> None:
 
 
 @CUDA
-def test_biased_sdpa_matches_explicit_forward_and_backward() -> None:
+@pytest.mark.parametrize("d_model", (16, 24, 128))
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+def test_biased_sdpa_matches_explicit_forward_and_backward(d_model, dtype) -> None:
     torch.manual_seed(63)
     device = torch.device("cuda", torch.cuda.current_device())
-    explicit = MHA(24, 4).to(device)
-    sdpa = MHA(24, 4).to(device)
+    if dtype == torch.bfloat16 and torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("native BF16 is unavailable")
+    explicit = MHA(d_model, 4).to(device)
+    sdpa = MHA(d_model, 4).to(device)
     sdpa.load_state_dict(explicit.state_dict())
-    query_a = torch.randn(2, 5, 24, device=device, requires_grad=True)
+    query_a = torch.randn(2, 5, d_model, device=device, requires_grad=True)
     query_b = query_a.detach().clone().requires_grad_()
     bias = torch.randn(2, 5, dtype=torch.float32, device=device)
     mask = torch.tensor(
         [[True, True, False, True, True], [True, False, True, True, True]],
         device=device,
     )
-    q_a, k_a, v_a = explicit._project(query_a, query_a)
-    q_b, k_b, v_b = sdpa._project(query_b, query_b)
-    wanted = _explicit_attention(explicit, q_a, k_a, v_a, bias, mask)
-    actual = sdpa._sdpa_biased_attention(q_b, k_b, v_b, bias, mask)
-    torch.testing.assert_close(actual, wanted, atol=1e-5, rtol=1e-5)
-    wanted.square().sum().backward()
-    actual.square().sum().backward()
-    torch.testing.assert_close(query_b.grad, query_a.grad, atol=1e-5, rtol=1e-5)
+    with torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
+        q_a, k_a, v_a = explicit._project(query_a, query_a)
+        q_b, k_b, v_b = sdpa._project(query_b, query_b)
+        # The mathematical reference keeps its score arithmetic in FP32.
+        with torch.autocast("cuda", enabled=False):
+            wanted = _explicit_attention(explicit, q_a, k_a, v_a, bias, mask)
+        actual = sdpa._sdpa_biased_attention(q_b, k_b, v_b, bias, mask)
+    rtol, atol = ((1e-5, 1e-5) if dtype == torch.float32 else
+                 (8e-3, 8e-4) if dtype == torch.float16 else (3e-2, 3e-3))
+    torch.testing.assert_close(actual, wanted, atol=atol, rtol=rtol)
+    wanted.float().square().mean().backward()
+    actual.float().square().mean().backward()
+    torch.testing.assert_close(query_b.grad, query_a.grad, atol=atol, rtol=rtol)
     for left, right in zip(explicit.parameters(), sdpa.parameters(), strict=True):
         if left.grad is not None:
-            torch.testing.assert_close(right.grad, left.grad, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(right.grad, left.grad, atol=atol, rtol=rtol)
+            error = torch.linalg.vector_norm(right.grad - left.grad)
+            reference_norm = torch.linalg.vector_norm(left.grad)
+            assert float(error / reference_norm.clamp_min(1e-12)) <= rtol
