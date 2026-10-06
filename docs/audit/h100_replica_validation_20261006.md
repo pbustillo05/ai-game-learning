@@ -152,7 +152,7 @@ fails with `ERR_NVGPUCTRPERM`. Shared driver policy is unchanged. A subsequent
 read-only Hopper NVML GPM probe succeeded: device-wide SM activity, achieved warp
 occupancy, Tensor/HMMA activity, integer/FP32/FP16 activity, and DRAM bandwidth
 percentages can be sampled without enabling shared profiler permissions.
-The retained `scripts/h100_gpm_monitor.py` writes full decimal values every
+The retained [`tools/h100-gpm-monitor.py`](../../tools/h100-gpm-monitor.py) writes full decimal values every
 250 ms. Both API status and finite, in-range percent values are required.
 One concurrent `nvidia-smi dmon` probe returned a spurious graphics-activity
 value above 100%; raw values are retained and invalid percentages excluded.
@@ -171,6 +171,18 @@ setter was called. Precise per-kernel stalls/issue metrics still require Nsight.
 5. Tune measured launch, layout, capture, or memory bottlenecks and rerun affected
    CUDA gates. One H100 cannot validate multi-rank NCCL; MPS/SM75 validation also
    requires the corresponding hardware.
+
+The reference-cache reuse estimate was subsequently repaired as `a7a20a1`.
+It had counted chunks of fresh rollout rows and ignored scheduled learner
+presentations, so the 116-step workload was wrongly denied cache admission.
+It now reads sampler metadata without advancing RNG, and rejects known
+unprofitable caches before launching a reference forward. The prior conversation
+passed all 20 affected CUDA tests (50.78 seconds) and is running the full suite
+at `fdb58ce`, whose production source and tests are byte-identical to `a7a20a1`
+(`git diff --exit-code ... -- pbg tests` passed). This thread's duplicate full
+run was stopped while waiting on shared CUDA extension compilation; its log
+does not establish a completed suite. The retained monitor was also exercised
+against the H100 with explicit NVML argument types and unchanged stream state.
 
 ## Isolated performance evidence at `3a2d9ac`
 
