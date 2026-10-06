@@ -1,0 +1,48 @@
+schema: pbg-variance-iteration-48h-v1
+received_utc: '2026-09-22T00:00:00Z'
+checkpoints:
+  normal10k: runs/experiments/nlhe_hu_32bb_normal_60h_20260812/checkpoint_00010000.pt
+  rb10k: runs/experiments/nlhe_hu_32bb_rb_dualclip5_60h_20260814/checkpoint_00010000.pt
+arms:
+  - sampled
+  - rb1024
+gradient:
+  public_rollouts: 384
+  decision_records: 256
+  repetitions_default: 32
+  repetitions_fallback: 16
+  lambda: 1.0
+  actor_loss: unclipped
+  value_coefficient: 0.0
+  entropy_coefficient: 0.0
+  reference_kl_coefficient: 0.0
+  rb_completions: 1024
+optimization:
+  public_rollouts: 384
+  decision_records: 256
+  repetitions: 6
+  maximum_steps_default: 100
+  maximum_steps_fallback: 38
+  endpoints_default: [0, 10, 20, 38, 100]
+  primary_endpoint: 38
+  restore_checkpoint_optimizer: true
+  cache_targets_once: true
+reference:
+  public_rollouts: 256
+  completions: 4096
+  completion_sampler: exact_collision_conditioned_profiles_and_uniform_runouts
+  signed_cache: conditional_positive_and_negative_advantage_moments
+  production_row_scaffold_completions: 1024
+  precision_public_rollouts: 32
+  precision_completions: [4096, 8192]
+  objective: expected ordinary sampled-target clipped PPO actor loss
+statistics:
+  bootstrap_unit: paired_repetition_id
+  bootstrap_draws: 20000
+  confidence_level: 0.95
+base_seed: 4820260922
+scope_lock_rule: >-
+  Before inspecting effects, cap every optimization run at 38 steps if the
+  measured forecast exceeds hour 40; if it still exceeds hour 40, reduce
+  gradient repetitions to 16. Preserve both checkpoints and six optimization
+  pairs per checkpoint.
