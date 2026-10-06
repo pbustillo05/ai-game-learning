@@ -90,6 +90,8 @@ def benchmark_training(
         )
     session = TrainingSession(cfg, resume_from=checkpoint, benchmark_telemetry=phase_telemetry,
                               initial_model_state=initial_model_state)
+    parameter_layout = session.modules.layout_manifest()
+    parameters_per_replica = session.modules.parameter_count
     cfg.execution.output_dir.mkdir(parents=True, exist_ok=True)
     rank = torch.distributed.get_rank() if session.distributed is not None else 0
     snapshot_directory = [tempfile.mkdtemp(prefix=".benchmark-reset-", dir=cfg.execution.output_dir)
@@ -263,6 +265,8 @@ def benchmark_training(
     properties = torch.cuda.get_device_properties(benchmark_device)
     from pbg.games.poker.model.work import shared_model_work_ledger
     report = {
+        "parameter_layout": parameter_layout,
+        "parameters_per_replica": parameters_per_replica,
         "work_ledger": shared_model_work_ledger(cfg.scientific_mapping()),
         "measurement": {"phase_telemetry": phase_telemetry,
                         "wall_boundary": "CUDA synchronized before and after complete production iteration",

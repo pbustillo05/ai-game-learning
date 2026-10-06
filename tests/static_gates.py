@@ -65,8 +65,18 @@ def forbidden_literal_violations(
     violations: list[str] = []
     for path in sorted(package.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        # PyTorch's fixed-shape compilation metadata is not a game/mode
+        # selector. Only the exact disabled dictionary setting is exempt.
+        compile_metadata_keys = {
+            id(key)
+            for node in ast.walk(tree) if isinstance(node, ast.Dict)
+            for key, value in zip(node.keys, node.values)
+            if isinstance(key, ast.Constant) and key.value == "dynamic"
+            and isinstance(value, ast.Constant) and value.value is False
+        }
         for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and node.value in blocked:
+            if (isinstance(node, ast.Constant) and node.value in blocked
+                    and id(node) not in compile_metadata_keys):
                 violations.append(f"{path}:{node.lineno}:{node.value}")
     return tuple(violations)
 

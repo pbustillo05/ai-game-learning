@@ -529,16 +529,22 @@ def test_benchmark_reuses_process_workspaces_across_repeats(
     progress_path = tmp_path / "benchmark.progress.json"
     report = benchmark_training(
         cfg,
-        warmup=1,
+        # Exact-shape admission starts on the second visit. Both warmups must
+        # finish before comparing steady-state workspace peaks.
+        warmup=2,
         repeats=3,
         progress_path=progress_path,
     )
     peaks = [sample["peak_allocated_bytes"] for sample in report["samples"]]
     progress = json.loads(progress_path.read_text(encoding="utf-8"))
     assert progress["status"] == "complete"
-    assert progress["completed_warmups"] == 1
+    assert progress["completed_warmups"] == 2
     assert progress["completed_repeats"] == 3
     assert len(progress["samples"]) == 3
+    for sample in report["samples"]:
+        before, after = sample["tensor_program_before"], sample["tensor_program_after"]
+        assert before["entries"] == after["entries"]
+        assert before["denied_shapes"] == after["denied_shapes"]
     del report
     gc.collect()
     torch.cuda.synchronize()

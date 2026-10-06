@@ -1604,8 +1604,8 @@ def test_checkpoint_resume_is_strict_and_execution_drift_is_allowed(
     model = _TinyModel(device)
     reference = _TinyModel(device)
     optimizer = DenseAdam(model, OptimizerConfig())
-    optimizer.exp_avg.fill_(0.3)
-    optimizer.exp_avg_sq.fill_(0.4)
+    optimizer.first[0].fill_(0.3)
+    optimizer.second[0].fill_(0.4)
     optimizer.step_count = 7
     generator = torch.Generator(device=device).manual_seed(41)
     generator_state = generator.get_state().clone()
@@ -1638,7 +1638,7 @@ def test_checkpoint_resume_is_strict_and_execution_drift_is_allowed(
     assert digest == sha256_file(path)
     model.weight.data.zero_()
     reference.weight.data.zero_()
-    optimizer.exp_avg.zero_()
+    optimizer.first[0].zero_()
     _scaler, reference_state, resumed, execution = load_checkpoint(
         path,
         model=model,
@@ -1651,7 +1651,7 @@ def test_checkpoint_resume_is_strict_and_execution_drift_is_allowed(
     torch.testing.assert_close(
         model.weight, torch.tensor([0.4, -0.8, 1.2], device=device)
     )
-    torch.testing.assert_close(optimizer.exp_avg, torch.full((3,), 0.3, device=device))
+    torch.testing.assert_close(optimizer.first[0], torch.full((3,), 0.3, device=device))
     assert resumed.recovered_overflow and resumed.iteration == 6
     assert reference_state.interval_iterations == 3
     assert execution == execution_manifest

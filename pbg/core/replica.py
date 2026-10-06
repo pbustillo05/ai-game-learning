@@ -602,27 +602,6 @@ class ReplicaLaneOptimizer:
     def zero_grad(self) -> None:
         self.group.zero_grad((self.lane,))
 
-    def agree_failure(self, failed: bool) -> bool:
-        if self.distributed is None:
-            return bool(failed)
-        local = torch.zeros(
-            self.group.modules.n_replica,
-            dtype=torch.bool,
-            device=self.group.modules.device,
-        )
-        local[self.lane] = bool(failed)
-        return bool(self.distributed.agree_failures(local)[self.lane])
-
-    def common_step_count(self, local_steps: int) -> int:
-        """Agree the number of ordered SUM/optimizer transitions across ranks."""
-
-        if self.distributed is None:
-            return int(local_steps)
-        return self.distributed.maximum_steps(
-            local_steps,
-            device=self.group.modules.device,
-        )
-
     def step(self) -> OptimizerStep:
         result = self.group.step(
             (self.lane,),

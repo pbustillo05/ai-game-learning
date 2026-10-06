@@ -160,6 +160,7 @@ def test_non_poker_bundle_reaches_one_optimizer_transition(
     owners.plan.device = "cuda"
     operations = _NonPokerOperations(owners.events)
     engine = object.__new__(_SyntheticEngine)
+    engine.config = SimpleNamespace(benchmark_telemetry=False)
     engine.operations = operations
     engine.optimizer = _Optimizer(owners.events)
     engine.rank_agreement = _Agreement()

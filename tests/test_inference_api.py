@@ -90,7 +90,7 @@ def test_inference_artifact_rejects_legacy_and_invalid_hash(tmp_path: Path) -> N
     torch.save(
         {"inference_artifact_schema_version": "pbg-inference-v1"}, legacy
     )
-    with pytest.raises(RuntimeError, match="strict queued"):
+    with pytest.raises(RuntimeError, match="strict shared-model"):
         load_inference_source(legacy)
     invalid = {
         "artifact_schema": INFERENCE_ARTIFACT_SCHEMA_VERSION,

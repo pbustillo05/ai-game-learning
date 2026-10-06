@@ -251,7 +251,7 @@ def test_native_postflop_model_consumes_signed_folded_summary() -> None:
     evaluation.value.mean().backward()
     assert any(
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
-        for parameter in model.postflop.parameters()
+        for parameter in (*model.shared.parameters(), *model.post_encoder.parameters())
     )
 
 

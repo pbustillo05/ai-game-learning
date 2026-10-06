@@ -956,6 +956,12 @@ def test_full_branched_iteration_is_family_pack_invariant() -> None:
             device,
         )
         model = _BranchedModel(device, geometry.private_hands)
+        # This is a fixed-output queue/sampling invariant. Random GEMM outputs
+        # can differ by batch shape, perturbing even negligible policy tails.
+        # Keep the public map trainable, with identical initial outputs.
+        with torch.no_grad():
+            model.public.weight.zero_()
+            model.public.bias.zero_()
         result = EngineDrivenBranchedAttempt(
             geometry=geometry,
             owners=GeneratedOwners(plan),
@@ -1002,6 +1008,7 @@ def test_full_branched_iteration_is_family_pack_invariant() -> None:
             wide_state[name],
             atol=0,
             rtol=0,
+            msg=lambda message: f"{name}: {message}",
         )
 
 

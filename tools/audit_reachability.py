@@ -38,6 +38,12 @@ DECLARED_PUBLIC_ROOTS = (
     "pbg.inference_artifact.export_inference_artifact",
     "pbg.benchmark.benchmark_training",
     "pbg.benchmark.compare_benchmark",
+    # Independent numerical diagnostics call the same tensor loss/backward.
+    "pbg.core.learner.LearnerOperation.forward_loss_backward",
+    # Preserved public paired-response evaluation, distinct from the CLI's
+    # fixed-target gain report.
+    "pbg.games.poker.queued.response.SequentialSharedResponseEvaluator",
+    "pbg.games.poker.queued.response.SequentialSharedResponseEvaluator.evaluate",
 )
 
 MAIN_GUARD_RE = re.compile(r"^pbg(?:\.[A-Za-z_]\w*)+$")

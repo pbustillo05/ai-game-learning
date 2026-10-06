@@ -330,14 +330,6 @@ class DenseAdam:
         return self.gradients.parameters
 
     @property
-    def exp_avg(self) -> Tensor:
-        return self.first[0] if self.count == 1 else self.first
-
-    @property
-    def exp_avg_sq(self) -> Tensor:
-        return self.second[0] if self.count == 1 else self.second
-
-    @property
     def step_count(self) -> int:
         return int(self.steps[0].item())
 
@@ -460,10 +452,6 @@ class DenseAdamLane:
             dtype=torch.float32, device=self.owner.device)
         self.owner.trackers[self.lane] = value.growth_tracker
         self.owner.enabled[self.lane] = value.enabled
-
-    @property
-    def loss_scale(self) -> Tensor:
-        return self.owner.controls[self.lane, 6]
 
     @property
     def gradients(self) -> DenseGradientOwner:

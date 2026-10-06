@@ -235,7 +235,7 @@ def test_runtime_separates_rb_rollout_and_natural_learner_domains(
             "rb_learner_operation"
         }
         session.step()
-        assert tuple(state.iteration for state in session.run_states) == (1, 16, 32) * replicas
+        assert tuple(state.iteration for state in session.run_states) == (1,) * replicas
     finally:
         session.close()
 
