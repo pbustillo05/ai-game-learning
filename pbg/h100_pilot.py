@@ -27,7 +27,6 @@ H100_DECLARED_TOTAL_BYTES = 80_000_000_000
 H100_MEMORY_GUARD_BYTES = 10 * GIB
 H100_MEMORY_BUDGET_BYTES = H100_DECLARED_TOTAL_BYTES - H100_MEMORY_GUARD_BYTES
 REPLICA_COUNTS = (1, 2, 4, 8, 16, 32)
-RB_SAMPLE_COUNTS = (256, 512, 1024)
 
 
 class PilotError(RuntimeError):
@@ -296,17 +295,6 @@ def write_arm_config(
     return load_config_mapping(mapping) if resolve else None
 
 
-def geometry_roots(replicas: int) -> tuple[int, ...]:
-    return {
-        1: (2048, 3072, 4096),
-        2: (1536, 2048, 3072),
-        4: (768, 1024, 1536),
-        8: (64, 128, 256),
-        16: (32, 64, 128),
-        32: (16, 32, 64),
-    }[replicas]
-
-
 def base_plan() -> dict[str, object]:
     """Small correctness gates, matched K=1/16/32 runs, and admitted K=8 fallback."""
     arms = []
@@ -534,14 +522,12 @@ __all__ = [
     "H100_MEMORY_BUDGET_BYTES",
     "INITIALIZER_SCHEMA",
     "PLAN_SCHEMA",
-    "RB_SAMPLE_COUNTS",
     "REPLICA_COUNTS",
     "Arm",
     "PilotError",
     "base_plan",
     "benchmark_summary",
     "export_model_initializer",
-    "geometry_roots",
     "h100_preflight",
     "load_model_initializer",
     "pilot_config_mapping",

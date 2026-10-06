@@ -13,7 +13,6 @@ from pbg.h100_pilot import (
     PilotError,
     base_plan,
     export_model_initializer,
-    geometry_roots,
     load_model_initializer,
     pilot_config_mapping,
     select_replica_count,
@@ -137,8 +136,6 @@ def test_replica_selection_requires_a_material_gain() -> None:
         },
     ]
     assert select_replica_count(rows) == 4
-    assert geometry_roots(1) == (2048, 3072, 4096)
-    assert geometry_roots(8) == (64, 128, 256)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
