@@ -424,6 +424,27 @@ def _run_learner_cohort(works, packets, *, iteration, owner, lanes):
     return metrics
 
 
+def _ready_learner_cohort(ready, *, lanes, keys, family_ranks, batched):
+    """Flush earlier FIFO families and batch the largest exact contiguous run.
+
+    A narrow tail must not let the lowest lane consume all of its next family
+    while other lanes are still finishing the previous one. These are bounded
+    host scheduling metadata; no rows, draws, or per-lane FIFO order change.
+    """
+    priority = min(family_ranks[index] for index in ready)
+    groups = []
+    for index in ready:
+        if family_ranks[index] != priority:
+            continue
+        if (groups and lanes[index] == lanes[groups[-1][-1]] + 1
+                and keys[index] == keys[groups[-1][0]]
+                and batched[index] and batched[groups[-1][0]]):
+            groups[-1].append(index)
+        else:
+            groups.append([index])
+    return max(groups, key=lambda indices: (len(indices), -indices[0]))
+
+
 def optimize_prepared(works, *, iteration, optimizer, distributed=None):
     """Logical-step FIFO scheduling of exact family cohorts, including K=1."""
     owner, group = _optimizer_binding(optimizer)
@@ -445,6 +466,12 @@ def optimize_prepared(works, *, iteration, optimizer, distributed=None):
     streams = [iter(packets(work)) for work in works]
     pending = [None for _ in works]
     ended = [False for _ in works]
+    # Production samplers expose the canonical store/FIFO order, including
+    # empty families. Diagnostic samplers discover their order on first use.
+    family_orders = [{name: rank for rank, name in enumerate(getattr(work.sampler, "stores", ()))}
+                     for work in works]
+    batched = {index: _operation_binding(work.iteration.learner.model_operation) is not None
+               for index, work in enumerate(works)}
     for logical_step in range(max(budgets, default=0)):
         active = [index for index, budget in enumerate(budgets) if logical_step < budget]
         mask = torch.zeros(owner.count, dtype=torch.bool, device=owner.device)
@@ -465,17 +492,14 @@ def optimize_prepared(works, *, iteration, optimizer, distributed=None):
                          and pending[index][0] == logical_step]
                 if not ready:
                     break
-                first = ready[0]
-                key = _learner_cohort_key(works[first], pending[first][1])
-                cohort = [first]
-                for index in ready[1:]:
-                    if (lanes[index] != lanes[cohort[-1]] + 1 or
-                        _learner_cohort_key(works[index], pending[index][1]) != key):
-                        break
-                    # Arbitrary callables have no batched parameter contract.
-                    if _operation_binding(works[first].iteration.learner.model_operation) is None:
-                        break
-                    cohort.append(index)
+                keys, family_ranks = {}, {}
+                for index in ready:
+                    physical = pending[index][1]
+                    keys[index] = _learner_cohort_key(works[index], physical)
+                    order = family_orders[index]
+                    family_ranks[index] = order.setdefault(physical.input_type, len(order))
+                cohort = _ready_learner_cohort(ready, lanes=lanes, keys=keys,
+                                              family_ranks=family_ranks, batched=batched)
                 result = _run_learner_cohort([works[index] for index in cohort],
                     [pending[index] for index in cohort], iteration=iteration, owner=owner,
                     lanes=[lanes[index] for index in cohort])
