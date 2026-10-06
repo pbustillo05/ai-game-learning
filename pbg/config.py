@@ -142,6 +142,10 @@ class ExecutionConfig:
     source_sha256: str
     frozen_checkpoint: Path | None = None
     distributed: bool = False
+    learner_family_rows: Mapping[str, int] | None = None
+    tensor_program: str = "captured"
+    program_cache_entries: int = 8
+    program_cache_bytes: int = 512 << 20
 
     def __post_init__(self) -> None:
         try:
@@ -152,6 +156,10 @@ class ExecutionConfig:
             ) from exc
         if device.type != "cuda":
             raise ConfigError("root.run.execution.device: training requires CUDA")
+        if self.tensor_program not in ("eager", "compiled", "captured"):
+            raise ConfigError("tensor_program must be eager, compiled, or captured")
+        if self.program_cache_entries <= 0 or self.program_cache_bytes < 0:
+            raise ConfigError("tensor program cache limits are invalid")
         if self.iterations <= 0 or self.checkpoint_every <= 0:
             raise ConfigError("root.run: iteration counts must be positive")
         if self.attention_backend not in ("sdpa", "chunked_dense"):
@@ -166,7 +174,15 @@ class ExecutionConfig:
     def _payload(self) -> dict[str, object]:
         manifest = self.manifest
         layout = self.layout
+        from pbg.core.precision import PrecisionPolicy
+        dtype_name = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}[layout.model_dtype]
         result: dict[str, object] = {
+            "precision_policy": PrecisionPolicy(dtype_name, layout.model_dtype, self.attention_backend, "cuda").manifest(),
+            "learner_family_rows": None if self.learner_family_rows is None else dict(self.learner_family_rows),
+            "tensor_program": {"mode": self.tensor_program, "cache_entries": self.program_cache_entries,
+                               "cache_bytes": self.program_cache_bytes, "layout_version": 2,
+                               "fullgraph": True, "dynamic": False,
+                               "compile_mode": "max-autotune-no-cudagraphs"},
             "schema": RESOLVED_EXECUTION_SCHEMA,
             "derivation_version": CAPACITY_DERIVATION_VERSION,
             "derivations": dict(self.derivations),
@@ -611,7 +627,7 @@ def _parse_attention(value: object) -> tuple[str, int | None, object]:
     return "chunked_dense", rows, {"kind": "chunked_dense", "query_rows": rows}
 
 
-def _parse_microbatch(value: object) -> tuple[dict[str, int | None], object]:
+def _parse_microbatch(value: object) -> tuple[dict[str, int | None | dict[str, int]], object]:
     if value == "auto":
         return {"rollout": None, "completion": None, "learner": None}, "auto"
     source = _object(value, "root.run.execution.microbatch")
@@ -621,7 +637,7 @@ def _parse_microbatch(value: object) -> tuple[dict[str, int | None], object]:
         raise ConfigError(
             "root.run.execution.microbatch: expected at least one preference"
         )
-    result: dict[str, int | None] = {
+    result: dict[str, int | None | dict[str, int]] = {
         "rollout": None,
         "completion": None,
         "learner": None,
@@ -631,7 +647,14 @@ def _parse_microbatch(value: object) -> tuple[dict[str, int | None], object]:
         ("completion_rows", "completion"),
         ("learner_rows", "learner"),
     ):
-        if public in source:
+        if public == "learner_rows" and isinstance(source.get(public), Mapping):
+            rows = {str(name): _positive_int(rows, f"microbatch.learner_rows.{name}")
+                    for name, rows in source[public].items()}
+            if not rows:
+                raise ConfigError("microbatch.learner_rows requires family rows")
+            result["learner_families"] = rows
+            result[internal] = max(rows.values())
+        elif public in source:
             result[internal] = _positive_int(
                 source[public], f"root.run.execution.microbatch.{public}"
             )
@@ -1054,6 +1077,7 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
             "microbatch",
             "distributed",
             "reference_cache",
+            "tensor_program",
         },
         "root.run.execution",
     )
@@ -1074,10 +1098,25 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
     precision = execution_source["precision"]
     if precision not in ("fp32", "fp16", "bf16"):
         raise ConfigError("root.run.execution.precision: expected fp32, fp16, or bf16")
+    program = _object(execution_source.get("tensor_program", {}), "root.run.execution.tensor_program")
+    _closed(program, {"mode", "cache_entries", "cache_bytes"}, "root.run.execution.tensor_program")
+    program_mode = program.get("mode", "captured")
+    if program_mode not in ("eager", "compiled", "captured"):
+        raise ConfigError("root.run.execution.tensor_program.mode: invalid execution mode")
+    program_entries = _positive_int(program.get("cache_entries", 8), "tensor_program.cache_entries")
+    program_bytes = _nonnegative_int(program.get("cache_bytes", 512 << 20), "tensor_program.cache_bytes")
+    canonical_program = {"mode": program_mode, "cache_entries": program_entries, "cache_bytes": program_bytes}
     attention_backend, query_rows, canonical_attention = _parse_attention(
         execution_source["attention"]
     )
     microbatch, canonical_microbatch = _parse_microbatch(execution_source["microbatch"])
+    family_names = ("pre", *(f"post_{live}" for live in range(2, geometry.players + 1)))
+    family_rows = microbatch.get("learner_families")
+    if family_rows is not None and set(family_rows) != set(family_names):
+        raise ConfigError("microbatch.learner_rows must cover exactly the run's input families")
+    if microbatch["learner"] is None:
+        family_rows = {name: 32 if name == "pre" else 8 for name in family_names}
+        microbatch["learner"] = 32
     memory = _object(execution_source["memory"], "root.run.execution.memory")
     _closed(memory, {"reserve_bytes"}, "root.run.execution.memory")
     _required(memory, {"reserve_bytes"}, "root.run.execution.memory")
@@ -1206,6 +1245,7 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
     canonical_execution: dict[str, object] = {
         "device": device_name,
         "precision": precision,
+        "tensor_program": canonical_program,
         "attention": canonical_attention,
         "memory": {"reserve_bytes": reserve_bytes},
         "microbatch": canonical_microbatch,
@@ -1261,6 +1301,7 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
             mode=schema,
             geometry=geometry,
             model=scientific.common.model,
+            scientific=canonical_scientific,
             precision=str(precision),
             device=device,
             workload=WorkloadSpec(
@@ -1276,6 +1317,9 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
             batch_size=scientific.common.schedule.batch_size,
             beta_max=beta_max,
             completion_samples=completion_samples,
+            query_rows=query_rows,
+            graph_cache_bytes=program_bytes if program_mode == "captured" else 0,
+            family_learner_caps=family_rows,
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"root.run: capacity compilation failed: {exc}") from exc
@@ -1287,6 +1331,10 @@ def load_config_mapping(raw: Mapping[str, object]) -> RootConfig:
         run_id=run_id,
         attention_backend=attention_backend,
         query_chunk_size=query_rows,
+        learner_family_rows=None if family_rows is None else MappingProxyType(dict(family_rows)),
+        tensor_program=program_mode,
+        program_cache_entries=program_entries,
+        program_cache_bytes=program_bytes,
         distributed=distributed,
         frozen_checkpoint=frozen_path,
         manifest=compiled.manifest,

@@ -1543,6 +1543,7 @@ class BranchedBatchSampler:
         sigma_pack_cap: int,
         action_pack_cap: int,
         statistical_counts: Mapping[str, int] | None = None,
+        family_sigma_caps: Mapping[str, int] | None = None,
     ) -> None:
         if not stores:
             raise ValueError("at least one branched learner store is required")
@@ -1616,6 +1617,10 @@ class BranchedBatchSampler:
             or action_pack_cap <= 0
         ):
             raise LearnerError("branched physical pack caps must be positive")
+        self.family_sigma_caps = {} if family_sigma_caps is None else dict(family_sigma_caps)
+        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
+               for value in self.family_sigma_caps.values()):
+            raise ValueError("family sigma caps must be positive integers")
         self.sigma_pack_cap = sigma_pack_cap
         self.action_pack_cap = action_pack_cap
 
@@ -1677,6 +1682,7 @@ class BranchedBatchSampler:
                     sigma_limit = min(
                         self.schedule.batch_size,
                         self.sigma_pack_cap,
+                        self.family_sigma_caps.get(name, self.sigma_pack_cap),
                         requested - emitted,
                     )
                     while take < sigma_limit:
@@ -1792,6 +1798,8 @@ class LearnerOperation:
         self.policy_operation = policy_operation
         if precision not in ("fp32", "fp16", "bf16"):
             raise ValueError("learner precision must be fp32, fp16, or bf16")
+        from pbg.core.precision import resolve_precision
+        self.precision_policy = resolve_precision(precision, torch.device("cuda"))
         self.precision = precision
         self.dtypes = LearnerDTypes(
             {
@@ -1858,8 +1866,6 @@ class LearnerOperation:
             "fp16": torch.float16,
             "bf16": torch.bfloat16,
         }[self.precision]
-        if self.precision == "bf16" and not torch.cuda.is_bf16_supported():
-            raise LearnerError("selected CUDA device does not support BF16")
         with torch.autocast(
             device_type="cuda",
             dtype=autocast_dtype,
@@ -1912,12 +1918,10 @@ class LearnerOperation:
                     else dict(cached)
                 )
             elif reference_operation is not None:
-                reference_evaluation = reference_operation(
-                    batch.input_type,
-                    sigma["model_input"],
-                    sigma_private,
-                    sigma["owner"],
-                )
+                with torch.no_grad():
+                    reference_evaluation = reference_operation(
+                        batch.input_type, sigma["model_input"], sigma_private, sigma["owner"],
+                    )
                 reference_sigma = (
                     {
                         name: _select_sampled_private(

@@ -69,7 +69,9 @@ class ReplicaModuleOwner:
         device = next(iter(devices))
         # Containers are storage, not autograd leaves. Only named views own grads.
         self.master = torch.empty((len(modules), width), dtype=torch.float32, device=device)
-        self.gradients = torch.zeros_like(self.master)
+        self.gradients = (torch.zeros_like(self.master)
+                          if any(value.requires_grad for value in source_parameters[0].values())
+                          else self.master.new_empty(0))
         self.parameters: dict[str, Tensor] = {}
         self.parameter_layout: dict[str, tuple[int, int, tuple[int, ...]]] = {}
         offset = 0

@@ -79,3 +79,14 @@ class LayerNorm(nn.LayerNorm):
             bias = broadcast_parameter(self.bias, value.shape[0], 1)
             result = result + bias.to(result.dtype).reshape(shape)
         return result
+
+
+def feature_cat(values, *, dim: int = -1) -> Tensor:
+    """Assemble working features directly in the selected compute dtype.
+
+    Call after sensitive reach/log/mass reductions, at the projection boundary.
+    This avoids promoting a complete activation bank with a small FP32 feature.
+    """
+    values = tuple(values)
+    dtype = compute_dtype(values[0])
+    return torch.cat(tuple(value.to(dtype) for value in values), dim=dim)

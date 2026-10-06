@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
-from pbg.core.tensor_ops import Linear, Embedding, broadcast_parameter
+from pbg.core.tensor_ops import feature_cat, Linear, Embedding, broadcast_parameter
 
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.model.shared import SharedPokerParameters
@@ -602,7 +602,7 @@ class PostflopEncoder(nn.Module):
             expanded_pressure,
             torch.ones_like(compact_ranges)[..., None],
         ]
-        row = self.row_affine(torch.cat(features, dim=-1))
+        row = self.row_affine(feature_cat(features, dim=-1))
         seats = torch.arange(players, device=row.device)[None].expand(batch, -1)
         if pub.button is not None:
             relative = torch.remainder(seats - pub.button[:, None].long(), players)
@@ -640,7 +640,7 @@ class PostflopEncoder(nn.Module):
             corrected_log_reach[..., None], expanded_geometry, beta_square,
             expanded_pressure, expanded_tight,
         ]
-        side_rows = torch.cat(side_parts, dim=-1)
+        side_rows = feature_cat(side_parts, dim=-1)
         x = token
         incidence_mass = corrected_log_reach.exp() * compact_mask
         identical_scale = torch.ones(
@@ -663,14 +663,14 @@ class PostflopEncoder(nn.Module):
             residual = x + attention.forward_biased(
                 normalized_x, normalized_x, key_bias, key_mask
             )
-            dynamic = torch.cat(
+            dynamic = feature_cat(
                 (j, overlap_card * overlap_card, overlap_card * overlap_equal), dim=-1
             )
             def pad_rows(value: Tensor) -> Tensor:
                 rows = value.reshape(batch, row_flat.shape[1], -1)
                 return torch.nn.functional.pad(rows, (0, 0, 0, token.shape[1] - rows.shape[1]))
             x = residual + ffn(
-                torch.cat((norm(residual), pad_rows(dynamic)), dim=-1),
+                feature_cat((norm(residual), pad_rows(dynamic)), dim=-1),
                 pad_rows(side_rows), "post",
             )
         final = shared.final_norm(x)
@@ -703,7 +703,7 @@ class PostflopEncoder(nn.Module):
             dim=-1,
         )
         live_summary = shared.seat_features(
-            torch.cat((pooled, live_seat_meta), dim=-1)
+            feature_cat((pooled, live_seat_meta), dim=-1)
         )
         full_mass = torch.zeros(
             (batch, players), dtype=mass.dtype, device=mass.device
@@ -717,7 +717,7 @@ class PostflopEncoder(nn.Module):
             dim=-1,
         )
         folded_summary = self.fold_features(
-            torch.cat((folder_seat_context, seat_meta), dim=-1)
+            feature_cat((folder_seat_context, seat_meta), dim=-1)
         )
         scattered_live = torch.zeros_like(folded_summary).scatter_add(
             1,

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor, nn
-from pbg.core.tensor_ops import Linear, Embedding
+from pbg.core.tensor_ops import Linear, Embedding, feature_cat
 
 from pbg.games.poker.model.heads import RaiseMixtureHead, TypeHead, ValueHead
 from pbg.games.poker.model.incidence import IncidenceResidual
@@ -79,7 +79,7 @@ class SharedPokerParameters(nn.Module):
     ) -> tuple[dict[str, Tensor], Tensor]:
         """Project the decision context once for all private rows."""
 
-        rows = torch.cat((actor_rows, private_embedding), dim=-1)
+        rows = feature_cat((actor_rows, private_embedding), dim=-1)
         context = torch.cat((anchors.flatten(1), global_feature), dim=-1)
         z_type = self.type_features.forward_factored(rows, context)
         z_raise = self.raise_features.forward_factored(rows, context)

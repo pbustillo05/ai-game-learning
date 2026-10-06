@@ -350,7 +350,6 @@ def _run_learner_cohort(works, packets, *, iteration, owner, lanes):
     dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[first.precision]
     reference_raw = None
     with torch.autocast("cuda", dtype=dtype, enabled=first.precision != "fp32"):
-        evaluation = operation(batch.input_type, sigma["model_input"], private, sigma["owner"])
         with torch.no_grad():
             if works[0].reference_caches is not None:
                 references = []
@@ -368,20 +367,53 @@ def _run_learner_cohort(works, packets, *, iteration, owner, lanes):
                 raw = reference(batch.input_type, sigma["model_input"], private, sigma["owner"]).policy_raw
                 reference_raw = ({name: _select_sampled_private(value, private, sigma["owner"])
                                   for name, value in raw.items()} if sampled else raw)
-        result = first.forward_loss(batch, iteration=iteration, lane_count=len(works),
-                                    loss_controls=controls, evaluation=evaluation,
-                                    reference_raw=reference_raw)
     weights = torch.stack([torch.as_tensor(packet[2], dtype=torch.float32, device=owner.device)
                            for packet in packets])
     torch._assert_async((torch.isfinite(weights) & weights.gt(0) & weights.le(1)).all(),
                         "physical objective weights must lie in (0,1]")
     lane_index = torch.tensor(lanes, dtype=torch.int64, device=owner.device)
-    owner.fatal[lane_index] |= ~torch.isfinite(result.total.detach())
-    scale = owner.controls.index_select(0, lane_index)[:, 6]
-    (result.total * weights * scale).sum().backward()
+    scales = owner.controls.index_select(0, lane_index)[:, 6]
+    sequential = isinstance(batch, SequentialLearnerBatch)
+    sigma_names = tuple(batch.sigma_fields)
+    action_names = () if sequential else tuple(batch.action_fields)
+    reference_names = () if reference_raw is None else tuple(reference_raw)
+    input_type, count = batch.input_type, len(works)
     names = (*LearnerIteration._METRICS, *LearnerIteration._MAX_METRICS)
-    metrics = torch.stack([getattr(result, name).detach() for name in names], dim=1)
-    metrics[:, :len(LearnerIteration._METRICS)].mul_(weights[:, None])
+
+    def program(*values):
+        from pbg.core.learner import BranchedLearnerBatch
+
+        sigma_index, action_ptr, action_index = values[:3]
+        offset = 3
+        sigma = dict(zip(sigma_names, values[offset:offset + len(sigma_names)], strict=True))
+        offset += len(sigma_names)
+        action = dict(zip(action_names, values[offset:offset + len(action_names)], strict=True))
+        offset += len(action_names)
+        raw = dict(zip(reference_names, values[offset:offset + len(reference_names)], strict=True))
+        offset += len(reference_names)
+        loss_controls, objective_weights, loss_scales = values[offset:]
+        physical = (SequentialLearnerBatch(input_type, sigma_index, sigma) if sequential else
+                    BranchedLearnerBatch(input_type, sigma_index, action_ptr, action_index, sigma, action))
+        private = sigma["sampled_private_state"] if sampled else sigma["owner"][:, None]
+        with torch.autocast("cuda", dtype=dtype, enabled=first.precision != "fp32"):
+            evaluation = operation(input_type, sigma["model_input"], private, sigma["owner"])
+            result = first.forward_loss(physical, iteration=0, lane_count=count,
+                                        loss_controls=loss_controls, evaluation=evaluation,
+                                        reference_raw=raw if reference_names else None)
+        metrics = torch.stack([getattr(result, name).detach() for name in names], dim=1)
+        metrics = torch.cat((metrics[:, :8] * objective_weights[:, None], metrics[:, 8:]), dim=1)
+        return result.total.detach(), metrics, (result.total * objective_weights * loss_scales).sum()
+
+    values = (batch.sigma_index, batch.action_ptr, batch.action_index,
+              *batch.sigma_fields.values(),
+              *(() if sequential else batch.action_fields.values()),
+              *(() if reference_raw is None else reference_raw.values()), controls, weights, scales)
+    key = (_learner_cohort_key(works[0], packets[0][1]), tuple(lanes), reference_names, 2)
+    total, metrics = owner.program_runner.run(key, program, values,
+        mutable=(owner.gradient_rows, *(buffer for module in owner.modules for buffer in module.buffers())))
+    owner.fatal[lane_index] |= ~torch.isfinite(total)
+    for gradient_owner in owner.gradient_owners:
+        gradient_owner.assert_bound()
     return metrics
 
 

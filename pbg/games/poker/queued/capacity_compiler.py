@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 import torch
@@ -40,7 +40,7 @@ from pbg.games.poker.queued.folded import sequential_family_workspace_row_bytes
 from pbg.games.poker.queued.hooks import NLHEGeometry, poker_partitions
 from pbg.games.poker.queued.rb_sampling import POSTERIOR_MAX_ATTEMPTS
 
-CAPACITY_DERIVATION_VERSION = "nlhe_capacity_v1"
+CAPACITY_DERIVATION_VERSION = "nlhe_capacity_v2"
 FIELD_ALIGNMENT = 64
 _CUBLAS_WORKSPACE_BYTES = 8 << 20
 
@@ -102,16 +102,30 @@ def _learner_workspace_row_bytes(
     model_dtype: torch.dtype,
     token_bound: int,
     action_width: int,
+    hidden: int,
+    static_width: int,
+    heads: int,
+    query_rows: int | None,
+    training: bool = True,
 ) -> int:
-    """Conservative concurrent forward/backward tensors for one learner row."""
+    """Full-width live feature, saved-autograd and backward scratch envelope.
+
+    SDPA is fused-only on CUDA; dense attention explicitly bounds query rows.
+    Named terms include packed projections, residual/normalization inputs,
+    both FFN hidden activations, dynamic/static adapters and FP32 incidence.
+    """
 
     element_bytes = torch.empty((), dtype=model_dtype).element_size()
-    transformer_values = token_bound * d_model * (4 + 3 * layers)
-    output_values = geometry.private_hands * (action_width + 3)
-    fp32_control = geometry.private_hands * (2 * action_width + 8)
-    return _align(
-        element_bytes * (transformer_values + output_values) + 4 * fp32_control
-    )
+    saved_per_layer = token_bound * (18 * d_model + 2 * hidden + static_width)
+    incidence_per_layer = 8 * token_bound * d_model
+    saved = layers * (element_bytes * saved_per_layer + 4 * incidence_per_layer)
+    working = element_bytes * token_bound * (12 * d_model + 2 * hidden + static_width)
+    attention = (4 * heads * token_bound * min(query_rows, token_bound) * 4
+                 if query_rows is not None else 4 * heads * token_bound * 4)
+    readout = element_bytes * geometry.private_hands * (3 * hidden + (action_width + 3) * d_model)
+    fp32_control = 4 * geometry.private_hands * (2 * action_width + 8)
+    return _align((saved if training else 4 * incidence_per_layer)
+                  + working + attention + readout + fp32_control)
 
 
 def _chance_frontier_row_bytes(
@@ -178,16 +192,22 @@ def compile_capacity(
     mode: ModeSchema,
     geometry: NLHEGeometry,
     model: object,
+    scientific: Mapping[str, object],
     precision: str,
     device: torch.device,
     workload: WorkloadSpec,
     batch_size: int,
     beta_max: int,
     completion_samples: int,
+    query_rows: int | None = None,
+    graph_cache_bytes: int = 0,
+    family_learner_caps: Mapping[str, int] | None = None,
 ) -> CompiledCapacity:
     """Compile all derived storage/layout values from one canonical source."""
 
     total_memory = _device_total_memory(device)
+    if total_memory >= 64 << 30:
+        workload = replace(workload, reserve_bytes=max(workload.reserve_bytes, 10 << 30))
     if not 0 <= workload.reserve_bytes < total_memory:
         raise ValueError("memory reserve must be nonnegative and below device memory")
     if workload.roots <= 0 or workload.replicas <= 0:
@@ -306,19 +326,40 @@ def compile_capacity(
         geometry,
         rao_blackwell=rao_blackwell,
     )
-    learner_workspace = _learner_workspace_row_bytes(
+    def learner_row_workspace(tokens):
+        return _learner_workspace_row_bytes(
+            geometry,
+            d_model=int(model.d_model),
+            layers=int(model.layers),
+            model_dtype=dtype,
+            token_bound=tokens,
+            action_width=action_width,
+            hidden=int(model.ffn_hidden or 4 * model.d_model),
+            static_width=int(model.class_embedding_dim + 3 + geometry.deck_cards
+                             + 4 * model.folder_beta_rank + 2 * model.d_model),
+            heads=int(model.n_heads), query_rows=query_rows,
+        )
+    learner_model_workspace = max(
+        min(learner_pack, (family_learner_caps or {}).get(name, learner_pack))
+        * learner_row_workspace(tokens) for name, tokens in token_bounds.items()
+    )
+    inference_workspace = _learner_workspace_row_bytes(
         geometry,
         d_model=int(model.d_model),
         layers=int(model.layers),
         model_dtype=dtype,
         token_bound=token_bound,
         action_width=action_width,
+        hidden=int(model.ffn_hidden or 4 * model.d_model),
+        static_width=int(model.class_embedding_dim + 3 + geometry.deck_cards
+                         + 4 * model.folder_beta_rank + 2 * model.d_model),
+        heads=int(model.n_heads), query_rows=query_rows, training=False,
     )
     movement_scratch = _align(
         64 * workload.replicas * (12 * topology_cap + 4 * topology_edge_cap + leaf_cap)
         + 4 * len(partitions.outputs) ** 2 * geometry.private_hands
     )
-    library_workspace = _CUBLAS_WORKSPACE_BYTES + (
+    library_workspace = graph_cache_bytes + _CUBLAS_WORKSPACE_BYTES + (
         rb_conversion_library_workspace_bytes(
             geometry.private_hands, geometry.private_classes
         )
@@ -351,6 +392,7 @@ def compile_capacity(
         + workload.replicas
         * topology_rows
         * _align(branched_topology_packet_row_bytes(), 8)
+        + workload.replicas * family_pack * inference_workspace
         + library_workspace
     )
     completion_phase_workspace = (
@@ -374,17 +416,22 @@ def compile_capacity(
         if mode.rollout_mode.is_branched
         else 0
     )
+    from pbg.games.poker.queued.model import model_storage_bytes
+    parameter_bytes, _ = model_storage_bytes(scientific)
+    optimizer_scratch = 16 * workload.replicas * parameter_bytes
     learner_phase_workspace = (
-        learner_pack * learner_workspace
-        + (
+        workload.replicas * learner_model_workspace
+        + workload.replicas * (
             learner_pack
             if not mode.rollout_mode.is_branched
             else min(action_total, learner_pack * beta_max)
         )
-        * learner_workspace
+        * _align(4 * max(geometry.model_input_width(name) for name in input_names)
+                 + 4 * geometry.private_hands * (12 * action_width + 32))
         + library_workspace
-        + alias_workspace
+        + workload.replicas * alias_workspace
         + workload.reference_cache_bytes
+        + optimizer_scratch
     )
 
     manifest = CapacityManifest(
@@ -459,7 +506,7 @@ def compile_capacity(
                 "tokens": "max_policy_partition_sequence_tokens",
                 "forest": "beta_bounded_forest_v1",
                 "best_response": "branched_full_or_sequential_symmetric_bound_v1",
-                "workspace": "implementation_concurrent_tensors_v1",
+                "workspace": "full_width_cohort_saved_autograd_v2",
                 "device_memory": "torch.cuda.get_device_properties",
             }
         ),

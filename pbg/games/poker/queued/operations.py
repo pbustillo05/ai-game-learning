@@ -138,6 +138,8 @@ class PokerOperations:
         self.rollout_operations = tuple(rollout_operations)
         self.frozen_operations = tuple(frozen_operations)
         self.seed = int(seed)
+        from pbg.core.precision import resolve_precision
+        self.precision_policy = resolve_precision(precision, plan.device)
         self.precision = precision
         self.utility = utility
         self.completion_samples = int(completion_samples)
@@ -358,8 +360,6 @@ class PokerOperations:
             "fp16": torch.float16,
             "bf16": torch.bfloat16,
         }[self.precision]
-        if self.precision == "bf16" and not torch.cuda.is_bf16_supported():
-            raise PokerOperationsError("selected CUDA device does not support BF16")
         with torch.autocast(
             device_type="cuda",
             dtype=autocast_dtype,

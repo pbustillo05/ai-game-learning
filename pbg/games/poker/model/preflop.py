@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 from torch import Tensor, nn
-from pbg.core.tensor_ops import Linear, Embedding, broadcast_parameter
+from pbg.core.tensor_ops import feature_cat, Linear, Embedding, broadcast_parameter
 
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.model.shared import SharedPokerParameters
@@ -550,7 +550,7 @@ class PreflopEncoder(nn.Module):
         expanded_geometry = geometry[:, None].expand(-1, players, -1, -1)
         log_range = torch.log(class_ranges.clamp_min(c.eps))
         constant = torch.ones_like(class_ranges)
-        row_feature = torch.cat(
+        row_feature = feature_cat(
             (
                 class_ranges[..., None], log_range[..., None], size_feature[..., None],
                 expanded_emb, expanded_geometry, constant[..., None],
@@ -589,7 +589,7 @@ class PreflopEncoder(nn.Module):
             dim=1,
         )
 
-        side_class = torch.cat(
+        side_class = feature_cat(
             (expanded_emb, class_ranges[..., None], log_range[..., None], expanded_geometry),
             dim=-1,
         )
@@ -613,14 +613,14 @@ class PreflopEncoder(nn.Module):
             x_hat = x + attention.forward_biased(
                 normalized_x, normalized_x, key_bias, key_mask
             )
-            dynamic = torch.cat(
+            dynamic = feature_cat(
                 (j, overlap_card * overlap_card, overlap_card * overlap_equal), dim=-1
             )
             def pad_rows(value: Tensor) -> Tensor:
                 rows = value.reshape(batch, players * self.n_classes, -1)
                 return torch.nn.functional.pad(rows, (0, 0, 0, token.shape[1] - rows.shape[1]))
             x = x_hat + layer_ffn(
-                torch.cat((layer_norm(x_hat), pad_rows(dynamic)), dim=-1),
+                feature_cat((layer_norm(x_hat), pad_rows(dynamic)), dim=-1),
                 pad_rows(side_class), "pre",
             )
 
@@ -646,7 +646,7 @@ class PreflopEncoder(nn.Module):
                 relative_seats.to(mass.dtype) / max(c.max_players - 1, 1),
             ), dim=-1,
         )
-        seat_summary = shared.seat_features(torch.cat((pooled, seat_meta), dim=-1))
+        seat_summary = shared.seat_features(feature_cat((pooled, seat_meta), dim=-1))
         actor_selector = (
             torch.arange(players, device=actor.device)[None, :]
             == actor[:, None]

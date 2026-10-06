@@ -313,6 +313,8 @@ class DenseAdam:
         self._transaction_state: tuple[dict[str, object], ...] | None = None
         self.lanes = tuple(DenseAdamLane(self, lane) for lane in range(self.count))
         self._transition = adam_transition
+        from pbg.core.execution_program import TensorProgramRunner
+        self.program_runner = TensorProgramRunner()
 
     @property
     def config(self) -> OptimizerConfig:
@@ -355,6 +357,14 @@ class DenseAdam:
     @property
     def transaction_bytes(self) -> int:
         return sum(value.numel() * value.element_size() for value in self._snapshots)
+
+    def configure_execution(self, *, mode: str, cache_entries: int, cache_bytes: int,
+                            reserve_bytes: int = 0, peak_workspace_bytes: int = 0) -> None:
+        from pbg.core.execution_program import TensorProgramRunner
+        self.program_runner = TensorProgramRunner(mode=mode, max_entries=cache_entries,
+                                                  byte_budget=cache_bytes, reserve_bytes=reserve_bytes,
+                                                  peak_workspace_bytes=peak_workspace_bytes)
+        self.configure_compilation(mode != "eager")
 
     def configure_compilation(self, enabled: bool) -> None:
         self._transition = (torch.compile(adam_transition, fullgraph=True, dynamic=False,

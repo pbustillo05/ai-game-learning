@@ -57,23 +57,25 @@ class IncidenceResidual(nn.Module):
         if identical_scale.shape != (batch, row_count):
             raise ValueError("identical_scale must have shape [R] or [B,R]")
         normalized = self.norm(rows)
-        source = self.source(normalized) * mass[..., None]
-        card_accumulator = torch.einsum(
-            "brc,bprd->bpcd", card_incidence.to(source.dtype), source
-        )
-        card_overlap = torch.einsum(
-            "brc,bpcd->bprd", card_incidence.to(source.dtype), card_accumulator
-        )
-        same = source * identical_scale[:, None, :, None].to(source.dtype)
-        total_card = card_overlap.sum(1, keepdim=True)
-        total_same = same.sum(1, keepdim=True)
-        other_equal = total_same - same
-        other_card = total_card - card_overlap - 2.0 * other_equal
-        own_card = card_overlap - 2.0 * same
+        projected = self.source(normalized)
+        # Incidence mass reductions retain FP32 accumulation; only the working
+        # residual/projection boundary returns to the selected compute dtype.
+        with torch.autocast(rows.device.type, enabled=False):
+            source = projected.float() * mass.float()[..., None]
+            incidence = card_incidence.float()
+            card_accumulator = torch.einsum("brc,bprd->bpcd", incidence, source)
+            card_overlap = torch.einsum("brc,bpcd->bprd", incidence, card_accumulator)
+            same = source * identical_scale[:, None, :, None].float()
+            total_card = card_overlap.sum(1, keepdim=True)
+            total_same = same.sum(1, keepdim=True)
+            other_equal = total_same - same
+            other_card = total_card - card_overlap - 2.0 * other_equal
+            own_card = card_overlap - 2.0 * same
+        query = self.query(normalized)
         residual = self.output(
             torch.nn.functional.gelu(
-                self.query(normalized)
-                + other_card
+                query
+                + other_card.to(query.dtype)
                 + self.identical(other_equal)
                 + self.own(own_card)
             )

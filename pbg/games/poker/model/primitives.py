@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from pbg.core.tensor_ops import Linear, LayerNorm, linear, broadcast_parameter
 from torch.utils.checkpoint import checkpoint
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 
 def accelerator_assert(condition: Tensor, message: str) -> None:
@@ -157,12 +158,23 @@ class MHA(nn.Module):
         additive_mask = additive_mask.masked_fill(
             ~key_mask[:, None, None, :], -torch.inf
         )
+        # Fused CUDA bias kernels require aligned row strides. Padding storage
+        # does not introduce keys or change the statistical/token domain.
+        padding = (-additive_mask.shape[-1]) % 8
+        if padding:
+            additive_mask = F.pad(additive_mask, (0, padding))[..., :key_bias.shape[-1]]
+        if q_head.device.type == "cuda":
+            # Capacity admission assumes linear fused SDPA workspace. A hidden
+            # quadratic math fallback would violate that contract.
+            with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION,
+                              SDPBackend.CUDNN_ATTENTION]):
+                return F.scaled_dot_product_attention(
+                    q_head / temperature, k_head, v_head,
+                    attn_mask=additive_mask, dropout_p=0.0,
+                )
         return F.scaled_dot_product_attention(
-            q_head / temperature,
-            k_head,
-            v_head,
-            attn_mask=additive_mask,
-            dropout_p=0.0,
+            q_head / temperature, k_head, v_head,
+            attn_mask=additive_mask, dropout_p=0.0,
         )
 
     def configure_execution(

@@ -182,6 +182,11 @@ class TrainingSession:
         )
         validate_workload_capabilities(self.device, workload=workload)
         torch.cuda.set_device(self.device)
+        from pbg.core.precision import resolve_precision
+        self.precision_policy = resolve_precision(
+            config.scientific.common.precision.name, self.device,
+            attention_backend=config.execution.attention_backend,
+        )
         if config.execution.distributed:
             self._owns_process_group = not dist.is_initialized()
             if not dist.is_initialized():
@@ -211,18 +216,35 @@ class TrainingSession:
             config.scientific.common.game.rank_count,
         )
         self.runtime_identity = {
+            "precision_policy": self.precision_policy.manifest(),
             "code": code_identity(),
             "accelerator": accelerator_identity(self.geometry.rank_count),
         }
-        self.plan = build_storage_plan(
-            self.mode,
-            poker_partitions(self.geometry, self.mode),
-            config.execution.manifest,
-            config.execution.layout,
-            self.device,
-        )
         frozen = _frozen_state(config)
-        count = self.plan.manifest.n_replica
+        count = config.execution.manifest.n_replica
+        from pbg.games.poker.queued.model import model_storage_bytes
+        parameter_bytes, buffer_bytes = model_storage_bytes(scientific)
+        # One master, gradient, two moments and three rollback vectors; buffers
+        # have one rollback copy. Small device controls/counters are explicit.
+        resident_bytes = count * (7 * parameter_bytes + 2 * buffer_bytes + 133)
+        if config.scientific.common.reference is not None:
+            resident_bytes += count * (parameter_bytes + buffer_bytes)
+        if frozen is not None:
+            frozen_parameter, frozen_buffer = model_storage_bytes(frozen[1])
+            resident_bytes += count * (frozen_parameter + frozen_buffer)
+        optimizer_scratch = 16 * count * parameter_bytes
+        manifest = config.execution.manifest
+        preflight = build_storage_plan(self.mode, poker_partitions(self.geometry, self.mode),
+                                       manifest, config.execution.layout, self.device)
+        peak = max(item.required_bytes for item in preflight.admissions
+                   if item.phase.name not in ("COMPLETION", "ALIGN_AND_SEAL", "TARGETS"))
+        free_bytes, _ = torch.cuda.mem_get_info(self.device)
+        if resident_bytes + peak + manifest.hardware.reserve_bytes > free_bytes:
+            raise RuntimeError("model/optimizer owners plus exact-shape workspace exceed available CUDA memory; reduce physical microbatches or replicas")
+        self.memory_ledger = {"predicted_resident_bytes": resident_bytes,
+                              "optimizer_scratch_bound_bytes": optimizer_scratch,
+                              "graph_cache_budget_bytes": config.execution.program_cache_bytes,
+                              "reserve_bytes": manifest.hardware.reserve_bytes}
         modules = []
         for lane in range(count):
             torch.manual_seed(config.scientific.common.seed + lane)
@@ -234,6 +256,7 @@ class TrainingSession:
             modules.append(module)
         self.inference = PokerReplicaInference(modules)
         self.modules: ReplicaModuleOwner = self.inference.modules
+        del modules, module
         if initial_model_state is not None:
             if not initial_model_state or any(
                 not isinstance(name, str) or not isinstance(value, torch.Tensor)
@@ -262,6 +285,13 @@ class TrainingSession:
                 LossScaler(enabled=config.scientific.common.precision.name == "fp16")
                 for _ in range(count)
             ),
+        )
+        self.optimizers.optimizer.configure_execution(
+            mode=config.execution.tensor_program,
+            cache_entries=config.execution.program_cache_entries,
+            cache_bytes=config.execution.program_cache_bytes,
+            reserve_bytes=config.execution.manifest.hardware.reserve_bytes,
+            peak_workspace_bytes=config.execution.manifest.learner_workspace_bytes,
         )
         self.generators = tuple(
             torch.Generator(device=self.device).manual_seed(
@@ -320,6 +350,7 @@ class TrainingSession:
                 module.eval().requires_grad_(False)
                 frozen_modules.append(module)
             self.frozen_inference = PokerReplicaInference(frozen_modules)
+            del frozen_modules, module
             if config.scientific.applicable.get("response_initialization") == "target":
                 if frozen_scientific["model"] != scientific["model"]:
                     raise RuntimeError("initialize-from-target requires the same shared model configuration")
@@ -329,6 +360,12 @@ class TrainingSession:
                         self.reference_modules.lane_module(lane).load_state_dict(
                             frozen, strict=True
                         )
+        # Recheck after the actual owners exist; allocator free memory now
+        # includes masters, rollback/reference/frozen storage and library state.
+        torch.cuda.empty_cache()
+        self.plan = build_storage_plan(self.mode, poker_partitions(self.geometry, self.mode),
+                                       manifest, config.execution.layout, self.device)
+        self.memory_ledger["actual_learner_resident_bytes"] = self.optimizers.memory_report().total_bytes
         if self.distributed is not None:
             owners = (self.modules,) + (
                 (self.reference_modules,) if self.reference_modules is not None else ()
@@ -606,6 +643,7 @@ class TrainingSession:
                 reproducibility=(self.config.scientific.common.reproducibility),
                 distributed=self.distributed,
                 benchmark_telemetry=self.benchmark_telemetry,
+                learner_family_rows=self.config.execution.learner_family_rows,
             ),
             owner_factory=lambda: GeneratedOwners(self.plan),
             operations=self._poker_operations(),
@@ -816,6 +854,8 @@ class TrainingSession:
                         ),
                     },
                     "memory": {
+                        "owner_ledger": self.memory_ledger,
+                        "tensor_program": self.optimizers.optimizer.program_runner.manifest(),
                         "configured_budget_bytes": (
                             self.plan.manifest.hardware.usable_memory_bytes
                         ),
@@ -823,6 +863,9 @@ class TrainingSession:
                             admission.phase.name: admission.required_bytes
                             for admission in self.plan.admissions
                         },
+                        "external_bytes": max(0, torch.cuda.get_device_properties(self.device).total_memory
+                                              - torch.cuda.mem_get_info(self.device)[0]
+                                              - torch.cuda.memory_reserved(self.device)),
                         "allocated_bytes": torch.cuda.memory_allocated(self.device),
                         "reserved_bytes": torch.cuda.memory_reserved(self.device),
                         "peak_allocated_bytes": (

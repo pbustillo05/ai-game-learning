@@ -48,10 +48,12 @@ def max_policy_partition_sequence_tokens(
             + k_act
         )
     }
-    flop_hands = math.comb(geometry.n_cards - 3, 2)
+    # post_A combines streets and currently uses a full-width stable map.
+    # Board masks remove contributions, not allocated token rows.
+    post_rows = geometry.n_hands
     for live_players in range(2, n_players + 1):
         result[f"post_{live_players}"] = (
-            live_players * flop_hands
+            live_players * post_rows
             + scalar_count
             + 6
             + history

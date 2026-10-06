@@ -452,10 +452,9 @@ class QueuedPokerModel(nn.Module):
         )
 
 
-def build_model_from_config(
+def model_configuration_from_scientific(
     scientific: Mapping[str, object],
-    device: torch.device | str,
-) -> QueuedPokerModel:
+) -> tuple[NLHEGeometry, PokerModelConfig]:
     """Reconstruct the selected queued architecture from scientific state.
 
     Architecture values that are functions of other scientific values are
@@ -532,6 +531,20 @@ def build_model_from_config(
     if model_config.folder_beta_rank > geometry.deck_cards:
         raise ValueError("scientific.model.folder_beta_rank exceeds the compact deck")
 
+    return geometry, model_config
+
+
+def model_storage_bytes(scientific: Mapping[str, object]) -> tuple[int, int]:
+    """Count actual parameter/buffer shapes without allocating accelerator state."""
+    with torch.device("meta"):
+        metadata = QueuedPokerModel(*model_configuration_from_scientific(scientific))
+    return (sum(value.numel() * value.element_size() for value in metadata.parameters()),
+            sum(value.numel() * value.element_size() for value in metadata.buffers()))
+
+
+def build_model_from_config(scientific: Mapping[str, object], device: torch.device | str) -> QueuedPokerModel:
+    """Build the sole model from the same validated geometry/config as admission."""
+    geometry, model_config = model_configuration_from_scientific(scientific)
     target = torch.device(device)
     if target.type not in ("cuda", "mps"):
         raise ValueError("queued poker model construction requires CUDA or MPS")
@@ -543,4 +556,4 @@ def build_model_from_config(
     return result
 
 
-__all__ = ["PokerModelError", "QueuedPokerModel", "build_model_from_config"]
+__all__ = ["PokerModelError", "QueuedPokerModel", "build_model_from_config", "model_configuration_from_scientific"]

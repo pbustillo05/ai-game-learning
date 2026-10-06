@@ -128,6 +128,7 @@ class IterationConfig:
     reproducibility: str = "strict"
     distributed: object | None = None
     benchmark_telemetry: bool = False
+    learner_family_rows: Mapping[str, int] | None = None
 
     def __post_init__(self) -> None:
         if not self.lanes:
@@ -1443,6 +1444,7 @@ class IterationEngine:
                 sigma_pack_cap=owners.plan.manifest.learner_sigma_pack_cap,
                 action_pack_cap=owners.plan.manifest.learner_action_pack_cap,
                 statistical_counts=statistical_counts,
+                family_sigma_caps=self.config.learner_family_rows,
             )
         else:
             stores = {
@@ -1522,6 +1524,9 @@ class IterationEngine:
                         )
                         for name, tokens in costs.items()
                     }
+                if self.config.learner_family_rows is not None:
+                    physical_caps = {name: min(global_cap, cap)
+                                     for name, cap in self.config.learner_family_rows.items()}
                 iteration = LearnerIteration(
                     learner=learner,
                     optimizer=self._lane_optimizer(lane),  # type: ignore[arg-type]

@@ -81,7 +81,7 @@ def test_source_round_trip_and_resolved_hash_are_deterministic() -> None:
     assert rebuilt.execution.mapping() == cfg.execution.mapping()
     resolved = cfg.execution.mapping()
     assert resolved["schema"] == "pbg_resolved_execution_v1"
-    assert resolved["derivation_version"] == "nlhe_capacity_v1"
+    assert resolved["derivation_version"] == "nlhe_capacity_v2"
     assert len(resolved["resolved_sha256"]) == 64
     json.dumps(resolved, sort_keys=True, allow_nan=False)
 
