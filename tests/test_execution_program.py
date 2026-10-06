@@ -190,7 +190,8 @@ def test_reference_cache_budget_is_shared_across_resident_lanes(monkeypatch):
         return SimpleNamespace(allocated_bytes=kwargs["byte_budget"])
     monkeypatch.setattr(iteration, "build_reference_output_cache", build)
     for lane in range(count):
-        assert engine._reference_caches(owners, lane, {"post_2": store})
+        sampler = SimpleNamespace(statistical_counts=None, statistical_presentations=1024)
+        assert engine._reference_caches(owners, lane, {"post_2": store}, sampler=sampler)
     assert sum(budgets) == total
     assert max(budgets) - min(budgets) == 1
     assert caps == [8] * count

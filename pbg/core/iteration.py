@@ -1349,6 +1349,8 @@ class IterationEngine:
         owners: GeneratedOwners,
         lane: int,
         stores: Mapping[str, AlignedSequentialStore | RaggedBranchedStore],
+        *,
+        sampler: SequentialBatchSampler | BranchedBatchSampler,
     ) -> dict[str, ReferenceOutputCache] | None:
         reference = self.config.lanes[lane].reference_operation
         if not self.config.cache_reference_outputs or reference is None:
@@ -1360,17 +1362,21 @@ class IterationEngine:
         budget = share + int(lane < remainder)
         if budget == 0:
             return None
+        counts = sampler.statistical_counts
+        total = sampler.statistical_presentations
+        population = sum(store.rows for store in stores.values())
         for name, store in stores.items():
             columns = (
                 store.sealed_inputs.aligned_payload_columns
                 if isinstance(store, RaggedBranchedStore)
                 else store.sealed_inputs.columns
             )
-            calls = max(
-                1,
-                (store.rows + self.config.schedule.batch_size - 1)
-                // self.config.schedule.batch_size,
-            )
+            # Estimate row reuse over the entire learning schedule, rather
+            # than the number of chunks in one traversal of fresh rollout rows.
+            # Counts are metadata; estimating them must not consume sampler RNG.
+            presentations = (total * store.rows / population if counts is None
+                             else total * counts[name] / sum(counts.values()))
+            passes = presentations / store.rows
             candidate = build_reference_output_cache(
                 reference,
                 input_type=name,
@@ -1385,7 +1391,7 @@ class IterationEngine:
                 precision=self.config.precision,
                 byte_budget=budget,
                 resident_bytes=resident,
-                predicted_saved_seconds=float(max(0, calls - 1)),
+                predicted_saved_seconds=max(0.0, passes - 1.0),
                 predicted_build_seconds=0.5,
             )
             if candidate is None:
@@ -1480,7 +1486,7 @@ class IterationEngine:
         reference_caches: dict[str, ReferenceOutputCache] | None = None
         try:
             reference_caches = self._reference_caches(
-                owners, lane, stores
+                owners, lane, stores, sampler=sampler
             )
             learner = LearnerOperation(
                 context.mode,

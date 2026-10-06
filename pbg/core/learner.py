@@ -464,6 +464,18 @@ def build_reference_output_cache(
         "bf16": torch.bfloat16,
     }[precision]
 
+    # Reject a known unprofitable cache before launching a reference forward.
+    # Payload admission is checked again once the first chunk proves its size.
+    if not ReferenceOutputCache.eligible(
+        byte_budget=byte_budget,
+        resident_bytes=resident_bytes,
+        build_bytes=0,
+        payload_bytes=0,
+        predicted_saved_seconds=predicted_saved_seconds,
+        predicted_build_seconds=predicted_build_seconds,
+    ):
+        return None
+
     def evaluate(begin: int, end: int) -> Mapping[str, Tensor]:
         with (
             torch.no_grad(),
