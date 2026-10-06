@@ -1,8 +1,47 @@
 """Explicit accelerator precision policy resolved outside tensor execution."""
 
 from dataclasses import dataclass
+import os
 
 import torch
+
+
+def configure_cuda_reproducibility(profile: str) -> dict[str, object]:
+    """Apply the declared process-wide CUDA policy before model execution.
+
+    Seeding alone does not make CUDA gradient reductions deterministic. Strict
+    replay also requires deterministic operator dispatch and cuBLAS workspace.
+    Native low-precision GEMMs retain FP32 accumulation in every profile.
+    """
+    if profile not in ("strict", "seeded", "throughput"):
+        raise ValueError("invalid CUDA reproducibility profile")
+    workspace = os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    strict = profile == "strict"
+    if strict and workspace not in (":4096:8", ":16:8"):
+        raise ValueError("strict CUDA reproducibility requires CUBLAS_WORKSPACE_CONFIG=:4096:8 or :16:8")
+    torch.use_deterministic_algorithms(strict)
+    torch.backends.cudnn.deterministic = profile != "throughput"
+    torch.backends.cudnn.benchmark = profile == "throughput"
+    # FP32 incidence, folded summaries, and parity gates retain IEEE input
+    # precision even when the major model projections use BF16 Tensor Cores.
+    precision = "ieee"
+    torch.backends.cuda.matmul.fp32_precision = precision
+    torch.backends.cudnn.fp32_precision = precision
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
+    return {
+        "profile": profile,
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "matmul_fp32_precision": torch.backends.cuda.matmul.fp32_precision,
+        "cudnn_fp32_precision": torch.backends.cudnn.fp32_precision,
+        "fp16_reduced_precision_reduction": False,
+        "bf16_reduced_precision_reduction": False,
+        "fp16_accumulation": False,
+        "cublas_workspace_config": workspace,
+    }
 
 
 @dataclass(frozen=True)

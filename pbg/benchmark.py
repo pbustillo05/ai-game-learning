@@ -92,6 +92,7 @@ def benchmark_training(
                               initial_model_state=initial_model_state)
     parameter_layout = session.modules.layout_manifest()
     parameters_per_replica = session.modules.parameter_count
+    backend_policy = dict(session.backend_policy)
     cfg.execution.output_dir.mkdir(parents=True, exist_ok=True)
     rank = torch.distributed.get_rank() if session.distributed is not None else 0
     snapshot_directory = [tempfile.mkdtemp(prefix=".benchmark-reset-", dir=cfg.execution.output_dir)
@@ -291,6 +292,7 @@ def benchmark_training(
             "required_sample_metrics": list(_REQUIRED_SAMPLE_METRICS),
         },
         "environment": {
+            "cuda_backend_policy": backend_policy,
             "device": str(benchmark_device),
             "device_name": properties.name,
             "compute_capability": [properties.major, properties.minor],

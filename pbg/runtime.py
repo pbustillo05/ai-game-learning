@@ -181,8 +181,9 @@ class TrainingSession:
             local_rank=local_rank,
         )
         validate_workload_capabilities(self.device, workload=workload)
+        from pbg.core.precision import configure_cuda_reproducibility, resolve_precision
+        self.backend_policy = configure_cuda_reproducibility(config.scientific.common.reproducibility)
         torch.cuda.set_device(self.device)
-        from pbg.core.precision import resolve_precision
         self.precision_policy = resolve_precision(
             config.scientific.common.precision.name, self.device,
             attention_backend=config.execution.attention_backend,
@@ -217,6 +218,7 @@ class TrainingSession:
         )
         self.runtime_identity = {
             "precision_policy": self.precision_policy.manifest(),
+            "cuda_backend_policy": self.backend_policy,
             "code": code_identity(),
             "accelerator": accelerator_identity(self.geometry.rank_count),
         }
