@@ -85,6 +85,27 @@ a 512-node per-replica cap, exercising the admission repair. Evidence:
 `reports/native_consumers_fixed.log` and `reports/native_consumers.json`.
 The failed candidate's logs remain diagnostic evidence, not successful results.
 
+The earlier conversation's isolated, CUDA-tested scheduler and capture repairs
+were reviewed and integrated as `5024269` and `b14850e`:
+
+- Uneven preflop tails previously let low-numbered lanes run through postflop
+  before their peers reached it, destroying otherwise compatible cohorts.
+  Scheduling now drains earlier FIFO families and selects the largest exact
+  contiguous cohort, preserving per-lane samples, ordering and updates.
+- When measured graph residency exceeds the cache budget, the entire graph pool
+  is released while its already-warmed compiled function remains cached. This
+  preserves live mutable addresses and avoids reverting recurring shapes to
+  eager execution. Staging/pre-admission failures still execute eagerly.
+
+After integration, all 12 full-depth native BF16 variants passed another 36
+iterations at clean `b14850e`. The integrated full suite passed 566 tests and
+found one stale cross-replica launch-count assertion; scheduling changed the
+healthy lane's calls before injected failure from two to one. That count is
+not a rollback contract. The test now requires healthy work and exactly one
+injected failure, then checks unchanged masters, buffers, Adam state, scaler,
+RNG, versions and logical counters. All 38 affected CUDA tests passed with one
+hardware-dependent skip (43.08 seconds). No numerical tolerance changed.
+
 These checks ran alongside compilation or other correctness checks. They
 establish numerical and memory facts, not isolated timing or throughput.
 
@@ -126,10 +147,18 @@ and cannot establish steady-state throughput. Untimed consumer checks overlapped
 this cold smoke. Its report is under
 `runs/experiments/nlhe_hu_32bb_normal_h100_captured_smoke_k1_3a2d9ac/`.
 
-Nsight Compute 2025.1.1 is installed, but hardware counter access fails with
-`ERR_NVGPUCTRPERM`. Shared driver policy is unchanged. CUDA timelines and NVML
-clocks/power/memory/utilization can be recorded; Tensor Core activity, achieved
-SM occupancy and idle-cycle percentages cannot be measured directly here.
+Nsight Compute 2025.1.1 is installed, but its per-kernel hardware counter access
+fails with `ERR_NVGPUCTRPERM`. Shared driver policy is unchanged. A subsequent
+read-only Hopper NVML GPM probe succeeded: device-wide SM activity, achieved warp
+occupancy, Tensor/HMMA activity, integer/FP32/FP16 activity, and DRAM bandwidth
+percentages can be sampled without enabling shared profiler permissions.
+The retained `scripts/h100_gpm_monitor.py` writes full decimal values every
+250 ms. Both API status and finite, in-range percent values are required.
+One concurrent `nvidia-smi dmon` probe returned a spurious graphics-activity
+value above 100%; raw values are retained and invalid percentages excluded.
+Concurrent probe numbers are instrumentation checks, not workload attribution.
+GPM stream-state queries returned disabled before and after monitoring; no
+setter was called. Precise per-kernel stalls/issue metrics still require Nsight.
 
 ## Remaining work
 
@@ -218,9 +247,35 @@ when permissions permit collection:
 
 The current driver has `RmProfilingAdminOnly: 1`; the container lacks both
 CAP_SYS_ADMIN and CAP_PERFMON. Provider/host profiling permission is required
-for those measurements. No driver policy or container permissions were changed.
+for those Nsight measurements. No driver policy or container permissions were
+changed. GPM interval measurements are a separate permitted path, with metric
+definitions documented by [NVIDIA](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmEnums.html).
+
+An interactive integer-rounded view can be started with:
+
+```bash
+nvidia-smi dmon --id GPU-c0a3cd37-65a1-2be4-42ea-79c44f710069 \
+  --gpm-metrics 1,2,3,5,7,10,12,13 --format csv -o DT -d 1
+```
+
+For full decimals, run the retained monitor with `--uuid` selecting this GPU,
+`--interval 0.25`, and `--output` naming a JSONL evidence file. GPM reports
+device-wide interval averages: low SM activity can coexist with high graphics
+activity when small kernels run frequently. SM activity's complement describes
+inactive SM time averaged over the chip, not every CUDA core's issue-idle cycles.
+Occupancy measures resident active warps, not arithmetic throughput; Tensor
+activity likewise is not achieved TFLOP/s. Tensor pipe activity, instruction
+issue, memory traffic and end-to-end throughput must be interpreted together.
 
 ## Measured optimization priorities
+
+User constraint: preserve `docs/queued/design` and the existing queue design and
+layouts. Do not pursue postflop private-hand compact-bound changes or further
+queue partitioning. No such change has been implemented. Optimization work
+focuses on batch size, physical packs, replica count K, and measured pipeline
+underutilization within the current design.
+Heads-up ($P=2$) is the primary optimization workload. Multi-way games remain
+correctness/compatibility gates; the performance and tuning matrix uses HU.
 
 1. Tune physical packs before increasing K: the default K=1 physical caps leave
    much of this H100 unused, and larger caps already yielded a whole-pipeline gain.
@@ -230,11 +285,10 @@ for those measurements. No driver policy or container permissions were changed.
    compiled execution after a graph denial if compiled timing supports it.
 3. Evaluate device reference-output caching after matched cache-off baselines.
    The same frozen reference is currently recomputed for reused learner rows.
-4. Test a static postflop compact bound based on at least three board cards.
-   All compatible private hands fit in $\binom{4R-3}{2}$ rows; the current default
-   map allocates $\binom{4R}{2}$. Existing gather/scatter masks can preserve full
-   output IDs while reducing private token work. This needs CUDA parity and
-   performance measurements before adoption.
-5. Inspect odd static feature widths and alignment-sensitive GEMMs, and compare
-   fused attention backends while preserving the learned additive key prior.
-   These remain hypotheses; Tensor Core counters would improve attribution.
+4. Attribute GPM SM activity, warp occupancy, Tensor/HMMA activity and DRAM
+   bandwidth to existing rollout, completion, target, reference and learner
+   stages. Prioritize stages with low activity and material wall time, then
+   tune their existing packs and reduce launch overhead without changing queues.
+5. Compare existing fused attention backends while preserving the learned
+   additive key prior. Per-kernel Tensor Core counters would improve attribution;
+   permitted GPM interval counters already support whole-pipeline comparisons.
