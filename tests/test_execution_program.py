@@ -77,34 +77,6 @@ def test_first_replay_warmup_reset_and_live_controls(mode):
 
 
 @CUDA
-def test_capture_stream_is_shared_by_eager_admission_and_multiple_shapes(monkeypatch):
-    # Keep real CUDA autograd and graph replay; compilation itself is covered
-    # by the native program tests. Record the stream when autograd is built.
-    monkeypatch.setattr(torch, "compile", lambda operation, **kwargs: operation)
-    parameter = torch.nn.Parameter(torch.tensor(0.25, device="cuda"))
-    parameter.grad = torch.zeros_like(parameter)
-    runner = TensorProgramRunner(mode="captured", byte_budget=256 << 20)
-    streams = []
-    expected = torch.zeros_like(parameter)
-
-    def program(value):
-        streams.append(torch.cuda.current_stream().cuda_stream)
-        prediction = parameter * value
-        return prediction.detach(), prediction.square().sum()
-
-    for rows in (2, 3, 2, 3, 2, 3):
-        value = torch.full((rows,), 0.5, device="cuda")
-        expected.add_(2 * parameter.detach() * value.square().sum())
-        output, = runner.run(rows, program, (value,), mutable=(parameter.grad,))
-        torch.testing.assert_close(output, parameter.detach() * value)
-        torch.testing.assert_close(parameter.grad, expected)
-    assert len(set(streams)) == 1
-    assert streams[0] != torch.cuda.default_stream().cuda_stream
-    assert runner.manifest()["captured_entries"] == 2
-    assert runner.replays == 4
-
-
-@CUDA
 def test_denied_shape_stays_uncaptured_and_cache_is_bounded():
     parameter = torch.nn.Parameter(torch.tensor(1., device="cuda"))
     parameter.grad = torch.zeros_like(parameter)

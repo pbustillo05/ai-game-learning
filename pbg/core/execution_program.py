@@ -43,7 +43,6 @@ class TensorProgramRunner:
         self.seen: OrderedDict[object, int] = OrderedDict()
         self.calls = self.replays = self.uncaptured = 0
         self.work_counts: dict[str, dict[str, int]] = {}
-        self._capture_stream: torch.cuda.Stream | None = None
 
     @property
     def resident_bytes(self) -> int:
@@ -62,32 +61,6 @@ class TensorProgramRunner:
         return tuple(value.detach() for value in outputs[:-1])
 
     def run(self, key, operation, inputs, *, mutable):
-        inputs, mutable = tuple(inputs), tuple(mutable)
-        if self.mode != "captured":
-            return self._run(key, operation, inputs, mutable=mutable)
-        if not inputs or any(value.device.type != "cuda" or value.device != inputs[0].device
-                             for value in inputs + mutable):
-            raise ValueError("CUDA capture inputs and mutable tensors must share a CUDA device")
-        device = inputs[0].device
-        if self._capture_stream is None:
-            self._capture_stream = torch.cuda.Stream(device=device)
-        if self._capture_stream.device != device:
-            raise ValueError("a captured tensor program runner must retain its CUDA device")
-        caller = torch.cuda.current_stream(device)
-        stream = self._capture_stream
-        stream.wait_stream(caller)
-        try:
-            # Autograd can retain AccumulateGrad nodes between compiled shapes.
-            # Their stream is fixed when first created, so eager admission,
-            # warmup and every capture must use the same non-default stream.
-            with torch.cuda.stream(stream):
-                for value in inputs + mutable:
-                    value.record_stream(stream)
-                return self._run(key, operation, inputs, mutable=mutable)
-        finally:
-            caller.wait_stream(stream)
-
-    def _run(self, key, operation, inputs, *, mutable):
         self.calls += 1
         inputs, mutable = tuple(inputs), tuple(mutable)
         signature = tuple((tuple(value.shape), tuple(value.stride()), value.dtype, value.device)
@@ -137,7 +110,7 @@ class TensorProgramRunner:
             return self._invoke(operation, inputs)
         device = inputs[0].device
         current = torch.cuda.current_stream(device)
-        warmup = current
+        warmup = torch.cuda.Stream(device=device)
         snapshots = tuple(value.detach().clone() for value in mutable)
         rng = torch.cuda.get_rng_state(device)
         entry.static = tuple(value.detach().clone() for value in inputs)
