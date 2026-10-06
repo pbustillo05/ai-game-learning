@@ -12,7 +12,7 @@ The configuration flow has three products:
 2. The NLHE capacity compiler combines that specification with poker geometry,
    the selected mode, implementation workspace formulas, and memory observed
    from the selected CUDA device. It emits one immutable resolved execution
-   manifest. The resolved mapping records `nlhe_capacity_v1`, its individual
+   manifest. The resolved mapping records `nlhe_capacity_v2`, its individual
    derivation authorities, the canonical source hash, and its own content hash.
 3. Actual row counts, allocator high-water marks, pack utilization, free memory,
    and overflow recovery are runtime telemetry. They are never accepted as
@@ -48,3 +48,16 @@ lossless history length, input widths, private domains, action width, token and
 token-pair bounds, sequential action rows, balanced best-response capacity,
 forest edges, physical packs, and concurrent workspaces. Changing those
 derivations requires a new capacity derivation version.
+
+The shared model accepts one positive `scientific.model.layers` value; retired
+`n_layers_pre`/`n_layers_post` keys and split checkpoint formats are rejected.
+`run.execution.microbatch.learner_rows` accepts either one positive cap or an
+exact family mapping, such as `{pre: 32, post_2: 8}` for heads-up. These are
+physical packing limits and do not change the statistical schedule.
+
+`run.execution.tensor_program` selects `mode: eager`, `compiled`, or `captured`
+for the same learner tensor program, with bounded `cache_entries` and
+`cache_bytes`. Precision is explicit: H100 supports native BF16; SM75 supports
+FP32/FP16 and rejects BF16. Master parameters, gradients, optimizer state, loss
+reductions and incidence accumulation remain FP32. The resolved manifest records
+the precision policy, shape-derived memory admission and graph-cache allowance.

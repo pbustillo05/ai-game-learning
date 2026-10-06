@@ -68,7 +68,7 @@ from pbg.games.poker.queued.hooks import (
     rb_partitions,
     sampled_partitions,
 )
-from pbg.games.poker.queued.model import QueuedPokerModel, build_model_from_config
+from pbg.games.poker.queued.model import build_model_from_config
 from pbg.games.poker.queued.policy import (
     CHECK_CALL,
     FOLD,

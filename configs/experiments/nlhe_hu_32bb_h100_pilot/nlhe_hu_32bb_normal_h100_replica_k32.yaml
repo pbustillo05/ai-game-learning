@@ -3,7 +3,7 @@ scientific:
   mode:
     training_regime: self_play
     rollout_mode: sequential
-    private_estimator: rao_blackwell
+    private_estimator: sampled
   game:
     players: 2
     stack_bb: 32.0
@@ -32,7 +32,7 @@ scientific:
     reference_kl:
       coefficient: 0.05
       refresh:
-        effective_hands: 172800000.0
+        effective_hands: 900000.0
   optimizer:
     kind: adamw
     learning_rate: 5.0e-05
@@ -45,25 +45,30 @@ scientific:
     batch_size: 256
     steps: 116
   lambda: 0.95
-  completion:
-    samples: 16
 run:
   seed: 104830
   reproducibility: throughput
   utility: stack_normalized
   workload:
-    roots: 4
+    roots: 64
+    replicas: 32
   execution:
     device: cuda:0
     precision: bf16
     attention: sdpa
-    reference_cache: auto
+    reference_cache: 'off'
+    tensor_program:
+      mode: captured
+      cache_entries: 8
+      cache_bytes: 8589934592
     memory:
       reserve_bytes: 10737418240
     microbatch:
-      rollout_rows: 4
-      completion_rows: 16
-      learner_rows: 256
+      rollout_rows: 8
+      completion_rows: 64
+      learner_rows:
+        pre: 32
+        post_2: 8
   iterations: 1
   checkpoint_every: 1
-  output_dir: runs/experiments/nlhe_hu_32bb_h100_pilot/runtime/nlhe_hu_32bb_rb_h100_bf16_smoke
+  output_dir: runs/experiments/nlhe_hu_32bb_h100_pilot/runtime/nlhe_hu_32bb_normal_h100_replica_k32

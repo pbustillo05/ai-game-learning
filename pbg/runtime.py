@@ -479,6 +479,7 @@ class TrainingSession:
                 generator=self.generators[0],
             )
             optimizer.scaler = scaler
+            self.optimizers.versions[0] = optimizer.step_count
             self.reference_states = None if reference is None else (reference,)
             self.run_states = (state,)
         else:
@@ -582,7 +583,6 @@ class TrainingSession:
         completion_samples = int(
             self.config.scientific.applicable.get("completion_samples", 0)
         )
-        shared_inference = count > 1 or self.distributed is not None
         return PokerOperations(
             geometry=self.geometry,
             plan=self.plan,
@@ -600,8 +600,8 @@ class TrainingSession:
             utility=self.config.scientific.common.utility,
             completion_samples=completion_samples,
             response_cutoff="probe" in self.config.scientific.applicable,
-            inference=self.inference if shared_inference else None,
-            frozen_inference=(self.frozen_inference if shared_inference else None),
+            inference=self.inference,
+            frozen_inference=self.frozen_inference,
         )
 
     def _iteration_engine(self) -> IterationEngine:

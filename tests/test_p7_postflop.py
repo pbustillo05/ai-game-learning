@@ -101,39 +101,41 @@ def test_postflop_forward_scatter_and_autocast():
     assert mixed.v.dtype == torch.float16
 
 
+@CUDA
 def test_incidence_residual_exact_card_identical_and_own_channels():
-    torch.manual_seed(71)
-    layer = IncidenceResidual(3)
-    rows = torch.randn(1, 3, 4, 3)
-    mass = torch.rand(1, 3, 4)
-    incidence = torch.zeros(4, 52)
-    incidence[0, [0, 1]] = 1
-    incidence[1, [0, 2]] = 1
-    incidence[2, [3, 4]] = 1
-    incidence[3, [1, 4]] = 1
-    _, card, equal, own = layer(rows, mass, incidence, torch.ones(4))
-    source = layer.source(layer.norm(rows)) * mass[..., None]
-    expected_card = torch.zeros_like(card)
-    expected_equal = torch.zeros_like(equal)
-    expected_own = torch.zeros_like(own)
-    for q in range(3):
-        for h in range(4):
-            for other in range(3):
-                for g in range(4):
-                    overlap = float((incidence[h] * incidence[g]).sum())
-                    contribution = source[0, other, g]
-                    if other == q:
-                        expected_own[0, q, h] += contribution * (
-                            overlap - 2.0 * float(g == h)
-                        )
-                    else:
-                        expected_card[0, q, h] += contribution * (
-                            overlap - 2.0 * float(g == h)
-                        )
-                        expected_equal[0, q, h] += contribution * float(g == h)
-    torch.testing.assert_close(card, expected_card)
-    torch.testing.assert_close(equal, expected_equal)
-    torch.testing.assert_close(own, expected_own)
+    with torch.device("cuda"):
+        torch.manual_seed(71)
+        layer = IncidenceResidual(3)
+        rows = torch.randn(1, 3, 4, 3)
+        mass = torch.rand(1, 3, 4)
+        incidence = torch.zeros(4, 52)
+        incidence[0, [0, 1]] = 1
+        incidence[1, [0, 2]] = 1
+        incidence[2, [3, 4]] = 1
+        incidence[3, [1, 4]] = 1
+        _, card, equal, own = layer(rows, mass, incidence, torch.ones(4))
+        source = layer.source(layer.norm(rows)) * mass[..., None]
+        expected_card = torch.zeros_like(card)
+        expected_equal = torch.zeros_like(equal)
+        expected_own = torch.zeros_like(own)
+        for q in range(3):
+            for h in range(4):
+                for other in range(3):
+                    for g in range(4):
+                        overlap = float((incidence[h] * incidence[g]).sum())
+                        contribution = source[0, other, g]
+                        if other == q:
+                            expected_own[0, q, h] += contribution * (
+                                overlap - 2.0 * float(g == h)
+                            )
+                        else:
+                            expected_card[0, q, h] += contribution * (
+                                overlap - 2.0 * float(g == h)
+                            )
+                            expected_equal[0, q, h] += contribution * float(g == h)
+        torch.testing.assert_close(card, expected_card)
+        torch.testing.assert_close(equal, expected_equal)
+        torch.testing.assert_close(own, expected_own)
 
 
 def test_signed_beta_coordinates_consume_current_evaluator_eigenpairs():
@@ -233,28 +235,30 @@ def test_compact_contract_v2_folder_features_feed_postflop_model():
     assert torch.isfinite(output.v).all()
 
 
+@CUDA
 def test_current_evaluator_summary_rejects_retired_field_aliases():
-    pub, ranges, masks = _inputs()
-    pub.status[:, 1] = 1
-    pub.to_act.zero_()
-    masks.status = pub.status
-    batch = ranges.shape[0]
-    cfg = type(_cfg())(**{**_cfg().__dict__, "folder_beta_rank": 2})
-    masks.evaluator_summary = PartitionSummaryBatch(
-        {
-            "hand_log_ratio": torch.zeros(batch, 1326),
-            "beta_eigenvalue": torch.zeros(batch, 2),
-            "beta_eigenvector": torch.zeros(batch, 52, 2),
-            "folder_log_mass": torch.zeros(batch, 1),
-            "folder_card_marginal": torch.ones(batch, 1, 52),
-            "folder_mask": torch.ones(batch, 1, dtype=torch.bool),
-            "folder_line_meta": torch.zeros(batch, 1, 8),
-            "folder_seat": torch.ones(batch, 1, dtype=torch.long),
-        },
-        {"contract_version": "2"},
-    )
-    with pytest.raises(ValueError, match="folder card marginals"):
-        FamilyModelFixture(cfg, "post").eval()(pub, ranges, masks=masks)
+    with torch.device("cuda"):
+        pub, ranges, masks = _inputs()
+        pub.status[:, 1] = 1
+        pub.to_act.zero_()
+        masks.status = pub.status
+        batch = ranges.shape[0]
+        cfg = type(_cfg())(**{**_cfg().__dict__, "folder_beta_rank": 2})
+        masks.evaluator_summary = PartitionSummaryBatch(
+            {
+                "hand_log_ratio": torch.zeros(batch, 1326),
+                "beta_eigenvalue": torch.zeros(batch, 2),
+                "beta_eigenvector": torch.zeros(batch, 52, 2),
+                "folder_log_mass": torch.zeros(batch, 1),
+                "folder_card_marginal": torch.ones(batch, 1, 52),
+                "folder_mask": torch.ones(batch, 1, dtype=torch.bool),
+                "folder_line_meta": torch.zeros(batch, 1, 8),
+                "folder_seat": torch.ones(batch, 1, dtype=torch.long),
+            },
+            {"contract_version": "2"},
+        )
+        with pytest.raises(ValueError, match="folder card marginals"):
+            FamilyModelFixture(cfg, "post").eval()(pub, ranges, masks=masks)
 
 
 @CUDA

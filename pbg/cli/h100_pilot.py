@@ -7,36 +7,29 @@ import json
 import subprocess
 import sys
 import time
-from dataclasses import asdict
+import shutil
+from dataclasses import asdict, replace
 from pathlib import Path
 
-import torch
 
 from pbg.benchmark import benchmark_training
 from pbg.config import load_config
+from pbg.core.persistence import sha256_file
+from pbg.identity import code_identity
 from pbg.h100_pilot import (
-    H100_MEMORY_BUDGET_BYTES,
-    RB_SAMPLE_COUNTS,
+    PLAN_SCHEMA,
     Arm,
     PilotError,
     base_plan,
     benchmark_summary,
     export_model_initializer,
-    geometry_roots,
     h100_preflight,
     load_model_initializer,
     select_replica_count,
+    selected_gpu_snapshot,
     write_arm_config,
     write_json,
 )
-
-DEFAULT_NORMAL_CHECKPOINT = Path(
-    "runs/nlhe_hu_32bb_24h_normal_20260722/ckpt_0000700.pt"
-)
-DEFAULT_RB_CHECKPOINT = Path(
-    "runs/nlhe_hu_32bb_24h_rb_20260722/ckpt_0000700.pt"
-)
-
 
 def _arm(value: dict[str, object]) -> Arm:
     return Arm(**value)  # type: ignore[arg-type]
@@ -49,17 +42,16 @@ def _prepare(args: argparse.Namespace) -> None:
     reports = destination / "reports"
     destination.mkdir(parents=True, exist_ok=True)
     initializers = {}
-    for mode, source in (
-        ("normal", Path(args.normal_checkpoint)),
-        ("rb", Path(args.rb_checkpoint)),
-    ):
+    for mode, source in (("normal", args.normal_checkpoint), ("rb", args.rb_checkpoint)):
         target = artifacts / f"nlhe_hu_32bb_{mode}_initializer.pt"
-        initializers[mode] = export_model_initializer(source, target)
+        initializers[mode] = ({"kind": "seeded", "seed": 104830} if source is None else
+                              export_model_initializer(Path(source), target))
     plan = base_plan()
     plan["directory"] = str(destination)
     plan["configs_directory"] = str(configs)
     plan["reports_directory"] = str(reports)
     plan["initializers"] = initializers
+    plan["code"] = code_identity()
     write_json(plan, destination / "plan.json")
     for value in plan["arms"]:
         arm = _arm(value)
@@ -67,6 +59,7 @@ def _prepare(args: argparse.Namespace) -> None:
             arm,
             configs / f"{arm.name}.yaml",
             output_dir=destination / "runtime" / arm.name,
+            resolve=False,
         )
     print(destination / "plan.json")
 
@@ -88,13 +81,15 @@ def _run_arm(args: argparse.Namespace) -> None:
         learner_pack=args.learner_pack,
         warmup=args.warmup,
         repeats=args.repeats,
+        seed=args.seed,
     )
     config = load_config(args.config)
     if config.execution.manifest.n_replica != arm.replicas:
         raise PilotError("arm replica count differs from strict config")
     if config.scientific.common.root_count != arm.roots:
         raise PilotError("arm root count differs from strict config")
-    state, initializer = load_model_initializer(args.initializer)
+    state, initializer = (load_model_initializer(args.initializer) if args.initializer else
+                          (None, {"kind": "seeded", "seed": config.scientific.common.seed}))
     benchmark = benchmark_training(
         config,
         warmup=arm.warmup,
@@ -117,7 +112,7 @@ def _invoke_arm(
     *,
     directory: Path,
     configs_directory: Path,
-    initializer: Path,
+    initializer: Path | None,
     hardware: str,
     timeout_seconds: float | None,
 ) -> dict[str, object]:
@@ -128,6 +123,7 @@ def _invoke_arm(
         config,
         output_dir=directory / "runtime" / arm.name,
         hardware=hardware,
+        resolve=False,
     )
     command = [
         sys.executable,
@@ -156,22 +152,31 @@ def _invoke_arm(
         str(arm.repeats),
         "--config",
         str(config),
-        "--initializer",
-        str(initializer),
+        "--seed",
+        str(arm.seed),
         "--report",
         str(report),
     ]
+    if initializer is not None:
+        command.extend(["--initializer", str(initializer)])
     if arm.completion_samples is not None:
         command.extend(
             ["--completion-samples", str(arm.completion_samples)]
         )
     if hardware == "local":
         command.append("--allow-non-h100")
-    subprocess.run(
-        command,
-        check=True,
-        timeout=timeout_seconds,
-    )
+    idle_before = selected_gpu_snapshot()
+    try:
+        subprocess.run(command, check=True, timeout=timeout_seconds)
+    except BaseException:
+        # Only this arm's generated configuration/runtime scratch is disposable.
+        shutil.rmtree(directory / "runtime" / arm.name, ignore_errors=True)
+        config.unlink(missing_ok=True)
+        raise
+    finally:
+        idle_after = selected_gpu_snapshot()
+        if idle_after["used_memory_mib"] > idle_before["used_memory_mib"] + 64:
+            raise PilotError("selected GPU memory did not return to its idle baseline after child exit")
     value = json.loads(report.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise PilotError(f"{arm.name} emitted a non-object report")
@@ -188,137 +193,135 @@ def _record_failure(
     }
 
 
+def _preflight(args: argparse.Namespace) -> None:
+    report = h100_preflight()
+    write_json(report, args.report)
+    print(args.report)
+
+
 def _run(args: argparse.Namespace) -> None:
     plan_path = Path(args.plan)
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    if plan.get("schema") != "pbg-h100-pilot-plan-v1":
-        raise PilotError("unsupported pilot plan")
-    hardware = h100_preflight()
-    directory = Path(plan["directory"])
-    configs_directory = Path(plan["configs_directory"])
-    initializer_paths = {
-        mode: Path(plan["initializers"][mode]["path"])
-        for mode in ("normal", "rb")
-    }
-    deadline_minutes = float(
-        args.deadline_minutes
-        if args.deadline_minutes is not None
-        else plan["deadline_minutes"]
-    )
-    reserve_seconds = float(plan["shutdown_reserve_minutes"]) * 60.0
-    deadline = time.monotonic() + deadline_minutes * 60.0
-    state: dict[str, object] = {
-        "schema": "pbg-h100-pilot-run-v1",
-        "plan": str(plan_path),
-        "hardware": hardware,
-        "deadline_minutes": deadline_minutes,
-        "completed": [],
-        "failures": [],
-        "selected_replicas": {},
-        "selected_roots": {},
-        "deadline_reached": False,
-    }
+    if plan.get("schema") != PLAN_SCHEMA:
+        raise PilotError("unsupported pilot plan; regenerate the shared-model rental plan")
+    directory, configs_directory = Path(plan["directory"]), Path(plan["configs_directory"])
+    identity = {"plan_sha256": sha256_file(plan_path), "code": code_identity()}
+    if plan.get("code") != identity["code"]:
+        raise PilotError("pilot plan code identity differs; prepare a new plan after code changes")
     state_path = directory / "run_state.json"
+    if state_path.exists():
+        if not args.resume:
+            raise PilotError("pilot progress already exists; pass --resume or use a new directory")
+        state = json.loads(state_path.read_text())
+        if state.get("identity") != identity:
+            raise PilotError("cannot reuse benchmark evidence from a different plan or code revision")
+    else:
+        state = {"schema": "pbg-h100-replica-run-v2", "identity": identity,
+                 "completed": [], "artifacts": {}, "failures": [], "selected_replicas": {}}
+    preflight = directory / "reports" / "preflight.json"
+    # Keep the orchestration process free of CUDA contexts so each child leaves
+    # the selected GPU idle and another process is never mistaken for our work.
+    subprocess.run([sys.executable, "-m", "pbg.cli.h100_pilot", "preflight", "--report", str(preflight)], check=True)
+    hardware = json.loads(preflight.read_text())
+    state["hardware"] = hardware
+    deadline_minutes = args.deadline_minutes or plan["deadline_minutes"]
+    deadline = time.monotonic() + deadline_minutes * 60 - plan["shutdown_reserve_minutes"] * 60
+    initializers = {mode: (Path(plan["initializers"][mode]["path"])
+                          if "path" in plan["initializers"][mode] else None)
+                    for mode in ("normal", "rb")}
+    write_json(state, state_path)
+    log = directory / "reports" / "correctness.log"
+    if state.get("correctness_passed", False) and (
+        not log.exists() or sha256_file(log) != state.get("correctness_log_sha256")
+    ):
+        raise PilotError("completed correctness evidence changed")
+    if not state.get("correctness_passed", False):
+        log = directory / "reports" / "correctness.log"
+        with log.open("w") as output:
+            result = subprocess.run([sys.executable, "-m", "pytest", "-q"],
+                                    stdout=output, stderr=subprocess.STDOUT,
+                                    timeout=max(1, deadline - time.monotonic()))
+        if result.returncode:
+            state["failures"].append({"stage": "correctness", "log": str(log)})
+            write_json(state, state_path)
+            raise PilotError(f"correctness gates failed; inspect {log} before benchmarking")
+        state["correctness_passed"] = True
+        state["correctness_log_sha256"] = sha256_file(log)
+        write_json(state, state_path)
 
-    def execute(arm: Arm, *, required: bool = False) -> dict[str, object] | None:
-        remaining = deadline - time.monotonic() - reserve_seconds
+    def execute(arm, *, required=False):
+        report_path = directory / "reports" / f"{arm.name}.json"
+        artifact = state["artifacts"].get(arm.name)
+        if artifact is not None:
+            if not report_path.exists() or sha256_file(report_path) != artifact:
+                raise PilotError(f"completed evidence changed: {report_path}")
+            return json.loads(report_path.read_text())
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             state["deadline_reached"] = True
             write_json(state, state_path)
             return None
         try:
-            report = _invoke_arm(
-                arm,
-                directory=directory,
-                configs_directory=configs_directory,
-                initializer=initializer_paths[arm.mode],
-                hardware="h100",
-                timeout_seconds=remaining,
-            )
-        except (OSError, subprocess.SubprocessError, PilotError) as error:
+            report = _invoke_arm(arm, directory=directory, configs_directory=configs_directory,
+                                 initializer=initializers[arm.mode], hardware="h100", timeout_seconds=remaining)
+        except (OSError, subprocess.SubprocessError, PilotError, ValueError) as error:
             state["failures"].append(_record_failure(arm, error))
             write_json(state, state_path)
             if required:
                 raise
             return None
         state["completed"].append(report["summary"])
+        state["artifacts"][arm.name] = sha256_file(report_path)
         write_json(state, state_path)
         return report
 
     arms = [_arm(value) for value in plan["arms"]]
     for arm in (value for value in arms if value.stage == "smoke"):
-        execute(arm, required=True)
-    scaling: dict[str, list[dict[str, object]]] = {
-        "normal": [],
-        "rb": [],
-    }
+        if execute(arm, required=True) is None:
+            return
+    scaling = {mode: [] for mode in ("normal", "rb")}
     for arm in (value for value in arms if value.stage == "replica_scaling"):
         report = execute(arm)
         if report is not None:
             scaling[arm.mode].append(report["summary"])
     for mode in ("normal", "rb"):
-        selected = select_replica_count(
-            scaling[mode],
-            minimum_gain=float(plan["replica_gain_threshold"]),
-            memory_ceiling_bytes=int(plan["memory_ceiling_bytes"]),
-        )
-        state["selected_replicas"][mode] = selected
-        geometry_reports = []
-        for roots in geometry_roots(selected):
-            arm = Arm(
-                f"nlhe_hu_32bb_{mode}_h100_k{selected}_roots{roots}",
-                "geometry",
-                mode,
-                selected,
-                roots,
-                1024 if mode == "rb" else None,
-            )
-            report = execute(arm)
+        if not any(row["replicas"] >= 16 for row in scaling[mode]):
+            fallback = next(arm for arm in arms if arm.mode == mode and arm.stage == "fallback")
+            report = execute(fallback)
             if report is not None:
-                geometry_reports.append(report["summary"])
-        passing = [
-            report
-            for report in geometry_reports
-            if int(report["peak_reserved_bytes"]) <= H100_MEMORY_BUDGET_BYTES
-        ]
-        if not passing:
-            raise PilotError(f"{mode} geometry stage has no passing arm")
-        winner = max(
-            passing,
-            key=lambda report: float(report["player_nodes_per_second"]),
-        )
-        state["selected_roots"][mode] = int(winner["roots_per_replica"])
-        write_json(state, state_path)
-    rb_k = int(state["selected_replicas"]["rb"])
-    rb_roots = int(state["selected_roots"]["rb"])
-    for samples in RB_SAMPLE_COUNTS:
-        execute(
-            Arm(
-                f"nlhe_hu_32bb_rb_h100_k{rb_k}_roots{rb_roots}_samples{samples}",
-                "rb_samples",
-                "rb",
-                rb_k,
-                rb_roots,
-                samples,
-            )
-        )
-    state["elapsed_seconds"] = deadline_minutes * 60.0 - max(
-        deadline - time.monotonic(), 0.0
-    )
+                scaling[mode].append(report["summary"])
+        if not any(row["replicas"] == 1 for row in scaling[mode]):
+            write_json(state, state_path)
+            return
+        selected = select_replica_count(scaling[mode], minimum_gain=plan["replica_gain_threshold"],
+                                        memory_ceiling_bytes=hardware["memory_budget_bytes"])
+        state["selected_replicas"][mode] = selected
+        baseline = next(row for row in scaling[mode] if row["replicas"] == 1)
+        state.setdefault("matched_scaling", {})[mode] = [
+            {"replicas": row["replicas"],
+             "aggregate_rate_ratio": row["player_nodes_per_second"] / baseline["player_nodes_per_second"],
+             "K_T1_over_TK": row["replicas"] * baseline["seconds"] / row["seconds"],
+             "per_run_latency_seconds": row["seconds"]} for row in scaling[mode]]
+        selected_arm = next(arm for arm in arms if arm.mode == mode and arm.replicas == selected
+                            and arm.stage != "smoke")
+        for seed in plan["validation_seeds"]:
+            arm = replace(selected_arm, name=f"nlhe_hu_32bb_{mode}_h100_k{selected}_seed{seed}",
+                          stage="seed_validation", seed=seed, repeats=3)
+            if execute(arm, required=True) is None:
+                return
+    state["complete"] = True
     write_json(state, state_path)
     (directory / "PILOT_COMPLETE").touch()
     print(state_path)
 
 
 def _local_smoke(args: argparse.Namespace) -> None:
-    if not torch.cuda.is_available():
-        raise PilotError("local smoke requires CUDA")
-    device = torch.device("cuda:0")
+    hardware = selected_gpu_snapshot()
     directory = Path(args.directory)
     configs_directory = Path(args.configs_directory)
     initializer_paths = {
-        "normal": Path(args.normal_initializer),
-        "rb": Path(args.rb_initializer),
+        "normal": None if args.normal_initializer is None else Path(args.normal_initializer),
+        "rb": None if args.rb_initializer is None else Path(args.rb_initializer),
     }
     reports = []
     arms = (
@@ -347,7 +350,7 @@ def _local_smoke(args: argparse.Namespace) -> None:
     write_json(
         {
             "schema": "pbg-h100-pilot-local-smoke-v1",
-            "device_name": torch.cuda.get_device_properties(device).name,
+            "device_name": hardware["name"],
             "reports": reports,
         },
         destination,
@@ -369,9 +372,9 @@ def _parser() -> argparse.ArgumentParser:
         default="configs/experiments/nlhe_hu_32bb_h100_pilot",
     )
     prepare.add_argument(
-        "--normal-checkpoint", default=str(DEFAULT_NORMAL_CHECKPOINT)
+        "--normal-checkpoint", default=None
     )
-    prepare.add_argument("--rb-checkpoint", default=str(DEFAULT_RB_CHECKPOINT))
+    prepare.add_argument("--rb-checkpoint", default=None)
     prepare.set_defaults(function=_prepare)
 
     arm = commands.add_parser("arm")
@@ -381,13 +384,14 @@ def _parser() -> argparse.ArgumentParser:
     arm.add_argument("--replicas", type=int, required=True)
     arm.add_argument("--roots", type=int, required=True)
     arm.add_argument("--completion-samples", type=int)
-    arm.add_argument("--rollout-pack", type=int, default=256)
-    arm.add_argument("--completion-pack", type=int, default=512)
-    arm.add_argument("--learner-pack", type=int, default=256)
+    arm.add_argument("--rollout-pack", type=int, default=8)
+    arm.add_argument("--completion-pack", type=int, default=64)
+    arm.add_argument("--learner-pack", type=int, default=32)
     arm.add_argument("--warmup", type=int, default=1)
     arm.add_argument("--repeats", type=int, default=3)
     arm.add_argument("--config", required=True)
-    arm.add_argument("--initializer", required=True)
+    arm.add_argument("--initializer")
+    arm.add_argument("--seed", type=int, default=104830)
     arm.add_argument("--report", required=True)
     arm.add_argument("--allow-non-h100", action="store_true")
     arm.set_defaults(function=_run_arm)
@@ -395,6 +399,7 @@ def _parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run")
     run.add_argument("--plan", required=True)
     run.add_argument("--deadline-minutes", type=float)
+    run.add_argument("--resume", action="store_true")
     run.set_defaults(function=_run)
 
     smoke = commands.add_parser("local-smoke")
@@ -406,11 +411,14 @@ def _parser() -> argparse.ArgumentParser:
         "--configs-directory",
         default="configs/experiments/nlhe_hu_32bb_h100_pilot_local",
     )
-    smoke.add_argument("--normal-initializer", required=True)
-    smoke.add_argument("--rb-initializer", required=True)
+    smoke.add_argument("--normal-initializer")
+    smoke.add_argument("--rb-initializer")
     smoke.add_argument("--timeout-minutes", type=float, default=20.0)
     smoke.add_argument("--fail-fast", action="store_true")
     smoke.set_defaults(function=_local_smoke)
+    preflight = commands.add_parser("preflight")
+    preflight.add_argument("--report", required=True)
+    preflight.set_defaults(function=_preflight)
     return parser
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -438,7 +439,7 @@ class DenseAdamLane:
     """A zero-copy checkpoint/control view, with no optimizer implementation."""
 
     def __init__(self, owner: DenseAdam, lane: int) -> None:
-        self.owner, self.lane = owner, lane
+        self.owner, self.lane = weakref.proxy(owner), lane
 
     @property
     def config(self) -> OptimizerConfig:

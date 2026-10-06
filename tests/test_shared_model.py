@@ -202,3 +202,47 @@ def test_frozen_opponent_rejects_incompatible_input_or_policy_contract(section, 
     frozen[section][field] = value
     with pytest.raises(RuntimeError, match="frozen checkpoint"):
         _validate_frozen_compatibility(current, frozen, initialize=False)
+
+
+@CUDA
+@pytest.mark.parametrize("precision,dtype,rtol,atol", [
+    ("fp16", torch.float16, 8e-3, 8e-4),
+    ("bf16", torch.bfloat16, 3e-2, 3e-3),
+])
+@pytest.mark.parametrize("family", ["pre", "post"])
+def test_native_precision_model_outputs_and_gradients(precision, dtype, rtol, atol, family):
+    from pbg.core.precision import resolve_precision
+    if precision == "bf16" and torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("native BF16 is unavailable on this architecture")
+    resolve_precision(precision, torch.device("cuda"))
+    torch.manual_seed(610)
+    reference = QueuedPokerModel(NLHEGeometry(2, 32, 13), config()).cuda()
+    candidate = copy.deepcopy(reference)
+    if family == "pre":
+        public, ranges = pre_inputs(players=2)
+        def forward(model):
+            return model.pre_encoder(model.shared, public, ranges).v
+    else:
+        public, ranges, masks = post_inputs()
+        masks.compact_size = 12
+        def forward(model):
+            return model.post_encoder(model.shared, public, ranges, masks=masks).v
+    observed = []
+    handle = candidate.shared.attentions[0].register_forward_hook(
+        lambda module, args, result: observed.append(result.dtype))
+    expected = forward(reference)
+    expected.float().square().mean().backward()
+    with torch.autocast("cuda", dtype=dtype):
+        actual = forward(candidate)
+        loss = actual.float().square().mean()
+    loss.backward()
+    handle.remove()
+    assert observed == [dtype]
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=rtol, atol=atol)
+    for left, right in zip(candidate.parameters(), reference.parameters(), strict=True):
+        assert left.dtype == torch.float32
+        assert (left.grad is None) == (right.grad is None)
+        if left.grad is not None:
+            assert left.grad.dtype == torch.float32
+            assert bool(torch.isfinite(left.grad).all())
+            torch.testing.assert_close(left.grad, right.grad, rtol=rtol, atol=atol)

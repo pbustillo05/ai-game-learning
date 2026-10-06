@@ -321,14 +321,7 @@ class IterationTelemetry:
     peak_allocated_bytes: int
     peak_reserved_bytes: int
     model_inference_seconds: float
-    target_kernel_cuda_seconds: float
-    rollout_peak_allocated_bytes: int
-    completion_peak_allocated_bytes: int
-    align_peak_allocated_bytes: int
-    targets_peak_allocated_bytes: int
-    model_stage_peak_allocated_bytes: int
-    sampling_stage_peak_allocated_bytes: int
-    transition_stage_peak_allocated_bytes: int
+    phase_measurements: dict[str, dict[str, float | int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -418,6 +411,7 @@ class _IterationState:
     benchmark_started: float
     rollout_seconds: float = 0.0
     target_seconds: float = 0.0
+    phase_measurements: dict[str, dict[str, float | int]] = field(default_factory=dict)
     host_synchronizations: int = 0
     completion_observations: Mapping[str, object] = field(
         default_factory=lambda: MappingProxyType({})
@@ -1361,7 +1355,11 @@ class IterationEngine:
             return None
         admitted: dict[str, ReferenceOutputCache] = {}
         resident = 0
-        budget = owners.plan.layout.reference_cache_bytes
+        total_budget = owners.plan.layout.reference_cache_bytes
+        share, remainder = divmod(total_budget, len(self.config.lanes))
+        budget = share + int(lane < remainder)
+        if budget == 0:
+            return None
         for name, store in stores.items():
             columns = (
                 store.sealed_inputs.aligned_payload_columns
@@ -1381,7 +1379,9 @@ class IterationEngine:
                     "sampled_private_state", columns["owner"][:, None]
                 ),
                 owner=columns["owner"],
-                pack_cap=owners.plan.manifest.learner_sigma_pack_cap,
+                pack_cap=min(owners.plan.manifest.learner_sigma_pack_cap,
+                    (self.config.learner_family_rows or {}).get(
+                        name, owners.plan.manifest.learner_sigma_pack_cap)),
                 precision=self.config.precision,
                 byte_budget=budget,
                 resident_bytes=resident,
@@ -1666,14 +1666,7 @@ class IterationEngine:
                     peak_allocated_bytes=peak_allocated,
                     peak_reserved_bytes=peak_reserved,
                     model_inference_seconds=model_seconds,
-                    target_kernel_cuda_seconds=state.target_seconds,
-                    rollout_peak_allocated_bytes=peak_allocated,
-                    completion_peak_allocated_bytes=peak_allocated,
-                    align_peak_allocated_bytes=peak_allocated,
-                    targets_peak_allocated_bytes=peak_allocated,
-                    model_stage_peak_allocated_bytes=peak_allocated,
-                    sampling_stage_peak_allocated_bytes=peak_allocated,
-                    transition_stage_peak_allocated_bytes=peak_allocated,
+                    phase_measurements=dict(state.phase_measurements),
                 )
             observability = self.operations.observability(
                 CompletedLane(
@@ -1724,6 +1717,7 @@ class IterationEngine:
         iteration: int,
     ) -> IterationBatchResult:
         entered_index = 0
+        rollout_started = time.perf_counter()
         owners.enter_phase(_PHASES[0])
         phase_open = True
         state: _IterationState | None = None
@@ -1734,6 +1728,14 @@ class IterationEngine:
                 agreed = self._failure_from_device(remote.failure)
                 agreed._rank_agreed = True  # type: ignore[attr-defined]
                 raise agreed
+            if self.config.benchmark_telemetry:
+                torch.cuda.synchronize(owners.plan.device)
+                state.phase_measurements["ROLLOUT"] = {
+                    "synchronized_wall_seconds": time.perf_counter() - rollout_started,
+                    "allocated_bytes_at_boundary": torch.cuda.memory_allocated(owners.plan.device),
+                    "cumulative_peak_allocated_bytes": torch.cuda.max_memory_allocated(owners.plan.device),
+                    "named_live_owner_bytes": owners.memory_report().allocated_owner_bytes,
+                }
             owners.release_after(ExecutionPhase.ROLLOUT)
             phase_open = False
 
@@ -1765,9 +1767,20 @@ class IterationEngine:
                 operations, start=1
             ):
                 entered_index = index
+                if self.config.benchmark_telemetry:
+                    torch.cuda.synchronize(owners.plan.device)
+                phase_started = time.perf_counter()
                 owners.enter_phase(phase)
                 phase_open = True
                 operation()
+                if self.config.benchmark_telemetry:
+                    torch.cuda.synchronize(owners.plan.device)
+                    state.phase_measurements[phase.name] = {
+                        "synchronized_wall_seconds": time.perf_counter() - phase_started,
+                        "allocated_bytes_at_boundary": torch.cuda.memory_allocated(owners.plan.device),
+                        "cumulative_peak_allocated_bytes": torch.cuda.max_memory_allocated(owners.plan.device),
+                        "named_live_owner_bytes": owners.memory_report().allocated_owner_bytes,
+                    }
                 owners.release_after(phase)
                 phase_open = False
             result = self._build_result(owners, state)

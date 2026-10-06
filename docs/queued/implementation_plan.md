@@ -67,7 +67,7 @@ target builder, learner, or optimizer.
 ```text
 ModeSchema
   -> semantic family FIFOs
-  -> replica-vmapped model inference -> sample -> commit
+  -> explicit-K model inference -> sample -> commit
   -> Leaf -> LayerWork
   -> CPU Topology -> GPU LayerPlan
   -> align-and-seal
@@ -625,9 +625,9 @@ evidence; old learner, optimizer, `replica_*.py`, tests, audits, and history.
 **Implement:**
 
 - zero-copy parameter and dense-gradient lane binding;
-- the same per-lane forward/loss/scale/immediate-backward operation;
+- one explicit-K forward/loss operation and external backward over the sum of independent weighted lane losses;
 - active lane scheduling without padding;
-- one functional `vmap` operation for replica-batched rollout and
+- one explicit-K tensor operation for replica-batched rollout and
   reference-model inference over independent lane parameters and state, with
   autograd disabled and no shared-weight substitution;
 - compatible grouped non-autograd work;
@@ -639,8 +639,10 @@ evidence; old learner, optimizer, `replica_*.py`, tests, audits, and history.
   artifacts;
 - explicit control, posterior, gradient, and optimizer dtypes.
 
-Do not add functional/`vmap` learner backward, stacked replay, replica
-losses/adapters, summed lane graphs, or replica optimizer semantics.
+The approved H100 execution contract supersedes the original serialized learner
+restriction: compatible exact-shape cohorts sum independent lane objectives for
+one backward, retaining per-lane clipping, optimizer state and failure handling.
+K=1 uses the same tensor program. Do not introduce a second learner algorithm.
 
 **Gate:**
 
@@ -649,7 +651,7 @@ losses/adapters, summed lane graphs, or replica optimizer semantics.
 - lane counts `{1,2,4,8}` prove complete state isolation;
 - inactive lanes do no work and unused parameters receive explicit zero
   gradients;
-- replica-`vmap` inference matches independent lane inference for active
+- explicit-K inference matches independent lane inference for active
   subsets, adds no padding rows or inactive-lane RNG draws, and preserves
   lane-owned outputs and labels;
 - dense Adam and AdamW match independent oracles;

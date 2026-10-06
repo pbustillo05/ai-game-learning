@@ -17,6 +17,8 @@ def run_cli(*, require_replica: bool = False) -> None:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--phase-telemetry", action="store_true",
+                        help="Instrument synchronized phase boundaries; report separately from throughput")
     parser.add_argument("--baseline", default=None)
     parser.add_argument("--max-regression", type=float, default=0.10)
     parser.add_argument("--allow-environment-mismatch", action="store_true")
@@ -29,6 +31,7 @@ def run_cli(*, require_replica: bool = False) -> None:
         warmup=args.warmup,
         repeats=args.repeats,
         checkpoint=args.checkpoint,
+        phase_telemetry=args.phase_telemetry,
     )
     encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output:

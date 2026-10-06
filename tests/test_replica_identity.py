@@ -39,7 +39,6 @@ from pbg.core.learner import (
     LearnerOperation,
     LearnerSchedule,
     LossConfig,
-    LossResult,
     ModelEvaluation,
     PolicyEvaluation,
     SequentialLearnerBatch,

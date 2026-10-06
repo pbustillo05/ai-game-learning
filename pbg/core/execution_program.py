@@ -40,6 +40,7 @@ class TensorProgramRunner:
         self.entries: dict[object, _Entry] = {}
         self.seen: OrderedDict[object, int] = OrderedDict()
         self.calls = self.replays = self.uncaptured = 0
+        self.work_counts: dict[str, dict[str, int]] = {}
 
     @property
     def resident_bytes(self) -> int:
@@ -152,7 +153,8 @@ class TensorProgramRunner:
         return entry.outputs
 
     def manifest(self) -> dict[str, object]:
-        return {"mode": self.mode, "max_entries": self.max_entries,
+        return {"work_counts": {key: dict(value) for key, value in self.work_counts.items()},
+                "mode": self.mode, "max_entries": self.max_entries,
                 "byte_budget": self.byte_budget, "entries": len(self.entries),
                 "resident_bytes": self.resident_bytes, "calls": self.calls,
                 "replays": self.replays, "uncaptured": self.uncaptured,

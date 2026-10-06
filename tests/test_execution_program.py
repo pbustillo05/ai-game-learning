@@ -116,3 +116,42 @@ def test_token_admission_counts_full_postflop_storage():
     from pbg.games.poker.model.capacity import max_policy_partition_sequence_tokens
     bounds = max_policy_partition_sequence_tokens(n_players=2, stack_bb=32, rank_count=13, k_act=7)
     assert bounds["post_2"] > 2 * 1326
+
+
+def test_optimizer_lane_does_not_retain_owner():
+    import weakref
+    from pbg.core.optimization import DenseAdam, DenseAdamLane
+    owner = DenseAdam.__new__(DenseAdam)
+    lane = DenseAdamLane(owner, 0)
+    owner.lanes = (lane,)
+    reference = weakref.ref(owner)
+    del owner
+    assert reference() is None
+    with pytest.raises(ReferenceError):
+        _ = lane.owner.configs
+
+
+def test_reference_cache_budget_is_shared_across_resident_lanes(monkeypatch):
+    from types import SimpleNamespace
+    from pbg.core.iteration import IterationEngine
+    import pbg.core.iteration as iteration
+    count, total = 16, 1003
+    engine = IterationEngine.__new__(IterationEngine)
+    engine.config = SimpleNamespace(lanes=[SimpleNamespace(reference_operation=object()) for _ in range(count)],
+        cache_reference_outputs=True, learner_family_rows={"pre": 32, "post_2": 8},
+        schedule=SimpleNamespace(batch_size=256), precision="bf16")
+    owners = SimpleNamespace(plan=SimpleNamespace(layout=SimpleNamespace(reference_cache_bytes=total),
+                                                  manifest=SimpleNamespace(learner_sigma_pack_cap=32)))
+    store = SimpleNamespace(rows=512, sealed_inputs=SimpleNamespace(columns={
+        "model_input": torch.empty(512, 1, device="meta"), "owner": torch.empty(512, device="meta")}))
+    budgets, caps = [], []
+    def build(*args, **kwargs):
+        budgets.append(kwargs["byte_budget"])
+        caps.append(kwargs["pack_cap"])
+        return SimpleNamespace(allocated_bytes=kwargs["byte_budget"])
+    monkeypatch.setattr(iteration, "build_reference_output_cache", build)
+    for lane in range(count):
+        assert engine._reference_caches(owners, lane, {"post_2": store})
+    assert sum(budgets) == total
+    assert max(budgets) - min(budgets) == 1
+    assert caps == [8] * count

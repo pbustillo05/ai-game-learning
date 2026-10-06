@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from pbg.core.tensor_ops import Linear, Embedding
+from pbg.core.tensor_ops import Linear
 
 from pbg.games.poker.model.primitives import FFN
 

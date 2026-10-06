@@ -10,12 +10,10 @@ from types import MappingProxyType
 from typing import Protocol
 
 import torch
-from torch import Tensor
 
 from pbg.core.learner import (
     BranchedBatchSampler,
     LearnerOperation,
-    LossResult,
     ReferenceOutputCache,
     SequentialBatchSampler,
     SequentialLearnerBatch,
@@ -411,6 +409,15 @@ def _run_learner_cohort(works, packets, *, iteration, owner, lanes):
     key = (_learner_cohort_key(works[0], packets[0][1]), tuple(lanes), reference_names, 2)
     total, metrics = owner.program_runner.run(key, program, values,
         mutable=(owner.gradient_rows, *(buffer for module in owner.modules for buffer in module.buffers())))
+    work = owner.program_runner.work_counts.setdefault(input_type,
+        {"sigma_presentations": 0, "action_presentations": 0, "cohort_calls": 0,
+         "reference_forward_sigma_presentations": 0, "reference_cache_sigma_presentations": 0})
+    work["sigma_presentations"] += batch.rows
+    work["action_presentations"] += batch.action_rows
+    work["cohort_calls"] += 1
+    if reference_raw is not None:
+        reference_kind = "cache" if works[0].reference_caches is not None else "forward"
+        work[f"reference_{reference_kind}_sigma_presentations"] += batch.rows
     owner.fatal[lane_index] |= ~torch.isfinite(total)
     for gradient_owner in owner.gradient_owners:
         gradient_owner.assert_bound()
@@ -496,6 +503,10 @@ def optimize_prepared(works, *, iteration, optimizer, distributed=None):
             transition = owner.step_device(mask)
             if group is not None and hasattr(group, "versions"):
                 group.versions.add_(transition[0].to(group.versions.dtype))
+            for index in active:
+                transitions[index].append(tuple(value[lanes[index]].clone() for value in transition))
+                if index in seen:
+                    metrics[index].append(weighted[index].clone())
         except Exception as exc:
             failure = exc
         failed = owner.fatal.clone()
@@ -505,11 +516,6 @@ def optimize_prepared(works, *, iteration, optimizer, distributed=None):
             failed = distributed.agree_failures(failed)
         if failure is not None or (distributed is not None and bool(failed.any())):
             raise TrainingError("learner optimizer failed before rank-common publication") from failure
-        assert transition is not None
-        for index in active:
-            transitions[index].append(tuple(value[lanes[index]].clone() for value in transition))
-            if index in seen:
-                metrics[index].append(weighted[index].clone())
     failed = owner.fatal.clone()
     if any(packet is not None for packet in pending):
         failed.fill_(True)

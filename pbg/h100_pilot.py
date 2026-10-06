@@ -6,6 +6,9 @@ import json
 import math
 import os
 import tempfile
+import subprocess
+import platform
+from importlib.metadata import version
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -14,16 +17,16 @@ import torch
 import yaml
 
 from pbg.config import RootConfig, load_config_mapping
-from pbg.core.persistence import model_state_sha256, sha256_file
+from pbg.core.persistence import CHECKPOINT_SCHEMA, model_state_sha256, sha256_file
 
-INITIALIZER_SCHEMA = "pbg-h100-pilot-initializer-v1"
-PLAN_SCHEMA = "pbg-h100-pilot-plan-v1"
+INITIALIZER_SCHEMA = "pbg-h100-shared-initializer-v2"
+PLAN_SCHEMA = "pbg-h100-replica-execution-plan-v2"
 RESULT_SCHEMA = "pbg-h100-pilot-result-v1"
 GIB = 1 << 30
 H100_DECLARED_TOTAL_BYTES = 80_000_000_000
-H100_MEMORY_BUDGET_BYTES = 70 * GIB
 H100_MEMORY_GUARD_BYTES = 10 * GIB
-REPLICA_COUNTS = (1, 2, 4, 8)
+H100_MEMORY_BUDGET_BYTES = H100_DECLARED_TOTAL_BYTES - H100_MEMORY_GUARD_BYTES
+REPLICA_COUNTS = (1, 2, 4, 8, 16, 32)
 RB_SAMPLE_COUNTS = (256, 512, 1024)
 
 
@@ -39,17 +42,18 @@ class Arm:
     replicas: int
     roots: int
     completion_samples: int | None
-    rollout_pack: int = 256
-    completion_pack: int = 512
-    learner_pack: int = 256
-    warmup: int = 1
-    repeats: int = 3
+    rollout_pack: int = 8
+    completion_pack: int = 64
+    learner_pack: int = 32
+    warmup: int = 2
+    repeats: int = 5
+    seed: int = 104830
 
     def __post_init__(self) -> None:
         if self.mode not in ("normal", "rb"):
             raise ValueError("pilot mode must be normal or rb")
         if self.replicas not in REPLICA_COUNTS:
-            raise ValueError("pilot replicas must be one of 1, 2, 4, 8")
+            raise ValueError("pilot replicas must be one of 1, 2, 4, 8, 16, 32")
         if (
             self.roots <= 0
             or min(self.rollout_pack, self.completion_pack, self.learner_pack) <= 0
@@ -106,6 +110,8 @@ def export_model_initializer(
     payload = torch.load(source, map_location="cpu", weights_only=False)
     if not isinstance(payload, Mapping):
         raise PilotError("initializer source is not a checkpoint mapping")
+    if payload.get("checkpoint_schema") != CHECKPOINT_SCHEMA:
+        raise PilotError("initializer requires a shared-model checkpoint; split artifacts are unsupported")
     state = _tensor_state(payload.get("model"), source=str(source))
     if "lanes" in state:
         raise PilotError("replica checkpoint model state is not a single initializer")
@@ -220,8 +226,9 @@ def pilot_config_mapping(
         raise ValueError("hardware profile must be h100 or local")
     h100 = hardware == "h100"
     precision = "bf16" if h100 else "fp32"
-    batch_size = 256 if h100 else 8
-    gradient_steps = 116 if h100 else 1
+    production = h100 and arm.stage != "smoke"
+    batch_size = 256 if production else 8
+    gradient_steps = 116 if production else 2 if h100 else 1
     rollout_pack = min(arm.rollout_pack, batch_size) if not h100 else arm.rollout_pack
     completion_pack = (
         min(arm.completion_pack, batch_size) if not h100 else arm.completion_pack
@@ -236,7 +243,7 @@ def pilot_config_mapping(
             gradient_steps=gradient_steps,
         ),
         "run": {
-            "seed": 104830,
+            "seed": arm.seed,
             "reproducibility": "throughput",
             "utility": "stack_normalized",
             "workload": {
@@ -247,14 +254,16 @@ def pilot_config_mapping(
                 "device": device,
                 "precision": precision,
                 "attention": "sdpa",
-                "reference_cache": "auto" if arm.replicas == 1 else "off",
+                "reference_cache": "off",
+                "tensor_program": {"mode": "captured" if h100 else "eager",
+                                   "cache_entries": 8, "cache_bytes": 8 * GIB if h100 else 0},
                 "memory": {
                     "reserve_bytes": (H100_MEMORY_GUARD_BYTES if h100 else 256 << 20)
                 },
                 "microbatch": {
                     "rollout_rows": rollout_pack,
                     "completion_rows": completion_pack,
-                    "learner_rows": learner_pack,
+                    "learner_rows": {"pre": learner_pack, "post_2": min(learner_pack, 8)},
                 },
             },
             "iterations": 1,
@@ -262,7 +271,6 @@ def pilot_config_mapping(
             "output_dir": str(output_dir),
         },
     }
-    load_config_mapping(result)
     return result
 
 
@@ -272,7 +280,8 @@ def write_arm_config(
     *,
     output_dir: str | Path,
     hardware: str = "h100",
-) -> RootConfig:
+    resolve: bool = True,
+) -> RootConfig | None:
     target = Path(destination)
     mapping = pilot_config_mapping(
         arm,
@@ -284,7 +293,7 @@ def write_arm_config(
         yaml.safe_dump(mapping, sort_keys=False),
         encoding="utf-8",
     )
-    return load_config_mapping(mapping)
+    return load_config_mapping(mapping) if resolve else None
 
 
 def geometry_roots(replicas: int) -> tuple[int, ...]:
@@ -292,67 +301,34 @@ def geometry_roots(replicas: int) -> tuple[int, ...]:
         1: (2048, 3072, 4096),
         2: (1536, 2048, 3072),
         4: (768, 1024, 1536),
-        8: (384, 512, 768),
+        8: (64, 128, 256),
+        16: (32, 64, 128),
+        32: (16, 32, 64),
     }[replicas]
 
 
 def base_plan() -> dict[str, object]:
-    arms: list[Arm] = [
-        Arm(
-            "nlhe_hu_32bb_normal_h100_bf16_smoke",
-            "smoke",
-            "normal",
-            1,
-            4,
-            None,
-            rollout_pack=4,
-            completion_pack=16,
-            warmup=0,
-            repeats=1,
-        ),
-        Arm(
-            "nlhe_hu_32bb_rb_h100_bf16_smoke",
-            "smoke",
-            "rb",
-            1,
-            4,
-            16,
-            rollout_pack=4,
-            completion_pack=16,
-            warmup=0,
-            repeats=1,
-        ),
-    ]
-    arms.extend(
-        Arm(
-            f"nlhe_hu_32bb_{mode}_h100_replica_k{replicas}",
-            "replica_scaling",
-            mode,
-            replicas,
-            512,
-            1024 if mode == "rb" else None,
-        )
-        for mode in ("normal", "rb")
-        for replicas in (1,)
-    )
-    return {
-        "schema": PLAN_SCHEMA,
-        "deadline_minutes": 170,
-        "shutdown_reserve_minutes": 10,
-        "replica_gain_threshold": 0.10,
-        "memory_ceiling_bytes": H100_MEMORY_BUDGET_BYTES,
-        "fixed_batch_size": 256,
-        "fixed_gradient_steps": 116,
-        "production_precision": "bf16",
-        "replica_counts": [1],
-        "execution_packs": {
-            "rollout_rows": 256,
-            "completion_rows": 512,
-            "learner_rows": 256,
-        },
-        "rb_sample_counts": list(RB_SAMPLE_COUNTS),
-        "arms": [asdict(arm) for arm in arms],
-    }
+    """Small correctness gates, matched K=1/16/32 runs, and admitted K=8 fallback."""
+    arms = []
+    for mode in ("normal", "rb"):
+        for replicas in (1, 2):
+            arms.append(Arm(f"nlhe_hu_32bb_{mode}_h100_smoke_k{replicas}", "smoke", mode,
+                            replicas, 4, 16 if mode == "rb" else None,
+                            rollout_pack=2, completion_pack=4, learner_pack=2,
+                            warmup=0, repeats=1))
+        for replicas in (1, 16, 32, 8):
+            arms.append(Arm(f"nlhe_hu_32bb_{mode}_h100_replica_k{replicas}",
+                            "fallback" if replicas == 8 else "replica_scaling", mode,
+                            replicas, 64, 256 if mode == "rb" else None))
+    return {"schema": PLAN_SCHEMA, "deadline_minutes": 240,
+            "shutdown_reserve_minutes": 10, "replica_gain_threshold": 0.10,
+            "memory_ceiling_bytes": H100_MEMORY_BUDGET_BYTES,
+            "fixed_batch_size": 256, "fixed_gradient_steps": 116,
+            "production_precision": "bf16", "replica_counts": [1, 16, 32],
+            "fallback_replicas": 8, "validation_seeds": [205991, 308177],
+            "execution_packs": {"rollout_rows": 8, "completion_rows": 64,
+                                "learner_rows": {"pre": 32, "post_2": 8}},
+            "arms": [asdict(arm) for arm in arms]}
 
 
 def select_replica_count(
@@ -384,30 +360,85 @@ def select_replica_count(
     return selected
 
 
-def h100_preflight() -> dict[str, object]:
-    """Require one visible BF16-capable H100 before spending pilot time."""
+def selected_gpu_snapshot(*, allow_current_process: bool = False) -> dict[str, object]:
+    """Read resource state without initializing a CUDA context or altering jobs."""
+    selector = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not selector or "," in selector:
+        raise PilotError("set CUDA_VISIBLE_DEVICES to one idle GPU index or UUID")
+    def smi(*arguments):
+        return subprocess.check_output(["nvidia-smi", "-i", selector, *arguments], text=True).strip()
+    raw = smi("--query-compute-apps=pid", "--format=csv,noheader,nounits")
+    pids = [int(pid.strip()) for pid in raw.splitlines() if pid.strip().isdigit()]
+    other = [pid for pid in pids if not allow_current_process or pid != os.getpid()]
+    if other:
+        raise PilotError(f"selected GPU has compute jobs: {other}; leave them untouched")
+    return {"selector": selector,
+            "used_memory_mib": int(smi("--query-gpu=memory.used", "--format=csv,noheader,nounits")),
+            "name": smi("--query-gpu=name", "--format=csv,noheader,nounits")}
 
+
+def h100_preflight() -> dict[str, object]:
+    """Record hardware/software and execute real native BF16 fused backward."""
+    idle = selected_gpu_snapshot(allow_current_process=True)
+    expected = json.loads((Path(__file__).parents[1] / "configs/h100_environment.json").read_text())
+    actual = {name: version(name) for name in expected["packages"]}
+    drift = {name: {"expected": required, "actual": actual[name]}
+             for name, required in expected["packages"].items() if actual[name] != required}
+    if drift or platform.python_version() != expected["python"]:
+        raise PilotError(f"rental environment differs from pinned reference: {drift}; Python {platform.python_version()}")
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-        raise PilotError("pilot requires exactly one visible CUDA GPU")
+        raise PilotError("pilot requires exactly one explicitly visible CUDA GPU")
     device = torch.device("cuda:0")
     properties = torch.cuda.get_device_properties(device)
-    if (
-        "H100" not in properties.name.upper()
-        or properties.major < 9
-        or properties.total_memory < H100_DECLARED_TOTAL_BYTES
-        or not torch.cuda.is_bf16_supported()
-    ):
-        raise PilotError(
-            "pilot requires an H100 with compute capability >= 9.0, "
-            "at least 80,000,000,000 bytes, and BF16 support"
-        )
-    return {
-        "device": str(device),
-        "name": properties.name,
-        "compute_capability": [properties.major, properties.minor],
-        "total_memory_bytes": properties.total_memory,
-        "bf16_supported": True,
-    }
+    if ("H100" not in properties.name.upper() or properties.major < 9
+        or properties.total_memory < 70 * GIB):
+        raise PilotError("pilot requires a full H100 with native BF16 and at least 70 GiB reported memory")
+    selector = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not selector or "," in selector:
+        raise PilotError("set CUDA_VISIBLE_DEVICES to one idle GPU index or UUID")
+    def smi(*arguments):
+        return subprocess.check_output(["nvidia-smi", "-i", selector, *arguments], text=True).strip()
+    processes = smi("--query-compute-apps=pid", "--format=csv,noheader,nounits")
+    others = [int(pid.strip()) for pid in processes.splitlines() if pid.strip().isdigit() and int(pid) != os.getpid()]
+    if others:
+        raise PilotError(f"selected GPU has other compute jobs: {others}; no workload launched")
+    hardware = smi("--query-gpu=uuid,name,driver_version,memory.total,mig.mode.current,clocks.sm,clocks.mem,power.limit",
+                   "--format=csv,noheader,nounits")
+    from pbg.core.precision import resolve_precision
+    from pbg.games.poker.model.primitives import MHA
+    from pbg.identity import accelerator_identity, code_identity
+    policy = resolve_precision("bf16", device)
+    module = MHA(128, 4).to(device)
+    value = torch.randn(2, 64, 128, device=device, requires_grad=True)
+    bias = torch.randn(2, 64, device=device, dtype=torch.float32)
+    mask = torch.ones(2, 64, device=device, dtype=torch.bool)
+    with torch.autocast("cuda", dtype=policy.compute_dtype):
+        output = module(value, value, bias, mask)
+        objective = output.float().square().mean()
+    objective.backward()
+    torch.cuda.synchronize(device)
+    if output.dtype != torch.bfloat16 or not all(
+        parameter.grad is not None and bool(torch.isfinite(parameter.grad).all())
+        for parameter in module.parameters()
+    ) or not bool(torch.isfinite(value.grad).all()):
+        raise PilotError("native BF16 fused-attention forward/backward gate failed")
+    identity = accelerator_identity(13)
+    revision = identity["evaluator"].get("build_revision")
+    if revision != expected["evaluator_revision"]:
+        raise PilotError(f"evaluator revision differs from pin: {revision}")
+    report = {"device": str(device), "idle_before": idle, "name": properties.name,
+              "compute_capability": [properties.major, properties.minor],
+              "total_memory_bytes": properties.total_memory,
+              "memory_budget_bytes": properties.total_memory - H100_MEMORY_GUARD_BYTES,
+              "bf16_supported": True, "fused_attention_backward": "passed",
+              "nvidia_smi_fields": "uuid,name,driver,memory_MiB,MIG,SM_MHz,memory_MHz,power_W",
+              "nvidia_smi": hardware, "torch": torch.__version__, "cuda": torch.version.cuda,
+              "cudnn": torch.backends.cudnn.version(), "compiled_architectures": torch.cuda.get_arch_list(),
+              "python": platform.python_version(), "packages": actual,
+              "precision_policy": policy.manifest(), "identity": identity, "code": code_identity()}
+    del module, value, output, objective, bias, mask
+    torch.cuda.empty_cache()
+    return report
 
 
 def benchmark_summary(
@@ -429,6 +460,12 @@ def benchmark_summary(
     for sample in samples:
         if not isinstance(sample, Mapping):
             raise PilotError("benchmark sample is not an object")
+        if arm.warmup > 0:
+            program_before = sample.get("tensor_program_before", {})
+            program_after = sample.get("tensor_program_after", {})
+            if (program_before.get("entries") != program_after.get("entries") or
+                program_before.get("denied_shapes") != program_after.get("denied_shapes")):
+                raise PilotError("timed sample contains compile/capture admission; increase warmup")
         before = sample.get("logical_work_before")
         after = sample.get("logical_work_after")
         if (
@@ -466,6 +503,10 @@ def benchmark_summary(
         "mode": arm.mode,
         "replicas": arm.replicas,
         "roots_per_replica": arm.roots,
+        "seed": arm.seed,
+        "learner_presentations_per_second": float(median["learner_presentations_per_second"]),
+        "learner_presentations": int(median["learner_presentations"]),
+        "optimizer_steps": int(median["optimizer_steps"]),
         "completion_samples": arm.completion_samples,
         "rollout_pack": arm.rollout_pack,
         "completion_pack": arm.completion_pack,

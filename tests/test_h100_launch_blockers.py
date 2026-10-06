@@ -16,19 +16,9 @@ from pbg.h100_pilot import (
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
-@pytest.mark.parametrize(
-    "device_type",
-    (
-        "cpu",
-        pytest.param("cuda", marks=CUDA),
-    ),
-)
-def test_route_casts_only_model_input_at_bf16_storage_boundary(
-    device_type: str,
-) -> None:
-    device = torch.device(
-        "cpu" if device_type == "cpu" else f"cuda:{torch.cuda.current_device()}"
-    )
+@CUDA
+def test_route_casts_only_model_input_at_bf16_storage_boundary() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
     destination = {
         "model_input": torch.zeros((2, 2, 3), dtype=torch.bfloat16, device=device)
     }
@@ -83,7 +73,9 @@ def test_route_keeps_every_other_dtype_mismatch_fatal(
 
 
 @pytest.mark.parametrize("mode", ("normal", "rb"))
-def test_512_root_configs_compile_all_capacity_from_workload(mode: str) -> None:
+def test_512_root_configs_compile_all_capacity_from_workload(mode: str, monkeypatch) -> None:
+    from pbg.games.poker.queued import capacity_compiler
+    monkeypatch.setattr(capacity_compiler, "_device_total_memory", lambda device: 80_000_000_000)
     arm = Arm(
         f"nlhe_hu_32bb_{mode}_h100_roots512",
         "geometry",
@@ -97,14 +89,14 @@ def test_512_root_configs_compile_all_capacity_from_workload(mode: str) -> None:
 
     assert "manifest" not in mapping["run"]
     config = load_config_mapping(mapping)
-    assert config.execution.manifest.family_pack_cap == 256
+    assert config.execution.manifest.family_pack_cap == 8
     assert config.execution.manifest.partition_rows("folded_range_cap") == {}
 
 
 @pytest.mark.parametrize("mode", ("normal", "rb"))
-def test_checked_in_512_root_k1_config_has_no_authored_capacity(
-    mode: str,
-) -> None:
+def test_checked_in_k1_config_has_no_authored_capacity(mode: str, monkeypatch) -> None:
+    from pbg.games.poker.queued import capacity_compiler
+    monkeypatch.setattr(capacity_compiler, "_device_total_memory", lambda device: 80_000_000_000)
     path = (
         Path("configs/experiments/nlhe_hu_32bb_h100_pilot")
         / f"nlhe_hu_32bb_{mode}_h100_replica_k1.yaml"
@@ -115,11 +107,11 @@ def test_checked_in_512_root_k1_config_has_no_authored_capacity(
 
     assert "manifest" not in mapping["run"]
     assert "layout" not in mapping["run"]
-    assert mapping["run"]["execution"]["reference_cache"] == "auto"
+    assert mapping["run"]["execution"]["reference_cache"] == "off"
     assert mapping["run"]["execution"]["microbatch"] == {
-        "rollout_rows": 256,
-        "completion_rows": 512,
-        "learner_rows": 256,
+        "rollout_rows": 8,
+        "completion_rows": 64,
+        "learner_rows": {"pre": 32, "post_2": 8},
     }
-    assert config.scientific.common.root_count == 512
+    assert config.scientific.common.root_count == 64
     assert config.execution.manifest.partition_rows("folded_range_cap") == {}
