@@ -1,0 +1,194 @@
+# Consumed by experiments.hyperparameter_search campaign/worker, not pbg.cli.train.
+kind: nlhe_hyperparameter_campaign_v1
+status: pre-registered control and search; no quality winner selected
+initialization:
+  checkpoint: runs/nlhe_hu_32bb_full_sequential_rb/ckpt_0001110.pt
+  sha256: bced881945512f2a4152d3acd88a0a06395a00130cdf68a61aa2652bc1b5aebb
+  preflop_inputs: legacy
+  value_scale: 32.0
+training:
+  kind: nlhe_run_v1
+  scientific:
+    mode:
+      training_regime: self_play
+      rollout_mode: sequential
+      private_estimator: rao_blackwell
+    game:
+      players: 2
+      stack_bb: 32.0
+      rank_count: 13
+    model:
+      d_model: 128
+      n_heads: 4
+      layers:
+        pre: 4
+        post: 6
+      raises:
+        components: 2
+        minimum_scale: 0.02
+      class_embedding_dim: 32
+      folder_beta_rank: 0
+      folder_line_dim: 8
+      epsilon: 1.0e-08
+    objective:
+      policy_clip: 0.2
+      value:
+        kind: clipped
+        epsilon: 0.00625
+        coefficient: 0.016
+      entropy:
+        kind: constant
+        coefficient: 0.0015625
+      reference_kl:
+        coefficient: 0.00625
+        refresh:
+          iterations: 1000000000
+    optimizer:
+      kind: adamw
+      learning_rate: 5.0e-05
+      beta1: 0.9
+      beta2: 0.999
+      epsilon: 1.0e-08
+      weight_decay: 0.01
+      grad_clip: 0.5
+    schedule:
+      batch_size: 128
+      steps: 24
+    lambda: 0.95
+    completion:
+      samples: 1024
+  run:
+    seed: 918273
+    reproducibility: strict
+    utility: stack_normalized
+    workload:
+      roots: 512
+    recovery:
+      minimum_roots: 512
+    execution:
+      device: cuda:0
+      precision: fp16
+      attention: sdpa
+      reference_cache:
+        budget_bytes: 268435456
+      memory:
+        reserve_bytes: 1350242468
+      microbatch:
+        rollout_rows: 48
+        completion_rows: 512
+        learner_rows: 12
+    iterations: 100000000
+    checkpoint_every: 20
+    output_dir: runs/experiments/nlhe_hu_32bb_rb_campaign_control
+control:
+  clock: global_player_decisions
+  gradient_reduction: global_mean
+  entropy:
+    initial_coefficient: 0.0015625
+    zero_after_decisions: 250000
+  reference:
+    interval_decisions: 400000
+  checkpoint_seconds: 600
+  snapshot_seconds: 1800
+  initial_loss_scale: 1024.0
+  thermal_policy: telemetry_only
+  max_nonfinite_steps: 0
+  posterior_clock:
+    exponent: 1.0
+campaign:
+  screen_seconds: 7200
+  confirm_seconds: 10800
+  cold_seconds: 14400
+  screen_br_seconds: 1800
+  confirm_br_seconds: 3600
+  cold_br_seconds: 3600
+  screen_hands: 512
+  confirm_hands: 2048
+  cold_hands: 4096
+  screen_seed: 918273
+  confirmation_seeds:
+  - 20260929
+  - 20260930
+  cold_seed: 20261001
+  br_seeds:
+  - 4101
+  - 4102
+  - 4103
+  shortlist: 3
+  cold_finalists: 2
+  cross_panel_hands: 512
+  confirmation_selection: control + strongest single change + strongest compatible
+    two-change combination; fallback top2 singles if every combination conflicts
+best_response:
+  overrides:
+    scientific.mode.private_estimator: rao_blackwell
+    scientific.optimizer.learning_rate: 0.0001
+    scientific.objective.value:
+      kind: mse
+      coefficient: 0.016
+    scientific.objective.reference_kl: null
+    scientific.schedule.batch_size: 256
+    scientific.schedule.steps: 12
+    control.entropy.initial_coefficient: 0.00078125
+    control.entropy.zero_after_decisions: 100000
+    control.reference.interval_decisions: null
+    run.execution.reference_cache: 'off'
+arms:
+- name: control
+  overrides: {}
+- name: entropy_zero
+  overrides:
+    control.entropy.initial_coefficient: 0.0
+- name: entropy_slow
+  overrides:
+    control.entropy.zero_after_decisions: 1000000
+- name: kl_weak
+  overrides:
+    scientific.objective.reference_kl.coefficient: 0.003125
+- name: kl_strong
+  overrides:
+    scientific.objective.reference_kl.coefficient: 0.0125
+- name: reference_fast
+  overrides:
+    control.reference.interval_decisions: 100000
+- name: reference_fixed
+  overrides:
+    control.reference.interval_decisions: null
+- name: learning_rate_fast
+  overrides:
+    scientific.optimizer.learning_rate: 0.0001
+- name: critic_weight_4x
+  overrides:
+    scientific.objective.value.coefficient: 0.064
+- name: critic_unclipped
+  overrides:
+    scientific.objective.value:
+      kind: mse
+      coefficient: 0.016
+- name: reuse_half
+  overrides:
+    scientific.schedule.steps: 12
+- name: posterior_clock_raw
+  overrides:
+    control.clock: posterior_effective_hands
+- name: posterior_clock_sqrt
+  overrides:
+    control.clock: posterior_effective_hands
+    control.posterior_clock.exponent: 0.5
+comparison:
+  conditions:
+  - sampled
+  - rao_blackwell
+  selection: one shared parameter profile; equal weight to both modes
+  primary_budget: equal end-to-end training wall time on identical three-GPU allocation
+  secondary_axes:
+  - global fresh player decisions
+  - global roots
+  - optimizer steps
+  - global learner presentations
+  schedule_clock: 'Shared rule in both modes: fresh decisions control versus exact
+    public-posterior exp(H)^alpha hypotheses (alpha1 or0.5); Normal contributes1.
+    No Monte Carlo completion-ESS multiplier.'
+  mode_specific_parameters:
+    completion.samples: RB-only estimator computation; fixed at1024, absent for sampled.
+      Not a shared loss/schedule search dimension.

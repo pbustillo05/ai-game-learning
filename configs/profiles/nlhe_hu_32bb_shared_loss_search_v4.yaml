@@ -1,0 +1,492 @@
+# Revision 4: corrected pre-terminal posterior clock; all scientific settings shared by Normal and RB.
+kind: nlhe_hyperparameter_campaign_v1
+status: 'v4: pre-terminal trajectory-weighted posterior clock, bounded CUDA analysis,
+  full-size validation gate'
+initialization:
+  checkpoint: runs/nlhe_hu_32bb_full_sequential_rb/ckpt_0001110.pt
+  sha256: bced881945512f2a4152d3acd88a0a06395a00130cdf68a61aa2652bc1b5aebb
+  preflop_inputs: legacy
+  value_scale: 32.0
+training:
+  kind: nlhe_run_v1
+  scientific:
+    mode:
+      training_regime: self_play
+      rollout_mode: sequential
+      private_estimator: rao_blackwell
+    game:
+      players: 2
+      stack_bb: 32.0
+      rank_count: 13
+    model:
+      d_model: 128
+      n_heads: 4
+      layers:
+        pre: 4
+        post: 6
+      raises:
+        components: 2
+        minimum_scale: 0.02
+      class_embedding_dim: 32
+      folder_beta_rank: 0
+      folder_line_dim: 8
+      epsilon: 1.0e-08
+    objective:
+      policy_clip: 0.2
+      value:
+        kind: clipped
+        epsilon: 0.00625
+        coefficient: 0.016
+      entropy:
+        kind: constant
+        coefficient: 0.0015625
+      reference_kl:
+        coefficient: 0.00625
+        refresh:
+          iterations: 1000000000
+    optimizer:
+      kind: adamw
+      learning_rate: 5.0e-05
+      beta1: 0.9
+      beta2: 0.999
+      epsilon: 1.0e-08
+      weight_decay: 0.01
+      grad_clip: 0.5
+    schedule:
+      batch_size: 128
+      steps: 24
+    lambda: 0.95
+    completion:
+      samples: 1024
+  run:
+    seed: 918273
+    reproducibility: strict
+    utility: stack_normalized
+    workload:
+      roots: 512
+    recovery:
+      minimum_roots: 512
+    execution:
+      device: cuda:0
+      precision: fp16
+      attention: sdpa
+      reference_cache:
+        budget_bytes: 1073741824
+      memory:
+        reserve_bytes: 1350242468
+      microbatch:
+        rollout_rows: 48
+        completion_rows: 512
+        learner_rows: 12
+    iterations: 100000000
+    checkpoint_every: 20
+    output_dir: runs/experiments/nlhe_hu_32bb_rb_campaign_control
+control:
+  clock: global_player_decisions
+  gradient_reduction: global_mean
+  entropy:
+    initial_coefficient: 0.0015625
+    zero_after_decisions: 250000
+  reference:
+    interval_decisions: 400000
+  checkpoint_seconds: 600
+  snapshot_seconds: 1800
+  initial_loss_scale: 1024.0
+  thermal_policy: telemetry_only
+  max_nonfinite_steps: 0
+  entropy_clock: global_player_decisions
+  reference_clock: global_player_decisions
+campaign:
+  screen_seconds: 7200
+  confirm_seconds: 10800
+  cold_seconds: 14400
+  screen_br_seconds: 1800
+  confirm_br_seconds: 3600
+  cold_br_seconds: 3600
+  screen_hands: 512
+  confirm_hands: 2048
+  cold_hands: 8192
+  screen_seed: 918273
+  confirmation_seeds:
+  - 20260929
+  - 20260930
+  cold_seed: 20261001
+  br_seeds:
+  - 4101
+  - 4102
+  - 4103
+  shortlist: 3
+  cold_finalists: 2
+  cross_panel_hands: 512
+  confirmation_selection: Original control + selected matched-reuse workload with
+    control loss + selected workload with best compatible loss changes; fresh paired
+    seeds and deduplication
+  workload_seconds: 7200
+  regularizer_seconds: 7200
+  workload_hands: 512
+  regularizer_hands: 512
+  regularizer_seed: 918274
+  clock_probe_hands: 512
+  clock_probe_enabled: true
+  clock_audit_br_seconds: 3600
+best_response:
+  overrides:
+    scientific.mode.private_estimator: rao_blackwell
+    scientific.optimizer.learning_rate: 0.0001
+    scientific.objective.value:
+      kind: mse
+      coefficient: 0.016
+    scientific.objective.reference_kl: null
+    scientific.schedule.batch_size: 256
+    scientific.schedule.steps: 12
+    control.entropy.initial_coefficient: 0.00078125
+    control.entropy.zero_after_decisions: 100000
+    control.reference.interval_decisions: null
+    run.execution.reference_cache: 'off'
+    control.entropy_clock: global_player_decisions
+    control.reference_clock: global_player_decisions
+arms:
+- name: control
+  overrides:
+    run.workload.roots: 512
+    run.recovery.minimum_roots: 512
+    scientific.schedule.batch_size: 128
+    scientific.schedule.steps: 24
+  global_three_gpu:
+    roots: 1536
+    statistical_batch: 384
+    steps: 24
+    presentations: 9216
+  purpose: constant B*steps/N = 6 presentations per root; measure actual decision
+    reuse
+- name: n1024_b128_s48
+  overrides:
+    run.workload.roots: 1024
+    run.recovery.minimum_roots: 1024
+    scientific.schedule.batch_size: 128
+    scientific.schedule.steps: 48
+  global_three_gpu:
+    roots: 3072
+    statistical_batch: 384
+    steps: 48
+    presentations: 18432
+  purpose: constant B*steps/N = 6 presentations per root; measure actual decision
+    reuse
+- name: n1024_b256_s24
+  overrides:
+    run.workload.roots: 1024
+    run.recovery.minimum_roots: 1024
+    scientific.schedule.batch_size: 256
+    scientific.schedule.steps: 24
+  global_three_gpu:
+    roots: 3072
+    statistical_batch: 768
+    steps: 24
+    presentations: 18432
+  purpose: constant B*steps/N = 6 presentations per root; measure actual decision
+    reuse
+- name: n2048_b256_s48
+  overrides:
+    run.workload.roots: 2048
+    run.recovery.minimum_roots: 2048
+    scientific.schedule.batch_size: 256
+    scientific.schedule.steps: 48
+    run.execution.microbatch.learner_rows: 6
+  global_three_gpu:
+    roots: 6144
+    statistical_batch: 768
+    steps: 48
+    presentations: 36864
+  purpose: constant B*steps/N = 6 presentations per root; measure actual decision
+    reuse
+- name: entropy_zero
+  overrides:
+    control.entropy.initial_coefficient: 0.0
+- name: kl_weak
+  overrides:
+    scientific.objective.reference_kl.coefficient: 0.003125
+- name: kl_strong
+  overrides:
+    scientific.objective.reference_kl.coefficient: 0.0125
+- name: reference_fast
+  overrides:
+    control.reference.interval_decisions: 100000
+- name: reference_fixed
+  overrides:
+    control.reference.interval_decisions: null
+- name: learning_rate_fast
+  overrides:
+    scientific.optimizer.learning_rate: 0.0001
+- name: critic_weight_4x
+  overrides:
+    scientific.objective.value.coefficient: 0.064
+- name: critic_unclipped
+  overrides:
+    scientific.objective.value:
+      kind: mse
+      coefficient: 0.016
+- name: posterior_clock_raw
+  overrides:
+    control.entropy_clock: posterior_effective_hands
+    control.reference_clock: posterior_effective_hands
+  purpose: Both schedules use exact pre-terminal combo breadth weighted by player
+    decision counts
+- name: entropy_half
+  overrides:
+    control.entropy.initial_coefficient: 0.00078125
+  purpose: Lower exploration pressure around normalized historical coefficient
+- name: entropy_double
+  overrides:
+    control.entropy.initial_coefficient: 0.003125
+  purpose: Higher exploration pressure while still decaying to exactly zero
+- name: entropy_fast
+  overrides:
+    control.entropy.zero_after_decisions: 125000
+  purpose: Separate exploration duration from initial coefficient
+- name: entropy_slow
+  overrides:
+    control.entropy.zero_after_decisions: 1000000
+  purpose: Restore the earlier long-decay experiment; finite zero endpoint
+- name: learning_rate_slow
+  overrides:
+    scientific.optimizer.learning_rate: 2.5e-05
+  purpose: Bracket historical learning rate in both directions
+- name: critic_weight_quarter
+  overrides:
+    scientific.objective.value.coefficient: 0.004
+  purpose: Test weaker critic pressure around the normalized continuity value
+- name: critic_clip_wide
+  overrides:
+    scientific.objective.value.epsilon: 0.025
+  purpose: Separate value trust region from value-loss weight; 0.8 bb in normalized
+    units
+- name: ppo_clip_tight
+  overrides:
+    scientific.objective.policy_clip: 0.1
+  purpose: Test a tighter actor trust region independently of reference KL
+- name: lambda_09
+  overrides:
+    scientific.lambda: 0.9
+  purpose: Test return/baseline bias-variance tradeoff at identical workloads
+- name: posterior_entropy_only
+  overrides:
+    control.entropy_clock: posterior_effective_hands
+  purpose: Isolate entropy scheduling from reference scheduling
+- name: posterior_reference_only
+  overrides:
+    control.reference_clock: posterior_effective_hands
+  purpose: Isolate reference scheduling from entropy scheduling
+comparison:
+  conditions:
+  - sampled
+  - rao_blackwell
+  selection: One shared scientific profile; equally weight Normal and RB league results
+    against a frozen common opponent population
+  primary_budget: equal end-to-end training wall time on identical three-GPU allocation
+  secondary_axes:
+  - global fresh player decisions
+  - global roots
+  - optimizer steps
+  - global learner presentations
+  schedule_clock: Fresh player decisions versus raw exact posterior exp(H); no exponent
+    or sample-independence claim. Correlation/gradient-noise audit precedes interpretation.
+  mode_specific_parameters:
+    completion.samples: RB-only estimator computation; fixed at1024, absent for sampled.
+      Not a shared loss/schedule search dimension.
+pipeline: paired_league_v2
+workload_arms:
+- name: control
+  overrides:
+    run.workload.roots: 512
+    run.recovery.minimum_roots: 512
+    scientific.schedule.batch_size: 128
+    scientific.schedule.steps: 24
+  global_three_gpu:
+    roots: 1536
+    statistical_batch: 384
+    steps: 24
+    presentations: 9216
+  purpose: constant B*steps/N = 6 presentations per root; measure actual decision
+    reuse
+- name: n1024_b128_s48
+  overrides:
+    run.workload.roots: 1024
+    run.recovery.minimum_roots: 1024
+    scientific.schedule.batch_size: 128
+    scientific.schedule.steps: 48
+  global_three_gpu:
+    roots: 3072
+    statistical_batch: 384
+    steps: 48
+    presentations: 18432
+  purpose: constant B*steps/N = 6 presentations per root; measure actual decision
+    reuse
+- name: n1024_b256_s24
+  overrides:
+    run.workload.roots: 1024
+    run.recovery.minimum_roots: 1024
+    scientific.schedule.batch_size: 256
+    scientific.schedule.steps: 24
+  global_three_gpu:
+    roots: 3072
+    statistical_batch: 768
+    steps: 24
+    presentations: 18432
+  purpose: constant B*steps/N = 6 presentations per root; measure actual decision
+    reuse
+- name: n2048_b256_s48
+  overrides:
+    run.workload.roots: 2048
+    run.recovery.minimum_roots: 2048
+    scientific.schedule.batch_size: 256
+    scientific.schedule.steps: 48
+    run.execution.microbatch.learner_rows: 6
+  global_three_gpu:
+    roots: 6144
+    statistical_batch: 768
+    steps: 48
+    presentations: 36864
+  purpose: constant B*steps/N = 6 presentations per root; measure actual decision
+    reuse
+regularizer_arms:
+- name: control
+  overrides: {}
+- name: entropy_zero
+  overrides:
+    control.entropy.initial_coefficient: 0.0
+- name: kl_weak
+  overrides:
+    scientific.objective.reference_kl.coefficient: 0.003125
+- name: kl_strong
+  overrides:
+    scientific.objective.reference_kl.coefficient: 0.0125
+- name: reference_fast
+  overrides:
+    control.reference.interval_decisions: 100000
+- name: reference_fixed
+  overrides:
+    control.reference.interval_decisions: null
+- name: learning_rate_fast
+  overrides:
+    scientific.optimizer.learning_rate: 0.0001
+- name: critic_weight_4x
+  overrides:
+    scientific.objective.value.coefficient: 0.064
+- name: critic_unclipped
+  overrides:
+    scientific.objective.value:
+      kind: mse
+      coefficient: 0.016
+- name: posterior_clock_raw
+  overrides:
+    control.entropy_clock: posterior_effective_hands
+    control.reference_clock: posterior_effective_hands
+  purpose: Both schedules use exact pre-terminal combo breadth weighted by player
+    decision counts
+- name: entropy_half
+  overrides:
+    control.entropy.initial_coefficient: 0.00078125
+  purpose: Lower exploration pressure around normalized historical coefficient
+- name: entropy_double
+  overrides:
+    control.entropy.initial_coefficient: 0.003125
+  purpose: Higher exploration pressure while still decaying to exactly zero
+- name: entropy_fast
+  overrides:
+    control.entropy.zero_after_decisions: 125000
+  purpose: Separate exploration duration from initial coefficient
+- name: entropy_slow
+  overrides:
+    control.entropy.zero_after_decisions: 1000000
+  purpose: Restore the earlier long-decay experiment; finite zero endpoint
+- name: learning_rate_slow
+  overrides:
+    scientific.optimizer.learning_rate: 2.5e-05
+  purpose: Bracket historical learning rate in both directions
+- name: critic_weight_quarter
+  overrides:
+    scientific.objective.value.coefficient: 0.004
+  purpose: Test weaker critic pressure around the normalized continuity value
+- name: critic_clip_wide
+  overrides:
+    scientific.objective.value.epsilon: 0.025
+  purpose: Separate value trust region from value-loss weight; 0.8 bb in normalized
+    units
+- name: ppo_clip_tight
+  overrides:
+    scientific.objective.policy_clip: 0.1
+  purpose: Test a tighter actor trust region independently of reference KL
+- name: lambda_09
+  overrides:
+    scientific.lambda: 0.9
+  purpose: Test return/baseline bias-variance tradeoff at identical workloads
+- name: posterior_entropy_only
+  overrides:
+    control.entropy_clock: posterior_effective_hands
+  purpose: Isolate entropy scheduling from reference scheduling
+- name: posterior_reference_only
+  overrides:
+    control.reference_clock: posterior_effective_hands
+  purpose: Isolate reference scheduling from entropy scheduling
+gradient_noise:
+  enabled: true
+  repetitions: 16
+  seed_base: 804000
+  roots_per_rank:
+  - 512
+  - 1024
+  - 2048
+  batches_per_rank:
+  - 128
+  - 256
+  learner_steps: 1
+  objective: policy gradient only; entropy/KL/value coefficients zero
+  purpose: measure gradient variance and mean agreement; diagnostic only, no automatic
+    clock multiplier
+  bootstrap_repetitions: 1000
+evaluation:
+  primary: balanced randomized round robin, raw zero-sum bb/hand
+  shared_population: both modes, every candidate equally weighted; diagonal payoff
+    zero
+  promotion: fixed equal-hand screening then independent training seeds and fresh
+    evaluation deals
+  sensitive_br: only regularizer control versus raw posterior clock, both modes; same
+    response budget
+  limits: population-relative strength; non-transitivity retained in payoff matrix;
+    not Nash exploitability
+  fixed_anchor: Every policy versus unchanged checkpoint1110; secondary regression
+    panel, excluded from automatic selection
+study_revision: shared_loss_search_v3
+reuse_design:
+  quantity: global learner presentations / global fresh trained player decisions
+  workload_constraint: B * steps / N = 6 at every registered workload setting
+  expected_initial_reuse: about 1.5 at the measured checkpoint-1110 decision length
+    of about 4 per root
+  important_limit: 'Not exact epochs: realized decision counts change with policy.
+    Log actual reuse; no hidden per-mode step adaptation.'
+  historical_context:
+    july_median_reuse: 1.31
+    failed_august_normal_median_reuse: 1.64
+    failed_august_rb_median_reuse: 1.76
+fixed_parameters_rationale:
+  units: stack_normalized in all trials; four value-affine tensors divided by32 on
+    initialization
+  architecture_and_action_space: fixed to preserve checkpoint compatibility and isolate
+    the diagnosed objectives
+  adam_betas_epsilon_weight_decay_grad_clip: held at historical control; weaker failure-specific
+    evidence than entropy/KL/critic controls
+  completion_samples: 1024 for RB; normal has no completion estimator. Keep finite-completion
+    precision fixed during the shared scientific search
+  excluded: No entropy that stays positive forever; no posterior exponent tuning;
+    no large-reuse factorial
+  reference_cadence: 100k,400k,and fixed anchor. Another finite interval beyond screen
+    exposure would duplicate fixed-anchor behavior
+posterior_exposure:
+  schema: preterminal-trajectory-weighted-posterior-exposure-v2
+  formula: sum_i sum_p decisions(i,p) * exp(H(P(x_p | preterminal_i)))
+  normal: one per fresh trained player decision
+  posterior: exact HU collision-conditioned marginal from pre-terminal leaf ranges
+    before completion sampling
+  exponent: 1.0
+  completion_sample_count_used: false
+selected_profile_path: configs/profiles/nlhe_hu_32bb_shared_loss_selected_v4.json
