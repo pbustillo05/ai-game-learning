@@ -2210,6 +2210,10 @@ class PokerLearnerPolicy:
         self.machine = PokerStateMachine(geometry)
         self.policy = PokerPolicyOperator() if policy is None else policy
 
+    @property
+    def cohort_key(self):
+        return (type(self), self.machine.geometry, self.policy.epsilon)
+
     def __call__(
         self,
         input_type: str,

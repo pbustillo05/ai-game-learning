@@ -199,120 +199,9 @@ class LearnerIteration:
         reference_operation=None,
         reference_caches: Mapping[str, ReferenceOutputCache] | None = None,
     ) -> IterationResult:
-        metric_rows: list[Tensor] = []
-        steps: list[OptimizerStep] = []
-        presentations = 0
-        active_step: int | None = None
-        weighted: dict[str, Tensor] = {}
-        step_error: Exception | None = None
-        agree_failure = getattr(self.optimizer, "agree_failure", None)
-        common_step_count = getattr(self.optimizer, "common_step_count", None)
-        expected = sampler.optimizer_steps
-        if common_step_count is not None:
-            expected = common_step_count(expected)
-
-        def finish_step() -> None:
-            nonlocal step_error
-            if active_step is None:
-                return
-            if agree_failure is not None and agree_failure(
-                step_error is not None
-            ):
-                self.optimizer.zero_grad()
-                error = step_error
-                step_error = None
-                if error is None:
-                    raise TrainingError(
-                        "learner step failed on another distributed rank"
-                    )
-                if getattr(self.optimizer, "distributed", None) is None:
-                    raise TrainingError(
-                        "learner step failed before optimizer transition"
-                    ) from error
-                raise TrainingError(
-                    "learner step failed before distributed SUM"
-                ) from error
-            steps.append(self.optimizer.step())
-            metric_rows.append(
-                torch.stack(
-                    tuple(
-                        weighted[name]
-                        for name in (*self._METRICS, *self._MAX_METRICS)
-                    )
-                )
-            )
-            step_error = None
-
-        for batch in sampler.batches():
-            if batch.logical_step != active_step:
-                finish_step()
-                self.optimizer.zero_grad()
-                active_step = batch.logical_step
-                weighted = {}
-            if step_error is None:
-                try:
-                    for physical, weight in self._physical_batches(batch):
-                        result: LossResult = (
-                            self.learner.forward_loss_backward(
-                                physical,
-                                iteration=iteration,
-                                reference_operation=(
-                                    reference_operation
-                                    if reference_caches is None
-                                    else None
-                                ),
-                                reference_cache=(
-                                    None
-                                    if reference_caches is None
-                                    else reference_caches.get(
-                                        batch.input_type
-                                    )
-                                ),
-                                loss_scale=self.optimizer.scaler.scale,
-                                objective_weight=weight,
-                            )
-                        )
-                        for name in self._METRICS:
-                            weighted[name] = (
-                                weighted.get(name, 0.0)
-                                + weight * getattr(result, name).detach()
-                            )
-                        for name in self._MAX_METRICS:
-                            value = getattr(result, name).detach()
-                            weighted[name] = (
-                                value
-                                if name not in weighted
-                                else torch.maximum(weighted[name], value)
-                            )
-                except Exception as exc:
-                    if agree_failure is None:
-                        raise
-                    step_error = exc
-            presentations += batch.rows
-        finish_step()
-        while len(steps) < expected:
-            self.optimizer.zero_grad()
-            if agree_failure is not None and agree_failure(False):
-                raise TrainingError(
-                    "learner step failed on another distributed rank"
-                )
-            steps.append(self.optimizer.step())
-        if len(steps) != expected:
-            raise TrainingError(
-                "learner sampler exceeded its rank-common optimizer budget"
-            )
-        losses = (
-            tuple(
-                {
-                    name: float(row[index])
-                    for index, name in enumerate((*self._METRICS, *self._MAX_METRICS))
-                }
-                for row in torch.stack(metric_rows).cpu().tolist()
-            )
-            if metric_rows
-            else ()
-        )
-        return IterationResult(losses, tuple(steps), presentations)
+        work = PreparedLearner(self, sampler, reference_operation, reference_caches)
+        return optimize_prepared((work,), iteration=iteration, optimizer=self.optimizer,
+                                 distributed=getattr(self.optimizer, "distributed", None))[0]
 
     @staticmethod
     def commit_run_state(
@@ -366,6 +255,245 @@ class PreparedLearner:
             reference_operation=self.reference_operation,
             reference_caches=self.reference_caches,
         )
+
+
+def _optimizer_binding(value):
+    """Resolve scheduling views to the sole dense device optimizer."""
+    if isinstance(value, DenseAdam):
+        return value, None
+    group = getattr(value, "group", value)
+    owner = getattr(group, "optimizer", None)
+    if isinstance(owner, DenseAdam):
+        return owner, group
+    owner = getattr(value, "owner", None)
+    if isinstance(owner, DenseAdam):
+        return owner, None
+    raise TrainingError("learner requires a dense tensor optimizer owner")
+
+
+def _operation_binding(operation):
+    module = operation if isinstance(operation, torch.nn.Module) else getattr(operation, "__self__", None)
+    reference = getattr(module, "_replica_owner_ref", None)
+    owner = None if reference is None else reference()
+    if owner is None:
+        return None
+    return owner, module._replica_lane, ("__call__" if operation is module else operation.__name__)
+
+
+def _cohort_operation(operations):
+    first = operations[0]
+    binding = _operation_binding(first)
+    if binding is None:
+        if len(operations) != 1:
+            raise TrainingError("unbound model operation cannot form a replica cohort")
+        return first
+    owner, lane, method = binding
+    if any(_operation_binding(op) != (owner, lane + offset, method)
+           for offset, op in enumerate(operations)):
+        raise TrainingError("model cohort lost contiguous parameter ownership")
+    return getattr(owner.cohort_module(lane, len(operations)), method)
+
+
+def _merge_learner_batches(batches):
+    from pbg.core.learner import BranchedLearnerBatch
+
+    first = batches[0]
+    if len(batches) == 1:
+        return first
+
+    def fields(name):
+        mappings = [getattr(batch, name) for batch in batches]
+        if any(tuple(mapping) != tuple(mappings[0]) for mapping in mappings):
+            raise TrainingError("cohort learner fields differ")
+        return MappingProxyType({key: torch.cat([mapping[key] for mapping in mappings])
+                                 for key in mappings[0]})
+
+    indices = torch.cat([batch.sigma_index for batch in batches])
+    if isinstance(first, SequentialLearnerBatch):
+        return SequentialLearnerBatch(first.input_type, indices, fields("fields"))
+    pointers = torch.cat([batch.action_ptr[:-1] + lane * first.action_rows
+                          for lane, batch in enumerate(batches)] +
+                         [first.action_ptr.new_tensor([len(batches) * first.action_rows])])
+    return BranchedLearnerBatch(first.input_type, indices, pointers,
+                               torch.cat([batch.action_index for batch in batches]),
+                               fields("sigma_fields"), fields("action_fields"))
+
+
+def _learner_cohort_key(work, batch):
+    learner = work.iteration.learner
+    binding = _operation_binding(learner.model_operation)
+    model = (id(learner.model_operation),) if binding is None else (id(binding[0]), binding[2])
+    policy = getattr(learner.policy_operation, "cohort_key", id(learner.policy_operation))
+    reference = _operation_binding(work.reference_operation)
+    reference_key = ((id(work.reference_operation),) if reference is None
+                     else (id(reference[0]), reference[2]))
+    schema = tuple((name, tuple(value.shape[1:]), value.dtype)
+                   for mapping in (batch.sigma_fields, batch.action_fields)
+                   for name, value in mapping.items())
+    return (type(batch), batch.input_type, batch.rows, batch.action_rows,
+            learner.mode.key, learner.precision, policy, model, reference_key,
+            work.reference_caches is not None, learner.loss.branching is not None, schema)
+
+
+def _run_learner_cohort(works, packets, *, iteration, owner, lanes):
+    from pbg.core.contracts import PrivateEstimator
+    from pbg.core.learner import _select_sampled_private
+
+    batch = _merge_learner_batches([packet[1] for packet in packets])
+    learners = [work.iteration.learner for work in works]
+    first = learners[0]
+    sampled = first.mode.private_estimator is PrivateEstimator.SAMPLED
+    sigma = batch.sigma_fields
+    private = sigma["sampled_private_state"] if sampled else sigma["owner"][:, None]
+    operation = _cohort_operation([learner.model_operation for learner in learners])
+    controls = first.controls(tuple(learner.loss for learner in learners), iteration, owner.device)
+    dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[first.precision]
+    reference_raw = None
+    with torch.autocast("cuda", dtype=dtype, enabled=first.precision != "fp32"):
+        evaluation = operation(batch.input_type, sigma["model_input"], private, sigma["owner"])
+        with torch.no_grad():
+            if works[0].reference_caches is not None:
+                references = []
+                for work, packet in zip(works, packets, strict=True):
+                    physical = packet[1]
+                    cached = work.reference_caches[physical.input_type].gather(physical.sigma_index)
+                    if sampled:
+                        cached = {name: _select_sampled_private(value,
+                                  physical.sigma_fields["sampled_private_state"],
+                                  physical.sigma_fields["owner"]) for name, value in cached.items()}
+                    references.append(cached)
+                reference_raw = {name: torch.cat([ref[name] for ref in references]) for name in references[0]}
+            elif works[0].reference_operation is not None:
+                reference = _cohort_operation([work.reference_operation for work in works])
+                raw = reference(batch.input_type, sigma["model_input"], private, sigma["owner"]).policy_raw
+                reference_raw = ({name: _select_sampled_private(value, private, sigma["owner"])
+                                  for name, value in raw.items()} if sampled else raw)
+        result = first.forward_loss(batch, iteration=iteration, lane_count=len(works),
+                                    loss_controls=controls, evaluation=evaluation,
+                                    reference_raw=reference_raw)
+    weights = torch.stack([torch.as_tensor(packet[2], dtype=torch.float32, device=owner.device)
+                           for packet in packets])
+    torch._assert_async((torch.isfinite(weights) & weights.gt(0) & weights.le(1)).all(),
+                        "physical objective weights must lie in (0,1]")
+    lane_index = torch.tensor(lanes, dtype=torch.int64, device=owner.device)
+    owner.fatal[lane_index] |= ~torch.isfinite(result.total.detach())
+    scale = owner.controls.index_select(0, lane_index)[:, 6]
+    (result.total * weights * scale).sum().backward()
+    names = (*LearnerIteration._METRICS, *LearnerIteration._MAX_METRICS)
+    metrics = torch.stack([getattr(result, name).detach() for name in names], dim=1)
+    metrics[:, :len(LearnerIteration._METRICS)].mul_(weights[:, None])
+    return metrics
+
+
+def optimize_prepared(works, *, iteration, optimizer, distributed=None):
+    """Logical-step FIFO scheduling of exact family cohorts, including K=1."""
+    owner, group = _optimizer_binding(optimizer)
+    lanes = tuple(getattr(work.iteration.optimizer, "lane", index) for index, work in enumerate(works))
+    if len(set(lanes)) != len(lanes) or any(lane < 0 or lane >= owner.count for lane in lanes):
+        raise TrainingError("prepared learner lanes do not match optimizer ownership")
+    budgets = [work.sampler.optimizer_steps for work in works]
+    if distributed is not None:
+        budgets = [distributed.maximum_steps(count, device=owner.device) for count in budgets]
+    metrics = [[] for _ in works]
+    transitions = [[] for _ in works]
+    presentations = [0 for _ in works]
+
+    def packets(work):
+        for batch in work.sampler.batches():
+            for physical, weight in work.iteration._physical_batches(batch):
+                yield batch.logical_step, physical, weight
+
+    streams = [iter(packets(work)) for work in works]
+    pending = [None for _ in works]
+    ended = [False for _ in works]
+    for logical_step in range(max(budgets, default=0)):
+        active = [index for index, budget in enumerate(budgets) if logical_step < budget]
+        mask = torch.zeros(owner.count, dtype=torch.bool, device=owner.device)
+        mask[[lanes[index] for index in active]] = True
+        owner.gradient_rows.masked_fill_(mask[:, None], 0)
+        weighted = torch.zeros((len(works), 10), dtype=torch.float32, device=owner.device)
+        seen = set()
+        failure = None
+        try:
+            while True:
+                for index in active:
+                    if pending[index] is None and not ended[index]:
+                        pending[index] = next(streams[index], None)
+                        ended[index] = pending[index] is None
+                    if pending[index] is not None and pending[index][0] < logical_step:
+                        raise TrainingError("learner FIFO logical step moved backwards")
+                ready = [index for index in active if pending[index] is not None
+                         and pending[index][0] == logical_step]
+                if not ready:
+                    break
+                first = ready[0]
+                key = _learner_cohort_key(works[first], pending[first][1])
+                cohort = [first]
+                for index in ready[1:]:
+                    if (lanes[index] != lanes[cohort[-1]] + 1 or
+                        _learner_cohort_key(works[index], pending[index][1]) != key):
+                        break
+                    # Arbitrary callables have no batched parameter contract.
+                    if _operation_binding(works[first].iteration.learner.model_operation) is None:
+                        break
+                    cohort.append(index)
+                result = _run_learner_cohort([works[index] for index in cohort],
+                    [pending[index] for index in cohort], iteration=iteration, owner=owner,
+                    lanes=[lanes[index] for index in cohort])
+                for row, index in enumerate(cohort):
+                    weighted[index, :8].add_(result[row, :8])
+                    weighted[index, 8:] = (torch.maximum(weighted[index, 8:], result[row, 8:])
+                                           if index in seen else result[row, 8:])
+                    seen.add(index)
+                    presentations[index] += pending[index][1].rows
+                    pending[index] = None
+        except Exception as exc:
+            failure = exc
+        failed = owner.fatal.clone()
+        if failure is not None:
+            failed.logical_or_(mask)
+        if distributed is not None:
+            failed = distributed.agree_failures(failed)
+        # This is the rank-common failure boundary before dense gradient SUM.
+        if failure is not None or (distributed is not None and bool(failed.any())):
+            raise TrainingError("learner failed before optimizer transition or distributed SUM") from failure
+        if distributed is not None:
+            distributed.sum_gradients(owner.gradient_rows, mask)
+        transition = None
+        try:
+            transition = owner.step_device(mask)
+            if group is not None and hasattr(group, "versions"):
+                group.versions.add_(transition[0].to(group.versions.dtype))
+        except Exception as exc:
+            failure = exc
+        failed = owner.fatal.clone()
+        if failure is not None:
+            failed.logical_or_(mask)
+        if distributed is not None:
+            failed = distributed.agree_failures(failed)
+        if failure is not None or (distributed is not None and bool(failed.any())):
+            raise TrainingError("learner optimizer failed before rank-common publication") from failure
+        assert transition is not None
+        for index in active:
+            transitions[index].append(tuple(value[lanes[index]].clone() for value in transition))
+            if index in seen:
+                metrics[index].append(weighted[index].clone())
+    failed = owner.fatal.clone()
+    if any(packet is not None for packet in pending):
+        failed.fill_(True)
+    if distributed is not None:
+        failed = distributed.agree_failures(failed)
+    if bool(failed.any()):
+        raise TrainingError("learner failed or exceeded its optimizer budget before publication")
+    names = (*LearnerIteration._METRICS, *LearnerIteration._MAX_METRICS)
+    results = []
+    for index in range(len(works)):
+        losses = tuple(dict(zip(names, row, strict=True))
+                       for row in (torch.stack(metrics[index]).cpu().tolist() if metrics[index] else ()))
+        steps = (DenseAdam.materialize_steps(tuple(torch.stack([row[field] for row in transitions[index]])
+                 for field in range(7))) if transitions[index] else ())
+        results.append(IterationResult(losses, steps, presentations[index]))
+    return tuple(results)
 
 
 class LearnerTransaction:
@@ -456,42 +584,25 @@ class LearnerTransaction:
                     )
                     break
             if failure is None:
-                for lane, work in enumerate(prepared):
-                    if work is None:
-                        raise TrainingError(
-                            "learner transaction omitted a prepared lane"
-                        )
-                    local_failure = None
-                    result: IterationResult | None = None
-                    try:
-                        result = work.optimize(iteration=iteration)
-                    except Exception as exc:  # noqa: BLE001 - lane transaction
-                        local_failure = exc
-                    if self._common_failure(lane, local_failure is not None):
-                        failure = (
-                            local_failure
-                            if local_failure is not None
-                            else TrainingError(
-                                "learner execution failed on another rank"
-                            )
-                        )
-                        break
-                    if result is None:
-                        raise TrainingError(
-                            "successful learner lane omitted its result"
-                        )
-                    results.append(result)
+                try:
+                    if any(work is None for work in prepared):
+                        raise TrainingError("learner transaction omitted a prepared lane")
+                    results = list(optimize_prepared(
+                        prepared, iteration=iteration, optimizer=self.optimizer,
+                        distributed=self.distributed,
+                    ))
+                    for state, result in zip(self.run_states, results, strict=True):
+                        if state is not None:
+                            LearnerIteration.commit_run_state(state, result, iteration=iteration)
+                except Exception as exc:
+                    failure = exc
+                # Reporting and counter publication can fail after the final
+                # device update. Every rank must retain its rollback point.
+                if self._common_failure(0, failure is not None):
+                    if failure is None:
+                        failure = TrainingError("learner publication failed on another rank")
             if failure is not None:
                 raise failure
-            for state, result in zip(
-                self.run_states, results, strict=True
-            ):
-                if state is not None:
-                    LearnerIteration.commit_run_state(
-                        state,
-                        result,
-                        iteration=iteration,
-                    )
             self.optimizer.commit_transaction()
             transaction_open = False
             return tuple(results)

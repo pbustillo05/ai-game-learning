@@ -335,8 +335,9 @@ class _LaneStepper:
 
 class _SingleOptimizerGroup:
     def __init__(self, optimizer) -> None:
+        self.optimizer = optimizer
         self.optimizers = (optimizer,)
-        self.versions = torch.zeros(1, dtype=torch.int64)
+        self.versions = torch.zeros(1, dtype=torch.int64, device=optimizer.device)
         self._transaction_versions = None
 
     def begin_transaction(self) -> None:

@@ -167,3 +167,38 @@ def test_explicit_replica_forward_backward_matches_independent_calls(lanes):
     torch.testing.assert_close(owner.gradients, 2 * saved, atol=5e-5, rtol=5e-5)
     assert before == {name: parameter.grad.data_ptr() for name, parameter in batched.named_parameters()}
     owner.assert_zero_copy()
+
+
+def _scientific_contract():
+    return {
+        "game": {"players": 2, "stack_bb": 32, "rank_count": 13},
+        "model": {"layers": 2, "d_model": 32, "folder_beta_rank": 16,
+                  "folder_line_dim": 8, "raises": {"components": 4, "minimum_scale": 0.02},
+                  "epsilon": 1e-8},
+        "run": {"utility": "raw_bb"},
+        "mode": {"rollout_mode": "sequential", "private_estimator": "sampled",
+                 "training_regime": "self_play"},
+    }
+
+
+def test_frozen_opponent_may_have_different_internal_width_and_depth():
+    from pbg.runtime import _validate_frozen_compatibility
+    current = _scientific_contract()
+    frozen = copy.deepcopy(current)
+    frozen["model"].update(layers=6, d_model=128)
+    _validate_frozen_compatibility(current, frozen, initialize=False)
+
+
+@pytest.mark.parametrize("section,field,value", [
+    ("game", "players", 3), ("game", "stack_bb", 64),
+    ("model", "folder_beta_rank", 8), ("model", "folder_line_dim", 4),
+    ("model", "raises", {"components": 2, "minimum_scale": 0.02}),
+    ("run", "utility", "stack_normalized"),
+])
+def test_frozen_opponent_rejects_incompatible_input_or_policy_contract(section, field, value):
+    from pbg.runtime import _validate_frozen_compatibility
+    current = _scientific_contract()
+    frozen = copy.deepcopy(current)
+    frozen[section][field] = value
+    with pytest.raises(RuntimeError, match="frozen checkpoint"):
+        _validate_frozen_compatibility(current, frozen, initialize=False)

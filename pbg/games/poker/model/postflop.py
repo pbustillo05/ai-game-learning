@@ -252,9 +252,7 @@ class PostflopEncoder(nn.Module):
             if seat.shape != (batch, folder_count):
                 raise ValueError("folder_seat must have shape [B,F]")
             safe_seat = seat.to(device=device, dtype=torch.long).clamp(0, players - 1)
-            # Out-of-place scatter is required when replica inference vmaps
-            # model parameters: ``context`` then carries the vmap level while
-            # a shape-only zero allocation does not.
+            # Preserve differentiable folder contributions during seat assembly.
             seat_context = seat_context.scatter_add(
                 1,
                 safe_seat[..., None].expand(-1, -1, self.cfg.d_model),
@@ -618,10 +616,10 @@ class PostflopEncoder(nn.Module):
         row = row + shared.actor_embedding(actor_flag.long())[:, :, None]
         row_flat = row.reshape(batch, live_players * mapping.compact_size, d)
         public, public_mask = self._public_tokens(
-            shared, pub, masks.fold_line_features, combo_ranges.dtype, relative
+            shared, pub, masks.fold_line_features, row.dtype, relative
         )
         actor_relative = relative.gather(1, actor[:, None]).squeeze(1)
-        anchors = broadcast_parameter(shared.anchor_tokens, batch, 2).to(combo_ranges.dtype) + shared.anchor_seat_embedding(actor_relative)[:, None]
+        anchors = broadcast_parameter(shared.anchor_tokens, batch, 2).to(row.dtype) + shared.anchor_seat_embedding(actor_relative)[:, None]
         token = torch.cat((row_flat, public, anchors), dim=1)
         row_mask = compact_mask.reshape(batch, -1)
         key_mask = torch.cat((row_mask, public_mask, torch.ones((batch, c.k_act), dtype=torch.bool, device=row.device)), dim=1)

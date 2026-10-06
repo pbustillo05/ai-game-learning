@@ -279,8 +279,8 @@ class _LearnerToy(torch.nn.Module):
         _private: torch.Tensor,
         _owner: torch.Tensor,
     ) -> ModelEvaluation:
-        value = self.value_weight * model_input
-        logit = self.logit * model_input
+        value = broadcast_parameter(self.value_weight, model_input.shape[0], 0)[:, None] * model_input
+        logit = broadcast_parameter(self.logit, model_input.shape[0], 0)[:, None] * model_input
         return ModelEvaluation({"logit": logit}, value)
 
 
@@ -440,27 +440,22 @@ def _distributed_sum_worker(
 
             @staticmethod
             def batches():
-                yield SequentialLearnerBatch(
-                    "pre",
-                    torch.tensor([0], dtype=torch.int64, device=gradients.device),
-                    {"model_input": torch.ones((1, 1), device=gradients.device)},
-                )
+                yield _learner_batch()
 
-        class _AsymmetricLearner:
-            @staticmethod
-            def forward_loss_backward(*_args, **_kwargs) -> LossResult:
+        class _AsymmetricLearner(LearnerOperation):
+            def forward_loss(self, *args, **kwargs):
                 if rank == 1:
                     raise RuntimeError("injected pre-SUM learner failure")
-                value = module.logit.square() + module.value_weight.square()
-                value.backward()
-                zero = value.detach() * 0
-                return LossResult(value.detach(), zero, zero, zero, zero, zero, zero)
+                return super().forward_loss(*args, **kwargs)
 
         with pytest.raises(
             TrainingError, match="failed .* distributed SUM|another distributed"
         ):
             LearnerIteration(
-                learner=_AsymmetricLearner(),  # type: ignore[arg-type]
+                learner=_AsymmetricLearner(
+                    mode_schema("self_play", "sequential", "sampled"),
+                    LossConfig(), module, _learner_policy,
+                ),
                 optimizer=optimizer_group.lane_stepper(0, distributed=synchronizer),  # type: ignore[arg-type]
             ).optimize(_OneBatch(), iteration=0)  # type: ignore[arg-type]
         assert optimizer_group.versions.tolist() == [0]
@@ -1204,8 +1199,13 @@ def test_zero_copy_lanes_use_one_dense_gradient_axis_and_dense_oracle(
     assert isinstance(memory, ReplicaMemoryReport)
     memory.assert_reconciled(owner, group)
     assert memory.gradient_bytes == 4 * owner.parameter_count * 4
-    assert memory.optimizer_bytes == 2 * memory.gradient_bytes
-    assert memory.transaction_bytes == (3 * memory.gradient_bytes + memory.buffer_bytes)
+    assert memory.optimizer_bytes == sum(
+        value.numel() * value.element_size() for value in group._optimizer_tensors()
+    )
+    assert memory.transaction_bytes == (
+        group.optimizer.transaction_bytes
+        + group.versions.numel() * group.versions.element_size()
+    )
     assert bool(group.gradients[1].eq(0).all())
     assert group.versions.tolist() == [1, 0, 1, 1]
     owner.assert_zero_copy()

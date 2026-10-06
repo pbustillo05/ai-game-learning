@@ -74,6 +74,32 @@ def _checkpoint_payload(path: Path) -> dict[str, object]:
     return value
 
 
+def _validate_frozen_compatibility(
+    current: Mapping[str, object], frozen: Mapping[str, object], *, initialize: bool
+) -> None:
+    """Check encoded inputs and policy interpretation before allocating models."""
+    if current.get("game") != frozen.get("game"):
+        raise RuntimeError("frozen checkpoint game geometry differs")
+    left, right = current.get("model"), frozen.get("model")
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        raise RuntimeError("frozen checkpoint model configuration is missing")
+    for field in ("folder_beta_rank", "folder_line_dim", "raises", "epsilon"):
+        if left.get(field) != right.get(field):
+            raise RuntimeError(f"frozen checkpoint input/policy contract differs: {field}")
+    current_run, frozen_run = current.get("run"), frozen.get("run")
+    if (not isinstance(current_run, Mapping) or not isinstance(frozen_run, Mapping)
+        or current_run.get("utility") != frozen_run.get("utility")):
+        raise RuntimeError("frozen checkpoint utility units differ")
+    if initialize:
+        current_mode, frozen_mode = current.get("mode"), frozen.get("mode")
+        if not isinstance(current_mode, Mapping) or not isinstance(frozen_mode, Mapping):
+            raise RuntimeError("frozen checkpoint mode is missing")
+        left_heads = mode_schema(**dict(current_mode)).rollout_mode.is_branched
+        right_heads = mode_schema(**dict(frozen_mode)).rollout_mode.is_branched
+        if left != right or left_heads != right_heads:
+            raise RuntimeError("initialize-from-target requires the same shared model and heads")
+
+
 def _frozen_state(cfg: RootConfig) -> tuple[dict[str, torch.Tensor], dict[str, object]] | None:
     path = cfg.execution.frozen_checkpoint
     if path is None:
@@ -92,6 +118,10 @@ def _frozen_state(cfg: RootConfig) -> tuple[dict[str, torch.Tensor], dict[str, o
     scientific = payload.get("scientific_config")
     if not isinstance(scientific, dict):
         raise RuntimeError("frozen checkpoint scientific configuration is missing")
+    _validate_frozen_compatibility(
+        cfg.scientific_mapping(), scientific,
+        initialize=cfg.scientific.applicable.get("response_initialization") == "target",
+    )
     return model, scientific
 
 
@@ -191,6 +221,7 @@ class TrainingSession:
             config.execution.layout,
             self.device,
         )
+        frozen = _frozen_state(config)
         count = self.plan.manifest.n_replica
         modules = []
         for lane in range(count):
@@ -275,7 +306,6 @@ class TrainingSession:
                 )
                 for _ in range(count)
             )
-        frozen = _frozen_state(config)
         self.frozen_inference: PokerReplicaInference | None = None
         if frozen is not None:
             frozen, frozen_scientific = frozen

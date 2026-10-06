@@ -9,6 +9,7 @@ dense FP32 gradient rows when distributed execution requires it.
 from __future__ import annotations
 
 import copy
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -135,6 +136,8 @@ class ReplicaModuleOwner:
         module.train(self.training)
         if any(value.device.type == "meta" for value in module.state_dict().values()):
             raise ReplicaError("zero-copy lane binding retained meta storage")
+        module._replica_owner_ref = weakref.ref(self)
+        module._replica_lane = lane
         self._lanes[lane] = module
         return module
 
@@ -282,6 +285,9 @@ class FunctionalReplicaInference:
             raise ValueError("active lanes must be unique and match the host cohort")
         for lane in lanes:
             self.owner._check_lane(lane)
+        if lane_ids is not None:
+            expected = torch.tensor(lanes, dtype=torch.int64, device=active_lanes.device)
+            torch._assert_async((active_lanes == expected).all(), "device lanes disagree with host cohort")
         if not lane_arguments or any(
             not isinstance(arg, Tensor) or arg.device != self.owner.device
             or arg.ndim < 2 or arg.shape[:2] != lane_arguments[0].shape[:2]
@@ -396,8 +402,10 @@ class ReplicaMemoryReport:
         modules: ReplicaModuleOwner,
         optimizers: ReplicaOptimizerGroup,
     ) -> None:
-        expected = optimizers.memory_report()
-        if self != expected or optimizers.modules is not modules:
+        tensors = optimizers.resident_tensors()
+        unique = {value.untyped_storage().data_ptr(): value.untyped_storage().nbytes()
+                  for value in tensors}
+        if self.total_bytes != sum(unique.values()) or optimizers.modules is not modules:
             raise ReplicaError("replica named resident bytes do not reconcile")
 
 
@@ -427,26 +435,34 @@ class ReplicaOptimizerGroup:
         self.exp_avg_sq = self.optimizer.second
         self.optimizers = self.optimizer.lanes
         self.versions = torch.zeros(count, dtype=torch.int64, device=modules.device)
+        self._version_snapshot = torch.empty_like(self.versions)
         self._transaction_versions: Tensor | None = None
         modules.assert_zero_copy()
 
+    def _optimizer_tensors(self) -> tuple[Tensor, ...]:
+        owner = self.optimizer
+        return (owner.first, owner.second, owner.steps, owner.trackers,
+                owner.enabled, owner.decoupled, owner.fatal, owner.controls, self.versions)
+
+    def resident_tensors(self) -> tuple[Tensor, ...]:
+        """Owning allocations, excluding named leaf and lane aliases."""
+        return (self.modules.master, *self.modules.buffers.values(), self.gradients,
+                *self._optimizer_tensors(), *self.optimizer._snapshots,
+                self._version_snapshot)
+
     def memory_report(self) -> ReplicaMemoryReport:
-        return ReplicaMemoryReport(
-            parameter_bytes=sum(
-                value.numel() * value.element_size()
-                for value in self.modules.parameters.values()
-            ),
-            buffer_bytes=sum(
-                value.numel() * value.element_size()
-                for value in self.modules.buffers.values()
-            ),
-            gradient_bytes=self.gradients.numel() * self.gradients.element_size(),
-            optimizer_bytes=(
-                self.exp_avg.numel() * self.exp_avg.element_size()
-                + self.exp_avg_sq.numel() * self.exp_avg_sq.element_size()
-            ),
-            transaction_bytes=self.optimizer.transaction_bytes,
+        def size(values):
+            return sum(value.numel() * value.element_size() for value in values)
+
+        report = ReplicaMemoryReport(
+            parameter_bytes=size((self.modules.master,)),
+            buffer_bytes=size(self.modules.buffers.values()),
+            gradient_bytes=size((self.gradients,)),
+            optimizer_bytes=size(self._optimizer_tensors()),
+            transaction_bytes=self.optimizer.transaction_bytes + size((self._version_snapshot,)),
         )
+        report.assert_reconciled(self.modules, self)
+        return report
 
     def begin_transaction(self) -> None:
         """Create one rollback point spanning every learner lane."""
@@ -454,7 +470,8 @@ class ReplicaOptimizerGroup:
         if self._transaction_versions is not None:
             raise ReplicaError("replica optimizer transaction is already active")
         self.optimizer.begin_transaction()
-        self._transaction_versions = self.versions.clone()
+        self._version_snapshot.copy_(self.versions)
+        self._transaction_versions = self._version_snapshot
 
     def rollback_transaction(self) -> None:
         """Restore all lanes after any local or rank-common learner failure."""

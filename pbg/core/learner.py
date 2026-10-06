@@ -388,7 +388,7 @@ def compact_best_response_evaluation(
     ) -> Tensor:
         source = learned_value if learned_value is not None else frozen_value
         assert source is not None
-        result = source.new_empty((trained.shape[0], *source.shape[1:]))
+        result = source.new_zeros((trained.shape[0], *source.shape[1:]))
         if learned_value is not None:
             result.index_copy_(0, trained_row, learned_value)
         if frozen_value is not None:
@@ -400,7 +400,6 @@ def compact_best_response_evaluation(
     for item in (learned, frozen):
         if item is not None and (
             tuple(item.policy_raw) != policy_names
-            or tuple(item.public_heads) != public_names
         ):
             raise LearnerError("trained and frozen BR model schemas differ")
     return ModelEvaluation(
@@ -421,7 +420,7 @@ def compact_best_response_evaluation(
             {
                 name: merge(
                     None if learned is None else learned.public_heads[name],
-                    None if frozen is None else frozen.public_heads[name],
+                    None if frozen is None else frozen.public_heads.get(name),
                 )
                 for name in public_names
             }

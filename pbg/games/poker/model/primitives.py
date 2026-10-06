@@ -12,10 +12,8 @@ from torch.utils.checkpoint import checkpoint
 
 
 def accelerator_assert(condition: Tensor, message: str) -> None:
-    """Issue an asynchronous check unless an enclosing transform owns it."""
+    """Issue a device-side asynchronous CUDA check."""
 
-    if torch._C._functorch.is_batchedtensor(condition):
-        return
     if condition.device.type == "cuda":
         torch._assert_async(condition, message)
     elif not bool(condition):
