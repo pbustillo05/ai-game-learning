@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
+from pbg.core.tensor_ops import Linear, Embedding
 
 from pbg.games.poker.model.primitives import LN, accelerator_assert
 
@@ -20,11 +21,11 @@ class IncidenceResidual(nn.Module):
     def __init__(self, d_model: int) -> None:
         super().__init__()
         self.norm = LN(d_model)
-        self.source = nn.Linear(d_model, d_model, bias=False)
-        self.query = nn.Linear(d_model, d_model)
-        self.identical = nn.Linear(d_model, d_model, bias=False)
-        self.own = nn.Linear(d_model, d_model, bias=False)
-        self.output = nn.Linear(d_model, d_model)
+        self.source = Linear(d_model, d_model, bias=False)
+        self.query = Linear(d_model, d_model)
+        self.identical = Linear(d_model, d_model, bias=False)
+        self.own = Linear(d_model, d_model, bias=False)
+        self.output = Linear(d_model, d_model)
 
     def forward(
         self,

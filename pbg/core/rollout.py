@@ -530,6 +530,7 @@ class FamilyBatch:
     lanes: Tensor
     row: Tensor
     fields: Mapping[str, Tensor]
+    lane_ids: tuple[int, ...] | None = None
 
     @property
     def lane_count(self) -> int:
@@ -812,7 +813,7 @@ class SemanticFamilyFIFO:
                 for name, value in self.family.columns.items()
             }
         )
-        return FamilyBatch(self.input_type, lanes, row, fields)
+        return FamilyBatch(self.input_type, lanes, row, fields, scheduled.lanes)
 
 @dataclass(frozen=True)
 class ModelWorkspace:

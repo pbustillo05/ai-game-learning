@@ -271,39 +271,6 @@ class PokerOperations:
         def flatten(value: Tensor) -> Tensor:
             return value.flatten(0, 1)
 
-        def evaluate(
-            operation: PokerReplicaInference,
-            selected: Tensor,
-        ) -> tuple[ModelEvaluation, Tensor, Tensor] | None:
-            count = selected.sum(1, dtype=torch.int64)
-            width = int(count.max().item())
-            if width == 0:
-                return None
-            ordinal = torch.arange(rows, dtype=torch.int64, device=self.plan.device)[
-                None
-            ].expand(lane_count, -1)
-            packed_row = torch.argsort(
-                torch.where(selected, ordinal, rows + ordinal),
-                dim=1,
-                stable=True,
-            )[:, :width]
-            valid = (
-                torch.arange(width, dtype=torch.int64, device=self.plan.device)[None]
-                < count[:, None]
-            )
-            packed_row = torch.where(valid, packed_row, torch.zeros_like(packed_row))
-            lane_row = torch.arange(
-                lane_count, dtype=torch.int64, device=self.plan.device
-            )[:, None]
-            result = operation(
-                forward.input_type,
-                model_input[lane_row, packed_row],
-                private[lane_row, packed_row],
-                owner[lane_row, packed_row],
-                active_lanes=lanes,
-            )
-            return result, packed_row, valid
-
         mode = self.modes[lane]
         if mode.training_regime is TrainingRegime.SELF_PLAY:
             result = self.inference(
@@ -312,6 +279,7 @@ class PokerOperations:
                 private,
                 owner,
                 active_lanes=lanes,
+                lane_ids=forward.lane_ids,
             )
             return ModelEvaluation(
                 MappingProxyType(
@@ -328,57 +296,54 @@ class PokerOperations:
         if self.frozen_inference is None or role is None:
             raise PokerOperationsError("replica best response omitted its frozen role")
         trained = owner.eq(role)
-        learned = evaluate(self.inference, trained)
-        frozen = evaluate(self.frozen_inference, ~trained)
-        prototype = learned[0] if learned is not None else frozen[0]
-        if prototype is None:
+        host_lanes = (tuple(lanes.cpu().tolist()) if forward.lane_ids is None else forward.lane_ids)
+        pieces: list[tuple[ModelEvaluation, Tensor, Tensor]] = []
+        ordinal = torch.arange(rows, dtype=torch.int64, device=self.plan.device)[None].expand(lane_count, -1)
+        for operation, selected in ((self.inference, trained), (self.frozen_inference, ~trained)):
+            # Counts are bounded scheduling metadata. Exact role cohorts never
+            # evaluate inactive lanes or invented decision rows.
+            counts = selected.sum(1, dtype=torch.int64).cpu().tolist()
+            groups: dict[int, list[int]] = {}
+            for position, count in enumerate(counts):
+                if count:
+                    groups.setdefault(count, []).append(position)
+            ordered = torch.argsort(torch.where(selected, ordinal, rows + ordinal), dim=1, stable=True)
+            for width, positions in groups.items():
+                position = torch.tensor(positions, dtype=torch.int64, device=self.plan.device)
+                packed_row = ordered.index_select(0, position)[:, :width]
+                lane_row = position[:, None].expand_as(packed_row)
+                selected_lanes = tuple(host_lanes[index] for index in positions)
+                result = operation(
+                    forward.input_type,
+                    model_input[lane_row, packed_row],
+                    private[lane_row, packed_row], owner[lane_row, packed_row],
+                    active_lanes=lanes.index_select(0, position), lane_ids=selected_lanes,
+                )
+                pieces.append((result, lane_row, packed_row))
+        if not pieces:
             raise PokerOperationsError("best-response model batch is empty")
+        prototype = pieces[0][0]
 
-        def restore(
-            learned_value: Tensor | None,
-            frozen_value: Tensor | None,
-        ) -> Tensor:
-            source = learned_value if learned_value is not None else frozen_value
-            assert source is not None
-            output = source.new_empty((lane_count, rows, *source.shape[2:]))
-            for value, packed in (
-                (learned_value, learned),
-                (frozen_value, frozen),
-            ):
-                if value is None or packed is None:
-                    continue
-                packed_row, valid = packed[1:]
-                lane_row = torch.arange(
-                    lane_count,
-                    dtype=torch.int64,
-                    device=self.plan.device,
-                )[:, None].expand_as(packed_row)
-                output[lane_row[valid], packed_row[valid]] = value[valid]
+        def restore(field: str, name: str | None = None) -> Tensor:
+            source = prototype.value if field == "value" else getattr(prototype, field)[name]
+            output = source.new_zeros((lane_count, rows, *source.shape[2:]))
+            for result, lane_row, packed_row in pieces:
+                if field == "value":
+                    value = result.value
+                else:
+                    value = getattr(result, field).get(name)
+                    if value is None:
+                        # Frozen structural rows never retain branching heads.
+                        if field != "public_heads":
+                            raise PokerOperationsError("model policy field is missing")
+                        continue
+                output[lane_row, packed_row] = value
             return flatten(output)
 
         return ModelEvaluation(
-            MappingProxyType(
-                {
-                    name: restore(
-                        None if learned is None else learned[0].policy_raw[name],
-                        None if frozen is None else frozen[0].policy_raw[name],
-                    )
-                    for name in prototype.policy_raw
-                }
-            ),
-            restore(
-                None if learned is None else learned[0].value,
-                None if frozen is None else frozen[0].value,
-            ),
-            MappingProxyType(
-                {
-                    name: restore(
-                        None if learned is None else learned[0].public_heads[name],
-                        None if frozen is None else frozen[0].public_heads[name],
-                    )
-                    for name in prototype.public_heads
-                }
-            ),
+            MappingProxyType({name: restore("policy_raw", name) for name in prototype.policy_raw}),
+            restore("value"),
+            MappingProxyType({name: restore("public_heads", name) for name in prototype.public_heads}),
         )
 
     @torch.no_grad()
@@ -687,7 +652,7 @@ class PokerOperations:
         return PokerLearnerPolicy(self.geometry, self.policy)
 
     def model_costs(self, lane: int) -> Mapping[str, int] | None:
-        preflop = getattr(self.models[lane], "preflop", None)
+        preflop = getattr(self.models[lane], "pre_encoder", None)
         model_config = getattr(preflop, "cfg", None)
         if model_config is None:
             return None

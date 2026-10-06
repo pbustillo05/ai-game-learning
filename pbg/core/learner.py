@@ -1776,7 +1776,7 @@ def _select_sampled_private(value: Tensor, private: Tensor, owner: Tensor) -> Te
 
 
 class LearnerOperation:
-    """One authoritative forward/loss/immediate-backward operation."""
+    """One tensor loss with independent lane reductions and external backward."""
 
     def __init__(
         self,
@@ -1802,19 +1802,33 @@ class LearnerOperation:
             }[precision]
         )
 
-    def forward_loss_backward(
+    def forward_loss(
         self,
         batch: SequentialLearnerBatch | BranchedLearnerBatch,
         *,
         iteration: int,
         reference_operation: ModelOperation | None = None,
         reference_cache: ReferenceOutputCache | None = None,
-        loss_scale: float = 1.0,
-        objective_weight: float | Tensor = 1.0,
+        lane_count: int = 1,
+        loss_controls: Tensor | None = None,
+        evaluation: ModelEvaluation | None = None,
+        reference_raw: Mapping[str, Tensor] | None = None,
     ) -> LossResult:
         if not isinstance(batch, (SequentialLearnerBatch, BranchedLearnerBatch)):
             raise LearnerError("learner batch has no supported presentation")
         rows = batch.rows
+        if lane_count <= 0 or rows % lane_count or batch.action_rows % lane_count:
+            raise LearnerError("loss cohort must contain exact equal-shape lanes")
+        if loss_controls is None:
+            loss_controls = self.controls((self.loss,), iteration, batch.sigma_index.device)
+        if loss_controls.shape != (lane_count, 10) or loss_controls.dtype != torch.float32:
+            raise LearnerError("loss controls must be FP32 [K,10]")
+        def action_control(column: int) -> Tensor:
+            return loss_controls[:, column, None].expand(-1, batch.action_rows // lane_count).reshape(-1, 1)
+        def sigma_control(column: int) -> Tensor:
+            return loss_controls[:, column, None].expand(-1, rows // lane_count).reshape(-1, 1)
+        def lane_mean(value: Tensor) -> Tensor:
+            return value.reshape(lane_count, -1).mean(-1)
         sigma_index = batch.sigma_index
         action_ptr = batch.action_ptr
         sigma = batch.sigma_fields
@@ -1852,12 +1866,10 @@ class LearnerOperation:
             dtype=autocast_dtype,
             enabled=self.precision != "fp32",
         ):
-            evaluation = self.model_operation(
-                batch.input_type,
-                sigma["model_input"],
-                sigma_private,
-                sigma["owner"],
-            )
+            if evaluation is None:
+                evaluation = self.model_operation(
+                    batch.input_type, sigma["model_input"], sigma_private, sigma["owner"],
+                )
             natural_raw = (
                 {
                     name: _select_sampled_private(
@@ -1880,7 +1892,9 @@ class LearnerOperation:
                 else evaluation.value
             )
             reference = None
-            if reference_cache is not None:
+            if reference_raw is not None:
+                reference_sigma = dict(reference_raw)
+            elif reference_cache is not None:
                 if reference_operation is not None:
                     raise LearnerError(
                         "reference cache and operation are mutually exclusive"
@@ -1994,22 +2008,13 @@ class LearnerOperation:
         )
         log_ratio = current_log - old_log
         ratio = log_ratio.exp()
-        clipped = ratio.clamp(
-            1 - self.loss.policy_clip,
-            1 + self.loss.policy_clip,
-        )
+        clip = action_control(0)
+        clipped = ratio.clamp(1 - clip, 1 + clip)
         negative = advantage.lt(0)
-        ratio_cap = self.loss.negative_advantage_ratio_cap
-        if ratio_cap is None:
-            policy_ratio = ratio
-            negative_capped = torch.zeros_like(negative)
-        else:
-            # Standard PPO leaves r*A unbounded when A < 0 and r exceeds the
-            # ordinary upper clip. Bound that branch in log space so a
-            # vanishing frozen-policy probability cannot dominate backward.
-            negative_ratio = log_ratio.clamp_max(math.log(ratio_cap)).exp()
-            policy_ratio = torch.where(negative, negative_ratio, ratio)
-            negative_capped = negative & log_ratio.gt(math.log(ratio_cap))
+        log_cap = action_control(1)
+        negative_ratio = torch.minimum(log_ratio, log_cap).exp()
+        policy_ratio = torch.where(negative, negative_ratio, ratio)
+        negative_capped = negative & log_ratio.gt(log_cap)
         policy_row = (
             posterior
             * -torch.minimum(
@@ -2021,7 +2026,7 @@ class LearnerOperation:
         reference_row = (posterior * reference_kl).sum(-1)
         approximate_row = (posterior * ((ratio - 1) - log_ratio)).sum(-1)
         clipped_row = (
-            posterior * ratio.sub(1).abs().gt(self.loss.policy_clip).float()
+            posterior * ratio.sub(1).abs().gt(clip).float()
         ).sum(-1)
         negative_cap_row = (
             posterior * negative_capped.float()
@@ -2031,12 +2036,12 @@ class LearnerOperation:
             supported_negative,
             log_ratio,
             torch.zeros_like(log_ratio),
-        ).amax()
+        ).reshape(lane_count, -1).amax(-1)
         negative_influence_max = (
             posterior
             * advantage.neg().clamp_min(0)
             * torch.where(negative, policy_ratio, torch.zeros_like(policy_ratio))
-        ).amax()
+        ).reshape(lane_count, -1).amax(-1)
         sigma_posterior = torch.zeros_like(current_value, dtype=torch.float32)
         sigma_posterior.scatter_add_(
             0,
@@ -2048,16 +2053,12 @@ class LearnerOperation:
             torch.finfo(torch.float32).tiny
         )
         value_error = (current_value - target_value).square()
-        if self.loss.value.kind == "clipped":
-            assert self.loss.value.epsilon is not None
-            clipped_value = old_value + (current_value - old_value).clamp(
-                -self.loss.value.epsilon,
-                self.loss.value.epsilon,
-            )
-            value_error = torch.maximum(
-                value_error,
-                (clipped_value - target_value).square(),
-            )
+        value_epsilon = sigma_control(3)
+        clipped_value = old_value + (current_value - old_value).clamp(-value_epsilon, value_epsilon)
+        value_error = torch.where(
+            sigma_control(9).bool(),
+            torch.maximum(value_error, (clipped_value - target_value).square()), value_error,
+        )
         value_row = (sigma_posterior * value_error).sum(-1)
 
         def mean_by_sigma(rows: Tensor) -> Tensor:
@@ -2099,7 +2100,7 @@ class LearnerOperation:
                 )
             ):
                 raise LearnerError("public heads and targets are not sigma aligned")
-            eps = self.loss.branching.trace_epsilon
+            eps = sigma_control(8).squeeze(-1)
             trace_ratio = (trace_target + eps) / (
                 trace_prediction.clamp_min(torch.finfo(torch.float32).tiny) + eps
             )
@@ -2107,7 +2108,7 @@ class LearnerOperation:
                 sigma["target_degree"].ge(2),
                 trace_ratio - trace_ratio.log() - 1,
                 torch.zeros_like(trace_ratio),
-            ).mean()
+            ).reshape(lane_count, -1).mean(-1)
             torch._assert_async(
                 cost_target.gt(0).all(),
                 "cost targets must be positive",
@@ -2115,62 +2116,69 @@ class LearnerOperation:
             cost_ratio = cost_target / cost_prediction.clamp_min(
                 torch.finfo(torch.float32).tiny
             )
-            cost_loss = (cost_ratio - cost_ratio.log() - 1).mean()
+            cost_loss = lane_mean(cost_ratio - cost_ratio.log() - 1)
         else:
-            trace_loss = current_value.new_zeros(())
-            cost_loss = current_value.new_zeros(())
-        policy_loss = sigma_policy.mean()
-        value_loss = value_row.mean()
-        entropy_mean = sigma_entropy.mean()
-        reference_kl_mean = sigma_reference.mean()
-        reference_coefficient = self.loss.reference_kl_coefficient or 0.0
-        trace_coefficient = (
-            0.0
-            if self.loss.branching is None
-            else self.loss.branching.trace_coefficient
-        )
-        cost_coefficient = (
-            0.0 if self.loss.branching is None else self.loss.branching.cost_coefficient
-        )
+            trace_loss = current_value.new_zeros((lane_count,))
+            cost_loss = current_value.new_zeros((lane_count,))
+        policy_loss = lane_mean(sigma_policy)
+        value_loss = lane_mean(value_row)
+        entropy_mean = lane_mean(sigma_entropy)
+        reference_kl_mean = lane_mean(sigma_reference)
         total = (
-            policy_loss
-            + self.loss.value.coefficient * value_loss
-            - self.loss.entropy_at(iteration) * entropy_mean
-            + reference_coefficient * reference_kl_mean
-            + trace_coefficient * trace_loss
-            + cost_coefficient * cost_loss
+            policy_loss + loss_controls[:, 2] * value_loss
+            - loss_controls[:, 4] * entropy_mean
+            + loss_controls[:, 5] * reference_kl_mean
+            + loss_controls[:, 6] * trace_loss + loss_controls[:, 7] * cost_loss
         )
-        if self.precision != "fp16" and not torch.isfinite(total):
-            raise LearnerError("learner loss is nonfinite")
-        if isinstance(objective_weight, Tensor):
-            if (
-                objective_weight.device != sigma_index.device
-                or objective_weight.numel() != 1
-            ):
-                raise LearnerError(
-                    "physical objective weight must be one device scalar"
-                )
-            torch._assert_async(
-                torch.isfinite(objective_weight)
-                & objective_weight.gt(0)
-                & objective_weight.le(1),
-                "physical objective weight must lie in (0,1]",
-            )
-        elif not math.isfinite(objective_weight) or not 0 < objective_weight <= 1:
-            raise LearnerError("physical objective weight must lie in (0,1]")
-        (total * float(loss_scale) * objective_weight).backward()
         return LossResult(
             total,
             policy_loss,
             value_loss,
             entropy_mean,
             reference_kl_mean,
-            sigma_approximate.mean(),
-            sigma_clipped.mean(),
-            sigma_negative_capped.mean(),
+            lane_mean(sigma_approximate),
+            lane_mean(sigma_clipped),
+            lane_mean(sigma_negative_capped),
             negative_log_ratio_max,
             negative_influence_max,
         )
+
+    @staticmethod
+    def controls(losses: tuple[LossConfig, ...], iteration: int, device: torch.device) -> Tensor:
+        """Resolve independent scientific controls into device inputs."""
+
+        return torch.tensor([
+            [loss.policy_clip,
+             math.inf if loss.negative_advantage_ratio_cap is None else math.log(loss.negative_advantage_ratio_cap),
+             loss.value.coefficient, loss.value.epsilon or 0.0, loss.entropy_at(iteration),
+             loss.reference_kl_coefficient or 0.0,
+             0.0 if loss.branching is None else loss.branching.trace_coefficient,
+             0.0 if loss.branching is None else loss.branching.cost_coefficient,
+             1.0e-8 if loss.branching is None else loss.branching.trace_epsilon,
+             float(loss.value.kind == "clipped")]
+            for loss in losses
+        ], dtype=torch.float32, device=device)
+
+    def forward_loss_backward(
+        self, batch: SequentialLearnerBatch | BranchedLearnerBatch, *, iteration: int,
+        reference_operation: ModelOperation | None = None,
+        reference_cache: ReferenceOutputCache | None = None,
+        loss_scale: float | Tensor = 1.0, objective_weight: float | Tensor = 1.0,
+    ) -> LossResult:
+        """Singleton diagnostic interface to the same tensor loss program."""
+
+        result = self.forward_loss(batch, iteration=iteration,
+                                   reference_operation=reference_operation,
+                                   reference_cache=reference_cache)
+        if self.precision != "fp16" and not bool(torch.isfinite(result.total).all()):
+            raise LearnerError("learner loss is nonfinite")
+        weight = torch.as_tensor(objective_weight, dtype=torch.float32, device=batch.sigma_index.device)
+        if weight.numel() != 1:
+            raise LearnerError("physical objective weight must be one device scalar")
+        torch._assert_async((torch.isfinite(weight) & weight.gt(0) & weight.le(1)).all(),
+                            "physical objective weight must lie in (0,1]")
+        (result.total * loss_scale * weight).sum().backward()
+        return LossResult(**{name: getattr(result, name).squeeze(0) for name in result.__dataclass_fields__})
 
 
 @dataclass

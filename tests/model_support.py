@@ -34,6 +34,10 @@ class FixedOutputPokerModel(QueuedPokerModel):
         self.postflop = postflop
         self.register_buffer("combo_class", torch.tensor(DeckGeometry(geometry.rank_count).class_of_combo))
 
+    @property
+    def replica_shared_buffers(self):
+        return ("combo_class",)
+
     @staticmethod
     def _select(result, selected_private):
         if selected_private is None:

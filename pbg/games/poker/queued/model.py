@@ -162,6 +162,12 @@ class QueuedPokerModel(nn.Module):
             persistent=False,
         )
 
+    @property
+    def replica_shared_buffers(self) -> tuple[str, ...]:
+        """Every model buffer is immutable deck/class geometry."""
+
+        return tuple(name for name, _ in self.named_buffers())
+
     def configure_execution(
         self, attention_backend: str, query_chunk_size: int | None = None
     ) -> None:

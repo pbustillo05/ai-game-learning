@@ -7,6 +7,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from pbg.core.tensor_ops import Linear, LayerNorm, linear, broadcast_parameter
 from torch.utils.checkpoint import checkpoint
 
 
@@ -21,7 +22,7 @@ def accelerator_assert(condition: Tensor, message: str) -> None:
         raise ValueError(message)
 
 
-class LN(nn.LayerNorm):
+class LN(LayerNorm):
     """Standard layer normalization with learned affine parameters."""
 
 
@@ -47,8 +48,8 @@ class FFN(nn.Module):
             raise ValueError("FFN dimensions must be positive")
         self.in_dim = in_dim
         self.out_dim = out_dim
-        self.w1 = nn.Linear(in_dim, hidden)
-        self.w2 = nn.Linear(hidden, out_dim)
+        self.w1 = Linear(in_dim, hidden)
+        self.w2 = Linear(hidden, out_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         """Return an output shaped ``[*x.shape[:-1], out_dim]``."""
@@ -63,8 +64,8 @@ class FFN(nn.Module):
         split = rows.shape[-1]
         if split + context.shape[-1] != self.in_dim:
             raise ValueError("factored FFN widths do not match its input")
-        row_projection = F.linear(rows, self.w1.weight[:, :split], self.w1.bias)
-        context_projection = F.linear(context, self.w1.weight[:, split:])
+        row_projection = linear(rows, self.w1.weight[..., :split], self.w1.bias)
+        context_projection = linear(context, self.w1.weight[..., split:])
         return self.w2(gelu(row_projection + context_projection[:, None, :]))
 
 
@@ -83,8 +84,8 @@ class MHA(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
-        self.w_qkv = nn.Linear(d_model, 3 * d_model)
-        self.w_o = nn.Linear(d_model, d_model)
+        self.w_qkv = Linear(d_model, 3 * d_model)
+        self.w_o = Linear(d_model, d_model)
         # Execution-only attributes are deliberately absent from state_dict.
         self.attention_backend = "sdpa"
         self.query_chunk_size: int | None = None
@@ -106,8 +107,8 @@ class MHA(nn.Module):
         else:
             # Cross-attention uses the same packed owner without projecting
             # unused Q rows for keys or unused K/V rows for queries.
-            q_value = F.linear(q, self.w_qkv.weight[:self.d_model], self.w_qkv.bias[:self.d_model])
-            k_value, v_value = F.linear(kv, self.w_qkv.weight[self.d_model:], self.w_qkv.bias[self.d_model:]).split(self.d_model, dim=-1)
+            q_value = linear(q, self.w_qkv.weight[..., :self.d_model, :], self.w_qkv.bias[..., :self.d_model])
+            k_value, v_value = linear(kv, self.w_qkv.weight[..., self.d_model:, :], self.w_qkv.bias[..., self.d_model:]).split(self.d_model, dim=-1)
         q_head = q_value.reshape(batch, n_query, self.n_heads, self.d_head)
         k_head = k_value.reshape(batch, n_key, self.n_heads, self.d_head)
         v_head = v_value.reshape(batch, n_key, self.n_heads, self.d_head)
@@ -151,7 +152,7 @@ class MHA(nn.Module):
     ) -> Tensor:
         """Use native SDPA with the exact additive reach/key bias."""
 
-        temperature = self.temperature.to(dtype=q_head.dtype)[None, :, None, None]
+        temperature = broadcast_parameter(self.temperature, q_head.shape[0], 1).to(dtype=q_head.dtype)[:, :, None, None]
         # Keep reach/key priors in their declared fp32 precision while the
         # content projections continue to use the configured autocast dtype.
         additive_mask = key_bias[:, None, None, :]
@@ -194,7 +195,7 @@ class MHA(nn.Module):
     ) -> Tensor:
         """Exact full-key softmax with bounded query-score workspace."""
 
-        temperature = self.temperature.float()[None, :, None, None]
+        temperature = broadcast_parameter(self.temperature, q_head.shape[0], 1).float()[:, :, None, None]
         scale = 1.0 / math.sqrt(self.d_head)
 
         def attend(query_chunk: Tensor, key: Tensor, value: Tensor) -> Tensor:

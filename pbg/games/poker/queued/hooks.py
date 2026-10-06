@@ -1267,6 +1267,7 @@ class PokerForwardInput:
     sampled_private_state: Tensor
     owner: Tensor
     role_selector: Tensor | None = None
+    lane_ids: tuple[int, ...] | None = None
 
 
 class SequentialPokerHooks:
@@ -1482,6 +1483,7 @@ class SequentialPokerHooks:
                 if "role_selector" in batch.fields
                 else None
             ),
+            batch.lane_ids,
         )
 
     def sample(self, request: SampleRequest) -> SampleWorkspace:

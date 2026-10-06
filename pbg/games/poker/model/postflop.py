@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
+from pbg.core.tensor_ops import Linear, Embedding, broadcast_parameter
 
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.model.shared import SharedPokerParameters
@@ -81,14 +82,14 @@ class PostflopEncoder(nn.Module):
             )
         d, dc = c.d_model, c.class_embedding_dim
         geo_dim = self.n_cards + 2 * c.folder_beta_rank
-        self.rank_embedding = nn.Embedding(13, dc)
-        self.suit_embedding = nn.Embedding(4, dc)
+        self.rank_embedding = Embedding(13, dc)
+        self.suit_embedding = Embedding(4, dc)
         self.combo_features = FFN(3 * dc, dc, c.ffn_hidden)
-        self.row_affine = nn.Linear(3 + dc + geo_dim + d + 1, d)
+        self.row_affine = Linear(3 + dc + geo_dim + d + 1, d)
         self.folder_context = FFN(1 + c.folder_line_dim, d, c.ffn_hidden)
-        self.tight_delta_projection = nn.Linear(self.n_cards, d, bias=False)
-        self.tight_contraction_projection = nn.Linear(1, d, bias=False)
-        self.board_projection = nn.Linear(dc, d)
+        self.tight_delta_projection = Linear(self.n_cards, d, bias=False)
+        self.tight_contraction_projection = Linear(1, d, bias=False)
+        self.board_projection = Linear(dc, d)
         self.fold_features = FFN(d + 3, d, c.ffn_hidden)
         branching_dim = (2 + c.max_players) * d
         self.branching_heads = (
@@ -453,7 +454,7 @@ class PostflopEncoder(nn.Module):
             torch.full((count,), kind, dtype=torch.long, device=scalar.device)
             for count, kind in type_groups
         ])
-        scalar_tokens = scalar_tokens + shared.public_type_embedding(scalar_type)[None]
+        scalar_tokens = scalar_tokens + shared.public_type_embedding(scalar_type[None].expand(batch, -1))
         seat_position = shared.seat_embedding(relative)
         scalar_tokens = scalar_tokens + torch.cat(
             (
@@ -479,9 +480,9 @@ class PostflopEncoder(nn.Module):
         board_mask = pub.board >= 0
         board_tokens = self.board_projection(self._card_embedding(pub.board).to(dtype))
         board_tokens = board_tokens + shared.public_type_embedding(
-            torch.full(pub.board.shape, 1, dtype=torch.long, device=pub.board.device)
+            torch.full(pub.board.shape, 12, dtype=torch.long, device=pub.board.device)
         )
-        state = shared.state_token.to(dtype)[None, None, :].expand(batch, 1, -1)
+        state = broadcast_parameter(shared.state_token, batch, 1).to(dtype)[:, None]
         token = torch.cat((state, scalar_tokens, board_tokens), dim=1)
         supplied_seat_mask = (
             torch.ones(
@@ -526,8 +527,8 @@ class PostflopEncoder(nn.Module):
             history_token += shared.history_action_embedding(history.action.clamp(0, 3).long())
             history_token += shared.history_street_embedding(history.street.clamp(0, 3).long())
             history_token += shared.history_position_embedding(
-                torch.arange(history.mask.shape[1], device=scalar.device)
-            )[None]
+                torch.arange(history.mask.shape[1], device=scalar.device)[None].expand(batch, -1)
+            )
             safe_actor = history.actor.clamp(0, players - 1).long()
             history_token += shared.seat_embedding(relative.gather(1, safe_actor)) * (
                 history.actor >= 0
@@ -620,7 +621,7 @@ class PostflopEncoder(nn.Module):
             shared, pub, masks.fold_line_features, combo_ranges.dtype, relative
         )
         actor_relative = relative.gather(1, actor[:, None]).squeeze(1)
-        anchors = shared.anchor_tokens.to(combo_ranges.dtype)[None] + shared.anchor_seat_embedding(actor_relative)[:, None]
+        anchors = broadcast_parameter(shared.anchor_tokens, batch, 2).to(combo_ranges.dtype) + shared.anchor_seat_embedding(actor_relative)[:, None]
         token = torch.cat((row_flat, public, anchors), dim=1)
         row_mask = compact_mask.reshape(batch, -1)
         key_mask = torch.cat((row_mask, public_mask, torch.ones((batch, c.k_act), dtype=torch.bool, device=row.device)), dim=1)

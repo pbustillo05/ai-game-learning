@@ -58,7 +58,7 @@ def decode_model_evaluation(values: Mapping[str, Tensor]) -> ModelEvaluation:
 
 
 class PokerReplicaInference:
-    """Replica-vmapped rollout and reference inference in natural lane shape."""
+    """Explicit-K rollout and reference inference in natural lane shape."""
 
     def __init__(self, modules: Sequence[nn.Module] | ReplicaModuleOwner) -> None:
         self.modules = (
@@ -80,6 +80,7 @@ class PokerReplicaInference:
         *,
         active_lanes: Tensor,
         natural_domain: bool = False,
+        lane_ids: Sequence[int] | None = None,
     ) -> ModelEvaluation:
         if (
             model_input.ndim != 3
@@ -99,6 +100,7 @@ class PokerReplicaInference:
             owner,
             static_arguments=(input_type,),
             static_keywords={"natural_domain": natural_domain},
+            lane_ids=lane_ids,
         )
         return decode_model_evaluation(encoded)
 

@@ -10,6 +10,7 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 import torch
+from pbg.core.tensor_ops import Linear, linear, broadcast_parameter
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -156,7 +157,7 @@ class _Toy(torch.nn.Module):
         if kind != "toy":
             raise ValueError("wrong static inference identity")
         return {
-            "prediction": value @ self.weight + self.bias + self.offset,
+            "prediction": linear(value, self.weight.transpose(-1, -2), self.bias) + broadcast_parameter(self.offset, value.shape[0], 0)[:, None],
             "label": value[:, :1],
         }
 
@@ -169,7 +170,7 @@ class _PokerPartition(torch.nn.Module):
 
     def forward(self, value: torch.Tensor) -> ModelEvaluation:
         rows = value.shape[0]
-        base = self.scale * torch.ones(
+        base = broadcast_parameter(self.scale, rows, 0)[:, None] * torch.ones(
             (rows, self.width), dtype=value.dtype, device=value.device
         )
         return ModelEvaluation(
@@ -189,7 +190,7 @@ class _CheckDownPartition(torch.nn.Module):
         super().__init__()
         del input_width
         self.output_width = output_width
-        self.public = torch.nn.Linear(26, 1)
+        self.public = Linear(26, 1)
         self.value_bias = torch.nn.Parameter(torch.zeros(output_width))
 
     def forward(self, value: torch.Tensor) -> ModelEvaluation:
@@ -231,7 +232,7 @@ class _CheckDownPartition(torch.nn.Module):
                     ),
                 }
             ),
-            self.value_bias[None] + base,
+            broadcast_parameter(self.value_bias, rows, 1) + base,
         )
 
 
@@ -244,8 +245,8 @@ class _BranchedCheckDownPartition(_CheckDownPartition):
             ordinary.value,
             MappingProxyType(
                 {
-                    "trace": torch.sigmoid(self.value_bias.mean()).expand(rows),
-                    "cost": self.value_bias.mean().exp().expand(rows),
+                    "trace": torch.sigmoid(broadcast_parameter(self.value_bias, rows, 1).mean(-1)),
+                    "cost": broadcast_parameter(self.value_bias, rows, 1).mean(-1).exp(),
                 }
             ),
         )
@@ -469,7 +470,7 @@ def _distributed_sum_worker(
 
 @CUDA
 @pytest.mark.parametrize("count", (1, 2, 4, 8))
-def test_replica_vmap_matches_independent_active_lanes_without_padding(
+def test_replica_cohort_matches_independent_active_lanes_without_padding(
     count: int,
 ) -> None:
     modules = _modules(count)
@@ -508,7 +509,7 @@ def test_replica_vmap_matches_independent_active_lanes_without_padding(
 
 
 @CUDA
-def test_poker_rollout_vmap_preserves_lane_weights_and_natural_labels() -> None:
+def test_poker_rollout_cohort_preserves_lane_weights_and_natural_labels() -> None:
     geometry = NLHEGeometry(2, 8.0, 4)
     modules = [
         FixedOutputPokerModel(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from pbg.core.tensor_ops import Linear, Embedding
 
 from pbg.games.poker.model.primitives import FFN
 
@@ -15,7 +16,7 @@ class TypeHead(nn.Module):
     def __init__(self, in_dim: int) -> None:
         super().__init__()
         self.in_dim = in_dim
-        self.affine = nn.Linear(in_dim, 3)
+        self.affine = Linear(in_dim, 3)
 
     def forward(self, z_type: Tensor) -> Tensor:
         """Map row features ``[...,D]`` to type logits ``[...,3]``."""
@@ -35,8 +36,8 @@ class RaiseMixtureHead(nn.Module):
         self.in_dim = in_dim
         self.m_raise = m_raise
         self.s_min = float(s_min)
-        self.mixture_affine = nn.Linear(in_dim, 3 * m_raise)
-        self.allin_affine = nn.Linear(in_dim, 1)
+        self.mixture_affine = Linear(in_dim, 3 * m_raise)
+        self.allin_affine = Linear(in_dim, 1)
 
     def forward(
         self, z_raise: Tensor, z_allin: Tensor | None = None
@@ -70,7 +71,7 @@ class ValueHead(nn.Module):
         super().__init__()
         feature_dim = in_dim if feature_dim is None else feature_dim
         self.features = FFN(in_dim, feature_dim, hidden)
-        self.affine = nn.Linear(feature_dim, 1)
+        self.affine = Linear(feature_dim, 1)
 
     def forward(self, z_value: Tensor) -> Tensor:
         """Return values shaped ``z_value.shape[:-1]``."""
@@ -87,8 +88,8 @@ class PublicBranchingHeads(nn.Module):
         self.public_features = FFN(public_dim, feature_dim, hidden)
         self.t_features = FFN(feature_dim, feature_dim, hidden)
         self.c_features = FFN(feature_dim, feature_dim, hidden)
-        self.t_affine = nn.Linear(feature_dim, 1)
-        self.c_affine = nn.Linear(feature_dim, 1)
+        self.t_affine = Linear(feature_dim, 1)
+        self.c_affine = Linear(feature_dim, 1)
 
     def forward(self, public: Tensor) -> tuple[Tensor, Tensor]:
         if public.ndim != 2 or public.shape[-1] != self.public_dim:

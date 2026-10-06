@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 from torch import Tensor, nn
+from pbg.core.tensor_ops import Linear, Embedding, broadcast_parameter
 
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.model.shared import SharedPokerParameters
@@ -220,9 +221,9 @@ class PreflopEncoder(nn.Module):
         d = c.d_model
         dc = c.class_embedding_dim
 
-        self.class_embedding = nn.Embedding(self.n_classes, dc)
+        self.class_embedding = Embedding(self.n_classes, dc)
         class_geometry_dim = self.n_cards + 2
-        self.class_row_affine = nn.Linear(dc + 4 + class_geometry_dim, d)
+        self.class_row_affine = Linear(dc + 4 + class_geometry_dim, d)
         branching_dim = (2 + c.max_players) * d
         self.branching_heads = (
             PublicBranchingHeads(branching_dim, d, c.ffn_hidden)
@@ -442,7 +443,7 @@ class PreflopEncoder(nn.Module):
             torch.full((count,), kind, dtype=torch.long, device=device)
             for count, kind in type_groups
         ])
-        token = shared.public_scalar_affine(scalars[..., None]) + shared.public_type_embedding(type_ids)[None, :, :]
+        token = shared.public_scalar_affine(scalars[..., None]) + shared.public_type_embedding(type_ids[None].expand(batch, -1))
         seat_position = shared.seat_embedding(relative_seats)
         seat_prefix = torch.zeros(
             (batch, 1, self.cfg.d_model), dtype=token.dtype, device=device
@@ -485,8 +486,8 @@ class PreflopEncoder(nn.Module):
                 history.street.clamp(0, 3).long()
             )
             history_token = history_token + shared.history_position_embedding(
-                torch.arange(history.mask.shape[1], device=device)
-            )[None]
+                torch.arange(history.mask.shape[1], device=device)[None].expand(batch, -1)
+            )
             safe_actor = history.actor.clamp(0, players - 1).long()
             history_token = history_token + shared.seat_embedding(
                 relative_seats.gather(1, safe_actor)
@@ -494,7 +495,7 @@ class PreflopEncoder(nn.Module):
             token = torch.cat((token, history_token), dim=1)
             valid = torch.cat((valid, history.mask), dim=1)
         public_mean = (token * valid[..., None]).sum(dim=1) / valid.sum(dim=1, keepdim=True)
-        state = shared.state_token[None, :] + public_mean
+        state = broadcast_parameter(shared.state_token, batch, 1).to(token.dtype) + public_mean
         return torch.cat((token, state[:, None, :]), dim=1), torch.cat(
             (valid, torch.ones((batch, 1), dtype=torch.bool, device=device)), dim=1
         )
@@ -565,7 +566,7 @@ class PreflopEncoder(nn.Module):
 
         public_token, public_mask = self._public_tokens(shared, pub, seat_mask, relative_seats)
         actor_relative = relative_seats.gather(1, actor[:, None]).squeeze(1)
-        anchors = shared.anchor_tokens[None, :, :] + shared.anchor_seat_embedding(actor_relative)[:, None, :]
+        anchors = broadcast_parameter(shared.anchor_tokens, batch, 2).to(row.dtype) + shared.anchor_seat_embedding(actor_relative)[:, None, :]
         token = torch.cat((row_flat, public_token, anchors), dim=1)
         row_mask_flat = class_mask.reshape(batch, players * self.n_classes)
         key_mask = torch.cat(

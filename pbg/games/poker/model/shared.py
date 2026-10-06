@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor, nn
+from pbg.core.tensor_ops import Linear, Embedding
 
 from pbg.games.poker.model.heads import RaiseMixtureHead, TypeHead, ValueHead
 from pbg.games.poker.model.incidence import IncidenceResidual
@@ -20,12 +21,12 @@ class FamilyFFN(nn.Module):
 
     def __init__(self, d: int, hidden: int, pre: int, post: int) -> None:
         super().__init__()
-        self.common = nn.Linear(4 * d, hidden)
+        self.common = Linear(4 * d, hidden)
         self.static = nn.ModuleDict({
-            "pre": nn.Linear(pre, hidden, bias=False),
-            "post": nn.Linear(post, hidden, bias=False),
+            "pre": Linear(pre, hidden, bias=False),
+            "post": Linear(post, hidden, bias=False),
         })
-        self.output = nn.Linear(hidden, d)
+        self.output = Linear(hidden, d)
 
     def forward(self, common: Tensor, static: Tensor, family: str) -> Tensor:
         return self.output(gelu(self.common(common) + self.static[family](static)))
@@ -38,20 +39,20 @@ class SharedPokerParameters(nn.Module):
         super().__init__()
         d, dc = cfg.d_model, cfg.class_embedding_dim
         hidden = cfg.ffn_hidden or 4 * d
-        self.seat_embedding = nn.Embedding(cfg.max_players, d)
-        self.status_embedding = nn.Embedding(3, d)
-        self.actor_embedding = nn.Embedding(2, d)
-        self.public_scalar_affine = nn.Linear(1, d)
+        self.seat_embedding = Embedding(cfg.max_players, d)
+        self.status_embedding = Embedding(3, d)
+        self.actor_embedding = Embedding(2, d)
+        self.public_scalar_affine = Linear(1, d)
         # pot, stack, commitment, street, legality, ticks, bounds,
         # street commitment, exact betting amounts, action mask, raises, fold.
-        self.public_type_embedding = nn.Embedding(12, d)
-        self.history_numeric_affine = nn.Linear(6, d)
-        self.history_action_embedding = nn.Embedding(4, d)
-        self.history_street_embedding = nn.Embedding(4, d)
-        self.history_position_embedding = nn.Embedding(cfg.max_history_tokens, d)
+        self.public_type_embedding = Embedding(13, d)
+        self.history_numeric_affine = Linear(6, d)
+        self.history_action_embedding = Embedding(4, d)
+        self.history_street_embedding = Embedding(4, d)
+        self.history_position_embedding = Embedding(cfg.max_history_tokens, d)
         self.state_token = nn.Parameter(torch.zeros(d))
         self.anchor_tokens = nn.Parameter(torch.empty(cfg.k_act, d))
-        self.anchor_seat_embedding = nn.Embedding(cfg.max_players, d)
+        self.anchor_seat_embedding = Embedding(cfg.max_players, d)
         nn.init.normal_(self.anchor_tokens, std=d**-0.5)
         self.layer_norms = nn.ModuleList(LN(d) for _ in range(cfg.layers))
         self.attentions = nn.ModuleList(MHA(d, cfg.n_heads) for _ in range(cfg.layers))

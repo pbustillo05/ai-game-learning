@@ -17,7 +17,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch import Tensor, nn
-from torch.func import functional_call, stack_module_state, vmap
 
 from pbg.core.optimization import (
     DenseAdam,
@@ -62,11 +61,38 @@ class ReplicaModuleOwner:
                 or tuple(module.state_dict()) != state_names
             ):
                 raise ValueError("replica modules have different state layouts")
-        parameters, buffers = stack_module_state(list(modules))
-        if any(value.dtype != torch.float32 for value in parameters.values()):
+        source_parameters = tuple(dict(module.named_parameters()) for module in modules)
+        if any(value.dtype != torch.float32 for lane in source_parameters for value in lane.values()):
             raise TypeError("replica master parameters must be FP32")
-        self.parameters = dict(parameters)
-        self.buffers = dict(buffers)
+        width = sum(value.numel() for value in source_parameters[0].values())
+        device = next(iter(devices))
+        # Containers are storage, not autograd leaves. Only named views own grads.
+        self.master = torch.empty((len(modules), width), dtype=torch.float32, device=device)
+        self.gradients = torch.zeros_like(self.master)
+        self.parameters: dict[str, Tensor] = {}
+        self.parameter_layout: dict[str, tuple[int, int, tuple[int, ...]]] = {}
+        offset = 0
+        with torch.no_grad():
+            for name in parameter_names:
+                original = source_parameters[0][name]
+                end = offset + original.numel()
+                shape = tuple(original.shape)
+                view = self.master[:, offset:end].view(len(modules), *shape)
+                for lane, values in enumerate(source_parameters):
+                    if values[name].shape != original.shape or values[name].requires_grad != original.requires_grad:
+                        raise ValueError("replica parameter shapes or trainability differ")
+                    view[lane].copy_(values[name])
+                leaf = nn.Parameter(view, requires_grad=original.requires_grad)
+                if original.requires_grad:
+                    leaf.grad = self.gradients[:, offset:end].view_as(leaf)
+                self.parameters[name] = leaf
+                self.parameter_layout[name] = (offset, end, shape)
+                offset = end
+        source_buffers = tuple(dict(module.named_buffers()) for module in modules)
+        self.buffers = {
+            name: torch.stack(tuple(values[name] for values in source_buffers))
+            for name in buffer_names
+        }
         self.n_replica = len(modules)
         self.device = next(iter(devices))
         self.training = modules[0].training
@@ -75,6 +101,7 @@ class ReplicaModuleOwner:
         self._persistent_names = state_names
         self._code = copy.deepcopy(modules[0]).to("meta")
         self._lanes: dict[int, nn.Module] = {}
+        self._cohorts: dict[tuple[int, int], nn.Module] = {}
 
     @property
     def parameter_count(self) -> int:
@@ -97,8 +124,11 @@ class ReplicaModuleOwner:
             target, leaf = _owner(module, name)
             target._parameters[leaf] = nn.Parameter(
                 self.parameters[name][lane],
-                requires_grad=True,
+                requires_grad=self.parameters[name].requires_grad,
             )
+            if target._parameters[leaf].requires_grad:
+                begin, end, shape = self.parameter_layout[name]
+                target._parameters[leaf].grad = self.gradients[lane, begin:end].view(shape)
         for name in self._buffer_names:
             target, leaf = _owner(module, name)
             target._buffers[leaf] = self.buffers[name][lane]
@@ -108,9 +138,47 @@ class ReplicaModuleOwner:
         self._lanes[lane] = module
         return module
 
+    def cohort_module(self, start: int, count: int) -> nn.Module:
+        """Bind an exact contiguous lane run to named stacked leaf/grad views."""
+
+        self._check_lane(start)
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0 or start + count > self.n_replica:
+            raise ValueError("cohort must be a nonempty contiguous resident lane run")
+        key = (start, count)
+        if key in self._cohorts:
+            return self._cohorts[key]
+        module = copy.deepcopy(self._code)
+        for name, (begin, end, shape) in self.parameter_layout.items():
+            target, leaf = _owner(module, name)
+            parameter = nn.Parameter(
+                self.master[start:start + count, begin:end].view(count, *shape),
+                requires_grad=self.parameters[name].requires_grad,
+            )
+            if parameter.requires_grad:
+                parameter.grad = self.gradients[start:start + count, begin:end].view_as(parameter)
+            target._parameters[leaf] = parameter
+        # Poker buffers are immutable geometry, shared across decision batches.
+        # Other tensor programs explicitly declare which buffers are shared.
+        shared = set(getattr(module, "replica_shared_buffers", ()))
+        for name in self._buffer_names:
+            target, leaf = _owner(module, name)
+            target._buffers[leaf] = (self.buffers[name][start] if name in shared
+                                    else self.buffers[name][start:start + count])
+        module.train(self.training)
+        self._cohorts[key] = module
+        return module
+
     def assert_zero_copy(self) -> None:
         """Prove every materialized lane still aliases its stacked owner."""
 
+        if self.master.requires_grad or self.gradients.requires_grad:
+            raise ReplicaError("flat storage must not be a trainable leaf")
+        for name, (begin, end, shape) in self.parameter_layout.items():
+            parameter = self.parameters[name]
+            if parameter.data_ptr() != self.master[:, begin:end].data_ptr():
+                raise ReplicaError("named parameter lost flat master ownership")
+            if parameter.requires_grad and (parameter.grad is None or parameter.grad.data_ptr() != self.gradients[:, begin:end].data_ptr()):
+                raise ReplicaError("named parameter lost flat gradient ownership")
         for lane, module in self._lanes.items():
             for name, parameter in module.named_parameters():
                 if parameter.data_ptr() != self.parameters[name][lane].data_ptr():
@@ -118,6 +186,29 @@ class ReplicaModuleOwner:
             for name, buffer in module.named_buffers():
                 if buffer.data_ptr() != self.buffers[name][lane].data_ptr():
                     raise ReplicaError("a lane buffer lost its zero-copy binding")
+
+        for (start, count), module in self._cohorts.items():
+            for name, parameter in module.named_parameters():
+                begin, end, _shape = self.parameter_layout[name]
+                expected = self.master[start:start + count, begin:end]
+                if parameter.data_ptr() != expected.data_ptr():
+                    raise ReplicaError("cohort parameter lost its zero-copy binding")
+                if parameter.requires_grad and (parameter.grad is None or parameter.grad.data_ptr() != self.gradients[start:start + count, begin:end].data_ptr()):
+                    raise ReplicaError("cohort gradient lost its zero-copy binding")
+
+    def layout_manifest(self) -> dict[str, object]:
+        """Logical-to-physical parameter map, including packed QKV ordering."""
+
+        return {
+            "schema": "pbg-flat-replica-layout-v1",
+            "replicas": self.n_replica,
+            "physical_width": self.master.shape[1],
+            "padding_elements": 0,
+            "parameters": tuple({
+                "name": name, "begin": begin, "end": end, "shape": shape,
+                "packing": "Q,K,V" if ".w_qkv." in name else "native",
+            } for name, (begin, end, shape) in self.parameter_layout.items()),
+        }
 
     def lane_state_dict(self, lane: int) -> dict[str, Tensor]:
         self._check_lane(lane)
@@ -141,7 +232,7 @@ class ReplicaModuleOwner:
 
     def state_dict(self) -> dict[str, object]:
         return {
-            "schema": "pbg-queued-replica-module-v1",
+            "schema": "pbg-queued-replica-module-v2",
             "n_replica": self.n_replica,
             "lanes": tuple(
                 self.lane_state_dict(lane) for lane in range(self.n_replica)
@@ -151,7 +242,7 @@ class ReplicaModuleOwner:
     def load_state_dict(self, state: Mapping[str, object]) -> None:
         if (
             set(state) != {"schema", "n_replica", "lanes"}
-            or state["schema"] != "pbg-queued-replica-module-v1"
+            or state["schema"] != "pbg-queued-replica-module-v2"
         ):
             raise ValueError("replica module state schema is invalid")
         if state["n_replica"] != self.n_replica:
@@ -169,106 +260,54 @@ OutputEncoder = Callable[[Any], Mapping[str, Tensor]]
 
 
 class FunctionalReplicaInference:
-    """One no-grad ``vmap(functional_call)`` over only the active lane subset."""
+    """No-grad calls to the shared explicit-K program on contiguous lane runs."""
 
-    def __init__(
-        self,
-        owner: ReplicaModuleOwner,
-        *,
-        encode_output: OutputEncoder,
-    ) -> None:
+    def __init__(self, owner: ReplicaModuleOwner, *, encode_output: OutputEncoder) -> None:
         self.owner = owner
         self.encode_output = encode_output
 
     def __call__(
-        self,
-        active_lanes: Tensor,
-        *lane_arguments: Tensor,
+        self, active_lanes: Tensor, *lane_arguments: Tensor,
         static_arguments: tuple[object, ...] = (),
         static_keywords: Mapping[str, object] | None = None,
+        lane_ids: Sequence[int] | None = None,
     ) -> Mapping[str, Tensor]:
-        if (
-            active_lanes.device != self.owner.device
-            or active_lanes.dtype != torch.int64
-            or active_lanes.ndim != 1
-            or not active_lanes.is_contiguous()
-            or active_lanes.numel() == 0
+        if (active_lanes.device != self.owner.device or active_lanes.dtype != torch.int64
+            or active_lanes.ndim != 1 or not active_lanes.is_contiguous() or active_lanes.numel() == 0):
+            raise ValueError("active lanes must be a nonempty contiguous CUDA int64 row")
+        # Production FIFO callers already own this bounded host schedule. The
+        # optional conversion is only for standalone API/diagnostic calls.
+        lanes = tuple(active_lanes.cpu().tolist()) if lane_ids is None else tuple(lane_ids)
+        if len(lanes) != active_lanes.numel() or len(set(lanes)) != len(lanes):
+            raise ValueError("active lanes must be unique and match the host cohort")
+        for lane in lanes:
+            self.owner._check_lane(lane)
+        if not lane_arguments or any(
+            not isinstance(arg, Tensor) or arg.device != self.owner.device
+            or arg.ndim < 2 or arg.shape[:2] != lane_arguments[0].shape[:2]
+            or arg.shape[0] != len(lanes) for arg in lane_arguments
         ):
-            raise ValueError(
-                "active lanes must be a nonempty contiguous CUDA int64 row"
-            )
-        ordered = active_lanes.sort().values
-        torch._assert_async(
-            (
-                ordered.ge(0)
-                & ordered.lt(self.owner.n_replica)
-                & torch.cat(
-                    (
-                        torch.ones(1, dtype=torch.bool, device=ordered.device),
-                        ordered[1:].ne(ordered[:-1]),
-                    )
-                )
-            ).all(),
-            "active replica lanes must be unique addresses in [0,K)",
-        )
-        active = int(active_lanes.numel())
-        for argument in lane_arguments:
-            if (
-                not isinstance(argument, Tensor)
-                or argument.device != self.owner.device
-                or argument.ndim == 0
-                or argument.shape[0] != active
-            ):
-                raise ValueError(
-                    "every inference tensor must be device-local with leading "
-                    "active-lane extent"
-                )
-        parameters = {
-            name: value.index_select(0, active_lanes)
-            for name, value in self.owner.parameters.items()
-        }
-        buffers = {
-            name: value.index_select(0, active_lanes)
-            for name, value in self.owner.buffers.items()
-        }
-        keywords = {} if static_keywords is None else dict(static_keywords)
-
-        def one_lane(
-            lane_parameters: Mapping[str, Tensor],
-            lane_buffers: Mapping[str, Tensor],
-            *arguments: Tensor,
-        ) -> dict[str, Tensor]:
-            result = functional_call(
-                self.owner._code,
-                (lane_parameters, lane_buffers),
-                (*static_arguments, *arguments),
-                keywords,
-                strict=True,
-            )
-            encoded = dict(self.encode_output(result))
-            if not encoded or any(
-                not isinstance(value, Tensor) for value in encoded.values()
-            ):
-                raise TypeError(
-                    "replica inference encoder must return a nonempty tensor mapping"
-                )
-            return encoded
-
-        operation = vmap(
-            one_lane,
-            in_dims=(0, 0, *(0 for _ in lane_arguments)),
-            randomness="error",
-        )
+            raise ValueError("inference arguments require aligned [active,rows,...] tensors")
+        rows = lane_arguments[0].shape[1]
+        outputs: dict[str, list[Tensor]] = {}
+        begin = 0
         with torch.no_grad():
-            result = operation(parameters, buffers, *lane_arguments)
-        if any(
-            value.device != self.owner.device
-            or value.shape[0] != active
-            or value.requires_grad
-            for value in result.values()
-        ):
-            raise ReplicaError("replica inference output lost lane ownership")
-        return MappingProxyType(dict(result))
+            while begin < len(lanes):
+                end = begin + 1
+                while end < len(lanes) and lanes[end] == lanes[end - 1] + 1:
+                    end += 1
+                module = self.owner.cohort_module(lanes[begin], end - begin)
+                arguments = tuple(arg[begin:end].flatten(0, 1) for arg in lane_arguments)
+                encoded = self.encode_output(module(*static_arguments, *arguments, **dict(static_keywords or {})))
+                if not encoded or any(not isinstance(value, Tensor) for value in encoded.values()):
+                    raise TypeError("replica inference encoder must return tensor fields")
+                for name, value in encoded.items():
+                    if value.shape[0] != (end - begin) * rows or value.device != self.owner.device:
+                        raise ReplicaError("cohort inference changed decision ownership")
+                    outputs.setdefault(name, []).append(value.reshape(end - begin, rows, *value.shape[1:]))
+                begin = end
+        return MappingProxyType({name: torch.cat(values, dim=0) if len(values) > 1 else values[0]
+                                 for name, values in outputs.items()})
 
 
 class DistributedSUM:
@@ -363,7 +402,7 @@ class ReplicaMemoryReport:
 
 
 class ReplicaOptimizerGroup:
-    """One ordered dense replica-axis owner serving ordinary ``DenseAdam``."""
+    """One vectorized dense optimizer with zero-copy lane control views."""
 
     def __init__(
         self,
@@ -378,24 +417,16 @@ class ReplicaOptimizerGroup:
             scalers = tuple(LossScaler() for _ in range(count))
         if len(scalers) != count:
             raise ValueError("one loss scaler is required per replica lane")
-        width = modules.parameter_count
-        self.gradients = torch.zeros(
-            (count, width), dtype=torch.float32, device=modules.device
+        self.optimizer = DenseAdam(
+            tuple(modules.lane_module(lane) for lane in range(count)), config,
+            scalers=tuple(scalers), parameter_flat=modules.master,
+            gradient_flat=modules.gradients,
         )
-        self.exp_avg = torch.zeros_like(self.gradients)
-        self.exp_avg_sq = torch.zeros_like(self.gradients)
-        self.optimizers = tuple(
-            DenseAdam(
-                modules.lane_module(lane),
-                config,
-                scaler=scalers[lane],
-                gradient_flat=self.gradients[lane],
-                exp_avg=self.exp_avg[lane],
-                exp_avg_sq=self.exp_avg_sq[lane],
-            )
-            for lane in range(count)
-        )
-        self.versions = torch.zeros(count, dtype=torch.int64)
+        self.gradients = modules.gradients
+        self.exp_avg = self.optimizer.first
+        self.exp_avg_sq = self.optimizer.second
+        self.optimizers = self.optimizer.lanes
+        self.versions = torch.zeros(count, dtype=torch.int64, device=modules.device)
         self._transaction_versions: Tensor | None = None
         modules.assert_zero_copy()
 
@@ -414,10 +445,7 @@ class ReplicaOptimizerGroup:
                 self.exp_avg.numel() * self.exp_avg.element_size()
                 + self.exp_avg_sq.numel() * self.exp_avg_sq.element_size()
             ),
-            transaction_bytes=sum(
-                optimizer.transaction_bytes
-                for optimizer in self.optimizers
-            ),
+            transaction_bytes=self.optimizer.transaction_bytes,
         )
 
     def begin_transaction(self) -> None:
@@ -425,15 +453,7 @@ class ReplicaOptimizerGroup:
 
         if self._transaction_versions is not None:
             raise ReplicaError("replica optimizer transaction is already active")
-        begun: list[DenseAdam] = []
-        try:
-            for optimizer in self.optimizers:
-                optimizer.begin_transaction()
-                begun.append(optimizer)
-        except Exception:
-            for optimizer in reversed(begun):
-                optimizer.rollback_transaction()
-            raise
+        self.optimizer.begin_transaction()
         self._transaction_versions = self.versions.clone()
 
     def rollback_transaction(self) -> None:
@@ -441,8 +461,7 @@ class ReplicaOptimizerGroup:
 
         if self._transaction_versions is None:
             raise ReplicaError("replica optimizer transaction is not active")
-        for optimizer in self.optimizers:
-            optimizer.rollback_transaction()
+        self.optimizer.rollback_transaction()
         self.versions.copy_(self._transaction_versions)
         self._transaction_versions = None
 
@@ -451,8 +470,7 @@ class ReplicaOptimizerGroup:
 
         if self._transaction_versions is None:
             raise ReplicaError("replica optimizer transaction is not active")
-        for optimizer in self.optimizers:
-            optimizer.commit_transaction()
+        self.optimizer.commit_transaction()
         self._transaction_versions = None
 
     def _mask(self, lanes: Sequence[int]) -> Tensor:
@@ -470,26 +488,21 @@ class ReplicaOptimizerGroup:
         return mask
 
     def zero_grad(self, lanes: Sequence[int]) -> None:
-        for lane in lanes:
-            self.optimizers[int(lane)].zero_grad()
+        active = self._mask(lanes)
+        self.gradients.masked_fill_(active[:, None], 0.0)
 
-    def step(
-        self,
-        lanes: Sequence[int],
-        *,
-        distributed: DistributedSUM | None = None,
-    ) -> tuple[OptimizerStep | None, ...]:
+    def step_device(self, lanes: Sequence[int], *, distributed: DistributedSUM | None = None):
         active = self._mask(lanes)
         if distributed is not None:
             distributed.sum_gradients(self.gradients, active)
-        result: list[OptimizerStep | None] = [None] * self.modules.n_replica
-        for lane in lanes:
-            normalized = int(lane)
-            step = self.optimizers[normalized].step()
-            result[normalized] = step
-            if step.applied:
-                self.versions[normalized] += 1
-        return tuple(result)
+        result = self.optimizer.step_device(active)
+        self.versions.add_(result[0].to(self.versions.dtype))
+        return result
+
+    def step(self, lanes: Sequence[int], *, distributed: DistributedSUM | None = None) -> tuple[OptimizerStep | None, ...]:
+        result = DenseAdam.materialize_steps(self.step_device(lanes, distributed=distributed))
+        enabled = set(lanes)
+        return tuple(value if lane in enabled else None for lane, value in enumerate(result))
 
     def state_dict(self) -> dict[str, object]:
         if self._transaction_versions is not None:
@@ -497,7 +510,7 @@ class ReplicaOptimizerGroup:
                 "cannot checkpoint an active replica optimizer transaction"
             )
         return {
-            "schema": "pbg-queued-replica-optimizer-v1",
+            "schema": "pbg-queued-replica-optimizer-v2",
             "n_replica": self.modules.n_replica,
             "versions": self.versions.clone(),
             "lanes": tuple(optimizer.state_dict() for optimizer in self.optimizers),
@@ -514,7 +527,7 @@ class ReplicaOptimizerGroup:
         expected = {"schema", "n_replica", "versions", "lanes", "scalers"}
         if (
             set(state) != expected
-            or state["schema"] != "pbg-queued-replica-optimizer-v1"
+            or state["schema"] != "pbg-queued-replica-optimizer-v2"
         ):
             raise ValueError("replica optimizer state schema is invalid")
         if state["n_replica"] != self.modules.n_replica:

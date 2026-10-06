@@ -122,3 +122,48 @@ def test_shared_gradient_is_weighted_sum_of_both_families():
         else:
             expected = 0.3 * (0 if pre is None else pre) + 0.7 * (0 if post is None else post)
             torch.testing.assert_close(parameter.grad, expected, atol=3e-5, rtol=3e-5)
+
+
+@CUDA
+@pytest.mark.parametrize("lanes", [1, 2, 4])
+def test_explicit_replica_forward_backward_matches_independent_calls(lanes):
+    from dataclasses import fields, is_dataclass
+    from pbg.core.replica import ReplicaModuleOwner
+
+    torch.manual_seed(604)
+    models = [QueuedPokerModel(NLHEGeometry(2, 32, 13), config()).cuda() for _ in range(lanes)]
+    owner = ReplicaModuleOwner(models)
+    batched = owner.cohort_module(0, lanes)
+    public, ranges = [], []
+    for lane in range(lanes):
+        pub, reach = pre_inputs(players=2)
+        pub.pot = pub.pot + lane
+        public.append(pub)
+        ranges.append(reach.roll(lane, dims=-1))
+
+    def concatenate(values):
+        if values[0] is None:
+            return None
+        if is_dataclass(values[0]):
+            return type(values[0])(**{f.name: concatenate([getattr(x, f.name) for x in values]) for f in fields(values[0])})
+        return torch.cat(values, dim=0)
+
+    out = batched.pre_encoder(batched.shared, concatenate(public), torch.cat(ranges))
+    independent = [model.pre_encoder(model.shared, pub, reach) for model, pub, reach in zip(models, public, ranges, strict=True)]
+    torch.testing.assert_close(out.v, torch.cat([x.v for x in independent]), atol=3e-5, rtol=3e-5)
+    before = {name: parameter.grad.data_ptr() for name, parameter in batched.named_parameters()}
+    out.v.square().sum().backward()
+    for expected in independent:
+        expected.v.square().sum().backward()
+    for lane, model in enumerate(models):
+        for name, expected in model.named_parameters():
+            begin, end, shape = owner.parameter_layout[name]
+            actual = owner.gradients[lane, begin:end].view(shape)
+            torch.testing.assert_close(actual, torch.zeros_like(expected) if expected.grad is None else expected.grad,
+                                       atol=5e-5, rtol=5e-5)
+    saved = owner.gradients.clone()
+    second = batched.pre_encoder(batched.shared, concatenate(public), torch.cat(ranges))
+    second.v.square().sum().backward()
+    torch.testing.assert_close(owner.gradients, 2 * saved, atol=5e-5, rtol=5e-5)
+    assert before == {name: parameter.grad.data_ptr() for name, parameter in batched.named_parameters()}
+    owner.assert_zero_copy()
