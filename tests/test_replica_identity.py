@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.model_support import FixedOutputPokerModel
+
 import copy
 import math
 from dataclasses import replace
@@ -250,7 +252,7 @@ class _BranchedCheckDownPartition(_CheckDownPartition):
 
 
 def _branched_check_down_model(geometry: NLHEGeometry) -> QueuedPokerModel:
-    return QueuedPokerModel(
+    return FixedOutputPokerModel(
         geometry,
         _BranchedCheckDownPartition(
             geometry.preflop_model_input_width,
@@ -382,7 +384,7 @@ def _poker_layout(geometry: NLHEGeometry) -> PhysicalLayout:
 
 
 def _check_down_model(geometry: NLHEGeometry) -> QueuedPokerModel:
-    return QueuedPokerModel(
+    return FixedOutputPokerModel(
         geometry,
         _CheckDownPartition(
             geometry.preflop_model_input_width,
@@ -509,7 +511,7 @@ def test_replica_vmap_matches_independent_active_lanes_without_padding(
 def test_poker_rollout_vmap_preserves_lane_weights_and_natural_labels() -> None:
     geometry = NLHEGeometry(2, 8.0, 4)
     modules = [
-        QueuedPokerModel(
+        FixedOutputPokerModel(
             geometry,
             _PokerPartition(geometry.rank_count**2, 0.1 + lane),
             _PokerPartition(geometry.private_hands, 0.2 + lane),

@@ -9,15 +9,12 @@ import torch
 from torch import Tensor, nn
 
 from pbg.games.poker.cards import DeckGeometry
+from pbg.games.poker.model.shared import SharedPokerParameters
 from pbg.games.poker.model.heads import (
     PublicBranchingHeads,
-    RaiseMixtureHead,
-    TypeHead,
-    ValueHead,
 )
 from pbg.games.poker.model.incidence import (
     CompactMap,
-    IncidenceResidual,
     build_compact_map,
     compact_gather,
     compact_scatter,
@@ -29,8 +26,6 @@ from pbg.games.poker.model.preflop import (
 )
 from pbg.games.poker.model.primitives import (
     FFN,
-    LN,
-    MHA,
     accelerator_assert,
 )
 
@@ -62,7 +57,7 @@ def _require_device(condition: Tensor, message: str) -> None:
     accelerator_assert(condition, message)
 
 
-class PostflopNet(nn.Module):
+class PostflopEncoder(nn.Module):
     """Pre-LN transformer over evaluator-selected live combo rows."""
 
     requires_partition_summary = True
@@ -93,42 +88,8 @@ class PostflopNet(nn.Module):
         self.folder_context = FFN(1 + c.folder_line_dim, d, c.ffn_hidden)
         self.tight_delta_projection = nn.Linear(self.n_cards, d, bias=False)
         self.tight_contraction_projection = nn.Linear(1, d, bias=False)
-        self.seat_embedding = nn.Embedding(c.max_players, d)
-        self.status_embedding = nn.Embedding(3, d)
-        self.actor_embedding = nn.Embedding(2, d)
-        self.public_scalar_affine = nn.Linear(1, d)
-        self.public_type_embedding = nn.Embedding(12, d)
-        self.history_numeric_affine = nn.Linear(6, d)
-        self.history_action_embedding = nn.Embedding(4, d)
-        self.history_street_embedding = nn.Embedding(4, d)
-        self.history_position_embedding = nn.Embedding(c.max_history_tokens, d)
         self.board_projection = nn.Linear(dc, d)
-        self.state_token = nn.Parameter(torch.zeros(d))
-        self.anchor_tokens = nn.Parameter(torch.empty(c.k_act, d))
-        self.anchor_seat_embedding = nn.Embedding(c.max_players, d)
-        nn.init.normal_(self.anchor_tokens, std=d**-0.5)
-
-        static_side_dim = (
-            dc + 3 + geo_dim + 2 * c.folder_beta_rank + 2 * d
-        )
-        side_dim = static_side_dim + 3 * d
-        self.layer_norms = nn.ModuleList(LN(d) for _ in range(c.n_layers_post))
-        self.attentions = nn.ModuleList(MHA(d, c.n_heads) for _ in range(c.n_layers_post))
-        self.incidence_residuals = nn.ModuleList(
-            IncidenceResidual(d) for _ in range(c.n_layers_post)
-        )
-        self.layer_ffns = nn.ModuleList(FFN(d + side_dim, d, c.ffn_hidden) for _ in range(c.n_layers_post))
-        self.final_norm = LN(d)
-        self.actor_seat_features = FFN(4 * d, d, c.ffn_hidden)
-        self.global_features = FFN((2 + c.max_players) * d, d, c.ffn_hidden)
-        self.seat_features = FFN(d + 3, d, c.ffn_hidden)
         self.fold_features = FFN(d + 3, d, c.ffn_hidden)
-        readout_dim = d + c.k_act * d + dc + d
-        self.type_features = FFN(readout_dim, d, c.ffn_hidden)
-        self.raise_features = FFN(readout_dim, d, c.ffn_hidden)
-        self.type_head = TypeHead(d)
-        self.raise_head = RaiseMixtureHead(d, c.m_raise, c.s_min)
-        self.value_head = ValueHead(readout_dim, feature_dim=d, hidden=c.ffn_hidden)
         branching_dim = (2 + c.max_players) * d
         self.branching_heads = (
             PublicBranchingHeads(branching_dim, d, c.ffn_hidden)
@@ -444,6 +405,7 @@ class PostflopNet(nn.Module):
 
     def _public_tokens(
         self,
+        shared: SharedPokerParameters,
         pub: PokerPublicBatch,
         fold: Tensor | None,
         dtype: torch.dtype,
@@ -486,13 +448,13 @@ class PostflopNet(nn.Module):
             groups.extend((flat.mean(dim=1, keepdim=True), flat.square().mean(dim=1, keepdim=True)))
             type_groups.append((2, 11))
         scalar = torch.cat([value.to(dtype) for value in groups], dim=1)
-        scalar_tokens = self.public_scalar_affine(scalar[..., None])
+        scalar_tokens = shared.public_scalar_affine(scalar[..., None])
         scalar_type = torch.cat([
             torch.full((count,), kind, dtype=torch.long, device=scalar.device)
             for count, kind in type_groups
         ])
-        scalar_tokens = scalar_tokens + self.public_type_embedding(scalar_type)[None]
-        seat_position = self.seat_embedding(relative)
+        scalar_tokens = scalar_tokens + shared.public_type_embedding(scalar_type)[None]
+        seat_position = shared.seat_embedding(relative)
         scalar_tokens = scalar_tokens + torch.cat(
             (
                 torch.zeros(
@@ -516,10 +478,10 @@ class PostflopNet(nn.Module):
         )
         board_mask = pub.board >= 0
         board_tokens = self.board_projection(self._card_embedding(pub.board).to(dtype))
-        board_tokens = board_tokens + self.public_type_embedding(
+        board_tokens = board_tokens + shared.public_type_embedding(
             torch.full(pub.board.shape, 1, dtype=torch.long, device=pub.board.device)
         )
-        state = self.state_token.to(dtype)[None, None, :].expand(batch, 1, -1)
+        state = shared.state_token.to(dtype)[None, None, :].expand(batch, 1, -1)
         token = torch.cat((state, scalar_tokens, board_tokens), dim=1)
         supplied_seat_mask = (
             torch.ones(
@@ -560,14 +522,14 @@ class PostflopNet(nn.Module):
                 ),
                 dim=-1,
             ).to(dtype)
-            history_token = self.history_numeric_affine(numeric)
-            history_token += self.history_action_embedding(history.action.clamp(0, 3).long())
-            history_token += self.history_street_embedding(history.street.clamp(0, 3).long())
-            history_token += self.history_position_embedding(
+            history_token = shared.history_numeric_affine(numeric)
+            history_token += shared.history_action_embedding(history.action.clamp(0, 3).long())
+            history_token += shared.history_street_embedding(history.street.clamp(0, 3).long())
+            history_token += shared.history_position_embedding(
                 torch.arange(history.mask.shape[1], device=scalar.device)
             )[None]
             safe_actor = history.actor.clamp(0, players - 1).long()
-            history_token += self.seat_embedding(relative.gather(1, safe_actor)) * (
+            history_token += shared.seat_embedding(relative.gather(1, safe_actor)) * (
                 history.actor >= 0
             )[..., None]
             token = torch.cat((token, history_token), dim=1)
@@ -576,11 +538,13 @@ class PostflopNet(nn.Module):
 
     def forward(
         self,
+        shared: SharedPokerParameters,
         pub: PokerPublicBatch,
         combo_ranges: Tensor,
         actor_seat: Tensor | None = None,
         masks: PostflopMasks | None = None,
         *,
+        selected_private: Tensor | None = None,
         _prepared_metadata: tuple[
             Tensor,
             Tensor,
@@ -647,16 +611,16 @@ class PostflopNet(nn.Module):
             relative = seats
         live_relative = relative.gather(1, live_ids)
         live_status = status.gather(1, live_ids)
-        row = row + self.seat_embedding(live_relative)[:, :, None]
-        row = row + self.status_embedding(live_status)[:, :, None]
+        row = row + shared.seat_embedding(live_relative)[:, :, None]
+        row = row + shared.status_embedding(live_status)[:, :, None]
         actor_flag = live_ids == actor[:, None]
-        row = row + self.actor_embedding(actor_flag.long())[:, :, None]
+        row = row + shared.actor_embedding(actor_flag.long())[:, :, None]
         row_flat = row.reshape(batch, live_players * mapping.compact_size, d)
         public, public_mask = self._public_tokens(
-            pub, masks.fold_line_features, combo_ranges.dtype, relative
+            shared, pub, masks.fold_line_features, combo_ranges.dtype, relative
         )
         actor_relative = relative.gather(1, actor[:, None]).squeeze(1)
-        anchors = self.anchor_tokens.to(combo_ranges.dtype)[None] + self.anchor_seat_embedding(actor_relative)[:, None]
+        anchors = shared.anchor_tokens.to(combo_ranges.dtype)[None] + shared.anchor_seat_embedding(actor_relative)[:, None]
         token = torch.cat((row_flat, public, anchors), dim=1)
         row_mask = compact_mask.reshape(batch, -1)
         key_mask = torch.cat((row_mask, public_mask, torch.ones((batch, c.k_act), dtype=torch.bool, device=row.device)), dim=1)
@@ -684,8 +648,8 @@ class PostflopNet(nn.Module):
             (batch, mapping.compact_size), dtype=combo_ranges.dtype, device=combo_ranges.device
         )
         for norm, attention, incidence, ffn in zip(
-            self.layer_norms, self.attentions, self.incidence_residuals,
-            self.layer_ffns, strict=True
+            shared.layer_norms, shared.attentions, shared.incidence_residuals,
+            shared.layer_ffns, strict=True
         ):
             row_state = x[:, :row_flat.shape[1]].reshape(
                 batch, live_players, mapping.compact_size, d
@@ -703,24 +667,14 @@ class PostflopNet(nn.Module):
             dynamic = torch.cat(
                 (j, overlap_card * overlap_card, overlap_card * overlap_equal), dim=-1
             )
-            complete_side = torch.cat((side_rows, dynamic), dim=-1)
-            side = torch.cat(
-                (
-                    complete_side.reshape(batch, row_flat.shape[1], -1),
-                    torch.zeros(
-                        (
-                            batch,
-                            token.shape[1] - row_flat.shape[1],
-                            complete_side.shape[-1],
-                        ),
-                        dtype=complete_side.dtype,
-                        device=token.device,
-                    ),
-                ),
-                dim=1,
+            def pad_rows(value: Tensor) -> Tensor:
+                rows = value.reshape(batch, row_flat.shape[1], -1)
+                return torch.nn.functional.pad(rows, (0, 0, 0, token.shape[1] - rows.shape[1]))
+            x = residual + ffn(
+                torch.cat((norm(residual), pad_rows(dynamic)), dim=-1),
+                pad_rows(side_rows), "post",
             )
-            x = residual + ffn(torch.cat((norm(residual), side), dim=-1))
-        final = self.final_norm(x)
+        final = shared.final_norm(x)
         final_rows = final[:, :row_flat.shape[1]].reshape(
             batch, live_players, mapping.compact_size, d
         )
@@ -738,7 +692,7 @@ class PostflopNet(nn.Module):
             ),
             dim=-1,
         )
-        actor_summary = self.actor_seat_features(actor_anchor_input)
+        actor_summary = shared.actor_seat_features(actor_anchor_input)
         mass = incidence_mass.sum(2)
         pooled = (final_rows * incidence_mass[..., None]).sum(2) / mass[..., None].clamp_min(c.eps)
         live_seat_meta = torch.stack(
@@ -749,7 +703,7 @@ class PostflopNet(nn.Module):
             ),
             dim=-1,
         )
-        live_summary = self.seat_features(
+        live_summary = shared.seat_features(
             torch.cat((pooled, live_seat_meta), dim=-1)
         )
         full_mass = torch.zeros(
@@ -793,39 +747,34 @@ class PostflopNet(nn.Module):
             ),
             dim=1,
         )
-        global_feature = self.global_features(
+        global_feature = shared.global_features(
             torch.cat(
                 (public_mean, actor_summary, padded_seats.reshape(batch, -1)), dim=-1
             )
         )
-        readout = torch.cat((actor_rows, final_anchors.reshape(batch, 1, -1).expand(-1, mapping.compact_size, -1),
-                             combo_emb, global_feature[:, None].expand(-1, mapping.compact_size, -1)), dim=-1)
-        z_type, z_raise = self.type_features(readout), self.raise_features(readout)
-        type_logits = self.type_head(z_type).masked_fill(~actor_mask[..., None], 0)
-        omega, mu, scale, iota = self.raise_head(z_raise, z_type)
-        omega = omega.masked_fill(~actor_mask[..., None], 0)
-        mu = mu.masked_fill(~actor_mask[..., None], 0)
-        scale = scale.masked_fill(~actor_mask[..., None], 0)
-        iota = iota.masked_fill(~actor_mask, 0)
-        value = self.value_head(readout).masked_fill(~actor_mask, 0)
-        raw = {
-            "type_logits": compact_scatter(type_logits, mapping, dim=1),
-            "omega": compact_scatter(omega, mapping, dim=1),
-            "mu": compact_scatter(mu, mapping, dim=1),
-            "s": compact_scatter(scale, mapping, dim=1),
-            "iota": compact_scatter(iota, mapping, dim=1),
+        if selected_private is not None:
+            selected = mapping.full_to_compact.gather(1, selected_private[:, None])
+            accelerator_assert(selected.ge(0).all(), "selected private hand is board-incompatible")
+            actor_rows = actor_rows.gather(1, selected[..., None].expand(-1, 1, d))
+            combo_emb = combo_emb.gather(1, selected[..., None].expand(-1, 1, c.class_embedding_dim))
+            actor_mask = actor_mask.gather(1, selected)
+        compact_raw, value = shared.readout(actor_rows, combo_emb, final_anchors, global_feature)
+        compact_raw = {
+            name: field.masked_fill(~(actor_mask[..., None] if field.ndim == 3 else actor_mask), 0)
+            for name, field in compact_raw.items()
         }
-        # Padded/impossible private rows are excluded by posterior masks in the
-        # loss, but the factorized adapter still evaluates a complete fixed-width
-        # row. Give those rows a harmless valid distribution rather than the
-        # scatter fill value (notably, a zero logistic scale).
-        full_actor_mask = compact_scatter(actor_mask, mapping, dim=1)
+        value = value.masked_fill(~actor_mask, 0)
+        if selected_private is None:
+            raw = {name: compact_scatter(field, mapping, dim=1) for name, field in compact_raw.items()}
+            full_actor_mask = compact_scatter(actor_mask, mapping, dim=1)
+            full_value = compact_scatter(value, mapping, dim=1)
+        else:
+            raw, full_actor_mask, full_value = compact_raw, actor_mask, value
         invalid = ~full_actor_mask
         raw["omega"] = raw["omega"].masked_fill(invalid[..., None], 1.0 / c.m_raise)
         raw["mu"] = raw["mu"].masked_fill(invalid[..., None], 0.5)
         raw["s"] = raw["s"].masked_fill(invalid[..., None], 1.0)
         raw["iota"] = raw["iota"].masked_fill(invalid, 0.5)
-        full_value = compact_scatter(value, mapping, dim=1)
         t: Tensor | None = None
         cost: Tensor | None = None
         if self.branching_heads is not None:

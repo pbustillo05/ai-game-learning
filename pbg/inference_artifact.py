@@ -22,7 +22,7 @@ from pbg.core.persistence import (
     validate_checkpoint_payload,
 )
 
-INFERENCE_ARTIFACT_SCHEMA_VERSION = "pbg-queued-inference-v1"
+INFERENCE_ARTIFACT_SCHEMA_VERSION = "pbg-queued-shared-inference-v2"
 _FIELDS = {
     "artifact_schema",
     "source_checkpoint_schema",
@@ -64,7 +64,7 @@ def _load_artifact(path: Path) -> dict[str, Any]:
             REPLICA_CHECKPOINT_SCHEMA,
         )
     ):
-        raise RuntimeError("runtime accepts only strict queued inference artifacts")
+        raise RuntimeError("runtime accepts only strict shared-model inference artifacts; split-model artifacts are unsupported")
     scientific = value["scientific_config"]
     if not isinstance(scientific, dict):
         raise RuntimeError(  # noqa: TRY004 - malformed serialized artifact

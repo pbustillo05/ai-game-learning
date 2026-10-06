@@ -70,11 +70,11 @@ def _checkpoint_payload(path: Path) -> dict[str, object]:
         CHECKPOINT_SCHEMA,
         REPLICA_CHECKPOINT_SCHEMA,
     }:
-        raise RuntimeError("unsupported checkpoint schema")
+        raise RuntimeError("unsupported checkpoint schema; split-model artifacts are unsupported")
     return value
 
 
-def _frozen_state(cfg: RootConfig) -> dict[str, torch.Tensor] | None:
+def _frozen_state(cfg: RootConfig) -> tuple[dict[str, torch.Tensor], dict[str, object]] | None:
     path = cfg.execution.frozen_checkpoint
     if path is None:
         return None
@@ -89,7 +89,10 @@ def _frozen_state(cfg: RootConfig) -> dict[str, torch.Tensor] | None:
         raise RuntimeError(
             "a replica checkpoint cannot be an implicit frozen-profile selector"
         )
-    return model
+    scientific = payload.get("scientific_config")
+    if not isinstance(scientific, dict):
+        raise RuntimeError("frozen checkpoint scientific configuration is missing")
+    return model, scientific
 
 
 def _controller(config: BranchedModeConfig):
@@ -275,9 +278,10 @@ class TrainingSession:
         frozen = _frozen_state(config)
         self.frozen_inference: PokerReplicaInference | None = None
         if frozen is not None:
+            frozen, frozen_scientific = frozen
             frozen_modules = []
             for _ in range(count):
-                module = build_model_from_config(scientific, self.device)
+                module = build_model_from_config(frozen_scientific, self.device)
                 module.load_state_dict(frozen, strict=True)
                 module.configure_execution(
                     config.execution.attention_backend,
@@ -287,6 +291,8 @@ class TrainingSession:
                 frozen_modules.append(module)
             self.frozen_inference = PokerReplicaInference(frozen_modules)
             if config.scientific.applicable.get("response_initialization") == "target":
+                if frozen_scientific["model"] != scientific["model"]:
+                    raise RuntimeError("initialize-from-target requires the same shared model configuration")
                 for lane in range(count):
                     self.modules.lane_module(lane).load_state_dict(frozen, strict=True)
                     if self.reference_modules is not None:

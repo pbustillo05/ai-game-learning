@@ -21,9 +21,7 @@ training:
     model:
       d_model: 128
       n_heads: 4
-      layers:
-        pre: 4
-        post: 6
+      layers: 6
       raises:
         components: 2
         minimum_scale: 0.02

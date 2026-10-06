@@ -20,9 +20,9 @@ from pbg.core.execution_manifest import (
 from pbg.core.learner import ReferenceState
 from pbg.core.optimization import DenseAdam, LossScaler
 
-CHECKPOINT_SCHEMA = "pbg-queued-checkpoint-v3"
-REPLICA_CHECKPOINT_SCHEMA = "pbg-queued-replica-checkpoint-v3"
-DISTRIBUTED_CHECKPOINT_SCHEMA = "pbg-queued-distributed-checkpoint-v2"
+CHECKPOINT_SCHEMA = "pbg-queued-shared-checkpoint-v4"
+REPLICA_CHECKPOINT_SCHEMA = "pbg-queued-shared-replica-checkpoint-v4"
+DISTRIBUTED_CHECKPOINT_SCHEMA = "pbg-queued-shared-distributed-checkpoint-v3"
 
 
 class PersistenceError(RuntimeError):
@@ -291,7 +291,7 @@ def validate_checkpoint_payload(state: object) -> dict[str, object]:
         ):
             raise PersistenceError("replica checkpoint lanes are not aligned")
     else:
-        raise PersistenceError("unsupported checkpoint schema")
+        raise PersistenceError("unsupported checkpoint schema; split-model artifacts cannot resume the shared model")
     if any(
         not isinstance(config, Mapping) or digest != _canonical_hash(config)
         for config, digest in zip(configs, hashes, strict=True)
@@ -323,7 +323,7 @@ def load_checkpoint(
         torch.load(path, map_location="cpu", weights_only=False)
     )
     if state["checkpoint_schema"] != CHECKPOINT_SCHEMA:
-        raise PersistenceError("unsupported checkpoint schema")
+        raise PersistenceError("unsupported checkpoint schema; split-model artifacts cannot resume the shared model")
     expected_hash = _canonical_hash(expected_scientific_config)
     if state["scientific_sha256"] != expected_hash or state[
         "scientific_config"

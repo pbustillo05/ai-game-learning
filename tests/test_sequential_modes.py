@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.model_support import FixedOutputPokerModel
+
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -154,7 +156,7 @@ def test_native_postflop_model_consumes_signed_folded_summary() -> None:
     scientific["model"] = {
         "d_model": 8,
         "n_heads": 1,
-        "layers": {"pre": 1, "post": 1},
+        "layers": 1,
         "raises": {"components": 4, "minimum_scale": 0.02},
         "seat_capacity": 3,
         "class_embedding_dim": 4,
@@ -1047,7 +1049,7 @@ def test_all_four_sequential_modes_complete_an_optimizer_step(
     )
 
     def make_model() -> QueuedPokerModel:
-        result = QueuedPokerModel(
+        result = FixedOutputPokerModel(
             geometry,
             _FinitePartitionNetwork(
                 geometry.preflop_model_input_width,
@@ -1226,7 +1228,7 @@ def test_multiway_best_response_uses_the_shared_learner_and_optimizer(
     )
 
     def make_model() -> QueuedPokerModel:
-        result = QueuedPokerModel(
+        result = FixedOutputPokerModel(
             geometry,
             _FinitePartitionNetwork(
                 geometry.preflop_model_input_width,

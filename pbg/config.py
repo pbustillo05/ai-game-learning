@@ -309,8 +309,9 @@ def _parse_model(
         "epsilon",
     }
     _closed(source, allowed, "root.scientific.model")
-    layers = _object(source.get("layers", {}), "root.scientific.model.layers")
-    _closed(layers, {"pre", "post"}, "root.scientific.model.layers")
+    layers = source.get("layers", 6)
+    if isinstance(layers, bool) or not isinstance(layers, int) or layers <= 0:
+        raise ConfigError("root.scientific.model.layers: expected a positive integer; split-model artifacts are unsupported")
     raises = _object(source.get("raises", {}), "root.scientific.model.raises")
     _closed(raises, {"components", "minimum_scale"}, "root.scientific.model.raises")
     if "ffn_hidden" in source and source["ffn_hidden"] is None:
@@ -318,8 +319,7 @@ def _parse_model(
     internal = {
         "d_model": source.get("d_model", 256),
         "n_heads": source.get("n_heads", 8),
-        "n_layers_pre": layers.get("pre", 4),
-        "n_layers_post": layers.get("post", 4),
+        "layers": layers,
         "m_raise": raises.get("components", 4),
         "s_min": raises.get("minimum_scale", 0.02),
         "max_players": source.get("seat_capacity", players),
@@ -332,7 +332,7 @@ def _parse_model(
     canonical: dict[str, object] = {
         "d_model": internal["d_model"],
         "n_heads": internal["n_heads"],
-        "layers": {"pre": internal["n_layers_pre"], "post": internal["n_layers_post"]},
+        "layers": internal["layers"],
         "raises": {
             "components": internal["m_raise"],
             "minimum_scale": internal["s_min"],

@@ -12,14 +12,15 @@ from pbg.core.contracts import mode_schema
 from pbg.core.learner import ModelEvaluation
 from pbg.games.poker.cards import DeckGeometry
 from pbg.games.poker.model.capacity import max_public_history_tokens
-from pbg.games.poker.model.postflop import PostflopMasks, PostflopNet
+from pbg.games.poker.model.shared import SharedPokerParameters
+from pbg.games.poker.model.postflop import PostflopMasks, PostflopEncoder
 from pbg.games.poker.model.preflop import (
     PackedPublicHistory,
     PokerModelConfig,
     PokerPublicBatch,
     PolicyOutput,
     PreflopMasks,
-    PreflopNet,
+    PreflopEncoder,
 )
 from pbg.games.poker.model.primitives import MHA, accelerator_assert
 from pbg.games.poker.queued.folded import unpack_folded_statistics
@@ -144,26 +145,15 @@ def _validate_output(
 
 
 class QueuedPokerModel(nn.Module):
-    """Own preflop/postflop parameter separation and natural-domain routing.
+    """One shared model, routed through native preflop/postflop encoders."""
 
-    Each supplied partition network consumes the direct retained model-input
-    tensor and returns :class:`ModelEvaluation`.  Preflop operates on its
-    natural $R^2$ class domain and is lifted once to evaluator combo order;
-    every ``post_A`` family operates directly on the $H$ combo domain.
-    """
-
-    def __init__(
-        self,
-        geometry: NLHEGeometry,
-        preflop: nn.Module,
-        postflop: nn.Module,
-    ) -> None:
+    def __init__(self, geometry: NLHEGeometry, config: PokerModelConfig) -> None:
         super().__init__()
-        if preflop is postflop:
-            raise ValueError("preflop and postflop parameter owners must be distinct")
         self.geometry = geometry
-        self.preflop = preflop
-        self.postflop = postflop
+        self.shared = SharedPokerParameters(config, geometry.deck_cards)
+        deck = DeckGeometry(geometry.rank_count)
+        self.pre_encoder = PreflopEncoder(config, deck)
+        self.post_encoder = PostflopEncoder(config, deck)
         self.register_buffer("combo_class", _combo_class(geometry), persistent=True)
         deck = DeckGeometry(geometry.rank_count)
         self.register_buffer(
@@ -180,13 +170,6 @@ class QueuedPokerModel(nn.Module):
         for module in self.modules():
             if isinstance(module, MHA):
                 module.configure_execution(attention_backend, query_chunk_size)
-
-    @staticmethod
-    def _call_direct(module: nn.Module, model_input: Tensor) -> ModelEvaluation:
-        result = module(model_input)
-        if not isinstance(result, ModelEvaluation):
-            raise PokerModelError("partition network must return ModelEvaluation")
-        return result
 
     @staticmethod
     def _evaluation(result: PolicyOutput) -> ModelEvaluation:
@@ -283,7 +266,7 @@ class QueuedPokerModel(nn.Module):
         ).any(3).any(2)
         return public, compatible
 
-    def _call_preflop(self, model_input: Tensor) -> ModelEvaluation:
+    def _call_preflop(self, model_input: Tensor, selected_private: Tensor | None = None) -> ModelEvaluation:
         state = self._state("pre", model_input)
         log_reach, history = PokerStateMachine(self.geometry).model_context(
             "pre", model_input
@@ -293,18 +276,19 @@ class QueuedPokerModel(nn.Module):
         gauge = log_reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
         class_ranges = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
         return self._evaluation(
-            self.preflop(
-                public,
+            self.pre_encoder(
+                self.shared, public,
                 class_ranges,
                 public.to_act,
                 PreflopMasks(
                     seat_mask=public.seat_mask,
                     status=public.status,
                 ),
+                selected_private=selected_private,
             )
         )
 
-    def _call_postflop(self, input_type: str, model_input: Tensor) -> ModelEvaluation:
+    def _call_postflop(self, input_type: str, model_input: Tensor, selected_private: Tensor | None = None) -> ModelEvaluation:
         state = self._state(input_type, model_input)
         log_reach, history = PokerStateMachine(self.geometry).model_context(
             input_type, model_input
@@ -327,10 +311,10 @@ class QueuedPokerModel(nn.Module):
         finite = torch.isfinite(log_reach)
         gauge = log_reach.masked_fill(~finite, -torch.inf).max(2, keepdim=True).values
         ranges = torch.exp(log_reach - gauge).masked_fill(~finite, 0.0)
-        line_dim = getattr(self.postflop.cfg, "folder_line_dim", 0)
+        line_dim = getattr(self.post_encoder.cfg, "folder_line_dim", 0)
         summary = unpack_folded_statistics(
             self.geometry,
-            beta_rank=getattr(self.postflop.cfg, "folder_beta_rank", 0),
+            beta_rank=getattr(self.post_encoder.cfg, "folder_beta_rank", 0),
             line_metadata=_fold_line_metadata(
                 history,
                 state.status,
@@ -343,8 +327,8 @@ class QueuedPokerModel(nn.Module):
             ].float(),
         )
         return self._evaluation(
-            self.postflop(
-                public,
+            self.post_encoder(
+                self.shared, public,
                 ranges,
                 public.to_act,
                 PostflopMasks(
@@ -355,11 +339,13 @@ class QueuedPokerModel(nn.Module):
                     evaluator_summary=summary,
                     live_seat_ids=live_ids,
                 ),
+                selected_private=selected_private,
             )
         )
 
     def forward_partition(
-        self, input_type: str, model_input: Tensor
+        self, input_type: str, model_input: Tensor,
+        selected_private: Tensor | None = None,
     ) -> ModelEvaluation:
         if (
             model_input.device.type not in ("cuda", "mps")
@@ -371,45 +357,25 @@ class QueuedPokerModel(nn.Module):
             )
         batch = model_input.shape[0]
         if input_type == "pre":
-            result = (
-                self._call_preflop(model_input)
-                if isinstance(self.preflop, PreflopNet)
-                else self._call_direct(self.preflop, model_input)
-            )
+            result = self._call_preflop(model_input, selected_private)
             _validate_output(
                 result,
                 batch=batch,
-                width=self.geometry.private_classes,
+                width=self.geometry.private_classes if selected_private is None else 1,
                 device=model_input.device,
             )
         elif input_type.startswith("post_") and input_type[5:].isdigit():
             live = int(input_type[5:])
             if not 2 <= live <= self.geometry.players:
                 raise PokerModelError("postflop family has an invalid live-seat count")
-            if self.geometry.folded_summary_width and not isinstance(
-                self.postflop, PostflopNet
-            ):
-                state = self._state(input_type, model_input)
-                if not bool(
-                    (
-                        ~state.status.eq(FOLDED).any(-1) | model_input[:, -1].gt(0.5)
-                    ).all()
-                ):
-                    raise PokerModelError(
-                        "postflop folded seats require sealed folded summaries"
-                    )
-            result = (
-                self._call_postflop(input_type, model_input)
-                if isinstance(self.postflop, PostflopNet)
-                else self._call_direct(self.postflop, model_input)
-            )
+            result = self._call_postflop(input_type, model_input, selected_private)
         else:
             raise PokerModelError(f"unknown poker input partition {input_type!r}")
         if input_type != "pre":
             _validate_output(
                 result,
                 batch=batch,
-                width=self.geometry.private_hands,
+                width=self.geometry.private_hands if selected_private is None else 1,
                 device=model_input.device,
             )
         return result
@@ -435,23 +401,12 @@ class QueuedPokerModel(nn.Module):
         sampled_private_state: Tensor,
         owner: Tensor,
     ) -> ModelEvaluation:
-        result = self.forward_sequential_partition(input_type, model_input)
         owner64 = owner.to(torch.int64)
         combo = sampled_private_state.gather(
             1, owner64[:, None]
         ).squeeze(1).to(torch.int64)
         index = self.combo_class.index_select(0, combo) if input_type == "pre" else combo
-        row = torch.arange(index.numel(), device=index.device)
-        return ModelEvaluation(
-            MappingProxyType(
-                {
-                    name: value[row, index].unsqueeze(1)
-                    for name, value in result.policy_raw.items()
-                }
-            ),
-            result.value[row, index].unsqueeze(1),
-            result.public_heads,
-        )
+        return self.forward_partition(input_type, model_input, index)
 
     def rollout_operation(
         self,
@@ -531,11 +486,9 @@ def build_model_from_config(
         raise ValueError("scientific.game is not a valid NLHE geometry") from exc
 
     model_values = dict(model)
-    layers = model_values.pop("layers", None)
-    if not isinstance(layers, Mapping) or set(layers) != {"pre", "post"}:
-        raise ValueError("scientific.model.layers is required and must be closed")
-    model_values["n_layers_pre"] = layers["pre"]
-    model_values["n_layers_post"] = layers["post"]
+    layers = model_values.get("layers")
+    if isinstance(layers, bool) or not isinstance(layers, int) or layers <= 0:
+        raise ValueError("scientific.model.layers must be a positive integer; split-model artifacts are unsupported")
     raises = model_values.pop("raises", None)
     if not isinstance(raises, Mapping) or set(raises) != {
         "components",
@@ -578,12 +531,7 @@ def build_model_from_config(
         raise ValueError("queued poker model construction requires CUDA or MPS")
     if target.type == "cuda" and target.index is None:
         target = torch.device("cuda", torch.cuda.current_device())
-    deck = DeckGeometry(geometry.rank_count)
-    result = QueuedPokerModel(
-        geometry,
-        PreflopNet(model_config, deck),
-        PostflopNet(model_config, deck),
-    ).to(target)
+    result = QueuedPokerModel(geometry, model_config).to(target)
     if any(parameter.device != target for parameter in result.parameters()):
         raise PokerModelError("queued poker model construction changed device")
     return result

@@ -1,3 +1,4 @@
+from tests.model_support import FamilyModelFixture
 import pytest
 import torch
 
@@ -6,7 +7,6 @@ from pbg.games.poker.model.preflop import (
     PokerModelConfig,
     PokerPublicBatch,
     PreflopMasks,
-    PreflopNet,
 )
 
 CUDA = pytest.mark.skipif(
@@ -18,7 +18,7 @@ def _config(*, moment: bool = False, players: int = 3) -> PokerModelConfig:
     return PokerModelConfig(
         d_model=16,
         n_heads=4,
-        n_layers_pre=1,
+        layers=1,
         m_raise=2,
         k_act=5,
         max_players=players,
@@ -90,7 +90,7 @@ def _cuda_inputs(
 
 @CUDA
 def test_preflop_forward_shapes_fp32_and_autocast() -> None:
-    model = PreflopNet(_config(moment=True)).cuda()
+    model = FamilyModelFixture(_config(moment=True), "pre").cuda()
     pub, ranges = _cuda_inputs()
     output = model(pub, ranges)
     assert output.raw["type_logits"].shape == (2, 169, 3)
@@ -114,7 +114,7 @@ def test_preflop_forward_shapes_fp32_and_autocast() -> None:
 @CUDA
 def test_class_order_equivariance() -> None:
     torch.manual_seed(63)
-    model = PreflopNet(_config(players=2)).cuda().eval()
+    model = FamilyModelFixture(_config(players=2), "pre").cuda().eval()
     pub, ranges = _cuda_inputs(batch=1, players=2)
     permutation = torch.randperm(169, device="cuda")
     base = model(pub, ranges)
@@ -133,7 +133,7 @@ def test_class_order_equivariance() -> None:
 @CUDA
 def test_masked_empty_seat_cannot_change_output() -> None:
     torch.manual_seed(64)
-    model = PreflopNet(_config()).cuda().eval()
+    model = FamilyModelFixture(_config(), "pre").cuda().eval()
     pub, ranges = _cuda_inputs(batch=1)
     pub.seat_mask[:, -1] = False
     first = model(pub, ranges)
@@ -151,7 +151,7 @@ def test_masked_empty_seat_cannot_change_output() -> None:
 @CUDA
 def test_gradient_reaches_every_parameter() -> None:
     torch.manual_seed(65)
-    model = PreflopNet(_config(moment=True)).cuda()
+    model = FamilyModelFixture(_config(moment=True), "pre").cuda()
     pub, ranges = _cuda_inputs(batch=2)
     pub.status[0] = torch.tensor([0, 1, 2], device="cuda")
     output = model(pub, ranges)
@@ -164,7 +164,7 @@ def test_gradient_reaches_every_parameter() -> None:
         for name, parameter in model.named_parameters()
         if parameter.grad is not None and not bool((parameter.grad != 0).any())
     ]
-    assert not missing
+    assert missing == [name for name, _ in model.named_parameters() if ".static.post." in name]
     assert not zero
 
 
@@ -175,14 +175,14 @@ def test_model_config_is_strict() -> None:
 
 @CUDA
 def test_preflop_orbit_geometry_is_exact_and_history_changes_output() -> None:
-    model = PreflopNet(_config()).cuda().eval()
+    model = FamilyModelFixture(_config(), "pre").cuda().eval()
     torch.testing.assert_close(
-        model.class_card_geometry.sum(1),
+        model.encoder.class_card_geometry.sum(1),
         torch.full((169,), 2.0, device="cuda"),
     )
-    expected_overlap = model.class_card_geometry @ model.class_card_geometry.T
+    expected_overlap = model.encoder.class_card_geometry @ model.encoder.class_card_geometry.T
     torch.testing.assert_close(
-        model.class_overlap_scalars[:, 0], expected_overlap.diagonal()
+        model.encoder.class_overlap_scalars[:, 0], expected_overlap.diagonal()
     )
     pub, ranges = _cuda_inputs(batch=1)
     first = model(pub, ranges)
@@ -195,7 +195,7 @@ def test_preflop_orbit_geometry_is_exact_and_history_changes_output() -> None:
 @CUDA
 def test_preflop_conformance_paths_run_forward_backward_on_cuda() -> None:
     pub, ranges = _cuda_inputs(batch=1)
-    model = PreflopNet(_config()).cuda()
+    model = FamilyModelFixture(_config(), "pre").cuda()
     output = model(pub, ranges)
     (output.v.square().mean() + output.raw["type_logits"].square().mean()).backward()
     assert torch.isfinite(output.v).all()

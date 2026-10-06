@@ -166,7 +166,7 @@ def _scientific_mapping(
         "model": {
             "d_model": 128,
             "n_heads": 4,
-            "layers": {"pre": 4, "post": 6},
+            "layers": 6,
             "raises": {"components": 2, "minimum_scale": 0.02},
             "class_embedding_dim": 32,
             "folder_beta_rank": 0,

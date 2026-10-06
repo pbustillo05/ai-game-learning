@@ -57,6 +57,16 @@ class FFN(nn.Module):
             raise ValueError(f"expected final dimension {self.in_dim}, got {x.shape[-1]}")
         return self.w2(gelu(self.w1(x)))
 
+    def forward_factored(self, rows: Tensor, context: Tensor) -> Tensor:
+        """Project broadcast context once, with the same affine/nonlinearity."""
+
+        split = rows.shape[-1]
+        if split + context.shape[-1] != self.in_dim:
+            raise ValueError("factored FFN widths do not match its input")
+        row_projection = F.linear(rows, self.w1.weight[:, :split], self.w1.bias)
+        context_projection = F.linear(context, self.w1.weight[:, split:])
+        return self.w2(gelu(row_projection + context_projection[:, None, :]))
+
 
 class MHA(nn.Module):
     """Multi-head attention with learned content temperatures and key priors.
@@ -73,9 +83,7 @@ class MHA(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
-        self.w_q = nn.Linear(d_model, d_model)
-        self.w_k = nn.Linear(d_model, d_model)
-        self.w_v = nn.Linear(d_model, d_model)
+        self.w_qkv = nn.Linear(d_model, 3 * d_model)
         self.w_o = nn.Linear(d_model, d_model)
         # Execution-only attributes are deliberately absent from state_dict.
         self.attention_backend = "sdpa"
@@ -93,9 +101,16 @@ class MHA(nn.Module):
     def _project(self, q: Tensor, kv: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         batch, n_query, _ = q.shape
         n_key = kv.shape[1]
-        q_head = self.w_q(q).reshape(batch, n_query, self.n_heads, self.d_head)
-        k_head = self.w_k(kv).reshape(batch, n_key, self.n_heads, self.d_head)
-        v_head = self.w_v(kv).reshape(batch, n_key, self.n_heads, self.d_head)
+        if q is kv:
+            q_value, k_value, v_value = self.w_qkv(q).split(self.d_model, dim=-1)
+        else:
+            # Cross-attention uses the same packed owner without projecting
+            # unused Q rows for keys or unused K/V rows for queries.
+            q_value = F.linear(q, self.w_qkv.weight[:self.d_model], self.w_qkv.bias[:self.d_model])
+            k_value, v_value = F.linear(kv, self.w_qkv.weight[self.d_model:], self.w_qkv.bias[self.d_model:]).split(self.d_model, dim=-1)
+        q_head = q_value.reshape(batch, n_query, self.n_heads, self.d_head)
+        k_head = k_value.reshape(batch, n_key, self.n_heads, self.d_head)
+        v_head = v_value.reshape(batch, n_key, self.n_heads, self.d_head)
         return (
             q_head.transpose(1, 2),
             k_head.transpose(1, 2),

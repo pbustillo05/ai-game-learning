@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.model_support import FixedOutputPokerModel
+
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -589,7 +591,7 @@ def test_two_partition_model_routes_natural_domains_and_preserves_class_order() 
     postflop = _PartitionNetwork(
         geometry.postflop_model_input_width, geometry.private_hands, device
     )
-    model = QueuedPokerModel(geometry, preflop, postflop).to(device)
+    model = FixedOutputPokerModel(geometry, preflop, postflop).to(device)
     assert model.combo_class.cpu().tolist() == list(
         DeckGeometry(geometry.rank_count).class_of_combo
     )
@@ -669,7 +671,7 @@ def test_phase5_postflop_fails_before_silent_folded_summary_omission() -> None:
         street=torch.ones_like(state.street),
         status=status,
     )
-    model = QueuedPokerModel(
+    model = FixedOutputPokerModel(
         geometry,
         _PartitionNetwork(
             geometry.preflop_model_input_width,
@@ -956,7 +958,7 @@ def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
             "model": {
                 "d_model": 4,
                 "n_heads": 1,
-                "layers": {"pre": 1, "post": 1},
+                "layers": 1,
                 "raises": {"components": 2, "minimum_scale": 0.02},
                 "seat_capacity": 2,
                 "class_embedding_dim": 2,
@@ -972,12 +974,11 @@ def test_complete_poker_iteration_runs_reconstructed_architecture() -> None:
     assert all(
         attention.attention_backend == "sdpa" and attention.query_chunk_size is None
         for attention in (
-            *model.preflop.attentions,
-            *model.postflop.attentions,
+            *model.shared.attentions,
         )
     )
     with torch.no_grad():
-        for network in (model.preflop, model.postflop):
+        for network in (model.shared,):
             network.type_head.affine.weight.zero_()
             network.type_head.affine.bias.copy_(
                 torch.tensor([-30.0, 30.0, -60.0], device=device)

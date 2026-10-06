@@ -46,10 +46,8 @@ def test_key_bias_is_not_tempered() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     mha = MHA(16, 4).to(device)
     with torch.no_grad():
-        mha.w_q.weight.zero_()
-        mha.w_q.bias.zero_()
-        mha.w_k.weight.zero_()
-        mha.w_k.bias.zero_()
+        mha.w_qkv.weight[:2 * mha.d_model].zero_()
+        mha.w_qkv.bias[:2 * mha.d_model].zero_()
     query = torch.randn(2, 3, 16, device=device)
     context = torch.randn(2, 5, 16, device=device)
     bias = torch.randn(2, 5, dtype=torch.float32, device=device)

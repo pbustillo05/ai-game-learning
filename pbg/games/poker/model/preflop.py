@@ -11,17 +11,11 @@ import torch
 from torch import Tensor, nn
 
 from pbg.games.poker.cards import DeckGeometry
+from pbg.games.poker.model.shared import SharedPokerParameters
 from pbg.games.poker.model.heads import (
     PublicBranchingHeads,
-    RaiseMixtureHead,
-    TypeHead,
-    ValueHead,
 )
-from pbg.games.poker.model.incidence import IncidenceResidual
 from pbg.games.poker.model.primitives import (
-    FFN,
-    LN,
-    MHA,
     accelerator_assert,
 )
 
@@ -38,8 +32,7 @@ class PokerModelConfig:
 
     d_model: int = 256
     n_heads: int = 8
-    n_layers_pre: int = 4
-    n_layers_post: int = 4
+    layers: int = 6
     m_raise: int = 4
     k_act: int = 7
     s_min: float = 0.02
@@ -54,7 +47,7 @@ class PokerModelConfig:
 
     def __post_init__(self) -> None:
         integer_fields = (
-            "d_model", "n_heads", "n_layers_pre", "n_layers_post", "m_raise",
+            "d_model", "n_heads", "layers", "m_raise",
             "k_act", "max_players", "class_embedding_dim",
             "max_history_tokens", "folder_beta_rank",
             "folder_line_dim",
@@ -77,7 +70,7 @@ class PokerModelConfig:
             raise ValueError("s_min and eps must be finite")
         if self.d_model <= 0 or self.n_heads <= 0 or self.d_model % self.n_heads:
             raise ValueError("d_model must be positive and divisible by n_heads")
-        if self.n_layers_pre <= 0 or self.n_layers_post <= 0 or self.m_raise <= 0:
+        if self.layers <= 0 or self.m_raise <= 0:
             raise ValueError("layer and mixture counts must be positive")
         if self.k_act != 3 + self.m_raise:
             raise ValueError("k_act must equal 3 + m_raise")
@@ -207,7 +200,7 @@ def _mask_value(masks: PreflopMasks | Mapping[str, Tensor] | Tensor | None, name
     return getattr(masks, name)
 
 
-class PreflopNet(nn.Module):
+class PreflopEncoder(nn.Module):
     """Pre-LN transformer over all seated-player preflop class rows."""
 
     def __init__(
@@ -230,41 +223,6 @@ class PreflopNet(nn.Module):
         self.class_embedding = nn.Embedding(self.n_classes, dc)
         class_geometry_dim = self.n_cards + 2
         self.class_row_affine = nn.Linear(dc + 4 + class_geometry_dim, d)
-        self.seat_embedding = nn.Embedding(c.max_players, d)
-        self.status_embedding = nn.Embedding(3, d)
-        self.actor_embedding = nn.Embedding(2, d)
-        self.public_scalar_affine = nn.Linear(1, d)
-        self.public_type_embedding = nn.Embedding(10, d)
-        self.history_numeric_affine = nn.Linear(6, d)
-        self.history_action_embedding = nn.Embedding(4, d)
-        self.history_street_embedding = nn.Embedding(4, d)
-        self.history_position_embedding = nn.Embedding(c.max_history_tokens, d)
-        self.state_token = nn.Parameter(torch.zeros(d))
-        self.anchor_tokens = nn.Parameter(torch.empty(c.k_act, d))
-        self.anchor_seat_embedding = nn.Embedding(c.max_players, d)
-        nn.init.normal_(self.anchor_tokens, std=d**-0.5)
-
-        static_side_dim = dc + 2 + class_geometry_dim
-        side_dim = static_side_dim + 3 * d
-        self.layer_norms = nn.ModuleList(LN(d) for _ in range(c.n_layers_pre))
-        self.attentions = nn.ModuleList(MHA(d, c.n_heads) for _ in range(c.n_layers_pre))
-        self.incidence_residuals = nn.ModuleList(
-            IncidenceResidual(d) for _ in range(c.n_layers_pre)
-        )
-        self.layer_ffns = nn.ModuleList(
-            FFN(d + side_dim, d, c.ffn_hidden) for _ in range(c.n_layers_pre)
-        )
-        self.final_norm = LN(d)
-        self.actor_seat_ffn = FFN(4 * d, d, c.ffn_hidden)
-        self.seat_ffn = FFN(d + 3, d, c.ffn_hidden)
-        self.global_ffn = FFN((2 + c.max_players) * d, d, c.ffn_hidden)
-
-        readout_dim = d + c.k_act * d + dc + d
-        self.type_features = FFN(readout_dim, d, c.ffn_hidden)
-        self.raise_features = FFN(readout_dim, d, c.ffn_hidden)
-        self.type_head = TypeHead(d)
-        self.raise_head = RaiseMixtureHead(d, c.m_raise, c.s_min)
-        self.value_head = ValueHead(readout_dim, feature_dim=d, hidden=c.ffn_hidden)
         branching_dim = (2 + c.max_players) * d
         self.branching_heads = (
             PublicBranchingHeads(branching_dim, d, c.ffn_hidden)
@@ -442,6 +400,7 @@ class PreflopNet(nn.Module):
 
     def _public_tokens(
         self,
+        shared: SharedPokerParameters,
         pub: PokerPublicBatch,
         seat_mask: Tensor,
         relative_seats: Tensor,
@@ -452,15 +411,15 @@ class PreflopNet(nn.Module):
         scalar_groups = [
             pub.pot[:, None], pub.stacks, pub.committed,
             pub.street.to(dtype)[:, None], pub.legality_summary.to(dtype),
-            torch.cat((pub.n_ticks.to(dtype)[:, None], pub.raise_grid_bounds.to(dtype)), dim=1),
+            pub.n_ticks.to(dtype)[:, None], pub.raise_grid_bounds.to(dtype),
         ]
         type_groups = [
             (1, 0), (players, 1), (players, 2), (1, 3),
-            (pub.legality_summary.shape[1], 4), (3, 5),
+            (pub.legality_summary.shape[1], 4), (1, 5), (2, 6),
         ]
         if pub.committed_street is not None:
             scalar_groups.append(pub.committed_street.to(dtype))
-            type_groups.append((players, 6))
+            type_groups.append((players, 7))
         exact = [
             value.to(dtype)[:, None]
             for value in (
@@ -471,20 +430,20 @@ class PreflopNet(nn.Module):
         ]
         if exact:
             scalar_groups.append(torch.cat(exact, dim=1))
-            type_groups.append((len(exact), 7))
+            type_groups.append((len(exact), 8))
         if pub.legal_action_mask is not None:
             scalar_groups.append(pub.legal_action_mask.to(dtype))
-            type_groups.append((pub.legal_action_mask.shape[1], 8))
+            type_groups.append((pub.legal_action_mask.shape[1], 9))
         if pub.raise_ticks is not None:
             scalar_groups.append(pub.raise_ticks.to(dtype))
-            type_groups.append((pub.raise_ticks.shape[1], 9))
+            type_groups.append((pub.raise_ticks.shape[1], 10))
         scalars = torch.cat(scalar_groups, dim=1)
         type_ids = torch.cat([
             torch.full((count,), kind, dtype=torch.long, device=device)
             for count, kind in type_groups
         ])
-        token = self.public_scalar_affine(scalars[..., None]) + self.public_type_embedding(type_ids)[None, :, :]
-        seat_position = self.seat_embedding(relative_seats)
+        token = shared.public_scalar_affine(scalars[..., None]) + shared.public_type_embedding(type_ids)[None, :, :]
+        seat_position = shared.seat_embedding(relative_seats)
         seat_prefix = torch.zeros(
             (batch, 1, self.cfg.d_model), dtype=token.dtype, device=device
         )
@@ -518,35 +477,37 @@ class PreflopNet(nn.Module):
                 ),
                 dim=-1,
             ).to(dtype)
-            history_token = self.history_numeric_affine(numeric)
-            history_token = history_token + self.history_action_embedding(
+            history_token = shared.history_numeric_affine(numeric)
+            history_token = history_token + shared.history_action_embedding(
                 history.action.clamp(0, 3).long()
             )
-            history_token = history_token + self.history_street_embedding(
+            history_token = history_token + shared.history_street_embedding(
                 history.street.clamp(0, 3).long()
             )
-            history_token = history_token + self.history_position_embedding(
+            history_token = history_token + shared.history_position_embedding(
                 torch.arange(history.mask.shape[1], device=device)
             )[None]
             safe_actor = history.actor.clamp(0, players - 1).long()
-            history_token = history_token + self.seat_embedding(
+            history_token = history_token + shared.seat_embedding(
                 relative_seats.gather(1, safe_actor)
             ) * (history.actor >= 0)[..., None]
             token = torch.cat((token, history_token), dim=1)
             valid = torch.cat((valid, history.mask), dim=1)
         public_mean = (token * valid[..., None]).sum(dim=1) / valid.sum(dim=1, keepdim=True)
-        state = self.state_token[None, :] + public_mean
+        state = shared.state_token[None, :] + public_mean
         return torch.cat((token, state[:, None, :]), dim=1), torch.cat(
             (valid, torch.ones((batch, 1), dtype=torch.bool, device=device)), dim=1
         )
 
     def forward(
         self,
+        shared: SharedPokerParameters,
         pub: PokerPublicBatch,
         class_ranges: Tensor,
         actor_seat: Tensor | None = None,
         masks: PreflopMasks | Mapping[str, Tensor] | Tensor | None = None,
         *,
+        selected_private: Tensor | None = None,
         _prepared_metadata: tuple[
             Tensor, Tensor, Tensor, Tensor, Tensor, Tensor
         ]
@@ -596,15 +557,15 @@ class PreflopNet(nn.Module):
             dim=-1,
         )
         row = self.class_row_affine(row_feature)
-        row = row + self.seat_embedding(relative_seats)[:, :, None, :]
-        row = row + self.status_embedding(status)[:, :, None, :]
+        row = row + shared.seat_embedding(relative_seats)[:, :, None, :]
+        row = row + shared.status_embedding(status)[:, :, None, :]
         actor_flag = torch.arange(players, device=row.device)[None, :] == actor[:, None]
-        row = row + self.actor_embedding(actor_flag.long())[:, :, None, :]
+        row = row + shared.actor_embedding(actor_flag.long())[:, :, None, :]
         row_flat = row.reshape(batch, players * self.n_classes, d)
 
-        public_token, public_mask = self._public_tokens(pub, seat_mask, relative_seats)
+        public_token, public_mask = self._public_tokens(shared, pub, seat_mask, relative_seats)
         actor_relative = relative_seats.gather(1, actor[:, None]).squeeze(1)
-        anchors = self.anchor_tokens[None, :, :] + self.anchor_seat_embedding(actor_relative)[:, None, :]
+        anchors = shared.anchor_tokens[None, :, :] + shared.anchor_seat_embedding(actor_relative)[:, None, :]
         token = torch.cat((row_flat, public_token, anchors), dim=1)
         row_mask_flat = class_mask.reshape(batch, players * self.n_classes)
         key_mask = torch.cat(
@@ -635,8 +596,8 @@ class PreflopNet(nn.Module):
         incidence_mass = normalized
         identical_scale = (1.0 / self.class_sizes[class_ids]).to(class_ranges.dtype)
         for layer_norm, attention, incidence, layer_ffn in zip(
-            self.layer_norms, self.attentions, self.incidence_residuals,
-            self.layer_ffns, strict=True
+            shared.layer_norms, shared.attentions, shared.incidence_residuals,
+            shared.layer_ffns, strict=True
         ):
             row_state = x[:, : players * self.n_classes].reshape(
                 batch, players, self.n_classes, d
@@ -654,25 +615,15 @@ class PreflopNet(nn.Module):
             dynamic = torch.cat(
                 (j, overlap_card * overlap_card, overlap_card * overlap_equal), dim=-1
             )
-            side_rows = torch.cat((side_class, dynamic), dim=-1)
-            side = torch.cat(
-                (
-                    side_rows.reshape(batch, players * self.n_classes, -1),
-                    torch.zeros(
-                        (
-                            batch,
-                            token.shape[1] - players * self.n_classes,
-                            side_rows.shape[-1],
-                        ),
-                        dtype=side_rows.dtype,
-                        device=token.device,
-                    ),
-                ),
-                dim=1,
+            def pad_rows(value: Tensor) -> Tensor:
+                rows = value.reshape(batch, players * self.n_classes, -1)
+                return torch.nn.functional.pad(rows, (0, 0, 0, token.shape[1] - rows.shape[1]))
+            x = x_hat + layer_ffn(
+                torch.cat((layer_norm(x_hat), pad_rows(dynamic)), dim=-1),
+                pad_rows(side_class), "pre",
             )
-            x = x_hat + layer_ffn(torch.cat((layer_norm(x_hat), side), dim=-1))
 
-        final = self.final_norm(x)
+        final = shared.final_norm(x)
         final_rows = final[:, : players * self.n_classes].reshape(
             batch, players, self.n_classes, d
         )
@@ -684,7 +635,7 @@ class PreflopNet(nn.Module):
         actor_anchor_input = torch.cat(
             (final_anchors[:, 0], final_anchors[:, 1], final_anchors[:, 2], final_anchors[:, 3:].mean(dim=1)), dim=-1
         )
-        actor_summary = self.actor_seat_ffn(actor_anchor_input)
+        actor_summary = shared.actor_seat_features(actor_anchor_input)
         mass = masked_range.sum(dim=-1)
         pooled = (final_rows * masked_range[..., None]).sum(dim=2) / mass[..., None].clamp_min(c.eps)
         seat_meta = torch.stack(
@@ -694,7 +645,7 @@ class PreflopNet(nn.Module):
                 relative_seats.to(mass.dtype) / max(c.max_players - 1, 1),
             ), dim=-1,
         )
-        seat_summary = self.seat_ffn(torch.cat((pooled, seat_meta), dim=-1))
+        seat_summary = shared.seat_features(torch.cat((pooled, seat_meta), dim=-1))
         actor_selector = (
             torch.arange(players, device=actor.device)[None, :]
             == actor[:, None]
@@ -714,25 +665,17 @@ class PreflopNet(nn.Module):
             ),
             dim=1,
         )
-        global_feature = self.global_ffn(
+        global_feature = shared.global_features(
             torch.cat((public_mean, actor_summary, padded_seats.reshape(batch, c.max_players * d)), dim=-1)
         )
 
         batch_ids = torch.arange(batch, device=actor.device)
         actor_rows = final_rows[batch_ids, actor]
-        readout = torch.cat(
-            (
-                actor_rows,
-                final_anchors.reshape(batch, 1, c.k_act * d).expand(-1, self.n_classes, -1),
-                class_emb,
-                global_feature[:, None, :].expand(-1, self.n_classes, -1),
-            ), dim=-1,
-        )
-        z_type = self.type_features(readout)
-        z_raise = self.raise_features(readout)
-        type_logits = self.type_head(z_type)
-        omega, mu, scale, iota = self.raise_head(z_raise, z_type)
-        value = self.value_head(readout)
+        if selected_private is not None:
+            selected = selected_private[:, None, None]
+            actor_rows = actor_rows.gather(1, selected.expand(-1, 1, d))
+            class_emb = class_emb.gather(1, selected.expand(-1, 1, c.class_embedding_dim))
+        raw, value = shared.readout(actor_rows, class_emb, final_anchors, global_feature)
 
         t: Tensor | None = None
         cost: Tensor | None = None
@@ -742,7 +685,7 @@ class PreflopNet(nn.Module):
             )
             t, cost = self.branching_heads(branching_public)
         return PolicyOutput(
-            raw={"type_logits": type_logits, "omega": omega, "mu": mu, "s": scale, "iota": iota},
+            raw=raw,
             v=value,
             t=t,
             c=cost,

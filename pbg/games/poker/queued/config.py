@@ -54,8 +54,7 @@ class PrecisionConfig:
 class PokerModelSpec:
     d_model: int = 256
     n_heads: int = 8
-    n_layers_pre: int = 4
-    n_layers_post: int = 4
+    layers: int = 6
     m_raise: int = 4
     s_min: float = 0.02
     max_players: int = 6
@@ -69,8 +68,7 @@ class PokerModelSpec:
         for name in (
             "d_model",
             "n_heads",
-            "n_layers_pre",
-            "n_layers_post",
+            "layers",
             "m_raise",
             "max_players",
             "class_embedding_dim",

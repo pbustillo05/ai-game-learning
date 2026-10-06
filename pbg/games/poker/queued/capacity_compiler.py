@@ -98,8 +98,7 @@ def _learner_workspace_row_bytes(
     geometry: NLHEGeometry,
     *,
     d_model: int,
-    n_layers_pre: int,
-    n_layers_post: int,
+    layers: int,
     model_dtype: torch.dtype,
     token_bound: int,
     action_width: int,
@@ -107,7 +106,6 @@ def _learner_workspace_row_bytes(
     """Conservative concurrent forward/backward tensors for one learner row."""
 
     element_bytes = torch.empty((), dtype=model_dtype).element_size()
-    layers = max(n_layers_pre, n_layers_post)
     transformer_values = token_bound * d_model * (4 + 3 * layers)
     output_values = geometry.private_hands * (action_width + 3)
     fp32_control = geometry.private_hands * (2 * action_width + 8)
@@ -311,8 +309,7 @@ def compile_capacity(
     learner_workspace = _learner_workspace_row_bytes(
         geometry,
         d_model=int(model.d_model),
-        n_layers_pre=int(model.n_layers_pre),
-        n_layers_post=int(model.n_layers_post),
+        layers=int(model.layers),
         model_dtype=dtype,
         token_bound=token_bound,
         action_width=action_width,

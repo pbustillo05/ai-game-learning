@@ -1,3 +1,4 @@
+from tests.model_support import FamilyModelFixture
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -12,7 +13,6 @@ from pbg.games.poker.model.incidence import (
 )
 from pbg.games.poker.model.postflop import (
     PostflopMasks,
-    PostflopNet,
 )
 from pbg.games.poker.model.preflop import PokerModelConfig, PokerPublicBatch
 
@@ -66,7 +66,7 @@ def _cuda_inputs():
 
 def _cfg():
     return PokerModelConfig(
-        d_model=16, n_heads=4, n_layers_pre=1, n_layers_post=1,
+        d_model=16, n_heads=4, layers=1,
         m_raise=2, k_act=5, max_players=2, class_embedding_dim=4,
         ffn_hidden=24, use_branching_heads=True,
     )
@@ -88,7 +88,7 @@ def test_compact_gather_scatter_is_ragged_and_differentiable():
 def test_postflop_forward_scatter_and_autocast():
     torch.manual_seed(70)
     pub, ranges, masks = _cuda_inputs()
-    model = PostflopNet(_cfg()).cuda().eval()
+    model = FamilyModelFixture(_cfg(), "post").cuda().eval()
     output = model(pub, ranges, masks=masks)
     assert output.raw["type_logits"].shape == (2, 1326, 3)
     assert output.raw["omega"].shape == output.raw["mu"].shape == output.raw["s"].shape == (2, 1326, 2)
@@ -140,7 +140,7 @@ def test_signed_beta_coordinates_consume_current_evaluator_eigenpairs():
     torch.manual_seed(72)
     cfg = _cfg()
     cfg = type(cfg)(**{**cfg.__dict__, "folder_beta_rank": 52})
-    model = PostflopNet(cfg)
+    model = FamilyModelFixture(cfg, "post")
     compatibility = torch.zeros(1, 1326, dtype=torch.bool)
     compatibility[:, :8] = True
     mapping = build_compact_map(compatibility, compact_size=8)
@@ -154,7 +154,7 @@ def test_signed_beta_coordinates_consume_current_evaluator_eigenpairs():
         },
         metadata={"contract_version": "2"},
     )
-    correction, geometry = model._folded_geometry(summary, mapping, torch.float32)
+    correction, geometry = model.encoder._folded_geometry(summary, mapping, torch.float32)
     torch.testing.assert_close(correction, summary.fields["hand_log_ratio"][:, :8])
     positive = geometry[..., 52:104]
     negative = geometry[..., 104:]
@@ -197,7 +197,7 @@ def test_folder_pressure_and_folder_seat_readout_consume_semantic_fields():
         "folder_seat": torch.ones(batch, 1, dtype=torch.long, device=device),
     }
     masks.evaluator_summary = PartitionSummaryBatch(fields, {"contract_version": "2"})
-    model = PostflopNet(cfg).cuda().eval()
+    model = FamilyModelFixture(cfg, "post").cuda().eval()
     first = model(pub, ranges, masks=masks)
     changed = {key: value.clone() for key, value in fields.items()}
     changed["folder_card_mass"][..., :4] = 0.0
@@ -229,7 +229,7 @@ def test_compact_contract_v2_folder_features_feed_postflop_model():
     }
     masks.evaluator_summary = PartitionSummaryBatch(fields, {"contract_version": "2"})
     cfg = type(_cfg())(**{**_cfg().__dict__, "folder_beta_rank": 2})
-    output = PostflopNet(cfg).cuda().eval()(pub, ranges, masks=masks)
+    output = FamilyModelFixture(cfg, "post").cuda().eval()(pub, ranges, masks=masks)
     assert torch.isfinite(output.v).all()
 
 
@@ -254,7 +254,7 @@ def test_current_evaluator_summary_rejects_retired_field_aliases():
         {"contract_version": "2"},
     )
     with pytest.raises(ValueError, match="folder card marginals"):
-        PostflopNet(cfg).eval()(pub, ranges, masks=masks)
+        FamilyModelFixture(cfg, "post").eval()(pub, ranges, masks=masks)
 
 
 @CUDA
@@ -265,9 +265,9 @@ def test_folded_seats_do_not_create_postflop_attention_rows():
     masks.status = pub.status
     masks.live_seat_ids = torch.zeros((pub.street.shape[0], 1), dtype=torch.long)
     masks.compact_size = int(masks.compatibility.sum(1).max())
-    model = PostflopNet(_cfg()).cuda().eval()
+    model = FamilyModelFixture(_cfg(), "post").cuda().eval()
     lengths: list[int] = []
-    hook = model.attentions[0].register_forward_pre_hook(
+    hook = model.shared.attentions[0].register_forward_pre_hook(
         lambda module, args: lengths.append(args[0].shape[1])
     )
     try:
@@ -279,7 +279,7 @@ def test_folded_seats_do_not_create_postflop_attention_rows():
         pub.street.shape[0], -1
     )
     relative = torch.remainder(seats - pub.button[:, None], players)
-    public, _ = model._public_tokens(pub, None, ranges.dtype, relative)
+    public, _ = model.encoder._public_tokens(model.shared, pub, None, ranges.dtype, relative)
     expected = masks.compatibility.sum(1).max().item() + public.shape[1] + model.cfg.k_act
     assert lengths == [expected]
 
@@ -287,7 +287,7 @@ def test_folded_seats_do_not_create_postflop_attention_rows():
 @CUDA
 def test_postflop_conformance_paths_run_forward_backward_on_cuda():
     pub, ranges, masks = _cuda_inputs()
-    model = PostflopNet(_cfg()).cuda()
+    model = FamilyModelFixture(_cfg(), "post").cuda()
     output = model(pub, ranges, masks=masks)
     (output.v.square().mean() + output.raw["type_logits"].square().mean()).backward()
     assert torch.isfinite(output.v).all()
