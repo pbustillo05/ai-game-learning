@@ -1,9 +1,10 @@
 # H100 model architecture candidates — 2026-10-06
 
 This is a brainstorm requested by the user after the H100 learner profiles.
-No architecture below has been implemented or benchmarked. No GPU jobs were
-launched for this report. Protected theory and queued-design documents remain
-unchanged. Implementation of a selected architecture needs a separately
+The initial agent draft used no GPU jobs or implementation changes. The
+follow-up section records model-only CUDA width/depth configuration probes on
+October7. No architecture was adopted in production. Protected theory and
+queued-design documents remain unchanged. Implementation of a selected architecture needs a separately
 reviewed specification; this report does not redefine existing contracts.
 
 The target is faster learning at comparable quality and capacity. A high
@@ -215,3 +216,37 @@ the repository's held-out/evaluation methodology for long-run quality rather
 than interpreting short finite loss as equivalence. Only then try a 64-latent
 or dense-context competitor. These ablations are future work; they were not
 added to the bounded final H100 series.
+
+
+## Follow-up selected-output CUDA probes — 2026-10-07
+
+The user authorized up to30 additional minutes of H100 work at00:03 UTC.
+Six isolated eager BF16/IEEE model probes were completed on source1b69b5b,
+HU/R=13/32bb, with actual packet sizes176 pre and80 post states, K=1,
+three warmups and21 repetitions. Each process owned the otherwise idle GPU;
+NVML logs and the full timing arrays are retained. These probes use a value
+objective and selected outputs; they exclude PPO/reference/Adam/rollout and
+are not a whole-training or learning-quality comparison. No architecture was
+adopted in production. Tensor activity was not measured for these probes.
+
+| Shared trunk | Parameters | Pre176 median | Post80 median | Pre/post gain |
+| --- | ---: | ---: | ---: | ---: |
+| 6×128, heads4 | 6,889,987 | 53.462ms | 181.296ms | 1.00× /1.00× |
+| 3×192, heads3 | 10,477,108 | 37.697ms | 119.340ms | 1.42× /1.52× |
+| 2×256, heads4 | 15,745,011 | 33.730ms | 111.744ms | 1.58× /1.62× |
+
+All reports have finite gradients. Shared FFN hidden derives4d (512/768/1024).
+The explicit ffn_hidden config remains unspecified in **every** variant:
+setting it to4d also changes adapter defaults and would not reproduce the
+original6×128 baseline. Meta-only storage enumeration validated the actual
+configs and corrected an initial explicit-hidden parameter count before any
+probe used it. Whole-model parameters grow1.52× and2.29×; the earlier
+$Ld^2$ estimates refer only to trunk arithmetic, not whole-model parameter
+or work equivalence. Faster inference/training-quality tradeoffs still need
+several-seed comparisons at equal work and equal time.
+
+Raw reports: `runs/experiments/nlhe_hu_32bb_normal_h100_arch_`
+`{6x128,3x192,2x256}_{pre_r176,post_2_r80}_1b69b5b/`.
+Wrapper: validation `scripts/h100_architecture_probe.py`; it records the actual
+scientific overrides and source hashes. The existing queue/hand domains,
+shared pre/post weights and external outputs are retained.

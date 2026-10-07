@@ -104,3 +104,38 @@ address are distinct observations; their causal relationship is unproven.
 No additional GPU tests were launched. The latest archive contains this
 rejected candidate, its tests/failure, architecture proposals and all earlier
 raw evidence. Eager training improvements and their identities are unchanged.
+
+
+## Final follow-up, 2026-10-07: ready for offline continuation
+
+The user authorized a30-minute extension at00:03 UTC, then asked to finish
+at00:24 UTC. No additional experiment was started after that request.
+Production pbg/tools/tests remain identical to the previously validated source;
+neither the persistent-stream candidate nor BF16 normalization was adopted.
+
+New findings, all saved with identities and raw evidence:
+
+- Learner-only BF16 normalization:30.39571→29.18032s (**1.04165×**), peak
+  allocated20.408→16.458GB (**19.36% less**). All presentations, updates,
+  fresh nodes, per-family work/cache counts and non-timing structures match.
+  Four full-model CUDA output/gradient/storage oracles passed. The attempted
+  full production suite timed out after75% progress, without reported assertions;
+  its gate remains incomplete and the production patch was reverted.
+- Model-only selected-output architecture probes:3×192 gave1.42× pre/1.52×
+  post;2×256 gave1.58×/1.62× vs6×128. Three warmups/21 repeats, actual
+ 176/80 rows, finite gradients. Parameters grow1.52×/2.29×. No Tensor-activity,
+  full-training or learning-quality claim follows. No architecture adopted.
+- Consistent-stream capture under memcheck progressed through eight calls
+  including preflop capture/replays, then timed out at570s in another compiled
+  shape. No complete sanitizer summary exists. This did not locate or clear
+  the original illegal address. No more capture experiments followed.
+- Four shape-matched K=2 compiler sources and exact wrapper versions were
+  preserved before pod shutdown, with hashes and provenance limitations.
+
+Read `h100_bf16_normalization_validation_20261007.md` and
+`h100_capture_triage_extension_20261007.md` for exact commands, outcomes,
+source/precision caveats and future gates. The architecture report's follow-up
+section now includes measured timings and actual parameter counts.
+The refreshed tracked offline archive includes all these files and raw reports.
+The goal is being paused at the user's request to call it a day; unresolved
+capture correctness and future optimization adoption are not marked complete.
