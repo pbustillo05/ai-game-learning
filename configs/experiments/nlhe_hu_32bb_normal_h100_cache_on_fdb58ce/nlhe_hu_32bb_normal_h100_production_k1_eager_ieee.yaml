@@ -1,0 +1,74 @@
+kind: nlhe_run_v1
+scientific:
+  mode:
+    training_regime: self_play
+    rollout_mode: sequential
+    private_estimator: sampled
+  game:
+    players: 2
+    stack_bb: 32.0
+    rank_count: 13
+  model:
+    d_model: 128
+    n_heads: 4
+    layers: 6
+    raises:
+      components: 2
+      minimum_scale: 0.02
+    class_embedding_dim: 32
+    folder_beta_rank: 0
+    folder_line_dim: 8
+    epsilon: 1.0e-08
+  objective:
+    policy_clip: 0.2
+    value:
+      kind: clipped
+      epsilon: 0.2
+      coefficient: 0.125
+    entropy:
+      kind: linear_decay
+      coefficient: 0.025
+      iterations: 500
+    reference_kl:
+      coefficient: 0.05
+      refresh:
+        effective_hands: 900000.0
+  optimizer:
+    kind: adamw
+    learning_rate: 5.0e-05
+    beta1: 0.9
+    beta2: 0.999
+    epsilon: 1.0e-08
+    weight_decay: 0.0
+    grad_clip: 0.5
+  schedule:
+    batch_size: 256
+    steps: 116
+  lambda: 0.95
+run:
+  seed: 104830
+  reproducibility: throughput
+  utility: stack_normalized
+  workload:
+    roots: 64
+  execution:
+    device: cuda:0
+    precision: bf16
+    attention: sdpa
+    reference_cache:
+      budget_bytes: 1073741824
+    tensor_program:
+      mode: eager
+      cache_entries: 8
+      cache_bytes: 8589934592
+    memory:
+      reserve_bytes: 10737418240
+    microbatch:
+      rollout_rows: 8
+      completion_rows: 64
+      learner_rows:
+        pre: 256
+        post_2: 128
+  iterations: 1
+  checkpoint_every: 1
+  output_dir: /workspace/ai-game-learning/runs/experiments/nlhe_hu_32bb_normal_h100_cache_on_fdb58ce/runtime

@@ -1,0 +1,79 @@
+kind: nlhe_run_v1
+scientific:
+  mode:
+    training_regime: self_play
+    rollout_mode: sequential
+    private_estimator: rao_blackwell
+  game:
+    players: 6
+    stack_bb: 8.0
+    rank_count: 6
+  model:
+    d_model: 128
+    n_heads: 4
+    layers: 6
+    raises:
+      components: 2
+      minimum_scale: 0.02
+    class_embedding_dim: 32
+    ffn_hidden: 512
+    folder_beta_rank: 16
+    folder_line_dim: 8
+    epsilon: 1.0e-08
+  objective:
+    policy_clip: 0.2
+    value:
+      kind: mse
+      coefficient: 0.5
+    entropy:
+      kind: constant
+      coefficient: 0.01
+    reference_kl:
+      coefficient: 0.05
+      refresh:
+        effective_hands: 0.5
+  optimizer:
+    kind: adamw
+    learning_rate: 0.0003
+    beta1: 0.9
+    beta2: 0.999
+    epsilon: 1.0e-08
+    weight_decay: 0.0
+    grad_clip: 1.0
+  schedule:
+    batch_size: 8
+    steps: 2
+  lambda: 0.95
+  completion:
+    samples: 8
+run:
+  seed: 104830
+  reproducibility: throughput
+  utility: raw_bb
+  workload:
+    roots: 2
+    replicas: 2
+  execution:
+    device: cuda:0
+    precision: bf16
+    attention: sdpa
+    reference_cache: 'off'
+    tensor_program:
+      mode: eager
+      cache_entries: 8
+      cache_bytes: 0
+    memory:
+      reserve_bytes: 10737418240
+    microbatch:
+      rollout_rows: 2
+      completion_rows: 4
+      learner_rows:
+        pre: 4
+        post_2: 2
+        post_3: 2
+        post_4: 2
+        post_5: 2
+        post_6: 2
+  iterations: 1
+  checkpoint_every: 1
+  output_dir: /workspace/ai-game-learning/runs/experiments/nlhe_hu_32bb_normal_h100_validation/runtime/nlhe_6max_8bb_rb_h100_native_rao_blackwell

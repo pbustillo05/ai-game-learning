@@ -1,7 +1,9 @@
 # H100 replica validation and performance evidence
 
-Status: CUDA correctness gates passed; full-pipeline tuning and native capture
-validation are in progress. Production Normal eager timing is available.
+Status: integrated CUDA suite and eager consumer gates passed; full-pipeline
+tuning is bounded by the Runpod deadline. A newly observed asynchronous K=2
+capture illegal memory access remains unresolved despite a synchronous pass.
+See the latest-evidence/bounded-handoff sections before using captured execution.
 
 The active validation workstream is Codex conversation
 `01a112e3-cf04-72c3-aa47-8a7c4f333c52`. The earlier conversation detected these
@@ -177,8 +179,9 @@ It had counted chunks of fresh rollout rows and ignored scheduled learner
 presentations, so the 116-step workload was wrongly denied cache admission.
 It now reads sampler metadata without advancing RNG, and rejects known
 unprofitable caches before launching a reference forward. The prior conversation
-passed all 20 affected CUDA tests (50.78 seconds) and is running the full suite
-at `fdb58ce`, whose production source and tests are byte-identical to `a7a20a1`
+passed all 20 affected CUDA tests (50.78 seconds) and then the full suite:
+**572 passed, 2 skipped** in 273.60 seconds. That full run used `fdb58ce`,
+whose production source and tests are byte-identical to `a7a20a1`
 (`git diff --exit-code ... -- pbg tests` passed). This thread's duplicate full
 run was stopped while waiting on shared CUDA extension compilation; its log
 does not establish a completed suite. The retained monitor was also exercised
@@ -304,3 +307,311 @@ correctness/compatibility gates; the performance and tuning matrix uses HU.
 5. Compare existing fused attention backends while preserving the learned
    additive key prior. Per-kernel Tensor Core counters would improve attribution;
    permitted GPM interval counters already support whole-pipeline comparisons.
+
+
+## Current-source HU pack and hardware-counter confirmation
+
+The isolated matched cache-off baseline at `fdb58ce` (production code/tests
+equal to `a7a20a1`) measured 41.952 seconds median with pre=256/post=128,
+707.857 presentations/s, 169 fresh nodes and 116 optimizer steps. The earlier
+`83e9f55` cache-off baseline measured 42.552 seconds median. Raising only the
+postflop physical cap to 192 at `83e9f55` measured 42.664 seconds median
+(42.608, 42.664, 42.771 seconds). There is no demonstrated improvement: both
+post caps already execute the same 116 post and 116 pre learner cohort calls
+per iteration for this seed. Physical caps must change executed work to help.
+
+The post=192 run's three isolated repeated samples gave consistent read-only
+GPM interval averages: SM active 75.95/75.97/75.70%, warp occupancy
+40.46/40.50/40.34%, Tensor/HMMA active 9.00/8.98/8.97%, DRAM bandwidth
+active 34.69/34.73/34.66%, and FP32 active 4.33/4.33/4.32%. These are aggregate
+hardware counters, not inferred utilization from kernel names or model FLOP
+estimates. Approximate timed windows use progress observation timestamps plus
+recorded reset durations, trimming 300 ms from both ends; they do not provide
+per-kernel attribution. Raw status/value records and window boundaries are in
+`runs/experiments/nlhe_hu_32bb_normal_h100_eager_k1_p256_q192_83e9f55/`
+(`gpm.jsonl`, `gpm_summary.json`, `progress_observations.jsonl`).
+
+
+## Matched reference-cache result
+
+At frozen `fdb58ce` (production source/tests equal to `a7a20a1`), HU Normal
+K=1, pre=256/post=128, batch=256, steps=116, roots=64, IEEE/BF16 eager,
+seed=104830, two warmups and three isolated repetitions:
+
+| Reference cache | Repeated seconds | Median seconds | Presentations/s |
+| --- | --- | --- | --- |
+| Off | 41.952, 41.952, 41.950 | 41.952 | 707.857 |
+| 1 GiB budget | 30.681, 30.694, 30.582 | 30.681 | 967.905 |
+
+Caching provides **1.37x** further whole-pipeline throughput with unchanged
+169 fresh player nodes, 29,696 learner presentations and 116 optimizer steps.
+Per-sample runner counter differences show 29,696 reference cache presentations
+and zero repeated reference forward presentations. Allocated peak changes from
+20,403,443,200 to 20,408,236,544 bytes (+4,793,344 bytes); these peaks are process
+allocator measurements, not cache-payload accounting. The cache budget is not
+the actual occupied bytes. Reserved peak is 44,077,940,736 bytes with caching.
+There were no competing CUDA jobs. This is a same-source matched comparison,
+independent of the older 3.99x physical-pack comparison.
+
+Raw reports: `runs/experiments/nlhe_hu_32bb_normal_h100_cache_off_fdb58ce/report.json`
+and `runs/experiments/nlhe_hu_32bb_normal_h100_cache_on_fdb58ce/report.json`.
+
+
+## HU phase attribution at `8236a61`
+
+Separate instrumented Normal K=1, pre=256/post=128, cache off, one warmup
+and one repeated iteration measured 41.442 seconds. Synchronized phase windows
+were aligned with GPM using only intervals wholly contained in a phase; means
+are weighted by actual interval duration. This run is for attribution, not a
+replacement for the uninstrumented repeated medians.
+
+| Phase | Wall seconds | SM active | Warp occupancy | Tensor active | DRAM bandwidth |
+| --- | --- | --- | --- | --- | --- |
+| Rollout | 1.079 | 5.77% | 2.37% | 0.50% | 1.11% |
+| Learner | 40.290 | 80.29% | 42.79% | 9.52% | 36.65% |
+
+Learner accounts for 97.2% of iteration wall time. Rollout is poorly saturated,
+but its entire removal would save only about 2.6% on this workload. Completion
+(0.054 seconds), targets (0.012 seconds), queue drain, alignment/seal and final
+backward bookkeeping have no whole 250 ms GPM interval, so their activity is
+unmeasured rather than assumed zero. Use a faster permitted sampling interval
+or a separately repeated fixed stage to measure them; neither requires changing
+queues. Raw evidence and interval coverage: `phase_windows.jsonl`, `gpm.jsonl`,
+`phase_gpm_summary.json`, and `report.json` under
+`runs/experiments/nlhe_hu_32bb_normal_h100_eager_k1_p256_q128_s104830_8236a61_phase/`.
+
+
+With the 1 GiB reference-cache budget, the separate instrumented HU iteration
+measured 30.544 seconds, with learner 29.380 seconds, rollout 1.090 seconds.
+Learner GPM: SM active 78.85%, occupancy 40.81%, Tensor/HMMA active 9.93%,
+DRAM bandwidth 35.91%. Reference caching reduces wall time while aggregate
+SM activity slightly falls; optimizing for a utilization percentage alone
+would miss this throughput improvement. The reference build/gather remains
+inside learner timing; the existing phase schema does not separately time
+reference and learner forwards. Model kernel traces and runner presentation
+counters provide the complementary attribution. Evidence is the corresponding
+`...phase_cache/phase_gpm_summary.json`.
+
+
+Data-type interpretation: BF16 has FP32's exponent range with fewer mantissa
+bits; BF16 GEMMs and attention feed Tensor Cores while accumulating matrix
+products in FP32. FP32 master parameters and Adam state do not imply FP32
+model matmuls: autocast supplies BF16 operands to eligible operators. FP32
+non-tensor reductions, losses, normalization and residual intermediates remain
+visible separately. NVML HMMA activity includes BF16/FP16 Tensor Core work;
+near-zero scalar FP16 activity is compatible with active BF16 Tensor Cores.
+GPM is a hardware interval measurement, but it does not expose per-CUDA-core
+issue-idle or stall reasons. SM activity's complement measures average inactive
+SM cycles across the device, not each arithmetic lane's idle cycles. Nsight
+SM scheduler issue/stall counters are the appropriate next attribution if the
+provider grants read-only counter access.
+
+
+## First HU replica/pack tuning result
+
+Normal K=2, pre=128/post=64, cache off, batch=256 and steps=116 per lane,
+roots=64 per lane, one warmup and three exclusive samples at `8236a61`:
+89.770, 89.136, 89.187 seconds; median **89.187 seconds**, **665.927 learner
+presentations/s**, 59,392 presentations and 232 optimizer steps in aggregate.
+Fresh nodes are 169/144 by lane (313 total); post/pre mixture differs between
+lanes, so this is statistical-work scaling, not an equal-token model benchmark.
+Peak allocated/reserved bytes: 13,894,959,616 / 16,577,986,560. Source identity
+stayed fixed and no competing jobs were detected.
+
+Per-sample physical work counts: pre 44,851 presentations / 348 cohort calls;
+post 14,541 / 340 calls. Two large-pack K=1 executions make 464 total calls,
+versus 688 here. Unequal family tails prevent enough exact cohorts at these
+caps. The observed aggregate rate is below large-pack uncached K=1's 707.857/s;
+this K=2 setting is not recommended on throughput grounds. No conclusion
+about other K/pack combinations follows. Evidence:
+`runs/experiments/nlhe_hu_32bb_normal_h100_eager_k2_p128_q64_s104830_8236a61/report.json`.
+
+
+Continuation interruption: the first RB small-pack attempt completed its warmup
+but no timed sample before its exec process group was terminated. GPU process
+absence and the missing exec handle were both checked. Its partial GPM/progress
+records are retained under `...rb_h100_eager_k1_p32_q8_s104830_8236a61/`
+`interrupted_attempt_1/`; no timing is accepted. The orphaned reset checkpoint
+and failed config scratch were removed. Completed Normal reports are reused
+only after validating timing isolation, source revision and harness SHA. A
+detached controller waits for the verified live earlier-thread capture parent
+before resuming, then guards GPU idle/process state before each arm. This is
+continuation/recovery handling, not a source-code or queue-design change.
+
+
+The stopping agent's complete handoff was read and reconciled:
+[h100_validation_agent_handoff_20261006.md](h100_validation_agent_handoff_20261006.md).
+It confirms no production patches remain to merge; `a7a20a1` and `fdb58ce`
+have identical complete Git tree `5ec299353850cf0e1f5feafd41235c68f7764678`.
+The later `8236a61` adds GPM/documentation only. Its RB capture smoke was stopped
+at the user's request before completion; it supplies no correctness/performance
+evidence. Native captured Normal K=2 and RB K=1/2, RB larger packs/cache/seeds,
+whole-pipeline larger K and warmed compilation measurements remain this
+thread's responsibility. Completed cache and full-suite evidence is retained
+at the handoff's cited authoritative paths. No further GPU work from the
+stopping thread is expected.
+
+
+## Completed RB small-pack baseline
+
+RB K=1, pre=32/post=8, cache off, batch=256, steps=116, roots=64,
+completion samples=256 per root (16,384 total), eager IEEE/BF16 at `8236a61`:
+152.107, 151.891, 152.758 seconds after one warmup; median **152.107 seconds**.
+Every sample retains 169 fresh nodes (118 pre / 51 post), 29,696 learner
+presentations and 116 optimizer steps. Physical learner calls are 699 pre +
+1,164 post = 1,863, exactly the baseline packing workload. Source and ownership
+checks pass. This completes the previously interrupted arm; its interrupted
+first attempt remains excluded. Raw report:
+`runs/experiments/nlhe_hu_32bb_rb_h100_eager_k1_p32_q8_s104830_8236a61/report.json`.
+
+At this safe stage boundary, the scheduler was replaced while leaving the GPU
+child's repetitions untouched. The continued matrix prioritizes a same-source
+RB large-pack/cache comparison and RB phase attribution, then the missing
+captured Normal K=2 and RB K=1/2 gates. This is scheduling of experiments only;
+production FIFO/queue layouts are unchanged.
+
+
+## Matched RB pack/cache gains at `8236a61`
+
+HU 32bb R=13, BF16/IEEE, six layers d=128, K=1, roots=64, batch=256,
+116 steps, completion_samples=256 (16,384 completions per iteration),
+rollout/completion packs 8/64, seed104830. Each arm uses one warmup and three
+isolated checkpoint-reset repetitions against the same committed source.
+
+| Physical pre/post caps | Reference cache | Repeated seconds | Median | Presentations/s |
+| --- | --- | --- | --- | --- |
+| 32 / 8 | Off | 152.107, 151.891, 152.758 | 152.107 | 195.230 |
+| 256 / 128 | Off | 42.960, 43.194, 43.132 | 43.132 | 688.496 |
+| 256 / 128 | 1 GiB budget | 31.950, 32.086, 32.139 | 32.086 | 925.520 |
+
+All three preserve 169 fresh nodes (118 pre, 51 post), 29,696 presentations,
+116 optimizer steps and all 16,384 completion samples. Source consistency
+and process-ownership checks pass. Pack tuning yields **3.53x**, caching adds
+**1.34x**, and the combined same-source RB gain is **4.74x**. This combined
+claim is legitimate here because all three arms are same-source matched work;
+the separate cross-revision Normal comparisons must not be multiplied this way.
+Per-sample pre/post calls are 699/1,164 versus 116/116 for both large-pack arms.
+Cached large-pack RB has zero repeated reference forward presentations and
+29,696 cached reference presentations; fresh cache construction is included
+in wall time and excluded from these learner presentation counters.
+
+Large-pack cache-off allocated/reserved peaks: 22,319,663,616 / 45,906,657,280
+bytes. Cache-on: 22,335,695,872 / 45,057,310,720 bytes. These are allocator
+measurements and do not quantify payload residency. Reports/configs under
+`runs/experiments/nlhe_hu_32bb_rb_h100_eager_k1_p32_q8_s104830_8236a61/`,
+`...p256_q128_s104830_8236a61/` and `...p256_q128_s104830_8236a61_cache/`.
+Additional seeds, repeated reference refresh/resume, warmed compilation and
+larger K remain separate gates before choosing a production recommendation.
+
+## Bounded final run and offline continuation
+
+The user's remaining Runpod budget is at most two hours. A detached tmux series
+`h100-final` is now capped at **2026-10-07 00:01:48 UTC**, with GPU benchmark
+work stopping two minutes earlier. The unbounded launcher was stopped while
+its active Normal K=2 capture continues; the bounded controller adopts that
+child and then runs only the priority arms described in
+[h100_bounded_final_handoff_20261006.md](h100_bounded_final_handoff_20261006.md).
+The earlier broad remaining-work list is deferred where it exceeds this budget.
+Final status and the offline archive are documented there. Do not launch a
+new open-ended matrix or claim deferred capture/warmup gates are complete.
+
+RB phase telemetry completed: learner 42.033 / 43.282 seconds (97.1%), rollout
+1.122 seconds. Learner weighted GPM SM activity 82.75%, occupancy 45.17%,
+Tensor/HMMA activity 9.40%, DRAM bandwidth 38.61%. Rollout SM activity is 6.21%
+but occupies only 2.6% of wall time. These support prioritizing learner packing
+and execution efficiency. They do not establish per-core idle cycles or MFU.
+Evidence is the RB `...p256_q128_s104830_8236a61_phase/phase_gpm_summary.json`.
+
+The subsequent Tensor Core investigation and alignment experiments are detailed
+in the bounded handoff's latest-evidence section. Dense BF16 GEMM calibration
+reached 92.90% Tensor activity / ~680.67 TFLOP/s. Actual large-pack learner
+profiles spend 28.41% (pre) / 46.50% (post) of summed GPU kernel time in
+matrix multiplication plus attention, with substantial unfused non-matrix work.
+Exact-zero working padding 343->344 switches post static FFN GEMMs to Hopper
+kernels and improves model-only probes ~4%; three CUDA gradient/address oracle
+checks pass. No production padding/normalization change has been adopted.
+
+**New unresolved correctness finding:** ordinary asynchronous native captured
+Normal K=2 failed with CUDA illegal memory access. Its synchronous diagnostic
+with CUDA_LAUNCH_BLOCKING=1 passed 5 graphs/7 replays after cold compilation,
+but this is not a fix or evidence the asynchronous path is safe. The original
+failure log remains authoritative. RB captures were deferred under the bounded
+budget. The earlier 572-test suite does not cover/clear this newly found full-size
+capture failure; the goal remains unfinished pending final/offline analysis.
+
+
+## Closing update, 23:56 UTC: concrete capture diagnosis and repair
+
+This update supersedes the earlier prospective controller/capture descriptions.
+The main bounded series ended at 23:43 UTC. K=16 eager reached its 15-minute
+limit before completing its first warmup, so it has **no valid throughput
+result**. A partial last-minute warmup window had SM57.44%, occupancy30.17%,
+Tensor6.82%, DRAM25.07%; its phase is unknown, so this is not a whole-learner
+attribution. All memory and owned GPU processes were released.
+
+The asynchronous Compute Sanitizer diagnostic ended at 23:46:15 UTC with
+exit86 and four CUDA API errors. It did **not** report an invalid-global-memory
+access. The first error was cudaErrorStreamCaptureImplicit(906) at
+cudaStreamWaitEvent: a legacy stream would depend on a capturing blocking
+stream; subsequent errors included invalidated capture(901). PyTorch also
+warned that a retained AccumulateGrad node was on a different stream from
+its incoming gradient. Its artifacts are:
+`runs/experiments/nlhe_hu_32bb_normal_h100_captured_k2_memcheck_8236a61/`.
+This establishes a capture stream defect; its relationship to the original
+asynchronous illegal-memory-access failure still requires validation.
+
+Commit **96a7654** gives each captured TensorProgramRunner one persistent
+non-default CUDA stream, used from the first eager admission through compiled
+warmup, captures, fallbacks and replays. Explicit caller/runner stream waits
+preserve producer/consumer ordering. Inputs and mutable storage are recorded
+on that stream. This keeps retained autograd gradient-accumulation nodes on
+the same stream when new exact shapes are admitted. Eager/compiled modes retain
+their existing stream behavior. No queues, private-hand domains or architecture
+contracts were changed.
+
+Focused CUDA verification passed **21 tests / 15 warnings in49.19s**, including
+native BF16 model forward/backward/replay, stable gradients/live weights, graph
+budget rejection, and a new multiple-shape persistent-stream regression.
+Log: `runs/experiments/nlhe_hu_32bb_normal_h100_validation/reports/capture_stream_focused_cuda.log`.
+The previous572-test suite predates this final stream repair. A full public
+Normal K=2 asynchronous capture smoke is running with CUDA_LAUNCH_BLOCKING
+unset, ATEN-only compile search, four compile threads and a235s limit. Its
+outcome is recorded in the closing result below. No warmed capture speedup
+has been demonstrated. RB capture coverage and a broad post-repair suite
+remain future verification requirements.
+
+The architecture brainstorming agent completed a read-only investigation.
+See `docs/audit/h100_tensorcore_architecture_brainstorm_20261006.md` for
+ranked proposals, invariants, analytic cost estimates, risks and future tests.
+First compare a3×192 or2×256 shared trunk against6×128; then consider a
+64-latent full-domain encoder/decoder or dense range-context MLP. Every
+proposal retains the original queues, full private IDs, external I/O,
+reach/card/folded inputs and shared pre/post trunk weights. No architecture
+candidate was implemented, and the protected theory/design files were not
+modified. Performance and learning-quality claims require future ablations.
+
+
+## Closing outcome, 23:59 UTC — capture candidate rejected
+
+The full public asynchronous Normal K=2 smoke on96a7654 **failed again** with
+CUDA illegal memory access, surfaced at owner.fatal.clone, followed by
+rollback/context failures and allocator abort(exit134). No valid report or
+throughput was produced. The235s time limit was not reached. The persistent
+stream candidate therefore does not resolve the production failure, despite
+21 passing focused tests. It was **reverted**; the final production tree again
+matches the previously572-test-validated tree. This experiment is a useful
+negative result, not a successful repair. Its patch is retained as
+`reports/capture_stream_candidate_96a7654.patch`; result metadata and full log
+are `reports/capture_stream_async_public_result.json` and
+`reports/capture_stream_async_public_cuda.log` under the validation directory.
+Failed runtime/config scratch was removed. No GPU compute owner remains.
+
+Captured K=2 safety remains an unresolved correctness gate. Do not recommend
+captured mode or claim this fix works. Next diagnostics should reproduce under
+memcheck while holding autograd streams consistent, check compiled backward
+buffer lifetimes/replay aliases, and isolate family/lane/shape transitions.
+The original sanitizer906/901 stream failure and the asynchronous illegal
+address are distinct observations; their causal relationship is unproven.
+No additional GPU tests were launched. The latest archive contains this
+rejected candidate, its tests/failure, architecture proposals and all earlier
+raw evidence. Eager training improvements and their identities are unchanged.
